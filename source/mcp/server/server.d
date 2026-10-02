@@ -85,7 +85,8 @@ struct RegisteredResource
 
 /// A direct resource reader receiving the per-request `RequestContext` (so it
 /// can log, observe cancellation, or elicit through the real request channel).
-alias ResourceReader = ResourceContents delegate(RequestContext ctx) @safe;
+/// It returns every content item of the `resources/read` result.
+alias ResourceReader = ResourceContents[]delegate(RequestContext ctx) @safe;
 
 /// A prompt handler receiving the raw `Json arguments` and the per-request
 /// `RequestContext`, always producing a final result. See `MrtrPromptHandler`
@@ -95,7 +96,8 @@ alias PromptHandler = GetPromptResult delegate(Json arguments, RequestContext ct
 /// A resource template reader receiving the concrete URI, the captured `{var}`
 /// parameters, and the per-request `RequestContext` (so a template handler can
 /// log, observe cancellation, or elicit through the real request channel).
-alias TemplateReader = ResourceContents delegate(string uri,
+/// It returns every content item of the `resources/read` result.
+alias TemplateReader = ResourceContents[]delegate(string uri,
 		string[string] params, RequestContext ctx) @safe;
 
 /// A registered resource template: descriptor + reader receiving the concrete
@@ -846,16 +848,34 @@ final class McpServer : ServerCore
 	/// per-resource modern `CacheableResult` freshness hint is emitted on this
 	/// resource's `resources/read` response (modern protocol only).
 	///
-	/// This is the context-less form; for a reader that needs the per-request
-	/// `RequestContext` use the overload taking a `ResourceReader`.
+	/// This is the context-less, single-content form; the other overloads take a
+	/// reader that receives the per-request `RequestContext` and/or returns
+	/// several contents (`ReadResourceResult.contents` is an array).
 	void registerResource(Resource descriptor, ResourceContents delegate() @safe reader,
+			Nullable!CacheHint cache = Nullable!CacheHint.init) @safe
+	{
+		registerResource(descriptor, (RequestContext) => [reader()], cache);
+	}
+
+	/// As above, for a context-less reader returning several contents.
+	void registerResource(Resource descriptor, ResourceContents[]delegate() @safe reader,
 			Nullable!CacheHint cache = Nullable!CacheHint.init) @safe
 	{
 		registerResource(descriptor, (RequestContext) => reader(), cache);
 	}
 
-	/// Register a direct resource whose reader also receives the per-request
-	/// `RequestContext`. Otherwise identical to the context-less overload.
+	/// As above, for a single-content reader receiving the per-request
+	/// `RequestContext`.
+	void registerResource(Resource descriptor,
+			ResourceContents delegate(RequestContext ctx) @safe reader,
+			Nullable!CacheHint cache = Nullable!CacheHint.init) @safe
+	{
+		registerResource(descriptor, (RequestContext ctx) => [reader(ctx)], cache);
+	}
+
+	/// Register a direct resource whose reader receives the per-request
+	/// `RequestContext` and returns every content item. The canonical form the
+	/// other overloads adapt onto.
 	void registerResource(Resource descriptor, ResourceReader reader,
 			Nullable!CacheHint cache = Nullable!CacheHint.init) @safe
 	{
@@ -868,22 +888,38 @@ final class McpServer : ServerCore
 	/// captured `{var}` parameters. An optional per-template modern `CacheableResult`
 	/// freshness hint is emitted on a matching `resources/read` (modern only).
 	///
-	/// This is the context-less form; for a reader that needs the per-request
-	/// `RequestContext` (logging, cancellation, elicitation) use the overload
-	/// taking a `(string, string[string], RequestContext)` reader.
+	/// This is the context-less, single-content form; the other overloads take a
+	/// reader that receives the per-request `RequestContext` (logging,
+	/// cancellation, elicitation) and/or returns several contents.
 	void registerResourceTemplate(ResourceTemplate descriptor, ResourceContents delegate(string uri,
 			string[string] params) @safe reader, Nullable!CacheHint cache = Nullable!CacheHint.init) @safe
 	{
-		// Adapt the context-less reader to the context-aware form, ignoring the
-		// per-request context.
+		registerResourceTemplate(descriptor, (string uri, string[string] params,
+				RequestContext) => [reader(uri, params)], cache);
+	}
+
+	/// As above, for a context-less reader returning several contents.
+	void registerResourceTemplate(ResourceTemplate descriptor, ResourceContents[]delegate(string uri,
+			string[string] params) @safe reader, Nullable!CacheHint cache = Nullable!CacheHint.init) @safe
+	{
 		registerResourceTemplate(descriptor, (string uri, string[string] params,
 				RequestContext) => reader(uri, params), cache);
 	}
 
-	/// Register a resource template whose reader also receives the per-request
-	/// `RequestContext`, so a template handler can log, poll cancellation, or
-	/// elicit through the real request channel. Otherwise identical to the
-	/// context-less overload.
+	/// As above, for a single-content reader receiving the per-request
+	/// `RequestContext`.
+	void registerResourceTemplate(ResourceTemplate descriptor,
+			ResourceContents delegate(string uri, string[string] params,
+				RequestContext ctx) @safe reader,
+			Nullable!CacheHint cache = Nullable!CacheHint.init) @safe
+	{
+		registerResourceTemplate(descriptor, (string uri, string[string] params,
+				RequestContext ctx) => [reader(uri, params, ctx)], cache);
+	}
+
+	/// Register a resource template whose reader receives the per-request
+	/// `RequestContext` and returns every content item. The canonical form the
+	/// other overloads adapt onto.
 	void registerResourceTemplate(ResourceTemplate descriptor,
 			TemplateReader reader, Nullable!CacheHint cache = Nullable!CacheHint.init) @safe
 	{
@@ -3048,7 +3084,7 @@ final class McpServer : ServerCore
 			if (auto missing = direct.requiredClientCapabilities.missingFrom(declared))
 				throw missingRequiredClientCapability(missing.get);
 			ReadResourceResult result;
-			result.contents = [direct.reader(ctx).forVersion(ver)];
+			result.contents = projectContents(direct.reader(ctx), ver);
 			return maybeCache(result, direct.cache, ver);
 		}
 
@@ -3063,7 +3099,7 @@ final class McpServer : ServerCore
 				if (auto missing = t.requiredClientCapabilities.missingFrom(declared))
 					throw missingRequiredClientCapability(missing.get);
 				ReadResourceResult result;
-				result.contents = [t.reader(uri, captured, ctx).forVersion(ver)];
+				result.contents = projectContents(t.reader(uri, captured, ctx), ver);
 				return maybeCache(result, t.cache, ver);
 			}
 		}
@@ -3073,6 +3109,16 @@ final class McpServer : ServerCore
 		Json data = Json.emptyObject;
 		data["uri"] = uri;
 		throw resourceNotFound(uri, ver, data);
+	}
+
+	/// Project each content item a reader returned to the negotiated version.
+	private static ResourceContents[] projectContents(ResourceContents[] contents,
+			ProtocolVersion ver) @safe
+	{
+		import std.algorithm : map;
+		import std.array : array;
+
+		return contents.map!(c => c.forVersion(ver)).array;
 	}
 
 	// The MIME type SEP-2640 assigns to a directory resource. A directory is
@@ -5809,6 +5855,47 @@ unittest  // resources/list and resources/read for a direct resource
 	p["uri"] = "test://x";
 	auto read = s.handle(req(2, "resources/read", p)).get;
 	assert(read["result"]["contents"][0]["text"].get!string == "hi");
+}
+
+unittest  // a direct resource reader may return several contents
+{
+	auto s = new McpServer("t", "1");
+	s.registerResource(Resource("test://x", "x"), () @safe => [
+		ResourceContents.makeText("test://x", "text/plain", "one"),
+		ResourceContents.makeText("test://x#2", "text/plain", "two")
+	]);
+	s.registerResource(Resource("test://y", "y"),
+			(RequestContext ctx) @safe => [
+				ResourceContents.makeText("test://y", "text/plain", "y")
+	]);
+
+	Json p = Json.emptyObject;
+	p["uri"] = "test://x";
+	auto read = s.handle(req(1, "resources/read", p)).get["result"]["contents"];
+	assert(read.length == 2);
+	assert(read[0]["text"].get!string == "one");
+	assert(read[1]["text"].get!string == "two");
+	p["uri"] = "test://y";
+	assert(s.handle(req(2, "resources/read", p))
+			.get["result"]["contents"][0]["text"].get!string == "y");
+}
+
+unittest  // a resource template reader may return several contents
+{
+	auto s = new McpServer("t", "1");
+	ResourceTemplate t = {uriTemplate: "test://dir/{name}", name: "dir"};
+	s.registerResourceTemplate(t, (string uri,
+			string[string] params) @safe => [
+		ResourceContents.makeText(uri ~ "/a", "text/plain", params["name"] ~ "-a"),
+		ResourceContents.makeText(uri ~ "/b", "text/plain", params["name"] ~ "-b")
+	]);
+
+	Json p = Json.emptyObject;
+	p["uri"] = "test://dir/n";
+	auto read = s.handle(req(1, "resources/read", p)).get["result"]["contents"];
+	assert(read.length == 2);
+	assert(read[0]["text"].get!string == "n-a");
+	assert(read[1]["uri"].get!string == "test://dir/n/b");
 }
 
 unittest  // resources/read strips per-content _meta for a 2024-11-05 client
