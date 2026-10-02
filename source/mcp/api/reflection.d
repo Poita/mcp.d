@@ -974,10 +974,11 @@ private void registerPromptMethod(string memberName, alias overload, alias paren
 				// Populate PromptArgument.description from the @describeParam UDA.
 				enum d = describeFor!(overload, names[i]);
 				// A prompt argument is required only when it is neither Nullable nor
-				// carries a declared D-level default, matching the tool path.
+				// carries a declared default (D-level or @schemaDefault), matching
+				// the tool path.
 				descriptor.arguments ~= PromptArgument(names[i], d.length
-						? nullable(d) : Nullable!string.init,
-						!isInstanceOf!(Nullable, P) && is(defs[i] == void));
+						? nullable(d) : Nullable!string.init, !isInstanceOf!(Nullable, P)
+						&& is(defs[i] == void) && !ParamSchemaDefaults!(overload, i).length);
 			}
 		}
 	}
@@ -996,6 +997,21 @@ private void registerPromptMethod(string memberName, alias overload, alias paren
 			// elicitation) work from prompts, exactly as the tool path does.
 			static if (is(P : RequestContext))
 				argv[i] = ctx;
+			else static if (ParamSchemaDefaults!(overload, i).length)
+			{
+				// An omitted argument takes its advertised @schemaDefault.
+				if (argPresent(args, names[i]))
+				{
+					try
+						setBound(argv[i], marshalArg!(P, true)(args, names[i]));
+					catch (McpException e)
+						throw e;
+					catch (Exception e)
+						throw invalidParams("argument '" ~ names[i] ~ "': " ~ e.msg);
+				}
+				else
+					setBound(argv[i], cast(P) ParamSchemaDefaults!(overload, i)[0].value);
+			}
 			else static if (is(defs[i] == void))
 			{
 				// A malformed argument (e.g. an out-of-range enum member or a
@@ -1660,6 +1676,42 @@ unittest  // @prompt bool, floating-point, and Nullable args are parsed from the
 	auto resp = s.handle(Message(makeRequest(Json(3), "prompts/get", pp))).get;
 	assert("error" !in resp, resp.toString);
 	assert(resp["result"]["messages"][0]["content"]["text"].get!string == "true 0.5 7");
+}
+
+unittest  // a @prompt parameter with @schemaDefault is optional and takes that default
+{
+	import jsonschema : schemaDefault;
+	import mcp.protocol.jsonrpc : Message, makeRequest;
+
+	@safe final class DefaultedPromptApi
+	{
+		@prompt("page", "Prompt with a defaulted argument")
+		string page(string topic, @schemaDefault(3) int count)@safe
+		{
+			import std.conv : to;
+
+			return topic ~ " x" ~ count.to!string;
+		}
+	}
+
+	auto s = new McpServer("t", "1");
+	registerHandlers(s, new DefaultedPromptApi);
+	auto list = s.handle(Message(makeRequest(Json(1), "prompts/list", Json.emptyObject))).get;
+	auto args = list["result"]["prompts"][0]["arguments"];
+	foreach (i; 0 .. args.length)
+		if (args[i]["name"].get!string == "count")
+			assert(!("required" in args[i] && args[i]["required"].get!bool));
+
+	Json pp = Json.emptyObject;
+	pp["name"] = "page";
+	pp["arguments"] = Json(["topic": Json("d")]);
+	auto resp = s.handle(Message(makeRequest(Json(2), "prompts/get", pp))).get;
+	assert("error" !in resp, resp.toString);
+	assert(resp["result"]["messages"][0]["content"]["text"].get!string == "d x3");
+
+	pp["arguments"] = Json(["topic": Json("d"), "count": Json("5")]);
+	auto given = s.handle(Message(makeRequest(Json(3), "prompts/get", pp))).get;
+	assert(given["result"]["messages"][0]["content"]["text"].get!string == "d x5");
 }
 
 unittest  // @prompt string arg given JSON null -> clean InvalidParams, not vibe deserialization error
