@@ -260,6 +260,18 @@ final class ProxyStateStore
 			return entries.take(proxyState, found);
 	}
 
+	/// Return the details for `proxyState` without consuming them, setting
+	/// `found`.
+	ProxyAuthState peek(string proxyState, out bool found) @safe
+	{
+		synchronized (this)
+		{
+			auto p = entries.get(proxyState, false);
+			found = p !is null;
+			return found ? *p : ProxyAuthState.init;
+		}
+	}
+
 	/// Number of live pending authorizations (test/diagnostic use).
 	size_t length() @safe
 	{
@@ -566,7 +578,9 @@ void mountOAuthConsent(URLRouter router, OAuthProxy proxy, ProxyStateStore store
 		const form = readFormString(req);
 		const proxyState = formField(form, "state");
 		bool found;
-		auto st = store.take(proxyState, found);
+		// Peek rather than take: a refused approval (a forged cross-site post, a
+		// missing token) must not destroy the user's pending authorization.
+		auto st = store.peek(proxyState, found);
 		if (!found || st.clientRedirectUri.length == 0)
 		{
 			res.statusCode = HTTPStatus.badRequest;
@@ -584,6 +598,14 @@ void mountOAuthConsent(URLRouter router, OAuthProxy proxy, ProxyStateStore store
 			res.writeBody(
 				"Consent must be approved from the browser that was shown the consent screen",
 				"text/plain");
+			return;
+		}
+		// Consume the entry now that the approval is genuine, so it is single use.
+		store.take(proxyState, found);
+		if (!found)
+		{
+			res.statusCode = HTTPStatus.badRequest;
+			res.writeBody("Unknown or expired authorization state", "text/plain");
 			return;
 		}
 
@@ -1616,6 +1638,29 @@ unittest  // CONSENT CSRF: a POST /consent without the anti-CSRF token is refuse
 	const noToken = browserPost(router, "https://mcp.example.com/consent",
 			"state=" ~ encodeComponent(hiddenField(page.body_, "state")), page.setCookie);
 	assert(noToken.status == 403);
+}
+
+unittest  // CONSENT CSRF: a refused POST /consent leaves the pending authorization intact
+{
+	auto proxy = new OAuthProxy(consentMountConfig());
+	proxy.register(["http://localhost:5000/cb"]);
+	auto router = new URLRouter;
+	mountOAuthProxy(router, proxy);
+
+	const page = browserGet(router, "https://mcp.example.com/authorize?code_challenge=CH"
+			~ "&redirect_uri=http%3A%2F%2Flocalhost%3A5000%2Fcb&state=cs", "");
+	// A forged cross-site post (no consent cookie) and one missing the token.
+	assert(browserPost(router, "https://mcp.example.com/consent",
+			consentForm(page.body_), "").status == 403);
+	assert(browserPost(router, "https://mcp.example.com/consent",
+			"state=" ~ encodeComponent(hiddenField(page.body_, "state")), page.setCookie).status
+			== 403);
+
+	// The real user's approval still completes the flow.
+	const approved = browserPost(router, "https://mcp.example.com/consent",
+			consentForm(page.body_), page.setCookie);
+	assert(approved.status == 302);
+	assert(approved.location.startsWith("https://github.com/login/oauth/authorize?"));
 }
 
 unittest  // CONSENT HARDENING: the consent screen cannot be framed (clickjacking)
