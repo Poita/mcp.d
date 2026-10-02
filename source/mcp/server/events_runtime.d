@@ -667,6 +667,9 @@ final class EventsRuntime
 	void register(EventRegistration reg) @safe
 	{
 		const name = reg.descriptor.name;
+		// Compile before touching live subscriptions: a malformed schema is
+		// rejected with the current registration and its subscribers intact.
+		reg.inputValidator = compileInputValidator(reg.descriptor.inputSchema);
 		auto existing = name in types_;
 		bool descriptorChanged = existing is null;
 		if (existing !is null)
@@ -694,7 +697,6 @@ final class EventsRuntime
 				|| existing.emitOnly != reg.emitOnly || canonicalJsonString(
 						existing.descriptor.meta) != canonicalJsonString(reg.descriptor.meta);
 		}
-		reg.inputValidator = compileInputValidator(reg.descriptor.inputSchema);
 		types_[name] = reg;
 		if (descriptorChanged)
 			notifyListChanged();
@@ -4123,6 +4125,27 @@ unittest  // re-registering with an incompatible payloadSchema terminates with U
 	assert(params[0]["error"]["data"]["reason"].get!string == "schema_changed");
 	assert(changed == 2);
 	assert(rt.has("n")); // the type stays, under its new contract
+}
+
+unittest  // re-registering with a malformed inputSchema throws and leaves live subscriptions running
+{
+	import std.exception : collectException;
+
+	auto rt = testRuntime();
+	EventRegistration reg = {descriptor: EventType("n"), emitOnly: true};
+	reg.descriptor.inputSchema = parseJsonString(
+			`{"type":"object","properties":{"a":{"type":"string"}}}`);
+	rt.register(reg);
+	string[] methods;
+	cast(void) openLive(rt, "n", Json.emptyObject, "u", Json(1), (string m, Json p) @safe {
+		methods ~= m;
+	});
+	reg.descriptor.inputSchema = parseJsonString(
+			`{"type":"object","properties":{"a":{"type":"integer"}},"required":"a"}`);
+	assert(collectException(rt.register(reg)) !is null);
+	assert(methods.length == 0);
+	rt.emit(EventOccurrence("e", "n", "t"));
+	assert(methods == [eventsEventNotification]);
 }
 
 unittest  // an additive schema change keeps subscriptions but still notifies list_changed
