@@ -915,8 +915,8 @@ final class McpClient : ClientProtocol
 	{
 		auto result = withCancellation!DiscoverResult(opts.cancellation,
 				() @safe => cachedFetch!DiscoverResult(CacheKey("server/discover",
-					""), opts.cacheMode, () @safe => DiscoverResult.fromJson(rpc("server/discover",
-					Json.emptyObject))));
+					""), opts.cacheMode, () @safe => DiscoverResult.fromJson(
+					rpcWith("server/discover", Json.emptyObject, opts))));
 		discoverResult_ = result;
 		return result;
 	}
@@ -1292,7 +1292,7 @@ final class McpClient : ClientProtocol
 			auto a = drainList!ListToolsResult("tools/list",
 				(ref ListToolsResult x, ref ListToolsResult r) @safe {
 				x.tools ~= r.tools;
-			});
+			}, opts);
 			// On a modern session over HTTP (the x-mcp-header feature), the client MUST
 			// exclude from tools/list any tool whose inputSchema carries an invalid
 			// `x-mcp-header` annotation (2026-07-28 server/tools #x-mcp-header). Validate each
@@ -2229,7 +2229,7 @@ final class McpClient : ClientProtocol
 			return drainList!ListResourcesResult("resources/list",
 				(ref ListResourcesResult a, ref ListResourcesResult r) @safe {
 				a.resources ~= r.resources;
-			});
+			}, opts);
 		});
 	}
 
@@ -2251,7 +2251,7 @@ final class McpClient : ClientProtocol
 			return drainList!ListResourceTemplatesResult("resources/templates/list",
 				(ref ListResourceTemplatesResult a, ref ListResourceTemplatesResult r) @safe {
 				a.resourceTemplates ~= r.resourceTemplates;
-			});
+			}, opts);
 		});
 	}
 
@@ -2372,7 +2372,7 @@ final class McpClient : ClientProtocol
 			return drainList!ListPromptsResult("prompts/list",
 				(ref ListPromptsResult a, ref ListPromptsResult r) @safe {
 				a.prompts ~= r.prompts;
-			});
+			}, opts);
 		});
 	}
 
@@ -5537,6 +5537,79 @@ unittest  // getPrompt RequestOptions.logLevel attaches the modern per-request o
 	};
 	c.getPrompt("greet", Json.emptyObject, RequestOptions(ProgressToken.init, "warning"));
 	assert(seen["_meta"][MetaKey.logLevel].get!string == "warning");
+}
+
+version (unittest)
+{
+	// Issue `method`'s list verb on a modern client with a per-request log level
+	// and progress token, returning the params the server saw.
+	private Json listParamsSeen(string method, Json page,
+			void delegate(McpClient c, RequestOptions opts) @safe call)
+	{
+		auto c = McpClient.http("http://localhost");
+		c.enableModern();
+		Json seen = Json.undefined;
+		c.onRpcForTest = (string m, Json params) @safe {
+			if (m == method)
+				seen = params;
+			return page;
+		};
+		RequestOptions opts;
+		opts.progressToken = ProgressToken("list-tok");
+		opts.logLevel = "debug";
+		call(c, opts);
+		return seen;
+	}
+}
+
+unittest  // listTools applies RequestOptions progressToken and logLevel
+{
+	auto seen = listParamsSeen("tools/list", Json(["tools": Json.emptyArray]), (c, opts) @safe {
+		c.listTools(opts);
+	});
+	assert(seen["_meta"][MetaKey.logLevel].get!string == "debug");
+	assert(seen["_meta"]["progressToken"].get!string == "list-tok");
+}
+
+unittest  // listResources applies RequestOptions progressToken and logLevel
+{
+	auto seen = listParamsSeen("resources/list",
+			Json(["resources": Json.emptyArray]), (c, opts) @safe {
+		c.listResources(opts);
+	});
+	assert(seen["_meta"][MetaKey.logLevel].get!string == "debug");
+	assert(seen["_meta"]["progressToken"].get!string == "list-tok");
+}
+
+unittest  // listResourceTemplates applies RequestOptions progressToken and logLevel
+{
+	auto seen = listParamsSeen("resources/templates/list",
+			Json(["resourceTemplates": Json.emptyArray]), (c, opts) @safe {
+		c.listResourceTemplates(opts);
+	});
+	assert(seen["_meta"][MetaKey.logLevel].get!string == "debug");
+	assert(seen["_meta"]["progressToken"].get!string == "list-tok");
+}
+
+unittest  // listPrompts applies RequestOptions progressToken and logLevel
+{
+	auto seen = listParamsSeen("prompts/list", Json(["prompts": Json.emptyArray]), (c, opts) @safe {
+		c.listPrompts(opts);
+	});
+	assert(seen["_meta"][MetaKey.logLevel].get!string == "debug");
+	assert(seen["_meta"]["progressToken"].get!string == "list-tok");
+}
+
+unittest  // discover applies RequestOptions progressToken and logLevel
+{
+	auto seen = listParamsSeen("server/discover",
+			Json([
+				"supportedVersions": Json([Json("2026-07-28")]),
+				"capabilities": Json.emptyObject,
+				"serverInfo": Json(["name": Json("s"), "version": Json("1")])
+	]), (c, opts) @safe { c.discover(opts); });
+	assert(seen["_meta"][MetaKey.logLevel].get!string == "debug");
+	assert(seen["_meta"]["progressToken"].get!string == "list-tok");
 }
 
 unittest  // validateOutput passes a conforming structured result
