@@ -82,12 +82,54 @@ version (unittest)
 			return result;
 		}
 
-		/// Crude heuristic matching druntime: treat an assert as in-module when
-		/// the failing file path starts with the module name.
+		/// Treat an assert as in-module when the failing file is the module's
+		/// own source: its dotted name as a path ending in `.d` or
+		/// `/package.d`, at the start of `file` or right after a `/`.
 		private bool originatesIn(string moduleName, string file) @safe nothrow @nogc
 		{
-			return moduleName.length != 0 && file.length > moduleName.length
-				&& file[0 .. moduleName.length] == moduleName;
+			static immutable string[2] suffixes = [".d", "/package.d"];
+			if (moduleName.length == 0)
+				return false;
+			foreach (suffix; suffixes)
+			{
+				immutable total = moduleName.length + suffix.length;
+				if (file.length < total || file[$ - suffix.length .. $] != suffix)
+					continue;
+				immutable start = file.length - total;
+				if (start != 0 && file[start - 1] != '/')
+					continue;
+				bool same = true;
+				foreach (i, c; moduleName)
+				{
+					immutable f = file[start + i];
+					if (c == '.' ? f != '/' : f != c)
+					{
+						same = false;
+						break;
+					}
+				}
+				if (same)
+					return true;
+			}
+			return false;
+		}
+
+		@safe unittest
+		{
+			assert(originatesIn("mcp.internal.unittest_runner",
+					"source/mcp/internal/unittest_runner.d"));
+		}
+
+		@safe unittest
+		{
+			assert(originatesIn("mcp.transport", "source/mcp/transport/package.d"));
+		}
+
+		@safe unittest
+		{
+			assert(!originatesIn("mcp.transport", "source/mcp/transport/stdio.d"));
+			assert(!originatesIn("mcp.server.server", "source/mcp/server/server_test.d"));
+			assert(!originatesIn("", "source/mcp/server/server.d"));
 		}
 
 		private extern (C) void _d_print_throwable(Throwable t) nothrow;
@@ -105,12 +147,16 @@ version (unittest)
 			import core.stdc.stdio : printf, fflush, stdout;
 			import core.stdc.stdlib : exit;
 
-			// Keep the exact "<N> modules passed unittests" wording that CI and
-			// local greps rely on.
-			printf("%llu modules passed unittests\n", cast(ulong) result.passed);
-			fflush(stdout);
-
+			// Keep druntime's exact summary wording that CI and local greps rely
+			// on: "<N> modules passed unittests" on success and
+			// "<failed>/<executed> modules FAILED unittests" otherwise.
 			immutable anyFailed = result.passed != result.executed;
+			if (anyFailed)
+				printf("%llu/%llu modules FAILED unittests\n",
+						cast(ulong)(result.executed - result.passed), cast(ulong) result.executed);
+			else
+				printf("%llu modules passed unittests\n", cast(ulong) result.passed);
+			fflush(stdout);
 			exit(anyFailed ? 1 : 0);
 		}
 	}
