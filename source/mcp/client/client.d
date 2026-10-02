@@ -3465,7 +3465,9 @@ final class McpClient : ClientProtocol
 	/// the sticky per-request opt-in that `injectModernMeta` stamps onto every
 	/// subsequent request's `_meta` (see `withRequestLogLevel` and
 	/// `RequestOptions.logLevel` for a single-request override). Passing
-	/// an empty `level` clears the modern opt-in.
+	/// an empty `level` clears the modern opt-in; on a released protocol, where
+	/// there is nothing to clear, an empty `level` is rejected like any other
+	/// unrecognised name.
 	///
 	/// Typed entry point: pass a `LogLevel` for compile-time safety, so an invalid
 	/// level name can never reach the wire. Forwards to the string overload (whose
@@ -3475,15 +3477,14 @@ final class McpClient : ClientProtocol
 		setLogLevel(cast(string) level, opts);
 	}
 
-	/// an empty `level` clears the modern opt-in.
+	/// ditto
 	void setLogLevel(string level, RequestOptions opts = RequestOptions.init) @safe
 	{
 		// Reject an unrecognised level locally rather than POSTing it to a server
 		// that will reject it (released protocol) or silently stamping it into
-		// every modern request's `_meta` (2026-07-28). The empty string is the documented
-		// modern-opt-in clear and is left to pass through. Mirrors the server-side
-		// guard at server.d:1118.
-		if (level.length && logLevelRank(level) < 0)
+		// every modern request's `_meta` (2026-07-28). The empty string is the
+		// modern opt-in clear, so it passes only on a modern session.
+		if ((level.length || !useModern) && logLevelRank(level) < 0)
 			throw new McpException(ErrorCode.invalidParams, "Invalid log level: " ~ level);
 		if (useModern)
 		{
@@ -10413,6 +10414,21 @@ unittest  // close() cancels managed subscriptions and their watchdog does not r
 	c.onStreamWatchSleepForTest = (Duration d) @safe { now += 200_000; };
 	c.runStreamWatchdog(pushed);
 	assert(t.listens.length == 1, "a closed client must not reopen a managed stream");
+}
+
+unittest  // setLogLevel rejects an empty level on a legacy session without sending it
+{
+	import std.exception : collectException;
+
+	auto c = new McpClient(new RecordingClientTransport());
+	string[] sent;
+	c.onRpcForTest = (string method, Json params) @safe {
+		sent ~= method;
+		return Json.emptyObject;
+	};
+	auto e = collectException!McpException(c.setLogLevel(""));
+	assert(e !is null && e.code == ErrorCode.invalidParams);
+	assert(sent.length == 0);
 }
 
 unittest  // resources/subscribe and resources/unsubscribe fail locally on a modern session
