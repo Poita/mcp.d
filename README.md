@@ -11,9 +11,15 @@ the D programming language — client and server, built on [vibe-d](https://vibe
 
 ## Quickstart
 
-A server is a handful of annotated functions plus `runStdio`:
+A server is a handful of annotated functions plus `runStdio`. Save it as
+`server.d`; the comment at the top makes it a single-file dub package (see
+[Installation](#installation) for the dependency line):
 
 ```d
+/+ dub.sdl:
+    name "demo-server"
+    dependency "mcp-d" repository="git+https://github.com/Poita/mcp.d.git" version="~main"
++/
 module demo;
 
 import mcp;
@@ -33,11 +39,16 @@ void main()
 A client spawns that server over stdio, negotiates the protocol (any era — legacy
 or modern) with `connect()`, calls the tool, and checks the result. Wrap the work
 in `runWithEventLoop` — it drives vibe's event loop for you and hands back the
-scenario's value (see [Concurrency model](#concurrency-model)):
+scenario's value (see [Concurrency model](#concurrency-model)). Save it as
+`client.d` next to `server.d`:
 
 ```d
-// client.d — build server.d as ./demo-server first
+/+ dub.sdl:
+    name "demo-client"
+    dependency "mcp-d" repository="git+https://github.com/Poita/mcp.d.git" version="~main"
++/
 import mcp;
+import std.stdio : writeln;
 import vibe.data.json : parseJsonString;
 
 void main()
@@ -50,7 +61,17 @@ void main()
         return client.callTool("add", parseJsonString(`{"a": 2, "b": 3}`));
     });
     assert(result.structuredContent["result"].get!long == 5);
+    writeln("2 + 3 = ", result.structuredContent["result"].get!long);
 }
+```
+
+Build the server, then run the client from the same directory (it spawns
+`./demo-server`):
+
+```bash
+ulimit -n 65536                 # see Build & test
+dub build --single server.d     # produces ./demo-server
+dub run --single client.d       # prints "2 + 3 = 5"
 ```
 
 ## Installation
