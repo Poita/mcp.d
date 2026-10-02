@@ -774,9 +774,12 @@ stream/webhook via its loop:
 EventBatch!Email checkEmail(EmailArgs args, FetchContext ctx) @safe
 {
     if (ctx.isBootstrap) return EventBatch!Email.empty(currentCursor());
-    return EventBatch!Email.of(fetchSince(ctx.cursor, args), newCursor());
+    return EventBatch!Email.of(fetchSince(ctx.cursor.get, args), newCursor());
 }
 ```
+
+`ctx.cursor` is a `Nullable!string`: null means the client asked to start from
+now (`isBootstrap`), so read it with `.get` only after that check.
 
 The dynamic `server.registerEventType(EventRegistration(...))` path (raw `Json`)
 remains for runtime-defined types.
