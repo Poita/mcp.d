@@ -1403,12 +1403,15 @@ final class McpServer : ServerCore
 	/// from the Server), outside any in-flight POST. The Streamable HTTP
 	/// transport creates one channel per mount and attaches it here (via
 	/// `ensurePushChannel`); the `notify*`/`ping*` APIs deliver through it.
-	/// Attaching when a channel is already present is a no-op, so a second mount
-	/// of the same server reuses the first mount's channel.
-	void attachPushChannel(PushChannel channel) @safe
+	/// A server carries one channel: re-attaching the attached channel is a
+	/// no-op, and attaching a different one throws (a second mount reuses the
+	/// first mount's channel through `ensurePushChannel`).
+	package(mcp) void attachPushChannel(PushChannel channel) @safe
 	{
 		if (pushChannel is null)
 			pushChannel = channel;
+		else if (pushChannel !is channel)
+			throw new Exception("a push channel is already attached to this server");
 	}
 
 	/// The attached server->client push channel, or null if none has been
@@ -1486,7 +1489,7 @@ final class McpServer : ServerCore
 	/// stamped acknowledgement as that leading message. Legacy versions never
 	/// defined `subscriptions/listen`, so they take the normal path (returns
 	/// `false`) and the request is answered conventionally.
-	bool tryServeStdioListen(Message msg, void delegate(string) @safe writeLine) @safe
+	package(mcp) bool tryServeStdioListen(Message msg, void delegate(string) @safe writeLine) @safe
 	{
 		if (msg.kind != MessageKind.request || msg.method != "subscriptions/listen")
 			return false;
@@ -1583,7 +1586,7 @@ final class McpServer : ServerCore
 	/// the request id in `_meta` so concurrent streams sharing stdout can be routed.
 	/// Check-function types and heartbeats are advanced by `tickStdioEventStreams`.
 	/// Returns true when the message was an `events/stream` request it handled.
-	bool tryServeStdioEventsStream(Message msg, void delegate(string) @safe writeLine) @safe
+	package(mcp) bool tryServeStdioEventsStream(Message msg, void delegate(string) @safe writeLine) @safe
 	{
 		import mcp.protocol.events : StreamParams;
 
@@ -1673,7 +1676,7 @@ final class McpServer : ServerCore
 	/// and send each stream a cursor-carrying `notifications/events/heartbeat` at
 	/// least every 15s. Driven by the stdio transport's background ticker.
 	/// (Emit-only types receive their events live via `emit()`'s sink.)
-	void tickStdioEventStreams(long nowMs) @safe
+	package(mcp) void tickStdioEventStreams(long nowMs) @safe
 	{
 		import mcp.protocol.events : eventsEventNotification,
 			eventsHeartbeatNotification, heartbeatParams, withSubscriptionId;
@@ -1701,7 +1704,7 @@ final class McpServer : ServerCore
 	}
 
 	/// Whether any stdio `events/stream` push streams are open.
-	bool hasStdioEventStreams() @safe
+	package(mcp) bool hasStdioEventStreams() @safe
 	{
 		return stdioEventStreams_.length > 0;
 	}
@@ -2931,7 +2934,7 @@ final class McpServer : ServerCore
 	/// The three list-changed types appear as booleans (`{ "<type>": true }`) and
 	/// `resourceSubscriptions` as the agreed `string[]` of URIs; an empty object when
 	/// the filter opted into nothing.
-	Json acknowledgedSubsetFor(ListenFilter f) const @safe
+	package(mcp) Json acknowledgedSubsetFor(ListenFilter f) const @safe
 	{
 		Json subset = Json.emptyObject;
 		if (f.toolsListChanged)
@@ -4403,6 +4406,19 @@ unittest  // pingClient throws when there is no server->client push channel
 		assert(e.code == ErrorCode.internalError);
 	}
 	assert(threw);
+}
+
+unittest  // attachPushChannel refuses a second, different channel
+{
+	import std.exception : assertThrown, assertNotThrown;
+	import mcp.transport.sse_context : ServerPushChannel;
+
+	auto srv = makeTestServer();
+	auto first = new ServerPushChannel(new StreamCoordinator);
+	srv.attachPushChannel(first);
+	assertNotThrown(srv.attachPushChannel(first));
+	assertThrown(srv.attachPushChannel(new ServerPushChannel(new StreamCoordinator)));
+	assert(srv.serverPushChannel() is first);
 }
 
 unittest  // pingClient drives a ping on the push channel and awaits the empty reply
@@ -8712,7 +8728,7 @@ unittest  // a direct resource reader can receive the per-request RequestContext
 	s.registerResource(r, (RequestContext ctx) @safe => ResourceContents.makeText("s://ctx",
 			"text/plain", ctx.isStateless ? "stateless" : "session"));
 	auto res = s.handle(modernReq(1, "resources/read", Json([
-				"uri": Json("s://ctx")
+		"uri": Json("s://ctx")
 	]))).get;
 	assert(res["result"]["contents"][0]["text"].get!string == "stateless");
 }
