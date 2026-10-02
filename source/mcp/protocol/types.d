@@ -5365,13 +5365,23 @@ struct ProgressNotification
 
 	Json toJson() const @safe
 	{
+		import mcp.protocol.errors : invalidParams;
+
+		// `progressToken` is REQUIRED by the schema and is a string or number;
+		// an unset or otherwise-typed token cannot correlate the update with
+		// any request, so it is refused rather than emitted.
+		switch (progressToken.type)
+		{
+		case Json.Type.string:
+		case Json.Type.int_:
+		case Json.Type.bigInt:
+		case Json.Type.float_:
+			break;
+		default:
+			throw invalidParams("progress notification requires a string or number progressToken");
+		}
 		Json j = Json.emptyObject;
-		// `progressToken` is REQUIRED by the schema. Guard against a
-		// default-constructed (unset) token so we never silently drop the key
-		// (vibe omits `Json.undefined` values); mirror LogMessageNotification's
-		// data guard. The authoritative emit path (`reportProgress`) always sets
-		// the token, so this only hardens against misuse / parse-side reuse.
-		j["progressToken"] = progressToken.type == Json.Type.undefined ? Json(null) : progressToken;
+		j["progressToken"] = progressToken;
 		j["progress"] = progress;
 		if (!total.isNull)
 			j["total"] = total.get;
@@ -5485,12 +5495,26 @@ unittest  // ProgressNotification.matches an integer ProgressToken
 	assert(!n.matches(ProgressToken("42")));
 }
 
-unittest  // ProgressNotification.toJson always emits the REQUIRED progressToken
+unittest  // ProgressNotification.toJson throws -32602 when the REQUIRED progressToken is unset or not a string/number
 {
-	ProgressNotification n; // default-constructed: progressToken is unset
-	auto j = n.toJson();
-	assert("progressToken" in j); // never silently dropped (was Json.undefined)
-	assert(j["progressToken"].type == Json.Type.null_);
+	import std.exception : collectException;
+
+	foreach (tok; [Json.undefined, Json(null), Json(true), Json.emptyObject])
+	{
+		ProgressNotification n;
+		n.progressToken = tok;
+		auto ex = collectException!McpException(n.toJson());
+		assert(ex !is null && ex.code == ErrorCode.invalidParams);
+	}
+}
+
+unittest  // ProgressNotification.toJson emits a string or integer progressToken
+{
+	ProgressNotification n;
+	n.progressToken = Json("t");
+	assert(n.toJson()["progressToken"].get!string == "t");
+	n.progressToken = Json(7);
+	assert(n.toJson()["progressToken"].get!long == 7);
 }
 
 /// The severity of a `notifications/message`, per server/utilities/logging. The
