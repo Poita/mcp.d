@@ -99,29 +99,30 @@ package(mcp) template isRequiredField(T, string field)
 		enum isRequiredField = true;
 }
 
-/// Whether `v` equals its type's `.init`. Floating-point values are compared
-/// bitwise so a `.init` of NaN matches itself, and fieldwise structs and static
-/// arrays are compared member by member so a NaN inside them does too.
-private bool isInitValue(V)(const V v)
+/// Whether `v` equals `reference`, by default its type's `.init`. Floating-point
+/// values are compared bitwise so a `.init` of NaN matches itself, and fieldwise
+/// structs and static arrays are compared member by member against the matching
+/// member of `reference` so a NaN inside them does too.
+private bool isInitValue(V)(const V v, const V reference = V.init)
 {
 	static if (isFloatingPoint!V)
-		return v is V.init;
+		return v is reference;
 	else static if (isStaticArray!V)
 	{
-		foreach (ref e; v)
-			if (!isInitValue(e))
+		foreach (i, ref e; v)
+			if (!isInitValue(e, reference[i]))
 				return false;
 		return true;
 	}
 	else static if (isFieldwiseStruct!V)
 	{
 		static foreach (i; 0 .. V.tupleof.length)
-			if (!isInitValue(v.tupleof[i]))
+			if (!isInitValue(v.tupleof[i], reference.tupleof[i]))
 				return false;
 		return true;
 	}
 	else
-		return v == V.init;
+		return v == reference;
 }
 
 /// Whether the declared initializer of field `field` of `T` is readable at
@@ -533,4 +534,24 @@ unittest  // bindJson rejects an object missing an undefaulted floating-point fi
 	}
 
 	assertThrown!BindException(bindJson!S(parseJsonString(`{}`)));
+}
+
+unittest  // an undefaulted struct field whose struct type has a defaulted member is required
+{
+	static struct Inner
+	{
+		int a;
+		string b = "x";
+	}
+
+	static struct Outer
+	{
+		Inner inner;
+		Inner[2] pair;
+		Inner changed = Inner(0, "y");
+	}
+
+	static assert(isRequiredField!(Outer, "inner"));
+	static assert(isRequiredField!(Outer, "pair"));
+	static assert(!isRequiredField!(Outer, "changed"));
 }
