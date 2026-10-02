@@ -91,63 +91,113 @@ struct WwwAuthenticate
 }
 
 /// Parse a `WWW-Authenticate` header value such as
-/// `Bearer resource_metadata="https://...", scope="a b"`.
+/// `Bearer resource_metadata="https://...", scope="a b"` and return its
+/// `Bearer` challenge (matched case-insensitively), or the first challenge when
+/// none is `Bearer`. See `parseWwwAuthenticateChallenges`.
 WwwAuthenticate parseWwwAuthenticate(string header) @safe
 {
-	import std.string : strip, indexOf;
+	import std.uni : sicmp;
 
-	WwwAuthenticate w;
-	auto h = header.strip;
-	const sp = h.indexOf(' ');
-	if (sp < 0)
-	{
-		w.scheme = h;
-		return w;
-	}
-	w.scheme = h[0 .. sp];
-	auto rest = h[sp + 1 .. $].strip;
+	auto challenges = parseWwwAuthenticateChallenges(header);
+	foreach (c; challenges)
+		if (sicmp(c.scheme, "Bearer") == 0)
+			return c;
+	return challenges.length ? challenges[0] : WwwAuthenticate.init;
+}
 
-	// Split into key="value" or key=value pairs separated by commas (commas
-	// inside quotes are not expected for these params).
+/// Parse every challenge in a `WWW-Authenticate` header value (RFC 9110
+/// §11.6.1): `challenge = auth-scheme [ 1*SP ( token68 / #auth-param ) ]`,
+/// with challenges and auth-params sharing one comma-separated list. A token
+/// followed by `=` is an auth-param of the current challenge; any other token
+/// starts a new challenge. Quoted-string values are unescaped (RFC 9110
+/// §5.6.4) and parameter names are lowercased, as they are case-insensitive.
+/// A token68 credential is skipped.
+WwwAuthenticate[] parseWwwAuthenticateChallenges(string header) @safe
+{
+	import std.ascii : isWhite;
+	import std.uni : toLower;
+
+	WwwAuthenticate[] challenges;
 	size_t i;
-	while (i < rest.length)
+
+	void skipWhite()
 	{
-		const eq = rest[i .. $].indexOf('=');
-		if (eq < 0)
-			break;
-		auto key = rest[i .. i + eq].strip;
-		i += eq + 1;
-		string value;
-		if (i < rest.length && rest[i] == '"')
-		{
-			i++;
-			const end = rest[i .. $].indexOf('"');
-			if (end < 0)
-				break;
-			value = rest[i .. i + end];
-			i += end + 1;
-		}
-		else
-		{
-			const comma = rest[i .. $].indexOf(',');
-			if (comma < 0)
-			{
-				value = rest[i .. $].strip;
-				i = rest.length;
-			}
-			else
-			{
-				value = rest[i .. i + comma].strip;
-				i += comma;
-			}
-		}
-		if (key.length)
-			w.params[key] = value;
-		// skip a following comma and spaces
-		while (i < rest.length && (rest[i] == ',' || rest[i] == ' '))
+		while (i < header.length && (header[i] == ' ' || header[i] == '\t'))
 			i++;
 	}
-	return w;
+
+	bool isDelimiter(char c)
+	{
+		return c == ',' || c == '=' || c == '"' || isWhite(c);
+	}
+
+	string readToken()
+	{
+		const start = i;
+		while (i < header.length && !isDelimiter(header[i]))
+			i++;
+		return header[start .. i];
+	}
+
+	string readQuoted()
+	{
+		string value;
+		i++; // opening quote
+		while (i < header.length && header[i] != '"')
+		{
+			if (header[i] == '\\' && i + 1 < header.length)
+				i++;
+			value ~= header[i];
+			i++;
+		}
+		if (i < header.length)
+			i++; // closing quote
+		return value;
+	}
+
+	while (i < header.length)
+	{
+		skipWhite();
+		if (i < header.length && header[i] == ',')
+		{
+			i++;
+			continue;
+		}
+		const token = readToken();
+		if (token.length == 0)
+		{
+			// A stray delimiter: step over it so parsing always advances.
+			if (i < header.length)
+				i++;
+			continue;
+		}
+		skipWhite();
+		const isParam = challenges.length && i < header.length
+			&& header[i] == '=' && !(i + 1 < header.length && header[i + 1] == '=');
+		if (!isParam)
+		{
+			WwwAuthenticate c;
+			c.scheme = token;
+			challenges ~= c;
+			// A token68 credential (e.g. `abc==`) directly after the scheme.
+			if (i < header.length && header[i] != ',')
+			{
+				const save = i;
+				readToken();
+				while (i < header.length && header[i] == '=')
+					i++;
+				skipWhite();
+				if (i < header.length && header[i] != ',')
+					i = save; // not a token68: it was the first auth-param
+			}
+			continue;
+		}
+		i++; // '='
+		skipWhite();
+		const value = i < header.length && header[i] == '"' ? readQuoted() : readToken();
+		challenges[$ - 1].params[token.toLower] = value;
+	}
+	return challenges;
 }
 
 // ===========================================================================
@@ -490,6 +540,43 @@ unittest  // WWW-Authenticate exposes typed error()/errorDescription() accessors
 			`Bearer error="insufficient_scope", error_description="needs more scope"`);
 	assert(w.error == "insufficient_scope");
 	assert(w.errorDescription == "needs more scope");
+}
+
+unittest  // WWW-Authenticate unescapes backslash escapes inside a quoted-string (RFC 9110 §5.6.4)
+{
+	auto w = parseWwwAuthenticate(
+			`Bearer error_description="say \"hi\", then \\ leave", scope="read"`);
+	assert(w.errorDescription == `say "hi", then \ leave`);
+	assert(w.scope_ == "read");
+}
+
+unittest  // WWW-Authenticate selects the Bearer challenge when several are present
+{
+	auto w = parseWwwAuthenticate(`Basic realm="api", scope="basic-scope", `
+			~ `Bearer resource_metadata="https://mcp.example.com/prm", scope="read"`);
+	assert(w.scheme == "Bearer");
+	assert(w.resourceMetadata == "https://mcp.example.com/prm");
+	assert(w.scope_ == "read");
+	assert("realm" !in w.params);
+}
+
+unittest  // WWW-Authenticate keeps a later challenge's params out of the Bearer challenge
+{
+	auto w = parseWwwAuthenticate(`Bearer scope="read", DPoP algs="ES256", error="use_dpop_nonce"`);
+	assert(w.scheme == "Bearer");
+	assert(w.scope_ == "read");
+	assert(w.error is null);
+	assert("algs" !in w.params);
+}
+
+unittest  // WWW-Authenticate skips a token68 challenge and parses a bare scheme
+{
+	auto all = parseWwwAuthenticateChallenges(`Negotiate abc+/9==, Bearer, Basic realm=api`);
+	assert(all.length == 3);
+	assert(all[0].scheme == "Negotiate" && all[0].params.length == 0);
+	assert(all[1].scheme == "Bearer" && all[1].params.length == 0);
+	assert(all[2].scheme == "Basic" && all[2].params["realm"] == "api");
+	assert(parseWwwAuthenticate(`Negotiate abc+/9==, Bearer scope="x"`).scope_ == "x");
 }
 
 unittest  // WWW-Authenticate error()/errorDescription() are null when absent
