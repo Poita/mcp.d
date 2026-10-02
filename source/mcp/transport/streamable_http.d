@@ -1469,29 +1469,7 @@ unittest  // resourceOrigin strips the path from a configured resource identifie
 /// types and omits any matching one returns false.
 bool acceptsEventStream(string accept) @safe
 {
-	import std.string : strip, toLower;
-	import std.algorithm : splitter;
-
-	auto trimmed = accept.strip;
-	if (trimmed.length == 0)
-		return true;
-
-	foreach (part; trimmed.splitter(','))
-	{
-		auto mediaType = part;
-		foreach (i, c; part)
-		{
-			if (c == ';')
-			{
-				mediaType = part[0 .. i];
-				break;
-			}
-		}
-		const token = mediaType.strip.toLower;
-		if (token == "text/event-stream" || token == "text/*" || token == "*/*")
-			return true;
-	}
-	return false;
+	return acceptsMediaType(accept, "text", "event-stream");
 }
 
 unittest  // an Accept that names text/event-stream (or a wildcard covering it) is admitted
@@ -1530,26 +1508,27 @@ unittest  // matching is case-insensitive and tolerant of surrounding whitespace
 /// other `;`-parameters are ignored. An empty value (no `Accept`) is permissive.
 bool acceptsJson(string accept) @safe
 {
+	return acceptsMediaType(accept, "application", "json");
+}
+
+/// Whether the `Accept` value `accept` admits the media type `type/subtype`: an
+/// exact token, the `type/*` subtype wildcard, or the `*/*` full wildcard, with
+/// `;`-parameters ignored and case-insensitive matching. An empty value (no
+/// `Accept`) is permissive.
+private bool acceptsMediaType(string accept, string type, string subtype) @safe
+{
+	import std.algorithm : findSplitBefore, splitter;
 	import std.string : strip, toLower;
-	import std.algorithm : splitter;
 
 	auto trimmed = accept.strip;
 	if (trimmed.length == 0)
 		return true;
-
+	const exact = type ~ "/" ~ subtype;
+	const anySubtype = type ~ "/*";
 	foreach (part; trimmed.splitter(','))
 	{
-		auto mediaType = part;
-		foreach (i, c; part)
-		{
-			if (c == ';')
-			{
-				mediaType = part[0 .. i];
-				break;
-			}
-		}
-		const token = mediaType.strip.toLower;
-		if (token == "application/json" || token == "application/*" || token == "*/*")
+		const token = part.findSplitBefore(";")[0].strip.toLower;
+		if (token == exact || token == anySubtype || token == "*/*")
 			return true;
 	}
 	return false;
