@@ -185,7 +185,13 @@ package TokenInfo verifyToken(JwtVerifierConfig cfg, string token, KeySource key
 		return TokenInfo.invalid();
 
 	const signingInput = parts[0] ~ "." ~ parts[1];
-	const sig = base64UrlDecode(parts[2]);
+	// A malformed signature segment is an ordinary bad token, not a verifier
+	// fault, so it is rejected here rather than raised and logged.
+	ubyte[] sig;
+	try
+		sig = base64UrlDecode(parts[2]);
+	catch (Exception)
+		return TokenInfo.invalid();
 
 	bool sigOk = false;
 	foreach (pem; candidates)
@@ -1123,6 +1129,22 @@ unittest  // a bad-signature ES256 token (verified against the wrong EC key) fai
 	auto tampered = jwt[0 .. $ - 2] ~ (jwt[$ - 2] == 'A' ? "BB" : "AA");
 
 	auto ti = verifyToken(cfg, tampered, new NoKeys, 1_700_001_000);
+	assert(!ti.valid);
+}
+
+unittest  // a malformed signature segment is invalid without raising (no per-request warning)
+{
+	import std.exception : assertNotThrown;
+	import std.string : lastIndexOf;
+
+	JwtVerifierConfig cfg;
+	cfg.staticPublicKeysPem = [testEcPubPem];
+	auto jwt = makeEs256(`{"sub":"ec-user","exp":1700003600}`);
+	const dot = jwt.lastIndexOf('.');
+	const garbled = jwt[0 .. dot + 1] ~ "not*base64!";
+
+	TokenInfo ti;
+	assertNotThrown(ti = verifyToken(cfg, garbled, new NoKeys, 1_700_001_000));
 	assert(!ti.valid);
 }
 
