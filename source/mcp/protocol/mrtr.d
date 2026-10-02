@@ -519,9 +519,12 @@ ParamHeader[] paramHeaders(Json inputSchema) @safe
 /// syntax, no CR/LF, primitive-only (`number` forbidden), and case-insensitive
 /// uniqueness across the whole schema. The annotation MUST also sit on a property
 /// that is _statically reachable_ from the root via a chain of `properties` keys
-/// only: an annotation reachable solely through `items` (or any other array
-/// keyword), composition (`oneOf`/`anyOf`/`allOf`/`not`), conditional
-/// (`if`/`then`/`else`), or `$ref`/`$defs` makes the tool definition invalid.
+/// only: an annotation under any other keyword — `items` and the other array
+/// keywords, composition (`oneOf`/`anyOf`/`allOf`/`not`), conditional
+/// (`if`/`then`/`else`), `$ref`/`$defs`, `additionalProperties`,
+/// `patternProperties`, `dependentSchemas`, `unevaluatedProperties`,
+/// `propertyNames`, or an unknown keyword — makes the tool definition invalid.
+/// Data-valued keywords (`const`/`enum`/`default`/`examples`) are not searched.
 /// Returns a human-readable reason on the first violation, or `null` when every
 /// annotation is valid.
 string validateInputSchemaHeaders(Json inputSchema) @safe
@@ -562,16 +565,18 @@ string validateInputSchemaHeaders(Json inputSchema) @safe
 		return found;
 	}
 
-	// Keywords whose subtrees are NOT a `properties` chain: an annotation reached
-	// only through one of these is not statically reachable (array keywords,
-	// composition, conditional, and reference/definition containers).
-	static immutable string[] nonReachableKeys = [
-		"items", "prefixItems", "additionalItems", "contains", "oneOf", "anyOf",
-		"allOf", "not", "if", "then", "else", "$defs", "definitions"
+	// Keywords whose values are JSON data rather than subschemas: an
+	// `x-mcp-header` key inside them is not an annotation.
+	static immutable string[] valueKeys = [
+		"const", "enum", "default", "examples"
 	];
 
-	void walk(Json node) @safe
+	// `isProperty` is true when `node` is a `properties` member, whose own
+	// `x-mcp-header` the caller has already validated.
+	void walk(Json node, bool isProperty) @safe
 	{
+		import std.algorithm.searching : canFind;
+
 		if (err !is null || node.type != Json.Type.object)
 			return;
 		if ("properties" in node && node["properties"].type == Json.Type.object)
@@ -615,27 +620,33 @@ string validateInputSchemaHeaders(Json inputSchema) @safe
 						}
 						seen[lc] = true;
 					}
-					walk(prop);
+					walk(prop, true);
 				}
 			}();
 		}
-		// An annotation reachable only through a non-`properties` keyword violates the
-		// statically-reachable rule and invalidates the whole tool definition.
-		foreach (key; nonReachableKeys)
-		{
-			if (err !is null)
-				break;
-			if (key in node && containsAnnotation(node[key]))
+		// Only a chain of `properties` keys reaches an annotated property
+		// statically; an annotation under any other keyword (array, composition,
+		// conditional, reference, map-shaped keywords such as
+		// `additionalProperties`/`patternProperties`, or an unknown extension)
+		// invalidates the whole tool definition.
+		() @trusted {
+			foreach (string key, Json v; node)
 			{
-				err = "x-mcp-header MUST only be applied to statically reachable properties"
-					~ " (a chain of `properties` keys); an annotation under `" ~ key
-					~ "` is invalid";
-				return;
+				if (key == "properties" || valueKeys.canFind(key) || (isProperty
+						&& key == "x-mcp-header"))
+					continue;
+				if (key == "x-mcp-header" || containsAnnotation(v))
+				{
+					err = "x-mcp-header MUST only be applied to statically reachable properties"
+						~ " (a chain of `properties` keys); an annotation under `"
+						~ key ~ "` is invalid";
+					return;
+				}
 			}
-		}
+		}();
 	}
 
-	walk(inputSchema);
+	walk(inputSchema, false);
 	return err;
 }
 
@@ -1538,6 +1549,37 @@ unittest  // validateInputSchemaHeaders: a valid primitive annotation passes
 		"x-mcp-header": Json("Limit")
 	]);
 	schema["properties"] = props;
+	assert(validateInputSchemaHeaders(schema) is null);
+}
+
+unittest  // validateInputSchemaHeaders rejects an annotation under any non-`properties` keyword
+{
+	import vibe.data.json : parseJsonString;
+
+	enum ann = `{"type":"string","x-mcp-header":"H"}`;
+	foreach (frag; [
+		`"additionalProperties":` ~ ann, `"patternProperties":{"^a":` ~ ann ~ `}`,
+		`"dependentSchemas":{"a":{"properties":{"b":` ~ ann ~ `}}}`,
+		`"unevaluatedProperties":` ~ ann, `"propertyNames":` ~ ann,
+		`"x-vendor":{"properties":{"b":` ~ ann ~ `}}`, `"x-mcp-header":"Root"`
+	])
+	{
+		auto schema = parseJsonString(`{"type":"object",` ~ frag ~ `}`);
+		assert(validateInputSchemaHeaders(schema) !is null, frag);
+	}
+	// The same holds below a nested object property.
+	auto nested = parseJsonString(`{"type":"object","properties":{"o":{"type":"object",`
+			~ `"additionalProperties":` ~ ann ~ `}}}`);
+	assert(validateInputSchemaHeaders(nested) !is null);
+}
+
+unittest  // validateInputSchemaHeaders ignores annotation-shaped data under value keywords
+{
+	import vibe.data.json : parseJsonString;
+
+	auto schema = parseJsonString(`{"type":"object","properties":{"o":{"type":"object",`
+			~ `"default":{"x-mcp-header":"x"},"examples":[{"x-mcp-header":"y"}]},`
+			~ `"r":{"type":"string","x-mcp-header":"Region"}}}`);
 	assert(validateInputSchemaHeaders(schema) is null);
 }
 
