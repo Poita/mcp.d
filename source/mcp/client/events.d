@@ -69,6 +69,9 @@ final class WebhookReceiver
 	private SeenEntry[] seenOrder_;
 	private size_t seenHead_;
 	private long newestSeenTs_;
+	// Dedup keys whose delivery is being routed right now. A callback can yield,
+	// so a server retry may arrive before the first copy is recorded in `seen_`.
+	private bool[string] inProgress_;
 
 	private static struct SeenEntry
 	{
@@ -105,7 +108,10 @@ final class WebhookReceiver
 	/// Verify and route one delivery. Returns the HTTP status (and body) the
 	/// endpoint should reply with: `200` once the event is durably accepted (or a
 	/// verification challenge is echoed), `400` on a signature/parse failure, and
-	/// `503` for an unknown subscription id (a retryable subscribe/delivery race).
+	/// `503` for an unknown subscription id (a retryable subscribe/delivery race)
+	/// or for a retry of a delivery whose callback is still running (the server
+	/// retries again, and that retry is acknowledged or routed depending on how
+	/// the first copy finished).
 	ReceiverResponse processDelivery(string body, string[string] headers) @safe
 	{
 		const subId = headerGet(headers, "x-mcp-subscription-id");
@@ -136,6 +142,11 @@ final class WebhookReceiver
 			const key = subId ~ "\0" ~ wid;
 			if ((key in seen_) !is null)
 				return ReceiverResponse(200, ""); // already processed
+			if ((key in inProgress_) !is null)
+				return ReceiverResponse(503, "");
+			inProgress_[key] = true;
+			scope (exit)
+				inProgress_.remove(key);
 			// Recorded only once the delivery is handled: a callback that throws
 			// (the adapter answers 5xx) leaves the server's retry to be processed.
 			auto resp = route(body, *reg);
@@ -344,6 +355,101 @@ unittest  // a retried delivery (same webhook-id) is deduplicated, callback fire
 	assert(rx.processDelivery(body, headers).status == 200);
 	assert(rx.processDelivery(body, headers).status == 200); // retry
 	assert(count == 1); // routed only once
+}
+
+unittest  // a retry arriving while the first copy's callback is still running is not routed again
+{
+	import core.time : msecs;
+	import vibe.core.core : runTask, runEventLoop, exitEventLoop, sleep;
+
+	auto rx = new WebhookReceiver();
+	rx.verifyTimestamp = false;
+	int calls;
+	rx.register("sub_1", testSecret, (EventOccurrence occ) @safe {
+		++calls;
+		sleep(50.msecs); // the callback yields, e.g. awaiting a database write
+	});
+	const 
+	body = EventOccurrence("evt_1", "n", "t").toJson().toString();
+	DeliverySigning signing = {
+		secret: testSecret, messageId: "evt_1", timestamp: 1700, subscriptionId: "sub_1"
+	};
+	auto headers = signDeliveryHeaders(signing, body);
+	int first, retry, later;
+	runTask(() nothrow{
+		scope (exit)
+			exitEventLoop();
+		try
+		{
+			auto t = runTask(() nothrow{
+				try
+					first = rx.processDelivery(body, headers).status;
+				catch (Exception)
+				{
+				}
+			});
+			sleep(5.msecs);
+			retry = rx.processDelivery(body, headers).status;
+			t.join();
+			later = rx.processDelivery(body, headers).status;
+		}
+		catch (Exception)
+		{
+		}
+	});
+	runEventLoop();
+	assert(calls == 1, "a concurrent retry must not run the callback a second time");
+	assert(first == 200);
+	assert(retry != 200, "a retry during processing is answered retryable, not acknowledged");
+	assert(later == 200);
+}
+
+unittest  // a delivery whose callback fails while a retry waits leaves the next retry to be processed
+{
+	import core.time : msecs;
+	import vibe.core.core : runTask, runEventLoop, exitEventLoop, sleep;
+
+	auto rx = new WebhookReceiver();
+	rx.verifyTimestamp = false;
+	int calls;
+	rx.register("sub_1", testSecret, (EventOccurrence occ) @safe {
+		if (++calls == 1)
+		{
+			sleep(50.msecs);
+			throw new Exception("database down");
+		}
+	});
+	const 
+	body = EventOccurrence("evt_1", "n", "t").toJson().toString();
+	DeliverySigning signing = {
+		secret: testSecret, messageId: "evt_1", timestamp: 1700, subscriptionId: "sub_1"
+	};
+	auto headers = signDeliveryHeaders(signing, body);
+	int retry, later;
+	runTask(() nothrow{
+		scope (exit)
+			exitEventLoop();
+		try
+		{
+			auto t = runTask(() nothrow{
+				try
+					rx.processDelivery(body, headers);
+				catch (Exception)
+				{
+				}
+			});
+			sleep(5.msecs);
+			retry = rx.processDelivery(body, headers).status;
+			t.join();
+			later = rx.processDelivery(body, headers).status;
+		}
+		catch (Exception)
+		{
+		}
+	});
+	runEventLoop();
+	assert(retry != 200);
+	assert(later == 200 && calls == 2, "the failed delivery's retry must be routed");
 }
 
 unittest  // the same eventId fanned to two subscriptions reaches each subscription's callback
