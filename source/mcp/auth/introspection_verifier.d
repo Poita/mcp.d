@@ -127,9 +127,19 @@ interface Introspector
 	string introspect(string token) @safe;
 }
 
+/// Whether an introspection `token_type` names a refresh token (`refresh_token`,
+/// or the `Refresh` some servers report).
+private bool isRefreshTokenType(string tokenType) @safe
+{
+	import std.uni : sicmp;
+
+	return sicmp(tokenType, "refresh_token") == 0 || sicmp(tokenType, "refresh") == 0;
+}
+
 /// Map a raw RFC 7662 introspection response document to a `TokenInfo`, applying
 /// the `cfg` audience and required-scope checks. `active:false`, a non-object
-/// response, or a missing/false `active` member yields an invalid result.
+/// response, a missing/false `active` member, or a `token_type` naming a
+/// refresh token yields an invalid result.
 TokenInfo introspectionResult(IntrospectionConfig cfg, string responseJson) @safe
 {
 	Json doc;
@@ -148,6 +158,11 @@ TokenInfo introspectionResult(IntrospectionConfig cfg, string responseJson) @saf
 
 	auto active = doc["active"];
 	if (active.type != Json.Type.bool_ || !active.get!bool)
+		return TokenInfo.invalid();
+
+	// The hint is advisory: an AS may still describe a refresh token presented
+	// as a bearer, which must never authorize a request.
+	if (isRefreshTokenType(jsonStr(doc, "token_type")))
 		return TokenInfo.invalid();
 
 	auto auds = audiences(doc);
@@ -189,13 +204,15 @@ final class HttpIntrospector : Introspector
 	}
 }
 
-/// Build the form body for an introspection request (RFC 7662 2.1). For
-/// `client_secret_post`, the client credentials are appended to the body.
+/// Build the form body for an introspection request (RFC 7662 2.1). A bearer
+/// is always an access token, so the request carries
+/// `token_type_hint=access_token`. For `client_secret_post`, the client
+/// credentials are appended to the body.
 string introspectionBody(IntrospectionConfig cfg, string token) @safe
 {
 	import std.uri : encodeComponent;
 
-	string body_ = "token=" ~ encodeComponent(token);
+	string body_ = "token=" ~ encodeComponent(token) ~ "&token_type_hint=access_token";
 	if (cfg.authMethod == TokenEndpointAuthMethod.clientSecretPost)
 	{
 		body_ ~= "&client_id=" ~ encodeComponent(cfg.clientId);
@@ -502,13 +519,27 @@ unittest  // internal runs of spaces do not produce empty-string scopes
 	assert(ti.scopes == ["a", "b"]);
 }
 
-unittest  // introspectionBody for client_secret_basic carries only the token
+unittest  // introspectionBody for client_secret_basic carries only the token and its type hint
 {
 	IntrospectionConfig cfg;
 	cfg.authMethod = TokenEndpointAuthMethod.clientSecretBasic;
 	cfg.clientId = "rs";
 	cfg.clientSecret = "shh";
-	assert(introspectionBody(cfg, "abc 123") == "token=abc%20123");
+	assert(introspectionBody(cfg, "abc 123") == "token=abc%20123&token_type_hint=access_token");
+}
+
+unittest  // a response describing a refresh token is rejected
+{
+	IntrospectionConfig cfg;
+	assert(!introspectionResult(cfg, `{"active":true,"token_type":"refresh_token"}`).valid);
+	assert(!introspectionResult(cfg, `{"active":true,"token_type":"Refresh"}`).valid);
+}
+
+unittest  // a response describing a bearer access token is accepted
+{
+	IntrospectionConfig cfg;
+	assert(introspectionResult(cfg, `{"active":true,"token_type":"Bearer"}`).valid);
+	assert(introspectionResult(cfg, `{"active":true,"token_type":"access_token"}`).valid);
 }
 
 unittest  // introspectionBody for client_secret_post appends client credentials
@@ -518,7 +549,7 @@ unittest  // introspectionBody for client_secret_post appends client credentials
 	cfg.clientId = "rs";
 	cfg.clientSecret = "s e c";
 	const b = introspectionBody(cfg, "tok");
-	assert(b == "token=tok&client_id=rs&client_secret=s%20e%20c");
+	assert(b == "token=tok&token_type_hint=access_token&client_id=rs&client_secret=s%20e%20c");
 }
 
 unittest  // a stub-backed verifier validates an active token end to end
