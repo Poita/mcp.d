@@ -836,6 +836,9 @@ in (exchange !is null)
 	const upstreamTokenEndpoint = cfg.upstreamTokenEndpoint;
 
 	router.post(tokenPath, (HTTPServerRequest req, HTTPServerResponse res) @safe {
+		// Token responses carry credentials and MUST NOT be cached (RFC 6749 §5.1).
+		res.headers["Cache-Control"] = "no-store";
+		res.headers["Pragma"] = "no-cache";
 		const form = readFormString(req);
 		if (!formDecodes(form))
 		{
@@ -3045,6 +3048,39 @@ unittest  // PASSTHROUGH REGRESSION: with no issueToken/tokenStore the upstream 
 	assert(res.statusCode == 200);
 	// Passthrough relays the upstream token to the client verbatim.
 	assert(body_.canFind("gho_upstream_secret"));
+}
+
+unittest  // every /token response forbids caching (RFC 6749 §5.1)
+{
+	import vibe.http.common : HTTPMethod;
+	import vibe.http.server : createTestHTTPServerRequest,
+		createTestHTTPServerResponse, TestHTTPResponseMode;
+	import vibe.inet.url : URL;
+	import vibe.stream.memory : createMemoryOutputStream, createMemoryStream;
+
+	auto passthrough = mountSampleProxy();
+	auto brokered = brokerMountProxy(new ReferenceTokenStore());
+	foreach (proxy; [passthrough, brokered])
+	{
+		auto router = new URLRouter;
+		mountOAuthToken(router, proxy,
+				fixedUpstream(`{"access_token":"at","token_type":"bearer"}`));
+		foreach (form; [
+				redeemableCodeForm(proxy),
+				"grant_type=authorization_code&code=bad"
+			])
+		{
+			auto formBody = () @trusted { return cast(ubyte[]) form.dup; }();
+			auto req = createTestHTTPServerRequest(URL("https://mcp.example.com/token"),
+					HTTPMethod.POST, createMemoryStream(formBody, false));
+			req.headers["Content-Type"] = "application/x-www-form-urlencoded";
+			auto res = createTestHTTPServerResponse(createMemoryOutputStream(),
+					null, TestHTTPResponseMode.bodyOnly);
+			router.handleRequest(req, res);
+			assert(res.headers.get("Cache-Control", "") == "no-store");
+			assert(res.headers.get("Pragma", "") == "no-cache");
+		}
+	}
 }
 
 unittest  // PASSTHROUGH: a refresh token the proxy never relayed is refused without reaching the upstream
