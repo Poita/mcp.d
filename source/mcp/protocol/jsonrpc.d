@@ -71,10 +71,13 @@ private void validateEnvelope(Json j) @safe
 	if (("method" in j) && j["method"].type != Json.Type.string)
 		throw invalidRequest("`method` must be a string");
 	// JSON-RPC 2.0 §4.2: `params`, when present, MUST be a structured value
-	// (object or array). Rejecting primitives here keeps every handler from
-	// having to guard against reading fields off a number or string.
-	if (("params" in j) && j["params"].type != Json.Type.object
-			&& j["params"].type != Json.Type.array)
+	// (object or array); a primitive is an invalid request. MCP further defines
+	// every request's and notification's params as an object, so by-position
+	// (array) params are invalid params. Rejecting both here keeps every handler
+	// from having to guard against reading fields off a non-object.
+	if (("params" in j) && j["params"].type == Json.Type.array)
+		throw invalidParams("`params` must be an object");
+	if (("params" in j) && j["params"].type != Json.Type.object)
 		throw invalidRequest("`params` must be an object or array");
 	// A message bearing a `method` with an explicit `id:null` is neither a valid
 	// request (the spec requires a request id that is not null) nor a
@@ -568,11 +571,33 @@ unittest  // a notification with primitive params is rejected
 			`{"jsonrpc":"2.0","method":"notifications/initialized","params":7}`));
 }
 
-unittest  // object, array and absent params are accepted
+unittest  // object and absent params are accepted
 {
 	cast(void) parseMessage(`{"jsonrpc":"2.0","id":1,"method":"ping","params":{}}`);
-	cast(void) parseMessage(`{"jsonrpc":"2.0","id":1,"method":"ping","params":[]}`);
 	cast(void) parseMessage(`{"jsonrpc":"2.0","id":1,"method":"ping"}`);
+}
+
+unittest  // by-position (array) params are rejected with -32602 on requests and notifications
+{
+	import std.exception : collectException;
+
+	foreach (msg; [
+		`{"jsonrpc":"2.0","id":1,"method":"ping","params":[]}`,
+		`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":["x",{}]}`,
+		`{"jsonrpc":"2.0","method":"notifications/cancelled","params":[1]}`
+	])
+	{
+		auto ex = collectException!McpException(parseMessage(msg));
+		assert(ex !is null && ex.code == ErrorCode.invalidParams, msg);
+	}
+}
+
+unittest  // a batch member with array params is reported as a -32602 member error
+{
+	auto r = parseBatchTolerant(`[{"jsonrpc":"2.0","id":1,"method":"ping","params":[]},`
+			~ `{"jsonrpc":"2.0","id":2,"method":"ping"}]`);
+	assert(r.messages.length == 1 && r.errors.length == 1);
+	assert(r.errors[0].index == 0 && r.errors[0].error.code == ErrorCode.invalidParams);
 }
 
 unittest  // an error response whose error is not an object is rejected with -32600
