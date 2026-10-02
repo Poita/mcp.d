@@ -3659,6 +3659,11 @@ final class McpServer : ServerCore
 		{
 			// CallToolResult or InputRequiredResult.
 			auto response = entry.handler(args, ctx);
+			// A task handle is only meaningful to a client that declared the
+			// Tasks extension, whichever way the handler built it.
+			if (response.isTask && !acceptsTasks(declared, ver))
+				throw missingRequiredClientCapability(tasksRequiredCapabilities(),
+						"This tool requires the " ~ tasksExtensionKey ~ " extension");
 			// MRTR: an InputRequiredResult MUST NOT ask the client for an
 			// input kind it never declared. Drop any unsupported inputRequests
 			// against the same `declared` set used for capability gating above. If
@@ -8170,6 +8175,28 @@ unittest  // a task tool that requires the extension rejects a client without it
 	// The same call from a client that declared the extension creates a task.
 	auto ok = s.handle(modernReq(2, "tools/call",
 			Json(["name": Json("must-task"), "arguments": Json.emptyObject]))).get;
+	assert(ok["result"]["resultType"].get!string == "task");
+}
+
+unittest  // a handler-built task result is rejected with -32021 for a client without the extension
+{
+	auto s = new McpServer("t", "1");
+	Tool desc;
+	desc.name = "handmade-task";
+	desc.inputSchema = Json(["type": Json("object")]);
+	s.registerTool(desc, (Json args, RequestContext ctx) @safe => ToolResponse.task(
+			Json([
+			"resultType": Json("task"),
+			"task": Json(["taskId": Json("t1"), "status": Json("working")])
+	])));
+
+	auto resp = s.handle(modernReqNoTasks(1, "tools/call",
+			Json(["name": Json("handmade-task"), "arguments": Json.emptyObject]))).get;
+	assert(resp["error"]["code"].get!int == cast(int) ErrorCode.missingRequiredClientCapability);
+	assert(tasksExtensionKey in resp["error"]["data"]["requiredCapabilities"]["extensions"]);
+
+	auto ok = s.handle(modernReq(2, "tools/call",
+			Json(["name": Json("handmade-task"), "arguments": Json.emptyObject]))).get;
 	assert(ok["result"]["resultType"].get!string == "task");
 }
 
