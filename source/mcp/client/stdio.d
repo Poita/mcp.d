@@ -52,6 +52,8 @@ final class StdioClientTransport : ClientTransport
 	// (rendered as JSON): the action run when a notification stamped with that
 	// subscriptionId arrives.
 	private void delegate() @safe nothrow[string] pendingListens_;
+	// How long `openListen` waits for a listen stream's leading frame.
+	package Duration listenTimeout_ = 10.seconds;
 	// Counts how many times the child-shutdown sequence ran; exists so the
 	// idempotency of `close()` is directly observable. The sequence must run at
 	// most once per transport.
@@ -156,7 +158,8 @@ final class StdioClientTransport : ClientTransport
 	/// request id, per the modern stdio cancellation rule. The server answers the
 	/// listen request only when the stream ends: an error reply before the leading
 	/// frame is thrown from here, and a later reply ends the handle (`ended`,
-	/// `error`).
+	/// `error`). When no leading frame arrives within ten seconds the stream is
+	/// cancelled and this throws `RequestTimeoutException`.
 	SubscriptionStream openListen(Json message) @safe
 	{
 		import vibe.core.core : runTask;
@@ -186,9 +189,9 @@ final class StdioClientTransport : ClientTransport
 		// Await the listen request's reply on a background task: the server
 		// answers it only when the stream ends, with an error when it refuses or
 		// fails the stream. Return once the stream's leading frame (stamped with
-		// the listen id) arrives, or it ends first — then throw its error. The wait
-		// is bounded so a server that never sends a leading frame degrades to
-		// returning rather than hanging.
+		// the listen id) arrives, or it ends first — then throw its error. A server
+		// that sends no leading frame within `listenTimeout_` has the stream
+		// cancelled and the open fails with a timeout.
 		auto gate = new ListenGate;
 		pendingListens_[key] = () @safe nothrow{ gate.signal(true); };
 		scope (exit)
@@ -209,8 +212,20 @@ final class StdioClientTransport : ClientTransport
 		}
 		else
 			send(message);
-		if (!gate.wait(10.seconds) && stream.error !is null)
-			throw stream.error;
+		if (!gate.wait(listenTimeout_))
+		{
+			if (stream.error !is null)
+				throw stream.error;
+			if (!stream.ended)
+			{
+				import mcp.client.client : RequestTimeoutException;
+
+				stream.cancel();
+				throw new RequestTimeoutException(
+						"subscriptions/listen received no leading frame within "
+						~ listenTimeout_.toString());
+			}
+		}
 		return stream;
 	}
 
@@ -1031,6 +1046,34 @@ version (unittest) private string inLoopCapturing(scope void delegate() @safe bo
 	});
 	runEventLoop();
 	return failure;
+}
+
+unittest  // stdio openListen with no leading frame times out, cancels the stream and throws
+{
+	import core.time : msecs;
+	import mcp.client.client : RequestTimeoutException;
+
+	auto toClient = new TestLines;
+	string[] toServer;
+	bool timedOut;
+	const failure = inLoopCapturing(() @safe {
+		auto t = new StdioClientTransport(() @safe => toClient.take(), (string s) @safe {
+			toServer ~= s;
+		});
+		t.listenTimeout_ = 50.msecs;
+		auto listen = makeRequest(Json(7), "subscriptions/listen", Json.emptyObject);
+		try
+			t.openListen(listen);
+		catch (RequestTimeoutException)
+			timedOut = true;
+		toClient.closeEnd();
+	});
+	assert(failure.length == 0, failure);
+	assert(timedOut, "a listen with no leading frame must fail with RequestTimeoutException");
+	assert(toServer.length == 2, "the timed-out listen must be cancelled on the server");
+	auto c = parseJsonString(toServer[1]);
+	assert(c["method"].get!string == "notifications/cancelled");
+	assert(c["params"]["requestId"].get!long == 7);
 }
 
 unittest  // a stdio request with no reply fails after ClientSettings.requestTimeout and sends notifications/cancelled
