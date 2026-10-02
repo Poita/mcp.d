@@ -216,13 +216,25 @@ void mountMcp(URLRouter router, McpServer server,
 
 	// basic/authorization (RFC 9728 §3): publish the Protected Resource Metadata
 	// document so clients can discover the authorization server(s). Served
-	// unauthenticated (it is the discovery hook the 401 points clients to).
+	// unauthenticated (it is the discovery hook the 401 points clients to). The
+	// document is public, so any origin may read it: a browser-based client must
+	// fetch it before it holds a token.
 	if (opts.auth.enabled)
 	{
 		router.get(ProtectedResourceMetadataPath, (HTTPServerRequest req,
 				HTTPServerResponse res) @safe {
+			res.headers["Access-Control-Allow-Origin"] = "*";
 			res.statusCode = HTTPStatus.ok;
 			res.writeJsonBody(opts.auth.metadata().toJson());
+		});
+		router.match(HTTPMethod.OPTIONS, ProtectedResourceMetadataPath,
+				(HTTPServerRequest req, HTTPServerResponse res) @safe {
+			res.headers["Access-Control-Allow-Origin"] = "*";
+			res.headers["Access-Control-Allow-Methods"] = "GET";
+			res.headers["Access-Control-Allow-Headers"] = "MCP-Protocol-Version";
+			res.headers["Access-Control-Max-Age"] = "600";
+			res.statusCode = HTTPStatus.noContent;
+			res.writeVoidBody();
 		});
 	}
 
@@ -5003,7 +5015,7 @@ unittest  // closing a legacy GET stream fails the server->client request awaiti
 }
 
 version (unittest) private HTTPServerResponse corsRequest(URLRouter router,
-		HTTPMethod method, string[string] headers, string body_ = "") @safe
+		HTTPMethod method, string[string] headers, string body_ = "", string path = "/mcp") @safe
 {
 	import vibe.http.server : createTestHTTPServerRequest,
 		createTestHTTPServerResponse, TestHTTPResponseMode;
@@ -5011,8 +5023,8 @@ version (unittest) private HTTPServerResponse corsRequest(URLRouter router,
 	import vibe.stream.memory : createMemoryStream, createMemoryOutputStream;
 
 	auto buf = () @trusted { return cast(ubyte[]) body_.dup; }();
-	auto req = createTestHTTPServerRequest(URL("http://127.0.0.1/mcp"), method,
-			createMemoryStream(buf, false));
+	auto req = createTestHTTPServerRequest(URL("http://127.0.0.1" ~ path),
+			method, createMemoryStream(buf, false));
 	req.headers["Host"] = "127.0.0.1";
 	foreach (k, v; headers)
 		req.headers[k] = v;
@@ -5096,6 +5108,30 @@ unittest  // CORS: disallowed and absent origins get no CORS headers and no pref
 	assert(none.statusCode == 200);
 	assert("Access-Control-Allow-Origin" !in none.headers);
 	assert("Access-Control-Expose-Headers" !in none.headers);
+}
+
+unittest  // CORS: any origin may read the Protected Resource Metadata document
+{
+	auto server = McpServer.stateful("t", "1");
+	auto router = new URLRouter;
+	StreamableHttpOptions opts;
+	opts.auth.validator = (string t) @safe => TokenInfo.invalid();
+	opts.auth.resource = "https://mcp.example.com/mcp";
+	opts.auth.authorizationServers = ["https://auth.example.com"];
+	mountMcp(router, server, opts);
+
+	auto get = corsRequest(router, HTTPMethod.GET,
+			["Origin": "https://app.example.com"], "", ProtectedResourceMetadataPath);
+	assert(get.statusCode == 200);
+	assert(get.headers.get("Access-Control-Allow-Origin", "") == "*");
+
+	auto preflight = corsRequest(router, HTTPMethod.OPTIONS, [
+		"Origin": "https://app.example.com",
+		"Access-Control-Request-Method": "GET"
+	], "", ProtectedResourceMetadataPath);
+	assert(preflight.statusCode == 204);
+	assert(preflight.headers.get("Access-Control-Allow-Origin", "") == "*");
+	assert(preflight.headers.get("Access-Control-Allow-Methods", "") == "GET");
 }
 
 unittest  // stateless: notifications/cancelled reaches the same principal's in-flight request only
