@@ -2168,7 +2168,7 @@ final class HttpClientTransport : ClientTransport
 			.get!int : ErrorCode.internalError;
 		const m = ("message" in error && error["message"].type == Json.Type.string) ? error["message"]
 			.get!string : "server error";
-		return new McpException(code, m, error);
+		return new McpException(code, m, "data" in error ? error["data"] : Json.undefined);
 	}
 }
 
@@ -3053,6 +3053,15 @@ unittest  // errorFrom maps a well-formed JSON-RPC error object
 			parseJsonString(`{"code":-32601,"message":"Method not found"}`));
 	assert(err.code == ErrorCode.methodNotFound);
 	assert(err.msg == "Method not found");
+}
+
+unittest  // errorFrom keeps only the error's data member as McpException.data, like a local error
+{
+	auto err = HttpClientTransport.errorFrom(
+			parseJsonString(`{"code":-32042,"message":"m","data":{"elicitations":[]}}`));
+	assert(err.data.type == Json.Type.object && "elicitations" in err.data);
+	assert(HttpClientTransport.errorFrom(parseJsonString(`{"code":-32601,"message":"m"}`))
+			.data.type == Json.Type.undefined);
 }
 
 unittest  // errorFrom tolerates a non-integer code without throwing

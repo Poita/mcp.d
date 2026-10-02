@@ -1243,14 +1243,10 @@ final class McpClient : ClientProtocol
 	}
 
 	/// Extract the `supported` wire-version list from an
-	/// `UnsupportedProtocolVersionError`. The transport's `errorFrom`
-	/// (http_transport.d) stores the whole JSON-RPC error object in `data`, so the
-	/// list lives at `data.data.supported`.
+	/// `UnsupportedProtocolVersionError`'s `data`.
 	private static string[] supportedListFromError(McpException e) @safe
 	{
 		auto d = e.data;
-		if (d.type == Json.Type.object && "data" in d && d["data"].type == Json.Type.object)
-			d = d["data"];
 		string[] versions;
 		if (d.type == Json.Type.object && "supported" in d && d["supported"].type == Json
 				.Type.array)
@@ -3644,16 +3640,13 @@ final class McpClient : ClientProtocol
 
 	/// Register the `elicitationId`s announced by a `URLElicitationRequiredError`
 	/// (`-32042`) so a subsequent `notifications/elicitation/complete` correlates
-	/// and is forwarded. `error` is the JSON-RPC error object; the URL-mode
-	/// elicitations live under `error.data.elicitations[]`, each an
+	/// and is forwarded. `data` is the error's `data` member; the URL-mode
+	/// elicitations live under `data.elicitations[]`, each an
 	/// `ElicitRequestURLParams` carrying an `elicitationId` (2025-11-25 / modern
 	/// schema `URLElicitationRequiredError`). Ids already tracked are left as-is so
 	/// an in-flight completion state is not reset; malformed entries are skipped.
-	package void registerUrlElicitations(Json error) @safe
+	package void registerUrlElicitations(Json data) @safe
 	{
-		if (error.type != Json.Type.object || "data" !in error)
-			return;
-		auto data = error["data"];
 		if (data.type != Json.Type.object || "elicitations" !in data)
 			return;
 		auto elicitations = data["elicitations"];
@@ -6656,18 +6649,14 @@ unittest  // -32042 URLElicitationRequiredError registers its elicitationIds (cl
 {
 	auto c = McpClient.http("http://localhost");
 
-	// Build the error object exactly as the transport hands it to rpc():
-	// {code: -32042, message, data: {elicitations: [ElicitRequestURLParams...]}}.
+	// The error's data member as the transport hands it to rpc():
+	// {elicitations: [ElicitRequestURLParams...]}.
 	Json e0 = Json.emptyObject;
 	e0["mode"] = "url";
 	e0["url"] = "https://example.com/elicit/a";
 	e0["elicitationId"] = "e-from-error";
 	Json data = Json.emptyObject;
 	data["elicitations"] = Json([e0]);
-	Json error = Json.emptyObject;
-	error["code"] = cast(int) ErrorCode.urlElicitationRequired;
-	error["message"] = "URL elicitation required";
-	error["data"] = data;
 
 	// rpc() must surface the error AND, as a side effect, register the id so a
 	// later completion correlates. Drive it through the real rpc() path via the
@@ -6675,7 +6664,7 @@ unittest  // -32042 URLElicitationRequiredError registers its elicitationIds (cl
 	// (HttpClientTransport.errorFrom) would build.
 	c.onRpcForTest = (string, Json) @safe {
 		throw new McpException(cast(int) ErrorCode.urlElicitationRequired,
-				"URL elicitation required", error);
+				"URL elicitation required", data);
 	};
 
 	bool threw;
@@ -6705,10 +6694,8 @@ unittest  // registerUrlElicitations records every announced id; a non-32042 err
 	e1["elicitationId"] = "id-2";
 	Json data = Json.emptyObject;
 	data["elicitations"] = Json([e0, e1]);
-	Json error = Json.emptyObject;
-	error["data"] = data;
 
-	c.registerUrlElicitations(error);
+	c.registerUrlElicitations(data);
 
 	string[] seen;
 	c.onNotification = (string method, Json) @safe { seen ~= method; };
@@ -6724,14 +6711,10 @@ unittest  // registerUrlElicitations records every announced id; a non-32042 err
 unittest  // registerUrlElicitations tolerates a malformed/absent elicitations payload
 {
 	auto c = McpClient.http("http://localhost");
-	c.registerUrlElicitations(Json.emptyObject); // no data
-	Json missingArray = Json.emptyObject;
-	missingArray["data"] = Json.emptyObject; // data present, elicitations absent
-	c.registerUrlElicitations(missingArray);
+	c.registerUrlElicitations(Json.undefined); // no data
+	c.registerUrlElicitations(Json.emptyObject); // data present, elicitations absent
 	Json badEntries = Json.emptyObject;
-	Json d = Json.emptyObject;
-	d["elicitations"] = Json([Json("not-an-object"), Json.emptyObject]);
-	badEntries["data"] = d;
+	badEntries["elicitations"] = Json([Json("not-an-object"), Json.emptyObject]);
 	c.registerUrlElicitations(badEntries); // entries without a string id are skipped
 
 	// None of the above should have registered a correlatable id.
@@ -6757,9 +6740,7 @@ unittest  // the URL elicitation ids awaiting completion are capped, evicting th
 			"elicitationId": Json("e" ~ i.to!string)
 		]);
 	}
-	Json error = Json.emptyObject;
-	error["data"] = Json(["elicitations": Json(elicitations)]);
-	c.registerUrlElicitations(error);
+	c.registerUrlElicitations(Json(["elicitations": Json(elicitations)]));
 	assert(c.elicitationIds_.length < total, "ids awaiting completion must be capped");
 	assert("e4999" in c.elicitationIds_, "the newest id must still be tracked");
 	assert("e0" !in c.elicitationIds_, "the oldest id is evicted first");

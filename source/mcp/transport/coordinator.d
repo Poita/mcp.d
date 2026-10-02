@@ -37,8 +37,9 @@ Json cancelledNotification(long id, string reason) @safe
 
 /// Resolve a settled waiter's outcome into a value or an exception: if `error`
 /// is a JSON-RPC error object, throw `McpException` decoded from its `code`
-/// (defaulting to `internalError`) and `message` (defaulting to `defaultMsg`);
-/// otherwise return `result`. Shared by every coordinator's await path so the
+/// (defaulting to `internalError`), `message` (defaulting to `defaultMsg`) and
+/// `data` (the `McpException.data`, as for a locally raised error); otherwise
+/// return `result`. Shared by every coordinator's await path so the
 /// error decoding lives in one place.
 Json throwOrReturn(Json result, Json error, string defaultMsg) @safe
 {
@@ -48,7 +49,7 @@ Json throwOrReturn(Json result, Json error, string defaultMsg) @safe
 			.get!int : ErrorCode.internalError;
 		const m = ("message" in error && error["message"].type == Json.Type.string) ? error["message"]
 			.get!string : defaultMsg;
-		throw new McpException(code, m, error);
+		throw new McpException(code, m, "data" in error ? error["data"] : Json.undefined);
 	}
 	return result;
 }
@@ -401,6 +402,26 @@ unittest  // throwOrReturn yields McpException with internalError when "code" is
 		caught = e;
 	assert(caught !is null, "expected McpException, got nothing");
 	assert(caught.code == ErrorCode.internalError);
+}
+
+unittest  // throwOrReturn keeps only the error's data member as McpException.data, like a local error
+{
+	import vibe.data.json : parseJsonString;
+
+	McpException caught;
+	try
+		throwOrReturn(Json.undefined, parseJsonString(
+				`{"code":-32042,"message":"m","data":{"elicitations":[]}}`), "fallback");
+	catch (McpException e)
+		caught = e;
+	assert(caught.data.type == Json.Type.object && "elicitations" in caught.data);
+
+	caught = null;
+	try
+		throwOrReturn(Json.undefined, parseJsonString(`{"code":-32601,"message":"m"}`), "fallback");
+	catch (McpException e)
+		caught = e;
+	assert(caught.data.type == Json.Type.undefined);
 }
 
 unittest  // throwOrReturn yields McpException with defaultMsg when "message" is not a string
