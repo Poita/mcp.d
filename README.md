@@ -186,8 +186,8 @@ on the proxy's CIMD consent screen (a spec `SHOULD`).
 
 ### Platform support
 
-Linux, macOS, and Windows are all supported and exercised in CI (Linux/macOS with
-DMD and LDC, Windows with LDC). The stdio transport, the OS CSPRNG, and the OAuth
+Linux, macOS, and Windows are all supported and exercised in CI (Linux with DMD
+and LDC, macOS and Windows with LDC). The stdio transport, the OS CSPRNG, and the OAuth
 token store each have native Windows code paths; on Windows the token store
 tightens file permissions via ACLs rather than POSIX modes.
 
