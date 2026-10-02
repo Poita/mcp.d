@@ -2565,8 +2565,9 @@ private void handlePost(McpServer server, StreamCoordinator coord,
 			}
 			scope (exit)
 				pushStreams.release(principal);
-			handleListenStream(server, coord, msg, res, req.headers.get(HttpHeader.protocolVersion,
-					""), connToken, principalOf(token), maxQueued);
+			handleListenStream(server, coord, msg, res,
+					req.headers.get(HttpHeader.protocolVersion, ""), connToken,
+					principal, maxQueued);
 			return;
 		}
 		// Modern events/stream (push): like subscriptions/listen, this POST opens a
@@ -2593,7 +2594,7 @@ private void handlePost(McpServer server, StreamCoordinator coord,
 			}
 			scope (exit)
 				pushStreams.release(principal);
-			handleEventsStream(server, msg, res, token.valid ? token.subject : "", maxQueued);
+			handleEventsStream(server, msg, res, principal, maxQueued);
 			return;
 		}
 		// Resolve THIS request's per-connection state and hand it to
