@@ -720,7 +720,7 @@ final class McpServer : ServerCore
 	/// The JSON-RPC error a non-`McpException` thrown while serving `method`
 	/// becomes: logged in full, and sent as a generic internal error unless
 	/// `exposeInternalErrors` was called.
-	private McpException unexpectedFailure(string method, Exception e) @safe
+	package(mcp) McpException unexpectedFailure(string method, Exception e) @safe
 	{
 		import vibe.core.log : logError;
 
