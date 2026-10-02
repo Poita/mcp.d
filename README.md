@@ -998,13 +998,20 @@ stdio. The server side is `runStreamableHttp(server, port)` or `runStdio(server)
 
 **Running concurrent calls.** Every verb must run inside a task under a running
 event loop. Spawn each concurrent call as its own `runTask` and let the loop
-interleave their I/O:
+interleave their I/O. vibe requires a task body to be `nothrow`, so catch
+exceptions inside it:
 
 ```d
 import vibe.core.core : runTask;
 
-runTask({ auto a = client.callTool("one", argsA); /* ... */ });
-runTask({ auto b = client.callTool("two", argsB); /* ... */ });
+runTask(() nothrow {
+    try { auto a = client.callTool("one", argsA); /* ... */ }
+    catch (Exception e) { /* report e.msg */ }
+});
+runTask(() nothrow {
+    try { auto b = client.callTool("two", argsB); /* ... */ }
+    catch (Exception e) { /* report e.msg */ }
+});
 ```
 
 **Entering the loop from a non-vibe process.** If your process is not otherwise
