@@ -1210,7 +1210,7 @@ final class McpServer : ServerCore
 			throw internalError("startTask requires enableTasks() first");
 		if ((name in taskExecutors_) is null)
 			throw internalError("startTask: no task executor registered under '" ~ name ~ "'");
-		if (!declaresTasksExtension(ctx.clientCapabilities()))
+		if (!acceptsTasks(ctx.clientCapabilities(), ctx.protocolVersion))
 			return ToolResponse.complete(runTaskToolInline(name, input, ctx));
 		// The task is bound to the creating request's authenticated principal
 		// (if any), so every later tasks/* request must come from the same one.
@@ -1273,6 +1273,14 @@ final class McpServer : ServerCore
 		ext[tasksExtensionKey] = Json.emptyObject;
 		c.extensions = ext;
 		return c;
+	}
+
+	/// Whether a request on `ver` whose client declared `caps` can receive a task
+	/// handle: the Tasks extension is modern-only, so a 2025-era request never
+	/// can, whatever it declares under `extensions`.
+	private static bool acceptsTasks(const ClientCapabilities caps, ProtocolVersion ver) @safe
+	{
+		return ver.isModern && declaresTasksExtension(caps);
 	}
 
 	/// Whether `caps` declares the Tasks extension under `extensions`.
@@ -3543,7 +3551,7 @@ final class McpServer : ServerCore
 		// task, but only for a client that declared the extension. Without it a
 		// tool that requires the extension is rejected with -32021 naming it; any
 		// other tool's handler runs, and `startTask` runs its executor inline.
-		if (entry.taskSupport == TaskSupport.required && !declaresTasksExtension(declared))
+		if (entry.taskSupport == TaskSupport.required && !acceptsTasks(declared, ver))
 			throw missingRequiredClientCapability(tasksRequiredCapabilities(),
 					"This tool requires the " ~ tasksExtensionKey ~ " extension");
 		// Validate the supplied arguments against the tool's declared inputSchema
@@ -8020,6 +8028,43 @@ unittest  // startTask for a 2025-era client runs inline and leaves no orphaned 
 	]))).get;
 	assert("error" !in r);
 	assert(r["result"]["content"][0]["text"].get!string == "Hello, Bob");
+	assert(storedTaskCount(s) == 0);
+}
+
+version (unittest) private Message legacyInitDeclaringTasks() @safe
+{
+	return req(0, "initialize", Json([
+		"protocolVersion": Json("2025-11-25"),
+		"capabilities": Json([
+			"extensions": Json([tasksExtensionKey: Json.emptyObject])
+		]),
+		"clientInfo": Json(["name": Json("c"), "version": Json("1")])
+	]));
+}
+
+unittest  // startTask runs inline for a 2025-era client even when it declares the tasks extension
+{
+	auto s = makeEscalatingServer(TaskSupport.optional);
+	assert("error" !in s.handle(legacyInitDeclaringTasks()).get);
+	auto r = s.handle(req(1, "tools/call", Json([
+		"name": Json("escalate"),
+		"arguments": Json.emptyObject
+	]))).get;
+	assert("error" !in r);
+	assert("taskId" !in r["result"]);
+	assert(r["result"]["content"][0]["text"].get!string == "Hello, Bob");
+	assert(storedTaskCount(s) == 0);
+}
+
+unittest  // a task-required tool rejects a 2025-era client even when it declares the tasks extension
+{
+	auto s = makeEscalatingServer(TaskSupport.required);
+	assert("error" !in s.handle(legacyInitDeclaringTasks()).get);
+	auto r = s.handle(req(1, "tools/call", Json([
+		"name": Json("escalate"),
+		"arguments": Json.emptyObject
+	]))).get;
+	assert(r["error"]["code"].get!int == cast(int) ErrorCode.missingRequiredClientCapability);
 	assert(storedTaskCount(s) == 0);
 }
 
