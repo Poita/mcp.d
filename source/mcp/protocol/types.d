@@ -39,21 +39,21 @@ enum ContentKind
 /// per-kind duplication or "meaningless on this kind" footgun.
 mixin template ContentMetaFields()
 {
-	Json annotations = Json.undefined; /// optional annotations (audience/priority/lastModified)
+	Annotations annotations; /// optional annotations (audience/priority/lastModified)
 	Json meta = Json.undefined; /// optional `_meta` object
 
 	private void emitMeta(ref Json j) const @safe
 	{
-		if (annotations.type != Json.Type.undefined)
-			j["annotations"] = annotations;
+		if (!annotations.empty)
+			j["annotations"] = annotations.toJson();
 		if (meta.type == Json.Type.object)
 			j["_meta"] = meta;
 	}
 
 	private void parseMeta(Json j) @safe
 	{
-		if ("annotations" in j)
-			annotations = j["annotations"];
+		if ("annotations" in j && j["annotations"].type == Json.Type.object)
+			annotations = Annotations.fromJson(j["annotations"]);
 		if ("_meta" in j && j["_meta"].type == Json.Type.object)
 			meta = j["_meta"];
 	}
@@ -413,9 +413,9 @@ struct Content
 	}
 
 	/// The shared `annotations` value (any kind may carry it).
-	Json annotations() const @safe
+	Annotations annotations() const @safe
 	{
-		return payload.match!(c => c.annotations);
+		return payload.match!(c => c.annotations.dup);
 	}
 
 	/// The shared `_meta` value (any kind may carry it).
@@ -434,16 +434,28 @@ struct Content
 				t.content ~= b.dupSelf();
 			t.structuredContent = c.structuredContent;
 			t.isError = c.isError;
-			t.annotations = c.annotations;
+			t.annotations = c.annotations.dup;
 			t.meta = c.meta;
 			return Content(t);
-		}, (const ref c) => Content(c));
+		}, (const ref c) {
+			import std.traits : Unqual;
+
+			Unqual!(typeof(c)) x;
+			static foreach (i; 0 .. x.tupleof.length)
+			{
+				static if (is(typeof(x.tupleof[i]) == Annotations))
+					x.tupleof[i] = c.tupleof[i].dup;
+				else
+					x.tupleof[i] = c.tupleof[i];
+			}
+			return Content(x);
+		});
 	}
 
 	/// Attach optional annotations (audience/priority/lastModified) to this
 	/// content block. Returns a copy so calls can be chained, e.g.
 	/// `Content.makeText("hi").withAnnotations(a)`. Valid on every kind.
-	Content withAnnotations(Json a) const @safe
+	Content withAnnotations(Annotations a) const @safe
 	{
 		Content c = dupSelf();
 		c.payload.match!((ref x) { x.annotations = a; });
@@ -627,14 +639,14 @@ struct Content
 		{
 			auto placeholder = TextContent("[unsupported content of kind '" ~ kindWire()
 					~ "' omitted for protocol version " ~ v.toWire ~ "]");
-			placeholder.annotations = projectAnnotations(annotations, v);
+			placeholder.annotations = annotations.forVersion(v);
 			if (v >= ProtocolVersion.v2025_06_18)
 				placeholder.meta = meta;
 			return Content(placeholder);
 		}
 		// In-schema kind: copy, then strip shared fields the peer cannot accept.
 		Content c = dupSelf();
-		auto projAnn = projectAnnotations(c.annotations, v);
+		auto projAnn = c.annotations.forVersion(v);
 		c.payload.match!((ref x) {
 			x.annotations = projAnn;
 			// Content-level `_meta` is not in-schema before v2025-06-18; strip it for older peers.
@@ -672,20 +684,6 @@ struct Content
 	private Json resourceOrRaw() const @safe
 	{
 		return payload.match!((const ref UnknownContent c) => c.raw, _ => Json.emptyObject);
-	}
-
-	/// Strip `Annotations.lastModified` (2025-06-18+) from a raw annotations Json
-	/// when projecting for an older peer; leave audience/priority untouched.
-	private static Json projectAnnotations(Json ann, ProtocolVersion v) @safe
-	{
-		if (ann.type != Json.Type.object)
-			return ann;
-		if (v >= ProtocolVersion.v2025_06_18)
-			return ann;
-		Json copy = ann.clone;
-		if ("lastModified" in copy)
-			copy.remove("lastModified");
-		return copy;
 	}
 
 	/// Throws -32602 when `j` is not an object or its REQUIRED `type` is absent
@@ -834,6 +832,16 @@ struct Annotations
 	bool empty() const @safe
 	{
 		return audience.length == 0 && priority.isNull && lastModified.isNull;
+	}
+
+	/// A mutable copy.
+	Annotations dup() const @safe
+	{
+		Annotations a;
+		a.audience = audience.dup;
+		a.priority = priority;
+		a.lastModified = lastModified;
+		return a;
 	}
 
 	/// Return a copy projected for the negotiated protocol version. `audience` and
@@ -1861,9 +1869,7 @@ unittest  // content omits annotations key when none are set
 
 unittest  // content emits annotations when present
 {
-	Json a = Json.emptyObject;
-	a["audience"] = Json([Json("user")]);
-	a["priority"] = Json(0.9);
+	Annotations a = {audience: ["user"], priority: 0.9};
 	auto c = Content.makeImage("YWJj", "image/png").withAnnotations(a);
 	auto j = c.toJson();
 	assert(j["annotations"]["audience"][0].get!string == "user");
@@ -1932,14 +1938,23 @@ unittest  // tool_result content round-trips nested content/isError/structured
 
 unittest  // inbound content annotations are preserved on fromJson
 {
-	Json a = Json.emptyObject;
-	a["audience"] = Json([Json("assistant")]);
-	a["lastModified"] = Json("2025-01-01T00:00:00Z");
+	Annotations a = {
+		audience: ["assistant"], lastModified: "2025-01-01T00:00:00Z"
+	};
 	auto orig = Content.makeText("hi").withAnnotations(a);
 	auto back = Content.fromJson(orig.toJson());
-	assert(back.annotations.type == Json.Type.object);
-	assert(back.annotations["audience"][0].get!string == "assistant");
-	assert(back.annotations["lastModified"].get!string == "2025-01-01T00:00:00Z");
+	assert(back.annotations.audience == ["assistant"]);
+	assert(back.annotations.lastModified.get == "2025-01-01T00:00:00Z");
+}
+
+unittest  // inbound content annotations parse into the typed Annotations
+{
+	import vibe.data.json : parseJsonString;
+
+	auto c = Content.fromJson(
+			`{"type":"text","text":"x","annotations":{"priority":0.25}}`.parseJsonString);
+	assert(c.annotations.priority.get == 0.25);
+	assert(c.annotations.audience.length == 0);
 }
 
 unittest  // Content is a SumType over per-kind structs
@@ -5021,9 +5036,7 @@ unittest  // Content.forVersion drops content-level _meta for 2024-11-05, keeps 
 
 unittest  // Content.forVersion strips Annotations.lastModified pre-2025-06-18
 {
-	Json ann = Json.emptyObject;
-	ann["audience"] = Json([Json("user")]);
-	ann["lastModified"] = Json("2025-01-01T00:00:00Z");
+	Annotations ann = {audience: ["user"], lastModified: "2025-01-01T00:00:00Z"};
 	auto c = Content.makeText("hi").withAnnotations(ann);
 
 	auto old = c.forVersion(ProtocolVersion.v2024_11_05).toJson();
