@@ -629,7 +629,7 @@ struct Content
 	/// - Shared FIELDS: content-level `_meta` and `Annotations.lastModified` were
 	///   both introduced in v2025-06-18, so for any older peer (v2024-11-05 or
 	///   v2025-03-26) the `_meta` key is dropped and `annotations.lastModified`
-	///   is stripped.
+	///   is stripped. An embedded resource's own `_meta` is dropped likewise.
 	///
 	/// Mirrors the `Tool.forVersion` field-stripping pattern.
 	Content forVersion(ProtocolVersion v) const @safe
@@ -653,6 +653,17 @@ struct Content
 			if (v < ProtocolVersion.v2025_06_18)
 				x.meta = Json.undefined;
 		});
+		// The embedded `resource` (ResourceContents) gained `_meta` in the same
+		// revision. It is held as raw Json shared with the source block, so strip
+		// a copy rather than mutating the original.
+		if (v < ProtocolVersion.v2025_06_18)
+			c.payload.match!((ref EmbeddedResource e) {
+				if (e.resource.type == Json.Type.object && "_meta" in e.resource)
+				{
+					e.resource = e.resource.clone;
+					e.resource.remove("_meta");
+				}
+			}, (ref _) {});
 		return c;
 	}
 
@@ -5056,6 +5067,21 @@ unittest  // Content.forVersion drops content-level _meta for 2024-11-05, keeps 
 	assert("_meta" !in c.forVersion(ProtocolVersion.v2024_11_05).toJson());
 	auto keep = c.forVersion(ProtocolVersion.v2025_06_18).toJson();
 	assert("_meta" in keep && keep["_meta"]["x.example/k"].get!string == "v");
+}
+
+unittest  // Content.forVersion strips an embedded resource's _meta pre-2025-06-18
+{
+	import vibe.data.json : parseJsonString;
+
+	auto c = Content.fromJson(parseJsonString(
+			`{"type":"resource","resource":{"uri":"file://x",` ~ `"text":"hi","_meta":{"k":"v"}}}`));
+	auto old = c.forVersion(ProtocolVersion.v2025_03_26).toJson();
+	assert("_meta" !in old["resource"]);
+	assert(old["resource"]["text"].get!string == "hi");
+	auto keep = c.forVersion(ProtocolVersion.v2025_06_18).toJson();
+	assert(keep["resource"]["_meta"]["k"].get!string == "v");
+	// The source block is not mutated by the projection.
+	assert("_meta" in c.toJson()["resource"]);
 }
 
 unittest  // Content.forVersion strips Annotations.lastModified pre-2025-06-18
