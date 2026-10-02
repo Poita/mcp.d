@@ -306,6 +306,8 @@ final class HttpClientTransport : ClientTransport
 	// cannot allocate a source port) fails with a typed error instead of parking
 	// the calling fiber forever. Configurable via `setConnectTimeout`.
 	private Duration connectTimeout = 30.seconds;
+	/// How long `openListen` waits for the stream's leading frame.
+	package Duration listenTimeout_ = 10.seconds;
 	private enum Duration defaultSendTimeout = 30.seconds;
 	private Duration sendTimeout = defaultSendTimeout;
 	// Upper bound on any single response body or SSE event read from the server,
@@ -1628,11 +1630,11 @@ final class HttpClientTransport : ClientTransport
 		// subscriptions/listen) only after registering the subscription, so an
 		// occurrence published immediately after this call cannot race ahead of the
 		// registration and be missed. Capture the emit count before spawning the
-		// reader so an establishment that lands before we wait is not lost. The wait
-		// is bounded: a server that never sends a leading frame degrades to
-		// returning rather than hanging. A stream the server refuses before any
-		// frame (HTTP error, JSON-RPC error, connect failure) ends with an error,
-		// which is thrown here.
+		// reader so an establishment that lands before we wait is not lost. A stream
+		// the server refuses before any frame (HTTP error, JSON-RPC error, connect
+		// failure) ends with an error, which is thrown here. A server that sends no
+		// leading frame within `listenTimeout_` has the stream cancelled and the
+		// open fails with a timeout.
 		auto gate = new ListenGate;
 		runTask(() nothrow{
 			scope (exit)
@@ -1647,8 +1649,21 @@ final class HttpClientTransport : ClientTransport
 			{
 			}
 		});
-		if (!gate.wait(10.seconds) && stream.error !is null)
-			throw stream.error;
+		if (!gate.wait(listenTimeout_))
+		{
+			if (stream.error !is null)
+				throw stream.error;
+			if (!stream.ended)
+			{
+				import mcp.client.client : RequestTimeoutException;
+
+				stream.cancel();
+				const method = ("method" in message && message["method"].type == Json.Type.string) ? message["method"]
+					.get!string : "subscriptions/listen";
+				throw new RequestTimeoutException(
+						method ~ " received no leading frame within " ~ listenTimeout_.toString());
+			}
+		}
 		return stream;
 	}
 
@@ -4781,6 +4796,42 @@ unittest  // close() stops the server stream before the session DELETE, so it ne
 	});
 	assert(failure.length == 0, "scenario failed: " ~ failure);
 	assert(getSessions == ["s1"], "server stream GETs: " ~ getSessions.to!string);
+}
+
+unittest  // openListen with no leading frame times out, cancels the stream and throws
+{
+	import core.time : msecs, MonoTime;
+	import mcp.client.client : RequestTimeoutException;
+	import vibe.core.core : sleep;
+
+	bool release;
+	auto router = answeringRouter((Json req, HTTPServerResponse res) @safe {
+		writeSse(res, ": no frame yet\n");
+		const until = MonoTime.currTime + 5.seconds;
+		while (!release && MonoTime.currTime < until)
+			sleep(20.msecs);
+	});
+	bool timedOut;
+	size_t openSockets = size_t.max;
+	const failure = runAgainstFakeServer(router, (string url) @safe {
+		scope (exit)
+			release = true;
+		auto t = new HttpClientTransport(url);
+		scope (exit)
+			t.close();
+		t.listenTimeout_ = 100.msecs;
+		try
+			t.openListen(makeRequest(Json(1), "subscriptions/listen", Json.emptyObject));
+		catch (RequestTimeoutException)
+			timedOut = true;
+		const until = MonoTime.currTime + 2.seconds;
+		while (t.listenSockets.length && MonoTime.currTime < until)
+			sleep(10.msecs);
+		openSockets = t.listenSockets.length;
+	});
+	assert(failure.length == 0, "scenario failed: " ~ failure);
+	assert(timedOut, "a listen with no leading frame must fail with RequestTimeoutException");
+	assert(openSockets == 0, "the timed-out listen stream must be torn down");
 }
 
 unittest  // HttpEndpoint.hostHeader omits only the scheme's default port
