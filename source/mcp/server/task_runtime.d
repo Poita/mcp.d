@@ -444,11 +444,13 @@ final class TaskRuntime
 	}
 
 	/// Whether cancellation was requested for `id` (cooperative check for a
-	/// running handler).
+	/// running handler). A task that no longer exists (expired past its TTL, or
+	/// removed) also reports `true`: nothing can collect its result, so its
+	/// executor should stop.
 	bool cancelRequested(string id) @safe
 	{
 		auto r = fetch(id);
-		return !r.isNull && r.get.cancelRequested;
+		return r.isNull || r.get.cancelRequested;
 	}
 
 	/// Record `tasks/update` input responses for a task. Unknown/satisfied keys
@@ -787,6 +789,19 @@ unittest  // a non-terminal task expires ttl after creation, however recently it
 	auto ex = cast(McpException) collectException(rt.getDetailed(t.taskId));
 	assert(ex !is null && ex.code == ErrorCode.invalidParams);
 	assert(store.get(t.taskId).isNull);
+}
+
+unittest  // cancelRequested reports true once the task has expired, so its executor stops
+{
+	string now = "2026-06-07T10:00:00Z";
+	TaskOptions o;
+	o.nowIso = () @safe => now;
+	auto rt = new TaskRuntime(new InMemoryTaskStore(), o);
+	auto t = rt.createFor("slow", Json.undefined, nullable(1_000.msecs));
+	assert(!rt.cancelRequested(t.taskId));
+	now = "2026-06-07T10:00:01Z";
+	assert(rt.cancelRequested(t.taskId));
+	assert(rt.cancelRequested("never-existed"));
 }
 
 unittest  // sweepExpired removes expired records, terminal or not, and keeps the rest
