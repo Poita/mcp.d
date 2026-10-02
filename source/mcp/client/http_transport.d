@@ -862,7 +862,7 @@ final class HttpClientTransport : ClientTransport
 				scope (exit)
 					conn.release();
 
-				const req = buildHttpRequest("POST", ep.path, ep.host,
+				const req = buildHttpRequest("POST", ep.path, ep.hostHeader,
 						"application/json, text/event-stream", "close", true, hdrs, null, payload);
 				conn.write(cast(const(ubyte)[]) req);
 
@@ -1125,8 +1125,9 @@ final class HttpClientTransport : ClientTransport
 				auto conn = openClientStream(sock, ep.tls ? tlsContext() : null, ep.host);
 				scope (exit)
 					conn.release();
-				const getReq = buildHttpRequest("GET", ep.path, ep.host, "text/event-stream",
-						"keep-alive", true, verHeaders, cursor.lastEventId, null);
+				const getReq = buildHttpRequest("GET", ep.path, ep.hostHeader,
+						"text/event-stream", "keep-alive", true, verHeaders,
+						cursor.lastEventId, null);
 				conn.write(cast(const(ubyte)[]) getReq);
 
 				bool chunked;
@@ -1528,7 +1529,8 @@ final class HttpClientTransport : ClientTransport
 					scope (exit)
 						conn.release();
 
-					const req = buildHttpRequest("GET", ep.path, ep.host, "text/event-stream",
+					const req = buildHttpRequest("GET", ep.path, ep.hostHeader,
+							"text/event-stream",
 							"keep-alive", true, verHeaders, cursor.lastEventId, null);
 					conn.write(cast(const(ubyte)[]) req);
 
@@ -1704,7 +1706,7 @@ final class HttpClientTransport : ClientTransport
 
 				// One response per connection: `close` lets a non-streamed answer
 				// (an error body) be read to end-of-stream.
-				const req = buildHttpRequest("POST", ep.path, ep.host,
+				const req = buildHttpRequest("POST", ep.path, ep.hostHeader,
 						"text/event-stream", "close", true, reqHeaders, null, body);
 				conn.write(cast(const(ubyte)[]) req);
 
@@ -1928,7 +1930,7 @@ final class HttpClientTransport : ClientTransport
 				scope (exit)
 					conn.release();
 
-				const req = buildHttpRequest("GET", ep.path, ep.host,
+				const req = buildHttpRequest("GET", ep.path, ep.hostHeader,
 						"text/event-stream", "keep-alive", true, null, null, null);
 				conn.write(cast(const(ubyte)[]) req);
 
@@ -2060,6 +2062,17 @@ struct HttpEndpoint
 	ushort port;
 	string path;
 	bool tls;
+
+	/// The `Host` header value (RFC 9110 §7.2): the host, plus `:port` when the
+	/// port is not the scheme's default. An IPv6 literal keeps its brackets.
+	string hostHeader() const @safe
+	{
+		import std.conv : to;
+		import std.string : indexOf;
+
+		const h = (host.indexOf(':') >= 0 && host[0] != '[') ? "[" ~ host ~ "]" : host;
+		return port == (tls ? 443 : 80) ? h : h ~ ":" ~ port.to!string;
+	}
 }
 
 /// Parse `scheme://host[:port][/path]` into its components, defaulting the port
@@ -4323,4 +4336,50 @@ unittest  // closing the transport ends its open listen streams
 	});
 	assert(failure.length == 0, "scenario failed: " ~ failure);
 	assert(ended && !cancelled, "close() must end the transport's listen streams");
+}
+
+unittest  // the raw-socket POST sends a Host header carrying the non-default port
+{
+	import mcp.client.client : McpClient;
+	import std.algorithm : all;
+	import std.conv : to;
+
+	string[] hosts;
+	auto r = new URLRouter;
+	r.post("/mcp", (HTTPServerRequest req, HTTPServerResponse res) @safe {
+		hosts ~= req.headers.get("Host", "");
+		auto j = requestJson(req);
+		const method = ("method" in j) ? j["method"].get!string : "";
+		if (method == "initialize")
+			res.writeBody(initializeReply(j, "2025-11-25").toString(), "application/json");
+		else if ("id" !in j)
+		{
+			res.statusCode = 202;
+			res.writeBody("", "text/plain");
+		}
+		else
+			writeSse(res, toolsListFrame(j["id"].get!long));
+	});
+	string expected;
+	const failure = runAgainstFakeServer(r, (string url) @safe {
+		expected = "127.0.0.1:" ~ parseHttpEndpoint(url).port.to!string;
+		auto client = McpClient.http(url);
+		scope (exit)
+			client.close();
+		client.initialize("2025-11-25");
+		client.listTools();
+	});
+	assert(failure.length == 0, "scenario failed: " ~ failure);
+	assert(hosts.length >= 2);
+	assert(hosts.all!(h => h == expected), "Host must carry the port: " ~ hosts.to!string);
+}
+
+unittest  // HttpEndpoint.hostHeader omits only the scheme's default port
+{
+	assert(parseHttpEndpoint("http://h/x").hostHeader == "h");
+	assert(parseHttpEndpoint("https://h/x").hostHeader == "h");
+	assert(parseHttpEndpoint("http://h:443/x").hostHeader == "h:443");
+	assert(parseHttpEndpoint("https://h:8443/x").hostHeader == "h:8443");
+	assert(parseHttpEndpoint("http://[::1]:9000/x").hostHeader == "[::1]:9000");
+	assert(parseHttpEndpoint("https://[::1]/x").hostHeader == "[::1]");
 }
