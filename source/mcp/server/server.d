@@ -2468,14 +2468,13 @@ final class McpServer : ServerCore
 		// JSON-RPC response (its "result" is the long-lived notification stream), so
 		// it is never registered in `inFlight` and cannot be cancelled via the
 		// token path. Per basic/utilities/cancellation a client cancels the listen
-		// by `notifications/cancelled` referencing the listen request id. Compare
-		// using the same normalization `rpcIdString` produced the stored id with, so
-		// a numeric cancellation requestId matches a numeric (or string) listen id.
-		// On a match, drop the delivery sink and clear the recorded per-stream
+		// by `notifications/cancelled` referencing the listen request id, compared
+		// by `cancellationKey` so a string and a numeric id never match. On a match, drop the delivery sink and clear the recorded per-stream
 		// filter so the listener-driven notify path matches nothing and any
 		// subsequent notify*/notifyResourceUpdated writes nothing.
-		if (stdioListenSink !is null && stdioListenSubscriptionId.type != Json.Type.undefined
-				&& rpcIdString(params["requestId"]) == rpcIdString(stdioListenSubscriptionId))
+		const cancelKey = cancellationKey(params["requestId"]);
+		if (stdioListenSink !is null && cancelKey.length
+				&& cancelKey == cancellationKey(stdioListenSubscriptionId))
 		{
 			// Graceful teardown: the long-lived listen request returns its single
 			// response now — the `SubscriptionsListenResult` (modern
@@ -2487,11 +2486,10 @@ final class McpServer : ServerCore
 		// Stdio `events/stream` teardown: a push stream returns no JSON-RPC response,
 		// so the client cancels it by `notifications/cancelled` referencing the
 		// stream's request id. Close the handle (fires on_unsubscribe) and drop it.
-		const streamKey = cancellationKey(params["requestId"]);
-		if (auto h = streamKey in stdioEventStreams_)
+		if (auto h = cancelKey in stdioEventStreams_)
 		{
 			h.close();
-			stdioEventStreams_.remove(streamKey);
+			stdioEventStreams_.remove(cancelKey);
 			return;
 		}
 
@@ -6712,10 +6710,10 @@ unittest  // stdio subscriptions/listen is cancellable via notifications/cancell
 	assert(frames.length == before, "notify wrote to a cancelled stdio listen stream");
 }
 
-unittest  // stdio subscriptions/listen cancellation matches a string requestId too
+unittest  // stdio subscriptions/listen cancellation does not match a string requestId to a numeric id
 {
-	// rpcIdString normalizes numeric and string ids identically, so a cancellation
-	// carrying a string "42" tears down a listen whose id was the number 42.
+	// JSON-RPC ids are typed: the string "42" names a different request than the
+	// number 42, so it leaves the listen stream open.
 	auto s = new McpServer("t", "1");
 	s.enableToolsListChanged();
 	string[] frames;
@@ -6738,9 +6736,32 @@ unittest  // stdio subscriptions/listen cancellation matches a string requestId 
 	Json cp = Json.emptyObject;
 	cp["requestId"] = "42";
 	s.handle(Message(makeNotification("notifications/cancelled", cp)));
-	const before = frames.length;
-	assert(s.notifyToolsListChanged() == 0);
-	assert(frames.length == before);
+	assert(s.notifyToolsListChanged() == 1);
+}
+
+unittest  // stdio subscriptions/listen cancellation ignores a fractional requestId
+{
+	import std.exception : assertNotThrown;
+
+	auto s = new McpServer("t", "1");
+	s.enableToolsListChanged();
+	void sink(string line) @safe
+	{
+	}
+
+	Json meta = Json.emptyObject;
+	meta[MetaKey.protocolVersion] = "2026-07-28";
+	meta[MetaKey.clientCapabilities] = Json.emptyObject;
+	Json params = Json.emptyObject;
+	params["notifications"] = Json(["toolsListChanged": Json(true)]);
+	params["_meta"] = meta;
+	assert(s.tryServeStdioListen(Message(makeRequest(Json(42),
+			"subscriptions/listen", params)), &sink));
+
+	Json cp = Json.emptyObject;
+	cp["requestId"] = 1.5;
+	assertNotThrown(s.handle(Message(makeNotification("notifications/cancelled", cp))));
+	assert(s.notifyToolsListChanged() == 1);
 }
 
 unittest  // stdio subscriptions/listen does not wipe negotiated session clientCaps
