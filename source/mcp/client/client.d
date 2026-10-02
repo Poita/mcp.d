@@ -47,18 +47,20 @@ enum CacheMode
 /// Per-request options shared by the `McpClient` request verbs. All fields are
 /// independently combinable and default to "unset".
 ///
-/// Exactly these verbs accept a trailing `RequestOptions`: `callTool`,
-/// `getPrompt`, `complete`, `readResource`, `listTools`, `listResources`,
-/// `listResourceTemplates`, `listPrompts`, and `discover`. (`cacheMode` is only
-/// meaningful on the cacheable reads — the four `*/list` verbs, `readResource`,
-/// and `discover` — and is ignored on the others.)
+/// Every `McpClient` request verb takes a `RequestOptions` after its own
+/// arguments (`callToolAwait` and `awaitTask` follow it with an optional
+/// input-required callback); `initialize`, `connect`, and the verbs that open a
+/// stream or a managed subscription do not. (`cacheMode` is only meaningful on
+/// the cacheable reads — the four `*/list` verbs, `readResource`, and
+/// `discover` — and is ignored on the others.)
 ///
 /// - `progressToken`: attached as `params._meta.progressToken` so the server may
 ///   emit `notifications/progress` for the request (basic/utilities/progress).
 /// - `logLevel`: minimum `notifications/message` severity for this request,
 ///   carried in `params._meta["io.modelcontextprotocol/logLevel"]` (modern
-///   server/utilities/logging, SEP-2575/2577); ignored on a released protocol,
-///   empty attaches nothing.
+///   server/utilities/logging, SEP-2575/2577). Not sent on a released-protocol
+///   session, which sets verbosity with `setLogLevel` instead; empty attaches
+///   nothing.
 /// - `onProgress`: a per-call progress sink. When non-null and no explicit
 ///   `progressToken` is given, the verb mints a unique token; for the duration
 ///   of the call, progress correlated to that token is routed here while
@@ -1004,7 +1006,8 @@ final class McpClient : ClientProtocol
 
 	/// The auto-pagination page cap: the maximum number of pages any
 	/// auto-paginating list verb (`listTools`/`listResources`/`listPrompts`/
-	/// `listResourceTemplates`) follows before giving up, guarding against a peer
+	/// `listResourceTemplates`/`readDirectory`/`skillsList`/`listEvents`) follows
+	/// before giving up, guarding against a peer
 	/// whose `nextCursor` never converges. `0` disables the cap (the
 	/// non-progress/cycle checks still apply); the default is 1000.
 	size_t maxListPages() const @safe nothrow
@@ -1341,8 +1344,15 @@ final class McpClient : ClientProtocol
 	private Json rpcWith(string method, Json params, ref RequestOptions opts) @safe
 	{
 		auto token = effectiveToken(opts);
-		auto p = withRequestLogLevel(withProgressToken(params, token), opts.logLevel);
+		auto p = withSessionLogLevel(withProgressToken(params, token), opts.logLevel);
 		return withPerCallProgress!Json(opts, () @safe => rpc(method, p));
+	}
+
+	/// `withRequestLogLevel` on a modern session; `params` unchanged on a released
+	/// protocol, which has no per-request log level (use `setLogLevel` there).
+	private Json withSessionLogLevel(Json params, string level) @safe
+	{
+		return useModern ? withRequestLogLevel(params, level) : params;
 	}
 
 	/// Drive an auto-paginating list call. `fetchPage` is invoked once per page
@@ -1836,7 +1846,7 @@ final class McpClient : ClientProtocol
 			// Per-request modern logging opt-in: stamp the explicit level so
 			// `injectModernMeta` carries it (and leaves it to win over any sticky
 			// `setLogLevel` default). Empty -> no field.
-			auto params = withRequestLogLevel(buildParams(responses, requestState), logLevel);
+			auto params = withSessionLogLevel(buildParams(responses, requestState), logLevel);
 			result = R.fromJson(rpc(method, params));
 			// server/utilities/caching: an interim input_required result carries no
 			// caching hint, and a result produced by a retry carrying
@@ -2624,7 +2634,7 @@ final class McpClient : ClientProtocol
 			RequestOptions opts = RequestOptions.init) @safe
 	{
 		auto token = effectiveToken(opts);
-		auto params = withRequestLogLevel(withProgressToken(buildCompleteParams(reference,
+		auto params = withSessionLogLevel(withProgressToken(buildCompleteParams(reference,
 				argumentName, argumentValue, context), token), opts.logLevel);
 		return withPerCallProgress!CompleteResult(opts,
 				() @safe => CompleteResult.fromJson(rpc("completion/complete", params)));
@@ -5997,6 +6007,30 @@ version (unittest)
 		opts.logLevel = "debug";
 		call(c, opts);
 		return seen;
+	}
+}
+
+unittest  // a legacy session never stamps the modern per-request logLevel
+{
+	auto c = McpClient.http("http://localhost");
+	Json[string] seen;
+	c.onRpcForTest = (string method, Json params) @safe {
+		seen[method] = params;
+		if (method == "tools/call")
+			return Json(["content": Json.emptyArray]);
+		if (method == "completion/complete")
+			return Json(["completion": Json(["values": Json.emptyArray])]);
+		return Json.emptyObject;
+	};
+	RequestOptions opts;
+	opts.logLevel = "debug";
+	c.ping(opts);
+	c.callTool("t", Json.emptyObject, opts);
+	c.complete(CompletionReference.forPrompt("p"), "a", "v", null, opts);
+	foreach (method; ["ping", "tools/call", "completion/complete"])
+	{
+		auto p = seen[method];
+		assert("_meta" !in p || MetaKey.logLevel !in p["_meta"], method);
 	}
 }
 
