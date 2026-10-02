@@ -327,10 +327,11 @@ final class HttpClientTransport : ClientTransport
 	/// the tool inputSchema cache or modern state.
 	private ClientProtocol protocol;
 
-	// Optional cap on the number of POSTs in flight at once. Zero (the default)
-	// means unlimited: no semaphore is created and every request issues its POST
-	// immediately. When positive, a
-	// `LocalTaskSemaphore` admits at most this many concurrent POSTs and an excess
+	// Optional cap on the number of request POSTs in flight at once. Zero (the
+	// default) means unlimited: no semaphore is created and every request issues
+	// its POST immediately. When positive, a `LocalTaskSemaphore` admits at most
+	// this many concurrent request POSTs (notifications and replies bypass it,
+	// see `post`) and an excess
 	// caller awaits a permit instead of minting another socket, bounding the
 	// ephemeral-port / TIME_WAIT pressure a burst of concurrent requests creates.
 	private uint maxInFlight;
@@ -404,7 +405,7 @@ final class HttpClientTransport : ClientTransport
 
 	/// Bound each one-way POST (a notification, a reply to a server->client
 	/// request, or a legacy HTTP+SSE request) by `timeout`, so an unresponsive
-	/// server cannot hold the sending task or its in-flight permit indefinitely.
+	/// server cannot hold the sending task indefinitely.
 	/// Zero removes the bound.
 	void setSendTimeout(Duration timeout) @safe
 	{
@@ -623,10 +624,12 @@ final class HttpClientTransport : ClientTransport
 
 		const target = legacyMode ? legacyEndpoint : url;
 		int status;
-		// Hold an in-flight permit (no-op when uncapped) for the duration of the
-		// POST so a oneway send counts against the concurrency cap and releases on
-		// every exit path, including exceptions.
-		auto permit = acquireInFlight();
+		// Only a legacy request takes an in-flight permit. A notification or a reply
+		// to a server->client request bypasses the cap: the request POST awaiting
+		// that reply already holds a permit, so with every permit held by such
+		// requests a capped reply could never be sent.
+		const isRequest = message.type == Json.Type.object && "method" in message && "id" in message;
+		auto permit = isRequest ? acquireInFlight() : null;
 		scope (exit)
 			if (permit !is null)
 				permit.unlock();
@@ -4372,6 +4375,48 @@ unittest  // the raw-socket POST sends a Host header carrying the non-default po
 	assert(failure.length == 0, "scenario failed: " ~ failure);
 	assert(hosts.length >= 2);
 	assert(hosts.all!(h => h == expected), "Host must carry the port: " ~ hosts.to!string);
+}
+
+unittest  // a reply to a server->client request is sent while every in-flight permit is held
+{
+	import core.time : msecs, MonoTime;
+	import mcp.client.client : McpClient, ClientSettings;
+	import vibe.core.core : sleep;
+
+	bool replied;
+	auto r = new URLRouter;
+	r.post("/mcp", (HTTPServerRequest req, HTTPServerResponse res) @safe {
+		auto j = requestJson(req);
+		const method = ("method" in j) ? j["method"].get!string : "";
+		if (method == "initialize")
+			res.writeBody(initializeReply(j, "2025-11-25").toString(), "application/json");
+		else if ("id" !in j || method.length == 0)
+		{
+			if ("result" in j)
+				replied = true;
+			res.statusCode = 202;
+			res.writeBody("", "text/plain");
+		}
+		else
+		{
+			writeSse(res, `data: {"jsonrpc":"2.0","id":"s1","method":"ping"}` ~ "\n\n");
+			const until = MonoTime.currTime + 3.seconds;
+			while (!replied && MonoTime.currTime < until)
+				sleep(20.msecs);
+			writeSse(res, toolsListFrame(j["id"].get!long));
+		}
+	});
+	ClientSettings settings;
+	settings.maxInFlight = 1;
+	const failure = runAgainstFakeServer(r, (string url) @safe {
+		auto client = McpClient.http(url, settings);
+		scope (exit)
+			client.close();
+		client.initialize("2025-11-25");
+		client.listTools();
+	});
+	assert(failure.length == 0, "scenario failed: " ~ failure);
+	assert(replied, "the ping reply must not wait for the request POST's permit");
 }
 
 unittest  // HttpEndpoint.hostHeader omits only the scheme's default port

@@ -220,14 +220,13 @@ struct ClientSettings
 	/// exhausted) fails with a typed error instead of hanging indefinitely.
 	Duration connectTimeout = 30.seconds;
 
-	/// HTTP transport only: cap on concurrent in-flight POSTs (0 = unlimited).
+	/// HTTP transport only: cap on concurrent in-flight request POSTs (0 = unlimited).
 	/// Each request uses its own connection, so a positive cap makes excess
 	/// requests await a permit rather than opening another socket, bounding
-	/// socket / ephemeral-port use. The cap counts both request POSTs and the
-	/// oneway POSTs that carry notifications and replies to server-initiated
-	/// requests (sampling / elicitation / roots); when a tool uses those, size the
-	/// cap above the round-trip nesting depth so an awaiting request POST and its
-	/// reply POST can both hold a permit.
+	/// socket / ephemeral-port use. A request POST holds its permit until its
+	/// response stream ends. Notifications and replies to server-initiated
+	/// requests (sampling / elicitation / roots) are short and never wait for a
+	/// permit, so a request awaiting such a reply cannot deadlock the cap.
 	uint maxInFlight = 0;
 
 	/// The largest message the client accepts from the server: an HTTP response
