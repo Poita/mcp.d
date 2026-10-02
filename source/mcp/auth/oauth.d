@@ -1091,7 +1091,8 @@ unittest  // isSecureFetchUrl treats numeric loopback encodings as loopback (htt
 	assert(isSecureFetchUrl("https://2130706433/x", SsrfPolicy.allowLoopback)); // 127.0.0.1
 	assert(isSecureFetchUrl("https://127.1/x", SsrfPolicy.allowLoopback));
 	assert(isSecureFetchUrl("https://0x7f000001/x", SsrfPolicy.allowLoopback));
-	assert(isSecureFetchUrl("https://0177.0.0.1/x", SsrfPolicy.allowLoopback));
+	// A leading-zero part is ambiguous (octal or decimal by resolver) and fails closed.
+	assert(!isSecureFetchUrl("https://0177.0.0.1/x", SsrfPolicy.allowLoopback));
 }
 
 unittest  // isSecureFetchUrl rejects numeric encodings of the cloud metadata address (SSRF)

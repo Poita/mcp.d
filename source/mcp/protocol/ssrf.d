@@ -192,6 +192,34 @@ bool canonicalizeNumericIpv4(string host, out ubyte[4] outOct) @safe pure nothro
 	return true;
 }
 
+/// True when a numeric IPv4 literal has a multi-digit, non-hex part that starts
+/// with `0` (e.g. `0127.0.0.1`). `inet_aton` reads such a part as octal but some
+/// resolvers (macOS `getaddrinfo`) read it as decimal, so the literal names no
+/// single address and the classifiers fail it closed.
+private bool hasLeadingZeroPart(string host) @safe pure nothrow @nogc
+{
+	size_t start;
+	foreach (i; 0 .. host.length + 1)
+	{
+		if (i < host.length && host[i] != '.')
+			continue;
+		const part = host[start .. i];
+		if (part.length > 1 && part[0] == '0' && part[1] != 'x' && part[1] != 'X')
+			return true;
+		start = i + 1;
+	}
+	return false;
+}
+
+/// The canonical dotted-quad text of `oct`.
+private string dottedQuad(const ubyte[4] oct) @safe pure nothrow
+{
+	import std.conv : to;
+
+	return oct[0].to!string ~ "." ~ oct[1].to!string ~ "." ~ oct[2].to!string
+		~ "." ~ oct[3].to!string;
+}
+
 // ---------------------------------------------------------------------------
 // IPv6 literal parsing.
 // ---------------------------------------------------------------------------
@@ -558,9 +586,14 @@ private string stripPortAndBrackets(string host) @safe pure nothrow @nogc
 /// `pinnedIp`. This is the SINGLE address classifier all SSRF decisions flow
 /// through:
 ///
-/// - IP literals (IPv4 in every numeric encoding, IPv6 including embedded-IPv4,
-///   ULA, link-local and loopback) are classified directly and `pinnedIp` is the
-///   host verbatim (already a literal vibe will not re-resolve).
+/// - IPv4 literals in every numeric encoding are classified directly and
+///   `pinnedIp` is their canonical dotted quad. A literal with a multi-digit
+///   part that starts with `0` (`0127.0.0.1`) is octal to `inet_aton` but
+///   decimal to some resolvers, so it is `privateOrLinkLocal` with an empty
+///   `pinnedIp` (fail CLOSED).
+/// - IPv6 literals (including embedded-IPv4, ULA, link-local and loopback) are
+///   classified directly and `pinnedIp` is the host verbatim (already a literal
+///   vibe will not re-resolve).
 /// - `localhost` and `::1` are classified as loopback; `pinnedIp` is the host
 ///   verbatim.
 /// - A registered hostname is resolved; EVERY returned A/AAAA address is
@@ -600,11 +633,15 @@ AddressClass classifyHost(string host, out string pinnedIp) @safe
 		return AddressClass.loopback;
 	}
 
-	// A numeric IPv4 literal in any encoding — classify directly, pin verbatim.
+	// A numeric IPv4 literal in any encoding — classify directly and pin the
+	// canonical dotted quad, so the connection reaches exactly the classified
+	// address whatever the resolver makes of the original spelling.
 	ubyte[4] oct;
 	if (canonicalizeNumericIpv4(bare, oct))
 	{
-		pinnedIp = host;
+		if (hasLeadingZeroPart(bare))
+			return AddressClass.privateOrLinkLocal; // ambiguous literal -> fail CLOSED
+		pinnedIp = dottedQuad(oct);
 		return classifyIpv4Octets(oct[0], oct[1], oct[2], oct[3]);
 	}
 
@@ -679,7 +716,8 @@ private Resolution resolveHostAddresses(string host) @trusted
 /// explicit loopback names (`localhost`) are classified directly; any registered
 /// hostname is treated as `public_` (a lexical pre-filter cannot know what it
 /// resolves to — the resolve-and-pin connector makes the authoritative call).
-/// `@safe pure nothrow @nogc`.
+/// An IPv4 literal with a leading-zero multi-digit part is `privateOrLinkLocal`,
+/// as in `classifyHost`. `@safe pure nothrow @nogc`.
 AddressClass classifyHostLexical(string host) @safe pure nothrow @nogc
 {
 	import std.string : indexOf;
@@ -701,7 +739,11 @@ AddressClass classifyHostLexical(string host) @safe pure nothrow @nogc
 
 	ubyte[4] oct;
 	if (canonicalizeNumericIpv4(bare, oct))
+	{
+		if (hasLeadingZeroPart(bare))
+			return AddressClass.privateOrLinkLocal; // ambiguous literal -> fail closed
 		return classifyIpv4Octets(oct[0], oct[1], oct[2], oct[3]);
+	}
 
 	// A registered hostname: lexically public (no resolution here).
 	return AddressClass.public_;
@@ -1269,7 +1311,40 @@ unittest  // classifyHost classes numeric-encoded loopback as loopback (SSRF enc
 	assert(classifyHost("2130706433", pin) == AddressClass.loopback); // 127.0.0.1
 	assert(classifyHost("127.1", pin) == AddressClass.loopback);
 	assert(classifyHost("0x7f000001", pin) == AddressClass.loopback);
-	assert(classifyHost("0177.0.0.1", pin) == AddressClass.loopback);
+}
+
+unittest  // classifyHost pins a numeric IPv4 literal to its canonical dotted quad
+{
+	string pin;
+	assert(classifyHost("0x7f000001", pin) == AddressClass.loopback && pin == "127.0.0.1");
+	assert(classifyHost("2130706433:8080", pin) == AddressClass.loopback && pin == "127.0.0.1");
+	assert(classifyHost("8.8.2056", pin) == AddressClass.public_ && pin == "8.8.8.8");
+}
+
+unittest  // classifyHost fails closed on a multi-digit IPv4 part with a leading zero
+{
+	// Resolvers disagree on whether `0127` is octal (87) or decimal (127).
+	string pin;
+	assert(classifyHost("0127.0.0.1", pin) == AddressClass.privateOrLinkLocal && pin.length == 0);
+	assert(classifyHost("8.8.8.010", pin) == AddressClass.privateOrLinkLocal && pin.length == 0);
+	assert(classifyHost("00", pin) == AddressClass.privateOrLinkLocal && pin.length == 0);
+	assert(classifyHostLexical("0127.0.0.1") == AddressClass.privateOrLinkLocal);
+	assert(classifyHostLexical("0177.0.0.1:80") == AddressClass.privateOrLinkLocal);
+}
+
+unittest  // pinnedConnectAddress rejects a leading-zero IPv4 literal under every policy
+{
+	assert(!pinnedConnectAddress("0127.0.0.1", false, SsrfPolicy.blockInternal).ok);
+	assert(!pinnedConnectAddress("0127.0.0.1", false, SsrfPolicy.allowLoopback).ok);
+	assert(!pinnedConnectAddress("0127.0.0.1", false, SsrfPolicy.allowUserConfigured).ok);
+}
+
+unittest  // classifyHost keeps single-digit zero parts and hex parts unambiguous
+{
+	string pin;
+	assert(classifyHost("0.0.0.0", pin) == AddressClass.privateOrLinkLocal && pin == "0.0.0.0");
+	assert(classifyHost("10.0.0.1", pin) == AddressClass.privateOrLinkLocal && pin == "10.0.0.1");
+	assert(classifyHost("0x08.0x08.0x08.0x08", pin) == AddressClass.public_ && pin == "8.8.8.8");
 }
 
 unittest  // classifyHost classes numeric-encoded metadata/RFC1918 as private (SSRF encodings)
