@@ -576,6 +576,12 @@ void mountOAuthConsent(URLRouter router, OAuthProxy proxy, ProxyStateStore store
 	const secureCookie = proxy.config().baseUrl.startsWith("https://");
 	router.post(consentPath, (HTTPServerRequest req, HTTPServerResponse res) @safe {
 		const form = readFormString(req);
+		if (!formDecodes(form))
+		{
+			res.statusCode = HTTPStatus.badRequest;
+			res.writeJsonBody(invalidRequestJson("malformed form encoding"));
+			return;
+		}
 		const proxyState = formField(form, "state");
 		bool found;
 		// Peek rather than take: a refused approval (a forged cross-site post, a
@@ -1661,6 +1667,20 @@ unittest  // CONSENT CSRF: a refused POST /consent leaves the pending authorizat
 			consentForm(page.body_), page.setCookie);
 	assert(approved.status == 302);
 	assert(approved.location.startsWith("https://github.com/login/oauth/authorize?"));
+}
+
+unittest  // /consent answers a malformed percent-encoding with a 400 JSON invalid_request
+{
+	import vibe.data.json : parseJsonString;
+
+	auto proxy = new OAuthProxy(consentMountConfig());
+	proxy.register(["http://localhost:5000/cb"]);
+	auto router = new URLRouter;
+	mountOAuthProxy(router, proxy);
+
+	const res = browserPost(router, "https://mcp.example.com/consent", "state=%zz&csrf=x", "");
+	assert(res.status == 400);
+	assert(parseJsonString(res.body_)["error"].get!string == "invalid_request");
 }
 
 unittest  // CONSENT HARDENING: the consent screen cannot be framed (clickjacking)
