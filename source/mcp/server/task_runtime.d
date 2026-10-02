@@ -55,6 +55,9 @@ final class TaskRuntime
 	private TaskOptions opts_;
 	private void delegate(Json detailed, string owner) @safe onStatusChange_;
 	private BackgroundLoop sweeper_;
+	// Tasks whose status changes are not pushed: ephemeral records whose id no
+	// client ever learns.
+	private bool[string] silenced_;
 
 	this(TaskStore store, TaskOptions opts) @safe
 	{
@@ -78,6 +81,17 @@ final class TaskRuntime
 	void onStatusChange(void delegate(Json detailed, string owner) @safe cb) @safe
 	{
 		onStatusChange_ = cb;
+	}
+
+	/// Stop (`silent` true) or resume pushing status changes of task `id` to the
+	/// `onStatusChange` sink. Used for a task record that backs a synchronous
+	/// call, whose client never sees the task.
+	package(mcp) void setSilent(string id, bool silent) @safe nothrow
+	{
+		if (silent)
+			silenced_[id] = true;
+		else
+			silenced_.remove(id);
 	}
 
 	/// Create a fresh `working` task with no associated executor (the manual path,
@@ -288,7 +302,7 @@ final class TaskRuntime
 	{
 		import vibe.core.log : logWarn;
 
-		if (onStatusChange_ is null)
+		if (onStatusChange_ is null || id in silenced_)
 			return;
 		try
 			onStatusChange_(getDetailed(id), owner);

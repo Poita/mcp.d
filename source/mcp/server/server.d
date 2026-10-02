@@ -1194,9 +1194,14 @@ final class McpServer : ServerCore
 		auto exec = name in taskExecutors_;
 		auto seed = taskRuntime_.createFor(name, args, Nullable!Duration.init,
 				Nullable!Duration.init, requestPrincipal(ctx));
-		// The client never learns this task's id, so the record dies with the call.
+		// The client never learns this task's id, so the record dies with the call
+		// and its status changes are not pushed as notifications/tasks.
+		taskRuntime_.setSilent(seed.taskId, true);
 		scope (exit)
+		{
 			taskRuntime_.store.remove(seed.taskId);
+			taskRuntime_.setSilent(seed.taskId, false);
+		}
 		runTaskExecutor(taskRuntime_, seed.taskId, *exec);
 		auto detailed = taskRuntime_.getDetailed(seed.taskId);
 		const status = detailed["status"].get!string;
@@ -7565,6 +7570,40 @@ unittest  // a task tool called without the extension runs synchronously and ret
 	assert("taskId" !in resp["result"]);
 	assert(resp["result"]["structuredContent"]["result"].get!int == 42);
 	assert(resp["result"]["content"][0]["text"].get!string == "doubled");
+}
+
+unittest  // a task tool run inline for a client without the extension emits no notifications/tasks
+{
+	import std.algorithm : canFind;
+
+	auto s = new McpServer("t", "1");
+	s.enableTasks(null, TaskOptions.init, new SyncTaskDispatcher());
+	Tool desc;
+	desc.name = "slow";
+	desc.inputSchema = Json(["type": Json("object")]);
+	s.registerTaskTool(desc, (TaskContext tc) @safe {
+		tc.progress("halfway");
+		return Json(["content": Json.emptyArray]);
+	});
+	string[] frames;
+	void sink(string f) @safe
+	{
+		frames ~= f;
+	}
+
+	Json meta = Json.emptyObject;
+	meta[MetaKey.protocolVersion] = "2026-07-28";
+	meta[MetaKey.clientCapabilities] = Json.emptyObject;
+	Json params = Json.emptyObject;
+	params["notifications"] = Json(["toolsListChanged": Json(true)]);
+	params["_meta"] = meta;
+	assert(s.tryServeStdioListen(Message(makeRequest(Json(1),
+			"subscriptions/listen", params)), &sink));
+
+	auto resp = s.handle(modernReqNoTasks(2, "tools/call",
+			Json(["name": Json("slow"), "arguments": Json.emptyObject]))).get;
+	assert("error" !in resp);
+	assert(!frames.canFind!(fr => fr.canFind("notifications/tasks")));
 }
 
 unittest  // a synchronous task-tool call validates arguments before running the executor
