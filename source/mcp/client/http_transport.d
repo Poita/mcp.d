@@ -2049,10 +2049,8 @@ final class HttpClientTransport : ClientTransport
 						notifyLegacy(); // wake `startLegacyFallback`
 						return;
 					}
-					// `message` event (or untyped): a JSON-RPC message. Resolution and
-					// inbound dispatch run OUTSIDE any catch here, so a failure during
-					// dispatch propagates to the outer catch and tears the stream down
-					// (fast-failing every waiter) rather than being swallowed.
+					// `message` event (or untyped): a JSON-RPC message, resolved to its
+					// waiter or handed to the inbound handler on its own task.
 					resolveLegacyMessage(data);
 				});
 			}
@@ -2069,9 +2067,8 @@ final class HttpClientTransport : ClientTransport
 
 	/// Resolve one `message`-event frame from the legacy HTTP+SSE stream. A response
 	/// or error addressed to a registered waiter id resolves that waiter; any other
-	/// message falls through to the inbound dispatcher. Only the `parseJsonString`
-	/// step tolerates failure (non-JSON keep-alive frames), logged for visibility;
-	/// a failure anywhere else propagates so the caller can tear the stream down.
+	/// message goes to the inbound dispatcher on its own task. A non-JSON frame
+	/// (a keep-alive) is logged and ignored.
 	private void resolveLegacyMessage(string data) @safe
 	{
 		Message m;
@@ -2107,7 +2104,29 @@ final class HttpClientTransport : ClientTransport
 			notifyLegacy(); // wake the matching `legacyRpc`
 		}
 		else
-			dispatch(m);
+			dispatchOffReader(m);
+	}
+
+	/// Run the inbound handler for `m` on its own task. Every legacy response
+	/// arrives on the one GET stream, so a handler that issues a request of its
+	/// own (a sampling handler calling a tool, say) would otherwise wait on a
+	/// response the blocked reader can never deliver. `runTask` switches to the
+	/// new task at once, so a handler that does not block finishes before the
+	/// next event is read and arrival order is kept.
+	private void dispatchOffReader(Message m) @safe
+	{
+		import vibe.core.core : runTask;
+
+		runTask((Message msg) nothrow{
+			try
+				dispatch(msg);
+			catch (Exception e)
+			{
+				import vibe.core.log : logWarn;
+
+				logWarn("legacy HTTP+SSE: inbound handler threw: %s", e.msg);
+			}
+		}, m);
 	}
 
 	/// Fail every still-outstanding legacy waiter with a typed error so each blocked
@@ -2994,6 +3013,34 @@ unittest  // the legacy reader liveness flag starts false before runLegacyStream
 {
 	auto t = new HttpClientTransport("http://host:8080/mcp");
 	assert(!t.legacyStreamAlive);
+}
+
+unittest  // a legacy server->client request is handled off the reader so the reader keeps reading
+{
+	import core.time : msecs;
+	import vibe.core.core : runTask, sleep;
+
+	bool started, finished, readerFree;
+	const failure = runAgainstFakeServer(new URLRouter, (string url) @safe {
+		auto t = new HttpClientTransport(url);
+		auto release = createManualEvent();
+		t.setInboundHandler((Message m) @safe {
+			started = true;
+			// Stands in for a handler awaiting a response only the reader can deliver.
+			auto ec = release.emitCount;
+			release.wait(2.seconds, ec);
+			finished = true;
+		});
+		t.resolveLegacyMessage(
+			`{"jsonrpc":"2.0","id":"s1","method":"sampling/createMessage","params":{}}`);
+		readerFree = !finished;
+		release.emit();
+		sleep(50.msecs);
+		t.close();
+	});
+	assert(failure.length == 0, "scenario failed: " ~ failure);
+	assert(started && finished);
+	assert(readerFree, "the reader must not wait for a server->client request's handler");
 }
 
 unittest  // errorFrom maps a well-formed JSON-RPC error object
