@@ -196,9 +196,10 @@ in (store !is null)
 		TokenInfo info;
 		info.valid = true;
 		info.subject = t.subject;
-		info.scopes = t.scopes;
-		info.claims = t.claims;
-		info.audience = t.audience.length ? t.audience : [resource];
+		info.scopes = t.scopes.dup;
+		// Copies, so a handler editing its TokenInfo cannot rewrite the stored token.
+		info.claims = t.claims.clone();
+		info.audience = t.audience.length ? t.audience.dup : [resource];
 		return info;
 	};
 }
@@ -229,6 +230,26 @@ private long nowUnixSeconds() @safe
 
 	auto validate = referenceTokenValidator(store, "https://api.example.com");
 	assert(!validate(tok).valid);
+}
+
+@safe unittest  // a handler mutating the validated claims does not alter the stored token
+{
+	import vibe.data.json : parseJsonString;
+
+	auto store = new ReferenceTokenStore();
+	IssuedToken t;
+	t.subject = "alice";
+	t.expiresAt = long.max;
+	t.claims = parseJsonString(`{"role":"reader","nested":{"k":"v"}}`);
+	const tok = store.issue(t);
+	auto validate = referenceTokenValidator(store, "https://api.example.com");
+
+	auto info = validate(tok);
+	info.claims["role"] = "admin";
+	info.claims["nested"]["k"] = "changed";
+	auto again = validate(tok);
+	assert(again.claims["role"].get!string == "reader");
+	assert(again.claims["nested"]["k"].get!string == "v");
 }
 
 @safe unittest  // a revoked token no longer resolves or validates
