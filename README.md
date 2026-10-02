@@ -527,6 +527,10 @@ runWithEventLoop(() @safe {
 
 It discovers the protected-resource and authorization-server metadata, then:
 
+- **Picks the scopes**: `OAuthLogin.scopes` when set, otherwise the `scope` of
+  the 401 challenge passed as `OAuthLogin.wwwAuthenticate`, otherwise the
+  protected-resource metadata's `scopes_supported`.
+
 - **Reuses a stored token** for the endpoint when one is still valid, or redeems
   its refresh token, without opening a browser.
 - Otherwise **registers the client** — a pre-registered `OAuthLogin.clientId`, a

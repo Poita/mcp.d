@@ -56,6 +56,19 @@ package bool prmResourceMatches(string prmResource, string mcpEndpoint) @safe
 	return want.length > have.length && want.startsWith(have) && want[have.length] == '/';
 }
 
+/// Where an MCP endpoint's authorization server was found
+/// (`OAuthClient.discoverIssuer`).
+struct IssuerResolution
+{
+	/// The issuer to run authorization-server metadata discovery against.
+	string issuer;
+	/// True when `issuer` came from a protected-resource metadata document (RFC
+	/// 9728); false on the 2025-03-26 origin fallback.
+	bool fromProtectedResourceMetadata;
+	/// That protected-resource metadata document (empty on the origin fallback).
+	ProtectedResourceMetadata metadata;
+}
+
 /// A production OAuth 2.1 client for MCP: drives protected-resource and
 /// authorization-server metadata discovery (RFC 9728 / RFC 8414), Dynamic Client
 /// Registration (RFC 7591), and the token endpoint (authorization-code + PKCE,
@@ -294,8 +307,17 @@ final class OAuthClient
 	string resolveIssuer(string mcpEndpoint,
 			out bool fromProtectedResourceMetadata, string wwwAuthenticateHeader = "") @safe
 	{
+		const r = discoverIssuer(mcpEndpoint, wwwAuthenticateHeader);
+		fromProtectedResourceMetadata = r.fromProtectedResourceMetadata;
+		return r.issuer;
+	}
+
+	/// `resolveIssuer`, also returning the protected-resource metadata document
+	/// the issuer came from (for its `scopes_supported`).
+	IssuerResolution discoverIssuer(string mcpEndpoint, string wwwAuthenticateHeader = "") @safe
+	{
 		return resolveIssuerFrom(() => discoverProtectedResource(mcpEndpoint,
-				wwwAuthenticateHeader), mcpEndpoint, fromProtectedResourceMetadata);
+				wwwAuthenticateHeader), mcpEndpoint);
 	}
 
 	/// Decide the issuer from a protected-resource-metadata discovery, with the
@@ -306,23 +328,21 @@ final class OAuthClient
 	/// no authorization server, which RFC 9728 makes the only way to locate one)
 	/// propagates so the flow fails closed rather than silently relaxing issuer
 	/// binding.
-	private static string resolveIssuerFrom(scope ProtectedResourceMetadata delegate() @safe discover,
-			string mcpEndpoint, out bool fromProtectedResourceMetadata) @safe
+	private static IssuerResolution resolveIssuerFrom(
+			scope ProtectedResourceMetadata delegate() @safe discover, string mcpEndpoint) @safe
 	{
 		try
 		{
 			auto prm = discover();
 			if (prm.authorizationServers.length == 0)
 				throw internalError("Protected resource metadata lists no authorization_servers");
-			fromProtectedResourceMetadata = true;
-			return prm.authorizationServers[0];
+			return IssuerResolution(prm.authorizationServers[0], true, prm);
 		}
 		catch (PrmAbsentException)
 		{
 			// Genuine pre-RFC-9728 server: no PRM document at all -> origin fallback.
 		}
-		fromProtectedResourceMetadata = false;
-		return originOf(mcpEndpoint);
+		return IssuerResolution(originOf(mcpEndpoint), false);
 	}
 
 	/// Convenience overload that discards the discovery-source signal.
@@ -974,46 +994,44 @@ unittest  // exhausted PRM discovery distinguishes genuine absence from a fetch 
 
 unittest  // resolveIssuerFrom downgrades to the origin only when the PRM document is genuinely absent
 {
-	bool fromPrm;
-	const issuer = OAuthClient.resolveIssuerFrom(() @safe {
+	const r = OAuthClient.resolveIssuerFrom(() @safe {
 		throw new PrmAbsentException("no PRM");
 		return ProtectedResourceMetadata.init;
-	}, "https://mcp.example.com/sse", fromPrm);
-	assert(!fromPrm);
-	assert(issuer == "https://mcp.example.com");
+	}, "https://mcp.example.com/sse");
+	assert(!r.fromProtectedResourceMetadata);
+	assert(r.issuer == "https://mcp.example.com");
 }
 
 unittest  // resolveIssuerFrom does NOT silently downgrade on a fetch/security error — it propagates
 {
 	import std.exception : assertThrown;
 
-	bool fromPrm;
 	assertThrown!McpException(OAuthClient.resolveIssuerFrom(() @safe {
 			throw internalError("Refusing to fetch URL with no parseable host");
 			return ProtectedResourceMetadata.init;
-		}, "https://mcp.example.com/sse", fromPrm));
+		}, "https://mcp.example.com/sse"));
 }
 
 unittest  // resolveIssuerFrom refuses a PRM document that names no authorization server
 {
 	import std.exception : assertThrown;
 
-	bool fromPrm;
 	assertThrown!McpException(OAuthClient.resolveIssuerFrom(() @safe {
 			return ProtectedResourceMetadata.init;
-		}, "https://mcp.example.com/sse", fromPrm));
+		}, "https://mcp.example.com/sse"));
 }
 
 unittest  // resolveIssuerFrom returns the PRM-advertised authorization server on the modern path
 {
-	bool fromPrm;
-	const issuer = OAuthClient.resolveIssuerFrom(() @safe {
+	const r = OAuthClient.resolveIssuerFrom(() @safe {
 		ProtectedResourceMetadata prm;
 		prm.authorizationServers = ["https://as.example.com"];
+		prm.scopesSupported = ["mcp:read"];
 		return prm;
-	}, "https://mcp.example.com/sse", fromPrm);
-	assert(fromPrm);
-	assert(issuer == "https://as.example.com");
+	}, "https://mcp.example.com/sse");
+	assert(r.fromProtectedResourceMetadata);
+	assert(r.issuer == "https://as.example.com");
+	assert(r.metadata.scopesSupported == ["mcp:read"]);
 }
 
 unittest  // 2025-03-26 backcompat path: a sub-path issuer mismatch is tolerated

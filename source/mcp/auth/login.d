@@ -595,8 +595,14 @@ string loopbackResponseHtml(bool success) @safe pure nothrow
 /// client-registration inputs.
 struct OAuthLogin
 {
-	/// OAuth scopes to request (space-joined into the `scope` parameter).
+	/// OAuth scopes to request (space-joined into the `scope` parameter). When
+	/// empty, `useOAuth` requests the scopes named by `wwwAuthenticate`'s
+	/// challenge, else the protected-resource metadata's `scopes_supported`.
 	string[] scopes;
+	/// The `WWW-Authenticate` header of the 401 that prompted the login, if any.
+	/// Its `resource_metadata` URL is tried first for discovery and its `scope`
+	/// selects the scopes to request when `scopes` is empty.
+	string wwwAuthenticate;
 	/// Loopback listener port for the redirect. 0 selects an ephemeral port.
 	ushort callbackPort = 0;
 	/// The loopback path the authorization server redirects to.
@@ -631,6 +637,20 @@ struct OAuthLogin
 			s ~= (i ? " " : "") ~ sc;
 		return s;
 	}
+}
+
+/// The scopes a login requests: `opts.scopes` when set, otherwise those chosen
+/// by `selectScope` from the `opts.wwwAuthenticate` challenge and the
+/// protected-resource metadata `prm`.
+package string[] loginScopes(const OAuthLogin opts, const ProtectedResourceMetadata prm) @safe
+{
+	import std.array : split;
+
+	if (opts.scopes.length)
+		return opts.scopes.dup;
+	const challengeScope = opts.wwwAuthenticate.length
+		? parseWwwAuthenticate(opts.wwwAuthenticate).scope_ : null;
+	return selectScope(challengeScope, prm.scopesSupported).split();
 }
 
 /// The default loopback redirect URI for a given port and path. It names the
@@ -995,9 +1015,9 @@ OAuthSession useOAuth(McpClient client, string mcpEndpoint, OAuthLogin opts) @sa
 	// issuer only on the modern RFC 9728 path (issuer named by a
 	// protected-resource-metadata document); stay lenient on the 2025-03-26
 	// origin fallback.
-	bool issuerFromPrm;
-	const issuer = oauth.resolveIssuer(mcpEndpoint, issuerFromPrm);
-	auto as_ = oauth.discoverAuthServer(issuer, issuerFromPrm);
+	const located = oauth.discoverIssuer(mcpEndpoint, opts.wwwAuthenticate);
+	auto as_ = oauth.discoverAuthServer(located.issuer, located.fromProtectedResourceMetadata);
+	opts.scopes = loginScopes(opts, located.metadata);
 
 	// Reuse a cached, still-valid token when present. A record from another
 	// authorization server (or one that never recorded its issuer) is ignored:
@@ -1565,6 +1585,38 @@ unittest  // with no per-user directory the token store path is refused, not put
 	import std.exception : assertThrown;
 
 	assertThrown!McpException(tokenStorePathFor(fakeEnv(null), false));
+}
+
+unittest  // login scopes default to the WWW-Authenticate challenge's scope
+{
+	OAuthLogin opts;
+	opts.wwwAuthenticate = `Bearer resource_metadata="https://mcp.example.com/.well-known/oauth-protected-resource", scope="files:read files:write"`;
+	ProtectedResourceMetadata prm;
+	prm.scopesSupported = ["other"];
+	assert(loginScopes(opts, prm) == ["files:read", "files:write"]);
+}
+
+unittest  // login scopes fall back to the resource metadata's scopes_supported
+{
+	OAuthLogin opts;
+	ProtectedResourceMetadata prm;
+	prm.scopesSupported = ["mcp:read", "mcp:write"];
+	assert(loginScopes(opts, prm) == ["mcp:read", "mcp:write"]);
+}
+
+unittest  // explicitly configured login scopes win over discovered ones
+{
+	OAuthLogin opts;
+	opts.scopes = ["mine"];
+	opts.wwwAuthenticate = `Bearer scope="theirs"`;
+	ProtectedResourceMetadata prm;
+	prm.scopesSupported = ["supported"];
+	assert(loginScopes(opts, prm) == ["mine"]);
+}
+
+unittest  // with nothing configured or discovered no scope is requested
+{
+	assert(loginScopes(OAuthLogin.init, ProtectedResourceMetadata.init).length == 0);
 }
 
 unittest  // loopbackResponseHtml differs for success and failure
