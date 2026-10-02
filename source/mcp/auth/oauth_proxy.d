@@ -852,41 +852,73 @@ interface ConsentStore
 	void grantConsent(string consentSession, string client) @safe;
 }
 
+/// Bounds for an `InMemoryConsentStore`.
+struct ConsentStoreOptions
+{
+	/// Maximum number of approvals retained. When exceeded on `grantConsent`,
+	/// the oldest approval is evicted.
+	size_t maxApprovals = 10_000;
+
+	/// Maximum number of approvals retained for one client (across browsers).
+	/// When exceeded, that client's oldest approval is evicted, so a flood of
+	/// approvals for one client churns only its own entries rather than
+	/// pushing other clients' approvals out of `maxApprovals`. A client shared by
+	/// many users (a CIMD `client_id`, or a common DCR `redirect_uri`) re-prompts
+	/// its least recent users for consent past this many; raise it for such a
+	/// deployment.
+	size_t maxApprovalsPerClient = 1_000;
+}
+
 /// A simple in-memory `ConsentStore` bounded against unauthenticated growth: the
-/// number of approvals is capped, evicting the oldest approval first when the cap
-/// is reached, so the (otherwise insert-only) consent map cannot grow process
-/// memory without bound.
+/// number of approvals, overall and per client, is capped, evicting the oldest
+/// approval first when a cap is reached, so the (otherwise insert-only) consent
+/// map cannot grow process memory without bound. Eviction is amortized O(1).
 ///
 /// NOTE: even bounded, this in-memory default is unsuitable for an
 /// internet-exposed multi-process proxy: consent is per-process and lost on
-/// restart. Back it with shared, bounded storage (and consider a consent TTL) for
+/// restart, and an attacker registering many clients can still cycle the overall
+/// cap. Back it with shared, bounded storage (and consider a consent TTL) for
 /// such deployments.
 final class InMemoryConsentStore : ConsentStore
 {
-	/// Maximum number of approvals retained. When exceeded on `grantConsent`, the
-	/// oldest approval is evicted.
-	enum size_t defaultMaxApprovals = 10_000;
-
 	private static struct Key
 	{
 		string consentSession;
 		string client;
 	}
 
-	private bool[Key] approved;
-	private Key[] order;
-	private const size_t maxApprovals;
+	// One grant of `key`; `serial` tells it apart from a later re-grant of the
+	// same key after eviction, whose older queue slot must not evict it.
+	private static struct Slot
+	{
+		Key key;
+		ulong serial;
+	}
+
+	// Oldest-first grants, consumed from `head`; slots whose grant is gone are
+	// skipped, and the array is compacted once they dominate it.
+	private static struct SlotQueue
+	{
+		Slot[] slots;
+		size_t head;
+	}
+
+	private ulong[Key] approved; // key -> serial of its live grant
+	private SlotQueue order;
+	private SlotQueue[string] orderByClient;
+	private size_t[string] countByClient;
+	private ulong nextSerial;
+	private const ConsentStoreOptions opts;
 
 	this() @safe
 	{
-		this(defaultMaxApprovals);
+		this(ConsentStoreOptions.init);
 	}
 
-	/// Construct with an explicit approval cap (used by tests to drive
-	/// oldest-first eviction deterministically).
-	this(size_t maxApprovals) @safe
+	/// A store bounded by `opts`.
+	this(ConsentStoreOptions opts) @safe
 	{
-		this.maxApprovals = maxApprovals;
+		this.opts = opts;
 	}
 
 	override bool hasConsent(string consentSession, string client) @safe
@@ -903,14 +935,64 @@ final class InMemoryConsentStore : ConsentStore
 		const k = Key(consentSession, client);
 		if (k in approved)
 			return;
-		approved[k] = true;
-		order ~= k;
-		while (order.length > maxApprovals)
+		const slot = Slot(k, nextSerial++);
+		approved[k] = slot.serial;
+		order.slots ~= slot;
+		orderByClient.require(client).slots ~= slot;
+		const perClient = ++countByClient.require(client);
+		if (perClient > opts.maxApprovalsPerClient)
+			evictOldest(orderByClient[client]);
+		while (approved.length > opts.maxApprovals)
+			if (!evictOldest(order))
+				break;
+	}
+
+	private bool live(const Slot s) const @safe
+	{
+		auto p = s.key in approved;
+		return p !is null && *p == s.serial;
+	}
+
+	// Remove the oldest live grant in `q`, returning false when it holds none.
+	private bool evictOldest(ref SlotQueue q) @safe
+	{
+		while (q.head < q.slots.length)
 		{
-			const oldest = order[0];
-			order = order[1 .. $].dup;
-			approved.remove(oldest);
+			const s = q.slots[q.head++];
+			if (!live(s))
+				continue;
+			remove(s.key);
+			return true;
 		}
+		return false;
+	}
+
+	private void remove(const Key k) @safe
+	{
+		approved.remove(k);
+		auto n = k.client in countByClient;
+		if (--*n == 0)
+		{
+			countByClient.remove(k.client);
+			orderByClient.remove(k.client);
+		}
+		else
+			compact(orderByClient[k.client], *n);
+		compact(order, approved.length);
+	}
+
+	// Drop the skipped and stale slots once they outnumber `liveCount`, keeping
+	// the queue proportional to the grants it can still evict.
+	private void compact(ref SlotQueue q, size_t liveCount) @safe
+	{
+		if (q.slots.length - q.head <= 2 * liveCount + 16)
+			return;
+		Slot[] kept;
+		foreach (s; q.slots[q.head .. $])
+			if (live(s))
+				kept ~= s;
+		q.slots = kept;
+		q.head = 0;
 	}
 }
 
@@ -2254,9 +2336,46 @@ unittest  // REDIRECT REGISTRY: an oversized redirect_uris array is truncated at
 	assert(resp["redirect_uris"].length == maxRedirectUrisPerRegistration);
 }
 
+unittest  // CONSENT STORE: a flood of approvals for one client cannot evict another client's consent
+{
+	ConsentStoreOptions opts;
+	opts.maxApprovals = 3;
+	opts.maxApprovalsPerClient = 2;
+	auto store = new InMemoryConsentStore(opts);
+	store.grantConsent("real-browser", "http://real/cb");
+	foreach (i; 0 .. 50)
+	{
+		import std.conv : to;
+
+		store.grantConsent("flood-" ~ i.to!string, "http://attacker/cb");
+	}
+	assert(store.hasConsent("real-browser", "http://real/cb"));
+	// The flooding client keeps only its newest approvals.
+	assert(store.hasConsent("flood-49", "http://attacker/cb"));
+	assert(store.hasConsent("flood-48", "http://attacker/cb"));
+	assert(!store.hasConsent("flood-47", "http://attacker/cb"));
+}
+
+unittest  // CONSENT STORE: an approval evicted and granted again is not evicted early by its old slot
+{
+	ConsentStoreOptions opts;
+	opts.maxApprovals = 2;
+	auto store = new InMemoryConsentStore(opts);
+	store.grantConsent("b1", "http://a/cb");
+	store.grantConsent("b1", "http://b/cb");
+	store.grantConsent("b1", "http://c/cb"); // evicts a
+	store.grantConsent("b1", "http://a/cb"); // evicts b; a is now the newest
+	store.grantConsent("b1", "http://d/cb"); // evicts c, not a
+	assert(store.hasConsent("b1", "http://a/cb"));
+	assert(!store.hasConsent("b1", "http://c/cb"));
+	assert(store.hasConsent("b1", "http://d/cb"));
+}
+
 unittest  // CONSENT STORE: the consent store caps approvals, evicting the oldest first
 {
-	auto store = new InMemoryConsentStore(2);
+	ConsentStoreOptions opts;
+	opts.maxApprovals = 2;
+	auto store = new InMemoryConsentStore(opts);
 	store.grantConsent("browser-1", "http://a/cb");
 	store.grantConsent("browser-1", "http://b/cb");
 	// Third approval exceeds the cap of 2: the oldest ("a") is evicted.
@@ -2268,7 +2387,9 @@ unittest  // CONSENT STORE: the consent store caps approvals, evicting the oldes
 
 unittest  // CONSENT STORE: re-granting an existing consent does not consume cap headroom
 {
-	auto store = new InMemoryConsentStore(2);
+	ConsentStoreOptions opts;
+	opts.maxApprovals = 2;
+	auto store = new InMemoryConsentStore(opts);
 	store.grantConsent("browser-1", "http://a/cb");
 	store.grantConsent("browser-1", "http://a/cb"); // duplicate: no new slot used
 	store.grantConsent("browser-1", "http://b/cb");
