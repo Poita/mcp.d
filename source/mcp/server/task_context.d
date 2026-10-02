@@ -202,12 +202,12 @@ alias TaskExecutor = Json delegate(TaskContext tc) @safe;
 /// a cancel was requested during the run (an executor may abort by throwing);
 /// `TaskSuspended` leaves it `input_required`. Once
 /// the executor has suspended or detached, the dispatch ends there whatever it
-/// does afterwards. A task that expired during the run is left gone. Pure over the store, so it is correct whether invoked
+/// does afterwards. A task whose record was removed during the run is left gone. Pure over the store, so it is correct whether invoked
 /// in-process or by a remote worker. Throws only when the outcome cannot be
 /// recorded (e.g. the store is unreachable).
 void runTaskExecutor(TaskRuntime rt, string taskId, TaskExecutor executor) @safe
 {
-	// A task that expired while its executor ran has no record left to settle.
+	// A task removed while its executor ran has no record left to settle.
 	void settleCancelled() @safe
 	{
 		if (!rt.statusOf(taskId).isNull)
@@ -336,21 +336,17 @@ unittest  // a throwing status-change sink leaves a suspended task input_require
 	assert(rt.getDetailed(t.taskId)["status"].get!string == "input_required");
 }
 
-unittest  // an executor whose task expires mid-run stops without failing the dispatch
+unittest  // an executor whose task record is removed mid-run stops without failing the dispatch
 {
-	import core.time : msecs;
-	import std.typecons : nullable;
 	import mcp.server.task_store : InMemoryTaskStore;
 	import mcp.server.task_runtime : TaskOptions;
 
-	string now = "2026-06-07T10:00:00Z";
-	TaskOptions o;
-	o.nowIso = () @safe => now;
-	auto rt = new TaskRuntime(new InMemoryTaskStore(), o);
-	auto t = rt.createFor("slow", Json.undefined, nullable(1_000.msecs));
+	auto store = new InMemoryTaskStore();
+	auto rt = new TaskRuntime(store, TaskOptions.init);
+	auto t = rt.createFor("slow", Json.undefined);
 	bool sawCancel;
 	runTaskExecutor(rt, t.taskId, (TaskContext tc) @safe {
-		now = "2026-06-07T10:00:05Z";
+		store.remove(t.taskId);
 		sawCancel = tc.cancelRequested();
 		return Json.emptyObject;
 	});

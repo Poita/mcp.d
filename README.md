@@ -652,6 +652,12 @@ and `tc.detach(...)` leaves it `working` for `onDeployFinished` to complete out 
 band via `rt.complete` / `rt.fail` — no fiber held, so it works on any node. See
 [`examples/tasks`](examples/tasks/) for cancellation, durable stores, and the client side.
 
+A task's TTL (`@taskTtl`, else `TaskOptions.defaultTtl`, 10 minutes) is how long
+its record is kept after it settles, so the client has that long to collect the
+result. A task that is still working or awaiting input never expires, however long
+it runs — so a detached task whose callback never arrives stays until you
+`rt.fail` or cancel it.
+
 On the client, `callToolAwait(name, args, opts, onInputRequired)` hides the whole
 flow — it drives the poll loop and returns the final `CallToolResult`, so task and
 non-task tools look identical. Like `callTool` and every other request verb, it

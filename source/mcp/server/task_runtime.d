@@ -1,6 +1,6 @@
 module mcp.server.task_runtime;
 
-import core.time : Duration, seconds, msecs;
+import core.time : Duration, minutes, seconds, msecs;
 import std.datetime.systime : SysTime;
 import std.typecons : Nullable, nullable;
 import vibe.data.json : Json;
@@ -15,14 +15,16 @@ import mcp.server.task_store : TaskStore, TaskRecord, InMemoryTaskStore,
 
 /// Tuning for the task runtime. `idGenerator` mints task IDs (default
 /// `defaultTaskIdGenerator`). `defaultTtl` / `defaultPollInterval` seed a task's
-/// TTL / suggested poll cadence when a creator does not specify them.
+/// TTL / suggested poll cadence when a creator does not specify them. A task's
+/// TTL is how long its record is kept once it settles; a task that is still
+/// working or awaiting input never expires.
 /// `sweepInterval` is how often `enableTasks`'s background sweep removes expired
 /// tasks (zero disables it; expired tasks are still hidden on access). `nowIso` is an
 /// injectable clock returning an ISO-8601 timestamp; null uses the system clock.
 struct TaskOptions
 {
 	TaskIdGenerator idGenerator;
-	Duration defaultTtl = 60.seconds;
+	Duration defaultTtl = 10.minutes;
 	Duration defaultPollInterval = 5.seconds;
 	Duration sweepInterval = 30.seconds;
 	string delegate() @safe nowIso;
@@ -192,18 +194,17 @@ final class TaskRuntime
 			return Clock.currTime();
 	}
 
-	/// Whether `r` has outlived its TTL at `now`. The TTL runs from creation, so
-	/// a task in any status expires once `createdAt + ttl` has passed. A terminal
-	/// task is additionally retained for a full TTL after it settled
-	/// (`lastUpdatedAt`, frozen once terminal), so a client can always collect a
-	/// result even when the work ran longer than the TTL. A null TTL never expires.
+	/// Whether `r` has outlived its TTL at `now`. A task that has not settled
+	/// never expires, so work running longer than its TTL is never discarded. A
+	/// terminal task is retained for its TTL after it settled (`lastUpdatedAt`,
+	/// frozen once terminal), giving the client that long to collect the result.
+	/// A null TTL never expires.
 	private static bool isExpired(const TaskRecord r, SysTime now) @safe
 	{
-		if (r.meta.ttlMs.isNull)
+		if (r.meta.ttlMs.isNull || !isTerminal(r.meta.status))
 			return false;
-		const from = isTerminal(r.meta.status) ? r.meta.lastUpdatedAt : r.meta.createdAt;
 		try
-			return now >= SysTime.fromISOExtString(from) + r.meta.ttlMs.get.msecs;
+			return now >= SysTime.fromISOExtString(r.meta.lastUpdatedAt) + r.meta.ttlMs.get.msecs;
 		catch (Exception)
 			return false;
 	}
@@ -585,7 +586,7 @@ unittest  // create yields a working task with seeded ttl/poll and timestamps
 	assert(t.status == TaskStatus.working);
 	assert(t.taskId.length > 0);
 	assert(t.createdAt == "2026-06-07T10:30:00Z");
-	assert(t.ttlMs.get == 60_000 && t.pollIntervalMs.get == 5_000);
+	assert(t.ttlMs.get == 600_000 && t.pollIntervalMs.get == 5_000);
 	assert(rt.getDetailed(t.taskId)["status"].get!string == "working");
 }
 
@@ -838,39 +839,36 @@ unittest  // a terminal task expires ttl after it settled: tasks/get then report
 	assert(store.get(t.taskId).isNull, "an expired record is removed from the store");
 }
 
-unittest  // a non-terminal task expires ttl after creation, however recently it was updated
+unittest  // a non-terminal task never expires; its ttl starts once it settles
 {
-	import std.exception : collectException;
-
 	string now = "2026-06-07T10:00:00Z";
 	TaskOptions o;
 	o.nowIso = () @safe => now;
 	auto store = new InMemoryTaskStore();
 	auto rt = new TaskRuntime(store, o);
 	auto t = rt.create(nullable(1_000.msecs));
-	now = "2026-06-07T10:00:00.9Z";
-	rt.progress(t.taskId, "still going");
+	now = "2026-06-07T12:00:00Z";
+	assert(rt.sweepExpired() == 0);
 	assert(rt.getDetailed(t.taskId)["status"].get!string == "working");
-	now = "2026-06-07T10:00:01Z";
-	auto ex = cast(McpException) collectException(rt.getDetailed(t.taskId));
-	assert(ex !is null && ex.code == ErrorCode.invalidParams);
+	assert(!rt.cancelRequested(t.taskId));
+	rt.complete(t.taskId, Json.emptyObject);
+	now = "2026-06-07T12:00:01Z";
+	assert(rt.sweepExpired() == 1);
 	assert(store.get(t.taskId).isNull);
 }
 
-unittest  // cancelRequested reports true once the task has expired, so its executor stops
+unittest  // cancelRequested reports true once the task record is gone, so its executor stops
 {
-	string now = "2026-06-07T10:00:00Z";
-	TaskOptions o;
-	o.nowIso = () @safe => now;
-	auto rt = new TaskRuntime(new InMemoryTaskStore(), o);
-	auto t = rt.createFor("slow", Json.undefined, nullable(1_000.msecs));
+	auto store = new InMemoryTaskStore();
+	auto rt = new TaskRuntime(store, TaskOptions.init);
+	auto t = rt.createFor("slow", Json.undefined);
 	assert(!rt.cancelRequested(t.taskId));
-	now = "2026-06-07T10:00:01Z";
+	store.remove(t.taskId);
 	assert(rt.cancelRequested(t.taskId));
 	assert(rt.cancelRequested("never-existed"));
 }
 
-unittest  // sweepExpired removes expired records, terminal or not, and keeps the rest
+unittest  // sweepExpired removes settled records past their ttl and keeps the rest
 {
 	string now = "2026-06-07T10:00:00Z";
 	TaskOptions o;
@@ -880,15 +878,13 @@ unittest  // sweepExpired removes expired records, terminal or not, and keeps th
 	auto done = rt.create(nullable(1_000.msecs));
 	auto fresh = rt.create(nullable(60_000.msecs));
 	auto running = rt.create(nullable(1_000.msecs));
-	auto longRunning = rt.create(nullable(60_000.msecs));
 	rt.complete(done.taskId, Json.emptyObject);
 	rt.complete(fresh.taskId, Json.emptyObject);
 	now = "2026-06-07T10:00:02Z";
-	assert(rt.sweepExpired() == 2);
+	assert(rt.sweepExpired() == 1);
 	assert(store.get(done.taskId).isNull);
 	assert(!store.get(fresh.taskId).isNull);
-	assert(store.get(running.taskId).isNull);
-	assert(!store.get(longRunning.taskId).isNull);
+	assert(!store.get(running.taskId).isNull);
 }
 
 unittest  // cancelling a running executor's task records the request without a status notification

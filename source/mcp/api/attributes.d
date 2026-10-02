@@ -54,8 +54,8 @@ struct task
 	string title; /// optional human-readable display name (empty = unset)
 }
 
-/// Per-task time-to-live UDA, attached alongside `@task`: how long the task lives
-/// from creation. Intrinsic to the work the task does (a long-running job vs a
+/// Per-task time-to-live UDA, attached alongside `@task`: how long the task's
+/// record is kept after it settles (a task still working never expires). Intrinsic to the work the task does (a long-running job vs a
 /// quick computation), so it belongs on the task, not the server. Omit it to
 /// inherit `TaskOptions.defaultTtl`.
 ///
