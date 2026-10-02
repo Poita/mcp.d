@@ -778,8 +778,6 @@ struct Content
 	}
 }
 
-import mcp.protocol.capabilities : Icon;
-
 /// Optional annotations attached to resources, resource templates, and content
 /// blocks, per the MCP spec's `Annotations` shape. All fields are optional and
 /// advisory; a field left unset is omitted from the serialized form.
