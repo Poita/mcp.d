@@ -1549,9 +1549,10 @@ private TokenSet parseTokenResponse(int status, string responseBody) @safe
 package(mcp) enum size_t maxAuthResponseBytes = 256 * 1024;
 
 /// POST an `application/x-www-form-urlencoded` body to a token endpoint over the
-/// SDK's SSRF-safe transport (https, or http to loopback for dev) and return the
-/// parsed `TokenSet`. `authHeader`, when non-empty, is sent as `Authorization`.
-private TokenSet postTokenRequest(string tokenEndpoint, string body_, string authHeader) @safe
+/// SDK's SSRF-safe transport under `policy` and return the parsed `TokenSet`.
+/// `authHeader`, when non-empty, is sent as `Authorization`.
+private TokenSet postTokenRequest(string tokenEndpoint, string body_,
+		string authHeader, SsrfPolicy policy) @safe
 {
 	int status = 502;
 	string responseBody;
@@ -1560,7 +1561,7 @@ private TokenSet postTokenRequest(string tokenEndpoint, string body_, string aut
 		import vibe.http.common : HTTPMethod;
 		import vibe.stream.operations : readAllUTF8;
 
-		secureRequestHTTP(tokenEndpoint, SsrfPolicy.allowLoopback, (scope HTTPClientRequest creq) {
+		secureRequestHTTP(tokenEndpoint, policy, (scope HTTPClientRequest creq) {
 			creq.method = HTTPMethod.POST;
 			creq.headers["Content-Type"] = "application/x-www-form-urlencoded";
 			creq.headers["Accept"] = "application/json";
@@ -1579,27 +1580,30 @@ private TokenSet postTokenRequest(string tokenEndpoint, string body_, string aut
 /// (RFC 6749 §4.1.3 + PKCE RFC 7636). Use when an MCP server acts as an OAuth
 /// client to an upstream API; unlike `OAuthClient` this carries no RFC 8707
 /// `resource`. An empty `clientSecret` denotes a public client, so no
-/// credentials are sent; otherwise they go via HTTP Basic. Throws on an unsafe
-/// endpoint or a non-2xx response.
-TokenSet exchangeAuthCode(string tokenEndpoint, string code, string redirectUri,
-		string clientId, string clientSecret, string codeVerifier) @safe
+/// credentials are sent; otherwise they go via HTTP Basic. `policy` governs
+/// which hosts the endpoint may name (`SsrfPolicy.allowUserConfigured` for a
+/// token endpoint on a private network). Throws on an endpoint `policy` rejects
+/// or a non-2xx response.
+TokenSet exchangeAuthCode(string tokenEndpoint, string code, string redirectUri, string clientId,
+		string clientSecret, string codeVerifier, SsrfPolicy policy = SsrfPolicy.allowLoopback) @safe
 {
 	const body_ = buildAuthCodeTokenForm(code, redirectUri, codeVerifier, clientId, "");
 	const authHeader = clientSecret.length ? basicAuthHeader(clientId, clientSecret) : "";
-	return postTokenRequest(tokenEndpoint, body_, authHeader);
+	return postTokenRequest(tokenEndpoint, body_, authHeader, policy);
 }
 
 /// Refresh an access token at a third-party token endpoint (RFC 6749 §6). Use
 /// when an MCP server acts as an OAuth client to an upstream API; carries no
 /// RFC 8707 `resource`. An empty `clientSecret` denotes a public client, so no
-/// credentials are sent; otherwise they go via HTTP Basic. Throws on an unsafe
-/// endpoint or a non-2xx response.
+/// credentials are sent; otherwise they go via HTTP Basic. `policy` is as for
+/// `exchangeAuthCode`. Throws on an endpoint `policy` rejects or a non-2xx
+/// response.
 TokenSet refreshAccessToken(string tokenEndpoint, string refreshToken,
-		string clientId, string clientSecret) @safe
+		string clientId, string clientSecret, SsrfPolicy policy = SsrfPolicy.allowLoopback) @safe
 {
 	const body_ = buildRefreshTokenForm(refreshToken, clientId, "");
 	const authHeader = clientSecret.length ? basicAuthHeader(clientId, clientSecret) : "";
-	return postTokenRequest(tokenEndpoint, body_, authHeader);
+	return postTokenRequest(tokenEndpoint, body_, authHeader, policy);
 }
 
 unittest  // DCR request + responses round-trip

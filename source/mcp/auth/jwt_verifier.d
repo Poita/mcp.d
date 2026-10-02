@@ -34,6 +34,7 @@ static if (!is(typeof(EVP_DigestVerify)))
 			const(ubyte)* sig, size_t siglen, const(ubyte)* tbs, size_t tbslen);
 
 import mcp.auth.resource_server : TokenInfo, TokenValidator;
+import mcp.protocol.ssrf : SsrfPolicy;
 
 @safe:
 
@@ -90,6 +91,12 @@ struct JwtVerifierConfig
 
 	/// How long a fetched JWKS document is cached before being refetched.
 	Duration jwksCacheTtl = 300.seconds;
+
+	/// The SSRF policy applied to the `jwksUri` fetch. The default requires
+	/// `https` to a public host (plain `http` only to loopback); an IdP on a
+	/// private network (e.g. `keycloak.internal` resolving to `10.x`) needs
+	/// `SsrfPolicy.allowUserConfigured`.
+	SsrfPolicy ssrfPolicy = SsrfPolicy.allowLoopback;
 }
 
 // ===========================================================================
@@ -110,7 +117,7 @@ struct JwtVerifierConfig
 /// concurrency contract in `mcp.transport.session`).
 TokenValidator jwtVerifier(JwtVerifierConfig cfg) @safe
 {
-	auto cache = new JwksCache(cfg.jwksUri, cfg.jwksCacheTtl);
+	auto cache = new JwksCache(cfg.jwksUri, cfg.jwksCacheTtl, cfg.ssrfPolicy);
 	return (string token) @safe {
 		return verifyOrInvalid(() @safe => verifyToken(cfg, token, cache, currentUnixTime()));
 	};
@@ -640,6 +647,7 @@ package final class JwksCache : KeySource
 
 	private string uri;
 	private Duration ttl;
+	private SsrfPolicy policy;
 	private string[string] pemByKid; // kid -> PEM
 	private string[] allPems;
 	private long fetchedAt = -1;
@@ -655,10 +663,11 @@ package final class JwksCache : KeySource
 	/// drive it by hand.
 	package long delegate() @safe clock;
 
-	this(string uri, Duration ttl) @safe
+	this(string uri, Duration ttl, SsrfPolicy policy = SsrfPolicy.allowLoopback) @safe
 	{
 		this.uri = uri;
 		this.ttl = ttl;
+		this.policy = policy;
 		this.fetchLock = new TaskMutex;
 	}
 
@@ -705,7 +714,7 @@ package final class JwksCache : KeySource
 		if (lastAttemptAt >= 0 && t - lastAttemptAt < minRefetchInterval.total!"seconds")
 			return;
 		lastAttemptAt = t;
-		const doc = fetcher !is null ? fetcher(uri) : fetchJwks(uri);
+		const doc = fetcher !is null ? fetcher(uri) : fetchJwks(uri, policy);
 		if (doc.length)
 			load(doc);
 	}
@@ -741,31 +750,35 @@ package final class JwksCache : KeySource
 /// than buffered.
 private enum size_t maxJwksBytes = 256 * 1024;
 
-/// Fetch a JWKS document over HTTP(S). Returns the body, or empty on failure.
-private string fetchJwks(string uri) @trusted
+/// Fetch a JWKS document over HTTP(S) under `policy`. Returns the body, or
+/// empty on failure (logged, since every token then fails verification).
+private string fetchJwks(string uri, SsrfPolicy policy) @trusted
 {
+	import vibe.core.log : logWarn;
 	import vibe.http.client : HTTPClientRequest, HTTPClientResponse;
 	import vibe.http.common : HTTPMethod;
 	import vibe.stream.operations : readAllUTF8;
 	import mcp.auth.oauth : secureRequestHTTP;
-	import mcp.protocol.ssrf : SsrfPolicy;
 
-	// Refuse to fetch a JWKS over an insecure transport (must be https, or http
-	// to a loopback host for dev) or from an internal/link-local address. The
-	// fetch is pinned to a pre-vetted resolved address (DNS-rebinding SSRF
-	// mitigation); secureRequestHTTP throws on an unsafe or unresolvable host.
+	// secureRequestHTTP pins the fetch to a pre-vetted resolved address
+	// (DNS-rebinding SSRF mitigation) and throws on a host `policy` rejects.
 	string body_;
 	try
 	{
-		secureRequestHTTP(uri, SsrfPolicy.allowLoopback, (scope HTTPClientRequest req) {
+		secureRequestHTTP(uri, policy, (scope HTTPClientRequest req) {
 			req.method = HTTPMethod.GET;
 		}, (scope HTTPClientResponse res) {
 			if (res.statusCode / 100 == 2)
 				body_ = res.bodyReader.readAllUTF8(false, maxJwksBytes);
+			else
+				logWarn("JWKS fetch from %s returned HTTP %d", uri, res.statusCode);
 		});
 	}
-	catch (Exception)
+	catch (Exception e)
+	{
+		logWarn("JWKS fetch from %s failed: %s", uri, e.msg);
 		return null;
+	}
 	return body_;
 }
 
@@ -1421,6 +1434,49 @@ unittest  // JwksCache refuses to fetch from an insecure (plaintext http) JWKS U
 	// fetching signing keys over an insecure transport).
 	auto cache = new JwksCache("http://as.example.com/jwks", 60.seconds);
 	assert(cache.keysFor("any-kid").length == 0);
+}
+
+unittest  // a JWKS on a non-loopback internal address loads only under a policy that permits it
+{
+	import std.conv : to;
+	import vibe.core.core : runTask, runEventLoop, exitEventLoop;
+	import vibe.http.router : URLRouter;
+	import vibe.http.server : HTTPServerResponse, HTTPServerRequest,
+		HTTPServerSettings, listenHTTP;
+
+	const doc = `{"keys":[{"kty":"RSA","kid":"rsa-1","n":"` ~ testRsaN ~ `","e":"`
+		~ testRsaE ~ `"}]}`;
+	string failure;
+	size_t defaultKeys = size_t.max, permittedKeys;
+	runTask(() @safe nothrow{
+		try
+		{
+			auto router = new URLRouter;
+			router.get("/jwks", (HTTPServerRequest req, HTTPServerResponse res) @safe {
+				res.writeBody(doc, "application/json");
+			});
+			auto settings = new HTTPServerSettings;
+			settings.port = 0;
+			settings.bindAddresses = ["0.0.0.0"];
+			auto listener = listenHTTP(settings, router);
+			scope (exit)
+				() @trusted { listener.stopListening(); }();
+			// 0.0.0.0 is an internal, non-loopback address that still reaches
+			// this host's listener.
+			const uri = "http://0.0.0.0:" ~ listener.bindAddresses[0].port.to!string ~ "/jwks";
+			defaultKeys = new JwksCache(uri, 300.seconds).keysFor("rsa-1").length;
+			permittedKeys = new JwksCache(uri, 300.seconds, SsrfPolicy.allowUserConfigured).keysFor(
+				"rsa-1").length;
+		}
+		catch (Exception e)
+			failure = e.msg;
+		exitEventLoop();
+	});
+	runEventLoop();
+
+	assert(failure.length == 0, failure);
+	assert(defaultKeys == 0);
+	assert(permittedKeys == 1);
 }
 
 unittest  // JwksCache refuses an internal/link-local JWKS URI (SSRF mitigation)

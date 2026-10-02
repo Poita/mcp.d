@@ -61,6 +61,11 @@ struct IntrospectionConfig
 	/// the entry expires. Entry expiry is clamped to the token's `exp` (RFC 7662)
 	/// when present, so the staleness window never outlives the token itself.
 	Duration cacheTtl = Duration.zero;
+
+	/// The SSRF policy applied to the introspection request. The default
+	/// requires `https` to a public host (plain `http` only to loopback); an AS
+	/// on a private network needs `SsrfPolicy.allowUserConfigured`.
+	SsrfPolicy ssrfPolicy = SsrfPolicy.allowLoopback;
 }
 
 // ===========================================================================
@@ -227,15 +232,12 @@ private string postIntrospect(IntrospectionConfig cfg, string token) @trusted
 	import vibe.http.common : HTTPMethod;
 	import vibe.stream.operations : readAllUTF8;
 
-	// Refuse to introspect over an insecure transport (must be https, or http to
-	// a loopback host for dev) or against an internal/link-local address. The
-	// connect is pinned to a pre-vetted resolved address (DNS-rebinding
-	// mitigation); secureRequestHTTP throws on an unsafe or unresolvable host.
+	// The connect is pinned to a pre-vetted resolved address (DNS-rebinding
+	// mitigation); secureRequestHTTP throws on a host `cfg.ssrfPolicy` rejects.
 	const body_ = introspectionBody(cfg, token);
 	string responseBody;
 	bool ok = false;
-	secureRequestHTTP(cfg.introspectionEndpoint, SsrfPolicy.allowLoopback,
-			(scope HTTPClientRequest req) {
+	secureRequestHTTP(cfg.introspectionEndpoint, cfg.ssrfPolicy, (scope HTTPClientRequest req) {
 		req.method = HTTPMethod.POST;
 		req.headers["Content-Type"] = "application/x-www-form-urlencoded";
 		req.headers["Accept"] = "application/json";
@@ -688,6 +690,51 @@ unittest  // HttpIntrospector refuses an insecure (plaintext http) introspection
 	cfg.introspectionEndpoint = "http://as.example.com/introspect";
 	auto introspector = new HttpIntrospector(cfg);
 	assertThrown(introspector.introspect("some-token"));
+}
+
+unittest  // an introspection endpoint on a non-loopback internal address is reached only when permitted
+{
+	import std.conv : to;
+	import std.exception : assertThrown;
+	import vibe.core.core : runTask, runEventLoop, exitEventLoop;
+	import vibe.http.server : HTTPServerRequest, HTTPServerResponse,
+		HTTPServerSettings, listenHTTP;
+
+	string failure, permitted;
+	bool defaultRefused;
+	runTask(() @safe nothrow{
+		try
+		{
+			auto settings = new HTTPServerSettings;
+			settings.port = 0;
+			settings.bindAddresses = ["0.0.0.0"];
+			auto listener = listenHTTP(settings, (scope HTTPServerRequest req,
+				scope HTTPServerResponse res) @safe {
+				res.writeBody(`{"active":true}`, "application/json");
+			});
+			scope (exit)
+				() @trusted { listener.stopListening(); }();
+			// 0.0.0.0 is an internal, non-loopback address that still reaches
+			// this host's listener.
+			IntrospectionConfig cfg;
+			cfg.introspectionEndpoint = "http://0.0.0.0:"
+				~ listener.bindAddresses[0].port.to!string ~ "/introspect";
+			try
+				cast(void) new HttpIntrospector(cfg).introspect("tok");
+			catch (Exception)
+				defaultRefused = true;
+			cfg.ssrfPolicy = SsrfPolicy.allowUserConfigured;
+			permitted = new HttpIntrospector(cfg).introspect("tok");
+		}
+		catch (Exception e)
+			failure = e.msg;
+		exitEventLoop();
+	});
+	runEventLoop();
+
+	assert(failure.length == 0, failure);
+	assert(defaultRefused);
+	assert(permitted == `{"active":true}`);
 }
 
 unittest  // HttpIntrospector refuses an internal/link-local introspection endpoint (SSRF)

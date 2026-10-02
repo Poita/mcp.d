@@ -20,3 +20,4 @@ public import mcp.auth.introspection_verifier;
 public import mcp.auth.static_verifier;
 public import mcp.auth.oauth_proxy;
 public import mcp.auth.providers;
+public import mcp.protocol.ssrf : SsrfPolicy;

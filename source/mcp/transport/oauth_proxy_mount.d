@@ -57,6 +57,7 @@ import vibe.http.common : HTTPMethod;
 import mcp.auth.oauth : isValidClientIdMetadataUrl, TokenSet;
 import mcp.auth.oauth_proxy : ConsentRequiredException, InvalidClientIdMetadataException,
 	InvalidRedirectUriException, OAuthProxy, OAuthProxyConfig, RelayedCodeBinding;
+import mcp.protocol.ssrf : SsrfPolicy;
 
 @safe:
 
@@ -789,7 +790,8 @@ void mountOAuthToken(URLRouter router, OAuthProxy proxy) @safe
 {
 	mountOAuthToken(router, proxy, (string endpoint, string body_,
 			string authHeader, out string responseBody, out int status) @safe {
-		exchangeUpstream(endpoint, body_, authHeader, responseBody, status);
+		exchangeUpstream(endpoint, body_, authHeader, responseBody, status,
+			proxy.config.upstreamSsrfPolicy);
 	});
 }
 
@@ -1048,22 +1050,22 @@ private string formField(string form, string name) @safe
 /// resolved address (DNS-rebinding mitigation) and refuses an insecure transport
 /// (must be https, or http to a loopback host for dev) or an internal/link-local
 /// address, so the upstream credentials cannot be steered to a rebinding-chosen
-/// internal target. An integrator overriding `/token` can reuse this for the
-/// SSRF-pinned upstream call.
+/// internal target. `policy` is `OAuthProxyConfig.upstreamSsrfPolicy`. An
+/// integrator overriding `/token` can reuse this for the SSRF-pinned upstream
+/// call.
 void exchangeUpstream(string endpoint, string body_, string authHeader,
-		out string responseBody, out int status) @trusted
+		out string responseBody, out int status, SsrfPolicy policy = SsrfPolicy.allowLoopback) @trusted
 {
 	import vibe.http.client : HTTPClientRequest, HTTPClientResponse;
 	import vibe.stream.operations : readAllUTF8;
 	import mcp.auth.oauth : maxAuthResponseBytes, secureRequestHTTP;
-	import mcp.protocol.ssrf : SsrfPolicy;
 
 	// secureRequestHTTP throws on an unsafe or unresolvable host and pins the
 	// connect to the pre-vetted resolved address, so the upstream client_secret
 	// cannot be steered to a rebinding-chosen internal target.
 	int st = 502;
 	string rb;
-	secureRequestHTTP(endpoint, SsrfPolicy.allowLoopback, (scope HTTPClientRequest creq) {
+	secureRequestHTTP(endpoint, policy, (scope HTTPClientRequest creq) {
 		creq.method = HTTPMethod.POST;
 		creq.headers["Content-Type"] = "application/x-www-form-urlencoded";
 		creq.headers["Accept"] = "application/json";

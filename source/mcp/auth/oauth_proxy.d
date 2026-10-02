@@ -101,6 +101,12 @@ struct OAuthProxyConfig
 	/// `client_secret_basic` to send them via the HTTP Basic header.
 	TokenEndpointAuthMethod tokenEndpointAuthMethod = TokenEndpointAuthMethod.clientSecretPost;
 
+	/// The SSRF policy applied to the upstream authorization and token
+	/// endpoints. The default requires `https` to a public host (plain `http`
+	/// only to loopback); an IdP on a private network (e.g. `keycloak.internal`
+	/// resolving to `10.x`) needs `SsrfPolicy.allowUserConfigured`.
+	SsrfPolicy upstreamSsrfPolicy = SsrfPolicy.allowLoopback;
+
 	/// The proxy's own public base URL, including any mount path
 	/// (e.g. `https://mcp.example.com`). Used to construct the proxy's fixed
 	/// callback URL and as the issuer in the AS metadata it publishes.
@@ -996,9 +1002,8 @@ final class OAuthProxy
 	in (consentStore !is null)
 	in (redirectRegistry !is null)
 	{
-		// Operator-configured endpoints: a loopback upstream is a dev setup.
-		requireSecureUrl(cfg.upstreamAuthorizationEndpoint, SsrfPolicy.allowLoopback);
-		requireSecureUrl(cfg.upstreamTokenEndpoint, SsrfPolicy.allowLoopback);
+		requireSecureUrl(cfg.upstreamAuthorizationEndpoint, cfg.upstreamSsrfPolicy);
+		requireSecureUrl(cfg.upstreamTokenEndpoint, cfg.upstreamSsrfPolicy);
 		requireSecureUrl(cfg.callbackUrl(), SsrfPolicy.allowLoopback);
 		this.cfg = cfg;
 		this.consentStore = consentStore;
@@ -1344,6 +1349,18 @@ version (unittest)
 		d.redirectUris = ["http://127.0.0.1:8765/callback"];
 		return d;
 	}
+}
+
+unittest  // an upstream IdP on a private network is accepted only under a policy that permits it
+{
+	import std.exception : assertThrown;
+
+	auto cfg = sampleConfig();
+	cfg.upstreamAuthorizationEndpoint = "https://10.0.0.5/authorize";
+	cfg.upstreamTokenEndpoint = "https://10.0.0.5/token";
+	assertThrown(new OAuthProxy(cfg));
+	cfg.upstreamSsrfPolicy = SsrfPolicy.allowUserConfigured;
+	assert(new OAuthProxy(cfg).config.upstreamTokenEndpoint == "https://10.0.0.5/token");
 }
 
 unittest  // CIMD ADVERTISE: AS metadata sets client_id_metadata_document_supported when enabled
