@@ -2962,6 +2962,7 @@ string subscriptionIdString(Json id) @safe
 version (unittest)
 {
 	import std.conv : to;
+	import mcp.server.event_store : seqCursor;
 
 	// Build a runtime with deterministic clocks for tests.
 	private EventsRuntime testRuntime(long delegate() @safe nowMs = null) @safe
@@ -3330,7 +3331,7 @@ unittest  // an event emitted while a push stream starts is delivered once, afte
 	assert(frames == [
 		eventsActiveNotification, "evt_backlog", "evt_before_start", "evt_live"
 	]);
-	assert(handle.stream.cursor.get == "3"); // the live event's position, never rolled back
+	assert(handle.stream.cursor.get == seqCursor(3)); // the live event's position, never rolled back
 	handle.close();
 }
 
@@ -3371,7 +3372,7 @@ unittest  // a bootstrapping push stream delivers events emitted between open an
 	rt.emit(EventOccurrence("evt_before_start", "n", "t"));
 	rt.startPushStream(handle.stream, Nullable!string.init, Nullable!long.init);
 	assert(frames == [eventsActiveNotification, "evt_before_start"]);
-	assert(handle.stream.cursor.get == "2");
+	assert(handle.stream.cursor.get == seqCursor(2));
 	handle.close();
 }
 
@@ -5120,7 +5121,7 @@ unittest  // a fresh webhook subscription replays the retained events after its 
 		rt.emit(EventOccurrence(id, "n", "t"));
 	assert(ft.eventPosts().length == 0); // no subscriber yet
 	auto p = webhookSub("n", "https://proxy/hooks");
-	p.cursor = "1"; // the client last persisted position 1
+	p.cursor = seqCursor(1); // the client last persisted position 1
 	auto r = rt.subscribeWebhook(p, "user-1");
 	assert(!r.truncated);
 	assert(ft.eventPosts().length == 2); // evt_2 and evt_3 replayed
@@ -5128,7 +5129,7 @@ unittest  // a fresh webhook subscription replays the retained events after its 
 
 	assert(ft.eventPosts()[0].body.canFind("evt_2") && ft.eventPosts()[1].body.canFind("evt_3"));
 	// Both acked in order: the watermark settled at the last replayed position.
-	assert(rt.webhookStore().get(r.id).get.cursor.get == "3");
+	assert(rt.webhookStore().get(r.id).get.cursor.get == seqCursor(3));
 }
 
 unittest  // a null cursor bootstraps a webhook subscription at the current position
@@ -5138,7 +5139,7 @@ unittest  // a null cursor bootstraps a webhook subscription at the current posi
 	rt.emit(EventOccurrence("evt_old", "n", "t"));
 	auto r = rt.subscribeWebhook(webhookSub("n", "https://proxy/hooks"), "user-1");
 	assert(ft.eventPosts().length == 0); // nothing replayed
-	assert(!r.cursor.isNull && r.cursor.get == "1"); // a fresh cursor to persist
+	assert(!r.cursor.isNull && r.cursor.get == seqCursor(1)); // a fresh cursor to persist
 	assert(!r.truncated);
 	rt.emit(EventOccurrence("evt_new", "n", "t"));
 	assert(ft.eventPosts().length == 1);
@@ -5344,12 +5345,12 @@ unittest  // the watermark advances to a position only once every earlier one ha
 	EventRegistration reg = {descriptor: EventType("n"), emitOnly: true};
 	rt.register(reg);
 	auto r = rt.subscribeWebhook(webhookSub("n", "https://proxy/hooks"), "user-1");
-	rt.trackOutstanding(r.id, nullable("1"));
-	rt.trackOutstanding(r.id, nullable("2"));
-	rt.recordSuccess(r.id, nullable("2")); // position 2 settles first
+	rt.trackOutstanding(r.id, nullable(seqCursor(1)));
+	rt.trackOutstanding(r.id, nullable(seqCursor(2)));
+	rt.recordSuccess(r.id, nullable(seqCursor(2))); // position 2 settles first
 	assert(rt.webhookStore().get(r.id).get.cursor == r.cursor); // 1 still in flight: unchanged
-	rt.recordSuccess(r.id, nullable("1"));
-	assert(rt.webhookStore().get(r.id).get.cursor.get == "2"); // now both are safe
+	rt.recordSuccess(r.id, nullable(seqCursor(1)));
+	assert(rt.webhookStore().get(r.id).get.cursor.get == seqCursor(2)); // now both are safe
 }
 
 unittest  // a delivery yielding mid-POST does not let a sibling job of the subscription overtake it
@@ -5439,11 +5440,11 @@ unittest  // a refresh of a live subscription does not replay from the client's 
 	foreach (id; ["evt_1", "evt_2"])
 		rt.emit(EventOccurrence(id, "n", "t"));
 	assert(ft.eventPosts().length == 2);
-	assert(rt.webhookStore().get(r1.id).get.cursor.get == "2");
+	assert(rt.webhookStore().get(r1.id).get.cursor.get == seqCursor(2));
 	p.cursor = r1.cursor; // the client re-supplies the cursor it was first given
 	auto r2 = rt.subscribeWebhook(p, "user-1");
 	assert(ft.eventPosts().length == 2); // nothing redelivered
-	assert(r2.cursor.get == "2"); // the server's watermark, not the client's value
+	assert(r2.cursor.get == seqCursor(2)); // the server's watermark, not the client's value
 	assert(!r2.deliveryStatus.isNull);
 }
 
@@ -5473,7 +5474,7 @@ unittest  // a lapsed subscription is recreated from the client's cursor, with l
 	assert(ft.eventPosts().length == 3);
 
 	now += 2 * 60 * 1000; // the grant lapsed
-	p.cursor = "1"; // the client's last persisted position
+	p.cursor = seqCursor(1); // the client's last persisted position
 	auto r = rt.subscribeWebhook(p, "user-1");
 	assert(unsubs == 1 && subs == 2); // torn down and provisioned afresh
 	assert(ft.eventPosts().length == 5); // evt_2 and evt_3 replayed
@@ -5861,8 +5862,8 @@ unittest  // events missed while suspended are signalled with a gap once a refre
 	assert(ft.eventPosts().length == posts);
 	auto gapPosts = controlPostsOf(ft, "gap");
 	assert(gapPosts.length == gaps + 1);
-	assert(parseJsonString(gapPosts[$ - 1].body)["cursor"].get!string == "3");
-	assert(rt.webhookStore().get(r.id).get.cursor.get == "3");
+	assert(parseJsonString(gapPosts[$ - 1].body)["cursor"].get!string == seqCursor(3));
+	assert(rt.webhookStore().get(r.id).get.cursor.get == seqCursor(3));
 }
 
 unittest  // a job queued before its subscription was suspended is not re-leased on every drain
@@ -5919,7 +5920,7 @@ unittest  // deliveries to an endpoint that never verifies are dead-lettered aft
 	}
 	assert(queue.lease(now, 1000).length == 0);
 	assert(ft.eventPosts().length == 0);
-	assert(rt.webhookStore().get(r.id).get.cursor.get == "1");
+	assert(rt.webhookStore().get(r.id).get.cursor.get == seqCursor(1));
 }
 
 unittest  // a subscription's queued deliveries are bounded; the overflow is signalled with a gap
@@ -5946,8 +5947,8 @@ unittest  // a subscription's queued deliveries are bounded; the overflow is sig
 		deferred[i]();
 	assert(ft.eventPosts().length == 2);
 	auto gaps = controlPostsOf(ft, "gap");
-	assert(gaps.length == 1 && parseJsonString(gaps[0].body)["cursor"].get!string == "3");
-	assert(rt.webhookStore().get(r.id).get.cursor.get == "3");
+	assert(gaps.length == 1 && parseJsonString(gaps[0].body)["cursor"].get!string == seqCursor(3));
+	assert(rt.webhookStore().get(r.id).get.cursor.get == seqCursor(3));
 }
 
 unittest  // the pending bound also holds for deliveries that carry no cursor
@@ -6305,13 +6306,13 @@ unittest  // monotonic watermark: an out-of-order older ack does not regress the
 	auto r = rt.subscribeWebhook(webhookSub("n", "https://proxy/hooks"), "user-1");
 
 	// Advance the watermark to 10, then a stale ack for 4 must not pull it back.
-	rt.recordSuccess(r.id, nullable("10"));
-	assert(rt.webhookStore().get(r.id).get.cursor.get == "10");
-	rt.recordSuccess(r.id, nullable("4"));
-	assert(rt.webhookStore().get(r.id).get.cursor.get == "10"); // unchanged
+	rt.recordSuccess(r.id, nullable(seqCursor(10)));
+	assert(rt.webhookStore().get(r.id).get.cursor.get == seqCursor(10));
+	rt.recordSuccess(r.id, nullable(seqCursor(4)));
+	assert(rt.webhookStore().get(r.id).get.cursor.get == seqCursor(10)); // unchanged
 	// a strictly-greater ack still advances
-	rt.recordSuccess(r.id, nullable("11"));
-	assert(rt.webhookStore().get(r.id).get.cursor.get == "11");
+	rt.recordSuccess(r.id, nullable(seqCursor(11)));
+	assert(rt.webhookStore().get(r.id).get.cursor.get == seqCursor(11));
 }
 
 unittest  // an untracked position that cannot be ordered never moves the watermark
@@ -6453,7 +6454,7 @@ unittest  // a dead-lettered delivery settles its position so the watermark keep
 	auto r = rt.subscribeWebhook(webhookSub("n", "https://proxy/hooks"), "user-1");
 	rt.emit(EventOccurrence("evt_1", "n", "t")); // seq 1: the transport throws
 	rt.emit(EventOccurrence("evt_2", "n", "t")); // seq 2: delivered
-	assert(rt.webhookStore().get(r.id).get.cursor.get == "2");
+	assert(rt.webhookStore().get(r.id).get.cursor.get == seqCursor(2));
 }
 
 unittest  // re-publishing an event id already queued does not wedge the watermark
@@ -6477,5 +6478,5 @@ unittest  // re-publishing an event id already queued does not wedge the waterma
 	for (size_t i = 0; i < deferred.length; i++)
 		deferred[i]();
 	assert(ft.eventPosts().length == 2);
-	assert(rt.webhookStore().get(r.id).get.cursor.get == "3");
+	assert(rt.webhookStore().get(r.id).get.cursor.get == seqCursor(3));
 }

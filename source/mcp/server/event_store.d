@@ -28,20 +28,61 @@ long nowUnixMs() @safe
 }
 
 /// Parse a ring-buffer sequence cursor (the position stamped by `EmitBuffer`) into
-/// its numeric value. Returns false for a null/unparseable cursor. Shared so the
-/// webhook watermark can compare two cursors using the same encoding the buffer
-/// assigns.
+/// its numeric value. Returns false for a null/unparseable cursor, and for one
+/// stamped by another process: sequence numbers restart with each process, so
+/// only a cursor carrying this process's epoch names a position in its buffer.
+/// Shared so the webhook watermark can compare two cursors using the same
+/// encoding the buffer assigns.
 bool tryParseSeq(string s, out long seq) @safe nothrow
 {
+	import std.algorithm : startsWith;
 	import std.conv : to;
 
+	const prefix = seqEpoch() ~ ".";
+	if (!s.startsWith(prefix))
+		return false;
 	try
 	{
-		seq = to!long(s);
+		seq = to!long(s[prefix.length .. $]);
 		return true;
 	}
 	catch (Exception)
 		return false;
+}
+
+/// The cursor naming sequence number `seq` in this process's emit buffers.
+package string seqCursor(long seq) @safe nothrow
+{
+	import std.conv : to;
+
+	try
+		return seqEpoch() ~ "." ~ to!string(seq);
+	catch (Exception)
+		assert(0);
+}
+
+// A random identifier for this process, chosen once and prefixed to every
+// sequence cursor so a cursor from before a restart is recognised as foreign.
+private string seqEpoch() @trusted nothrow
+{
+	import std.concurrency : initOnce;
+
+	__gshared string epoch;
+	try
+		return initOnce!epoch(newSeqEpoch());
+	catch (Exception)
+		assert(0);
+}
+
+private string newSeqEpoch() @safe nothrow
+{
+	import std.format : format;
+	import std.random : unpredictableSeed;
+
+	try
+		return format("%016x", unpredictableSeed!ulong);
+	catch (Exception)
+		assert(0);
 }
 
 /// Configuration for the emit ring buffer: how long and how many events to retain
@@ -54,10 +95,11 @@ struct EmitBufferOptions
 
 /// A bounded, in-memory ring buffer of emitted events per event type. Backs
 /// `events/poll` for emit-only event types (those with no cursor-addressable
-/// upstream). The cursor is a process-local sequence number: a server restart
-/// invalidates all cursors, and a poll with a stale/unparseable cursor yields a
-/// fresh cursor with `truncated: true`. Events emitted during downtime are not
-/// recoverable — matching the upstream's own guarantees for push-only sources.
+/// upstream). The cursor is a sequence number tagged with a per-process epoch:
+/// a server restart invalidates all cursors, and a poll with a stale, foreign, or
+/// unparseable cursor yields a fresh cursor with `truncated: true`. Events
+/// emitted during downtime are not recoverable — matching the upstream's own
+/// guarantees for push-only sources.
 final class EmitBuffer
 {
 	private struct Entry
@@ -214,9 +256,7 @@ final class EmitBuffer
 
 	private static string seqString(long seq) @safe
 	{
-		import std.conv : to;
-
-		return to!string(seq);
+		return seqCursor(seq);
 	}
 }
 
@@ -558,9 +598,9 @@ unittest  // EmitBuffer assigns each event a monotonically increasing cursor
 	auto buf = new EmitBuffer();
 	auto c1 = buf.append("n", EventOccurrence("a", "n", "t"));
 	auto c2 = buf.append("n", EventOccurrence("b", "n", "t"));
-	import std.conv : to;
-
-	assert(to!long(c2) > to!long(c1));
+	long s1, s2;
+	assert(tryParseSeq(c1, s1) && tryParseSeq(c2, s2));
+	assert(s2 > s1);
 }
 
 unittest  // EmitBuffer caps a batch with maxEvents and sets hasMore
@@ -607,14 +647,15 @@ unittest  // EmitBuffer flags truncation for an unparseable cursor and resets to
 	assert(r.truncated && r.events.length == 0);
 }
 
-unittest  // EmitBuffer flags truncation for a cursor ahead of head (post-restart)
+unittest  // EmitBuffer flags truncation for a cursor ahead of head
 {
 	auto buf = new EmitBuffer();
-	buf.append("n", EventOccurrence("a", "n", "t")); // seq 1, head = "1"
-	// A cursor beyond the current head — e.g. a client resuming a pre-restart
-	// position the reset counter has not yet reached. It is unsatisfiable, so the
-	// buffer resets to head and signals a gap rather than reporting up-to-date.
-	auto r = buf.readSince("n", nullable("999"), Nullable!long.init, Nullable!long.init);
+	buf.append("n", EventOccurrence("a", "n", "t"));
+	// A cursor beyond the current head, e.g. a forged future position. It is
+	// unsatisfiable, so the buffer resets to head and signals a gap rather than
+	// reporting up-to-date.
+	auto r = buf.readSince("n", nullable(seqCursor(999)),
+			Nullable!long.init, Nullable!long.init);
 	assert(r.truncated && r.events.length == 0);
 	assert(r.cursor.get == buf.headCursor());
 }
@@ -684,6 +725,18 @@ unittest  // age eviction followed by other names' events still reports a gap on
 	buf.append("a", EventOccurrence("a2", "a", "t")); // a1 aged out, but c1 already saw it
 	auto r = buf.readSince("a", nullable(c1), Nullable!long.init, Nullable!long.init);
 	assert(!r.truncated && r.events.length == 1);
+}
+
+unittest  // a cursor issued by another process is truncated, not read as a position in this one
+{
+	auto buf = new EmitBuffer();
+	foreach (id; ["a", "b", "c"])
+		buf.append("n", EventOccurrence(id, "n", "t"));
+	// A position a previous process issued, which this process's sequence has
+	// since passed: it must not silently skip "b" and "c".
+	auto r = buf.readSince("n", nullable("1"), Nullable!long.init, Nullable!long.init);
+	assert(r.truncated && r.events.length == 0);
+	assert(r.cursor.get == buf.headCursor());
 }
 
 unittest  // a truncated read that selects nothing moves the cursor past the evicted events
