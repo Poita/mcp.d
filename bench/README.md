@@ -73,14 +73,17 @@ Because each call opens and closes its own TCP connection, a sustained run mints
 thousands of short-lived sockets that linger in `TIME_WAIT` (2×MSL ≈ 30 s on
 macOS). Mid-run `netstat` shows ~16,182 `TIME_WAIT` sockets on the endpoint — the
 *entire* ephemeral port range (`49152–65535`, ~16k ports). Once the pool is
-exhausted, new `connectTCP` calls **block indefinitely** (there is no free local
-port), so throughput collapses rather than climbing. The CPU-bound ceiling
+exhausted, a new connect cannot get a local port, so throughput collapses rather
+than climbing. The client bounds every connect by `ClientSettings.connectTimeout`
+(default 30 s), so an exhausted pool surfaces as a `connect ... timed out` error
+naming ephemeral-port exhaustion rather than a hang. The CPU-bound ceiling
 (~17k/s) is hit before that point; both server and client saturate one core.
 
 This also makes the loopback ephemeral pool the binding constraint for *any*
 multi-process load test: all clients on `127.0.0.1` share one ~16k-port pool, and
 a poisoned pool needs ~30 s to drain, so back-to-back high-rate runs must pause
-between them (the scripts here drain `TIME_WAIT` before each run).
+between them. Wait until `netstat -an | grep -c TIME_WAIT` falls back to its idle
+level before starting the next run.
 
 ### Multi-threaded server (`--threads`)
 
@@ -107,6 +110,4 @@ The single biggest lever for both throughput and the `TIME_WAIT` storm is HTTP
 keep-alive / connection reuse for the request/response path — falling back to a
 dedicated `Connection: close` socket only when a handler actually initiates a
 server→client request (sampling / elicitation / roots). That is a transport design
-change, not a benchmark tuning knob. A secondary, cheaper improvement: bound the
-client `connectTCP` with a timeout so ephemeral-port exhaustion surfaces as a clear
-error instead of an indefinite hang.
+change, not a benchmark tuning knob.
