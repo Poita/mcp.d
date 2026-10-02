@@ -6,7 +6,7 @@ import vibe.data.json : Json;
 import mcp.protocol.versions : ProtocolVersion;
 import mcp.protocol.sampling : CreateMessageRequest;
 import mcp.protocol.errors : isValidElicitationUrl, invalidParams;
-import mcp.protocol.jsonhelpers : tryGet;
+import mcp.protocol.jsonhelpers : tryGet, requireObject;
 
 @safe:
 
@@ -821,6 +821,7 @@ struct InputRequest
 	/// server-assigned id).
 	static InputRequest fromJson(string key, Json j) @safe
 	{
+		requireObject(j, "inputRequests." ~ key);
 		InputRequest r;
 		r.id = key;
 		r.type = ("method" in j && j["method"].type == Json.Type.string)
@@ -1852,6 +1853,22 @@ unittest  // InputRequest.elicitationUrl rejects a malformed (non-absolute) url
 	import mcp.protocol.errors : McpException;
 
 	assertThrown!McpException(InputRequest.elicitationUrl("e", "m", "not a url"));
+}
+
+unittest  // InputRequest.fromJson rejects a non-object request value with -32602
+{
+	import std.exception : collectException;
+	import mcp.protocol.errors : McpException, ErrorCode;
+
+	foreach (v; [Json(5), Json("x"), Json.emptyArray, Json(null)])
+	{
+		auto ex = collectException!McpException(InputRequest.fromJson("r1", v));
+		assert(ex !is null && ex.code == ErrorCode.invalidParams);
+	}
+	Json map = Json.emptyObject;
+	map["r1"] = Json(5);
+	auto ex = collectException!McpException(inputRequestsFromJson(map));
+	assert(ex !is null && ex.code == ErrorCode.invalidParams);
 }
 
 unittest  // InputRequest.fromJson: non-string "method" field is treated as unknown type

@@ -75,6 +75,7 @@ mixin template MetaField()
 
 	private void parseMetaField(Json j) @safe
 	{
+		requireObject(j, typeof(this).stringof);
 		if ("_meta" in j && j["_meta"].type == Json.Type.object)
 			meta = j["_meta"];
 	}
@@ -3428,6 +3429,7 @@ struct Root
 
 	static Root fromJson(Json j) @safe
 	{
+		requireObject(j, "Root");
 		Root r;
 		r.uri = j.getOr("uri", "");
 		tryGet(j, "name", r.name);
@@ -3718,6 +3720,29 @@ unittest  // Root preserves _meta
 	r.meta["k"] = "v";
 	auto back = Root.fromJson(r.toJson());
 	assert(back.meta["k"].get!string == "v");
+}
+
+unittest  // Root.fromJson rejects a non-object value with -32602
+{
+	import std.exception : collectException;
+
+	foreach (v; [Json(5), Json("file:///a"), Json.emptyArray, Json(null)])
+	{
+		auto ex = collectException!McpException(Root.fromJson(v));
+		assert(ex !is null && ex.code == ErrorCode.invalidParams);
+	}
+	auto ex = collectException!McpException(
+			ListRootsResult.fromJson(parseJsonString(`{"roots":["file:///a"]}`)));
+	assert(ex !is null && ex.code == ErrorCode.invalidParams);
+}
+
+unittest  // parseMetaField rejects a non-object value with -32602
+{
+	import std.exception : collectException;
+
+	Root r;
+	auto ex = collectException!McpException(r.parseMetaField(Json(5)));
+	assert(ex !is null && ex.code == ErrorCode.invalidParams);
 }
 
 unittest  // ListRootsResult serializes roots envelope
