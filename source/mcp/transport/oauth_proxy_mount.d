@@ -363,19 +363,41 @@ void mountOAuthProxy(URLRouter router, OAuthProxy proxy) @safe
 /// Mount the RFC 8414 Authorization Server Metadata and RFC 9728 Protected
 /// Resource Metadata well-known documents. The proxy advertises ITSELF as the
 /// AS, so these live at the proxy's own well-known paths.
+///
+/// Both documents are public and carry no credentials, so they are served with
+/// `Access-Control-Allow-Origin: *` and a CORS preflight is answered, letting a
+/// browser-based MCP client discover the proxy from another origin.
 void mountOAuthMetadata(URLRouter router, OAuthProxy proxy) @safe
 {
-	router.get("/.well-known/oauth-authorization-server",
-			(HTTPServerRequest req, HTTPServerResponse res) @safe {
+	enum asPath = "/.well-known/oauth-authorization-server";
+	enum prmPath = "/.well-known/oauth-protected-resource";
+
+	router.get(asPath, (HTTPServerRequest req, HTTPServerResponse res) @safe {
+		setMetadataCorsHeaders(res);
 		res.statusCode = HTTPStatus.ok;
 		res.writeJsonBody(proxy.metadataJson());
 	});
 
-	router.get("/.well-known/oauth-protected-resource", (HTTPServerRequest req,
-			HTTPServerResponse res) @safe {
+	router.get(prmPath, (HTTPServerRequest req, HTTPServerResponse res) @safe {
+		setMetadataCorsHeaders(res);
 		res.statusCode = HTTPStatus.ok;
 		res.writeJsonBody(proxy.resourceMetadata().toJson());
 	});
+
+	foreach (path; [asPath, prmPath])
+		router.match(HTTPMethod.OPTIONS, path, (HTTPServerRequest req,
+				HTTPServerResponse res) @safe {
+			setMetadataCorsHeaders(res);
+			res.headers["Access-Control-Allow-Methods"] = "GET, OPTIONS";
+			res.headers["Access-Control-Max-Age"] = "86400";
+			res.statusCode = HTTPStatus.noContent;
+			res.writeVoidBody();
+		});
+}
+
+private void setMetadataCorsHeaders(scope HTTPServerResponse res) @safe
+{
+	res.headers["Access-Control-Allow-Origin"] = "*";
 }
 
 /// Mount the RFC 7591 Dynamic Client Registration endpoint: echo the requested
@@ -2256,6 +2278,63 @@ unittest  // COMPOSE: the per-route helpers reproduce the AS-metadata leg
 
 	assert(res.statusCode == 200);
 	assert(body_.canFind("authorization_endpoint"));
+}
+
+unittest  // CORS: the well-known metadata documents are readable cross-origin
+{
+	import vibe.http.server : createTestHTTPServerRequest,
+		createTestHTTPServerResponse, TestHTTPResponseMode;
+	import vibe.inet.url : URL;
+	import vibe.stream.memory : createMemoryOutputStream;
+
+	auto proxy = mountSampleProxy();
+	auto router = new URLRouter;
+	mountOAuthMetadata(router, proxy);
+
+	foreach (path; [
+		"/.well-known/oauth-authorization-server",
+		"/.well-known/oauth-protected-resource"
+	])
+	{
+		auto req = createTestHTTPServerRequest(URL("https://mcp.example.com" ~ path));
+		req.headers["Origin"] = "https://app.example.com";
+		auto res = createTestHTTPServerResponse(createMemoryOutputStream(),
+				null, TestHTTPResponseMode.bodyOnly);
+		router.handleRequest(req, res);
+		assert(res.statusCode == 200);
+		assert(res.headers.get("Access-Control-Allow-Origin", "") == "*");
+	}
+}
+
+unittest  // CORS: a preflight to a well-known metadata document is answered
+{
+	import std.algorithm : canFind;
+	import vibe.http.common : HTTPMethod;
+	import vibe.http.server : createTestHTTPServerRequest,
+		createTestHTTPServerResponse, TestHTTPResponseMode;
+	import vibe.inet.url : URL;
+	import vibe.stream.memory : createMemoryOutputStream;
+
+	auto proxy = mountSampleProxy();
+	auto router = new URLRouter;
+	mountOAuthMetadata(router, proxy);
+
+	foreach (path; [
+		"/.well-known/oauth-authorization-server",
+		"/.well-known/oauth-protected-resource"
+	])
+	{
+		auto req = createTestHTTPServerRequest(URL("https://mcp.example.com" ~ path),
+				HTTPMethod.OPTIONS);
+		req.headers["Origin"] = "https://app.example.com";
+		req.headers["Access-Control-Request-Method"] = "GET";
+		auto res = createTestHTTPServerResponse(createMemoryOutputStream(),
+				null, TestHTTPResponseMode.bodyOnly);
+		router.handleRequest(req, res);
+		assert(res.statusCode == 204);
+		assert(res.headers.get("Access-Control-Allow-Origin", "") == "*");
+		assert(res.headers.get("Access-Control-Allow-Methods", "").canFind("GET"));
+	}
 }
 
 unittest  // COMPOSE: the per-route helpers reproduce the /register leg
