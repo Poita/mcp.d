@@ -686,7 +686,9 @@ struct InputRequest
 	}
 
 	/// Build a form-`elicitation` input-request from a message and an optional
-	/// JSON Schema (`requestedSchema`). For a `requestedSchema` derived from a flat
+	/// JSON Schema (`requestedSchema`). Form mode requires a `requestedSchema`, so
+	/// without one the request carries an empty object schema (a plain
+	/// confirmation). For a `requestedSchema` derived from a flat
 	/// struct `T`, use `mcp.protocol.schema.elicitationRequest!T` (where
 	/// reflection-driven schema generation lives, so this module stays free of any
 	/// schema/reflection dependency).
@@ -697,6 +699,11 @@ struct InputRequest
 		p["message"] = message;
 		if (requestedSchema.type == Json.Type.object)
 			p["requestedSchema"] = requestedSchema;
+		else
+			p["requestedSchema"] = Json([
+			"type": Json("object"),
+			"properties": Json.emptyObject
+		]);
 		return InputRequest(id, "elicitation", p);
 	}
 
@@ -1114,8 +1121,19 @@ unittest  // InputRequest.requestedSchema reads back the elicitation builder sch
 
 unittest  // InputRequest.requestedSchema is undefined when no schema is present
 {
-	auto ir = InputRequest.elicitation("e1", "Just a message");
+	auto ir = InputRequest("e1", "elicitation", Json([
+		"message": Json("Just a message")
+	]));
 	assert(ir.requestedSchema().type == Json.Type.undefined);
+}
+
+unittest  // InputRequest.elicitation without a schema sends an empty object schema
+{
+	auto ir = InputRequest.elicitation("e1", "Just a message");
+	auto schema = ir.params["requestedSchema"];
+	assert(schema["type"].get!string == "object");
+	assert(schema["properties"].type == Json.Type.object);
+	assert(schema["properties"].length == 0);
 }
 
 unittest  // MRTR InputRequiredResult round-trips and input responses parse
