@@ -166,8 +166,15 @@ final class WebhookReceiver
 			return ReceiverResponse(200, "");
 		}
 
+		// A malformed occurrence is the sender's fault and fails the same way on
+		// every retry, so it is answered 400 rather than surfacing as a 5xx.
+		EventOccurrence occ;
+		try
+			occ = EventOccurrence.fromJson(j);
+		catch (Exception)
+			return ReceiverResponse(400, "");
 		if (reg.onEvent !is null)
-			reg.onEvent(EventOccurrence.fromJson(j));
+			reg.onEvent(occ);
 		return ReceiverResponse(200, "");
 	}
 
@@ -301,6 +308,25 @@ unittest  // a tampered body fails signature verification with 400
 	auto headers = signDeliveryHeaders(signing, body);
 	auto resp = rx.processDelivery(body ~ "tampered", headers);
 	assert(resp.status == 400);
+}
+
+unittest  // a signed delivery whose body is not an event occurrence is rejected with 400
+{
+	auto rx = new WebhookReceiver();
+	rx.verifyTimestamp = false;
+	bool delivered;
+	rx.register("sub_1", testSecret, (EventOccurrence occ) @safe {
+		delivered = true;
+	});
+	foreach (body; [`[1,2]`, `"text"`, `42`])
+	{
+		DeliverySigning signing = {
+			secret: testSecret, messageId: "wid_bad", timestamp: 1700, subscriptionId: "sub_1"
+		};
+		auto headers = signDeliveryHeaders(signing, body);
+		assert(rx.processDelivery(body, headers).status == 400, body);
+	}
+	assert(!delivered);
 }
 
 unittest  // a retried delivery (same webhook-id) is deduplicated, callback fires once
