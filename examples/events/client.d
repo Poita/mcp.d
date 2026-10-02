@@ -57,7 +57,6 @@ int main(string[] args) @safe
 		check("extensions" in caps && (eventsExtensionKey in caps["extensions"]) !is null,
 			"discover capabilities.extensions should contain the events extension key");
 
-		client.connect();
 		check(client.eventsSupported(), "client.eventsSupported() should be true");
 
 		// --- 2. events/list declares incident.created -----------------------

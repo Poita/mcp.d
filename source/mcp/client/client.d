@@ -1028,7 +1028,8 @@ final class McpClient : ClientProtocol
 	/// `server/discover` (2026-07-28): fetch the server's supported versions,
 	/// capabilities, and identity. `DiscoverResult` is a `CacheableResult`, so a
 	/// still-fresh response is served from the cache without a round-trip;
-	/// `opts.cacheMode` overrides.
+	/// `opts.cacheMode` overrides. On a modern session the result also becomes
+	/// what `serverCapabilities`/`serverInfo`/`serverInstructions` report.
 	DiscoverResult discover(RequestOptions opts = RequestOptions.init) @safe
 	{
 		auto result = withCancellation!DiscoverResult(opts.cancellation,
@@ -1036,7 +1037,20 @@ final class McpClient : ClientProtocol
 					""), opts.cacheMode, () @safe => DiscoverResult.fromJson(
 					rpcWith("server/discover", Json.emptyObject, opts))));
 		discoverResult_ = result;
+		// A modern session has no initialize handshake, so discovery is where the
+		// server's capabilities and identity come from.
+		if (useModern)
+			adoptDiscovered(result);
 		return result;
+	}
+
+	/// Record what a `server/discover` result advertises as the server's
+	/// capabilities, identity and instructions.
+	private void adoptDiscovered(DiscoverResult d) @safe
+	{
+		serverCapabilities_ = d.capabilities;
+		serverInfo_ = d.serverInfo;
+		serverInstructions_ = d.instructions;
 	}
 
 	/// `server/discover` self-advertising modern framing, used by `connect()` to
@@ -1224,25 +1238,13 @@ final class McpClient : ClientProtocol
 			negotiated = chosen;
 			transport.setModernProtocol(true);
 			// No initialize handshake follows on the modern protocol path, so
-			// capture what `server/discover` advertised; otherwise the caller
-			// would have no way to inspect the server's capabilities/identity.
-			// When the probe succeeded (haveDisc), the result is already in hand;
-			// when it failed with UnsupportedProtocolVersionError (haveDisc is
-			// false), modern framing is now active so a fresh discover() populates
-			// the same fields.
+			// capture what `server/discover` advertised. A probe rejected with
+			// UnsupportedProtocolVersionError left nothing in hand, so a fresh
+			// discover() under the now-active modern framing supplies it.
 			if (haveDisc)
-			{
-				serverCapabilities_ = disc.capabilities;
-				serverInfo_ = disc.serverInfo;
-				serverInstructions_ = disc.instructions;
-			}
+				adoptDiscovered(disc);
 			else
-			{
-				auto freshDisc = discover();
-				serverCapabilities_ = freshDisc.capabilities;
-				serverInfo_ = freshDisc.serverInfo;
-				serverInstructions_ = freshDisc.instructions;
-			}
+				discover();
 		}
 		else
 		{
@@ -1294,9 +1296,7 @@ final class McpClient : ClientProtocol
 			transport.setModernProtocol(true);
 			// No `initialize` follows on the modern protocol path, so adopt what the
 			// prior discovery advertised directly — no `server/discover` round-trip.
-			serverCapabilities_ = prior.capabilities;
-			serverInfo_ = prior.serverInfo;
-			serverInstructions_ = prior.instructions;
+			adoptDiscovered(prior);
 		}
 		else
 		{
@@ -9180,6 +9180,25 @@ unittest  // connect() populates serverCapabilities/serverInfo/serverInstruction
 	assert(c.serverInfo().version_ == "2.0");
 	assert(!c.serverInstructions().isNull);
 	assert(c.serverInstructions().get == "hello");
+}
+
+unittest  // discover() on a modern session adopts the server's capabilities, identity and instructions
+{
+	auto transport = new RecordingClientTransport();
+	auto c = new McpClient(transport);
+	c.enableModern();
+	c.onRpcForTest = (string method, Json params) @safe {
+		DiscoverResult d;
+		d.supportedVersions = [ProtocolVersion.v2026_07_28.toWire];
+		d.serverInfo = Implementation("modern-srv", "2.0");
+		d.capabilities.logging = true;
+		d.instructions = "hello";
+		return d.toJson();
+	};
+	c.discover();
+	assert(c.serverInfo().name == "modern-srv");
+	assert(c.serverCapabilities().logging);
+	assert(!c.serverInstructions().isNull && c.serverInstructions().get == "hello");
 }
 
 version (unittest)
