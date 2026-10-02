@@ -515,6 +515,8 @@ void mountOAuthAuthorize(URLRouter router, OAuthProxy proxy, ProxyStateStore sto
 				renderConsent(doc.clientName, clientRedirect, proxyState);
 			catch (InvalidClientIdMetadataException)
 			{
+				bool dropped;
+				store.take(proxyState, dropped);
 				res.statusCode = HTTPStatus.badRequest;
 				res.writeJsonBody(invalidRequestJson("invalid client_id metadata document"));
 			}
@@ -642,6 +644,8 @@ void mountOAuthConsent(URLRouter router, OAuthProxy proxy, ProxyStateStore store
 			}
 			catch (InvalidClientIdMetadataException)
 			{
+				bool dropped;
+				store.take(proxyState, dropped);
 				res.statusCode = HTTPStatus.badRequest;
 				res.writeJsonBody(invalidRequestJson("invalid client_id metadata document"));
 			}
@@ -671,17 +675,45 @@ void mountOAuthConsent(URLRouter router, OAuthProxy proxy, ProxyStateStore store
 /// the proxy state in `store` and relay the upstream code straight back to the
 /// client.
 ///
+/// The callback is honoured only in the browser that consented to the client:
+/// the request must carry the consent cookie the pending authorization was
+/// started under, and that browser must hold consent for the client. Otherwise
+/// an attacker could approve their own client, hand a victim the resulting
+/// upstream authorize URL, and have the victim's code relayed to the attacker's
+/// redirect_uri. A refused callback leaves the pending authorization in place.
+///
 /// The `store` MUST be the one `mountOAuthAuthorize` writes to.
 void mountOAuthCallback(URLRouter router, OAuthProxy proxy, ProxyStateStore store) @safe
 {
+	import mcp.auth.oauth : constantTimeEquals;
+
 	const callbackPath = pathOf(proxy.config().callbackUrl());
+	const secureCookie = proxy.config().baseUrl.startsWith("https://");
 	router.get(callbackPath, (HTTPServerRequest req, HTTPServerResponse res) @safe {
 		const code = req.query.get("code", "");
 		const upstreamError = req.query.get("error", "");
 		const proxyState = req.query.get("state", "");
 		bool found;
+		const pending = store.peek(proxyState, found);
+		if (!found || pending.clientRedirectUri.length == 0)
+		{
+			res.statusCode = HTTPStatus.badRequest;
+			res.writeBody("Unknown or expired authorization state", "text/plain");
+			return;
+		}
+		const browserSession = req.cookies.get(consentCookieNameFor(secureCookie), "");
+		const consentIdentity = pending.clientId.length ? pending.clientId
+			: pending.clientRedirectUri;
+		if (pending.consentSession.length == 0 || !constantTimeEquals(browserSession,
+			pending.consentSession) || !proxy.hasConsent(pending.consentSession, consentIdentity))
+		{
+			res.statusCode = HTTPStatus.forbidden;
+			res.writeBody("The authorization must be completed in the browser that approved it",
+				"text/plain");
+			return;
+		}
 		auto st = store.take(proxyState, found);
-		if (!found || st.clientRedirectUri.length == 0)
+		if (!found)
 		{
 			res.statusCode = HTTPStatus.badRequest;
 			res.writeBody("Unknown or expired authorization state", "text/plain");
@@ -1812,6 +1844,7 @@ unittest  // UPSTREAM ERROR: /callback relays an upstream error to the client, n
 	// The upstream redirects back with an error and no code.
 	auto res2 = createTestHTTPServerResponse(null, null, TestHTTPResponseMode.bodyOnly);
 	auto req2 = createTestHTTPServerRequest(URL("https://mcp.example.com/auth/callback?error=access_denied&error_description=denied&state=" ~ proxyState));
+	req2.headers["Cookie"] = consentCookieName ~ "=browser-1";
 	router.handleRequest(req2, res2);
 
 	assert(res2.statusCode == 302);
@@ -2469,7 +2502,8 @@ version (unittest)
 		assert(upstream.status == 302);
 		const proxyState = upstream.location[upstream.location.indexOf("state=") + 6 .. $];
 		const relayed = browserGet(router,
-				"https://mcp.example.com/auth/callback?code=" ~ code ~ "&state=" ~ proxyState, "");
+				"https://mcp.example.com/auth/callback?code=" ~ code ~ "&state=" ~ proxyState,
+				"browser-1");
 		assert(relayed.location.startsWith("http://localhost:5000/cb?code=" ~ code));
 		return router;
 	}
@@ -2892,4 +2926,115 @@ unittest  // BROKER MOUNT: a refresh_token grant is refused, never relaying the 
 	assert(body_.canFind("unsupported_grant_type"));
 	assert(!body_.canFind("gho_upstream_secret"));
 	assert(!upstreamCalled);
+}
+
+version (unittest)
+{
+	/// The proxy `state` carried in an upstream authorize redirect.
+	private string upstreamStateOf(string location) @safe
+	{
+		import std.string : indexOf;
+
+		const mark = "state=";
+		const i = location.indexOf(mark);
+		assert(i >= 0);
+		auto rest = location[i + mark.length .. $];
+		const amp = rest.indexOf('&');
+		return amp < 0 ? rest : rest[0 .. amp];
+	}
+}
+
+unittest  // CALLBACK BINDING: a callback from a browser other than the consenting one is refused
+{
+	import std.algorithm : canFind;
+
+	auto proxy = new OAuthProxy(consentMountConfig());
+	proxy.register(["https://evil.example/cb"]);
+	auto router = new URLRouter;
+	mountOAuthProxy(router, proxy);
+
+	// The attacker approves their own client in their own browser and captures
+	// the upstream authorize URL instead of following it.
+	const page = browserGet(router, "https://mcp.example.com/authorize?code_challenge=ATTACKER"
+			~ "&redirect_uri=https%3A%2F%2Fevil.example%2Fcb&state=x", "");
+	const approved = browserPost(router, "https://mcp.example.com/consent",
+			consentForm(page.body_), page.setCookie);
+	assert(approved.status == 302);
+	const proxyState = upstreamStateOf(approved.location);
+
+	// The victim follows that URL; the upstream auto-approves and redirects the
+	// victim's browser (no consent cookie, or its own) back to the callback.
+	const noCookie = browserGet(router,
+			"https://mcp.example.com/auth/callback?code=VICTIM&state=" ~ proxyState, "");
+	assert(noCookie.status != 302);
+	assert(!noCookie.location.canFind("VICTIM"));
+	const otherCookie = browserGet(router,
+			"https://mcp.example.com/auth/callback?code=VICTIM&state=" ~ proxyState,
+			"victim-session");
+	assert(otherCookie.status != 302);
+	assert(!otherCookie.location.canFind("VICTIM"));
+}
+
+unittest  // CALLBACK BINDING: the consenting browser's callback relays the code
+{
+	import std.algorithm : canFind, startsWith;
+
+	auto proxy = new OAuthProxy(consentMountConfig());
+	proxy.register(["http://localhost:5000/cb"]);
+	auto router = new URLRouter;
+	mountOAuthProxy(router, proxy);
+
+	const page = browserGet(router, "https://mcp.example.com/authorize?code_challenge=CH"
+			~ "&redirect_uri=http%3A%2F%2Flocalhost%3A5000%2Fcb&state=cs", "");
+	const approved = browserPost(router, "https://mcp.example.com/consent",
+			consentForm(page.body_), page.setCookie);
+	const proxyState = upstreamStateOf(approved.location);
+
+	const cb = browserGet(router,
+			"https://mcp.example.com/auth/callback?code=C1&state=" ~ proxyState, page.setCookie);
+	assert(cb.status == 302);
+	assert(cb.location.startsWith("http://localhost:5000/cb?"));
+	assert(cb.location.canFind("code=C1"));
+}
+
+unittest  // CALLBACK BINDING: a pending authorization awaiting consent cannot be completed
+{
+	auto proxy = new OAuthProxy(consentMountConfig());
+	proxy.register(["http://localhost:5000/cb"]);
+	auto router = new URLRouter;
+	mountOAuthProxy(router, proxy);
+
+	const page = browserGet(router, "https://mcp.example.com/authorize?code_challenge=CH"
+			~ "&redirect_uri=http%3A%2F%2Flocalhost%3A5000%2Fcb&state=cs", "");
+	const proxyState = hiddenField(page.body_, "state");
+	assert(proxyState.length);
+
+	const cb = browserGet(router,
+			"https://mcp.example.com/auth/callback?code=C1&state=" ~ proxyState, page.setCookie);
+	assert(cb.status != 302);
+}
+
+unittest  // CIMD MOUNT: a rejected CIMD authorization leaves no pending state behind
+{
+	import vibe.http.server : createTestHTTPServerRequest,
+		createTestHTTPServerResponse, TestHTTPResponseMode;
+	import vibe.inet.url : URL;
+	import vibe.stream.memory : createMemoryOutputStream;
+
+	auto proxy = cimdProxyWithStubDoc(cimdMountConfig(), cimdMountDoc());
+	proxy.grantConsent("browser-1", "https://app.example.com/oauth/client.json");
+	auto router = new URLRouter;
+	auto store = new ProxyStateStore;
+	mountOAuthAuthorize(router, proxy, store);
+
+	auto sink = createMemoryOutputStream();
+	auto req = createTestHTTPServerRequest(URL("https://mcp.example.com/authorize?"
+			~ "client_id=https%3A%2F%2Fapp.example.com%2Foauth%2Fclient.json"
+			~ "&code_challenge=CH&redirect_uri=http%3A%2F%2F127.0.0.1%3A9999%2Fother&state=cs"));
+	req.headers["Cookie"] = consentCookieName ~ "=browser-1";
+	auto res = createTestHTTPServerResponse(sink, null, TestHTTPResponseMode.bodyOnly);
+	router.handleRequest(req, res);
+
+	assert(res.statusCode == 400);
+	assert(store.length == 0);
 }
