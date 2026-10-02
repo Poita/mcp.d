@@ -118,13 +118,10 @@ struct StreamableHttpOptions
 	/// mounted more than once, the first mount's value applies to every mount.
 	ReplayHistoryOptions replayHistory;
 
-	/// Stateful servers only: a session with no request and no open GET stream
-	/// for this long is expired (`Duration.zero` disables expiry).
-	Duration sessionIdleTtl = SessionManager.defaultIdleTtl;
-	/// Stateful servers only: the most sessions kept at once. Past it, creating a
-	/// session evicts the least-recently-active never-used session first, then
-	/// the least-recently-active one (`0` disables the cap).
-	size_t maxSessions = SessionManager.defaultMaxActive;
+	/// Stateful servers only: the idle expiry and the global and per-principal
+	/// caps on `Mcp-Session-Id` sessions. An `initialize` that would exceed a
+	/// cap when every session that could make room is busy is answered 503.
+	SessionLimits sessionLimits;
 }
 
 /// The well-known path (RFC 9728 §3) at which a protected resource server
@@ -208,8 +205,8 @@ void mountMcp(URLRouter router, McpServer server,
 	auto coord = push.coordinator;
 	// Session minting is derived from the server's mode: a `stateful`
 	// server mints/tracks an `Mcp-Session-Id`; a `stateless` server never does.
-	auto sessions = server.mode == ServerMode.stateful
-		? new SessionManager(opts.sessionIdleTtl, opts.maxSessions) : null;
+	auto sessions = server.mode == ServerMode.stateful ? new SessionManager(opts.sessionLimits)
+		: null;
 	auto statelessInFlight = sessions is null ? new StatelessInFlight : null;
 
 	// This mount owns a single fallback `ConnectionState`, which the server core
@@ -1325,7 +1322,11 @@ private void handleGet(McpServer server, ServerPushChannel push, SessionManager 
 		}
 		getConn = sessions.stateFor(sid);
 		ownerToken = sid;
+		sessions.streamOpened(sid);
 	}
+	scope (exit)
+		if (sessions !is null)
+			sessions.streamClosed(ownerToken);
 
 	// Open a long-lived SSE stream wired to the server-push channel, so the
 	// server can deliver unsolicited notifications/requests outside any POST.
@@ -2073,6 +2074,14 @@ private void handlePost(McpServer server, StreamCoordinator coord, SessionManage
 		{
 			try
 				mintedSessionId = sessions.create(principalOf(token));
+			catch (SessionCapacityException e)
+			{
+				res.statusCode = HTTPStatus.serviceUnavailable;
+				res.headers["Retry-After"] = "30";
+				res.writeBody(makeErrorResponse(msg.id, internalError(e.msg))
+						.toString(), "application/json");
+				return;
+			}
 			catch (McpException e)
 			{
 				res.statusCode = HTTPStatus.internalServerError;
@@ -2996,7 +3005,7 @@ unittest  // a session GET stream keeps its session alive and ends when the sess
 	import core.time : msecs;
 	import vibe.core.core : runTask, sleep, exitEventLoop, runEventLoop;
 
-	auto sessions = new SessionManager(300.msecs, 0);
+	auto sessions = new SessionManager(SessionLimits(300.msecs, 0));
 	const sid = sessions.create();
 	auto push = new ServerPushChannel(new StreamCoordinator);
 	const lid = push.addListener((string) @safe {}, Json.init, ListenFilter.init, "", null, sid);
@@ -4132,7 +4141,7 @@ unittest  // the standalone GET stream writes its first bytes as soon as it open
 	assert(ended, "DELETE must end the GET stream");
 }
 
-unittest  // evicting a session past the cap closes its open GET stream at once
+unittest  // an initialize past the cap is refused with 503 while every session holds a GET stream
 {
 	import core.time : msecs;
 	import vibe.core.core : runTask, sleep, exitEventLoop, runEventLoop;
@@ -4144,19 +4153,19 @@ unittest  // evicting a session past the cap closes its open GET stream at once
 	auto server = McpServer.stateful("t", "1");
 	auto router = new URLRouter;
 	StreamableHttpOptions opts;
-	opts.maxSessions = 1;
+	opts.sessionLimits.maxSessions = 1;
 	mountMcp(router, server, opts);
 
-	string initialize() @safe
+	HTTPServerResponse initialize() @safe
 	{
 		auto res = createTestHTTPServerResponse(createMemoryOutputStream(),
 				null, TestHTTPResponseMode.bodyOnly);
 		router.handleRequest(makeInitPostReq(initializeBody(),
 				["Accept": "application/json, text/event-stream"]), res);
-		return res.headers[SessionHeader];
+		return res;
 	}
 
-	const sid = initialize();
+	const sid = initialize().headers[SessionHeader];
 	bool ended;
 	runTask(() @safe nothrow{
 		try
@@ -4175,14 +4184,19 @@ unittest  // evicting a session past the cap closes its open GET stream at once
 		}
 		ended = true;
 	});
-	bool endedBeforeEviction;
+	int refused;
+	bool endedAfterRefusal;
 	runTask(() @safe nothrow{
 		try
 		{
 			sleep(200.msecs);
-			endedBeforeEviction = ended;
-			initialize();
-			sleep(1000.msecs);
+			refused = initialize().statusCode;
+			sleep(200.msecs);
+			endedAfterRefusal = ended;
+			router.handleRequest(sessionReq(HTTPMethod.DELETE, sid),
+				createTestHTTPServerResponse(createMemoryOutputStream(),
+				null, TestHTTPResponseMode.bodyOnly));
+			sleep(200.msecs);
 		}
 		catch (Exception)
 		{
@@ -4190,8 +4204,9 @@ unittest  // evicting a session past the cap closes its open GET stream at once
 		exitEventLoop();
 	});
 	runEventLoop();
-	assert(!endedBeforeEviction, "the GET stream must stay open while its session lives");
-	assert(ended, "evicting the session must close its GET stream promptly");
+	assert(refused == HTTPStatus.serviceUnavailable, "a full server must refuse a new session");
+	assert(!endedAfterRefusal, "a session holding a GET stream must never be evicted");
+	assert(ended);
 }
 
 version (unittest) private string initSession(URLRouter router, string ver = "2025-11-25") @safe

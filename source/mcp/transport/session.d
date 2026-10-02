@@ -52,18 +52,21 @@ struct BoundedExpiringMap(V)
 		return clock is null ? MonoTime.currTime : clock();
 	}
 
-	/// Sweep expired entries, evict the oldest if inserting a new key would
-	/// exceed the cap, then store `value` and stamp it as just-active.
-	void put(string key, V value) @safe
+	/// Sweep expired entries, evict the oldest idle entry if inserting a new key
+	/// would exceed the cap, then store `value` and stamp it as just-active.
+	/// Returns false, storing nothing, when the cap is reached and every entry
+	/// is busy.
+	bool put(string key, V value) @safe
 	{
 		const t = now();
 		sweepDue(t);
 		if (maxEntries != 0 && (key in values) is null)
-			while (values.length >= maxEntries && evictOldest())
-			{
-			}
+			while (values.length >= maxEntries)
+				if (!evictOldest())
+					return false;
 		values[key] = value;
 		stamps[key] = t;
+		return true;
 	}
 
 	/// Sweep expired entries, then consume and return the entry for `key`,
@@ -195,15 +198,29 @@ struct BoundedExpiringMap(V)
 			evict(k);
 	}
 
+	/// Number of live entries for which `pred` holds.
+	size_t count(scope bool delegate(ref V value) @safe pred) @safe
+	{
+		size_t n;
+		foreach (ref v; values)
+			if (pred(v))
+				n++;
+		return n;
+	}
+
 	/// Evict the least-recently-active never-used entry, or the
-	/// least-recently-active entry when every entry has been used.
-	private bool evictOldest() @safe
+	/// least-recently-active entry when every entry has been used, among the
+	/// entries `among` accepts (every entry when null). A busy entry is never
+	/// evicted. Returns false when there was no candidate.
+	bool evictOldest(scope bool delegate(ref V value) @safe among = null) @safe
 	{
 		string oldest, oldestUnused;
 		MonoTime oldestTs, oldestUnusedTs;
 		bool found, foundUnused;
 		foreach (k, ts; stamps)
 		{
+			if ((among !is null && !among(values[k])) || (busy !is null && busy(values[k])))
+				continue;
 			if (!found || ts < oldestTs)
 			{
 				oldest = k;
@@ -310,6 +327,35 @@ unittest  // BoundedExpiringMap remove drops the entry and reports prior presenc
 	assert(m.length == 0);
 }
 
+/// The bounds a `SessionManager` keeps its sessions within.
+struct SessionLimits
+{
+	/// A session with no request and no open GET stream for this long is
+	/// expired (`Duration.zero` disables expiry).
+	Duration idleTtl = 30.minutes;
+	/// The most sessions kept at once (`0`: unbounded). Past it, creating a
+	/// session evicts the least-recently-active never-used idle session first,
+	/// then the least-recently-active idle one; when every session is running a
+	/// request or holding a GET stream, the new session is refused instead.
+	size_t maxSessions = 10_000;
+	/// The most sessions one authenticated principal keeps at once (`0`:
+	/// unbounded). Past it, that principal's least-recently-active idle session
+	/// is evicted, so one principal cannot push out everyone else's sessions.
+	/// Unauthenticated sessions share no principal and are bounded only by
+	/// `maxSessions`.
+	size_t maxPerPrincipal = 0;
+}
+
+/// Thrown by `SessionManager.create` when a session cap is reached and every
+/// session that could make room is busy. The transport answers 503.
+class SessionCapacityException : Exception
+{
+	this(string msg, string file = __FILE__, size_t line = __LINE__) @safe pure nothrow
+	{
+		super(msg, file, line);
+	}
+}
+
 /// Tracks active Streamable HTTP sessions for a server mount.
 ///
 /// When session management is enabled (the server was built with
@@ -340,6 +386,7 @@ final class SessionManager
 	// by idle TTL and active-session cap, evicting least-recently-active sessions
 	// so a never-DELETE client cannot grow the table without bound.
 	private BoundedExpiringMap!Session sessions;
+	private size_t maxPerPrincipal;
 
 	/// A session's state together with the authenticated principal (token
 	/// subject, "" when unauthenticated) that created it.
@@ -347,31 +394,23 @@ final class SessionManager
 	{
 		ConnectionState state;
 		string principal;
+		/// Standalone GET streams currently open on the session.
+		size_t streams;
 	}
 
-	/// Default idle TTL applied when none is configured: a stateful session left
-	/// untouched for this long is swept on the next `create`.
-	enum Duration defaultIdleTtl = 30.minutes;
-
-	/// Default cap on concurrently-active sessions, bounding worst-case
-	/// `ConnectionState` residency for a server whose clients never issue DELETE.
-	enum size_t defaultMaxActive = 10_000;
-
-	/// Construct a session manager with the default idle TTL and active-session
-	/// cap, both bounding `ConnectionState` residency for abandoned sessions.
+	/// Construct a session manager with the default `SessionLimits`.
 	this() @safe
 	{
-		this(defaultIdleTtl, defaultMaxActive);
+		this(SessionLimits.init);
 	}
 
-	/// Construct with an explicit idle TTL and active-session cap (see
-	/// `StreamableHttpOptions.sessionIdleTtl` / `maxSessions`). `idleTtl`
-	/// `Duration.zero` disables the idle sweep; `maxActive` `0` disables the cap.
-	this(Duration idleTtl, size_t maxActive) @safe
+	/// Construct with explicit `limits`.
+	this(SessionLimits limits) @safe
 	{
-		sessions = BoundedExpiringMap!Session(idleTtl, maxActive, null);
+		sessions = BoundedExpiringMap!Session(limits.idleTtl, limits.maxSessions, null);
+		maxPerPrincipal = limits.maxPerPrincipal;
 		sessions.onEvict = &evicted;
-		sessions.busy = (ref Session s) @safe => s.state.inFlight.length > 0;
+		sessions.busy = (ref Session s) @safe => s.state.inFlight.length > 0 || s.streams > 0;
 	}
 
 	/// Called with a session's id after the idle sweep or the active-session cap
@@ -379,12 +418,10 @@ final class SessionManager
 	/// called for `terminate`.
 	void delegate(string id) @safe onExpire;
 
-	/// Cancel an expired or evicted session's in-flight requests, whose responses
-	/// can no longer be delivered, and report its end.
+	/// Report the end of an expired or evicted session. Only idle sessions
+	/// expire or are evicted, so it has no request to cancel.
 	private void evicted(string id, Session s) @safe
 	{
-		foreach (tok; s.state.inFlight)
-			tok.cancel();
 		if (onExpire !is null)
 			onExpire(id);
 	}
@@ -396,13 +433,17 @@ final class SessionManager
 	/// spec requirement that the id "MUST only contain visible ASCII characters
 	/// (ranging from 0x21 to 0x7E)".
 	///
-	/// Before minting the new session the idle TTL sweep runs lazily and, if the
-	/// active-session cap would be exceeded, the least-recently-active session is
-	/// evicted — so a client that connects, initializes, and walks away without
-	/// DELETE cannot grow the table without bound.
+	/// Before minting the new session the idle TTL sweep runs lazily and, if a
+	/// cap would be exceeded, the least-recently-active idle session is evicted:
+	/// one of `principal`'s own sessions for the per-principal cap, any session
+	/// for the global cap. So a client that connects, initializes, and walks away
+	/// without DELETE cannot grow the table without bound. A session running a
+	/// request or holding an open GET stream is never evicted; when only such
+	/// sessions remain, no session is minted.
 	///
-	/// Throws: `McpException` (`internalError`) when the host OS CSPRNG is
-	/// unavailable. This is fail-closed (see `generateSessionId`),
+	/// Throws: `SessionCapacityException` when a cap is reached and every
+	/// candidate session is busy. `McpException` (`internalError`) when the host
+	/// OS CSPRNG is unavailable. This is fail-closed (see `generateSessionId`),
 	/// so callers on the request path (e.g. `streamable_http.handlePost`'s
 	/// `initialize` branch) must be prepared for it to throw rather than always
 	/// returning an id. vibe.d converts an escaping `McpException` to an HTTP 500;
@@ -410,11 +451,40 @@ final class SessionManager
 	/// shape matches every other error path.
 	string create(string principal = "") @safe
 	{
+		if (maxPerPrincipal != 0 && principal.length)
+		{
+			bool mine(ref Session s) @safe
+			{
+				return s.principal == principal;
+			}
+
+			while (sessions.count(&mine) >= maxPerPrincipal)
+				if (!sessions.evictOldest(&mine))
+					throw new SessionCapacityException(
+							"too many active sessions for this principal");
+		}
 		const id = generateSessionId();
 		// put() runs the lazy idle sweep and cap eviction before inserting, so an
 		// abandoned session is reclaimed the next time any client initializes.
-		sessions.put(id, Session(new ConnectionState, principal));
+		if (!sessions.put(id, Session(new ConnectionState, principal)))
+			throw new SessionCapacityException("too many active sessions");
 		return id;
+	}
+
+	/// Record that a standalone GET stream opened on session `id`. While any is
+	/// open the session neither expires nor is evicted to make room.
+	void streamOpened(string id) @safe
+	{
+		if (auto p = sessions.get(id, true))
+			p.streams++;
+	}
+
+	/// Record that a standalone GET stream on session `id` closed.
+	void streamClosed(string id) @safe
+	{
+		if (auto p = sessions.get(id, true))
+			if (p.streams > 0)
+				p.streams--;
 	}
 
 	/// Whether `id` is an active session created by `principal`. A session id
@@ -496,7 +566,7 @@ unittest  // create() past the active-session cap evicts the oldest rather than 
 	import core.thread : Thread;
 	import core.time : msecs;
 
-	auto mgr = new SessionManager(Duration.zero, 3);
+	auto mgr = new SessionManager(SessionLimits(Duration.zero, 3));
 	const a = mgr.create();
 	Thread.sleep(2.msecs);
 	const b = mgr.create();
@@ -516,7 +586,7 @@ unittest  // resolving a session via stateFor refreshes its activity so it is no
 	import core.thread : Thread;
 	import core.time : msecs;
 
-	auto mgr = new SessionManager(Duration.zero, 2);
+	auto mgr = new SessionManager(SessionLimits(Duration.zero, 2));
 	const a = mgr.create();
 	Thread.sleep(2.msecs);
 	const b = mgr.create();
@@ -537,7 +607,7 @@ unittest  // an idle session past the TTL is swept on the next create()
 	import core.thread : Thread;
 	import core.time : msecs;
 
-	auto mgr = new SessionManager(5.msecs, 0);
+	auto mgr = new SessionManager(SessionLimits(5.msecs, 0));
 	const stale = mgr.create();
 	assert(mgr.isActive(stale));
 	Thread.sleep(20.msecs);
@@ -552,7 +622,7 @@ unittest  // a session with an in-flight request is not swept as idle
 	import core.time : msecs;
 	import mcp.server.context : CancellationToken;
 
-	auto mgr = new SessionManager(5.msecs, 0);
+	auto mgr = new SessionManager(SessionLimits(5.msecs, 0));
 	const busy = mgr.create();
 	auto tok = new CancellationToken;
 	mgr.stateFor(busy).inFlight["i:1"] = tok;
@@ -568,7 +638,7 @@ unittest  // a session's idle clock restarts when its last in-flight request end
 	import core.time : msecs;
 	import mcp.server.context : CancellationToken;
 
-	auto mgr = new SessionManager(30.msecs, 0);
+	auto mgr = new SessionManager(SessionLimits(30.msecs, 0));
 	const id = mgr.create();
 	auto state = mgr.stateFor(id);
 	state.inFlight["i:1"] = new CancellationToken;
@@ -589,7 +659,7 @@ unittest  // isActive sweeps expired entries without needing a create() to trigg
 	import core.thread : Thread;
 	import core.time : msecs;
 
-	auto mgr = new SessionManager(5.msecs, 0);
+	auto mgr = new SessionManager(SessionLimits(5.msecs, 0));
 	const stale = mgr.create();
 	assert(mgr.isActive(stale));
 	Thread.sleep(20.msecs);
@@ -607,7 +677,7 @@ unittest  // stateFor returns null for an expired session without needing a prio
 	import core.thread : Thread;
 	import core.time : msecs;
 
-	auto mgr = new SessionManager(5.msecs, 0);
+	auto mgr = new SessionManager(SessionLimits(5.msecs, 0));
 	const stale = mgr.create();
 	assert(mgr.isActive(stale));
 	Thread.sleep(20.msecs);
@@ -620,7 +690,7 @@ unittest  // stateFor returns null for an expired session without needing a prio
 
 unittest  // a disabled idle TTL and disabled cap leave sessions resident (historical behaviour)
 {
-	auto mgr = new SessionManager(Duration.zero, 0);
+	auto mgr = new SessionManager(SessionLimits(Duration.zero, 0));
 	string[] ids;
 	foreach (_; 0 .. 5)
 		ids ~= mgr.create();
@@ -777,22 +847,18 @@ unittest  // terminate cancels the session's in-flight requests
 	assert(tok.cancelled, "a terminated session's in-flight request must be cancelled");
 }
 
-unittest  // a session evicted past the cap has its in-flight cancelled and its end reported
+unittest  // a session evicted past the cap has its end reported
 {
 	import core.thread : Thread;
 	import core.time : msecs;
-	import mcp.server.context : CancellationToken;
 
-	auto mgr = new SessionManager(Duration.zero, 1);
+	auto mgr = new SessionManager(SessionLimits(Duration.zero, 1));
 	string[] ended;
 	mgr.onExpire = (string id) @safe { ended ~= id; };
 	const a = mgr.create();
-	auto tok = new CancellationToken;
-	mgr.stateFor(a).inFlight["i:1"] = tok;
 	Thread.sleep(2.msecs);
 	mgr.create();
 	assert(!mgr.isActive(a));
-	assert(tok.cancelled, "an evicted session's in-flight request must be cancelled");
 	assert(ended == [a], "an evicted session's end must be reported");
 }
 
@@ -801,7 +867,7 @@ unittest  // a session swept past its idle TTL has its end reported
 	import core.thread : Thread;
 	import core.time : msecs;
 
-	auto mgr = new SessionManager(5.msecs, 0);
+	auto mgr = new SessionManager(SessionLimits(5.msecs, 0));
 	string[] ended;
 	mgr.onExpire = (string id) @safe { ended ~= id; };
 	const a = mgr.create();
@@ -853,7 +919,7 @@ unittest  // past the cap, never-used sessions are evicted before used ones
 	import core.thread : Thread;
 	import core.time : msecs;
 
-	auto mgr = new SessionManager(Duration.zero, 3);
+	auto mgr = new SessionManager(SessionLimits(Duration.zero, 3));
 	const used = mgr.create();
 	assert(mgr.stateFor(used) !is null);
 	Thread.sleep(2.msecs);
@@ -873,7 +939,7 @@ unittest  // resolving a just-minted session for its initialize does not count a
 	import core.thread : Thread;
 	import core.time : msecs;
 
-	auto mgr = new SessionManager(Duration.zero, 2);
+	auto mgr = new SessionManager(SessionLimits(Duration.zero, 2));
 	const a = mgr.create();
 	assert(mgr.stateFor(a, false) !is null);
 	Thread.sleep(2.msecs);
@@ -883,4 +949,78 @@ unittest  // resolving a just-minted session for its initialize does not count a
 	mgr.create();
 	assert(!mgr.isActive(a), "a never-used session is the first eviction victim");
 	assert(mgr.isActive(b));
+}
+
+unittest  // past the cap, a session running a request is never evicted; create fails instead
+{
+	import std.exception : assertThrown;
+	import mcp.server.context : CancellationToken;
+
+	auto mgr = new SessionManager(SessionLimits(Duration.zero, 1));
+	const a = mgr.create();
+	mgr.stateFor(a).inFlight["i:1"] = new CancellationToken;
+	assertThrown!SessionCapacityException(mgr.create());
+	assert(mgr.isActive(a), "a busy session must survive an initialize past the cap");
+	assert(mgr.activeCount == 1);
+}
+
+unittest  // past the cap, a session holding a GET stream is never evicted
+{
+	import std.exception : assertThrown;
+
+	auto mgr = new SessionManager(SessionLimits(Duration.zero, 1));
+	const a = mgr.create();
+	mgr.streamOpened(a);
+	assertThrown!SessionCapacityException(mgr.create());
+	assert(mgr.isActive(a));
+	mgr.streamClosed(a);
+	const b = mgr.create();
+	assert(!mgr.isActive(a) && mgr.isActive(b), "an idle session makes room once its stream ends");
+}
+
+unittest  // a session holding a GET stream does not expire as idle
+{
+	import core.thread : Thread;
+	import core.time : msecs;
+
+	auto mgr = new SessionManager(SessionLimits(5.msecs, 0));
+	const a = mgr.create();
+	mgr.streamOpened(a);
+	Thread.sleep(20.msecs);
+	assert(mgr.isActive(a));
+}
+
+unittest  // past the per-principal cap, the principal's own oldest idle session is evicted
+{
+	import core.thread : Thread;
+	import core.time : msecs;
+
+	SessionLimits limits;
+	limits.idleTtl = Duration.zero;
+	limits.maxPerPrincipal = 2;
+	auto mgr = new SessionManager(limits);
+	const bob = mgr.create("bob");
+	Thread.sleep(2.msecs);
+	const a1 = mgr.create("alice");
+	Thread.sleep(2.msecs);
+	const a2 = mgr.create("alice");
+	Thread.sleep(2.msecs);
+	const a3 = mgr.create("alice");
+	assert(!mgr.isActive(a1), "alice's oldest session makes room for her new one");
+	assert(mgr.isActive(a2) && mgr.isActive(a3));
+	assert(mgr.isActive(bob), "one principal's sessions never evict another's");
+}
+
+unittest  // past the per-principal cap with every session busy, create fails
+{
+	import std.exception : assertThrown;
+
+	SessionLimits limits;
+	limits.maxPerPrincipal = 1;
+	auto mgr = new SessionManager(limits);
+	const a = mgr.create("alice");
+	mgr.streamOpened(a);
+	assertThrown!SessionCapacityException(mgr.create("alice"));
+	assert(mgr.isActive(a));
+	mgr.create("bob");
 }
