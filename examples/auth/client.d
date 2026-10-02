@@ -237,15 +237,13 @@ int run() @safe
 			});
 		}();
 		checkEq(status, 200, "PRM document status");
-		auto prm = () @trusted { return parseJsonString(body_); }();
-		checkEq(() @trusted { return prm["resource"].get!string; }(),
-				serverUrl, "PRM resource (raw)");
-		checkEq(() @trusted { return prm["authorization_servers"][0].get!string; }(),
-				Issuer, "PRM authorization_servers (raw)");
-		auto scopes = () @trusted { return prm["scopes_supported"]; }();
-		check(() @trusted {
-			return scopes[0].get!string == "mcp:read" && scopes[1].get!string == "mcp:write";
-		}(), "PRM scopes_supported mismatch (raw)");
+		auto prm = parseJsonString(body_);
+		checkEq(prm["resource"].get!string, serverUrl, "PRM resource (raw)");
+		checkEq(prm["authorization_servers"][0].get!string, Issuer,
+				"PRM authorization_servers (raw)");
+		auto scopes = prm["scopes_supported"];
+		check(scopes[0].get!string == "mcp:read" && scopes[1].get!string == "mcp:write",
+				"PRM scopes_supported mismatch (raw)");
 	}
 
 	// ---- 3. Happy path: full-scope token, connect + tools ----
@@ -256,7 +254,7 @@ int run() @safe
 	// the cleanest automated grant, so we POST to it and feed the returned
 	// `TokenSet.accessToken` to `setBearerToken`.
 	{
-		const tokenUrl = () @trusted { return startTokenEndpoint(serverUrl); }();
+		const tokenUrl = startTokenEndpoint(serverUrl);
 		auto oauth = new OAuthClient;
 		oauth.resource = serverUrl;
 		AuthorizationServerMetadata as_;
