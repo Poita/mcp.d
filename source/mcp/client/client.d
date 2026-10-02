@@ -975,6 +975,10 @@ final class McpClient : ClientProtocol
 	/// Perform the initialize handshake and send `notifications/initialized`.
 	InitializeResult initialize(string requestedVersion = latestLegacy.toWire) @safe
 	{
+		// The initialize handshake belongs to the stable protocols, so it runs
+		// (and the session continues) without modern per-request framing.
+		useModern = false;
+		transport.setModernProtocol(false);
 		InitializeParams params;
 		params.protocolVersion = requestedVersion;
 		// Advertise capabilities in the wire shape for the requested version:
@@ -1107,10 +1111,6 @@ final class McpClient : ClientProtocol
 		}
 		else
 		{
-			// The modern-framed probe left modern framing set; the mutually-chosen
-			// version is stable, so clear it before the `initialize` handshake runs
-			// under that stable version.
-			useModern = false;
 			negotiated = chosen;
 			initialize(chosen.toWire); // modern discovery, legacy version
 		}
@@ -8009,8 +8009,11 @@ version (unittest)
 		{
 		}
 
+		bool modern; // the last value passed to setModernProtocol
+
 		void setModernProtocol(bool modern) @safe
 		{
+			this.modern = modern;
 		}
 
 		bool cancelsByStreamClose() @safe
@@ -8189,6 +8192,29 @@ unittest  // connect() falls back to initialize when the discover probe gets any
 		};
 		assert(c.connect() == latestLegacy);
 	}
+}
+
+unittest  // initialize after enableModern runs the legacy handshake and leaves modern mode
+{
+	auto transport = new RecordingClientTransport();
+	auto c = new McpClient(transport);
+	c.enableModern();
+	Json initMessage;
+	transport.responder = (Json message, long expectId) @safe {
+		if (message["method"].get!string == "initialize")
+			initMessage = message;
+		Json r = Json.emptyObject;
+		r["protocolVersion"] = latestLegacy.toWire;
+		r["capabilities"] = Json.emptyObject;
+		r["serverInfo"] = Json([
+			"name": Json("legacy-srv"),
+			"version": Json("1.0")
+		]);
+		return r;
+	};
+	c.initialize();
+	assert("_meta" !in initMessage["params"], "initialize must not carry modern _meta");
+	assert(!transport.modern, "the transport must leave modern mode");
 }
 
 unittest  // McpClient installs its ClientProtocol collaborator on an arbitrary transport
