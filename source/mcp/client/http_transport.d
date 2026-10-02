@@ -306,7 +306,8 @@ final class HttpClientTransport : ClientTransport
 	// cannot allocate a source port) fails with a typed error instead of parking
 	// the calling fiber forever. Configurable via `setConnectTimeout`.
 	private Duration connectTimeout = 30.seconds;
-	private Duration sendTimeout = 30.seconds;
+	private enum Duration defaultSendTimeout = 30.seconds;
+	private Duration sendTimeout = defaultSendTimeout;
 	// Upper bound on any single response body or SSE event read from the server,
 	// so a hostile or broken server cannot make the client allocate without limit.
 	// Configurable via `setMaxMessageBytes`.
@@ -408,6 +409,13 @@ final class HttpClientTransport : ClientTransport
 	void setSendTimeout(Duration timeout) @safe
 	{
 		sendTimeout = timeout;
+	}
+
+	/// Bound each one-way POST by the client's request timeout; with no request
+	/// deadline (`Duration.zero`) the default send bound applies.
+	void setRequestTimeout(Duration timeout) @safe
+	{
+		sendTimeout = timeout > Duration.zero ? timeout : defaultSendTimeout;
 	}
 
 	/// Bound every response body and SSE event read from the server to `limit`

@@ -695,7 +695,7 @@ final class McpClient : ClientProtocol
 		if (settings.cacheServer.length)
 			cacheServer_ = settings.cacheServer;
 		eventSettings_ = settings.events;
-		requestTimeout_ = settings.requestTimeout;
+		requestTimeout = settings.requestTimeout;
 		resetTimeoutOnProgress_ = settings.resetTimeoutOnProgress;
 		taskPollInterval_ = settings.taskPollInterval;
 		taskTimeout_ = settings.taskTimeout;
@@ -720,6 +720,7 @@ final class McpClient : ClientProtocol
 	void requestTimeout(Duration timeout) @safe
 	{
 		requestTimeout_ = timeout;
+		transport.setRequestTimeout(timeout);
 	}
 
 	private EventClientSettings eventSettings_;
@@ -744,8 +745,6 @@ final class McpClient : ClientProtocol
 	{
 		auto transport = new HttpClientTransport(url, settings.maxInFlight);
 		transport.setConnectTimeout(settings.connectTimeout);
-		if (settings.requestTimeout > Duration.zero)
-			transport.setSendTimeout(settings.requestTimeout);
 		transport.setMaxMessageBytes(settings.maxMessageBytes);
 		transport.setTlsTrust(settings.tls);
 		auto c = new McpClient(transport, settings.clientInfo);
@@ -8171,6 +8170,12 @@ version (unittest)
 		}
 
 		bool modern; // the last value passed to setModernProtocol
+		Duration requestTimeout = Duration.max; // the last value passed to setRequestTimeout
+
+		void setRequestTimeout(Duration timeout) @safe
+		{
+			requestTimeout = timeout;
+		}
 
 		void setModernProtocol(bool modern) @safe
 		{
@@ -8310,6 +8315,10 @@ version (unittest)
 		{
 		}
 
+		void setRequestTimeout(Duration) @safe
+		{
+		}
+
 		bool cancelsByStreamClose() @safe
 		{
 			return false;
@@ -8376,6 +8385,16 @@ unittest  // initialize after enableModern runs the legacy handshake and leaves 
 	c.initialize();
 	assert("_meta" !in initMessage["params"], "initialize must not carry modern _meta");
 	assert(!transport.modern, "the transport must leave modern mode");
+}
+
+unittest  // the requestTimeout setter forwards the new timeout to the transport
+{
+	auto transport = new RecordingClientTransport();
+	auto c = new McpClient(transport);
+	c.requestTimeout = 5.seconds;
+	assert(transport.requestTimeout == 5.seconds);
+	c.requestTimeout = Duration.zero;
+	assert(transport.requestTimeout == Duration.zero);
 }
 
 unittest  // McpClient installs its ClientProtocol collaborator on an arbitrary transport

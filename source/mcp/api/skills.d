@@ -1866,6 +1866,7 @@ unittest  // verifyResourceDigest fails everything for an entry without a manife
 version (unittest)
 {
 	import mcp.protocol.jsonrpc : Message, makeRequest;
+	import core.time : Duration;
 	import mcp.client.transport : ClientTransport, SubscriptionStream, ClientProtocol;
 	import mcp.protocol.errors : McpException;
 
@@ -1938,6 +1939,10 @@ version (unittest)
 		}
 
 		void setModernProtocol(bool) @safe
+		{
+		}
+
+		void setRequestTimeout(Duration) @safe
 		{
 		}
 

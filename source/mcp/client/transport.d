@@ -1,5 +1,6 @@
 module mcp.client.transport;
 
+import core.time : Duration;
 import vibe.data.json : Json;
 
 import mcp.protocol.errors : McpException;
@@ -119,6 +120,11 @@ interface ClientTransport
 	/// the modern protocol does not have; a no-op on stdio and on transports where
 	/// the flag is irrelevant.
 	void setModernProtocol(bool modern) @safe;
+
+	/// Tell the transport the client's request timeout (`Duration.zero` when
+	/// requests have no deadline). The client enforces response deadlines itself;
+	/// the HTTP transport also bounds each one-way POST by it. A no-op on stdio.
+	void setRequestTimeout(Duration timeout) @safe;
 
 	/// Whether this transport signals request cancellation by closing the request's
 	/// stream rather than by sending `notifications/cancelled`. True only for a modern

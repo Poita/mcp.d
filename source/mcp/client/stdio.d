@@ -111,6 +111,11 @@ final class StdioClientTransport : ClientTransport
 	{
 	}
 
+	/// No-op: `McpClient` enforces request deadlines, and stdio sends need none.
+	void setRequestTimeout(Duration timeout) @safe
+	{
+	}
+
 	/// stdio signals cancellation with `notifications/cancelled` (it has no
 	/// per-request stream to close), so cancellation is never by stream close.
 	bool cancelsByStreamClose() @safe
