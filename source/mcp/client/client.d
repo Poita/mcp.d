@@ -1061,27 +1061,21 @@ final class McpClient : ClientProtocol
 	/// framing (the `MCP-Protocol-Version` modern header and a modern
 	/// `_meta.protocolVersion`). Without it the server falls back to its stable
 	/// default and answers methodNotFound, so an undecorated probe can never select
-	/// modern. This temporarily stamps modern framing on the single probe request and
-	/// restores the prior (unnegotiated) state on any legacy outcome, so a
-	/// genuine legacy server is still detected by the caller.
+	/// modern. This stamps modern framing on the single probe request only and then
+	/// restores the prior state: `connect` commits modern state once it has chosen
+	/// a mutually supported modern version.
 	private DiscoverResult discoverProbe() @safe
 	{
 		const priorUseModern = useModern;
 		const priorNegotiated = negotiated;
 		useModern = true;
 		negotiated = ProtocolVersion.v2026_07_28;
-		bool keepModernFraming;
 		scope (exit)
-			if (!keepModernFraming)
-			{
-				useModern = priorUseModern;
-				negotiated = priorNegotiated;
-			}
-		auto result = DiscoverResult.fromJson(rpc("server/discover", Json.emptyObject));
-		// The probe succeeded as modern; leave the framing in place so `connect`'s
-		// version selection runs against a modern-capable peer.
-		keepModernFraming = true;
-		return result;
+		{
+			useModern = priorUseModern;
+			negotiated = priorNegotiated;
+		}
+		return DiscoverResult.fromJson(rpc("server/discover", Json.emptyObject));
 	}
 
 	/// Attach an OAuth bearer access token, sent as `Authorization: Bearer
@@ -9180,6 +9174,25 @@ unittest  // connect() populates serverCapabilities/serverInfo/serverInstruction
 	assert(c.serverInfo().version_ == "2.0");
 	assert(!c.serverInstructions().isNull);
 	assert(c.serverInstructions().get == "hello");
+}
+
+unittest  // connect() leaves the client unnegotiated when discovery finds no mutual version
+{
+	import std.exception : collectException;
+
+	auto transport = new RecordingClientTransport();
+	auto c = new McpClient(transport);
+	const before = c.protocolVersion;
+	transport.responder = (Json message, long expectId) @safe {
+		DiscoverResult d;
+		d.supportedVersions = ["1999-01-01"];
+		return d.toJson();
+	};
+	auto e = collectException!McpException(c.connect());
+	assert(e !is null && e.code == ErrorCode.unsupportedProtocolVersion);
+	assert(c.protocolVersion == before, "a failed connect must not leave a negotiated version");
+	assert(!transport.modern);
+	assert(!c.useModern, "a failed connect must not leave modern framing on");
 }
 
 unittest  // discover() on a modern session adopts the server's capabilities, identity and instructions
