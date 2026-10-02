@@ -128,6 +128,20 @@ private void validateEnvelope(Json j) @safe
 		if (hasResult == hasError)
 			throw invalidRequest("Response must contain exactly one of result or error");
 	}
+	// JSON-RPC 2.0 §5.1: a response's `error` is an object with an integer `code`
+	// and a string `message`. Readers of an error response index those members
+	// directly, so any other shape is rejected here.
+	if (("method" !in j) && ("error" in j))
+	{
+		const err = j["error"];
+		if (err.type != Json.Type.object)
+			throw invalidRequest("Response `error` must be an object");
+		if ("code" !in err || (err["code"].type != Json.Type.int_
+				&& err["code"].type != Json.Type.bigInt))
+			throw invalidRequest("Response `error.code` must be an integer");
+		if ("message" !in err || err["message"].type != Json.Type.string)
+			throw invalidRequest("Response `error.message` must be a string");
+	}
 }
 
 /// Parse and classify a single JSON-RPC message from text.
@@ -559,4 +573,40 @@ unittest  // object, array and absent params are accepted
 	cast(void) parseMessage(`{"jsonrpc":"2.0","id":1,"method":"ping","params":{}}`);
 	cast(void) parseMessage(`{"jsonrpc":"2.0","id":1,"method":"ping","params":[]}`);
 	cast(void) parseMessage(`{"jsonrpc":"2.0","id":1,"method":"ping"}`);
+}
+
+unittest  // an error response whose error is not an object is rejected with -32600
+{
+	import std.exception : collectException;
+
+	foreach (e; [`"boom"`, `5`, `null`, `[]`, `true`])
+		foreach (id; [`1`, `null`])
+		{
+			auto ex = collectException!McpException(
+					parseMessage(`{"jsonrpc":"2.0","id":` ~ id ~ `,"error":` ~ e ~ `}`));
+			assert(ex !is null && ex.code == ErrorCode.invalidRequest, e);
+		}
+}
+
+unittest  // an error object needs an integer code and a string message
+{
+	import std.exception : collectException;
+
+	foreach (e; [
+		`{}`, `{"message":"x"}`, `{"code":-1}`, `{"code":"-1","message":"x"}`,
+		`{"code":-1.5,"message":"x"}`, `{"code":-1,"message":7}`
+	])
+	{
+		auto ex = collectException!McpException(
+				parseMessage(`{"jsonrpc":"2.0","id":1,"error":` ~ e ~ `}`));
+		assert(ex !is null && ex.code == ErrorCode.invalidRequest, e);
+	}
+}
+
+unittest  // a well-formed error object with data is accepted
+{
+	auto m = parseMessage(
+			`{"jsonrpc":"2.0","id":1,"error":{"code":-32602,"message":"bad","data":[1]}}`);
+	assert(m.kind == MessageKind.errorResponse);
+	assert(m.error["code"].get!long == -32602);
 }
