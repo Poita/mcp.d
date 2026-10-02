@@ -1287,6 +1287,15 @@ final class EventsRuntime
 		sub.expiresAtMs = grant.isNull ? 0 : grant.get;
 		const reactivated = !sub.active;
 		sub.active = true;
+		// A reactivated subscription is judged on what happens next, not on the
+		// failure streak that suspended it.
+		if (reactivated)
+		{
+			sub.failedSinceMs = 0;
+			sub.windowStartMs = 0;
+			sub.windowAttempts = 0;
+			sub.windowFailures = 0;
+		}
 		if (!sub.verified && urlAllowlisted(p.delivery.url))
 			sub.verified = true;
 		// on_subscribe runs before the subscription is stored, so a throwing hook
@@ -5714,6 +5723,35 @@ unittest  // a sustained failure rate over the minimum sample suspends the subsc
 	auto suspended = rt.webhookStore().get(r.id).get;
 	assert(!suspended.active); // 2 of 2 failed: 100% over a sample of 2
 	assert(suspended.windowAttempts == 2 && suspended.windowFailures == 2);
+}
+
+unittest  // a refresh that reactivates a suspended subscription starts a fresh failure window
+{
+	auto ft = new FakeWebhookTransport();
+	EventsOptions o;
+	o.nowMs = () @safe => 1_000_000L;
+	o.nowIso = () @safe => "t";
+	o.allowPrivateCallbackHosts = true;
+	o.webhookTransport = ft;
+	o.deliveryExecutor = (void delegate() @safe job) @safe { job(); };
+	o.deliverySleep = (Duration d) @safe {};
+	o.webhookMaxAttempts = 1;
+	o.webhookSuspension.minAttempts = 2;
+	o.webhookSuspension.failureRatePercent = 60;
+	auto rt = new EventsRuntime(null, o);
+	EventRegistration reg = {descriptor: EventType("n"), emitOnly: true};
+	rt.register(reg);
+	auto r = rt.subscribeWebhook(webhookSub("n", "https://proxy/hooks"), "user-1");
+	ft.eventStatuses = [500, 500, 500];
+	rt.emit(EventOccurrence("evt_1", "n", "t"));
+	rt.emit(EventOccurrence("evt_2", "n", "t"));
+	assert(!rt.webhookStore().get(r.id).get.active);
+	rt.subscribeWebhook(webhookSub("n", "https://proxy/hooks"), "user-1");
+	auto revived = rt.webhookStore().get(r.id).get;
+	assert(revived.active && revived.windowFailures == 0 && revived.failedSinceMs == 0);
+	// One failure in the fresh window is under the rate; the old streak is not held against it.
+	rt.emit(EventOccurrence("evt_3", "n", "t"));
+	assert(rt.webhookStore().get(r.id).get.active);
 }
 
 unittest  // every failed retry attempt counts toward suspension, so a dead endpoint suspends
