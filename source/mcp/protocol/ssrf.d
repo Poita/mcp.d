@@ -263,6 +263,10 @@ private bool parseIpv6Literal(string s, out ubyte[16] outBytes) @safe pure nothr
 			{
 				uint v;
 				size_t digits;
+				// A multi-digit octet starting with `0` is octal to some resolvers
+				// and decimal here; reject the ambiguous spelling.
+				if (i + 1 < tail.length && tail[i] == '0' && tail[i + 1] >= '0' && tail[i + 1] <= '9')
+					return false;
 				while (i < tail.length && tail[i] >= '0' && tail[i] <= '9')
 				{
 					v = v * 10 + cast(uint)(tail[i] - '0');
@@ -346,6 +350,64 @@ private bool parseIpv6Literal(string s, out ubyte[16] outBytes) @safe pure nothr
 	if (haveV4)
 		outBytes[12 .. 16] = v4[];
 	return true;
+}
+
+/// Render 16 IPv6 address bytes in the RFC 5952 canonical text form: lowercase
+/// hextets without leading zeros, with the longest run of two or more zero
+/// hextets (the first, on a tie) compressed to `::`.
+private string renderIpv6(const ubyte[16] b) @safe pure nothrow
+{
+	ushort[8] h;
+	foreach (i; 0 .. 8)
+		h[i] = cast(ushort)((b[2 * i] << 8) | b[2 * i + 1]);
+
+	ptrdiff_t bestStart = -1;
+	size_t bestLen;
+	for (size_t i = 0; i < 8;)
+	{
+		if (h[i] != 0)
+		{
+			i++;
+			continue;
+		}
+		size_t j = i;
+		while (j < 8 && h[j] == 0)
+			j++;
+		if (j - i > bestLen)
+		{
+			bestStart = i;
+			bestLen = j - i;
+		}
+		i = j;
+	}
+	if (bestLen < 2)
+		bestStart = -1;
+
+	static immutable hexDigits = "0123456789abcdef";
+	string s;
+	for (size_t i = 0; i < 8;)
+	{
+		if (i == bestStart)
+		{
+			s ~= "::";
+			i += bestLen;
+			continue;
+		}
+		if (s.length && s[$ - 1] != ':')
+			s ~= ':';
+		bool started;
+		foreach (shift; [12, 8, 4, 0])
+		{
+			const nibble = (h[i] >> shift) & 0xF;
+			if (nibble != 0 || started || shift == 0)
+			{
+				s ~= hexDigits[nibble];
+				started = true;
+			}
+		}
+		i++;
+	}
+	return s;
 }
 
 /// Parse a colon-separated list of IPv6 hextets into bytes; returns count of
@@ -592,8 +654,9 @@ private string stripPortAndBrackets(string host) @safe pure nothrow @nogc
 ///   decimal to some resolvers, so it is `privateOrLinkLocal` with an empty
 ///   `pinnedIp` (fail CLOSED).
 /// - IPv6 literals (including embedded-IPv4, ULA, link-local and loopback) are
-///   classified directly and `pinnedIp` is the host verbatim (already a literal
-///   vibe will not re-resolve).
+///   classified directly and `pinnedIp` is the RFC 5952 rendering of the parsed
+///   bytes (unbracketed, no port, zone id kept). An unparseable literal is
+///   `privateOrLinkLocal` with an empty `pinnedIp` (fail CLOSED).
 /// - `localhost` and `::1` are classified as loopback; `pinnedIp` is the host
 ///   verbatim.
 /// - A registered hostname is resolved; EVERY returned A/AAAA address is
@@ -622,7 +685,13 @@ AddressClass classifyHost(string host, out string pinnedIp) @safe
 		if (host[0] == '[' || (bare.indexOf(':') >= 0 && bare.indexOf('.') < 0)
 				|| (bare.indexOf(':') >= 0 && bare.indexOf("::") >= 0))
 		{
-			pinnedIp = host;
+			ubyte[16] bytes;
+			if (!parseIpv6Literal(bare, bytes))
+				return AddressClass.privateOrLinkLocal; // fail closed
+			// Pin the parsed address, not the text as written, so the connection
+			// reaches exactly the classified bytes; a zone id is kept verbatim.
+			const pct = bare.indexOf('%');
+			pinnedIp = renderIpv6(bytes) ~ (pct >= 0 ? bare[pct .. $] : "");
 			return classifyIpv6Literal(bare);
 		}
 	}
@@ -1296,12 +1365,50 @@ unittest  // classifyIpv6Literal keeps a public global-unicast control public
 	assert(classifyIpv6Literal("2001:db8::1") == AddressClass.public_);
 }
 
+unittest  // an IPv6 literal's embedded IPv4 tail with a leading-zero octet fails closed
+{
+	string pin;
+	assert(classifyIpv6Literal("::0177.0.0.1") == AddressClass.privateOrLinkLocal);
+	assert(classifyHost("[::0177.0.0.1]", pin) == AddressClass.privateOrLinkLocal);
+	assert(pin.length == 0);
+	assert(!pinnedConnectAddress("[::0177.0.0.1]", true, SsrfPolicy.allowUserConfigured).ok);
+}
+
+unittest  // an embedded IPv4 tail octet of a single zero is still accepted
+{
+	assert(classifyIpv6Literal("::8.8.0.8") == AddressClass.public_);
+}
+
+unittest  // classifyHost pins an IPv6 literal as the canonical rendering of its bytes
+{
+	string pin;
+	classifyHost("[2001:0DB8:0:0::1]:443", pin);
+	assert(pin == "2001:db8::1", pin);
+	classifyHost("[::8.8.8.8]", pin);
+	assert(pin == "::808:808", pin);
+	classifyHost("[::FFFF:808:808]", pin);
+	assert(pin == "::ffff:808:808", pin);
+	classifyHost("[2001:db8:0:1:0:0:0:1]", pin);
+	assert(pin == "2001:db8:0:1::1", pin);
+	classifyHost("[2001:db8:1:2:3:4:5:6]", pin);
+	assert(pin == "2001:db8:1:2:3:4:5:6", pin);
+	classifyHost("[fe80::1%25eth0]", pin);
+	assert(pin == "fe80::1%25eth0", pin);
+}
+
+unittest  // classifyHost leaves an unparseable IPv6 literal unpinned
+{
+	string pin;
+	assert(classifyHost("[2001:db8::zz]", pin) == AddressClass.privateOrLinkLocal);
+	assert(pin.length == 0);
+}
+
 unittest  // classifyHost classes loopback hosts without resolving
 {
 	string pin;
 	assert(classifyHost("localhost", pin) == AddressClass.loopback && pin == "localhost");
 	assert(classifyHost("127.0.0.1", pin) == AddressClass.loopback && pin == "127.0.0.1");
-	assert(classifyHost("[::1]", pin) == AddressClass.loopback && pin == "[::1]");
+	assert(classifyHost("[::1]", pin) == AddressClass.loopback && pin == "::1");
 	assert(classifyHost("127.0.0.1:8765", pin) == AddressClass.loopback);
 }
 
