@@ -1395,25 +1395,25 @@ final class McpClient : ClientProtocol
 	}
 
 	/// Drain a paginated `<method>` list into a single accumulated result `R`.
-	/// Owns the cursor-param building, the first-page `cache` capture, and the
-	/// `nextCursor` reset shared by every `list*` method; `append` is the only
-	/// per-call variation, concatenating one page's items onto the accumulator.
-	private R drainList(R)(string method, scope void delegate(ref R acc,
+	/// Owns the cursor-param building, the first-page `cache` capture (for a
+	/// result that carries one), and the `nextCursor` reset shared by every
+	/// paginated verb. Each page sends `params` plus its cursor; `append`
+	/// concatenates one page's items onto the accumulator.
+	private R drainList(R)(string method, Json params, scope void delegate(ref R acc,
 			ref R page) @safe append, RequestOptions opts = RequestOptions.init) @safe
 	{
 		R acc;
 		bool first = true;
 		paginate((Nullable!string cursor) @safe {
-			Json p = Json.emptyObject;
+			Json p = params.clone;
 			if (!cursor.isNull)
 				p["cursor"] = cursor.get;
 			auto res = R.fromJson(rpcWith(method, p, opts));
 			append(acc, res);
-			if (first)
-			{
-				acc.cache = res.cache;
-				first = false;
-			}
+			static if (is(typeof(acc.cache)))
+				if (first)
+					acc.cache = res.cache;
+			first = false;
 			return res.nextCursor;
 		});
 		acc.nextCursor = Nullable!string.init;
@@ -1435,7 +1435,7 @@ final class McpClient : ClientProtocol
 		const generation = cacheGeneration("tools/list", "");
 		const epoch = identityEpoch_;
 		auto acc = cachedFetch!ListToolsResult(CacheKey("tools/list", ""), opts.cacheMode, () @safe {
-			auto a = drainList!ListToolsResult("tools/list",
+			auto a = drainList!ListToolsResult("tools/list", Json.emptyObject,
 				(ref ListToolsResult x, ref ListToolsResult r) @safe {
 				x.tools ~= r.tools;
 			}, opts);
@@ -1883,8 +1883,8 @@ final class McpClient : ClientProtocol
 	{
 		bool uncacheable;
 		return mrtrLoop!CallToolResult("tools/call", logLevel, (responses,
-				requestState) => buildToolCallParams(name,
-				arguments, progressToken, responses, requestState), uncacheable);
+				requestState) => withMrtr(buildToolCallParams(name,
+				arguments, progressToken), responses, requestState), uncacheable);
 	}
 
 	/// Mint a process-unique string `ProgressToken` for a per-call progress sink.
@@ -2010,21 +2010,6 @@ final class McpClient : ClientProtocol
 		return withProgressToken(p, progressToken);
 	}
 
-	/// Build the `tools/call` params with any gathered MRTR (SEP-2322) input
-	/// responses attached as the top-level `params.inputResponses` map, and the
-	/// opaque `requestState` echoed back as `params.requestState`. Per SEP-2322
-	/// these are RequestParams fields, NOT `_meta` entries. With no responses
-	/// and no requestState this is identical to the plain `buildToolCallParams`.
-	/// Separated as a package static so the resubmission param shaping can be
-	/// unit-tested without a live server.
-	package static Json buildToolCallParams(string name, Json arguments,
-			ProgressToken progressToken, InputResponse[] responses, string requestState = "") @safe
-	{
-		Json p = buildToolCallParams(name, arguments, progressToken);
-		p = withInputResponses(p, responses);
-		return withRequestState(p, requestState);
-	}
-
 	/// Attach MRTR (SEP-2322) input responses to a request as the top-level
 	/// `params.inputResponses` map (id -> bare client result). An empty
 	/// `responses` list returns `params` unchanged. Exposed so callers can
@@ -2054,6 +2039,14 @@ final class McpClient : ClientProtocol
 			params = Json.emptyObject;
 		params["requestState"] = requestState;
 		return params;
+	}
+
+	/// Attach an MRTR (SEP-2322) resubmission's gathered `responses` and echoed
+	/// `requestState` to `params` (see `withInputResponses`/`withRequestState`).
+	/// With neither, `params` is returned unchanged.
+	package static Json withMrtr(Json params, InputResponse[] responses, string requestState = "") @safe
+	{
+		return withRequestState(withInputResponses(params, responses), requestState);
 	}
 
 	/// `tools/call` for a tool whose descriptor (and therefore `outputSchema`) is
@@ -2416,7 +2409,7 @@ final class McpClient : ClientProtocol
 	{
 		return cachedFetch!ListResourcesResult(CacheKey("resources/list", ""),
 				opts.cacheMode, () @safe {
-			return drainList!ListResourcesResult("resources/list",
+			return drainList!ListResourcesResult("resources/list", Json.emptyObject,
 				(ref ListResourcesResult a, ref ListResourcesResult r) @safe {
 				a.resources ~= r.resources;
 			}, opts);
@@ -2439,7 +2432,8 @@ final class McpClient : ClientProtocol
 		return cachedFetch!ListResourceTemplatesResult(CacheKey("resources/templates/list",
 				""), opts.cacheMode, () @safe {
 			return drainList!ListResourceTemplatesResult("resources/templates/list",
-				(ref ListResourceTemplatesResult a, ref ListResourceTemplatesResult r) @safe {
+				Json.emptyObject, (ref ListResourceTemplatesResult a,
+				ref ListResourceTemplatesResult r) @safe {
 				a.resourceTemplates ~= r.resourceTemplates;
 			}, opts);
 		});
@@ -2471,8 +2465,8 @@ final class McpClient : ClientProtocol
 			ProgressToken progressToken, out bool uncacheable, string logLevel = "") @safe
 	{
 		return mrtrLoop!ReadResourceResult("resources/read", logLevel, (responses,
-				requestState) => buildReadResourceParams(uri,
-				progressToken, responses, requestState), uncacheable);
+				requestState) => withMrtr(buildReadResourceParams(uri,
+				progressToken), responses, requestState), uncacheable);
 	}
 
 	/// Build the `resources/read` params, optionally attaching a progress token.
@@ -2481,17 +2475,6 @@ final class McpClient : ClientProtocol
 		Json p = Json.emptyObject;
 		p["uri"] = uri;
 		return withProgressToken(p, progressToken);
-	}
-
-	/// Build the `resources/read` params with any gathered MRTR (SEP-2322) input
-	/// responses attached as the top-level `params.inputResponses` map and the
-	/// opaque `requestState` echoed back, exactly as `buildToolCallParams` does.
-	package static Json buildReadResourceParams(string uri,
-			ProgressToken progressToken, InputResponse[] responses, string requestState = "") @safe
-	{
-		Json p = buildReadResourceParams(uri, progressToken);
-		p = withInputResponses(p, responses);
-		return withRequestState(p, requestState);
 	}
 
 	/// `resources/directory/read` (SEP-2640): the direct children of the directory
@@ -2504,18 +2487,11 @@ final class McpClient : ClientProtocol
 	/// often generated on demand.
 	ListResourcesResult readDirectory(string uri, RequestOptions opts = RequestOptions.init) @safe
 	{
-		ListResourcesResult acc;
-		paginate((Nullable!string cursor) @safe {
-			Json p = Json.emptyObject;
-			p["uri"] = uri;
-			if (!cursor.isNull)
-				p["cursor"] = cursor.get;
-			auto res = ListResourcesResult.fromJson(rpcWith("resources/directory/read", p, opts));
-			acc.resources ~= res.resources;
-			return res.nextCursor;
-		});
-		acc.nextCursor = Nullable!string.init;
-		return acc;
+		return drainList!ListResourcesResult("resources/directory/read",
+				Json(["uri": Json(uri)]), (ref ListResourcesResult a,
+					ref ListResourcesResult r) @safe {
+			a.resources ~= r.resources;
+		}, opts);
 	}
 
 	/// `skills/list` (Skills extension): the skill entries the connected server
@@ -2528,8 +2504,10 @@ final class McpClient : ClientProtocol
 	/// cache, since the per-entry digests are the signal hosts act on.
 	ListSkillsResult skillsList(RequestOptions opts = RequestOptions.init) @safe
 	{
-		return drainList!ListSkillsResult("skills/list", (ref ListSkillsResult a,
-				ref ListSkillsResult r) @safe { a.skills ~= r.skills; }, opts);
+		return drainList!ListSkillsResult("skills/list", Json.emptyObject,
+				(ref ListSkillsResult a, ref ListSkillsResult r) @safe {
+			a.skills ~= r.skills;
+		}, opts);
 	}
 
 	/// `skills/get` (Skills extension): the entry for the single skill whose
@@ -2559,7 +2537,7 @@ final class McpClient : ClientProtocol
 	private ListPromptsResult listPromptsImpl(RequestOptions opts) @safe
 	{
 		return cachedFetch!ListPromptsResult(CacheKey("prompts/list", ""), opts.cacheMode, () @safe {
-			return drainList!ListPromptsResult("prompts/list",
+			return drainList!ListPromptsResult("prompts/list", Json.emptyObject,
 				(ref ListPromptsResult a, ref ListPromptsResult r) @safe {
 				a.prompts ~= r.prompts;
 			}, opts);
@@ -2593,8 +2571,8 @@ final class McpClient : ClientProtocol
 	{
 		bool uncacheable;
 		return mrtrLoop!GetPromptResult("prompts/get", logLevel, (responses,
-				requestState) => buildGetPromptParams(name,
-				arguments, progressToken, responses, requestState), uncacheable);
+				requestState) => withMrtr(buildGetPromptParams(name,
+				arguments, progressToken), responses, requestState), uncacheable);
 	}
 
 	/// Build the `prompts/get` params, optionally attaching a progress token.
@@ -2605,19 +2583,6 @@ final class McpClient : ClientProtocol
 		p["name"] = name;
 		p["arguments"] = arguments;
 		return withProgressToken(p, progressToken);
-	}
-
-	/// Build the `prompts/get` params with any gathered MRTR (SEP-2322) input
-	/// responses attached as the top-level `params.inputResponses` map, and the
-	/// opaque `requestState` echoed back as `params.requestState`. With no
-	/// responses and no requestState this is identical to the plain
-	/// `buildGetPromptParams`. Mirrors `buildToolCallParams`.
-	package static Json buildGetPromptParams(string name, Json arguments,
-			ProgressToken progressToken, InputResponse[] responses, string requestState = "") @safe
-	{
-		Json p = buildGetPromptParams(name, arguments, progressToken);
-		p = withInputResponses(p, responses);
-		return withRequestState(p, requestState);
 	}
 
 	/// `completion/complete` — request autocompletion suggestions for an
@@ -2740,17 +2705,10 @@ final class McpClient : ClientProtocol
 	/// `events` aggregates every page (and `nextCursor` is null).
 	EventListResult listEvents(RequestOptions opts = RequestOptions.init) @safe
 	{
-		EventListResult acc;
-		paginate((Nullable!string cursor) @safe {
-			Json p = Json.emptyObject;
-			if (!cursor.isNull)
-				p["cursor"] = cursor.get;
-			auto res = EventListResult.fromJson(rpcWith("events/list", p, opts));
-			acc.events ~= res.events;
-			return res.nextCursor;
-		});
-		acc.nextCursor = Nullable!string.init;
-		return acc;
+		return drainList!EventListResult("events/list", Json.emptyObject,
+				(ref EventListResult a, ref EventListResult r) @safe {
+			a.events ~= r.events;
+		}, opts);
 	}
 
 	/// One `events/poll` round-trip for a single subscription. The low-level
@@ -7598,8 +7556,8 @@ unittest  // MRTR: withInputResponses attaches answers in top-level params.input
 	auto resp = InputResponse("date", Json([
 			"content": Json(["day": Json("monday")])
 	]));
-	auto params = McpClient.buildToolCallParams("book", Json.emptyObject,
-			ProgressToken.init, [resp]);
+	auto params = McpClient.withMrtr(McpClient.buildToolCallParams("book",
+			Json.emptyObject, ProgressToken.init), [resp]);
 	// SEP-2322: a top-level map keyed by the InputRequest id, value is the bare
 	// result — NOT under _meta and NOT an array of {id, result} wrappers.
 	auto map = params["inputResponses"];
@@ -7613,8 +7571,8 @@ unittest  // MRTR: withInputResponses attaches answers in top-level params.input
 
 unittest  // MRTR: withInputResponses with no answers leaves params untouched
 {
-	auto params = McpClient.buildToolCallParams("book", Json.emptyObject, ProgressToken.init, [
-	]);
+	auto params = McpClient.withMrtr(McpClient.buildToolCallParams("book",
+			Json.emptyObject, ProgressToken.init), []);
 	assert("inputResponses" !in params);
 	assert("_meta" !in params);
 }
@@ -7638,8 +7596,8 @@ unittest  // MRTR: withInputResponses preserves an existing params payload
 unittest  // MRTR: withRequestState echoes the opaque requestState at the top level
 {
 	auto resp = InputResponse("date", Json(["action": Json("accept")]));
-	auto params = McpClient.buildToolCallParams("book", Json.emptyObject,
-			ProgressToken.init, [resp], "eyJyIjoiRHVwIn0");
+	auto params = McpClient.withMrtr(McpClient.buildToolCallParams("book",
+			Json.emptyObject, ProgressToken.init), [resp], "eyJyIjoiRHVwIn0");
 	// SEP-2322: requestState is echoed verbatim as a top-level params field.
 	assert(params["requestState"].get!string == "eyJyIjoiRHVwIn0");
 }
@@ -7647,8 +7605,8 @@ unittest  // MRTR: withRequestState echoes the opaque requestState at the top le
 unittest  // MRTR: an empty requestState is never echoed (client MUST NOT invent one)
 {
 	auto resp = InputResponse("date", Json(["action": Json("accept")]));
-	auto params = McpClient.buildToolCallParams("book", Json.emptyObject,
-			ProgressToken.init, [resp]);
+	auto params = McpClient.withMrtr(McpClient.buildToolCallParams("book",
+			Json.emptyObject, ProgressToken.init), [resp]);
 	assert("requestState" !in params);
 }
 
