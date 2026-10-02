@@ -209,38 +209,48 @@ package TokenInfo verifyToken(JwtVerifierConfig cfg, string token, KeySource key
 	return validateClaims(cfg, payloadJson, now);
 }
 
+/// Read a JSON NumericDate (RFC 7519 §2: integer or fractional seconds) into
+/// `seconds`. Returns false for any other value, including a non-finite float.
+private bool numericDate(Json v, out double seconds) @safe
+{
+	import std.math : isFinite;
+
+	if (v.type == Json.Type.int_)
+		seconds = v.get!long;
+	else if (v.type == Json.Type.float_)
+		seconds = v.get!double;
+	else
+		return false;
+	return isFinite(seconds);
+}
+
 /// Validate the registered claims of an already-signature-verified payload.
 package TokenInfo validateClaims(JwtVerifierConfig cfg, Json payload, long now) @safe
 {
 	const skew = cast(long) cfg.clockSkew.total!"seconds";
 
-	// A JWT access token without an integer `exp` cannot be validated as
-	// unexpired, so it MUST be rejected (OAuth 2.1 §5.2 token validation,
-	// RFC 9068 §2.2/§4). An absent or non-integer `exp` is treated as invalid.
-	if (payload["exp"].type != Json.Type.int_)
+	// A JWT access token without a NumericDate `exp` (RFC 7519 §2: integer or
+	// fractional seconds) cannot be validated as unexpired, so it MUST be
+	// rejected (OAuth 2.1 §5.2 token validation, RFC 9068 §2.2/§4). An absent,
+	// non-numeric or non-finite `exp` is treated as invalid.
+	double e;
+	if (!numericDate(payload["exp"], e))
 		return TokenInfo.invalid();
-	const e = jsonLong(payload, "exp");
 	// RFC 7519 4.1.4: the token is expired once the current time is no longer
 	// before `exp`. With `clockSkew` the grace boundary is `now <= exp + skew`,
 	// so reject at the boundary (`>=`) rather than one second past it.
 	if (now >= e + skew)
 		return TokenInfo.invalid();
-	// `nbf` is optional, but when present it must be a NumericDate (RFC 7519
-	// §2, which permits fractional seconds); any other type is rejected so a
-	// malformed claim cannot switch the not-before check off.
-	const nbf = payload["nbf"];
-	if (nbf.type == Json.Type.int_)
+	// `nbf` is optional, but when present it must be a NumericDate; any other
+	// value is rejected so a malformed claim cannot switch the not-before check
+	// off.
+	const nbfClaim = payload["nbf"];
+	if (nbfClaim.type != Json.Type.undefined)
 	{
-		if (now + skew < nbf.get!long)
+		double nbf;
+		if (!numericDate(nbfClaim, nbf) || now + skew < nbf)
 			return TokenInfo.invalid();
 	}
-	else if (nbf.type == Json.Type.float_)
-	{
-		if (now + skew < nbf.get!double)
-			return TokenInfo.invalid();
-	}
-	else if (nbf.type != Json.Type.undefined)
-		return TokenInfo.invalid();
 
 	// Claims only an OIDC id_token carries. An id_token is typed `JWT` like many
 	// access tokens, and its `aud` is the client id, so without this check one
@@ -812,16 +822,6 @@ private string[] jsonStrArray(Json j, string key) @safe
 		if (e.type == Json.Type.string)
 			result ~= e.get!string;
 	return result;
-}
-
-/// Read an integer claim, returning 0 when absent or not an integer. Callers
-/// that require presence (e.g. `exp`) must check the JSON type separately.
-private long jsonLong(Json j, string key) @safe
-{
-	auto v = j[key];
-	if (v.type == Json.Type.int_)
-		return v.get!long;
-	return 0;
 }
 
 /// Extract the audiences from a claims object: `aud` may be a string or an array
@@ -1861,6 +1861,30 @@ unittest  // a fractional nbf is honoured: rejected while in the future, accepte
 	assert(!validateClaims(cfg, future, 1_700_001_000).valid);
 	auto past = parseJsonString(`{"exp":1700100000,"nbf":1700000000.5}`);
 	assert(validateClaims(cfg, past, 1_700_001_000).valid);
+}
+
+unittest  // a fractional exp is honoured: accepted while in the future, rejected once past
+{
+	JwtVerifierConfig cfg;
+	auto live = parseJsonString(`{"sub":"x","exp":1700003600.25}`);
+	assert(validateClaims(cfg, live, 1_700_001_000).valid);
+	auto expired = parseJsonString(`{"sub":"x","exp":1700000000.5}`);
+	assert(!validateClaims(cfg, expired, 1_700_001_000).valid);
+}
+
+unittest  // a non-finite exp or nbf is rejected
+{
+	JwtVerifierConfig cfg;
+	foreach (bad; [double.infinity, -double.infinity, double.nan])
+	{
+		auto exp = parseJsonString(`{"sub":"x"}`);
+		exp["exp"] = Json(bad);
+		assert(!validateClaims(cfg, exp, 1_700_001_000).valid);
+
+		auto nbf = parseJsonString(`{"sub":"x","exp":1700100000}`);
+		nbf["nbf"] = Json(bad);
+		assert(!validateClaims(cfg, nbf, 1_700_001_000).valid);
+	}
 }
 
 unittest  // verifyToken rejects a well-formed token when no candidate key exists
