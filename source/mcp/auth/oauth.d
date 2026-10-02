@@ -1045,7 +1045,11 @@ unittest  // isSecureFetchUrl rejects private/ULA/link-local IPv6 literals (SSRF
 	assert(!isSecureFetchUrl("https://[::ffff:169.254.169.254]/latest/meta-data",
 			SsrfPolicy.allowLoopback));
 	assert(!isSecureFetchUrl("https://[::ffff:10.0.0.5]/x", SsrfPolicy.allowLoopback));
-	assert(!isSecureFetchUrl("https://[::ffff:127.0.0.1]/x", SsrfPolicy.allowLoopback));
+	// IPv4-mapped loopback is gated exactly like the IPv4 loopback literal.
+	assert(isSecureFetchUrl("https://[::ffff:127.0.0.1]/x",
+			SsrfPolicy.allowLoopback) == isSecureFetchUrl("https://127.0.0.1/x",
+			SsrfPolicy.allowLoopback));
+	assert(!isSecureFetchUrl("https://[::ffff:127.0.0.1]/x", SsrfPolicy.blockInternal));
 	assert(!isSecureFetchUrl("https://[::ffff:0a00:0001]/x", SsrfPolicy.allowLoopback));
 	assert(!isSecureFetchUrl("https://[fe80::1]:443/x", SsrfPolicy.allowLoopback));
 }

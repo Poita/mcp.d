@@ -294,8 +294,14 @@ private bool parseIpv6Literal(string s, out ubyte[16] outBytes) @safe pure nothr
 				cast(ubyte) oct[3]
 			];
 			haveV4 = true;
-			// Replace the IPv4 tail with the hextet portion for hextet parsing.
-			s = (lastColon < 0) ? "" : s[0 .. lastColon + 1];
+			// Replace the IPv4 tail with the hextet portion for hextet parsing,
+			// dropping the separator colon unless it closes a `::`.
+			if (lastColon < 0)
+				s = "";
+			else if (lastColon > 0 && s[lastColon - 1] == ':')
+				s = s[0 .. lastColon + 1];
+			else
+				s = s[0 .. lastColon];
 		}
 	}
 
@@ -1372,6 +1378,17 @@ unittest  // an IPv6 literal's embedded IPv4 tail with a leading-zero octet fail
 	assert(classifyHost("[::0177.0.0.1]", pin) == AddressClass.privateOrLinkLocal);
 	assert(pin.length == 0);
 	assert(!pinnedConnectAddress("[::0177.0.0.1]", true, SsrfPolicy.allowUserConfigured).ok);
+}
+
+unittest  // an embedded IPv4 tail after hextets parses into the low 32 bits
+{
+	string pin;
+	assert(classifyIpv6Literal("::ffff:8.8.8.8") == AddressClass.public_);
+	assert(classifyIpv6Literal("::ffff:127.0.0.1") == AddressClass.loopback);
+	assert(classifyIpv6Literal("64:ff9b::10.0.0.1") == AddressClass.privateOrLinkLocal);
+	assert(classifyIpv6Literal("2001:db8:1:2:3:4:8.8.8.8") == AddressClass.public_);
+	classifyHost("[::FFFF:8.8.8.8]", pin);
+	assert(pin == "::ffff:808:808", pin);
 }
 
 unittest  // an embedded IPv4 tail octet of a single zero is still accepted
