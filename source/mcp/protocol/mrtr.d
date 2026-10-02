@@ -383,18 +383,28 @@ string encodeHeaderValue(string value) @safe
 	}() ~ "?=";
 }
 
-/// Decode an `Mcp-Param-*` header value produced by `encodeHeaderValue`.
+/// Decode an `Mcp-Param-*` header value produced by `encodeHeaderValue`. A
+/// sentinel-framed value whose body is not valid base64, or decodes to bytes
+/// that are not valid UTF-8, is malformed and returned undecoded, so comparing
+/// it against a body value yields a clean mismatch.
 string decodeHeaderValue(string headerValue) @safe
 {
 	import std.base64 : Base64, Base64Exception;
+	import std.utf : UTFException, validate;
 
 	if (headerValue.length >= 11 && headerValue[0 .. 9] == "=?base64?"
 			&& headerValue[$ - 2 .. $] == "?=")
 	{
 		const inner = headerValue[9 .. $ - 2];
 		try
-			return () @trusted { return cast(string) Base64.decode(inner); }();
+		{
+			auto decoded = () @trusted { return cast(string) Base64.decode(inner); }();
+			validate(decoded);
+			return decoded;
+		}
 		catch (Base64Exception)
+			return headerValue;
+		catch (UTFException)
 			return headerValue;
 	}
 	return headerValue;
@@ -1292,6 +1302,19 @@ unittest  // decodeHeaderValue tolerates sentinel-framed but invalid base64
 	// value is returned so downstream comparison yields a clean mismatch.
 	const malformed = "=?base64?@@@@?=";
 	assert(decodeHeaderValue(malformed) == malformed);
+}
+
+unittest  // decodeHeaderValue treats base64 that decodes to invalid UTF-8 as malformed
+{
+	import std.base64 : Base64;
+	import std.utf : validate;
+
+	const string bad = "=?base64?" ~ Base64.encode(cast(const(ubyte)[])[
+		0xff, 0xfe, 0x41
+	]).idup ~ "?=";
+	const decoded = decodeHeaderValue(bad);
+	assert(decoded == bad);
+	validate(decoded);
 }
 
 unittest  // encodeHeaderValue neutralises CR/LF, so an encoded value is wire-safe
