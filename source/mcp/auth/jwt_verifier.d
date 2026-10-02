@@ -210,8 +210,21 @@ package TokenInfo validateClaims(JwtVerifierConfig cfg, Json payload, long now) 
 	// so reject at the boundary (`>=`) rather than one second past it.
 	if (now >= e + skew)
 		return TokenInfo.invalid();
-	const nbf = jsonLong(payload, "nbf");
-	if (nbf != 0 && now + skew < nbf)
+	// `nbf` is optional, but when present it must be a NumericDate (RFC 7519
+	// §2, which permits fractional seconds); any other type is rejected so a
+	// malformed claim cannot switch the not-before check off.
+	const nbf = payload["nbf"];
+	if (nbf.type == Json.Type.int_)
+	{
+		if (now + skew < nbf.get!long)
+			return TokenInfo.invalid();
+	}
+	else if (nbf.type == Json.Type.float_)
+	{
+		if (now + skew < nbf.get!double)
+			return TokenInfo.invalid();
+	}
+	else if (nbf.type != Json.Type.undefined)
 		return TokenInfo.invalid();
 
 	if (cfg.issuer.length && jsonStr(payload, "iss") != cfg.issuer)
@@ -774,8 +787,7 @@ private string[] jsonStrArray(Json j, string key) @safe
 }
 
 /// Read an integer claim, returning 0 when absent or not an integer. Callers
-/// that require presence (e.g. `exp`) must check the JSON type separately;
-/// `nbf` is genuinely optional so a 0 result correctly disables the check.
+/// that require presence (e.g. `exp`) must check the JSON type separately.
 private long jsonLong(Json j, string key) @safe
 {
 	auto v = j[key];
@@ -1755,6 +1767,25 @@ unittest  // a token whose nbf is in the future is rejected (not-yet-valid)
 	auto payload = parseJsonString(`{"sub":"ec-user","exp":1700100000,"nbf":1700090000}`);
 	auto ti = validateClaims(cfg, payload, 1_700_001_000);
 	assert(!ti.valid);
+}
+
+unittest  // a non-numeric nbf is rejected rather than skipping the not-before check
+{
+	JwtVerifierConfig cfg;
+	foreach (nbf; [`"1700090000"`, `true`, `null`, `{}`, `[1700000000]`])
+	{
+		auto payload = parseJsonString(`{"exp":1700100000,"nbf":` ~ nbf ~ `}`);
+		assert(!validateClaims(cfg, payload, 1_700_001_000).valid, nbf);
+	}
+}
+
+unittest  // a fractional nbf is honoured: rejected while in the future, accepted once past
+{
+	JwtVerifierConfig cfg;
+	auto future = parseJsonString(`{"exp":1700100000,"nbf":1700090000.5}`);
+	assert(!validateClaims(cfg, future, 1_700_001_000).valid);
+	auto past = parseJsonString(`{"exp":1700100000,"nbf":1700000000.5}`);
+	assert(validateClaims(cfg, past, 1_700_001_000).valid);
 }
 
 unittest  // verifyToken rejects a well-formed token when no candidate key exists
