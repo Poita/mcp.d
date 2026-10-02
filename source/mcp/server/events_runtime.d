@@ -452,13 +452,31 @@ private struct WellKnownReceivers
 	long fetchedAtMs;
 }
 
-/// One position a webhook subscription has deliveries in flight at, with how many
-/// of them are still unsettled. Kept per subscription in enqueue order so the
+/// One position a webhook subscription has deliveries in flight at, with the
+/// jobs at it still unsettled. Kept per subscription in enqueue order so the
 /// watermark advances to a position only once every earlier one has settled.
 private struct OutstandingCursor
 {
 	string cursor;
-	int remaining;
+	string[] jobIds;
+}
+
+/// A delivery job this node enqueued and has not yet seen settle: the
+/// subscription it is for and the position it carries (null for none).
+private struct TrackedJob
+{
+	string subscriptionId;
+	Nullable!string cursor;
+}
+
+/// The lifecycle key of a webhook subscription whose `onSubscribe` fired on this
+/// node, kept so `onUnsubscribe` fires here even once the subscription has left
+/// the shared store.
+private struct WebhookRef
+{
+	string name;
+	Json arguments;
+	string principal;
 }
 
 /// The path of the receiver-published document that declares which paths under
@@ -552,7 +570,9 @@ final class EventsRuntime
 	private bool[string] runningSubscriptions_; // subscription ids with a delivery run in progress
 	private bool[string] localJobs_; // job ids waiting in or being delivered by a run on this node
 	private int[string] pendingCount_; // subscription id -> tracked, unsettled deliveries on this node
-	private string[string] cursorlessJobs_; // job id -> subscription id, for queued jobs with no cursor
+	private TrackedJob[string] trackedJobs_; // job id -> its subscription and position, while this node tracks it
+	private bool[string] enqueuing_; // job ids tracked whose enqueue call has not yet returned
+	private WebhookRef[string] heldWebhookRefs_; // subscription id -> lifecycle key acquired on this node
 	private Nullable!string[string] missed_; // subscription id -> furthest position dropped undelivered (null: none known), owed a gap
 	private BackgroundLoop worker_; // the periodic worker `startDeliveryWorker` runs
 
@@ -1332,6 +1352,7 @@ final class EventsRuntime
 				releaseLifecycle(p.name, p.arguments, principal);
 				return subscribeWebhook(p, principal);
 			}
+			heldWebhookRefs_[id] = WebhookRef(p.name, p.arguments, principal);
 		}
 		webhookStore_.put(sub);
 		// A fresh subscription replays from its cursor (or bootstraps a fresh one);
@@ -1424,20 +1445,34 @@ final class EventsRuntime
 			wellKnown_.remove(origin);
 	}
 
-	// Forget a webhook subscription everywhere: the store, the lifecycle refcount
-	// (firing `on_unsubscribe` on the last reference), and this node's in-flight
-	// bookkeeping.
+	// Forget a webhook subscription everywhere: the store, and this node's
+	// bookkeeping and lifecycle reference.
 	private void removeWebhookState(WebhookSubscription sub) @safe
 	{
 		webhookStore_.remove(sub.id);
-		outstanding_.remove(sub.id);
-		pendingCount_.remove(sub.id);
-		foreach (jobId, subId; cursorlessJobs_.dup)
-			if (subId == sub.id)
-				cursorlessJobs_.remove(jobId);
-		missed_.remove(sub.id);
-		nextFetchAt_.remove(sub.id);
-		releaseLifecycle(sub.name, sub.arguments, sub.principal);
+		forgetSubscription(sub.id);
+	}
+
+	// Drop this node's bookkeeping for a subscription that is gone from the
+	// store, and release the lifecycle reference this node acquired for it, if
+	// any (firing `on_unsubscribe` on the last reference). A node that never
+	// acquired one releases nothing, so a removal here never consumes a
+	// reference a local poll or stream of the same key holds.
+	private void forgetSubscription(string subId) @safe
+	{
+		outstanding_.remove(subId);
+		pendingCount_.remove(subId);
+		foreach (jobId, job; trackedJobs_.dup)
+			if (job.subscriptionId == subId)
+				trackedJobs_.remove(jobId);
+		missed_.remove(subId);
+		nextFetchAt_.remove(subId);
+		if (auto held = subId in heldWebhookRefs_)
+		{
+			auto key = *held;
+			heldWebhookRefs_.remove(subId);
+			releaseLifecycle(key.name, key.arguments, key.principal);
+		}
 	}
 
 	/// Replay for a fresh webhook subscription: enqueue every event since its
@@ -1575,44 +1610,52 @@ final class EventsRuntime
 			noteMissed(sub.id, shaped.cursor);
 			return false;
 		}
-		// Track before enqueueing (a shared queue's enqueue can yield to a drain
-		// that settles the job), and untrack when the job id is already queued:
-		// that one job settles once, so it must be counted once.
-		const jobId = sub.id ~ "/" ~ shaped.eventId;
-		trackOutstanding(sub.id, shaped.cursor);
-		// A job with no cursor has no position to settle, so it is counted
-		// against the bound by job id and released when it is acked.
-		const countById = shaped.cursor.isNull && (jobId in cursorlessJobs_) is null;
-		if (countById)
+		return enqueueTracked(Delivery(sub.id ~ "/" ~ shaped.eventId, sub.id, shaped, 0));
+	}
+
+	// Enqueue `job`, tracking it for the watermark and the pending bound first (a
+	// shared queue's enqueue can yield to a drain that settles the job). A job id
+	// already queued is one job that settles once, so it is counted once and
+	// false is returned.
+	private bool enqueueTracked(Delivery job) @safe
+	{
+		Nullable!string priorCursor;
+		if (auto prior = job.jobId in trackedJobs_)
+			priorCursor = prior.cursor;
+		const fresh = trackJob(job.subscriptionId, job.jobId, job.occ.cursor);
+		enqueuing_[job.jobId] = true;
+		bool added;
 		{
-			cursorlessJobs_[jobId] = sub.id;
-			pendingCount_[sub.id] = pendingCount_.get(sub.id, 0) + 1;
+			scope (exit)
+				enqueuing_.remove(job.jobId);
+			scope (failure)
+				if (fresh)
+					forgetJob(job.jobId);
+			added = deliveryQueue_.enqueue(job);
 		}
-		if (!deliveryQueue_.enqueue(Delivery(jobId, sub.id, shaped, 0)))
+		if (!added)
 		{
-			untrackOutstanding(sub.id, shaped.cursor);
-			if (countById)
-				releaseCursorless(jobId);
+			if (fresh)
+				forgetJob(job.jobId);
 			return false;
+		}
+		if (!fresh)
+		{
+			// The queue took a job id this node still tracked, so the earlier job
+			// was settled by another node: settle it here, then track this one.
+			settlePosition(job.subscriptionId, job.jobId, priorCursor);
+			trackJob(job.subscriptionId, job.jobId, job.occ.cursor);
 		}
 		return true;
 	}
 
-	// Remove a delivery job from the queue, releasing its slot under the pending
-	// bound when it was counted by job id.
+	// Remove a delivery job from the queue and stop tracking it. A job whose
+	// position settled is no longer tracked; one dropped unsettled (its
+	// subscription is gone) is simply forgotten.
 	private void ackJob(string jobId) @safe
 	{
 		deliveryQueue_.ack(jobId);
-		releaseCursorless(jobId);
-	}
-
-	private void releaseCursorless(string jobId) @safe
-	{
-		if (auto subId = jobId in cursorlessJobs_)
-		{
-			decrementPending(*subId);
-			cursorlessJobs_.remove(jobId);
-		}
+		forgetJob(jobId);
 	}
 
 	/// The deterministic subscription id for a key — a truncated SHA-256 of the
@@ -2011,7 +2054,7 @@ final class EventsRuntime
 			// Dead-letter: bound total attempts, and settle the position so the
 			// watermark is not held behind a job that will never be acked.
 			try
-				settlePosition(job.subscriptionId, job.occ.cursor);
+				settlePosition(job.subscriptionId, job.jobId, job.occ.cursor);
 			catch (Exception e)
 				logEventsError("settling a dead-lettered delivery threw", e);
 			ackJob(job.jobId);
@@ -2023,7 +2066,8 @@ final class EventsRuntime
 
 	/// Run the periodic worker until `stopDeliveryWorker` is called: every
 	/// `interval` it evicts aged emit-buffer events, expires poll leases, sweeps lapsed webhook subscriptions,
-	/// runs the poll-driven webhook pass, and drains the delivery queue.
+	/// reconciles delivery bookkeeping with the shared store and queue, runs the
+	/// poll-driven webhook pass, and drains the delivery queue.
 	/// `enableEvents` starts one per server at `workerInterval`; starting again
 	/// replaces (and stops) a worker already running. A multi-node deployment
 	/// shares a durable `DeliveryQueue` so any node's worker delivers (and
@@ -2069,6 +2113,7 @@ final class EventsRuntime
 		guarded("emit buffer eviction", &buffer_.evictExpired);
 		guarded("poll-lease sweep", &sweepPollLeases);
 		guarded("webhook sweep", &sweepWebhookSubscriptions);
+		guarded("delivery reconciliation", &reconcileDeliveries);
 		guarded("poll-driven webhook pass", &pollWebhookSubscriptions);
 		guarded("delivery drain", &drainDeliveries);
 	}
@@ -2140,7 +2185,7 @@ final class EventsRuntime
 		if (!job.gap && occ.toJson().toString().length > opts_.webhookMaxBodyBytes)
 		{
 			noteMissed(subId, occ.cursor);
-			settlePosition(subId, occ.cursor);
+			settlePosition(subId, job.jobId, occ.cursor);
 			ackJob(job.jobId);
 			flushMissed(s0.get);
 			return;
@@ -2161,7 +2206,7 @@ final class EventsRuntime
 			auto res = attemptDelivery(sn.get, job);
 			if (res.ok)
 			{
-				recordSuccess(subId, occ.cursor);
+				recordSuccess(subId, job.jobId, occ.cursor);
 				ackJob(job.jobId);
 				// The endpoint is taking deliveries again: send any gap it is owed.
 				flushMissed(sn.get);
@@ -2249,7 +2294,7 @@ final class EventsRuntime
 	private void abandonUndelivered(Delivery job) @safe
 	{
 		noteMissed(job.subscriptionId, job.occ.cursor);
-		settlePosition(job.subscriptionId, job.occ.cursor);
+		settlePosition(job.subscriptionId, job.jobId, job.occ.cursor);
 		ackJob(job.jobId);
 	}
 
@@ -2296,16 +2341,10 @@ final class EventsRuntime
 		occ.eventId = controlMessageId("gap");
 		occ.name = sub.name;
 		occ.cursor = cursor;
-		trackOutstanding(sub.id, occ.cursor);
 		const key = cursor.isNull ? occ.eventId : cursor.get;
 		Delivery job = Delivery(sub.id ~ "/gap/" ~ key, sub.id, occ, 0);
 		job.gap = true;
-		if (!deliveryQueue_.enqueue(job))
-		{
-			untrackOutstanding(sub.id, occ.cursor);
-			return false;
-		}
-		return true;
+		return enqueueTracked(job);
 	}
 
 	/// Single chokepoint for every callback POST: a delivery-time SSRF host check
@@ -2505,7 +2544,7 @@ final class EventsRuntime
 		}
 	}
 
-	private void recordSuccess(string subId, Nullable!string cursor) @safe
+	private void recordSuccess(string subId, string jobId, Nullable!string cursor) @safe
 	{
 		auto sn = webhookStore_.get(subId);
 		if (sn.isNull)
@@ -2519,22 +2558,24 @@ final class EventsRuntime
 		sub.windowAttempts++;
 		clearExpiredRotation(sub, now);
 		webhookStore_.put(sub);
-		settlePosition(subId, cursor);
+		settlePosition(subId, jobId, cursor);
 	}
 
-	// Record a delivery at `cursor` as settled (acked or abandoned) and advance the
-	// subscription's safe-to-persist watermark as far as the in-flight bookkeeping
-	// allows: to a position only once every earlier position has settled, so an
-	// out-of-order ack never lets the watermark skip an unacked event. A position
-	// this node never tracked (a job enqueued on another node, or before a
-	// restart) falls back to advancing when strictly ahead of the stored watermark.
-	private void settlePosition(string subId, Nullable!string cursor) @safe
+	// Record job `jobId` at `cursor` as settled (delivered or abandoned) and
+	// advance the subscription's safe-to-persist watermark as far as the in-flight
+	// bookkeeping allows: to a position only once every earlier position has
+	// settled, so an out-of-order ack never lets the watermark skip an unacked
+	// event. A job this node never tracked (one another node enqueued, or one
+	// from before a restart) falls back to advancing when strictly ahead of the
+	// stored watermark; the node that enqueued it settles it in order once it
+	// sees the job gone from the queue (`reconcileDeliveries`).
+	private void settlePosition(string subId, string jobId, Nullable!string cursor) @safe
 	{
+		string[] safe;
+		const tracked = settleJob(jobId, safe);
 		if (cursor.isNull)
 			return;
-		string[] safe;
 		string candidate;
-		const tracked = settleOutstanding(subId, cursor.get, safe);
 		if (tracked)
 		{
 			if (safe.length == 0)
@@ -2554,41 +2595,97 @@ final class EventsRuntime
 		}
 	}
 
-	// Note a delivery in flight at `cursor` for `subId`, in enqueue order.
-	private void trackOutstanding(string subId, Nullable!string cursor) @safe
+	// Start tracking job `jobId` for `subId`: it counts against the pending bound
+	// and, when it carries a cursor, holds the watermark at that position (in
+	// enqueue order) until it settles. Returns false when the job is already
+	// tracked.
+	private bool trackJob(string subId, string jobId, Nullable!string cursor) @safe
 	{
-		if (cursor.isNull)
-			return;
+		if ((jobId in trackedJobs_) !is null)
+			return false;
+		trackedJobs_[jobId] = TrackedJob(subId, cursor);
 		pendingCount_[subId] = pendingCount_.get(subId, 0) + 1;
+		if (cursor.isNull)
+			return true;
 		auto list = subId in outstanding_;
 		if (list !is null && (*list).length && (*list)[$ - 1].cursor == cursor.get)
-		{
-			(*list)[$ - 1].remaining++;
-			return;
-		}
-		outstanding_[subId] ~= OutstandingCursor(cursor.get, 1);
+			(*list)[$ - 1].jobIds ~= jobId;
+		else
+			outstanding_[subId] ~= OutstandingCursor(cursor.get, [jobId]);
+		return true;
 	}
 
-	// Withdraw a position `trackOutstanding` just recorded for a job that was
-	// never queued. It is the newest entry for `cursor`, so the latest match is
-	// decremented; an entry left at zero is dropped without settling anything.
-	private void untrackOutstanding(string subId, Nullable!string cursor) @safe
+	// Stop tracking a job without settling its position: it was never queued, or
+	// its subscription is gone. An entry it leaves empty is dropped.
+	private void forgetJob(string jobId) @safe
 	{
-		if (cursor.isNull)
+		auto job = untrackJob(jobId);
+		if (job.isNull || job.get.cursor.isNull)
 			return;
+		const subId = job.get.subscriptionId;
 		auto list = subId in outstanding_;
 		if (list is null)
 			return;
 		foreach_reverse (i, ref e; *list)
-			if (e.cursor == cursor.get)
+			if (removeJobId(e, jobId))
 			{
-				decrementPending(subId);
-				if (--e.remaining <= 0)
+				if (e.jobIds.length == 0)
 					*list = (*list)[0 .. i] ~ (*list)[i + 1 .. $];
 				break;
 			}
 		if ((*list).length == 0)
 			outstanding_.remove(subId);
+	}
+
+	// Settle one tracked job. Returns false when this node does not track it;
+	// otherwise `safe` receives, in order, every position that became safe to
+	// persist (possibly none, if an earlier one is still in flight).
+	private bool settleJob(string jobId, out string[] safe) @safe
+	{
+		auto job = untrackJob(jobId);
+		if (job.isNull)
+			return false;
+		if (job.get.cursor.isNull)
+			return true;
+		const subId = job.get.subscriptionId;
+		auto list = subId in outstanding_;
+		if (list is null)
+			return true;
+		foreach (ref e; *list)
+			if (removeJobId(e, jobId))
+				break;
+		while ((*list).length && (*list)[0].jobIds.length == 0)
+		{
+			safe ~= (*list)[0].cursor;
+			*list = (*list)[1 .. $];
+		}
+		if ((*list).length == 0)
+			outstanding_.remove(subId);
+		return true;
+	}
+
+	// Remove `jobId` from the tracked set, releasing its pending slot. Returns
+	// what was tracked for it, or null when nothing was.
+	private Nullable!TrackedJob untrackJob(string jobId) @safe
+	{
+		auto p = jobId in trackedJobs_;
+		if (p is null)
+			return Nullable!TrackedJob.init;
+		auto job = *p;
+		trackedJobs_.remove(jobId);
+		decrementPending(job.subscriptionId);
+		return nullable(job);
+	}
+
+	private static bool removeJobId(ref OutstandingCursor e, string jobId) @safe
+	{
+		foreach (i, id; e.jobIds)
+			if (id == jobId)
+			{
+				e.jobIds = e.jobIds[0 .. i] ~ e.jobIds[i + 1 .. $];
+				return true;
+			}
+		return false;
 	}
 
 	private void decrementPending(string subId) @safe
@@ -2598,34 +2695,43 @@ final class EventsRuntime
 				pendingCount_.remove(subId);
 	}
 
-	// Settle one in-flight delivery at `cursor`. Returns false when the position is
-	// not tracked here; otherwise `safe` receives, in order, every position that
-	// became safe to persist (possibly none, if an earlier one is still in flight).
-	private bool settleOutstanding(string subId, string cursor, out string[] safe) @safe
+	/// Bring this node's delivery bookkeeping in line with the shared store and
+	/// queue. A job this node enqueued may be delivered and acked by another
+	/// node's worker, and a subscription may be removed by another node; neither
+	/// reaches this node's in-memory tracking. So every subscription it holds
+	/// state for is checked against the store (state for one that is gone is
+	/// dropped, releasing a lifecycle reference acquired here), and every job it
+	/// tracks against the queue: one no longer queued has settled elsewhere and
+	/// is settled here, in order, which advances the watermark past positions
+	/// only this node can order and frees the job's slot under the pending
+	/// bound. Jobs this node is delivering or still enqueueing are skipped. The
+	/// periodic worker runs this every pass.
+	void reconcileDeliveries() @safe
 	{
-		auto list = subId in outstanding_;
-		if (list is null)
-			return false;
-		size_t idx = size_t.max;
-		foreach (i, ref e; *list)
-			if (e.cursor == cursor)
-			{
-				idx = i;
-				break;
-			}
-		if (idx == size_t.max)
-			return false;
-		if ((*list)[idx].remaining > 0)
-			decrementPending(subId);
-		(*list)[idx].remaining--;
-		while ((*list).length && (*list)[0].remaining <= 0)
+		bool[string] known;
+		foreach (subId; outstanding_.byKey)
+			known[subId] = true;
+		foreach (subId; pendingCount_.byKey)
+			known[subId] = true;
+		foreach (_, job; trackedJobs_)
+			known[job.subscriptionId] = true;
+		foreach (subId; missed_.byKey)
+			known[subId] = true;
+		foreach (subId; nextFetchAt_.byKey)
+			known[subId] = true;
+		foreach (subId; heldWebhookRefs_.byKey)
+			known[subId] = true;
+		foreach (subId, _; known)
+			if (webhookStore_.get(subId).isNull)
+				forgetSubscription(subId);
+		foreach (jobId, job; trackedJobs_.dup)
 		{
-			safe ~= (*list)[0].cursor;
-			*list = (*list)[1 .. $];
+			if ((jobId in trackedJobs_) is null || (jobId in localJobs_) !is null
+					|| (jobId in enqueuing_) !is null)
+				continue;
+			if (!deliveryQueue_.contains(jobId))
+				settlePosition(job.subscriptionId, jobId, job.cursor);
 		}
-		if ((*list).length == 0)
-			outstanding_.remove(subId);
-		return true;
 	}
 
 	// Drop a rotated previous secret once its grace window has elapsed, so a
@@ -5636,11 +5742,11 @@ unittest  // the watermark advances to a position only once every earlier one ha
 	EventRegistration reg = {descriptor: EventType("n"), emitOnly: true};
 	rt.register(reg);
 	auto r = rt.subscribeWebhook(webhookSub("n", "https://proxy/hooks"), "user-1");
-	rt.trackOutstanding(r.id, nullable(seqCursor(1)));
-	rt.trackOutstanding(r.id, nullable(seqCursor(2)));
-	rt.recordSuccess(r.id, nullable(seqCursor(2))); // position 2 settles first
+	rt.trackJob(r.id, "j1", nullable(seqCursor(1)));
+	rt.trackJob(r.id, "j2", nullable(seqCursor(2)));
+	rt.recordSuccess(r.id, "j2", nullable(seqCursor(2))); // position 2 settles first
 	assert(rt.webhookStore().get(r.id).get.cursor == r.cursor); // 1 still in flight: unchanged
-	rt.recordSuccess(r.id, nullable(seqCursor(1)));
+	rt.recordSuccess(r.id, "j1", nullable(seqCursor(1)));
 	assert(rt.webhookStore().get(r.id).get.cursor.get == seqCursor(2)); // now both are safe
 }
 
@@ -6614,6 +6720,127 @@ unittest  // multi-node: node B's worker delivers a job node A enqueued (shared 
 
 version (unittest)
 {
+	// Two nodes sharing one subscription store and delivery queue, serving a
+	// check-backed type whose cursors ("c<n>") only the enqueuing node can order —
+	// as two processes' emit-buffer cursors are, each carrying its own epoch.
+	// Node A enqueues but never delivers (its kicks are dropped); node B delivers.
+	private struct TwoNodes
+	{
+		InMemoryWebhookSubscriptionStore store;
+		InMemoryDeliveryQueue queue;
+		FakeWebhookTransport ftB;
+		EventsRuntime a, b;
+		long now = 1_000_000;
+		int produced; // the upstream holds events 1 .. produced
+		int unsubscribedOnA;
+	}
+
+	private TwoNodes* twoNodes(int maxPending) @safe
+	{
+		import std.conv : to;
+
+		auto t = new TwoNodes;
+		t.store = new InMemoryWebhookSubscriptionStore();
+		t.queue = new InMemoryDeliveryQueue();
+		t.ftB = new FakeWebhookTransport();
+		EventRegistration reg;
+		reg.descriptor.name = "mail";
+		reg.pollInterval = 1.seconds;
+		reg.check = (EventContext ctx) @safe {
+			const from = ctx.cursor.isNull ? t.produced : ctx.cursor.get[1 .. $].to!int;
+			EventOccurrence[] events;
+			foreach (i; from + 1 .. t.produced + 1)
+			{
+				auto occ = EventOccurrence("m" ~ i.to!string, "mail", "t");
+				occ.cursor = "c" ~ i.to!string;
+				events ~= occ;
+			}
+			return EventResult.of(events, "c" ~ t.produced.to!string);
+		};
+		EventsRuntime node(bool delivers, FakeWebhookTransport ft) @safe
+		{
+			EventsOptions o;
+			o.nowMs = () @safe => t.now;
+			o.nowIso = () @safe => "t";
+			o.allowPrivateCallbackHosts = true;
+			o.webhookTransport = ft;
+			o.deliveryQueue = t.queue;
+			o.webhookMaxPendingPerSubscription = maxPending;
+			o.deliverySleep = (Duration d) @safe {};
+			o.deliveryExecutor = delivers ? (void delegate() @safe job) @safe {
+				job();
+			} : (void delegate() @safe job) @safe {};
+			auto rt = new EventsRuntime(t.store, o);
+			rt.register(reg);
+			return rt;
+		}
+
+		t.b = node(true, t.ftB);
+		reg.onUnsubscribe = (EventContext ctx, string id) @safe {
+			t.unsubscribedOnA++;
+		};
+		t.a = node(false, new FakeWebhookTransport());
+		return t;
+	}
+
+	// Node A fetches whatever the upstream gained since its last pass.
+	private void pollOnA(TwoNodes* t) @safe
+	{
+		t.now += 1_000;
+		t.a.pollWebhookSubscriptions();
+	}
+}
+
+unittest  // multi-node: a job another node delivered settles on the enqueuing node, advancing the watermark
+{
+	auto t = twoNodes(1000);
+	auto r = t.a.subscribeWebhook(webhookSub("mail", "https://proxy/hooks"), "user-1");
+	assert(t.store.get(r.id).get.cursor.get == "c0");
+	t.produced = 2;
+	pollOnA(t);
+	t.b.drainDeliveries();
+	assert(t.ftB.eventPosts().length == 2);
+	// B cannot order A's cursors, so only A can move the watermark past them.
+	t.a.tick();
+	assert(t.store.get(r.id).get.cursor.get == "c2");
+	assert((r.id in t.a.pendingCount_) is null && (r.id in t.a.outstanding_) is null);
+}
+
+unittest  // multi-node: deliveries made by another node do not use up the enqueuing node's pending bound
+{
+	auto t = twoNodes(2);
+	auto r = t.a.subscribeWebhook(webhookSub("mail", "https://proxy/hooks"), "user-1");
+	foreach (round; 1 .. 4)
+	{
+		t.produced += 2;
+		pollOnA(t);
+		t.b.drainDeliveries();
+		t.a.tick();
+	}
+	assert(t.ftB.eventPosts().length == 6);
+	assert(controlPostsOf(t.ftB, "gap").length == 0);
+	assert(t.store.get(r.id).get.cursor.get == "c6");
+}
+
+unittest  // multi-node: a subscription removed by another node leaves no state behind on this one
+{
+	auto t = twoNodes(1000);
+	t.a.subscribeWebhook(webhookSub("mail", "https://proxy/hooks"), "user-1");
+	t.produced = 1;
+	pollOnA(t);
+	UnsubscribeParams u;
+	u.name = "mail";
+	u.arguments = Json.emptyObject;
+	u.url = "https://proxy/hooks";
+	t.b.unsubscribeWebhook(u, "user-1");
+	t.a.tick();
+	assert(t.a.nextFetchAt_.length == 0 && t.a.outstanding_.length == 0);
+	assert(t.a.pendingCount_.length == 0 && t.a.missed_.length == 0);
+	assert(t.unsubscribedOnA == 1, "the node that provisioned the upstream tears it down");
+}
+
+version (unittest)
+{
 	// Control-envelope POSTs of a given `type` (e.g. "gap"), for delivery assertions.
 	private FakeWebhookTransport.Req[] controlPostsOf(FakeWebhookTransport ft, string type) @safe
 	{
@@ -6737,12 +6964,12 @@ unittest  // monotonic watermark: an out-of-order older ack does not regress the
 	auto r = rt.subscribeWebhook(webhookSub("n", "https://proxy/hooks"), "user-1");
 
 	// Advance the watermark to 10, then a stale ack for 4 must not pull it back.
-	rt.recordSuccess(r.id, nullable(seqCursor(10)));
+	rt.recordSuccess(r.id, "j10", nullable(seqCursor(10)));
 	assert(rt.webhookStore().get(r.id).get.cursor.get == seqCursor(10));
-	rt.recordSuccess(r.id, nullable(seqCursor(4)));
+	rt.recordSuccess(r.id, "j4", nullable(seqCursor(4)));
 	assert(rt.webhookStore().get(r.id).get.cursor.get == seqCursor(10)); // unchanged
 	// a strictly-greater ack still advances
-	rt.recordSuccess(r.id, nullable(seqCursor(11)));
+	rt.recordSuccess(r.id, "j11", nullable(seqCursor(11)));
 	assert(rt.webhookStore().get(r.id).get.cursor.get == seqCursor(11));
 }
 
@@ -6753,7 +6980,7 @@ unittest  // an untracked position that cannot be ordered never moves the waterm
 	rt.register(reg);
 	auto r = rt.subscribeWebhook(webhookSub("n", "https://proxy/hooks"), "user-1");
 	const before = rt.webhookStore().get(r.id).get.cursor;
-	rt.recordSuccess(r.id, nullable("cursor-from-another-node"));
+	rt.recordSuccess(r.id, "j", nullable("cursor-from-another-node"));
 	assert(rt.webhookStore().get(r.id).get.cursor == before);
 }
 

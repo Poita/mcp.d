@@ -560,6 +560,10 @@ interface DeliveryQueue
 
 	/// Remove a delivered (or abandoned) job.
 	void ack(string jobId) @safe;
+
+	/// Whether `jobId` is still queued (leased or not). A node learns from this
+	/// that a job it enqueued was settled by another node's worker.
+	bool contains(string jobId) @safe;
 }
 
 /// In-memory `DeliveryQueue`. The default; jobs are lost on restart, which is the
@@ -624,6 +628,22 @@ final class InMemoryDeliveryQueue : DeliveryQueue
 	{
 		entries_.remove(jobId);
 	}
+
+	bool contains(string jobId) @safe
+	{
+		return (jobId in entries_) !is null;
+	}
+}
+
+unittest  // the in-memory delivery queue reports a job queued until it is acked
+{
+	auto q = new InMemoryDeliveryQueue();
+	q.enqueue(Delivery("j", "s", EventOccurrence("a", "n", "t"), 0));
+	assert(q.contains("j") && !q.contains("other"));
+	q.lease(0, 1000);
+	assert(q.contains("j"));
+	q.ack("j");
+	assert(!q.contains("j"));
 }
 
 // ---------------------------------------------------------------------------

@@ -1141,7 +1141,7 @@ unittest  // deliverInput rejects a key the task has not requested and records n
 	auto rt = new TaskRuntime(new InMemoryTaskStore(), TaskOptions.init);
 	auto t = rt.createFor("gate", Json.undefined);
 	auto none = cast(McpException) collectException(rt.deliverInput(t.taskId, Json([
-				"a": Json(1)
+		"a": Json(1)
 	])));
 	assert(none !is null && none.code == ErrorCode.invalidParams);
 	rt.requireInput(t.taskId, Json([
