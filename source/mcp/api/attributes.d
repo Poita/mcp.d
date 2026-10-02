@@ -320,6 +320,9 @@ struct lastModified
 /// is the human-readable text folded into that property's JSON Schema
 /// `description` (or, for prompts, into `PromptArgument.description`).
 ///
+/// A parameter is named by its wire name, the identifier with one trailing
+/// underscore dropped (`version` for `string version_`), as for `@mcpHeader`.
+///
 /// Repeatable: attach one `@describeParam` per documented parameter. Naming a
 /// parameter that the method does not declare — or an injected context
 /// parameter (a trailing `RequestContext` / `TaskContext`, which has no schema

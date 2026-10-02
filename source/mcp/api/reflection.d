@@ -21,7 +21,7 @@ import mcp.api.attributes;
 import mcp.api.apps : UiToolMeta, setUiToolMeta;
 import mcp.api.skills : Skill, registerSkill;
 import mcp.api.binding : bindJson, bindString, isFieldwiseStruct, schemaNode,
-	schemaOf, SchemaUse, setBound;
+	schemaOf, SchemaUse, setBound, wireName;
 import mcp.protocol.schema;
 
 @safe:
@@ -186,6 +186,11 @@ void registerModules(mods...)(McpServer server) @safe
 /// before the call.
 private alias BoundParameters(alias func) = staticMap!(Unqual, Parameters!func);
 
+/// The wire names of `func`'s parameters, in order: each identifier with one
+/// trailing underscore dropped (see `wireName`), the names the input schema,
+/// prompt arguments, and URI template variables use.
+private alias ParamWireNames(alias func) = staticMap!(wireName, ParameterIdentifierTuple!func);
+
 /// Reject any method-level `@describeParam` or `@mcpHeader` UDA whose
 /// `parameter` does not name a schema parameter of `func`. A parameter that is
 /// not declared at all, or one that is an injected context parameter (a trailing
@@ -195,7 +200,7 @@ private alias BoundParameters(alias func) = staticMap!(Unqual, Parameters!func);
 /// diagnostic instead.
 private void validateParamUdas(alias func)()
 {
-	alias names = ParameterIdentifierTuple!func;
+	alias names = ParamWireNames!func;
 	alias types = BoundParameters!func;
 
 	// Whether `pname` names a parameter of `func` that appears in the input
@@ -271,7 +276,7 @@ private Json parametersSchema(alias func)() @safe
 
 	validateParamUdas!func();
 
-	alias names = ParameterIdentifierTuple!func;
+	alias names = ParamWireNames!func;
 	alias types = BoundParameters!func;
 	// ParameterDefaultValueTuple yields `void` for a parameter with no declared
 	// D-level default and the default value's type otherwise.
@@ -594,7 +599,7 @@ private string bindToolArgs(alias overload)(Json args, ref Tuple!(BoundParameter
 {
 	import mcp.protocol.errors : McpException;
 
-	alias names = ParameterIdentifierTuple!overload;
+	alias names = ParamWireNames!overload;
 	alias defs = ParameterDefaultValueTuple!overload;
 	static foreach (i, P; BoundParameters!overload)
 	{
@@ -868,7 +873,7 @@ private void registerPromptMethod(string memberName, alias overload, alias paren
 		descriptor.title = nullable(attr.title);
 	if (attr.description.length)
 		descriptor.description = nullable(attr.description);
-	alias names = ParameterIdentifierTuple!overload;
+	alias names = ParamWireNames!overload;
 	alias defs = ParameterDefaultValueTuple!overload;
 	static foreach (i, P; BoundParameters!overload)
 	{
@@ -1019,10 +1024,9 @@ private void registerTemplateMethod(string memberName, alias overload,
 	{
 		static if (!is(P : RequestContext))
 		{
-			static assert(canFind(uriTemplateVars(attr.uriTemplate),
-					ParameterIdentifierTuple!overload[i]),
+			static assert(canFind(uriTemplateVars(attr.uriTemplate), ParamWireNames!overload[i]),
 					"@resourceTemplate method '" ~ memberName ~ "' parameter '"
-					~ ParameterIdentifierTuple!overload[i]
+					~ ParamWireNames!overload[i]
 					~ "' does not appear in URI template \"" ~ attr.uriTemplate ~ "\"");
 		}
 	}
@@ -1033,7 +1037,7 @@ private void registerTemplateMethod(string memberName, alias overload,
 			string[string] params, RequestContext ctx) @safe {
 		import mcp.protocol.errors : invalidParams;
 
-		alias names = ParameterIdentifierTuple!overload;
+		alias names = ParamWireNames!overload;
 		alias defs = ParameterDefaultValueTuple!overload;
 		Tuple!(BoundParameters!overload) argv;
 		static foreach (i, P; BoundParameters!overload)
@@ -4068,4 +4072,69 @@ unittest  // a floating-point output schema admits the null an unset value seria
 		if (tools[i]["name"].get!string == "read")
 			assert(tools[i]["outputSchema"]["properties"]["value"]["type"] == Json(
 					[Json("number"), Json("null")]), tools[i].toString);
+}
+
+version (unittest) private final class KeywordParamApi
+{
+	@tool("fetch", "Parameters named after D keywords")
+	@describeParam("version", "the version to fetch")
+	@mcpHeader("version", "Version")
+	string fetch(string version_, string body_) @safe
+	{
+		return version_ ~ "/" ~ body_;
+	}
+
+	@prompt("release", "Prompt with a keyword-named argument")
+	string release(string version_) @safe
+	{
+		return "release " ~ version_;
+	}
+
+	@resourceTemplate("pkg://{version}", "Package")
+	string pkg(string version_) @safe
+	{
+		return "pkg " ~ version_;
+	}
+}
+
+unittest  // a tool parameter's wire name drops one trailing underscore, as a struct field's does
+{
+	auto s = new McpServer("t", "1");
+	registerHandlers(s, new KeywordParamApi);
+	auto schema = s.handle(MakeListMessage()).get["result"]["tools"][0]["inputSchema"];
+	assert("version" in schema["properties"] && "body" in schema["properties"], schema.toString);
+	assert(schema["required"] == Json([Json("version"), Json("body")]), schema.toString);
+	assert(schema["properties"]["version"]["description"].get!string == "the version to fetch");
+	assert(schema["properties"]["version"]["x-mcp-header"].get!string == "Version");
+	auto r = callToolArgs(s, "fetch", `{"version":"1.2","body":"b"}`);
+	assert("isError" !in r, r.toString);
+	assert(r["content"][0]["text"].get!string == "1.2/b", r.toString);
+}
+
+unittest  // a prompt argument's wire name drops one trailing underscore
+{
+	import mcp.protocol.jsonrpc : Message, makeRequest;
+
+	auto s = new McpServer("t", "1");
+	registerHandlers(s, new KeywordParamApi);
+	auto prompts = s.handle(Message(makeRequest(Json(1), "prompts/list",
+			Json.emptyObject))).get["result"]["prompts"];
+	assert(prompts[0]["arguments"][0]["name"].get!string == "version", prompts.toString);
+	Json pp = Json.emptyObject;
+	pp["name"] = "release";
+	pp["arguments"] = parseJsonString(`{"version":"2"}`);
+	auto pr = s.handle(Message(makeRequest(Json(2), "prompts/get", pp))).get;
+	assert(pr["result"]["messages"][0]["content"]["text"].get!string == "release 2", pr.toString);
+}
+
+unittest  // a resource template parameter matches its URI variable without the trailing underscore
+{
+	import mcp.protocol.jsonrpc : Message, makeRequest;
+
+	auto s = new McpServer("t", "1");
+	registerHandlers(s, new KeywordParamApi);
+	Json rp = Json.emptyObject;
+	rp["uri"] = "pkg://3";
+	auto rr = s.handle(Message(makeRequest(Json(1), "resources/read", rp))).get;
+	assert(rr["result"]["contents"][0]["text"].get!string == "pkg 3", rr.toString);
 }

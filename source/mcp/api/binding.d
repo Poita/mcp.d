@@ -73,11 +73,15 @@ package(mcp) template wireFieldName(T, string field)
 
 	static if (hasUDA!(__traits(getMember, T, field), NameAttribute))
 		enum wireFieldName = getUDAs!(__traits(getMember, T, field), NameAttribute)[0].name;
-	else static if (field.length > 1 && field[$ - 1] == '_')
-		enum wireFieldName = field[0 .. $ - 1];
 	else
-		enum wireFieldName = field;
+		enum wireFieldName = wireName!field;
 }
+
+/// The JSON key for the D identifier `name` — a struct field without `@name`,
+/// or a handler parameter: `name` with a single trailing underscore stripped, so
+/// one named after a D keyword (`version_`, `body_`) appears as the keyword.
+package(mcp) enum wireName(string name) = name.length > 1 && name[$ - 1] == '_' ? name[0 .. $ - 1]
+		: name;
 
 /// Whether field `field` of struct `T` must be present in its JSON object: `T`
 /// is not `@allOptional`, and the field is not `Nullable`, not vibe-`@optional`,
