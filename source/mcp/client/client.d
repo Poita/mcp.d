@@ -107,8 +107,19 @@ final class CancellationToken
 			return;
 		cancelled_ = true;
 		reason_ = reason;
+		// Each hook aborts one in-flight call; a failing hook must not stop
+		// the remaining calls from being aborted.
 		foreach (hook; hooks_.dup.byValue)
-			hook(reason);
+		{
+			try
+				hook(reason);
+			catch (Exception e)
+			{
+				import vibe.core.log : logWarn;
+
+				logWarn("[mcp.client] cancellation hook threw: %s", e.msg);
+			}
+		}
 	}
 
 	/// Whether `cancel` has been called.
@@ -132,6 +143,17 @@ final class CancellationToken
 	{
 		hooks_.remove(id);
 	}
+}
+
+unittest  // CancellationToken.cancel runs every hook even when one throws
+{
+	auto token = new CancellationToken;
+	int ran;
+	token.bind(1, (string) @safe { ran++; throw new Exception("hook failed"); });
+	token.bind(2, (string) @safe { ran++; throw new Exception("hook failed"); });
+	token.cancel("stop");
+	assert(ran == 2);
+	assert(token.isCancelled);
 }
 
 /// The error a cancelled request fails with.
