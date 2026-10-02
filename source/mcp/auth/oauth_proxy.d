@@ -31,7 +31,7 @@
 /// are unit-testable with a mocked upstream.
 module mcp.auth.oauth_proxy;
 
-import core.time : Duration, minutes;
+import core.time : days, Duration, minutes;
 import std.string : endsWith, indexOf, startsWith;
 
 import vibe.data.json : Json;
@@ -979,6 +979,18 @@ final class OAuthProxy
 	/// Maximum number of relayed-but-unredeemed codes retained.
 	enum size_t maxRelayedCodes = 10_000;
 
+	// SHA-256 digests of the refresh tokens relayed to clients in passthrough
+	// mode; only these are forwarded upstream under the proxy's credentials.
+	private BoundedExpiringMap!bool relayedRefreshTokens = BoundedExpiringMap!bool(
+			relayedRefreshTokenTtl, maxRelayedRefreshTokens, null);
+
+	/// How long a relayed refresh token stays redeemable at `/token` without use.
+	enum Duration relayedRefreshTokenTtl = 90.days;
+
+	/// Maximum number of relayed refresh tokens retained; the least recently
+	/// recorded is forgotten first.
+	enum size_t maxRelayedRefreshTokens = 100_000;
+
 	this(OAuthProxyConfig cfg) @safe
 	{
 		this(cfg, new InMemoryConsentStore(), new InMemoryRedirectUriRegistry());
@@ -1216,6 +1228,43 @@ final class OAuthProxy
 		// registration is retained ahead of never-used ones.
 		if (binding.clientId.length == 0)
 			redirectRegistry.markUsed(binding.clientRedirectUri);
+	}
+
+	/// Record that `refreshToken` is being relayed to a client in an upstream
+	/// token response (passthrough mode), so a later `refresh_token` grant
+	/// presenting it is forwarded upstream. Only a digest is retained.
+	void recordRelayedRefreshToken(string refreshToken) @safe
+	{
+		if (refreshToken.length == 0)
+			return;
+		synchronized (this)
+			relayedRefreshTokens.put(refreshTokenKey(refreshToken), true);
+	}
+
+	/// Consume the record of a relayed `refreshToken`, returning whether this
+	/// proxy relayed it. A refresh grant presenting any other token is refused
+	/// before it reaches the upstream, so the proxy's confidential client
+	/// credentials never back a refresh token obtained elsewhere. The caller
+	/// re-records the token (or its rotation) once the upstream answers.
+	///
+	/// The record is in memory: after a restart, or on another instance of a
+	/// multi-process deployment, clients must sign in again to refresh.
+	bool takeRelayedRefreshToken(string refreshToken) @safe
+	{
+		if (refreshToken.length == 0)
+			return false;
+		bool found;
+		synchronized (this)
+			cast(void) relayedRefreshTokens.take(refreshTokenKey(refreshToken), found);
+		return found;
+	}
+
+	private static string refreshTokenKey(string refreshToken) @safe
+	{
+		import std.digest.sha : sha256Of;
+		import mcp.auth.oauth : base64UrlNoPad;
+
+		return base64UrlNoPad(sha256Of(refreshToken)[]);
 	}
 
 	/// Check an authorization-code `/token` request against the binding recorded
