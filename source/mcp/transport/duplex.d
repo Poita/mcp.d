@@ -5,7 +5,7 @@ import core.time : Duration, seconds;
 import vibe.core.core : runTask;
 import vibe.core.sync : TaskMutex;
 import vibe.core.task : Task;
-import vibe.data.json : Json;
+import vibe.data.json : Json, parseJsonString;
 
 import mcp.protocol.jsonrpc;
 import mcp.protocol.errors;
@@ -205,9 +205,13 @@ final class DuplexChannel
 			input = parseAny(line);
 		catch (McpException e)
 		{
-			// Reply to a malformed/invalid line rather than dropping it silently,
-			// with the request's id when it was determined and null otherwise.
-			send(makeErrorResponse(errorReplyId(e), e));
+			Json item;
+			try
+				item = parseJsonString(line);
+			catch (Exception)
+			{
+			}
+			answerMalformed(item, e);
 			return;
 		}
 		// A batch array on the server inbound path must be dispatched as a unit so the
@@ -222,28 +226,27 @@ final class DuplexChannel
 		}
 		foreach (m; input.messages)
 			routeMessage(m);
-		// A malformed batch member may still carry the id of a pending outbound
-		// request; wake that waiter with the member's error so the caller fails fast
-		// instead of blocking until its timeout. When no id is recoverable (the member
-		// is not an object, or its id is null/absent), reply with a null-id JSON-RPC
-		// error so the peer is still notified rather than dropped silently.
 		foreach (e; input.errors)
+			answerMalformed(e.item, e.error);
+	}
+
+	/// Answer an inbound message `item` that failed validation with `error`. A
+	/// malformed request is answered under its own id. Anything else carrying
+	/// the id of a pending outbound request wakes that waiter with `error`, so
+	/// the caller fails fast instead of blocking until its timeout. Otherwise
+	/// the peer gets a null-id JSON-RPC error rather than silence.
+	private void answerMalformed(Json item, McpException error) @safe
+	{
+		const replyId = errorReplyId(error);
+		if (replyId.type != Json.Type.null_)
 		{
-			// A malformed request is answered under its own id; it is never a
-			// reply to one of ours.
-			const replyId = errorReplyId(e.error);
-			if (replyId.type != Json.Type.null_)
-			{
-				send(makeErrorResponse(replyId, e.error));
-				continue;
-			}
-			Json id = (e.item.type == Json.Type.object && "id" in e.item) ? e.item["id"] : Json(
-					null);
-			if (id.type == Json.Type.null_ || id.type == Json.Type.undefined)
-				send(makeErrorResponse(Json(null), e.error));
-			else if (!coord.resolve(id, Json.undefined, toErrorJson(e.error)))
-				send(makeErrorResponse(Json(null), e.error));
+			send(makeErrorResponse(replyId, error));
+			return;
 		}
+		Json id = (item.type == Json.Type.object && "id" in item) ? item["id"] : Json(null);
+		if (id.type == Json.Type.null_ || id.type == Json.Type.undefined
+				|| !coord.resolve(id, Json.undefined, toErrorJson(error)))
+			send(makeErrorResponse(Json(null), error));
 	}
 
 	private void routeMessage(Message m) @safe
@@ -1029,6 +1032,55 @@ unittest  // a malformed batch member carrying a pending id wakes its deliver() 
 	assert(threw, "a malformed batch member for a pending id must wake its deliver()");
 	assert(errCode == ErrorCode.invalidRequest,
 			"the waiter must wake with the member's -32600 error, not a -32603 timeout");
+}
+
+unittest  // a malformed single-line reply carrying a pending id wakes its deliver() with an error, not a timeout
+{
+	auto toResponder = new LineLink;
+	auto toClient = new LineLink;
+
+	bool threw;
+	int errCode;
+	string[] extraWrites;
+	runTask(() nothrow{
+		scope (exit)
+			exitEventLoop();
+		try
+		{
+			auto channel = new DuplexChannel(() @safe { return toClient.take(); }, (string s) @safe {
+				toResponder.put(s);
+			}, (Message) @safe {});
+			channel.start();
+
+			runTask(() nothrow{
+				try
+				{
+					toResponder.take(); // the deliver() request frame
+					toClient.put(`{"jsonrpc":"2.0","id":1,"error":"boom"}`);
+				}
+				catch (Exception)
+				{
+				}
+			});
+
+			try
+				channel.deliver(makeRequest(Json(1L), "ping", Json.emptyObject), 1, 5.seconds);
+			catch (McpException e)
+			{
+				threw = true;
+				errCode = e.code;
+			}
+			extraWrites = toResponder.queue;
+		}
+		catch (Exception)
+		{
+		}
+	});
+	runEventLoop();
+	assert(threw, "a malformed reply for a pending id must wake its deliver()");
+	assert(errCode != ErrorCode.internalError,
+			"the waiter must wake with the reply's parse error, not a -32603 timeout");
+	assert(extraWrites.length == 0, "a reply resolved locally is not answered back to the peer");
 }
 
 unittest  // a malformed batch member with a non-integer (string) id sends a null-id error, not silence
