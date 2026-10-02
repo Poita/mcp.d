@@ -89,7 +89,9 @@ final class OAuthClient
 	string resource;
 	/// The client's redirect URI for the auth-code flow.
 	string redirectUri = "http://localhost:8765/callback";
-	/// How to authenticate at the token endpoint.
+	/// How to authenticate at the token endpoint. Under `none`, a client that
+	/// nevertheless holds a `clientSecret` authenticates with
+	/// `client_secret_basic`.
 	TokenEndpointAuthMethod authMethod = TokenEndpointAuthMethod.none;
 	/// RSA or EC (P-256) private key (PKCS#8 PEM) for `private_key_jwt` client
 	/// assertions. Required when `authMethod` is `privateKeyJwt`.
@@ -772,10 +774,15 @@ final class OAuthClient
 		return postParse(url, "application/json", cast(const(ubyte)[]) payload.toString());
 	}
 
+	// A client holding a secret authenticates with it even when `authMethod` was
+	// left at `none`: `client_secret_basic` is the RFC 6749 §2.3.1 default every
+	// AS must support, and dropping a supplied secret would silently downgrade a
+	// confidential client to a public one.
 	private Json postForm(string url, string form, RegisteredClient client) @safe
 	{
-		const useBasic = authMethod == TokenEndpointAuthMethod.clientSecretBasic
-			&& client.clientSecret.length;
+		const useBasic = client.clientSecret.length
+			&& (authMethod == TokenEndpointAuthMethod.clientSecretBasic
+					|| authMethod == TokenEndpointAuthMethod.none);
 		const auth = useBasic ? basicAuthHeader(client.clientId, client.clientSecret) : "";
 		return postParse(url, "application/x-www-form-urlencoded", cast(const(ubyte)[]) form, auth);
 	}
@@ -1723,6 +1730,31 @@ unittest  // token grants POST their forms and parse the token response (loopbac
 	auto t6 = c.clientCredentials(as_, RegisteredClient("cid", "shh"), "mcp:read");
 	assert(t6.accessToken == "at-123");
 	assert(!lastForm.canFind("client_secret="));
+}
+
+unittest  // a client secret supplied without an auth method is sent as client_secret_basic
+{
+	string lastAuth;
+	auto srv = startLoopback((scope HTTPServerRequest req, scope HTTPServerResponse res) @safe {
+		lastAuth = req.headers.get("Authorization", "");
+		res.writeBody(`{"access_token":"at","token_type":"bearer"}`, "application/json");
+	});
+	scope (exit)
+		srv.stop();
+
+	auto c = new OAuthClient();
+	c.resource = "http://127.0.0.1:3000/mcp";
+	AuthorizationServerMetadata as_;
+	as_.issuer = "https://as.example.com";
+	as_.tokenEndpoint = srv.base ~ "/token";
+	assert(c.authMethod == TokenEndpointAuthMethod.none);
+
+	c.clientCredentials(as_, RegisteredClient("cid", "shh"), "mcp:read");
+	assert(lastAuth == basicAuthHeader("cid", "shh"));
+
+	// A public client (no secret) still sends no credentials.
+	c.clientCredentials(as_, RegisteredClient("cid", ""), "mcp:read");
+	assert(lastAuth.length == 0);
 }
 
 unittest  // private_key_jwt: token requests carry a client_assertion (RFC 7523)

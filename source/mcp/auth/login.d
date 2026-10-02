@@ -697,7 +697,8 @@ struct OAuthLogin
 	/// SEP-991 OAuth Client ID Metadata Document URL (used as `client_id`
 	/// when the AS advertises `client_id_metadata_document_supported`).
 	string clientIdMetadataUrl;
-	/// How to authenticate at the token endpoint.
+	/// How to authenticate at the token endpoint. Under `none`, a supplied
+	/// `clientSecret` is sent with `client_secret_basic`.
 	TokenEndpointAuthMethod authMethod = TokenEndpointAuthMethod.none;
 	/// Maximum time to wait for the authorization-server redirect to arrive on
 	/// the loopback listener before aborting the interactive flow. Bounds the
