@@ -1012,10 +1012,11 @@ and `SkillDirOptions.publishNested` (the default) additionally publishes each
 nested skill as its own flat entry — authored frontmatter, `resources` covering
 exactly its subtree — validated by the same rules as a top-level skill.
 
-On the client, `listSkills(client)` calls `skills/list` (paginating to
-completion) and returns the typed entries; `getSkill(client, uri)` calls
-`skills/get` to fetch one skill's entry by its `SKILL.md` URI — including skills
-absent from the listing, which MAY be empty or partial. A `SkillEntry` exposes
+On the client, `client.skillsList()` calls `skills/list` (paginating to
+completion) and `.entries` gives the typed entries; `client.skillsGet(uri)` calls
+`skills/get` to fetch one skill's entry (`.entry`) by its `SKILL.md` URI —
+including skills absent from the listing, which MAY be empty or partial. Both
+results also carry the server's `cache` hint. A `SkillEntry` exposes
 its `resources` manifest, `isDynamic` for a `"dynamic"` entry, and `isValid`
 (an entry with neither shape is malformed and must not be loaded).
 `readSkill(client, "git-workflow")` / `readSkillUri(client, uri)` read a
@@ -1026,9 +1027,10 @@ frontmatter comparison); `checkSkillLimits` decides from the entry alone whether
 a skill exceeds the fixed per-skill limits. Note that no URI scheme marks a
 resource as a skill — a resource is known to be a skill only through a
 `skills/list` entry or a `skills/get` answer. When a skill's instructions point
-at a directory ("pick a template from `templates/`"), `readDirectory(client,
-uri)` scope-lists that directory's direct children via
-`resources/directory/read` (files plus `inode/directory` subdirectories) —
+at a directory ("pick a template from `templates/`"),
+`client.readDirectory(uri)` scope-lists that directory's direct children via
+`resources/directory/read` (files plus subdirectories, whose `mimeType` is
+`skillDirectoryMimeType`, `inode/directory`) —
 enabled automatically by `enableSkills`, which advertises `directoryRead: true`.
 
 The stable specification is written against protocol revision 2026-07-28, where

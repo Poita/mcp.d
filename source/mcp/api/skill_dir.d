@@ -15,8 +15,9 @@ module mcp.api.skill_dir;
 import vibe.data.json : Json;
 
 import mcp.server.server : McpServer;
-import mcp.api.skills : SkillFile, SkillEntry, registerSkillResources,
-	addSkillEntry, skillName, skillFileUri, isValidSkillPath,
+import mcp.protocol.types : SkillEntry;
+import mcp.api.skills : SkillFile, registerSkillResources, addSkillEntry,
+	skillName, skillFileUri, isValidSkillPath,
 	isValidSkillName, skillDigest,
 	verifyResourceDigest, resourceRef, maxSkillResources, maxSkillTotalBytes;
 
@@ -1317,7 +1318,7 @@ unittest  // parseSkillFrontmatter is public: hosts parse fetched SKILL.md front
 
 version (unittest)
 {
-	import mcp.api.skills : SkillResourceRef;
+	import mcp.protocol.types : SkillResourceRef;
 
 	// A well-formed SKILL.md and the entry a server would publish for it.
 	private enum verifyMd = "---\nname: x\ndescription: d\n---\n\n# Body\n";

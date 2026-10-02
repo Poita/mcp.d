@@ -3274,9 +3274,92 @@ struct ListResourcesResult
 	}
 }
 
+/// One `{uri, digest, size}` entry from a skill entry's `resources` manifest: a
+/// file the skill serves, the sha256 of the bytes it serves, and how many bytes
+/// those are.
+struct SkillResourceRef
+{
+	string uri; /// resource URI of the file
+	string digest; /// `sha256:<hex>` digest of the file's raw bytes
+	long size; /// byte length of the file's raw content (the bytes `digest` covers)
+
+	static SkillResourceRef fromJson(Json j) @safe
+	{
+		SkillResourceRef r;
+		if ("uri" in j && j["uri"].type == Json.Type.string)
+			r.uri = j["uri"].get!string;
+		if ("digest" in j && j["digest"].type == Json.Type.string)
+			r.digest = j["digest"].get!string;
+		if ("size" in j && j["size"].type == Json.Type.int_)
+			r.size = j["size"].get!long;
+		return r;
+	}
+}
+
+/// One skill entry, as carried by `skills/list` and `skills/get`. `name` and
+/// `description` are read from the verbatim `frontmatter` object (always present
+/// per the Agent Skills spec); `uri` addresses the `SKILL.md` directly, and
+/// `resources` is the complete per-file manifest a host verifies reads against.
+/// A dynamically generated skill publishes the string `"dynamic"` in place of a
+/// manifest: `isDynamic` is set and `resources` is empty, and the skill offers
+/// no content integrity. An entry with neither (`!isValid`) is malformed and
+/// must not be loaded. Within the frontmatter's `metadata` object, keys prefixed
+/// `io.modelcontextprotocol/` are reserved for MCP extensions; ignore
+/// unrecognized keys under that prefix.
+struct SkillEntry
+{
+	string uri; /// resource URI of the `SKILL.md`
+	Json frontmatter; /// verbatim `SKILL.md` frontmatter as JSON
+	SkillResourceRef[] resources; /// complete `{uri, digest, size}` manifest of the skill's files
+	bool isDynamic; /// `resources` was the string `"dynamic"`: generated content, no digests
+
+	/// Whether `resources` took one of the two shapes the extension allows: a
+	/// manifest array (never legitimately empty, as it always lists `SKILL.md`)
+	/// or the string `"dynamic"`. A host must not load an entry that is not valid.
+	bool isValid() const @safe pure nothrow
+	{
+		return isDynamic || resources.length > 0;
+	}
+
+	/// The skill `name` from the frontmatter, or empty if absent.
+	string name() const @safe
+	{
+		if (frontmatter.type == Json.Type.object && "name" in frontmatter
+				&& frontmatter["name"].type == Json.Type.string)
+			return frontmatter["name"].get!string;
+		return null;
+	}
+
+	/// The skill `description` from the frontmatter, or empty if absent.
+	string description() const @safe
+	{
+		if (frontmatter.type == Json.Type.object && "description" in frontmatter
+				&& frontmatter["description"].type == Json.Type.string)
+			return frontmatter["description"].get!string;
+		return null;
+	}
+
+	static SkillEntry fromJson(Json j) @safe
+	{
+		SkillEntry e;
+		if ("uri" in j && j["uri"].type == Json.Type.string)
+			e.uri = j["uri"].get!string;
+		if ("frontmatter" in j)
+			e.frontmatter = j["frontmatter"];
+		if ("resources" in j && j["resources"].type == Json.Type.array)
+			foreach (i; 0 .. j["resources"].length)
+				e.resources ~= SkillResourceRef.fromJson(j["resources"][i]);
+		else if ("resources" in j && j["resources"].type == Json.Type.string
+						&& j["resources"].get!string == "dynamic")
+					e.isDynamic = true;
+		return e;
+	}
+}
+
 /// Result of the Skills extension's `skills/list` method. Entries are carried
 /// as raw `Json`: their shape (`{uri, frontmatter, resources}`) is defined by
-/// the extension and passed through verbatim. `ListSkillsResult extends
+/// the extension and passed through verbatim; `entries` reads them as
+/// `SkillEntry`s. `ListSkillsResult extends
 /// PaginatedResult, CacheableResult`, so on the modern protocol it carries the
 /// same required `ttlMs`/`cacheScope` as `tools/list` and `resources/list`: a
 /// freshness hint for the listing, never an integrity property.
@@ -3321,6 +3404,15 @@ struct ListSkillsResult
 		r.parseMetaField(j);
 		return r;
 	}
+
+	/// The listed skills, typed.
+	SkillEntry[] entries() @safe
+	{
+		SkillEntry[] out_;
+		foreach (s; skills)
+			out_ ~= SkillEntry.fromJson(s);
+		return out_;
+	}
 }
 
 /// Result of the Skills extension's `skills/get` method: the entry for a single
@@ -3359,6 +3451,12 @@ struct GetSkillResult
 		r.cache = parseCacheHint(j);
 		r.parseMetaField(j);
 		return r;
+	}
+
+	/// The skill's entry, typed.
+	SkillEntry entry() @safe
+	{
+		return SkillEntry.fromJson(skill);
 	}
 }
 

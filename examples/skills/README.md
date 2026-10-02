@@ -33,7 +33,7 @@ total:
 
 1. `server/discover` advertises the skills extension with `directoryRead`, and
    `connect()` negotiates 2026-07-28.
-2. `skills/list` (`listSkills`) returns all five entries, each with a `SKILL.md`
+2. `skills/list` (`client.skillsList().entries`) returns all five entries, each with a `SKILL.md`
    uri and, for static skills, a manifest listing `SKILL.md` first with `sha256`
    digests and byte sizes; the raw result carries `ttlMs`/`cacheScope`. The
    dynamic `reports/daily` reads a generated body but fails
@@ -42,10 +42,10 @@ total:
    body.
 4. `team/release-helper` carries its authored frontmatter (`license`,
    `metadata.version`) and serves `references/CHECKLIST.md`.
-5. `getSkill` fetches entries by uri via `skills/get`; the fetched `SKILL.md`
+5. `client.skillsGet(uri).entry` fetches entries by uri via `skills/get`; the fetched `SKILL.md`
    and checklist pass `verifySkillMarkdown` / `verifyResourceDigest`, and the
    nested `hotfix-helper` answers with its own frontmatter.
-6. `readDirectory` walks `skill://team/release-helper`, listing `SKILL.md` as a
+6. `client.readDirectory` walks `skill://team/release-helper`, listing `SKILL.md` as a
    file and `references/` as a subdirectory, then descends into it.
 
 On success it prints `OK: ...` and exits `0`; any failed assertion prints what

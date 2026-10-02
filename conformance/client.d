@@ -140,7 +140,7 @@ private int runSkillsScenario(string url, string scenario) @safe
 	else
 		client.initialize();
 
-	auto skills = listSkills(client);
+	auto skills = client.skillsList().entries;
 	if (scenario == "sep-2640-client-no-prefetch" || skills.length == 0)
 		return 0; // the listing alone builds the registry; nothing is fetched
 
