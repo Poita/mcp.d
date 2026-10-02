@@ -931,7 +931,10 @@ from `std.file.thisExePath`.
 The directory's name, and the final segment of the skill path, must equal the
 frontmatter `name`, as the Agent Skills specification requires
 ([dyaml](https://code.dlang.org/packages/dyaml) parses the frontmatter). A
-symlink or exceeding `maxFiles`/`maxTotalBytes` is rejected. Skills may nest: a
+symlink or exceeding `maxFiles`/`maxTotalBytes` is rejected. Dot-prefixed files
+and directories (`.git/`, `.DS_Store`) are skipped unless you supply
+`SkillDirOptions.include`, which then decides for every file, dot-prefixed or
+not. Skills may nest: a
 `SKILL.md` in a descendant directory is ordinary supporting content of the
 enclosing skill (its files appear in the enclosing `resources` manifest too),
 and `SkillDirOptions.publishNested` (the default) additionally publishes each

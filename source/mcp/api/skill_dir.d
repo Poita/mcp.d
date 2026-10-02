@@ -35,7 +35,10 @@ struct SkillDirOptions
 	/// supporting file only — readable, but nothing marks it as a skill.
 	bool publishNested = true;
 	/// Optional filter: return `false` to exclude a file by its skill-relative
-	/// path (e.g. drop `.git/…` or `*.pyc`). `null` includes everything. Note a
+	/// path (e.g. drop `*.pyc`). `null` includes everything except dot-prefixed
+	/// files and directories (`.git/`, `.DS_Store`). A filter replaces that
+	/// default: it is consulted for every file, dot-prefixed ones included, so it
+	/// can opt them back in and must exclude any it does not want. Note a
 	/// filtered-out nested `SKILL.md` is neither served nor published as a
 	/// nested skill.
 	bool delegate(string relPath) @safe include;
@@ -415,6 +418,10 @@ private void walkInto(string base, string rel, ref RawFile[] files, ref size_t t
 	foreach (entry; listDir(here))
 	{
 		const childRel = rel.length ? rel ~ "/" ~ entry.name : entry.name;
+		// Without an include filter, dot-prefixed entries (.git/, .DS_Store) are
+		// skipped whole; a filter sees them and decides for itself.
+		if (include is null && entry.name.length && entry.name[0] == '.')
+			continue;
 		if (entry.isSymlink)
 			throw new Exception(
 					"registerSkillDir: symlinks are not allowed in a skill "
@@ -1055,6 +1062,60 @@ unittest  // registerSkillDir rejects a path whose final segment != frontmatter 
 	SkillDirOptions opts;
 	opts.path = "office/wrong-name";
 	assertThrown!Exception(registerSkillDir(s, root, opts));
+}
+
+version (unittest)
+{
+	import std.conv : text;
+
+	// The skill-relative paths of every file in the first listed skill's manifest.
+	private string[] manifestPaths(McpServer s) @safe
+	{
+		import std.algorithm : findSplitAfter;
+
+		string[] paths;
+		auto res = listedSkill(s, 99, 0)["resources"];
+		foreach (i; 0 .. res.length)
+			paths ~= res[i]["uri"].get!string.findSplitAfter("skill://pdf-forms/")[1];
+		return paths;
+	}
+}
+
+unittest  // dot-prefixed files and directories are skipped by default
+{
+	const root = tmpRoot("hidden", "pdf-forms");
+	writeSkillFixture(root);
+	scope (exit)
+		removeTree(root);
+	writeFile(root ~ "/.DS_Store", "junk");
+	writeNestedDir(root ~ "/.git");
+	writeFile(root ~ "/.git/config", "[core]\n");
+	writeFile(root ~ "/references/.hidden.md", "# Hidden\n");
+
+	auto s = new McpServer("t", "1");
+	registerSkillDir(s, root);
+	assert(manifestPaths(s) == ["SKILL.md", "references/FORMS.md"], manifestPaths(s).text);
+}
+
+unittest  // an include filter opts dot-prefixed paths back in
+{
+	import std.algorithm : canFind;
+
+	const root = tmpRoot("hidden-in", "pdf-forms");
+	writeSkillFixture(root);
+	scope (exit)
+		removeTree(root);
+	writeNestedDir(root ~ "/.config");
+	writeFile(root ~ "/.config/settings.json", "{}");
+	writeFile(root ~ "/.DS_Store", "junk");
+
+	auto s = new McpServer("t", "1");
+	SkillDirOptions opts;
+	opts.include = (string p) @safe => !p.canFind(".DS_Store");
+	registerSkillDir(s, root, opts);
+	assert(manifestPaths(s) == [
+		"SKILL.md", ".config/settings.json", "references/FORMS.md"
+	], manifestPaths(s).text);
 }
 
 unittest  // registerSkillDir rejects a directory whose name != frontmatter name
