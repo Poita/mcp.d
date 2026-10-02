@@ -2335,9 +2335,10 @@ final class McpServer : ServerCore
 		listCacheHints[listMethod] = nullable(hint);
 	}
 
-	/// Set the maximum number of items returned per `*/list` page
+	/// Set the maximum number of items returned per page of a paginated method
 	/// (server/utilities/pagination). When `size > 0`, `tools/list`,
-	/// `resources/list`, `resources/templates/list` and `prompts/list` return at
+	/// `resources/list`, `resources/templates/list`, `prompts/list`,
+	/// `resources/directory/read` and the Skills extension's `skills/list` return at
 	/// most `size` items per response and emit an opaque `nextCursor` whenever
 	/// more results remain; the client passes that cursor back as `params.cursor`
 	/// to fetch the next page (the bundled `McpClient` list helpers follow these
