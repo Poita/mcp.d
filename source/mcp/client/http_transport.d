@@ -1369,8 +1369,10 @@ final class HttpClientTransport : ClientTransport
 			}
 			break;
 		case MessageKind.errorResponse:
-			if (msg.id.type == Json.Type.int_
-					&& msg.id.get!long == expectId)
+			// A null-id error is one the server could not tie to a request id; on
+			// this request's stream it answers this request, as on a JSON body.
+			if ((msg.id.type == Json.Type.int_
+					&& msg.id.get!long == expectId) || msg.id.type == Json.Type.null_)
 				err = errorFrom(msg.error);
 			break;
 		case MessageKind.request:
@@ -4268,6 +4270,17 @@ unittest  // a JSON-RPC error body on a 5xx keeps its code alongside the HTTP st
 	auto h = cast(HttpStatusException) e;
 	assert(h !is null);
 	assert(h.status == 503 && h.code == -32001 && h.msg == "busy");
+}
+
+unittest  // a null-id JSON-RPC error on a request's SSE response stream fails that request with the error
+{
+	auto e = listToolsFailure((Json req, HTTPServerResponse res) @safe {
+		writeSse(res,
+			`data: {"jsonrpc":"2.0","id":null,"error":{"code":-32001,"message":"busy"}}` ~ "\n\n");
+	});
+	auto m = cast(McpException) e;
+	assert(m !is null);
+	assert(m.code == -32001 && m.msg == "busy", "got: " ~ m.msg);
 }
 
 unittest  // a 200 JSON body whose id does not match the request is rejected
