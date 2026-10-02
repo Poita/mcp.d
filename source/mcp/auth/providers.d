@@ -545,6 +545,7 @@ unittest  // resourceServer(JwtVerifierConfig) bundles validator + metadata in o
 unittest  // resourceServer omits authorizationServers when no issuer is pinned
 {
 	JwtVerifierConfig vc;
+	vc.allowAnyIssuer = true;
 	vc.audience = "api://x";
 	auto cfg = resourceServer(vc, mcpUrl);
 	assert(cfg.enabled);
