@@ -6,8 +6,8 @@
 /// reflected input schema advertises: a struct field is required unless it is
 /// `Nullable`, carries vibe's `@optional`, has a declared default (a
 /// `@schemaDefault` UDA or an initializer differing from its type's `.init`), or
-/// belongs to an `@allOptional` struct. An omitted optional field keeps its
-/// default. Struct fields are keyed by their serialized name (vibe's `@name`,
+/// belongs to an `@allOptional` struct. An omitted optional field takes its
+/// `@schemaDefault` value, else keeps its initializer. Struct fields are keyed by their serialized name (vibe's `@name`,
 /// else the field name with one trailing underscore stripped), and `@ignore`d
 /// fields are skipped. Enums are read by member name at any depth.
 module mcp.api.binding;
@@ -336,6 +336,7 @@ private JsonNode anyOfNode(JsonNode[] members...) pure
 /// `BindException` for a shape or value that does not fit `T`.
 package(mcp) T bindJson(T)(Json v, string path = "")
 {
+	import jsonschema.attributes : SchemaDefault;
 	import std.conv : to;
 	import std.sumtype : isSumType;
 
@@ -389,6 +390,10 @@ package(mcp) T bindJson(T)(Json v, string path = "")
 					auto p = key in v;
 					if (isPresent!FT(p))
 						setBound(__traits(getMember, result, field), bindJson!FT(*p, fieldPath));
+					else static if (hasUDA!(__traits(getMember, T, field), SchemaDefault))
+						setBound(__traits(getMember, result, field),
+								cast(FT) getUDAs!(__traits(getMember, T, field), SchemaDefault)[0]
+									.value);
 					else static if (isRequiredField!(T, field))
 						throw new BindException("missing required field '" ~ fieldPath
 								~ "' (to make it optional, declare it Nullable, mark it @optional, "
@@ -785,6 +790,22 @@ unittest  // a string-based enum field binds from its member name
 
 	assert(bindJson!S(parseJsonString(`{"shade":"dark"}`)).shade == Shade.dark);
 	assertThrown!BindException(bindJson!S(parseJsonString(`{"shade":"D"}`)));
+}
+
+unittest  // an omitted @schemaDefault field binds to the advertised default
+{
+	import jsonschema : schemaDefault;
+	import vibe.data.json : parseJsonString;
+
+	static struct S
+	{
+		@schemaDefault(10) int limit;
+		@schemaDefault(Shade.dark) Shade shade;
+	}
+
+	auto s = bindJson!S(parseJsonString(`{}`));
+	assert(s.limit == 10 && s.shade == Shade.dark);
+	assert(bindJson!S(parseJsonString(`{"limit":3}`)).limit == 3);
 }
 
 unittest  // bindString reads a string-based enum by member name
