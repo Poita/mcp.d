@@ -74,6 +74,14 @@ struct JwtVerifierConfig
 	/// (including this SDK's own token signer) emit. A token whose `typ` is
 	/// absent or not listed here is rejected; set this empty to disable the
 	/// check for legacy issuers.
+	///
+	/// Accepting `JWT` means `typ` alone cannot tell an access token from an OIDC
+	/// `id_token`, whose `aud` is the client id. The verifier therefore also
+	/// rejects any token carrying the id_token-only claims `nonce`, `at_hash` or
+	/// `c_hash`, but an id_token without them would still pass when `audience`
+	/// is a client id. Prefer `["at+jwt"]` for an issuer that emits RFC 9068
+	/// tokens, and never set `audience` to an OAuth client id that also receives
+	/// id_tokens from the same issuer.
 	string[] acceptedTokenTypes = ["at+jwt", "JWT"];
 
 	/// Leeway applied to `exp`/`nbf` to tolerate clock skew.
@@ -226,6 +234,14 @@ package TokenInfo validateClaims(JwtVerifierConfig cfg, Json payload, long now) 
 	}
 	else if (nbf.type != Json.Type.undefined)
 		return TokenInfo.invalid();
+
+	// Claims only an OIDC id_token carries. An id_token is typed `JWT` like many
+	// access tokens, and its `aud` is the client id, so without this check one
+	// could be replayed as an access token wherever the configured audience is
+	// that client id.
+	foreach (idTokenClaim; ["nonce", "at_hash", "c_hash"])
+		if (payload[idTokenClaim].type != Json.Type.undefined)
+			return TokenInfo.invalid();
 
 	if (cfg.issuer.length && jsonStr(payload, "iss") != cfg.issuer)
 		return TokenInfo.invalid();
@@ -1767,6 +1783,22 @@ unittest  // a token whose nbf is in the future is rejected (not-yet-valid)
 	auto payload = parseJsonString(`{"sub":"ec-user","exp":1700100000,"nbf":1700090000}`);
 	auto ti = validateClaims(cfg, payload, 1_700_001_000);
 	assert(!ti.valid);
+}
+
+unittest  // a token carrying OIDC id_token-only claims is rejected even when typ is JWT
+{
+	JwtVerifierConfig cfg;
+	cfg.audience = "client-123";
+	foreach (claim; [
+		`"nonce":"n-0S6_WzA2Mj"`, `"at_hash":"77QmUPtjPfzWtF2AnpK9RQ"`,
+		`"c_hash":"LDktKdoQak3Pk0cnXxCltA"`
+	])
+	{
+		auto payload = parseJsonString(`{"aud":"client-123","exp":1700100000,` ~ claim ~ `}`);
+		assert(!validateClaims(cfg, payload, 1_700_001_000).valid, claim);
+	}
+	auto plain = parseJsonString(`{"aud":"client-123","exp":1700100000}`);
+	assert(validateClaims(cfg, plain, 1_700_001_000).valid);
 }
 
 unittest  // a non-numeric nbf is rejected rather than skipping the not-before check
