@@ -363,14 +363,17 @@ void mountOAuthProxy(URLRouter router, OAuthProxy proxy) @safe
 
 /// Mount the RFC 8414 Authorization Server Metadata and RFC 9728 Protected
 /// Resource Metadata well-known documents. The proxy advertises ITSELF as the
-/// AS, so these live at the proxy's own well-known paths.
+/// AS, so these live at the proxy's own well-known paths. The AS metadata path
+/// is derived from the issuer (`OAuthProxyConfig.baseUrl`) as RFC 8414 §3.1
+/// requires: an issuer with a path component (`https://host/auth`) is served at
+/// `/.well-known/oauth-authorization-server/auth`.
 ///
 /// Both documents are public and carry no credentials, so they are served with
 /// `Access-Control-Allow-Origin: *` and a CORS preflight is answered, letting a
 /// browser-based MCP client discover the proxy from another origin.
 void mountOAuthMetadata(URLRouter router, OAuthProxy proxy) @safe
 {
-	enum asPath = "/.well-known/oauth-authorization-server";
+	const asPath = authServerMetadataPath(proxy.config().baseUrl);
 	enum prmPath = "/.well-known/oauth-protected-resource";
 
 	router.get(asPath, (HTTPServerRequest req, HTTPServerResponse res) @safe {
@@ -394,6 +397,16 @@ void mountOAuthMetadata(URLRouter router, OAuthProxy proxy) @safe
 			res.statusCode = HTTPStatus.noContent;
 			res.writeVoidBody();
 		});
+}
+
+/// The RFC 8414 §3.1 well-known path of the AS metadata for `issuer`: the
+/// well-known suffix inserted between the host and the issuer's path.
+private string authServerMetadataPath(string issuer) @safe
+{
+	auto path = pathOf(issuer);
+	while (path.length > 1 && path[$ - 1] == '/')
+		path = path[0 .. $ - 1];
+	return "/.well-known/oauth-authorization-server" ~ (path == "/" ? "" : path);
 }
 
 private void setMetadataCorsHeaders(scope HTTPServerResponse res) @safe
@@ -2309,6 +2322,41 @@ unittest  // COMPOSE: the per-route helpers reproduce the AS-metadata leg
 
 	assert(res.statusCode == 200);
 	assert(body_.canFind("authorization_endpoint"));
+}
+
+unittest  // an issuer with a path serves its AS metadata at the RFC 8414 path-inserted URL
+{
+	import std.algorithm : canFind;
+	import vibe.http.server : createTestHTTPServerRequest,
+		createTestHTTPServerResponse, TestHTTPResponseMode;
+	import vibe.inet.url : URL;
+	import vibe.stream.memory : createMemoryOutputStream;
+	import mcp.auth.oauth : authServerMetadataCandidates;
+
+	OAuthProxyConfig cfg;
+	cfg.upstreamAuthorizationEndpoint = "https://github.com/login/oauth/authorize";
+	cfg.upstreamTokenEndpoint = "https://github.com/login/oauth/access_token";
+	cfg.upstreamClientId = "Iv1.upstream";
+	cfg.baseUrl = "https://mcp.example.com/auth/";
+	cfg.resource = "https://mcp.example.com/mcp";
+	auto proxy = new OAuthProxy(cfg);
+	auto router = new URLRouter;
+	mountOAuthMetadata(router, proxy);
+
+	string bodyOf(string url)
+	{
+		auto sink = createMemoryOutputStream();
+		auto req = createTestHTTPServerRequest(URL(url));
+		auto res = createTestHTTPServerResponse(sink, null, TestHTTPResponseMode.bodyOnly);
+		router.handleRequest(req, res);
+		return () @trusted { return cast(string) sink.data.idup; }();
+	}
+
+	// The URL an RFC 8414 client derives from the issuer is the one served.
+	const discovered = authServerMetadataCandidates(proxy.metadataJson()["issuer"].get!string)[0];
+	assert(discovered == "https://mcp.example.com/.well-known/oauth-authorization-server/auth");
+	assert(bodyOf(discovered).canFind(`"issuer":"https://mcp.example.com/auth"`));
+	assert(bodyOf("https://mcp.example.com/.well-known/oauth-authorization-server").length == 0);
 }
 
 unittest  // CORS: the well-known metadata documents are readable cross-origin
