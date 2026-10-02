@@ -178,6 +178,16 @@ final class MemoryTokenStore : TokenStore
 	}
 }
 
+version (Posix)
+{
+	// BSD `flock(2)`, available on Linux, macOS and the BSDs. Unlike `fcntl`
+	// record locks it belongs to the open file description, so it also excludes
+	// another thread of this process that opened the lock file separately.
+	private extern (C) int flock(int fd, int operation) nothrow @nogc @system;
+	private enum int LOCK_EX = 2;
+	private enum int LOCK_UN = 8;
+}
+
 /// A file-backed `TokenStore`. Tokens for all resources are stored as a single
 /// JSON object (`{ "<resource>": { ... } }`) at `path`.
 ///
@@ -185,6 +195,11 @@ final class MemoryTokenStore : TokenStore
 /// the JSON blob at rest (e.g. with a key from the OS keychain). The plaintext
 /// implementation writes the file with owner-only (`0600`) permissions on
 /// POSIX.
+///
+/// `save` holds an exclusive advisory lock on the sidecar file `path ~ ".lock"`
+/// across its read-modify-write, so several processes sharing one token file
+/// (for example two MCP clients refreshing at once) never drop each other's
+/// tokens.
 class FileTokenStore : TokenStore
 {
 	/// The on-disk path of the token file.
@@ -270,22 +285,86 @@ class FileTokenStore : TokenStore
 			restrictDirPermissions(dir);
 		}
 
-		bool corrupt;
-		auto all = tryReadMap(corrupt);
-		// Do not silently overwrite an unparseable token file: preserve its bytes
-		// alongside (path~) so any recoverable tokens for other resources are not
-		// destroyed by this save.
-		if (corrupt)
-			() @trusted {
-			try
-				rename(path, path ~ "~");
-			catch (Exception)
-			{
-			}
-		}();
-		all[resource] = token.toJson();
-		auto bytes = serialize(all);
-		writeSecretFile(bytes);
+		withFileLock(() @safe {
+			bool corrupt;
+			auto all = tryReadMap(corrupt);
+			// Do not silently overwrite an unparseable token file: preserve its bytes
+			// alongside (path~) so any recoverable tokens for other resources are not
+			// destroyed by this save.
+			if (corrupt)
+				() @trusted {
+				try
+					rename(path, path ~ "~");
+				catch (Exception)
+				{
+				}
+			}();
+			all[resource] = token.toJson();
+			auto bytes = serialize(all);
+			writeSecretFile(bytes);
+		});
+	}
+
+	/// Run `fn` holding an exclusive advisory lock on the sidecar file
+	/// `path ~ ".lock"`, so processes (and threads) sharing the token file
+	/// serialize their read-modify-write and none loses another's update. The
+	/// token file itself is replaced by rename, so it cannot carry the lock.
+	private void withFileLock(scope void delegate() @safe fn) @safe
+	{
+		if (!path.length)
+			return fn();
+		const lockPath = path ~ ".lock";
+		version (Posix)
+		{
+			import core.stdc.errno : EINTR, errno;
+			import core.sys.posix.fcntl : open, O_CREAT, O_RDWR;
+			import core.sys.posix.unistd : close;
+			import std.string : toStringz;
+
+			const fd = () @trusted {
+				return open(lockPath.toStringz, O_CREAT | O_RDWR, 384); // 0600
+			}();
+			if (fd < 0)
+				throw internalError("FileTokenStore: could not open lock file " ~ lockPath);
+			// Closing the descriptor releases the lock.
+			scope (exit)
+				() @trusted { close(fd); }();
+			int rc;
+			do
+				rc = () @trusted { return flock(fd, LOCK_EX); }();
+			while (rc != 0 && (()@trusted => errno)() == EINTR);
+			if (rc != 0)
+				throw internalError("FileTokenStore: could not lock " ~ lockPath);
+			fn();
+		}
+		else version (Windows)
+		{
+			import core.sys.windows.windows : CloseHandle, CreateFileW,
+				FILE_ATTRIBUTE_NORMAL, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+				GENERIC_READ, GENERIC_WRITE, INVALID_HANDLE_VALUE,
+				LOCKFILE_EXCLUSIVE_LOCK, LockFileEx, OPEN_ALWAYS, OVERLAPPED, UnlockFileEx;
+			import std.utf : toUTF16z;
+
+			auto h = () @trusted {
+				return CreateFileW(lockPath.toUTF16z, GENERIC_READ | GENERIC_WRITE,
+						FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+						null, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, null);
+			}();
+			if (h == INVALID_HANDLE_VALUE)
+				throw internalError("FileTokenStore: could not open lock file " ~ lockPath);
+			scope (exit)
+				() @trusted { CloseHandle(h); }();
+			OVERLAPPED ov;
+			if (!()@trusted {
+					return LockFileEx(h, LOCKFILE_EXCLUSIVE_LOCK, 0, 1, 0, &ov);
+				}())
+				throw internalError("FileTokenStore: could not lock " ~ lockPath);
+			scope (exit)
+				() @trusted { UnlockFileEx(h, 0, 1, 0, &ov); }();
+			fn();
+		}
+		else
+			fn();
 	}
 
 	/// Persist `bytes` to `path` such that the plaintext secrets they contain are
@@ -2113,8 +2192,9 @@ version (Posix) unittest  // FileTokenStore.save does not chmod CWD when path ha
 	auto bare = "mcp-bare-token-" ~ Clock.currTime().toUnixTime().to!string ~ ".json";
 	scope (exit)
 	{
-		if (bare.exists)
-			remove(bare);
+		foreach (f; [bare, bare ~ ".lock"])
+			if (f.exists)
+				remove(f);
 	}
 
 	auto store = new FileTokenStore(bare);
@@ -2670,6 +2750,51 @@ version (Posix) unittest  // save() throws a typed error when the token director
 		threw = true;
 	assert(threw,
 			"save must surface a directory-creation failure rather than silently dropping the token");
+}
+
+version (Posix) @system unittest  // save() waits for the token file's lock, so concurrent writers never lose updates
+{
+	import core.atomic : atomicLoad, atomicStore;
+	import core.sys.posix.fcntl : open, O_CREAT, O_RDWR;
+	import core.sys.posix.unistd : close;
+	import core.thread : Thread;
+	import core.time : msecs;
+	import std.conv : to;
+	import std.datetime.systime : Clock;
+	import std.file : tempDir, mkdirRecurse, rmdirRecurse;
+	import std.path : buildPath;
+	import std.string : toStringz;
+
+	auto root = buildPath(tempDir, "mcp-login-lock-" ~ Clock.currTime().stdTime.to!string);
+	mkdirRecurse(root);
+	scope (exit)
+		() @trusted { rmdirRecurse(root); }();
+	auto file = buildPath(root, "tokens.json");
+
+	// Another process holds the lock mid read-modify-write.
+	const fd = () @trusted {
+		return open((file ~ ".lock").toStringz, O_CREAT | O_RDWR, 384);
+	}();
+	assert(fd >= 0);
+	assert(() @trusted { return flock(fd, LOCK_EX); }() == 0);
+
+	shared bool saved;
+	auto writer = new Thread(() {
+		auto store = new FileTokenStore(file);
+		StoredToken t;
+		t.accessToken = "from-writer";
+		store.save("https://b.example.com", t);
+		atomicStore(saved, true);
+	});
+	writer.start();
+	Thread.sleep(300.msecs);
+	assert(!atomicLoad(saved), "save must wait for the lock");
+
+	assert(() @trusted { return flock(fd, LOCK_UN); }() == 0);
+	assert(() @trusted { return close(fd); }() == 0);
+	writer.join();
+	assert(atomicLoad(saved));
+	assert(new FileTokenStore(file).load("https://b.example.com").accessToken == "from-writer");
 }
 
 version (Posix) unittest  // save() backs up an unparseable token file instead of silently destroying it
