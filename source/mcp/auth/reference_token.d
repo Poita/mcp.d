@@ -106,6 +106,16 @@ final class ReferenceTokenStore
 		return lookup(token, now());
 	}
 
+	/// Revoke `token` (e.g. at sign-out or on an RFC 7009 revocation request),
+	/// so it no longer resolves. Returns whether the store held it.
+	bool revoke(string token) @safe
+	{
+		if (!tokens.remove(token))
+			return false;
+		compactOrder();
+		return true;
+	}
+
 	/// The number of tokens currently held, including any expired ones not yet
 	/// swept.
 	size_t length() const @safe
@@ -219,6 +229,22 @@ private long nowUnixSeconds() @safe
 
 	auto validate = referenceTokenValidator(store, "https://api.example.com");
 	assert(!validate(tok).valid);
+}
+
+@safe unittest  // a revoked token no longer resolves or validates
+{
+	auto store = new ReferenceTokenStore();
+	IssuedToken t;
+	t.subject = "alice";
+	t.expiresAt = long.max;
+	const tok = store.issue(t);
+	const other = store.issue(t);
+
+	assert(store.revoke(tok));
+	assert(store.lookup(tok).isNull);
+	assert(!referenceTokenValidator(store, "https://api.example.com")(tok).valid);
+	assert(!store.revoke(tok), "revoking an unknown token reports nothing removed");
+	assert(!store.lookup(other).isNull);
 }
 
 @safe unittest  // referenceTokenValidator binds an audience-less token to the resource
