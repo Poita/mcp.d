@@ -172,10 +172,13 @@ string readBoundedBody(S)(S stream, size_t cap, out bool truncated) @trusted
 	return cast(string) buf;
 }
 
-/// Map an HTTP status to its delivery-error category.
+/// Map a non-2xx HTTP status to its delivery-error category. Only a 5xx is a
+/// server-side failure; any other final status — a 4xx, a redirect (deliveries
+/// never follow one), or a stray 1xx — means the endpoint is misconfigured for
+/// receiving deliveries, which the wire's `http_4xx` category reports.
 DeliveryErrorCategory categoryForStatus(int status) @safe pure nothrow @nogc
 {
-	return (status / 100 == 4) ? DeliveryErrorCategory.http4xx : DeliveryErrorCategory.http5xx;
+	return (status / 100 == 5) ? DeliveryErrorCategory.http5xx : DeliveryErrorCategory.http4xx;
 }
 
 /// Best-effort classification of a connector exception message into a category.
@@ -481,6 +484,14 @@ unittest  // categoryForStatus splits 4xx and 5xx
 {
 	assert(categoryForStatus(404) == DeliveryErrorCategory.http4xx);
 	assert(categoryForStatus(503) == DeliveryErrorCategory.http5xx);
+}
+
+unittest  // categoryForStatus reports a redirect or informational final status as http4xx
+{
+	assert(categoryForStatus(301) == DeliveryErrorCategory.http4xx);
+	assert(categoryForStatus(307) == DeliveryErrorCategory.http4xx);
+	assert(categoryForStatus(101) == DeliveryErrorCategory.http4xx);
+	assert(categoryForStatus(500) == DeliveryErrorCategory.http5xx);
 }
 
 unittest  // categoryForException classifies common failures
