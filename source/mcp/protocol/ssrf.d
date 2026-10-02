@@ -965,7 +965,8 @@ private void fetchPinned(string url, SsrfPolicy policy,
 {
 	import mcp.protocol.errors : invalidRequest;
 	import vibe.inet.url : URL;
-	import vibe.http.client : requestHTTP, HTTPClientSettings;
+	import vibe.http.client : HTTPClient, HTTPClientSettings;
+	import vibe.http.internal.basic_auth_client : addBasicAuth;
 
 	string scheme, host;
 	try
@@ -1024,18 +1025,29 @@ private void fetchPinned(string url, SsrfPolicy policy,
 		settings.readTimeout = options.timeout;
 	}
 
-	// vibe derives the Host header from u.host; restore the original host so the
-	// server sees the intended virtual host, not the pinned IP.
+	// Restore the original host so the server sees the intended virtual host,
+	// not the pinned IP.
 	string hostHeader = buildHostHeader(originalHost, u.port, u.defaultPort);
 
-	requestHTTP(u, (scope HTTPClientRequest req) {
+	// A dedicated connection per request rather than vibe's shared pool: the
+	// pool is keyed by host and port only, so a connection opened under one
+	// TLS trust setting (e.g. insecureSkipVerify) would otherwise be handed to
+	// a later request that expects full certificate verification.
+	auto client = new HTTPClient;
+	client.connect(u.host, u.port, tls, settings);
+	scope (exit)
+		client.disconnect();
+	client.request((scope HTTPClientRequest req) {
+		req.requestURL = u.localURI;
 		req.headers["Host"] = hostHeader;
+		if (u.username.length)
+			req.addBasicAuth(u.username, u.password);
 		if (requester !is null)
 			requester(req);
 	}, (scope HTTPClientResponse res) {
 		if (responder !is null)
 			responder(res);
-	}, settings);
+	});
 }
 
 /// Build the RFC 7230 §5.4 Host header value from a bare host string (as
@@ -1757,4 +1769,32 @@ unittest  // secureRequestHTTP skips certificate verification only when insecure
 		status = res.statusCode;
 	}, opts);
 	assert(status == 200);
+}
+
+unittest  // a connection opened with insecureSkipVerify is never reused by a verifying request
+{
+	import std.conv : to;
+
+	auto listener = startSelfSignedTlsServer();
+	scope (exit)
+		() @trusted { listener.stopListening(); }();
+	const url = "https://127.0.0.1:" ~ listener.bindAddresses[0].port.to!string ~ "/";
+
+	FetchOptions insecure;
+	insecure.tls.insecureSkipVerify = true;
+	int status;
+	secureRequestHTTP(url, SsrfPolicy.allowUserConfigured, null, (scope HTTPClientResponse res) {
+		status = res.statusCode;
+	}, insecure);
+	assert(status == 200);
+
+	bool reached;
+	try
+		secureRequestHTTP(url, SsrfPolicy.allowUserConfigured, null, (scope HTTPClientResponse res) {
+			reached = true;
+		});
+	catch (Exception)
+	{
+	}
+	assert(!reached, "a verifying request must not ride an unverified pooled connection");
 }
