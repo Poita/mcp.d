@@ -40,7 +40,10 @@ struct StreamableHttpOptions
 	/// the server with a trusted reverse proxy.
 	bool validateOrigin = true;
 	string[] allowedHosts = []; /// extra Host header values to accept
-	string[] allowedOrigins = []; /// extra Origin header values to accept
+	/// Extra Origin header values to accept. Requests from these origins, and
+	/// from localhost origins, get CORS headers (and their `OPTIONS` preflights
+	/// are answered) so browser-based clients can reach the endpoint.
+	string[] allowedOrigins = [];
 
 	/// OAuth 2.1 Resource Server enforcement (basic/authorization). When
 	/// `auth.validator` is set, every MCP request must present a valid
@@ -216,6 +219,7 @@ void mountMcp(URLRouter router, McpServer server,
 		});
 	}
 
+	mountCorsPreflight(router, opts.path, "POST, GET, DELETE", opts);
 	router.post(opts.path, (HTTPServerRequest req, HTTPServerResponse res) @safe {
 		if (!guardOrigin(req, res, opts))
 			return;
@@ -321,6 +325,8 @@ void mountLegacyHttpSse(URLRouter router, McpServer server,
 {
 	auto channel = new LegacySseChannel(opts.legacyMessagePath);
 	channel.coord.requestTimeout = opts.serverRequestTimeout;
+	mountCorsPreflight(router, opts.legacySsePath, "GET", opts);
+	mountCorsPreflight(router, opts.legacyMessagePath, "POST", opts);
 
 	router.get(opts.legacySsePath, (HTTPServerRequest req, HTTPServerResponse res) @safe {
 		if (!guardOrigin(req, res, opts))
@@ -842,32 +848,92 @@ string formatLegacyMessageEventRaw(string jsonText) @safe
 	return "event: message\ndata: " ~ jsonText ~ "\n\n";
 }
 
-/// Enforce DNS-rebinding protection. Returns true if the request may proceed;
+/// Enforce DNS-rebinding protection. Returns true if the request may proceed,
+/// with the CORS headers for an allowed cross-origin caller already set;
 /// otherwise writes a `403 Forbidden` and returns false.
 private bool guardOrigin(scope HTTPServerRequest req, scope HTTPServerResponse res,
 		StreamableHttpOptions opts) @safe
 {
-	if (!opts.validateOrigin)
-		return true;
-
-	const host = req.headers.get("Host", "");
-	const origin = req.headers.get("Origin", "");
-
-	// HTTP/1.1 mandates a Host header; an absent (or disallowed) Host is rejected
-	// so a request carrying neither Host nor Origin cannot fall through the guard.
-	if (!hostAllowed(host, opts.allowedHosts))
+	if (opts.validateOrigin)
 	{
-		res.statusCode = HTTPStatus.forbidden;
-		res.writeBody("Forbidden: Host not allowed", "text/plain");
-		return false;
+		const host = req.headers.get("Host", "");
+		const origin = req.headers.get("Origin", "");
+
+		// HTTP/1.1 mandates a Host header; an absent (or disallowed) Host is rejected
+		// so a request carrying neither Host nor Origin cannot fall through the guard.
+		if (!hostAllowed(host, opts.allowedHosts))
+		{
+			res.statusCode = HTTPStatus.forbidden;
+			res.writeBody("Forbidden: Host not allowed", "text/plain");
+			return false;
+		}
+		if (origin.length && !originAllowed(origin, opts.allowedOrigins))
+		{
+			res.statusCode = HTTPStatus.forbidden;
+			res.writeBody("Forbidden: Origin not allowed", "text/plain");
+			return false;
+		}
 	}
-	if (origin.length && !originAllowed(origin, opts.allowedOrigins))
-	{
-		res.statusCode = HTTPStatus.forbidden;
-		res.writeBody("Forbidden: Origin not allowed", "text/plain");
-		return false;
-	}
+	applyCorsHeaders(req, res, opts);
 	return true;
+}
+
+/// The request's `Origin` when it is one the mount admits for cross-origin
+/// access (localhost or `opts.allowedOrigins`), else "".
+private string corsOrigin(scope HTTPServerRequest req, StreamableHttpOptions opts) @safe
+{
+	const origin = req.headers.get("Origin", "");
+	return origin.length && originAllowed(origin, opts.allowedOrigins) ? origin : "";
+}
+
+/// Let a browser page on an admitted origin read the response, including the
+/// `Mcp-Session-Id` it must echo and the `WWW-Authenticate` challenge that
+/// starts authorization. Responses to any other origin carry no CORS headers.
+private void applyCorsHeaders(scope HTTPServerRequest req,
+		scope HTTPServerResponse res, StreamableHttpOptions opts) @safe
+{
+	const origin = corsOrigin(req, opts);
+	if (origin.length == 0)
+		return;
+	res.headers["Access-Control-Allow-Origin"] = origin;
+	res.headers["Access-Control-Expose-Headers"]
+		= "Mcp-Session-Id, MCP-Protocol-Version, WWW-Authenticate";
+	res.headers["Vary"] = "Origin";
+}
+
+/// Answer CORS preflight (`OPTIONS`) requests for `path` from admitted origins,
+/// allowing `methods` and the MCP request headers. A preflight from any other
+/// origin, or for a disallowed Host, is left unhandled.
+private void mountCorsPreflight(URLRouter router, string path, string methods,
+		StreamableHttpOptions opts) @safe
+{
+	router.match(HTTPMethod.OPTIONS, path, (HTTPServerRequest req, HTTPServerResponse res) @safe {
+		import std.algorithm : splitter, startsWith;
+		import std.string : strip, toLower;
+
+		if (opts.validateOrigin && !hostAllowed(req.headers.get("Host", ""), opts.allowedHosts))
+			return;
+		const origin = corsOrigin(req, opts);
+		if (origin.length == 0)
+			return;
+		// Tool parameters mirrored into `Mcp-Param-*` headers have per-tool names,
+		// so the ones the browser asks for are admitted alongside the fixed set.
+		string allowed = "Content-Type, Accept, Authorization, Mcp-Session-Id, "
+			~ "MCP-Protocol-Version, Last-Event-ID, Mcp-Method, Mcp-Name";
+		foreach (h; req.headers.get("Access-Control-Request-Headers", "").splitter(','))
+		{
+			const name = h.strip;
+			if (name.toLower.startsWith("mcp-param-"))
+				allowed ~= ", " ~ name;
+		}
+		res.headers["Access-Control-Allow-Origin"] = origin;
+		res.headers["Access-Control-Allow-Methods"] = methods;
+		res.headers["Access-Control-Allow-Headers"] = allowed;
+		res.headers["Access-Control-Max-Age"] = "600";
+		res.headers["Vary"] = "Origin";
+		res.statusCode = HTTPStatus.noContent;
+		res.writeVoidBody();
+	});
 }
 
 /// Enforce OAuth 2.1 Resource Server authorization (basic/authorization). When
@@ -4805,4 +4871,100 @@ unittest  // closing a legacy GET stream fails the server->client request awaiti
 	assert(failed);
 	assert(MonoTime.currTime - started < 5.seconds,
 			"the waiter must fail promptly once its stream closes");
+}
+
+version (unittest) private HTTPServerResponse corsRequest(URLRouter router,
+		HTTPMethod method, string[string] headers, string body_ = "") @safe
+{
+	import vibe.http.server : createTestHTTPServerRequest,
+		createTestHTTPServerResponse, TestHTTPResponseMode;
+	import vibe.inet.url : URL;
+	import vibe.stream.memory : createMemoryStream, createMemoryOutputStream;
+
+	auto buf = () @trusted { return cast(ubyte[]) body_.dup; }();
+	auto req = createTestHTTPServerRequest(URL("http://127.0.0.1/mcp"), method,
+			createMemoryStream(buf, false));
+	req.headers["Host"] = "127.0.0.1";
+	foreach (k, v; headers)
+		req.headers[k] = v;
+	auto res = createTestHTTPServerResponse(createMemoryOutputStream(), null,
+			TestHTTPResponseMode.bodyOnly);
+	router.handleRequest(req, res);
+	return res;
+}
+
+unittest  // CORS: a preflight from an allowed origin is answered with the MCP methods and headers
+{
+	import std.algorithm : canFind;
+
+	auto server = McpServer.stateful("t", "1");
+	auto router = new URLRouter;
+	StreamableHttpOptions opts;
+	opts.allowedOrigins = ["https://app.example.com"];
+	mountMcp(router, server, opts);
+
+	auto res = corsRequest(router, HTTPMethod.OPTIONS,
+			[
+				"Origin": "https://app.example.com",
+				"Access-Control-Request-Method": "POST",
+				"Access-Control-Request-Headers": "content-type, mcp-session-id, mcp-param-city",
+	]);
+	assert(res.statusCode == 204);
+	assert(res.headers.get("Access-Control-Allow-Origin", "") == "https://app.example.com");
+	const methods = res.headers.get("Access-Control-Allow-Methods", "");
+	assert(methods.canFind("POST") && methods.canFind("GET") && methods.canFind("DELETE"));
+	const allowed = res.headers.get("Access-Control-Allow-Headers", "");
+	foreach (h; [
+		"Content-Type", "Mcp-Session-Id", "MCP-Protocol-Version",
+		"Authorization", "Last-Event-ID", "mcp-param-city"
+	])
+		assert(allowed.canFind(h), allowed);
+	assert(res.headers.get("Vary", "").canFind("Origin"));
+}
+
+unittest  // CORS: a response to an allowed origin exposes Mcp-Session-Id and WWW-Authenticate
+{
+	import std.algorithm : canFind;
+
+	auto server = McpServer.stateful("t", "1");
+	auto router = new URLRouter;
+	StreamableHttpOptions opts;
+	opts.allowedOrigins = ["https://app.example.com"];
+	mountMcp(router, server, opts);
+
+	auto res = corsRequest(router, HTTPMethod.POST, [
+		"Origin": "https://app.example.com",
+		"Content-Type": "application/json",
+		"Accept": "application/json, text/event-stream",
+	], initializeBody());
+	assert(res.statusCode == 200);
+	assert(res.headers.get("Access-Control-Allow-Origin", "") == "https://app.example.com");
+	const exposed = res.headers.get("Access-Control-Expose-Headers", "");
+	assert(exposed.canFind("Mcp-Session-Id") && exposed.canFind("WWW-Authenticate"));
+	assert(res.headers.get("Vary", "").canFind("Origin"));
+}
+
+unittest  // CORS: disallowed and absent origins get no CORS headers and no preflight
+{
+	auto server = McpServer.stateful("t", "1");
+	auto router = new URLRouter;
+	StreamableHttpOptions opts;
+	opts.allowedOrigins = ["https://app.example.com"];
+	mountMcp(router, server, opts);
+
+	auto foreign = corsRequest(router, HTTPMethod.OPTIONS,
+			[
+				"Origin": "https://evil.example.com",
+				"Access-Control-Request-Method": "POST",
+	]);
+	assert("Access-Control-Allow-Origin" !in foreign.headers);
+	assert(foreign.statusCode != 204);
+
+	auto none = corsRequest(router, HTTPMethod.POST, [
+		"Content-Type": "application/json",
+		"Accept": "application/json, text/event-stream",
+	], initializeBody());
+	assert(none.statusCode == 200);
+	assert("Access-Control-Allow-Origin" !in none.headers);
+	assert("Access-Control-Expose-Headers" !in none.headers);
 }
