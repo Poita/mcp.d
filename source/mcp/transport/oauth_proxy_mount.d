@@ -10,8 +10,6 @@
 ///
 ///   * `GET  /.well-known/oauth-authorization-server` — RFC 8414 AS metadata
 ///     (`proxy.metadataJson`), advertising the proxy's own endpoints + PKCE S256.
-///   * `GET  /.well-known/oauth-protected-resource` — RFC 9728 PRM document
-///     (`proxy.resourceMetadata.toJson`).
 ///   * `POST /register` — RFC 7591 DCR, echoing the request's `redirect_uris`
 ///     and handing back the fixed upstream `client_id` (`proxy.register`).
 ///   * `GET  /authorize` — gated on the confused-deputy consent MUST: persists
@@ -44,6 +42,10 @@
 /// The pure relay helpers (`buildClientCallbackRedirect`, `redirectUrisFrom`,
 /// `ProxyStateStore`, `consentScreenHtml`) carry no HTTP state and are unit-tested
 /// directly; the `mountOAuthProxy` wiring threads them onto the router.
+///
+/// The RFC 9728 Protected Resource Metadata document belongs to the protected
+/// MCP endpoint, not the AS: `mountMcp` serves it when given
+/// `OAuthProxyConfig.toResourceServer()` as `StreamableHttpOptions.auth`.
 module mcp.transport.oauth_proxy_mount;
 
 import std.string : startsWith, indexOf;
@@ -343,7 +345,7 @@ private string mintState() @safe
 // ===========================================================================
 
 /// Mount the full client-facing OAuth surface of an `OAuthProxy` onto a vibe.d
-/// `URLRouter`. Registers the AS-metadata + PRM well-known documents, the RFC
+/// `URLRouter`. Registers the AS-metadata well-known document, the RFC
 /// 7591 `/register` endpoint, the `/authorize` -> upstream redirect (persisting
 /// the client's dynamic redirect URI), the fixed callback that relays the
 /// upstream code back to the client, and the `/token` endpoint that exchanges the
@@ -361,20 +363,18 @@ void mountOAuthProxy(URLRouter router, OAuthProxy proxy) @safe
 	mountOAuthToken(router, proxy);
 }
 
-/// Mount the RFC 8414 Authorization Server Metadata and RFC 9728 Protected
-/// Resource Metadata well-known documents. The proxy advertises ITSELF as the
-/// AS, so these live at the proxy's own well-known paths. The AS metadata path
-/// is derived from the issuer (`OAuthProxyConfig.baseUrl`) as RFC 8414 §3.1
+/// Mount the RFC 8414 Authorization Server Metadata well-known document. The
+/// proxy advertises ITSELF as the AS, so it lives at the proxy's own well-known
+/// path, derived from the issuer (`OAuthProxyConfig.baseUrl`) as RFC 8414 §3.1
 /// requires: an issuer with a path component (`https://host/auth`) is served at
 /// `/.well-known/oauth-authorization-server/auth`.
 ///
-/// Both documents are public and carry no credentials, so they are served with
+/// The document is public and carries no credentials, so it is served with
 /// `Access-Control-Allow-Origin: *` and a CORS preflight is answered, letting a
 /// browser-based MCP client discover the proxy from another origin.
 void mountOAuthMetadata(URLRouter router, OAuthProxy proxy) @safe
 {
 	const asPath = authServerMetadataPath(proxy.config().baseUrl);
-	enum prmPath = "/.well-known/oauth-protected-resource";
 
 	router.get(asPath, (HTTPServerRequest req, HTTPServerResponse res) @safe {
 		setMetadataCorsHeaders(res);
@@ -382,21 +382,13 @@ void mountOAuthMetadata(URLRouter router, OAuthProxy proxy) @safe
 		res.writeJsonBody(proxy.metadataJson());
 	});
 
-	router.get(prmPath, (HTTPServerRequest req, HTTPServerResponse res) @safe {
+	router.match(HTTPMethod.OPTIONS, asPath, (HTTPServerRequest req, HTTPServerResponse res) @safe {
 		setMetadataCorsHeaders(res);
-		res.statusCode = HTTPStatus.ok;
-		res.writeJsonBody(proxy.resourceMetadata().toJson());
+		res.headers["Access-Control-Allow-Methods"] = "GET, OPTIONS";
+		res.headers["Access-Control-Max-Age"] = "86400";
+		res.statusCode = HTTPStatus.noContent;
+		res.writeVoidBody();
 	});
-
-	foreach (path; [asPath, prmPath])
-		router.match(HTTPMethod.OPTIONS, path, (HTTPServerRequest req,
-				HTTPServerResponse res) @safe {
-			setMetadataCorsHeaders(res);
-			res.headers["Access-Control-Allow-Methods"] = "GET, OPTIONS";
-			res.headers["Access-Control-Max-Age"] = "86400";
-			res.statusCode = HTTPStatus.noContent;
-			res.writeVoidBody();
-		});
 }
 
 /// The RFC 8414 §3.1 well-known path of the AS metadata for `issuer`: the
@@ -2327,6 +2319,42 @@ unittest  // COMPOSE: the per-route helpers reproduce the AS-metadata leg
 	assert(body_.canFind("authorization_endpoint"));
 }
 
+unittest  // with the proxy and an authenticated MCP mount, the MCP mount alone serves the PRM document
+{
+	import std.algorithm : canFind;
+	import vibe.http.common : HTTPMethod;
+	import vibe.http.server : createTestHTTPServerRequest,
+		createTestHTTPServerResponse, TestHTTPResponseMode;
+	import vibe.inet.url : URL;
+	import vibe.stream.memory : createMemoryOutputStream;
+	import mcp.server.server : McpServer;
+	import mcp.transport.streamable_http : mountMcp, StreamableHttpOptions;
+
+	OAuthProxyConfig cfg;
+	cfg.upstreamAuthorizationEndpoint = "https://github.com/login/oauth/authorize";
+	cfg.upstreamTokenEndpoint = "https://github.com/login/oauth/access_token";
+	cfg.upstreamClientId = "Iv1.upstream";
+	cfg.baseUrl = "https://mcp.example.com";
+	cfg.resource = "https://mcp.example.com/mcp";
+	auto router = new URLRouter;
+	mountOAuthProxy(router, new OAuthProxy(cfg));
+	StreamableHttpOptions opts;
+	opts.auth = cfg.toResourceServer();
+	mountMcp(router, McpServer.stateless("t", "1"), opts);
+
+	auto req = createTestHTTPServerRequest(
+			URL("https://mcp.example.com/.well-known/oauth-protected-resource"), HTTPMethod.OPTIONS);
+	req.headers["Origin"] = "https://app.example.com";
+	req.headers["Access-Control-Request-Method"] = "GET";
+	req.headers["Access-Control-Request-Headers"] = "MCP-Protocol-Version";
+	auto res = createTestHTTPServerResponse(createMemoryOutputStream(), null,
+			TestHTTPResponseMode.bodyOnly);
+	router.handleRequest(req, res);
+	assert(res.statusCode == 204);
+	assert(res.headers.get("Access-Control-Allow-Headers", "").canFind("MCP-Protocol-Version"),
+			"the MCP mount's preflight must answer, not a second, narrower PRM route");
+}
+
 unittest  // an issuer with a path serves its AS metadata at the RFC 8414 path-inserted URL
 {
 	import std.algorithm : canFind;
@@ -2362,7 +2390,7 @@ unittest  // an issuer with a path serves its AS metadata at the RFC 8414 path-i
 	assert(bodyOf("https://mcp.example.com/.well-known/oauth-authorization-server").length == 0);
 }
 
-unittest  // CORS: the well-known metadata documents are readable cross-origin
+unittest  // CORS: the AS metadata document is readable cross-origin
 {
 	import vibe.http.server : createTestHTTPServerRequest,
 		createTestHTTPServerResponse, TestHTTPResponseMode;
@@ -2373,22 +2401,17 @@ unittest  // CORS: the well-known metadata documents are readable cross-origin
 	auto router = new URLRouter;
 	mountOAuthMetadata(router, proxy);
 
-	foreach (path; [
-		"/.well-known/oauth-authorization-server",
-		"/.well-known/oauth-protected-resource"
-	])
-	{
-		auto req = createTestHTTPServerRequest(URL("https://mcp.example.com" ~ path));
-		req.headers["Origin"] = "https://app.example.com";
-		auto res = createTestHTTPServerResponse(createMemoryOutputStream(),
-				null, TestHTTPResponseMode.bodyOnly);
-		router.handleRequest(req, res);
-		assert(res.statusCode == 200);
-		assert(res.headers.get("Access-Control-Allow-Origin", "") == "*");
-	}
+	auto req = createTestHTTPServerRequest(
+			URL("https://mcp.example.com/.well-known/oauth-authorization-server"));
+	req.headers["Origin"] = "https://app.example.com";
+	auto res = createTestHTTPServerResponse(createMemoryOutputStream(), null,
+			TestHTTPResponseMode.bodyOnly);
+	router.handleRequest(req, res);
+	assert(res.statusCode == 200);
+	assert(res.headers.get("Access-Control-Allow-Origin", "") == "*");
 }
 
-unittest  // CORS: a preflight to a well-known metadata document is answered
+unittest  // CORS: a preflight to the AS metadata document is answered
 {
 	import std.algorithm : canFind;
 	import vibe.http.common : HTTPMethod;
@@ -2401,22 +2424,17 @@ unittest  // CORS: a preflight to a well-known metadata document is answered
 	auto router = new URLRouter;
 	mountOAuthMetadata(router, proxy);
 
-	foreach (path; [
-		"/.well-known/oauth-authorization-server",
-		"/.well-known/oauth-protected-resource"
-	])
-	{
-		auto req = createTestHTTPServerRequest(URL("https://mcp.example.com" ~ path),
-				HTTPMethod.OPTIONS);
-		req.headers["Origin"] = "https://app.example.com";
-		req.headers["Access-Control-Request-Method"] = "GET";
-		auto res = createTestHTTPServerResponse(createMemoryOutputStream(),
-				null, TestHTTPResponseMode.bodyOnly);
-		router.handleRequest(req, res);
-		assert(res.statusCode == 204);
-		assert(res.headers.get("Access-Control-Allow-Origin", "") == "*");
-		assert(res.headers.get("Access-Control-Allow-Methods", "").canFind("GET"));
-	}
+	auto req = createTestHTTPServerRequest(
+			URL("https://mcp.example.com/.well-known/oauth-authorization-server"),
+			HTTPMethod.OPTIONS);
+	req.headers["Origin"] = "https://app.example.com";
+	req.headers["Access-Control-Request-Method"] = "GET";
+	auto res = createTestHTTPServerResponse(createMemoryOutputStream(), null,
+			TestHTTPResponseMode.bodyOnly);
+	router.handleRequest(req, res);
+	assert(res.statusCode == 204);
+	assert(res.headers.get("Access-Control-Allow-Origin", "") == "*");
+	assert(res.headers.get("Access-Control-Allow-Methods", "").canFind("GET"));
 }
 
 unittest  // COMPOSE: the per-route helpers reproduce the /register leg
@@ -3066,9 +3084,8 @@ unittest  // every /token response forbids caching (RFC 6749 §5.1)
 		mountOAuthToken(router, proxy,
 				fixedUpstream(`{"access_token":"at","token_type":"bearer"}`));
 		foreach (form; [
-				redeemableCodeForm(proxy),
-				"grant_type=authorization_code&code=bad"
-			])
+			redeemableCodeForm(proxy), "grant_type=authorization_code&code=bad"
+		])
 		{
 			auto formBody = () @trusted { return cast(ubyte[]) form.dup; }();
 			auto req = createTestHTTPServerRequest(URL("https://mcp.example.com/token"),
