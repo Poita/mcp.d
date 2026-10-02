@@ -1927,7 +1927,7 @@ final class EventsRuntime
 	// order, so a subscription's events never race or overtake one another and a
 	// burst of jobs for an unverified endpoint makes one verification attempt.
 	// Concurrency is thus one task per subscription with work. A job's lease is
-	// renewed as it starts, since it waited behind its siblings.
+	// renewed as it starts, and the waiting jobs' leases after each delivery.
 	private void runSubscription(string subId) @safe
 	{
 		const leaseMs = opts_.deliveryLease.total!"msecs";
@@ -1954,6 +1954,9 @@ final class EventsRuntime
 				localJobs_.remove(job.jobId);
 			deliveryQueue_.renew(job.jobId, opts_.nowMs() + leaseMs);
 			deliverGuarded(job);
+			// The jobs behind this one waited out its delivery, however long it
+			// took: renew them before their claim can lapse.
+			renewWaiting(subId, opts_.nowMs() + leaseMs);
 		}
 	}
 
@@ -4666,6 +4669,53 @@ unittest  // jobs queued behind a retrying job keep their lease, so another node
 		job();
 	}
 	assert(sleeps >= 3);
+	assert(stolen == 0, "a queued job's lease lapsed while it waited");
+}
+
+unittest  // jobs queued behind slow successful deliveries keep their lease
+{
+	import mcp.server.event_store : InMemoryDeliveryQueue;
+
+	long now = 1_000_000;
+	auto ft = new FakeWebhookTransport();
+	auto q = new InMemoryDeliveryQueue();
+	EventsOptions o;
+	o.nowMs = () @safe => now;
+	o.nowIso = () @safe => "t";
+	o.allowPrivateCallbackHosts = true;
+	o.callbackAllowlist = ["https://proxy/"];
+	o.webhookTransport = ft;
+	o.deliveryQueue = q;
+	o.webhookRetryBase = 1.msecs;
+	o.webhookHttpTimeout = 1.msecs;
+	o.deliveryLease = 1000.msecs;
+	void delegate() @safe[] deferred;
+	o.deliveryExecutor = (void delegate() @safe job) @safe { deferred ~= job; };
+	o.deliverySleep = (Duration d) @safe {};
+	auto rt = new EventsRuntime(null, o);
+	EventRegistration reg = {descriptor: EventType("n"), emitOnly: true};
+	rt.register(reg);
+	rt.subscribeWebhook(webhookSub("n", "https://proxy/hooks"), "user-1");
+	int posts;
+	size_t stolen;
+	void delegate() @safe slowPost;
+	slowPost = () @safe {
+		now += 600; // each delivery outlasts half the lease
+		if (++posts == 2)
+			stolen = q.lease(now, 1000).length; // another node's drain
+		else
+			ft.duringPost = slowPost;
+	};
+	ft.duringPost = slowPost;
+	foreach (id; ["evt_1", "evt_2", "evt_3"])
+		rt.emit(EventOccurrence(id, "n", "t"));
+	while (deferred.length)
+	{
+		auto job = deferred[0];
+		deferred = deferred[1 .. $];
+		job();
+	}
+	assert(posts >= 2);
 	assert(stolen == 0, "a queued job's lease lapsed while it waited");
 }
 
