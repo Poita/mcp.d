@@ -362,7 +362,7 @@ void mountMcp(URLRouter router, McpServer server,
 		string payload;
 		if (!readPostBody(req, res, opts.maxRequestBytes, payload))
 			return;
-		handlePost(server, coord, sessions, statelessInFlight, pushStreams,
+		handlePost(server, push, sessions, statelessInFlight, pushStreams,
 			opts.streamLimits.maxQueuedStreamBytes, token, payload, req, res);
 	});
 	if (sessions !is null)
@@ -1738,7 +1738,7 @@ private void handleGet(McpServer server, ServerPushChannel push, SessionManager 
 /// existing `notify*` / `notifyResourceUpdated` APIs deliver opted-in change
 /// notifications onto it. The connection is held open (with SSE comment
 /// heartbeats) until the client disconnects.
-private void handleListenStream(McpServer server, StreamCoordinator coord, Message msg,
+private void handleListenStream(McpServer server, ServerPushChannel push, Message msg,
 		HTTPServerResponse res, string protoHeader, string connToken,
 		string principal, size_t maxQueued) @safe
 {
@@ -1776,7 +1776,6 @@ private void handleListenStream(McpServer server, StreamCoordinator coord, Messa
 	scope (exit)
 		writeFrame.close();
 
-	auto push = ensurePushChannel(server, coord);
 	// The listen request's id becomes the stream's subscriptionId: every
 	// notification delivered to this listener (including the leading
 	// acknowledgement) is stamped with it in
@@ -2288,11 +2287,12 @@ unittest  // a stateful initialize is scoped by its minted session, never the he
 	assert(requestScope("sess", "") == "sess");
 }
 
-private void handlePost(McpServer server, StreamCoordinator coord,
+private void handlePost(McpServer server, ServerPushChannel push,
 		SessionManager sessions, StatelessInFlight statelessInFlight,
 		StreamGate pushStreams, size_t maxQueued,
 		TokenInfo token, string payload, HTTPServerRequest req, HTTPServerResponse res) @safe
 {
+	auto coord = push.coordinator;
 
 	ParsedInput input;
 	try
@@ -2565,7 +2565,7 @@ private void handlePost(McpServer server, StreamCoordinator coord,
 			}
 			scope (exit)
 				pushStreams.release(principal);
-			handleListenStream(server, coord, msg, res,
+			handleListenStream(server, push, msg, res,
 					req.headers.get(HttpHeader.protocolVersion, ""), connToken,
 					principal, maxQueued);
 			return;
@@ -2621,7 +2621,7 @@ private void handlePost(McpServer server, StreamCoordinator coord,
 		// A session-bound 2025-11-25 stream advertises resumability with its
 		// priming event, so record its events for a GET Last-Event-ID resume.
 		if (sessions !is null && sendsPrimingEvent(effVersion))
-			ctx.enableReplay(ensurePushChannel(server, coord));
+			ctx.enableReplay(push);
 		scope (exit)
 			ctx.endReplay();
 		auto resp = server.handle(msg, ctx);
