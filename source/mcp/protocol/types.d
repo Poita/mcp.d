@@ -3487,7 +3487,9 @@ enum ElicitAction
 /// omitted for `decline`/`cancel`.
 struct ElicitResult
 {
-	ElicitAction action; /// the user's decision
+	/// The user's decision. Defaults to `cancel` so an unset result never
+	/// reads as consent.
+	ElicitAction action = ElicitAction.cancel;
 	Json content = Json.undefined; /// accept: the collected `{name: value}` map
 	mixin MetaField;
 
@@ -3560,12 +3562,10 @@ struct ElicitResult
 
 	static ElicitResult fromJson(Json j) @safe
 	{
+		// `action` starts as `cancel`, so a missing/non-string/unknown `action`
+		// is never treated as an `accept` (which would consume input the user
+		// never agreed to). Only an explicit, recognized action string changes it.
 		ElicitResult r;
-		// Fail closed: default to `cancel` so a missing/non-string/unknown
-		// `action` is never treated as an `accept` (which would consume input
-		// the user never agreed to). Only an explicit, recognized action string
-		// changes this.
-		r.action = ElicitAction.cancel;
 		if (j.type != Json.Type.object)
 			return r;
 		if ("action" in j && j["action"].type == Json.Type.string)
@@ -3767,6 +3767,13 @@ unittest  // ElicitParams.toJson emits mode for url variant
 	assert(j["mode"].get!string == "url");
 	assert(j["url"].get!string == "https://example.com");
 	assert(j["elicitationId"].get!string == "e1");
+}
+
+unittest  // a default-initialised ElicitResult is a cancel, never an accept
+{
+	ElicitResult r;
+	assert(r.action == ElicitAction.cancel);
+	assert(r.toJson()["action"].get!string == "cancel");
 }
 
 unittest  // ElicitResult.accept emits {action, content}
