@@ -118,21 +118,13 @@ struct ToolResponse
 		return t;
 	}
 
-	/// Convenience: build a final result from a typed `value`. Serialises `value`
-	/// to JSON and uses it as the result's `structuredContent`, defaulting the
-	/// human-readable `content` to a single text block holding that same JSON.
-	/// The serialisation is done inline here (independent of any
-	/// `CallToolResult.structured!T` helper) so this overload stays compilable on
-	/// its own.
+	/// Convenience: build a final result from a typed `value` via
+	/// `CallToolResult.structured`, so a fieldwise struct becomes the
+	/// `structuredContent` object and any other value is wrapped under `result`,
+	/// with `content` defaulting to a text block holding that same JSON.
 	static ToolResponse complete(T)(T value) @safe if (!is(T : CallToolResult))
 	{
-		import vibe.data.json : serializeToJson;
-
-		Json sc = serializeToJson(value);
-		CallToolResult r;
-		r.structuredContent = sc;
-		r.content = [Content.makeText(sc.toString())];
-		return ToolResponse.complete(r);
+		return ToolResponse.complete(CallToolResult.structured(value));
 	}
 
 	/// As `inputRequired`, but encodes a typed `state` as the opaque
@@ -260,4 +252,24 @@ unittest  // PromptResponse.forVersion rejects an input-required result on a non
 	]);
 	assertThrown!McpException(pr.forVersion(ProtocolVersion.v2025_11_25));
 	assertNotThrown(pr.forVersion(ProtocolVersion.v2026_07_28));
+}
+
+unittest  // ToolResponse.complete(T) wraps a non-struct value under `result`
+{
+	auto r = ToolResponse.complete(42).toJson();
+	assert(r["structuredContent"].type == Json.Type.object);
+	assert(r["structuredContent"]["result"].get!int == 42);
+}
+
+unittest  // ToolResponse.complete(T) emits a fieldwise struct as the object itself
+{
+	static struct Point
+	{
+		int x;
+		int y;
+	}
+
+	auto r = ToolResponse.complete(Point(1, 2)).toJson();
+	assert(r["structuredContent"]["x"].get!int == 1);
+	assert(r["structuredContent"]["y"].get!int == 2);
 }

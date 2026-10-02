@@ -474,26 +474,7 @@ private CallToolResult toToolResult(R)(R ret) @safe if (!is(R == void))
 		return r;
 	}
 	else
-	{
-		CallToolResult r;
-		// Serialize through EnumByNamePolicy so enum leaves (the value itself, or
-		// enums nested in structs/arrays) emit their schema-declared string member
-		// name, matching the tool's outputSchema instead of an integer base value.
-		static if (isFieldwiseStruct!R)
-			auto structured = () @trusted {
-				return serializeWithPolicy!(JsonSerializer, EnumByNamePolicy)(ret);
-			}();
-		else
-		{
-			Json structured = Json.emptyObject;
-			structured["result"] = () @trusted {
-				return serializeWithPolicy!(JsonSerializer, EnumByNamePolicy)(ret);
-			}();
-		}
-		r.structuredContent = structured;
-		r.content = [Content.makeText(structured.toString())];
-		return r;
-	}
+		return CallToolResult.structured(ret);
 }
 
 /// Collect every `@icon` UDA on a method into the descriptor `Icon[]` shape.

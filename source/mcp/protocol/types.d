@@ -1221,6 +1221,8 @@ struct CallToolResult
 	/// match `T` is likewise mapped to `invalidParams` (rather than leaking a raw
 	/// vibe exception); an `McpException` propagates unchanged. Enum fields are
 	/// read by member name, as `structured` and the reflection layer write them.
+	/// A `T` that is not a fieldwise-serialized struct is read from the `result`
+	/// member, matching the wrapping `structured` applies.
 	T structuredContentAs(T)() const @safe
 	{
 		import mcp.protocol.errors : invalidParams;
@@ -1229,13 +1231,18 @@ struct CallToolResult
 			throw invalidParams("structuredContent: expected a JSON object, got " ~ (
 					structuredContent.type == Json.Type.undefined
 					? "no structuredContent" : "a non-object value"));
+		import mcp.api.binding : isFieldwiseStruct;
 		import mcp.api.reflection : EnumByNamePolicy;
 		import vibe.data.json : JsonSerializer;
 		import vibe.data.serialization : deserializeWithPolicy;
 
+		static if (isFieldwiseStruct!T)
+			const Json src = structuredContent;
+		else
+			const Json src = structuredContent["result"];
 		try
 			return () @trusted {
-			return deserializeWithPolicy!(JsonSerializer, EnumByNamePolicy, T)(structuredContent);
+			return deserializeWithPolicy!(JsonSerializer, EnumByNamePolicy, T)(src);
 		}();
 		catch (McpException e)
 			throw e;
@@ -1289,20 +1296,29 @@ struct CallToolResult
 
 	/// Build a `CallToolResult` whose `structuredContent` is `value` serialized
 	/// with enums written by member name, matching the reflected output schema and
-	/// `structuredContentAs!T`. When `content` is null it defaults to a single
-	/// text block carrying the JSON string of `value`, mirroring the reflection
-	/// layer's `toToolResult` behaviour so a structured result also has a
+	/// `structuredContentAs!T`. `structuredContent` must be an object, so a
+	/// fieldwise-serialized struct is emitted as itself and every other value
+	/// (scalars, arrays, `Nullable`, `Json`, custom-serialized structs) is wrapped
+	/// as `{"result": value}`. When `content` is null it defaults to a single
+	/// text block carrying that JSON, so a structured result also has a
 	/// human-readable content fallback for clients that ignore `structuredContent`.
 	static CallToolResult structured(T)(T value, Content[] content = null) @safe
 	{
+		import mcp.api.binding : isFieldwiseStruct;
 		import mcp.api.reflection : EnumByNamePolicy;
 		import vibe.data.json : JsonSerializer;
 		import vibe.data.serialization : serializeWithPolicy;
 
 		CallToolResult r;
-		auto sc = () @trusted {
+		Json sc = () @trusted {
 			return serializeWithPolicy!(JsonSerializer, EnumByNamePolicy)(value);
 		}();
+		static if (!isFieldwiseStruct!T)
+		{
+			Json wrapped = Json.emptyObject;
+			wrapped["result"] = sc;
+			sc = wrapped;
+		}
 		r.structuredContent = sc;
 		r.content = content !is null ? content : [
 			Content.makeText(sc.toString())
@@ -1430,6 +1446,14 @@ unittest  // CallToolResult.structured!T honours an explicit content override
 	assert(r.content.length == 1);
 	assert(r.content[0].text == "18C in Paris");
 	assert(r.structuredContent["city"].get!string == "Paris");
+}
+
+unittest  // CallToolResult.structured!T wraps a non-struct value under `result` and structuredContentAs!T unwraps it
+{
+	auto r = CallToolResult.structured([1, 2, 3]);
+	assert(r.structuredContent.type == Json.Type.object);
+	assert(r.structuredContent["result"].length == 3);
+	assert(r.structuredContentAs!(int[]) == [1, 2, 3]);
 }
 
 /// Result of `tools/list` (paginated).
