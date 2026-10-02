@@ -65,7 +65,8 @@ final class DuplexChannel
 	/// stdio transport's logging channel, when null.
 	void delegate(string) @safe nothrow onError;
 
-	private void reportError(string msg) @safe nothrow
+	/// Report `msg` to `onError`, or to stderr when it is null.
+	void reportError(string msg) @safe nothrow
 	{
 		import std.stdio : stderr;
 

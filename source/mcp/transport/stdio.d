@@ -145,16 +145,10 @@ void serveStdio(McpServer server, string delegate() @safe readLine,
 			// its reply but not yet written it.
 			inflight.start();
 			runTask((Message msg) nothrow{
-				try
-				{
-					auto ctx = new StdioContextFactoryReply(server, &sink, &serverRequest, msg);
-					ctx.run(channel);
-				}
-				catch (Exception)
-				{
-				}
-				finally
+				scope (exit)
 					inflight.finish();
+				auto ctx = new StdioContextFactoryReply(server, &sink, &serverRequest, msg);
+				ctx.run(channel);
 			}, m);
 			break;
 		case MessageKind.notification:
@@ -190,15 +184,15 @@ void serveStdio(McpServer server, string delegate() @safe readLine,
 				if (reply.length)
 					channel.sendRaw(reply);
 			}
-			catch (Exception)
-			{
-			}
+			catch (Exception e)
+				channel.reportError("batch: " ~ e.msg);
 			finally
 				inflight.finish();
 		}, raw);
 	}
 
 	channel = new DuplexChannel(readLine, writeLine, &onInbound, &onInboundBatch);
+	channel.onError = opts.onError;
 	// Change notifications for a 2025-era client ride the same serialized writer.
 	server.attachStdioSink(&sink);
 	scope (exit)
@@ -272,7 +266,7 @@ private final class StdioContextFactoryReply
 	private Message msg;
 
 	this(McpServer server, void delegate(string) @safe sink, Json delegate(string,
-			Json) @safe serverRequest, Message msg) @safe
+			Json) @safe serverRequest, Message msg) @safe nothrow
 	{
 		this.server = server;
 		this.sink = sink;
@@ -280,20 +274,51 @@ private final class StdioContextFactoryReply
 		this.msg = msg;
 	}
 
-	void run(DuplexChannel channel) @safe
+	/// Dispatch `msg` and write its reply. A dispatch that throws is reported
+	/// and answered with a -32603 error so the peer does not wait forever; a
+	/// reply that cannot be written is reported.
+	void run(DuplexChannel channel) @safe nothrow
 	{
+		import std.typecons : Nullable;
+		import mcp.protocol.errors : internalError;
+		import mcp.protocol.jsonrpc : makeErrorResponse;
 		import mcp.server.context : StdioContext;
 		import mcp.transport.sse_context : extractProgressToken;
 
-		// The channel has already parsed and classified `msg`, so it is dispatched
-		// directly against the bound connection rather than re-serialised for
-		// `handleRaw` to parse again.
-		auto ctx = new StdioContext(sink, serverRequest, server.clientCapabilities,
-				extractProgressToken(msg.params),
-				server.negotiatedVersion, server.mode == ServerMode.stateless);
-		auto reply = server.handle(msg, ctx);
-		if (!reply.isNull)
+		Nullable!Json reply;
+		try
+		{
+			// The channel has already parsed and classified `msg`, so it is dispatched
+			// directly against the bound connection rather than re-serialised for
+			// `handleRaw` to parse again.
+			auto ctx = new StdioContext(sink, serverRequest, server.clientCapabilities,
+					extractProgressToken(msg.params),
+					server.negotiatedVersion, server.mode == ServerMode.stateless);
+			reply = server.handle(msg, ctx);
+		}
+		catch (Exception e)
+		{
+			channel.reportError("request " ~ idText() ~ ": " ~ e.msg);
+			try
+				reply = makeErrorResponse(msg.id, internalError("request handling failed"));
+			catch (Exception)
+			{
+			}
+		}
+		if (reply.isNull)
+			return;
+		try
 			channel.sendRaw(reply.get.toString());
+		catch (Exception e)
+			channel.reportError("request " ~ idText() ~ ": reply write failed: " ~ e.msg);
+	}
+
+	private string idText() @safe nothrow
+	{
+		try
+			return msg.id.toString();
+		catch (Exception)
+			return "?";
 	}
 }
 
@@ -315,6 +340,11 @@ struct StdioOptions
 	/// the client's reply before it fails with `RequestTimeoutException` and is
 	/// cancelled toward the client with `notifications/cancelled`.
 	Duration serverRequestTimeout = defaultServerRequestTimeout;
+
+	/// Receives a description of each failure the transport survives: a request
+	/// whose handling or reply write threw, an unreadable input. stdout carries
+	/// only MCP messages, so this defaults to stderr when null.
+	void delegate(string) @safe nothrow onError;
 }
 
 /// Serve `server` over stdio with default options except for `maxLineBytes`
@@ -2064,6 +2094,48 @@ unittest  // serveStdio stops at end-of-input (null line) after servicing pendin
 	// The read loop serviced the ping and then exited cleanly on EOF (the event
 	// loop returning is what lets us reach here).
 	assert(outCount == 1);
+}
+
+unittest  // a request reply that fails to write is reported through StdioOptions.onError
+{
+	import std.algorithm.searching : canFind;
+
+	auto s = new McpServer("t", "1");
+	auto link = new ServerLink;
+	string[] errors;
+	StdioOptions opts;
+	opts.onError = (string msg) @safe nothrow{ errors ~= msg; };
+	void failingWrite(string line) @safe
+	{
+		throw new Exception("stdout gone");
+	}
+
+	() @trusted {
+		runTask(() nothrow{
+			scope (exit)
+				exitEventLoop();
+			try
+				serveStdio(s, &link.readLine, &failingWrite, opts);
+			catch (Exception)
+			{
+			}
+		});
+		runTask(() nothrow{
+			try
+			{
+				link.feed(`{"jsonrpc":"2.0","id":1,"method":"ping"}`);
+				foreach (_; 0 .. 8)
+					yield();
+				link.closeInput();
+			}
+			catch (Exception)
+			{
+			}
+		});
+		runEventLoop();
+	}();
+	assert(errors.canFind!(e => e.canFind("stdout gone")),
+			"a failed reply write must be reported, not swallowed");
 }
 
 unittest  // a handler still running when stdin EOFs is drained: its reply is not dropped
