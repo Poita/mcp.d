@@ -755,18 +755,17 @@ private string bindToolArgs(alias overload)(Json args, ref Tuple!(BoundParameter
 	return null;
 }
 
-private void registerToolMethod(string memberName, alias overload, alias parent)(
-		McpServer server, tool attr) @safe
+/// The `Tool` descriptor for the method `overload` annotated with `attr`, its
+/// `@tool` or `@taskTool`: the name, description, and title from `attr`, the
+/// input schema from the parameters, output schema from the return type, the
+/// hint UDAs (`@readOnly` / `@destructive` / `@idempotent` / `@openWorld`) and
+/// `@hintTitle` as annotations, `@icon` / `@meta`, and `@ui` merged into
+/// `_meta.ui`. A hint marker's presence sets its hint to true; absence leaves it
+/// unset (omitted from the wire form).
+private Tool toolDescriptor(alias overload, A)(A attr) @safe
+		if (is(A == tool) || is(A == taskTool))
 {
 	import std.traits : ReturnType;
-
-	static foreach (P; BoundParameters!overload)
-	{
-		static assert(!is(P == TaskContext), "@tool method '" ~ memberName
-				~ "' must not take a TaskContext; declare it with @taskTool to run as a task.");
-		static assert(!is(P == EventContext), "@tool method '" ~ memberName
-				~ "' must not take an EventContext; only event handlers receive one.");
-	}
 
 	Tool descriptor;
 	descriptor.name = attr.name;
@@ -779,12 +778,6 @@ private void registerToolMethod(string memberName, alias overload, alias parent)
 	if (outSchema.type == Json.Type.object)
 		descriptor.outputSchema = outSchema;
 
-	// Fold every method UDA in a single pass: the marker hint UDAs (@readOnly /
-	// @destructive / @idempotent / @openWorld) and the @hintTitle value UDA into
-	// typed ToolAnnotations. A single loop keeps every UDA handled in one place so
-	// a new UDA cannot land in only one pass. A marker's presence sets the
-	// corresponding hint to true; absence leaves it unset (omitted from the wire
-	// form).
 	ToolAnnotations anns;
 	static foreach (a; __traits(getAttributes, overload))
 	{
@@ -806,14 +799,29 @@ private void registerToolMethod(string memberName, alias overload, alias parent)
 		descriptor.annotations = anns.toJson();
 
 	applyIconsAndMeta!overload(descriptor);
-
-	// Fold a @ui UDA into the tool's _meta.ui (MCP Apps), merging with any
-	// _meta already set by @meta above.
+	// @ui merges into the _meta that @meta set.
 	static foreach (a; __traits(getAttributes, overload))
 	{
 		static if (is(typeof(a) == ui))
 			setUiToolMeta(descriptor, UiToolMeta(a.resourceUri, a.visibility));
 	}
+	return descriptor;
+}
+
+private void registerToolMethod(string memberName, alias overload, alias parent)(
+		McpServer server, tool attr) @safe
+{
+	import std.traits : ReturnType;
+
+	static foreach (P; BoundParameters!overload)
+	{
+		static assert(!is(P == TaskContext), "@tool method '" ~ memberName
+				~ "' must not take a TaskContext; declare it with @taskTool to run as a task.");
+		static assert(!is(P == EventContext), "@tool method '" ~ memberName
+				~ "' must not take an EventContext; only event handlers receive one.");
+	}
+
+	auto descriptor = toolDescriptor!overload(attr);
 
 	server.registerTool(descriptor, (Json args, RequestContext ctx) @safe {
 		Tuple!(BoundParameters!overload) argv;
@@ -862,38 +870,7 @@ private void registerTaskMethod(string memberName, alias overload, alias parent)
 	static assert(!is(ReturnType!overload == ToolResponse),
 			"@taskTool method '" ~ memberName ~ "' must return a value (or void), not ToolResponse");
 
-	Tool descriptor;
-	descriptor.name = attr.name;
-	if (attr.description.length)
-		descriptor.description = nullable(attr.description);
-	if (attr.title.length)
-		descriptor.title = nullable(attr.title);
-	descriptor.inputSchema = parametersSchema!overload();
-	auto outSchema = outputSchemaOf!(ReturnType!overload)();
-	if (outSchema.type == Json.Type.object)
-		descriptor.outputSchema = outSchema;
-
-	// Behavioral-hint UDAs fold exactly as for @tool.
-	ToolAnnotations anns;
-	static foreach (a; __traits(getAttributes, overload))
-	{
-		static if (__traits(isSame, a, readOnly))
-			anns.readOnlyHint = true;
-		else static if (__traits(isSame, a, destructive))
-			anns.destructiveHint = true;
-		else static if (__traits(isSame, a, idempotent))
-			anns.idempotentHint = true;
-		else static if (__traits(isSame, a, openWorld))
-			anns.openWorldHint = true;
-		else static if (is(typeof(a) == hintTitle))
-		{
-			if (a.value.length)
-				anns.title = a.value;
-		}
-	}
-	if (!anns.empty)
-		descriptor.annotations = anns.toJson();
-	applyIconsAndMeta!overload(descriptor);
+	auto descriptor = toolDescriptor!overload(attr);
 
 	// Per-task timing from @taskTtl / @taskPollInterval; an absent UDA inherits the
 	// corresponding server default.
@@ -4563,6 +4540,28 @@ unittest  // @fieldDescription on a parameter is its description, and @describeP
 	auto props = parametersSchema!(FieldDescriptionParamApi.find)()["properties"];
 	assert(props["q"]["description"].get!string == "search text", props.toString);
 	assert(props["limit"]["description"].get!string == "page size", props.toString);
+}
+
+version (unittest) private final class UiTaskApi
+{
+	@taskTool("render_later", "Render a widget as a task")
+	@ui("ui://demo/widget", "model")
+	string renderLater(string spec, TaskContext tc) @safe
+	{
+		return spec;
+	}
+}
+
+unittest  // @ui on a @taskTool attaches _meta.ui to its descriptor
+{
+	import mcp.server.task_context : SyncTaskDispatcher;
+
+	auto s = new McpServer("t", "1");
+	s.enableTasks(null, TaskOptions.init, new SyncTaskDispatcher());
+	registerHandlers(s, new UiTaskApi);
+	auto t = s.handle(MakeListMessage()).get["result"]["tools"][0];
+	assert(t["_meta"]["ui"]["resourceUri"].get!string == "ui://demo/widget", t.toString);
+	assert(t["_meta"]["ui"]["visibility"] == Json([Json("model")]), t.toString);
 }
 
 unittest  // a JSON Schema facet on a handler method is rejected at compile time
