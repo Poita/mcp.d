@@ -691,12 +691,16 @@ final class McpServer : ServerCore
 	/// (other than `ping`) before the client has sent `notifications/initialized`.
 	/// With this enabled, a stateful session that receives e.g. `tools/list` after
 	/// the `initialize` response but before `notifications/initialized` is rejected
-	/// with -32002. `initialize` and `ping` are always allowed; the stateless path
-	/// (which has no per-session `initialized` handshake) is exempt. OFF by default
+	/// with -32002. `initialize` and `ping` are always allowed. OFF by default
 	/// — the rule is a SHOULD and well-behaved clients send `initialized`
-	/// immediately.
+	/// immediately. Throws on a stateless server, which has no per-session
+	/// `initialized` handshake to gate on.
 	void requireInitialized() @safe
 	{
+		if (mode_ == ServerMode.stateless)
+			throw new Exception("requireInitialized() is not available on a stateless"
+					~ " server: it has no per-session initialized handshake. Construct the"
+					~ " server with McpServer.stateful() instead.");
 		requireInitialized_ = true;
 	}
 
@@ -4421,6 +4425,13 @@ unittest  // a stateless server still serves a second initialize from a fresh si
 	assert("error" !in first);
 	auto second = s.handle(req(2, "initialize", p)).get;
 	assert("error" !in second, "a stateless server must not reject a fresh client's initialize");
+}
+
+unittest  // requireInitialized throws on a stateless server, which has no initialized handshake
+{
+	import std.exception : assertThrown;
+
+	assertThrown(McpServer.stateless("t", "1").requireInitialized());
 }
 
 unittest  // requireInitialized: a stateful request before notifications/initialized is rejected

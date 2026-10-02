@@ -79,7 +79,8 @@ struct ServerSettings
 
 	/// Reject a stateful session's requests (other than `ping`) that arrive before
 	/// its `notifications/initialized` with -32002 (calls `requireInitialized`).
-	/// Off by default: the lifecycle rule is a SHOULD.
+	/// Off by default: the lifecycle rule is a SHOULD. Setting it on a
+	/// `stateless` server makes `newServer()` throw.
 	bool requireInitialized;
 
 	/// Send an unexpected handler exception's message to the client instead of a
@@ -109,8 +110,8 @@ struct ServerSettings
 	/// Construct a fresh `McpServer` from this settings' identity and mode, then
 	/// apply the capability/validation flags via the matching `enable*`/`disable*`
 	/// methods. Tools, resources, and prompts are registered on the returned server
-	/// before serving. Throws when `resourceSubscriptions` is set on a `stateless`
-	/// mode (the loud error from `enableResourceSubscriptions()`).
+	/// before serving. Throws when `resourceSubscriptions` or `requireInitialized`
+	/// is set on a `stateless` mode.
 	McpServer newServer() @safe
 	{
 		import mcp.api.apps : enableApps;
@@ -416,6 +417,17 @@ version (unittest)
 	server.handle(Message(makeRequest(Json(1), "initialize", init)));
 	auto early = server.handle(Message(makeRequest(Json(2), "tools/list", Json.emptyObject))).get;
 	assert(early["error"]["code"].get!int == -32002);
+}
+
+@safe unittest
+{
+	// requireInitialized on a STATELESS server makes newServer() throw.
+	import std.exception : assertThrown;
+
+	ServerSettings s;
+	s.serverInfo = Implementation("settings-srv", "1.0");
+	s.requireInitialized = true;
+	assertThrown(s.newServer());
 }
 
 @safe unittest
