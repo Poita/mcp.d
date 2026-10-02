@@ -137,7 +137,9 @@ struct TaskContext
 
 	/// Suspend the executor pending client input. Persists `requests` as the
 	/// task's outstanding `inputRequests` (status `input_required`, or
-	/// `cancelled` if a cancel was already requested) and throws `TaskSuspended`. Never returns — its `noreturn` result type lets an executor
+	/// `cancelled` if a cancel was already requested) and throws `TaskSuspended`.
+	/// `requests` must be non-empty; an empty set throws `internalError`, which
+	/// fails the task. Never returns — its `noreturn` result type lets an executor
 	/// write `return tc.requireInput(...);` from a value-returning method.
 	noreturn requireInput(const(InputRequest)[] requests) @safe
 	{
@@ -354,6 +356,19 @@ unittest  // an executor whose task expires mid-run stops without failing the di
 	});
 	assert(sawCancel);
 	assert(rt.statusOf(t.taskId).isNull);
+}
+
+unittest  // an executor suspending with no input requests fails the task
+{
+	import mcp.server.task_store : InMemoryTaskStore;
+	import mcp.server.task_runtime : TaskOptions;
+
+	auto rt = new TaskRuntime(new InMemoryTaskStore(), TaskOptions.init);
+	auto t = rt.createFor("gate", Json.undefined);
+	runTaskExecutor(rt, t.taskId, (TaskContext tc) @safe {
+		return tc.requireInput([]);
+	});
+	assert(rt.getDetailed(t.taskId)["status"].get!string == "failed");
 }
 
 unittest  // requireInput suspends into input_required; re-run completes after answer

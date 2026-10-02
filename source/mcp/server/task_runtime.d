@@ -358,9 +358,13 @@ final class TaskRuntime
 	/// to server-to-client requests); an earlier answer to a key requested again
 	/// is discarded, so only a fresh answer satisfies it. A task whose cancellation was already
 	/// requested is cancelled instead, since no dispatch would ever resume it. A
-	/// no-op if the task is already terminal.
+	/// no-op if the task is already terminal. Throws `internalError` when
+	/// `inputRequests` is not a non-empty object: a task suspended with nothing to
+	/// answer could never resume.
 	void requireInput(string id, Json inputRequests) @safe
 	{
+		if (inputRequests.type != Json.Type.object || inputRequests.length == 0)
+			throw internalError("task '" ~ id ~ "' requires input but supplied no input requests");
 		modify(id, (ref TaskRecord r) @safe {
 			if (isTerminal(r.meta.status))
 				return Change.none;
@@ -372,8 +376,7 @@ final class TaskRuntime
 			else
 			{
 				transition(r, TaskStatus.inputRequired);
-				r.inputRequests = (inputRequests.type == Json.Type.object)
-					? inputRequests : Json.emptyObject;
+				r.inputRequests = inputRequests;
 				// A key asked for again needs a fresh answer: drop the earlier one
 				// so it cannot satisfy the new request. Other keys' answers stay,
 				// since a re-run executor passes its earlier gates with them.
@@ -741,6 +744,18 @@ unittest  // a status transition clears the previous status message
 	rt.progress(resumed.taskId, "waiting for approval");
 	assert(rt.resumeWorking(resumed.taskId));
 	assert("statusMessage" !in rt.getDetailed(resumed.taskId));
+}
+
+unittest  // requireInput rejects an empty request set and leaves the task working
+{
+	import std.exception : collectException;
+
+	auto rt = new TaskRuntime(new InMemoryTaskStore(), TaskOptions.init);
+	auto t = rt.createFor("gate", Json.undefined);
+	auto ex = cast(McpException) collectException(rt.requireInput(t.taskId, Json.emptyObject));
+	assert(ex !is null && ex.code == ErrorCode.internalError);
+	assert(collectException(rt.requireInput(t.taskId, Json.undefined)) !is null);
+	assert(rt.getDetailed(t.taskId)["status"].get!string == "working");
 }
 
 unittest  // a unique-id collision from a bad generator is retried, then errors
