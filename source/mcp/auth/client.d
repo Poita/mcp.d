@@ -87,8 +87,9 @@ final class OAuthClient
 	/// `jwtBearerGrant` reject an empty value.
 	/// `useOAuth` sets this to the canonical MCP server URI automatically.
 	string resource;
-	/// The client's redirect URI for the auth-code flow.
-	string redirectUri = "http://localhost:8765/callback";
+	/// The client's redirect URI for the auth-code flow. The default names the
+	/// `127.0.0.1` literal (RFC 8252 §8.3), as `loopbackRedirectUri` does.
+	string redirectUri = "http://127.0.0.1:8765/callback";
 	/// How to authenticate at the token endpoint. Under `none`, a client that
 	/// nevertheless holds a `clientSecret` authenticates with
 	/// `client_secret_basic`.
@@ -744,9 +745,10 @@ final class OAuthClient
 
 	// Secure POST a body to `url` with the given content type, optionally adding
 	// an Authorization header, and parse the response as JSON (empty body -> {}).
-	// Throws when the response status is not 2xx, surfacing the error body if
-	// present (consistent with tryGetJson which guards status the same way).
-	private Json postParse(string url, string contentType,
+	// Throws when the response status is not 2xx, naming `endpoint` (e.g.
+	// "Token endpoint") and surfacing the error body if present (consistent with
+	// tryGetJson which guards status the same way).
+	private Json postParse(string endpoint, string url, string contentType,
 			scope const(ubyte)[] payload, string authHeader = null) @safe
 	{
 		import std.conv : to;
@@ -762,7 +764,7 @@ final class OAuthClient
 		}, (scope HTTPClientResponse res) {
 			auto body = res.bodyReader.readAllUTF8(false, maxAuthResponseBytes);
 			if (res.statusCode / 100 != 2)
-				throw internalError("Token endpoint returned HTTP " ~ res.statusCode.to!string ~ (
+				throw internalError(endpoint ~ " returned HTTP " ~ res.statusCode.to!string ~ (
 					body.length ? ": " ~ body : ""));
 			result = body.length ? parseJsonString(body) : Json.emptyObject;
 		});
@@ -771,7 +773,8 @@ final class OAuthClient
 
 	private Json postJson(string url, Json payload) @safe
 	{
-		return postParse(url, "application/json", cast(const(ubyte)[]) payload.toString());
+		return postParse("Dynamic client registration endpoint", url,
+				"application/json", cast(const(ubyte)[]) payload.toString());
 	}
 
 	// A client holding a secret authenticates with it even when `authMethod` was
@@ -784,7 +787,8 @@ final class OAuthClient
 			&& (authMethod == TokenEndpointAuthMethod.clientSecretBasic
 					|| authMethod == TokenEndpointAuthMethod.none);
 		const auth = useBasic ? basicAuthHeader(client.clientId, client.clientSecret) : "";
-		return postParse(url, "application/x-www-form-urlencoded", cast(const(ubyte)[]) form, auth);
+		return postParse("Token endpoint", url,
+				"application/x-www-form-urlencoded", cast(const(ubyte)[]) form, auth);
 	}
 }
 
@@ -1287,6 +1291,46 @@ unittest  // postParse treats a non-2xx token-endpoint response as an error
 	// A non-2xx response from the token endpoint must surface as an exception,
 	// not silently return an empty TokenSet.
 	assertThrown(c.refresh(as_, RegisteredClient("cid", ""), "rt"));
+}
+
+unittest  // a failed dynamic registration names the registration endpoint, not the token endpoint
+{
+	import std.algorithm : canFind;
+	import std.conv : to;
+	import vibe.http.server : HTTPServerRequest, HTTPServerResponse,
+		HTTPServerSettings, listenHTTP;
+
+	auto settings = new HTTPServerSettings();
+	settings.bindAddresses = ["127.0.0.1"];
+	settings.port = 0;
+	auto listener = () @trusted {
+		return listenHTTP(settings, (scope HTTPServerRequest req, scope HTTPServerResponse res) @safe {
+			res.statusCode = 400;
+			res.writeBody(`{"error":"invalid_client_metadata"}`, "application/json");
+		});
+	}();
+	scope (exit)
+		() @trusted { listener.stopListening(); }();
+
+	AuthorizationServerMetadata as_;
+	as_.registrationEndpoint = "http://127.0.0.1:"
+		~ listener.bindAddresses[0].port.to!string ~ "/register";
+	auto c = new OAuthClient();
+	c.resource = "http://127.0.0.1:3000/mcp";
+	string msg;
+	try
+		cast(void) c.register(as_, "client");
+	catch (Exception e)
+		msg = e.msg;
+	assert(msg.canFind("registration endpoint returned HTTP 400"), msg);
+	assert(!msg.canFind("Token endpoint"), msg);
+}
+
+unittest  // the default redirect URI names the 127.0.0.1 literal, not localhost (RFC 8252 §8.3)
+{
+	import std.algorithm : startsWith;
+
+	assert(new OAuthClient().redirectUri.startsWith("http://127.0.0.1:"));
 }
 
 unittest  // tokenExchange refuses when the RFC 8707 resource indicator is unset
