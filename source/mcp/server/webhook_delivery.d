@@ -243,11 +243,11 @@ bool callbackHostAllowed(string url, bool allowPrivate) @safe
 {
 	import mcp.protocol.ssrf : classifyHostLexical, AddressClass;
 
-	if (allowPrivate)
-		return true;
 	const host = hostOf(url);
 	if (host.length == 0)
 		return false;
+	if (allowPrivate)
+		return true;
 	// A registered name classifies as public_ lexically; the connector re-checks
 	// the resolved IP at delivery time, so only reject literals that are provably
 	// internal here.
@@ -499,6 +499,12 @@ unittest  // categoryForException classifies common failures
 	assert(categoryForException("TLS handshake failed") == DeliveryErrorCategory.tlsError);
 	assert(categoryForException("operation timed out") == DeliveryErrorCategory.timeout);
 	assert(categoryForException("connection refused") == DeliveryErrorCategory.connectionRefused);
+}
+
+unittest  // callbackHostAllowed rejects a URL with no host even when private hosts are allowed
+{
+	assert(!callbackHostAllowed("https:///hooks", true));
+	assert(!callbackHostAllowed("not a url", true));
 }
 
 unittest  // callbackHostAllowed rejects internal literals but permits public names

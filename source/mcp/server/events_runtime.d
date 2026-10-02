@@ -1325,8 +1325,8 @@ final class EventsRuntime
 	// --- webhook subscription management -----------------------------------
 
 	/// Idempotently subscribe (or refresh) a webhook subscription on the key
-	/// `(principal, url, name, arguments)`. Validates the callback URL (https) and
-	/// the `whsec_` secret, negotiates a TTL grant, rotates the secret with a grace
+	/// `(principal, url, name, arguments)`. Validates the callback URL (https, with a
+	/// host that is not a provably internal literal) and the `whsec_` secret, negotiates a TTL grant, rotates the secret with a grace
 	/// window, and upserts the stored subscription. Fires `on_subscribe` only for a
 	/// genuinely new subscription. (Endpoint verification and outbound delivery are
 	/// performed by the webhook delivery engine.)
@@ -1832,16 +1832,18 @@ final class EventsRuntime
 	{
 		import std.algorithm : startsWith;
 
-		if (url.startsWith("https://"))
-			return;
 		// A plain-http callback is permitted only in the dev/test configuration that
 		// relaxes the SSRF host check AND only when the host classifies as
 		// loopback/internal — never a public host, so a cleartext POST (payload plus
 		// subscribe-time secret) cannot leave the local network even with the dev flag.
 		// Production requires https everywhere.
-		if (opts_.allowPrivateCallbackHosts && url.startsWith("http://") && isInternalHttpHost(url))
-			return;
-		throw invalidParams("delivery.url must be an https URL");
+		if (!url.startsWith("https://") && !(opts_.allowPrivateCallbackHosts
+				&& url.startsWith("http://") && isInternalHttpHost(url)))
+			throw invalidParams("delivery.url must be an https URL");
+		// The same lexical SSRF check delivery applies: a provably internal literal
+		// (or a URL with no host) is refused before it takes quota or fires on_subscribe.
+		if (!callbackHostAllowed(url, opts_.allowPrivateCallbackHosts))
+			throw invalidParams("delivery.url must name a publicly routable host");
 	}
 
 	// Whether the host of an `http://` URL classifies as loopback or
@@ -6326,10 +6328,59 @@ unittest  // a delivery to a non-globally-routable callback is rejected before a
 {
 	auto ft = new FakeWebhookTransport();
 	auto rt = engineRuntime(ft, /*allowPrivate*/ false);
-	// subscribe-time only checks https; the private host is rejected at delivery.
-	rt.subscribeWebhook(webhookSub("n", "https://10.0.0.1/hooks"), "user-1");
+	// A subscription already in the store bypasses the subscribe-time check; the
+	// private host is still rejected at delivery.
+	WebhookSubscription sub;
+	sub.id = "sub-private";
+	sub.principal = "user-1";
+	sub.name = "n";
+	sub.url = "https://10.0.0.1/hooks";
+	sub.secret = testSecret;
+	sub.noExpiry = true;
+	rt.webhookStore().put(sub);
 	rt.emit(EventOccurrence("evt_1", "n", "t"));
 	assert(ft.posts.length == 0); // SSRF guard blocked the verification/delivery POST
+}
+
+unittest  // subscribeWebhook rejects a non-globally-routable callback host
+{
+	import mcp.protocol.errors : McpException, ErrorCode;
+
+	auto ft = new FakeWebhookTransport();
+	auto rt = engineRuntime(ft, /*allowPrivate*/ false);
+	int subs;
+	EventRegistration reg = {descriptor: EventType("n"), emitOnly: true};
+	reg.onSubscribe = (EventContext ctx, string id) @safe { subs++; };
+	rt.register(reg);
+	foreach (url; [
+			"https://169.254.169.254/x", "https://10.0.0.1/hooks",
+			"https://[::1]/hooks"
+		])
+	{
+		int code;
+		try
+			rt.subscribeWebhook(webhookSub("n", url), "user-1");
+		catch (McpException e)
+			code = e.code;
+		assert(code == ErrorCode.invalidParams, url);
+	}
+	assert(subs == 0);
+	assert(rt.webhookStore().all().length == 0);
+}
+
+unittest  // subscribeWebhook rejects a callback URL with no host, even in dev mode
+{
+	import mcp.protocol.errors : McpException, ErrorCode;
+
+	auto ft = new FakeWebhookTransport();
+	auto rt = engineRuntime(ft, /*allowPrivate*/ true);
+	int code;
+	try
+		rt.subscribeWebhook(webhookSub("n", "https:///hooks"), "user-1");
+	catch (McpException e)
+		code = e.code;
+	assert(code == ErrorCode.invalidParams);
+	assert(rt.webhookStore().all().length == 0);
 }
 
 unittest  // a refresh after a delivery failure surfaces deliveryStatus.lastError
