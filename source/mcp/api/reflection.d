@@ -20,36 +20,12 @@ import mcp.server.events_runtime : EventRegistration, EventCheck;
 import mcp.api.attributes;
 import mcp.api.apps : UiToolMeta, setUiToolMeta;
 import mcp.api.skills : Skill, registerSkill;
-import mcp.api.binding : bindJson, bindString, isFieldwiseStruct, schemaNode,
-	schemaOf, SchemaUse, setBound, wireName;
+import mcp.api.binding : bindJson, bindString, schemaNode, schemaOf,
+	SchemaUse, setBound, wireName;
 import mcp.protocol.schema;
+import mcp.protocol.jsonhelpers : isFieldwiseStruct;
 
 @safe:
-
-/// vibe.data serialization policy that maps any `enum` leaf to / from its
-/// member *name* (string), rather than vibe's default numeric base value.
-///
-/// The reflection layer emits enum schemas as `{type:"string", enum:[names…]}`
-/// (see `mcp.api.binding.schemaOf`), so both directions of marshalling must agree: struct
-/// params/returns and bare-enum values are (de)serialized by-name. The policy
-/// only defines `toRepresentation`/`fromRepresentation` for enums, so vibe's
-/// `isPolicySerializable` is false for every other type and the default
-/// behaviour is preserved (it still recurses into nested struct/array fields,
-/// applying this rule to any enum found at any depth).
-template EnumByNamePolicy(T) if (is(T == enum))
-{
-	import std.conv : to;
-
-	static string toRepresentation(T v) @safe
-	{
-		return v.to!string;
-	}
-
-	static T fromRepresentation(string s) @safe
-	{
-		return s.to!T;
-	}
-}
 
 /// Register every `@tool` / `@prompt` / `@resource` / `@resourceTemplate`
 /// annotated method of `obj` on `server`, deriving JSON schemas and argument

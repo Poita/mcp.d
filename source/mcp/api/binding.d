@@ -17,6 +17,7 @@ import std.typecons : Nullable;
 
 import jsonschema.node : JsonNode;
 import vibe.data.json : Json;
+import mcp.protocol.jsonhelpers : isFieldwiseStruct;
 
 @safe:
 
@@ -33,27 +34,6 @@ final class BindException : Exception
 		super(msg, file, line);
 	}
 }
-
-/// Whether struct `T` is bound field by field. Structs vibe serializes in a
-/// custom form (`std.datetime` types, `toJson`/`fromJson`, `toString`/
-/// `fromString`, `toRepresentation`/`fromRepresentation`) and the `Nullable` /
-/// `SumType` / `Json` wrappers are handled elsewhere.
-package(mcp) template isFieldwiseStruct(T)
-{
-	import std.datetime.date : Date, DateTime, TimeOfDay;
-	import std.datetime.systime : SysTime;
-	import std.sumtype : isSumType;
-
-	static if (!is(T == struct) || is(T == Json) || isInstanceOf!(Nullable, T)
-			|| isSumType!T || is(T == SysTime) || is(T == DateTime)
-			|| is(T == Date) || is(T == TimeOfDay))
-		enum isFieldwiseStruct = false;
-	else
-		enum isFieldwiseStruct = !hasCustomRepresentation!T;
-}
-
-private enum hasCustomRepresentation(T) = __traits(hasMember, T, "fromJson")
-	|| __traits(hasMember, T, "fromString") || __traits(hasMember, T, "fromRepresentation");
 
 /// Whether field `field` of struct `T` takes part in (de)serialization: a
 /// public, non-`@ignore`d instance field.
@@ -529,7 +509,7 @@ package(mcp) T bindString(T)(string raw, string path = "")
 /// read by member name.
 private T bindLeaf(T)(Json v, string path)
 {
-	import mcp.api.reflection : EnumByNamePolicy;
+	import mcp.protocol.schema : EnumByNamePolicy;
 	import vibe.data.json : JsonSerializer;
 	import vibe.data.serialization : deserializeWithPolicy;
 

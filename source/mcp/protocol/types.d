@@ -1232,8 +1232,8 @@ struct CallToolResult
 			throw invalidParams("structuredContent: expected a JSON object, got " ~ (
 					structuredContent.type == Json.Type.undefined
 					? "no structuredContent" : "a non-object value"));
-		import mcp.api.binding : isFieldwiseStruct;
-		import mcp.api.reflection : EnumByNamePolicy;
+		import mcp.protocol.jsonhelpers : isFieldwiseStruct;
+		import mcp.protocol.schema : EnumByNamePolicy;
 		import vibe.data.json : JsonSerializer;
 		import vibe.data.serialization : deserializeWithPolicy;
 
@@ -1305,8 +1305,8 @@ struct CallToolResult
 	/// human-readable content fallback for clients that ignore `structuredContent`.
 	static CallToolResult structured(T)(T value, Content[] content = null) @safe
 	{
-		import mcp.api.binding : isFieldwiseStruct;
-		import mcp.api.reflection : EnumByNamePolicy;
+		import mcp.protocol.jsonhelpers : isFieldwiseStruct;
+		import mcp.protocol.schema : EnumByNamePolicy;
 		import vibe.data.json : JsonSerializer;
 		import vibe.data.serialization : serializeWithPolicy;
 
@@ -3633,7 +3633,7 @@ struct ElicitResult
 	/// `enum` schema the reflection layer derives for them.
 	static ElicitResult accept(T)(T value) @safe
 	{
-		import mcp.api.reflection : EnumByNamePolicy;
+		import mcp.protocol.schema : EnumByNamePolicy;
 		import vibe.data.json : JsonSerializer;
 		import vibe.data.serialization : serializeWithPolicy;
 
@@ -3729,7 +3729,7 @@ struct ElicitResult
 	/// throws `McpException(invalidParams)`.
 	T contentAs(T)() const @safe
 	{
-		import mcp.api.reflection : EnumByNamePolicy;
+		import mcp.protocol.schema : EnumByNamePolicy;
 		import mcp.protocol.errors : invalidParams;
 		import vibe.data.json : JsonSerializer;
 		import vibe.data.serialization : deserializeWithPolicy;

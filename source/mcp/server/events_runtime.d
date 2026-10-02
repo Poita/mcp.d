@@ -77,7 +77,7 @@ final class EventHandle(A, P)
 {
 	import vibe.data.json : JsonSerializer;
 	import vibe.data.serialization : serializeWithPolicy, deserializeWithPolicy;
-	import mcp.api.reflection : EnumByNamePolicy;
+	import mcp.protocol.schema : EnumByNamePolicy;
 
 	private EventsRuntime rt_;
 	private EventRegistration reg_;

@@ -11,6 +11,28 @@ import vibe.data.json : Json;
 
 @safe:
 
+/// Whether struct `T` is (de)serialized field by field. Structs vibe serializes
+/// in a custom form (`std.datetime` types, `toJson`/`fromJson`, `toString`/
+/// `fromString`, `toRepresentation`/`fromRepresentation`) and the `Nullable` /
+/// `SumType` / `Json` wrappers are not.
+package(mcp) template isFieldwiseStruct(T)
+{
+	import std.datetime.date : Date, DateTime, TimeOfDay;
+	import std.datetime.systime : SysTime;
+	import std.sumtype : isSumType;
+	import std.traits : isInstanceOf;
+
+	static if (!is(T == struct) || is(T == Json) || isInstanceOf!(Nullable, T)
+			|| isSumType!T || is(T == SysTime) || is(T == DateTime)
+			|| is(T == Date) || is(T == TimeOfDay))
+		enum isFieldwiseStruct = false;
+	else
+		enum isFieldwiseStruct = !hasCustomRepresentation!T;
+}
+
+private enum hasCustomRepresentation(T) = __traits(hasMember, T, "fromJson")
+	|| __traits(hasMember, T, "fromString") || __traits(hasMember, T, "fromRepresentation");
+
 /// Returns true when `t` is a JSON type that can legitimately hold a value of
 /// type `T`. For integral `T`, both `Type.int_` and `Type.bigInt` are accepted:
 /// vibe.d parses JSON integers outside `long`'s range as `Type.bigInt`, and the

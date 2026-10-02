@@ -39,6 +39,31 @@ Json jsonSchemaOf(T)()
 	}
 }
 
+/// vibe.data serialization policy that maps any `enum` leaf to / from its
+/// member *name* (string), rather than vibe's default numeric base value.
+///
+/// Derived schemas describe enums as `{type:"string", enum:[names…]}`, so both
+/// directions of marshalling must agree: struct params/returns and bare-enum
+/// values are (de)serialized by-name. The policy only defines
+/// `toRepresentation`/`fromRepresentation` for enums, so vibe's
+/// `isPolicySerializable` is false for every other type and the default
+/// behaviour is preserved (it still recurses into nested struct/array fields,
+/// applying this rule to any enum found at any depth).
+template EnumByNamePolicy(T) if (is(T == enum))
+{
+	import std.conv : to;
+
+	static string toRepresentation(T v) @safe
+	{
+		return v.to!string;
+	}
+
+	static T fromRepresentation(string s) @safe
+	{
+		return s.to!T;
+	}
+}
+
 /// True when `F` is a scalar permitted as an elicitation form field: a
 /// bool/integer/floating/string/enum, a `Nullable` of one, or a flat array of a
 /// primitive enum (a multi-select). No nested objects or arrays of objects.
