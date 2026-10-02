@@ -1601,14 +1601,14 @@ private void handleGet(McpServer server, ServerPushChannel push, SessionManager 
 	// The standalone stream this GET would open is always text/event-stream. A
 	// well-behaved client signals it can consume that via Accept; a client whose
 	// Accept provably excludes text/event-stream could not read the stream, so
-	// answer with the spec-sanctioned GET alternative (405 Allow: POST) rather
-	// than opening a stream it cannot use. A missing Accept is treated
-	// permissively and still opens the stream.
+	// it is refused with 406 rather than opened; 405 would wrongly claim this
+	// mount does not serve GET. A missing Accept is treated permissively and
+	// still opens the stream.
 	if (!acceptsEventStream(req.headers.get("Accept", "")))
 	{
-		res.statusCode = HTTPStatus.methodNotAllowed;
-		res.headers["Allow"] = "POST";
-		res.writeBody("", "text/plain");
+		res.statusCode = HTTPStatus.notAcceptable;
+		res.writeBody("The standalone GET stream is text/event-stream;"
+				~ " Accept must admit text/event-stream", "text/plain");
 		return;
 	}
 
@@ -4739,6 +4739,21 @@ version (unittest) private HTTPServerRequest sessionReq(HTTPMethod method,
 	auto req = makeInitPostReq(body_, h);
 	req.method = method;
 	return req;
+}
+
+unittest  // a stateful GET whose Accept excludes text/event-stream is 406, not 405
+{
+	import vibe.http.server : createTestHTTPServerResponse, TestHTTPResponseMode;
+	import vibe.stream.memory : createMemoryOutputStream;
+
+	auto router = new URLRouter;
+	mountMcp(router, McpServer.stateful("t", "1"));
+	const sid = initSession(router);
+	auto res = createTestHTTPServerResponse(createMemoryOutputStream(), null,
+			TestHTTPResponseMode.bodyOnly);
+	router.handleRequest(sessionReq(HTTPMethod.GET, sid, "", "application/json"), res);
+	assert(res.statusCode == HTTPStatus.notAcceptable);
+	assert("Allow" !in res.headers, "GET is a supported method on a stateful mount");
 }
 
 unittest  // two mounts of one stateful server keep each session's events on its own streams
