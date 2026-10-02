@@ -434,9 +434,15 @@ private Json parametersSchema(alias func)() @safe
 									.stringof ~ "; x-mcp-header permits only integer/string/boolean (or Nullable thereof)");
 							ps["x-mcp-header"] = attr.name;
 						}
-				// Fold the @describeParam UDA into the property's JSON Schema
-				// `description` (a standard annotation keyword, valid in every
-				// protocol version).
+				// Fold the parameter's @fieldDescription, then the method's
+				// @describeParam for it (which takes precedence), into the
+				// property's JSON Schema `description` (a standard annotation
+				// keyword, valid in every protocol version).
+				static foreach (attr; ParamAttributes!(func, i))
+				{
+					static if (is(typeof(attr) == fieldDescription))
+						ps["description"] = attr.value;
+				}
 				{
 					enum d = describeFor!(func, names[i]);
 					static if (d.length)
@@ -4540,6 +4546,23 @@ unittest  // an omitted @schemaDefault argument binds to the advertised default
 	assert(r["structuredContent"]["result"].get!int == 13, r.toString);
 	r = callToolArgs(s, "sum", `{"n":1,"x":0,"y":0}`);
 	assert(r["structuredContent"]["result"].get!int == 1, r.toString);
+}
+
+version (unittest) private final class FieldDescriptionParamApi
+{
+	@tool("find", "Find things")
+	@describeParam("limit", "page size")
+	string find(@fieldDescription("search text") string q, @fieldDescription("ignored") int limit)@safe
+	{
+		return q;
+	}
+}
+
+unittest  // @fieldDescription on a parameter is its description, and @describeParam wins over it
+{
+	auto props = parametersSchema!(FieldDescriptionParamApi.find)()["properties"];
+	assert(props["q"]["description"].get!string == "search text", props.toString);
+	assert(props["limit"]["description"].get!string == "page size", props.toString);
 }
 
 unittest  // a JSON Schema facet on a handler method is rejected at compile time
