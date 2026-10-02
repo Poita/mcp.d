@@ -3,6 +3,7 @@ module mcp.transport.stdio;
 import core.time : Duration, seconds;
 import vibe.data.json : Json;
 
+import mcp.protocol.jsonrpc : Message;
 import mcp.server.server;
 import mcp.server.settings : ServerSettings;
 import mcp.transport.coordinator : defaultServerRequestTimeout;
@@ -66,8 +67,8 @@ void serveStdio(McpServer server, string delegate() @safe readLine,
 
 	// Count of dispatched-but-not-yet-finished request handler tasks. Cooperative
 	// vibe tasks on one thread never preempt each other between yield points, so a
-	// plain counter (incremented before runTask, decremented in the handler's
-	// finally) needs no atomics. After the read loop ends at EOF we drain this to
+	// plain counter (incremented when a handler starts, decremented when it ends)
+	// needs no atomics. After the read loop ends at EOF we drain this to
 	// zero under a bounded grace period so an already-computed reply still flushes
 	// through channel.sendRaw before the loop tears down.
 	auto inflight = new InflightCount;
@@ -138,18 +139,15 @@ void serveStdio(McpServer server, string delegate() @safe readLine,
 					startTicker();
 				return;
 			}
-			// Dispatch the request in its own task so a blocking/long-running handler
-			// (server->client request, cancellation poll loop) does not stall the
-			// read loop. The handler's notifications + reply ride `channel.send`.
-			// Track it as in-flight so EOF cannot abandon a handler that has computed
-			// its reply but not yet written it.
+			// The channel already runs this on its own task, so a blocking or
+			// long-running handler (server->client request, cancellation poll loop)
+			// does not stall the read loop. The handler's notifications + reply ride
+			// `channel.send`. Track it as in-flight so EOF cannot abandon a handler
+			// that has computed its reply but not yet written it.
 			inflight.start();
-			runTask((Message msg) nothrow{
-				scope (exit)
-					inflight.finish();
-				auto ctx = new StdioContextFactoryReply(server, &sink, &serverRequest, msg);
-				ctx.run(channel);
-			}, m);
+			scope (exit)
+				inflight.finish();
+			replyToRequest(server, &sink, &serverRequest, m, channel);
 			break;
 		case MessageKind.notification:
 			// The channel already runs this on its own task, started immediately, so
@@ -252,74 +250,53 @@ private final class InflightCount
 	}
 }
 
-/// Helper that dispatches one inbound stdio request through the server with a
-/// `StdioContext`, then writes the reply (if any) on the channel. Kept as a small
-/// class so the per-request closure captured by `runTask` has a stable `this`.
-private final class StdioContextFactoryReply
+/// Dispatch one inbound stdio request `msg` through `server` with a
+/// `StdioContext`, then write its reply (if any) on `channel`. A dispatch that
+/// throws is reported and answered with a -32603 error so the peer does not wait
+/// forever; a reply that cannot be written is reported.
+private void replyToRequest(McpServer server, void delegate(string) @safe sink,
+		Json delegate(string, Json) @safe serverRequest, Message msg, DuplexChannel channel) @safe nothrow
 {
-	import vibe.data.json : Json;
-	import mcp.protocol.jsonrpc : Message;
+	import std.typecons : Nullable;
+	import mcp.protocol.errors : internalError;
+	import mcp.protocol.jsonrpc : makeErrorResponse;
+	import mcp.server.context : StdioContext;
+	import mcp.transport.sse_context : extractProgressToken;
 
-	private McpServer server;
-	private void delegate(string) @safe sink;
-	private Json delegate(string, Json) @safe serverRequest;
-	private Message msg;
-
-	this(McpServer server, void delegate(string) @safe sink, Json delegate(string,
-			Json) @safe serverRequest, Message msg) @safe nothrow
-	{
-		this.server = server;
-		this.sink = sink;
-		this.serverRequest = serverRequest;
-		this.msg = msg;
-	}
-
-	/// Dispatch `msg` and write its reply. A dispatch that throws is reported
-	/// and answered with a -32603 error so the peer does not wait forever; a
-	/// reply that cannot be written is reported.
-	void run(DuplexChannel channel) @safe nothrow
-	{
-		import std.typecons : Nullable;
-		import mcp.protocol.errors : internalError;
-		import mcp.protocol.jsonrpc : makeErrorResponse;
-		import mcp.server.context : StdioContext;
-		import mcp.transport.sse_context : extractProgressToken;
-
-		Nullable!Json reply;
-		try
-		{
-			// The channel has already parsed and classified `msg`, so it is dispatched
-			// directly against the bound connection rather than re-serialised for
-			// `handleRaw` to parse again.
-			auto ctx = new StdioContext(sink, serverRequest, server.clientCapabilities,
-					extractProgressToken(msg.params),
-					server.negotiatedVersion, server.mode == ServerMode.stateless);
-			reply = server.handle(msg, ctx);
-		}
-		catch (Exception e)
-		{
-			channel.reportError("request " ~ idText() ~ ": " ~ e.msg);
-			try
-				reply = makeErrorResponse(msg.id, internalError("request handling failed"));
-			catch (Exception)
-			{
-			}
-		}
-		if (reply.isNull)
-			return;
-		try
-			channel.sendRaw(reply.get.toString());
-		catch (Exception e)
-			channel.reportError("request " ~ idText() ~ ": reply write failed: " ~ e.msg);
-	}
-
-	private string idText() @safe nothrow
+	string idText() @safe nothrow
 	{
 		try
 			return msg.id.toString();
 		catch (Exception)
 			return "?";
 	}
+
+	Nullable!Json reply;
+	try
+	{
+		// The channel has already parsed and classified `msg`, so it is dispatched
+		// directly against the bound connection rather than re-serialised for
+		// `handleRaw` to parse again.
+		auto ctx = new StdioContext(sink, serverRequest, server.clientCapabilities,
+				extractProgressToken(msg.params),
+				server.negotiatedVersion, server.mode == ServerMode.stateless);
+		reply = server.handle(msg, ctx);
+	}
+	catch (Exception e)
+	{
+		channel.reportError("request " ~ idText() ~ ": " ~ e.msg);
+		try
+			reply = makeErrorResponse(msg.id, internalError("request handling failed"));
+		catch (Exception)
+		{
+		}
+	}
+	if (reply.isNull)
+		return;
+	try
+		channel.sendRaw(reply.get.toString());
+	catch (Exception e)
+		channel.reportError("request " ~ idText() ~ ": reply write failed: " ~ e.msg);
 }
 
 /// Static options for the stdio server transport, bundled into one value so
