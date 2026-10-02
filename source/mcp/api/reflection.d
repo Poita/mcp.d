@@ -2,7 +2,7 @@ module mcp.api.reflection;
 
 import std.traits;
 import std.typecons : Tuple, Nullable, nullable;
-import std.meta : AliasSeq;
+import std.meta : AliasSeq, staticMap;
 
 import vibe.data.json : Json, serializeToJson, deserializeJson, JsonSerializer;
 import vibe.data.serialization : serializeWithPolicy, deserializeWithPolicy;
@@ -165,6 +165,11 @@ void registerModules(mods...)(McpServer server) @safe
 		registerModule!mod(server);
 }
 
+/// The parameter types of `func` with top-level qualifiers removed, so an `in`,
+/// `const`, or `immutable` parameter's argument can be bound into a mutable slot
+/// before the call.
+private alias BoundParameters(alias func) = staticMap!(Unqual, Parameters!func);
+
 /// Reject any method-level `@describeParam` or `@mcpHeader` UDA whose
 /// `parameter` does not name a schema parameter of `func`. A parameter that is
 /// not declared at all, or one that is an injected context parameter (a trailing
@@ -175,7 +180,7 @@ void registerModules(mods...)(McpServer server) @safe
 private void validateParamUdas(alias func)()
 {
 	alias names = ParameterIdentifierTuple!func;
-	alias types = Parameters!func;
+	alias types = BoundParameters!func;
 
 	// Whether `pname` names a parameter of `func` that appears in the input
 	// schema (declared, and not an injected RequestContext / TaskContext).
@@ -239,7 +244,7 @@ private Json parametersSchema(alias func)() @safe
 	validateParamUdas!func();
 
 	alias names = ParameterIdentifierTuple!func;
-	alias types = Parameters!func;
+	alias types = BoundParameters!func;
 	// ParameterDefaultValueTuple yields `void` for a parameter with no declared
 	// D-level default and the default value's type otherwise.
 	alias defs = ParameterDefaultValueTuple!func;
@@ -267,7 +272,7 @@ private Json parametersSchema(alias func)() @safe
 				import jsonschema.vibejson : nodeToVibeJson;
 
 				auto psNode = schemaNode!(P, true)();
-				applyUdaFacets!(__traits(getAttributes, types[i .. i + 1]))(psNode);
+				applyUdaFacets!(__traits(getAttributes, Parameters!func[i .. i + 1]))(psNode);
 				Json ps = nodeToVibeJson(psNode);
 				// Modern x-mcp-header: a method-level @mcpHeader(parameter, name)
 				// naming this parameter mirrors it into an `Mcp-Param-<name>`
@@ -574,13 +579,13 @@ private Nullable!CacheHint collectCache(alias overload)() @safe
 /// value that cannot be converted; the caller reports it as an `isError` result,
 /// the classification this SDK uses for tool input failures. An `McpException`
 /// raised while binding propagates unchanged.
-private string bindToolArgs(alias overload)(Json args, ref Tuple!(Parameters!overload) argv) @safe
+private string bindToolArgs(alias overload)(Json args, ref Tuple!(BoundParameters!overload) argv) @safe
 {
 	import mcp.protocol.errors : McpException;
 
 	alias names = ParameterIdentifierTuple!overload;
 	alias defs = ParameterDefaultValueTuple!overload;
-	static foreach (i, P; Parameters!overload)
+	static foreach (i, P; BoundParameters!overload)
 	{
 		static if (!is(P : RequestContext) && !is(P == TaskContext))
 		{
@@ -608,7 +613,7 @@ private void registerToolMethod(string memberName, alias overload, alias parent)
 {
 	import std.traits : ReturnType;
 
-	static foreach (P; Parameters!overload)
+	static foreach (P; BoundParameters!overload)
 	{
 		static assert(!is(P == TaskContext), "@tool method '" ~ memberName
 				~ "' must not take a TaskContext; declare it with @task to run as a task.");
@@ -664,8 +669,8 @@ private void registerToolMethod(string memberName, alias overload, alias parent)
 	}
 
 	server.registerTool(descriptor, (Json args, RequestContext ctx) @safe {
-		Tuple!(Parameters!overload) argv;
-		static foreach (i, P; Parameters!overload)
+		Tuple!(BoundParameters!overload) argv;
+		static foreach (i, P; BoundParameters!overload)
 			static if (is(P : RequestContext))
 				argv[i] = ctx;
 		if (auto failure = bindToolArgs!overload(args, argv))
@@ -699,7 +704,7 @@ private void registerTaskMethod(string memberName, alias overload, alias parent)
 	// A task executor runs asynchronously, after the originating request has
 	// already returned a task handle — there is no live RequestContext to inject.
 	// Task methods observe progress/cancellation/input through a TaskContext.
-	static foreach (P; Parameters!overload)
+	static foreach (P; BoundParameters!overload)
 	{
 		static assert(!is(P : RequestContext),
 				"@task method '" ~ memberName ~ "' must not take a RequestContext "
@@ -765,8 +770,8 @@ private void registerTaskMethod(string memberName, alias overload, alias parent)
 	// propagates to runTaskExecutor, which fails the task; a
 	// `tc.requireInput(...)` suspends it.
 	server.registerTaskTool(descriptor, (TaskContext tc) @safe {
-		Tuple!(Parameters!overload) argv;
-		static foreach (i, P; Parameters!overload)
+		Tuple!(BoundParameters!overload) argv;
+		static foreach (i, P; BoundParameters!overload)
 			static if (is(P == TaskContext))
 				argv[i] = tc;
 		if (auto failure = bindToolArgs!overload(tc.inputJson(), argv))
@@ -854,7 +859,7 @@ private void registerPromptMethod(string memberName, alias overload, alias paren
 		descriptor.description = nullable(attr.description);
 	alias names = ParameterIdentifierTuple!overload;
 	alias defs = ParameterDefaultValueTuple!overload;
-	static foreach (i, P; Parameters!overload)
+	static foreach (i, P; BoundParameters!overload)
 	{
 		static if (!is(P : RequestContext))
 		{
@@ -876,8 +881,8 @@ private void registerPromptMethod(string memberName, alias overload, alias paren
 		import mcp.protocol.errors : McpException, invalidParams;
 		import mcp.server.responses : PromptResponse;
 
-		Tuple!(Parameters!overload) argv;
-		static foreach (i, P; Parameters!overload)
+		Tuple!(BoundParameters!overload) argv;
+		static foreach (i, P; BoundParameters!overload)
 		{
 			// A declared RequestContext parameter binds to the real per-request
 			// context so context-dependent features (logging, cancellation,
@@ -999,7 +1004,7 @@ private void registerTemplateMethod(string memberName, alias overload,
 
 	// Every bound parameter must name a template variable; any other name would
 	// silently receive an empty or default value on every read.
-	static foreach (i, P; Parameters!overload)
+	static foreach (i, P; BoundParameters!overload)
 	{
 		static if (!is(P : RequestContext))
 		{
@@ -1018,8 +1023,8 @@ private void registerTemplateMethod(string memberName, alias overload,
 		import mcp.protocol.errors : invalidParams;
 
 		alias names = ParameterIdentifierTuple!overload;
-		Tuple!(Parameters!overload) argv;
-		static foreach (i, P; Parameters!overload)
+		Tuple!(BoundParameters!overload) argv;
+		static foreach (i, P; BoundParameters!overload)
 		{
 			// A declared RequestContext parameter binds to the real per-request
 			// context so context-dependent features work from resource templates,
@@ -3830,4 +3835,56 @@ unittest  // a @resource method that takes parameters is rejected at compile tim
 {
 	auto s = new McpServer("t", "1");
 	static assert(!__traits(compiles, registerHandlers(s, new ParamResourceApi)));
+}
+
+version (unittest) private final class QualifiedParamApi
+{
+	@tool("repeat", "Repeat a string")
+	string repeat(in string s, const int n, immutable bool loud) @safe
+	{
+		import std.array : replicate;
+
+		return loud ? s.replicate(n) ~ "!" : s.replicate(n);
+	}
+
+	@prompt("greet", "Greet someone")
+	string greet(in string name, const int times) @safe
+	{
+		import std.conv : to;
+
+		return name ~ times.to!string;
+	}
+
+	@resourceTemplate("q://{id}", "Q", "text/plain")
+	string q(const int id, const RequestContext ctx) @safe
+	{
+		import std.conv : to;
+
+		return "q-" ~ id.to!string;
+	}
+}
+
+unittest  // handlers with in/const/immutable parameters register and dispatch
+{
+	import mcp.protocol.jsonrpc : Message, makeRequest;
+
+	auto s = new McpServer("t", "1");
+	registerHandlers(s, new QualifiedParamApi);
+
+	Json tp = Json.emptyObject;
+	tp["name"] = "repeat";
+	tp["arguments"] = parseJsonString(`{"s":"ab","n":2,"loud":true}`);
+	auto tr = s.handle(Message(makeRequest(Json(1), "tools/call", tp))).get;
+	assert(tr["result"]["content"][0]["text"].get!string == "abab!", tr.toString);
+
+	Json pp = Json.emptyObject;
+	pp["name"] = "greet";
+	pp["arguments"] = parseJsonString(`{"name":"Sam","times":"3"}`);
+	auto pr = s.handle(Message(makeRequest(Json(2), "prompts/get", pp))).get;
+	assert(pr["result"]["messages"][0]["content"]["text"].get!string == "Sam3", pr.toString);
+
+	Json rp = Json.emptyObject;
+	rp["uri"] = "q://7";
+	auto rr = s.handle(Message(makeRequest(Json(3), "resources/read", rp))).get;
+	assert(rr["result"]["contents"][0]["text"].get!string == "q-7", rr.toString);
 }
