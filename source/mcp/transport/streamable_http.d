@@ -113,6 +113,11 @@ struct StreamableHttpOptions
 	/// is mounted more than once, the first mount's value applies to every mount.
 	Duration serverRequestTimeout = defaultServerRequestTimeout;
 
+	/// Stateful servers only: how much SSE stream history is kept so a client
+	/// can resume a dropped stream with `Last-Event-ID`. When one server is
+	/// mounted more than once, the first mount's value applies to every mount.
+	ReplayHistoryOptions replayHistory;
+
 	/// Stateful servers only: a session with no request and no open GET stream
 	/// for this long is expired (`Duration.zero` disables expiry).
 	Duration sessionIdleTtl = SessionManager.defaultIdleTtl;
@@ -199,7 +204,7 @@ void mountMcp(URLRouter router, McpServer server,
 	// mounts. The first mount's `serverRequestTimeout` applies.
 	auto fresh = new StreamCoordinator;
 	fresh.requestTimeout = opts.serverRequestTimeout;
-	auto push = ensurePushChannel(server, fresh);
+	auto push = ensurePushChannel(server, fresh, opts.replayHistory);
 	auto coord = push.coordinator;
 	// Session minting is derived from the server's mode: a `stateful`
 	// server mints/tracks an `Mcp-Session-Id`; a `stateless` server never does.
