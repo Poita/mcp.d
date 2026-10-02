@@ -2251,6 +2251,23 @@ private void refuseTooManyPushStreams(HTTPServerResponse res, Json id) @safe
 			internalError("too many open notification streams")).toString(), "application/json");
 }
 
+/// The token a POST's request is scoped by (its cancellation, server->client
+/// waiter and replay-owner key): the session an `initialize` just minted, else
+/// `headerScope`, the scope the request's own headers name. A stateful
+/// `initialize` may carry a stale or foreign `Mcp-Session-Id`, which must never
+/// own the new session's stream.
+private string requestScope(string headerScope, string mintedSessionId) @safe pure nothrow
+{
+	return mintedSessionId.length ? mintedSessionId : headerScope;
+}
+
+unittest  // a stateful initialize is scoped by its minted session, never the header's
+{
+	assert(requestScope("stale-or-foreign", "minted") == "minted");
+	assert(requestScope("", "minted") == "minted");
+	assert(requestScope("sess", "") == "sess");
+}
+
 private void handlePost(McpServer server, StreamCoordinator coord,
 		SessionManager sessions, StatelessInFlight statelessInFlight,
 		StreamGate pushStreams, size_t maxQueued,
@@ -2574,10 +2591,10 @@ private void handlePost(McpServer server, StreamCoordinator coord,
 		// is refused inside the context and surfaced as 406 below, rather than
 		// emitting an SSE body the client declared it cannot read.
 		const reqAcceptsSse = acceptsEventStream(req.headers.get("Accept", ""));
-		auto ctx = new HttpStreamContext(res, coord, clientCapsFor(server, reqState),
-				extractProgressToken(msg.params),
-				token, isModernReq, effVersion, cancelScope, reqState,
-				server.mode == ServerMode.stateless, reqAcceptsSse);
+		auto ctx = new HttpStreamContext(res, coord, clientCapsFor(server,
+				reqState), extractProgressToken(msg.params),
+				token, isModernReq, effVersion, requestScope(cancelScope, mintedSessionId),
+				reqState, server.mode == ServerMode.stateless, reqAcceptsSse);
 		// A session-bound 2025-11-25 stream advertises resumability with its
 		// priming event, so record its events for a GET Last-Event-ID resume.
 		if (sessions !is null && sendsPrimingEvent(effVersion))
