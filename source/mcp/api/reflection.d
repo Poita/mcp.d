@@ -99,7 +99,10 @@ private void registerAnnotatedMembers(alias root, alias parent)(McpServer server
 			static foreach (overload; __traits(getOverloads, root, memberName))
 			{
 				static if (hasHandlerUda!overload())
+				{
 					checkHandlerSafety!(memberName, overload)();
+					checkMethodFacets!(memberName, overload)();
+				}
 				static foreach (attr; __traits(getAttributes, overload))
 				{
 					static if (is(attr))
@@ -198,6 +201,47 @@ void registerModules(mods...)(McpServer server) @safe
 /// `const`, or `immutable` parameter's argument can be bound into a mutable slot
 /// before the call.
 private alias BoundParameters(alias func) = staticMap!(Unqual, Parameters!func);
+
+/// The UDAs attached to parameter `i` of `func`. The compiler reports the
+/// attributes of a parameter that carries any prefixed by those of `func`
+/// itself, so that prefix is dropped.
+private template ParamAttributes(alias func, size_t i)
+{
+	alias all = AliasSeq!(__traits(getAttributes, Parameters!func[i .. i + 1]));
+	alias own = AliasSeq!(__traits(getAttributes, func));
+	static if (own.length && all.length > own.length
+			&& AliasSeq!(all[0 .. own.length]).stringof == own.stringof)
+		alias ParamAttributes = all[own.length .. $];
+	else
+		alias ParamAttributes = all;
+}
+
+/// Whether `A` is one of the `jsonschema` facet UDA types, which describe a
+/// parameter or struct field.
+private template isSchemaFacet(A)
+{
+	import jsonschema.attributes : Maximum, Minimum, SchemaDefault, fieldDescription,
+		format, maxItems, maxLength, minItems, minLength, pattern, title;
+
+	enum isSchemaFacet = isInstanceOf!(Minimum, A) || isInstanceOf!(Maximum, A)
+		|| isInstanceOf!(SchemaDefault, A) || is(A == fieldDescription)
+		|| is(A == format) || is(A == maxItems) || is(A == maxLength)
+		|| is(A == minItems) || is(A == minLength) || is(A == pattern) || is(A == title);
+}
+
+/// Reject a JSON Schema facet UDA attached to the handler method `f` itself:
+/// facets describe a parameter or struct field, and on a method they would
+/// match nothing.
+private void checkMethodFacets(string memberName, alias f)()
+{
+	static foreach (attr; __traits(getAttributes, f))
+		static if (!is(attr))
+			static assert(!isSchemaFacet!(typeof(attr)),
+					"@" ~ attr.stringof ~ " on '" ~ memberName
+					~ "' is a JSON Schema facet, which applies to a parameter "
+					~ "or struct field, not a method; attach it to the parameter (for a "
+					~ "display title use @tool's title argument or @hintTitle)");
+}
 
 /// The wire names of `func`'s parameters, in order: each identifier with one
 /// trailing underscore dropped (see `wireName`), the names the input schema,
@@ -351,7 +395,7 @@ private Json parametersSchema(alias func)() @safe
 					auto psNode = schemaNode!(TemplateArgsOf!P[0], SchemaUse.input)();
 				else
 					auto psNode = schemaNode!(P, SchemaUse.input)();
-				applyUdaFacets!(__traits(getAttributes, Parameters!func[i .. i + 1]))(psNode);
+				applyUdaFacets!(ParamAttributes!(func, i))(psNode);
 				Json ps = nodeToVibeJson(psNode);
 				// Modern x-mcp-header: a method-level @mcpHeader(parameter, name)
 				// naming this parameter mirrors it into an `Mcp-Param-<name>`
@@ -4421,4 +4465,38 @@ unittest  // a string-based enum parameter is advertised and bound by member nam
 	assert(props["fallback"]["default"].get!string == "soft", props.toString);
 	auto r = callToolArgs(s, "speak", `{"tone":"loud"}`);
 	assert(r["content"][0]["text"].get!string == "loud/soft", r.toString);
+}
+
+version (unittest) private final class MethodUdaParamApi
+{
+	@tool("f", "f")
+	@hintTitle("Nice") @describeParam("y", "why") @readOnly string f(@minimum(1) int x, int y)@safe
+	{
+		return "";
+	}
+}
+
+unittest  // a parameter's attributes exclude the attributes of its function
+{
+	alias f = MethodUdaParamApi.f;
+	static assert(ParamAttributes!(f, 0).length == 1);
+	static assert(is(typeof(ParamAttributes!(f, 0)[0]) == typeof(minimum(1))));
+	static assert(ParamAttributes!(f, 1).length == 0);
+	auto props = parametersSchema!f()["properties"];
+	assert(props["x"].length == 2 && props["x"]["minimum"].get!long == 1, props.toString);
+}
+
+version (unittest) private final class MethodTitleApi
+{
+	@tool("f", "f") @title("Nice")
+	string f(int x) @safe
+	{
+		return "";
+	}
+}
+
+unittest  // a JSON Schema facet on a handler method is rejected at compile time
+{
+	auto s = new McpServer("t", "1");
+	static assert(!__traits(compiles, registerHandlers(s, new MethodTitleApi)));
 }

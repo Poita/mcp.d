@@ -452,7 +452,10 @@ struct meta
 /// MCP users get them from `mcp.api.attributes` alongside the MCP-specific UDAs,
 /// and so the type identity matches what `jsonschema` matches against. The
 /// `format` facet is re-exported as `schemaFormat` so `import mcp;` does not
-/// collide with `std.format.format`.
+/// collide with `std.format.format`. They attach to a handler parameter or a
+/// struct field; one attached to a handler method is a compile error (a tool's
+/// display title is `@tool`'s `title` argument, or `@hintTitle` for its
+/// annotations).
 public import jsonschema : fieldDescription, minimum, maximum, title, schemaFormat = format,
 	minLength, maxLength, pattern, minItems, maxItems, SchemaDefault, schemaDefault;
 
