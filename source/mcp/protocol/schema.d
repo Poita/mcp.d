@@ -56,7 +56,7 @@ template isElicitScalar(F)
 
 /// True when `T` is a flat struct whose every field is an `isElicitScalar`, i.e. a
 /// valid type to derive an elicitation form `requestedSchema` from (via
-/// `jsonSchemaOf!T`). Used by `RequestContext.elicit!T` and `elicitationRequest!T`
+/// `elicitationSchemaOf!T`). Used by `RequestContext.elicit!T` and `elicitationRequest!T`
 /// to reject nested/array structs at compile time.
 template isFlatElicitationStruct(T)
 {
@@ -69,7 +69,7 @@ template isFlatElicitationStruct(T)
 }
 
 /// Build a form-`elicitation` `InputRequest` whose `requestedSchema` is derived
-/// from the flat struct `T` via `jsonSchemaOf!T` (same compile-time flat-struct
+/// from the flat struct `T` via `elicitationSchemaOf!T` (same compile-time flat-struct
 /// restriction as `RequestContext.elicit!T`). This convenience lives beside
 /// `jsonSchemaOf` because deriving a schema from a D type is reflection work; the
 /// `InputRequest.elicitation(string, string, Json)` overload in `mcp.protocol.mrtr`
@@ -80,7 +80,27 @@ auto elicitationRequest(T)(string id, string message) @safe
 
 	static assert(isFlatElicitationStruct!T, "elicitationRequest!T requires a flat struct of scalar fields (string/number/integer/boolean/enum); " ~ T
 			.stringof ~ " has a nested or non-scalar field");
-	return InputRequest.elicitation(id, message, jsonSchemaOf!T);
+	return InputRequest.elicitation(id, message, elicitationSchemaOf!T);
+}
+
+/// The elicitation form `requestedSchema` for the flat struct `T`. Elicitation
+/// properties must be primitive schemas, so a `Nullable` field renders as its
+/// bare primitive (no `anyOf` null branch) and is optional by being absent
+/// from `required`.
+Json elicitationSchemaOf(T)()
+{
+	import jsonschema : generate = jsonSchemaOf, GeneratorSettings;
+	import jsonschema.vibejson : nodeToVibeJson;
+
+	static assert(isFlatElicitationStruct!T, "elicitationSchemaOf!T requires a flat struct of scalar fields (string/number/integer/boolean/enum); " ~ T
+			.stringof ~ " has a nested or non-scalar field");
+	enum settings = () {
+		GeneratorSettings s;
+		s.inlineSubschemas = true;
+		s.nullableOmitsNull = true;
+		return s;
+	}();
+	return nodeToVibeJson(generate!(T, settings)());
 }
 
 @safe unittest  // elicitationRequest!T derives requestedSchema from a flat struct
@@ -96,7 +116,25 @@ auto elicitationRequest(T)(string id, string message) @safe
 	auto ir = elicitationRequest!Details("e2", "Details?");
 	assert(ir.type == "elicitation");
 	assert(ir.params["message"].get!string == "Details?");
-	assert(ir.params["requestedSchema"] == jsonSchemaOf!Details);
+	assert(ir.params["requestedSchema"] == elicitationSchemaOf!Details);
+}
+
+@safe unittest  // elicitationRequest!T renders a Nullable field as a bare primitive, optional via required
+{
+	import std.typecons : Nullable;
+
+	static struct Contact
+	{
+		string name;
+		Nullable!int age;
+	}
+
+	const schema = elicitationRequest!Contact("e3", "Contact?").params["requestedSchema"];
+	const age = schema["properties"]["age"];
+	assert(age["type"].get!string == "integer");
+	assert("anyOf" !in age);
+	assert(schema["required"].length == 1 && schema["required"][0].get!string == "name");
+	assert(elicitationSchemaOf!Contact == schema);
 }
 
 @safe unittest  // elicitationRequest!T rejects a non-flat struct at compile time

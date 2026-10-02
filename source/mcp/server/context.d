@@ -7,7 +7,7 @@ import mcp.protocol.errors;
 import mcp.protocol.sampling : CreateMessageRequest, CreateMessageResult;
 import mcp.protocol.types : ListRootsResult, ElicitResult, ElicitAction, LogLevel, shouldLog;
 import mcp.protocol.capabilities : ClientCapabilities, ClientCapability;
-import mcp.protocol.schema : jsonSchemaOf, isFlatElicitationStruct;
+import mcp.protocol.schema : elicitationSchemaOf, isFlatElicitationStruct;
 import mcp.auth.resource_server : TokenInfo;
 import mcp.protocol.jsonrpc : makeNotification;
 import mcp.protocol.versions : ProtocolVersion, latestLegacy, supportsProgressMessage;
@@ -261,7 +261,7 @@ interface RequestContext
 	}
 
 	/// Typed convenience over `elicit(string, Json)`: derive the form
-	/// `requestedSchema` from the flat struct `T` via `jsonSchemaOf!T`, send the
+	/// `requestedSchema` from the flat struct `T` via `elicitationSchemaOf!T`, send the
 	/// elicitation, and return the typed `ElicitResult`. On an `accept`, decode
 	/// the collected values with `result.contentAs!T`. `T` must be a flat struct
 	/// of scalar fields (string / number / integer / boolean / enum, optionally
@@ -271,7 +271,7 @@ interface RequestContext
 	{
 		static assert(isFlatElicitationStruct!T, "elicit!T requires a flat struct of scalar fields (string/number/integer/boolean/enum); " ~ T
 				.stringof ~ " has a nested or non-scalar field");
-		return elicit(message, jsonSchemaOf!T);
+		return elicit(message, elicitationSchemaOf!T);
 	}
 
 	/// Request URL-mode elicitation from the client (`elicitation/create` with
@@ -1045,9 +1045,9 @@ unittest  // form-mode elicit() returns a typed ElicitResult with the parsed act
 	assert(r.action == ElicitAction.accept);
 }
 
-unittest  // elicit!T derives requestedSchema from the struct via jsonSchemaOf
+unittest  // elicit!T derives requestedSchema from the struct via elicitationSchemaOf
 {
-	import mcp.protocol.schema : jsonSchemaOf;
+	import mcp.protocol.schema : elicitationSchemaOf;
 
 	static struct TripDetails
 	{
@@ -1059,7 +1059,7 @@ unittest  // elicit!T derives requestedSchema from the struct via jsonSchemaOf
 	ElicitResult r = probe.elicit!TripDetails("Trip details?");
 	assert(probe.lastMethod == "elicitation/create");
 	assert(probe.lastParams["message"].get!string == "Trip details?");
-	assert(probe.lastParams["requestedSchema"] == jsonSchemaOf!TripDetails);
+	assert(probe.lastParams["requestedSchema"] == elicitationSchemaOf!TripDetails);
 	assert(r.action == ElicitAction.accept);
 }
 

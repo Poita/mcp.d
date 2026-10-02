@@ -603,8 +603,8 @@ is predictable when porting a hand-built server):
 | `std.datetime` `SysTime` / `Date` | `{"type": "string", "format": "date-time"/"date"}` |
 | `std.datetime` `DateTime` / `TimeOfDay` | `{"type": "string", "pattern": …}` matching `YYYY-MM-DDTHH:MM:SS` / `HH:MM:SS` (no UTC offset, so not the RFC 3339 `date-time`/`time` formats) |
 | `SumType!(A, B, …)` | `{"anyOf": [<A>, <B>, …]}` |
-| `Nullable!T` (tool parameter) | `<T>`, made optional by omission from `required` |
-| `Nullable!T` (output / elicitation schema) | `{"anyOf": [<T>, {"type": "null"}]}` |
+| `Nullable!T` (tool parameter / elicitation field) | `<T>`, made optional by omission from `required` |
+| `Nullable!T` (output schema) | `{"anyOf": [<T>, {"type": "null"}]}` |
 
 Integer types map to `"integer"` (not `"number"`) deliberately — it is the more
 precise constraint; use `double` for a field that should accept fractional values.
