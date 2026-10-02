@@ -150,6 +150,22 @@ enum idempotent;
 /// (`ToolAnnotations.openWorldHint`). Presence = `true`; absence = unset.
 enum openWorld;
 
+/// Marker UDA on a struct bound from tool arguments making every field
+/// optional: an omitted field keeps the struct's own default. Without it a
+/// field is required unless it is `Nullable`, vibe-`@optional`, or has an
+/// initializer differing from its type's `.init` — so `bool verbose = false;`
+/// is required, as D cannot tell that initializer from none.
+///
+/// Example:
+/// ---
+/// @allOptional struct ListOptions
+/// {
+///     bool verbose = false;
+///     int depth;
+/// }
+/// ---
+enum allOptional;
+
 /// Positional value UDA setting the annotation-level display title
 /// (`ToolAnnotations.title`), distinct from `@tool`'s 3rd argument
 /// (`Tool.title`). Attach alongside `@tool`.

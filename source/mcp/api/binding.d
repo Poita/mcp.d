@@ -4,12 +4,12 @@
 /// `schemaOf!T` describes `T` the way vibe serializes it, and `bindJson!T` converts
 /// an inbound JSON value into `T` following the same optionality rules the
 /// reflected input schema advertises: a struct field is required unless it is
-/// `Nullable`, carries vibe's `@optional`, or has a declared default (a
-/// `@schemaDefault` UDA or an initializer differing from its type's `.init`). An
-/// omitted optional field keeps its default. Struct fields are keyed by their
-/// serialized name (vibe's `@name`, else the field name with one trailing
-/// underscore stripped), and `@ignore`d fields are skipped. Enums are read by
-/// member name at any depth.
+/// `Nullable`, carries vibe's `@optional`, has a declared default (a
+/// `@schemaDefault` UDA or an initializer differing from its type's `.init`), or
+/// belongs to an `@allOptional` struct. An omitted optional field keeps its
+/// default. Struct fields are keyed by their serialized name (vibe's `@name`,
+/// else the field name with one trailing underscore stripped), and `@ignore`d
+/// fields are skipped. Enums are read by member name at any depth.
 module mcp.api.binding;
 
 import std.traits;
@@ -79,19 +79,21 @@ package(mcp) template wireFieldName(T, string field)
 		enum wireFieldName = field;
 }
 
-/// Whether field `field` of struct `T` must be present in its JSON object: it is
-/// not `Nullable`, not vibe-`@optional`, and has no declared default (a
-/// `@schemaDefault` UDA, or an initializer that differs from its type's `.init`).
+/// Whether field `field` of struct `T` must be present in its JSON object: `T`
+/// is not `@allOptional`, and the field is not `Nullable`, not vibe-`@optional`,
+/// and has no declared default (a `@schemaDefault` UDA, or an initializer that
+/// differs from its type's `.init`).
 package(mcp) template isRequiredField(T, string field)
 {
 	import jsonschema.attributes : SchemaDefault;
+	import mcp.api.attributes : allOptional;
 	import vibe.data.serialization : OptionalAttribute;
 
 	alias member = __traits(getMember, T, field);
 	alias FT = typeof(member);
 
-	static if (isInstanceOf!(Nullable, FT) || hasUDA!(member,
-			OptionalAttribute) || hasUDA!(member, SchemaDefault))
+	static if (hasUDA!(T, allOptional) || isInstanceOf!(Nullable, FT)
+			|| hasUDA!(member, OptionalAttribute) || hasUDA!(member, SchemaDefault))
 		enum isRequiredField = false;
 	else static if (hasCtInitializer!(T, field))
 		enum isRequiredField = isInitValue(__traits(getMember, T.init, field));
@@ -365,7 +367,9 @@ package(mcp) T bindJson(T)(Json v, string path = "")
 					if (isPresent!FT(p))
 						setBound(__traits(getMember, result, field), bindJson!FT(*p, fieldPath));
 					else static if (isRequiredField!(T, field))
-						throw new BindException("missing required field '" ~ fieldPath ~ "'");
+						throw new BindException("missing required field '" ~ fieldPath
+								~ "' (to make it optional, declare it Nullable, mark it @optional, "
+								~ "or mark " ~ T.stringof ~ " @allOptional)");
 				}
 			}
 		}
@@ -532,6 +536,7 @@ unittest  // bindJson binds a SumType to the first member type the value fits
 
 unittest  // bindJson reports the dotted path of a missing nested field
 {
+	import std.algorithm.searching : startsWith;
 	import std.exception : collectException;
 	import vibe.data.json : parseJsonString;
 
@@ -548,7 +553,7 @@ unittest  // bindJson reports the dotted path of a missing nested field
 	auto e = collectException!BindException(
 			bindJson!Outer(parseJsonString(`{"items":[{"n":1},{}]}`)));
 	assert(e !is null);
-	assert(e.msg == "missing required field 'items[1].n'", e.msg);
+	assert(e.msg.startsWith("missing required field 'items[1].n'"), e.msg);
 }
 
 unittest  // an undefaulted floating-point field is required, and a defaulted one is optional
@@ -646,4 +651,40 @@ unittest  // an undefaulted struct field whose struct type has a defaulted membe
 	static assert(isRequiredField!(Outer, "inner"));
 	static assert(isRequiredField!(Outer, "pair"));
 	static assert(!isRequiredField!(Outer, "changed"));
+}
+
+unittest  // a missing required field's error says how to make the field optional
+{
+	import std.algorithm.searching : canFind;
+	import std.exception : collectException;
+	import vibe.data.json : parseJsonString;
+
+	static struct S
+	{
+		bool verbose = false;
+	}
+
+	auto e = collectException!BindException(bindJson!S(parseJsonString(`{}`)));
+	assert(e !is null);
+	assert(e.msg.canFind("@optional") && e.msg.canFind("Nullable")
+			&& e.msg.canFind("@allOptional"), e.msg);
+}
+
+unittest  // every field of an @allOptional struct is optional and keeps its default when omitted
+{
+	import mcp.api.attributes : allOptional;
+	import vibe.data.json : parseJsonString;
+
+	@allOptional static struct S
+	{
+		bool verbose = false;
+		int depth;
+		string name = "x";
+	}
+
+	static assert(!isRequiredField!(S, "verbose"));
+	static assert(!isRequiredField!(S, "depth"));
+	auto s = bindJson!S(parseJsonString(`{"depth":2}`));
+	assert(!s.verbose && s.depth == 2 && s.name == "x");
+	assert("required" !in schemaOf!(S, SchemaUse.input)());
 }

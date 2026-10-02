@@ -604,7 +604,7 @@ is predictable when porting a hand-built server):
 | `enum` | `{"type": "string", "enum": [members…]}` |
 | `T[]` | `{"type": "array", "items": <T>}` |
 | `V[string]` | `{"type": "object", "additionalProperties": <V>}` |
-| `struct` | `{"type": "object", "properties": …, "required": […]}`, keyed by the serialized field name (vibe's `@name`, else the field name minus one trailing `_`); a `Nullable`, vibe-`@optional`, or defaulted field is not required |
+| `struct` | `{"type": "object", "properties": …, "required": […]}`, keyed by the serialized field name (vibe's `@name`, else the field name minus one trailing `_`); a `Nullable`, vibe-`@optional`, or defaulted field (an initializer differing from the type's `.init`) is not required, and `@allOptional` on the struct makes every field optional |
 | `Json` | `{}` (any JSON value) |
 | `std.datetime` `SysTime` / `Date` | `{"type": "string", "format": "date-time"/"date"}` |
 | `std.datetime` `DateTime` / `TimeOfDay` | `{"type": "string", "pattern": …}` matching `YYYY-MM-DDTHH:MM:SS` / `HH:MM:SS` (no UTC offset, so not the RFC 3339 `date-time`/`time` formats) |
