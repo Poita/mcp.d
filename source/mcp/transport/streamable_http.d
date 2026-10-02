@@ -327,7 +327,6 @@ void mountMcp(URLRouter router, McpServer server,
 	auto fresh = new StreamCoordinator;
 	fresh.requestTimeout = opts.serverRequestTimeout;
 	auto push = ensurePushChannel(server, fresh, opts.replayHistory);
-	auto coord = push.coordinator;
 	// Session minting is derived from the server's mode: a `stateful`
 	// server mints/tracks an `Mcp-Session-Id`; a `stateless` server never does.
 	auto sessions = server.mode == ServerMode.stateful ? new SessionManager(opts.sessionLimits)
@@ -5907,7 +5906,7 @@ unittest  // a subscriptions/listen stream's events carry no SSE id: it is never
 	ListenFilter filter;
 	filter.active = true;
 	filter.toolsListChanged = true;
-	addListenStreamListener(push, (string f) @safe { frames ~= f; }, Json(1), filter, "");
+	cast(void) addListenStreamListener(push, (string f) @safe { frames ~= f; }, Json(1), filter, "");
 	assert(server.notifyToolsListChanged() == 1);
 	assert(frames.length == 1);
 	assert(!frames[0].canFind("id: "), frames[0]);
