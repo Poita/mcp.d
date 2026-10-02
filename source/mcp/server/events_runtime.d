@@ -28,8 +28,10 @@ import mcp.server.webhook_delivery : WebhookTransport, SecureWebhookTransport,
 	WebhookHttpResult, V1aSigner, signDeliveryHeaders, callbackHostAllowed, challengeEchoed;
 
 /// Grace window during which a rotated webhook secret is dual-signed alongside
-/// the new one, so in-flight deliveries verify under either (Standard Webhooks
-/// multi-signature). Five minutes covers a delivery's retry window.
+/// the new one (Standard Webhooks multi-signature), so a receiver still holding
+/// the old secret keeps verifying while the client rolls the new one out to it.
+/// Every attempt is signed when it is sent, so the window bounds that rollout,
+/// not a delivery's retry span.
 private enum long secretRotationGraceMs = 5 * 60 * 1000;
 
 @safe:
@@ -1384,8 +1386,8 @@ final class EventsRuntime
 		sub.name = p.name;
 		sub.arguments = p.arguments;
 		sub.url = p.delivery.url;
-		// Secret rotation: keep the prior secret for a grace window so in-flight
-		// deliveries verify under either (Standard Webhooks multi-signature).
+		// Secret rotation: keep the prior secret for a grace window so a receiver
+		// not yet updated verifies under either (Standard Webhooks multi-signature).
 		if (!isNew && sub.secret.length && sub.secret != p.delivery.secret)
 		{
 			sub.previousSecret = sub.secret;

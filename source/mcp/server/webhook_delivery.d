@@ -211,7 +211,8 @@ string[string] signDeliveryHeaders(string secret, string previousSecret, long gr
 	string sig = headers["webhook-signature"];
 
 	// Secret rotation: dual-sign with the prior secret during the grace window so
-	// in-flight deliveries verify under either (Standard Webhooks multi-signature).
+	// a receiver not yet updated verifies under either (Standard Webhooks
+	// multi-signature).
 	if (previousSecret.length && nowMs < graceUntilMs)
 	{
 		auto prev = Webhook(previousSecret);
