@@ -20,7 +20,8 @@ import mcp.server.events_runtime : EventRegistration, EventCheck;
 import mcp.api.attributes;
 import mcp.api.apps : UiToolMeta, setUiToolMeta;
 import mcp.api.skills : Skill, registerSkill;
-import mcp.api.binding : bindJson, bindString, isFieldwiseStruct, schemaNode, schemaOf, setBound;
+import mcp.api.binding : bindJson, bindString, isFieldwiseStruct, schemaNode,
+	schemaOf, SchemaUse, setBound;
 import mcp.protocol.schema;
 
 @safe:
@@ -234,6 +235,18 @@ private string describeFor(alias func, string pname)() @safe
 	return desc;
 }
 
+/// The header name a method-level `@mcpHeader` UDA on `func` assigns to the
+/// parameter named `pname`, or `""` when none does.
+private string headerFor(alias func, string pname)() @safe
+{
+	string header;
+	static foreach (attr; __traits(getAttributes, func))
+		static if (is(typeof(attr) == mcpHeader))
+			if (attr.parameter == pname)
+				header = attr.name;
+	return header;
+}
+
 /// Whether `P` is an admissible `@mcpHeader` parameter type: one whose
 /// `jsonSchemaOf` yields a modern primitive header type (integer/string/boolean).
 /// `Nullable!T` is unwrapped to its inner type. Mirrors the runtime check
@@ -278,15 +291,17 @@ private Json parametersSchema(alias func)() @safe
 				// Json once the facets are applied, then layer the MCP-specific
 				// extensions (x-mcp-header, description) on below.
 				//
-				// A tool input models an optional parameter as a bare type absent
-				// from `required` (the convention the MCP reference servers use),
-				// not as a union with null, so a `Nullable!T` emits the bare schema
-				// for T; optionality is carried by `required` below. Output schemas
-				// keep the honest anyOf:[T,null].
+				// A `Nullable!T` parameter is optional (absent from `required`)
+				// and its schema also admits an explicit `null`, which binds as
+				// unset. An x-mcp-header parameter keeps the bare primitive `type`
+				// the header extension requires.
 				import jsonschema : applyUdaFacets;
 				import jsonschema.vibejson : nodeToVibeJson;
 
-				auto psNode = schemaNode!(P, true)();
+				static if (isInstanceOf!(Nullable, P) && headerFor!(func, names[i]).length)
+					auto psNode = schemaNode!(TemplateArgsOf!P[0], SchemaUse.input)();
+				else
+					auto psNode = schemaNode!(P, SchemaUse.input)();
 				applyUdaFacets!(__traits(getAttributes, Parameters!func[i .. i + 1]))(psNode);
 				Json ps = nodeToVibeJson(psNode);
 				// Modern x-mcp-header: a method-level @mcpHeader(parameter, name)
@@ -436,13 +451,13 @@ private Json outputSchemaOf(R)() @safe
 			|| isSomeString!R || is(R == void) || is(R == Content) || is(R == Content[]))
 		return Json.undefined;
 	else static if (isFieldwiseStruct!R)
-		return schemaOf!(R, false);
+		return schemaOf!(R, SchemaUse.output);
 	else
 	{
 		Json s = Json.emptyObject;
 		s["type"] = "object";
 		Json props = Json.emptyObject;
-		props["result"] = schemaOf!(R, false);
+		props["result"] = schemaOf!(R, SchemaUse.output);
 		s["properties"] = props;
 		s["required"] = Json([Json("result")]);
 		return s;
@@ -3320,30 +3335,31 @@ unittest  // a parameter facet + a method-level marker on the same tool compiles
 	registerHandlers(s, new OptionalParamApi);
 }
 
-unittest  // a Nullable!T parameter is a bare optional: no anyOf/null, absent from required (#1265)
+unittest  // a Nullable!T parameter is an optional flat type admitting null, absent from required
 {
 	auto schema = optToolSchema();
 	auto order = schema["properties"]["order"];
-	assert(order["type"].get!string == "string");
+	assert(order["type"] == Json([Json("string"), Json("null")]), order.toString);
 	assert("anyOf" !in order);
 	// All parameters are optional, so the schema carries no `required` array.
 	assert("required" !in schema);
 }
 
-unittest  // an optional enum parameter keeps its enum constraint without a null branch (#1266)
+unittest  // an optional enum parameter keeps its enum constraint inline, with null as a member
 {
 	auto schema = optToolSchema();
 	auto unique = schema["properties"]["unique"];
-	assert(unique["type"].get!string == "string");
+	assert(unique["type"] == Json([Json("string"), Json("null")]), unique.toString);
 	assert("anyOf" !in unique);
-	assert(unique["enum"].length == 3);
+	assert(unique["enum"].length == 4);
+	assert(unique["enum"][3].type == Json.Type.null_);
 }
 
-unittest  // @schemaDefault on a Nullable parameter emits `default` (#1264)
+unittest  // @schemaDefault on a Nullable parameter emits `default`
 {
 	auto schema = optToolSchema();
 	auto page = schema["properties"]["page"];
-	assert(page["type"].get!string == "integer");
+	assert(page["type"] == Json([Json("integer"), Json("null")]), page.toString);
 	assert("anyOf" !in page);
 	assert(page["default"].get!long == 1);
 }
@@ -3921,4 +3937,78 @@ unittest  // handlers with in/const/immutable parameters register and dispatch
 	rp["uri"] = "q://7";
 	auto rr = s.handle(Message(makeRequest(Json(3), "resources/read", rp))).get;
 	assert(rr["result"]["contents"][0]["text"].get!string == "q-7", rr.toString);
+}
+
+version (unittest) private Json callToolArgs(McpServer s, string name, string arguments) @safe
+{
+	import mcp.protocol.jsonrpc : Message, makeRequest;
+
+	Json p = Json.emptyObject;
+	p["name"] = name;
+	p["arguments"] = parseJsonString(arguments);
+	return s.handle(Message(makeRequest(Json(1), "tools/call", p))).get["result"];
+}
+
+version (unittest) private final class NullInputApi
+{
+	static struct Filter
+	{
+		string q;
+		Nullable!int limit;
+	}
+
+	@tool("nul", "Nullable inputs")
+	string nul(Nullable!int limit, Nullable!int[] slots,
+			Nullable!(OptionalParamApi.Unique) unique, Filter filter) @safe
+	{
+		import std.conv : to;
+
+		return (limit.isNull ? "-" : limit.get.to!string) ~ ":" ~ slots.length.to!string ~ ":" ~ (
+				unique.isNull ? "-" : "u") ~ ":" ~ (filter.limit.isNull ? "-" : "l");
+	}
+}
+
+unittest  // explicit null for a Nullable parameter passes input validation and binds as null
+{
+	auto s = new McpServer("t", "1");
+	registerHandlers(s, new NullInputApi);
+	auto r = callToolArgs(s, "nul", `{"limit":null,"slots":[],"filter":{"q":"x"}}`);
+	assert("isError" !in r, r.toString);
+	assert(r["content"][0]["text"].get!string == "-:0:-:-", r.toString);
+}
+
+unittest  // a null element of a Nullable!T[] parameter passes input validation
+{
+	auto s = new McpServer("t", "1");
+	registerHandlers(s, new NullInputApi);
+	auto r = callToolArgs(s, "nul", `{"slots":[1,null],"filter":{"q":"x"}}`);
+	assert("isError" !in r, r.toString);
+	assert(r["content"][0]["text"].get!string == "-:2:-:-", r.toString);
+}
+
+unittest  // explicit null for a Nullable enum parameter passes input validation
+{
+	auto s = new McpServer("t", "1");
+	registerHandlers(s, new NullInputApi);
+	auto r = callToolArgs(s, "nul", `{"unique":null,"slots":[],"filter":{"q":"x"}}`);
+	assert("isError" !in r, r.toString);
+}
+
+unittest  // explicit null for a Nullable struct field passes input validation
+{
+	auto s = new McpServer("t", "1");
+	registerHandlers(s, new NullInputApi);
+	auto r = callToolArgs(s, "nul", `{"slots":[],"filter":{"q":"x","limit":null}}`);
+	assert("isError" !in r, r.toString);
+}
+
+unittest  // a Nullable @mcpHeader parameter keeps the bare primitive type x-mcp-header requires
+{
+	import mcp.protocol.mrtr : paramHeaders;
+
+	auto s = new McpServer("t", "1");
+	registerHandlers(s, new NullableHeaderApi);
+	auto schema = s.handle(MakeListMessage()).get["result"]["tools"][0]["inputSchema"];
+	assert(schema["properties"]["region"]["type"].get!string == "integer", schema.toString);
+	assert(paramHeaders(schema).length == 1);
 }

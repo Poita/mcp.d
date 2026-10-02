@@ -609,15 +609,17 @@ is predictable when porting a hand-built server):
 | `std.datetime` `SysTime` / `Date` | `{"type": "string", "format": "date-time"/"date"}` |
 | `std.datetime` `DateTime` / `TimeOfDay` | `{"type": "string", "pattern": …}` matching `YYYY-MM-DDTHH:MM:SS` / `HH:MM:SS` (no UTC offset, so not the RFC 3339 `date-time`/`time` formats) |
 | `SumType!(A, B, …)` | `{"anyOf": [<A>, <B>, …]}` |
-| `Nullable!T` (tool parameter / elicitation field) | `<T>`, made optional by omission from `required` |
+| `Nullable!T` (tool parameter / input field) | `<T>` widened to admit `null` (`"type": [<T's type>, "null"]`, plus `null` in an `enum`), made optional by omission from `required`; an explicit `null` binds as unset |
+| `Nullable!T` (elicitation field) | `<T>`, made optional by omission from `required` |
 | `Nullable!T` (output schema) | `{"anyOf": [<T>, {"type": "null"}]}` |
 
 Integer types map to `"integer"` (not `"number"`) deliberately — it is the more
 precise constraint; use `double` for a field that should accept fractional values.
-An optional tool parameter is modelled as a bare type left out of `required` (the
-convention used by the MCP reference servers); declare it `Nullable!T` or give it a
+An optional tool parameter is left out of `required`; declare it `Nullable!T` (whose
+schema also admits an explicit `null`, as LLM clients often send one) or give it a
 D default value (`int page = 1`), which is also emitted as the property's
-`"default"`. Field/parameter constraints are added with UDAs: `@minimum` /
+`"default"`. A `Nullable` parameter mirrored into a header with `@mcpHeader` keeps
+the bare primitive type `x-mcp-header` requires. Field/parameter constraints are added with UDAs: `@minimum` /
 `@maximum`, `@minLength` / `@maxLength`, `@pattern`, `@minItems` / `@maxItems`,
 `@schemaFormat` (JSON Schema `format`), `@title`, `@schemaDefault`, and
 `@fieldDescription`.

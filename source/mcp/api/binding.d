@@ -132,25 +132,34 @@ private enum hasCtInitializer(T, string field) = __traits(compiles,
 
 private enum ctValue(alias v) = v;
 
+/// Which side of a tool a derived schema describes.
+package(mcp) enum SchemaUse
+{
+	/// A tool's arguments, which `bindJson` reads.
+	input,
+	/// A tool's structured result, as vibe serializes it.
+	output,
+}
+
 /// The JSON Schema for `T` as vibe (de)serializes it, fully inlined. Struct
 /// fields are keyed by `wireFieldName`, listed in `required` per
-/// `isRequiredField`, and carry their `@fieldDescription` and facet UDAs. With
-/// `omitNull` a `Nullable!U` is described by the bare schema of `U` (an input
-/// models optionality through `required`); otherwise it is `anyOf: [U, null]`.
-/// `TimeOfDay` and `DateTime` are strings constrained by a pattern. Other
-/// scalars, enums, and custom-serialized types come from the `jsonschema`
-/// generator.
-package(mcp) Json schemaOf(T, bool omitNull)()
+/// `isRequiredField`, and carry their `@fieldDescription` and facet UDAs. For
+/// an input a `Nullable!U` is the schema of `U` widened in place to admit
+/// `null` (see `admitNull`), since `bindJson` reads `null` as an unset value;
+/// for an output it is `anyOf: [U, null]`. `TimeOfDay` and `DateTime` are
+/// strings constrained by a pattern. Other scalars, enums, and
+/// custom-serialized types come from the `jsonschema` generator.
+package(mcp) Json schemaOf(T, SchemaUse use)()
 {
 	import jsonschema.vibejson : nodeToVibeJson;
 
-	return nodeToVibeJson(schemaNode!(T, omitNull)());
+	return nodeToVibeJson(schemaNode!(T, use)());
 }
 
 /// `schemaOf` in the `jsonschema` IR, so facet UDAs can be folded onto the
 /// result before rendering. `Ancestors` are the enclosing struct types, used to
 /// reject recursive types, which an inlined schema cannot describe.
-package(mcp) JsonNode schemaNode(T, bool omitNull, Ancestors...)()
+package(mcp) JsonNode schemaNode(T, SchemaUse use, Ancestors...)()
 {
 	import std.datetime.date : DateTime, TimeOfDay;
 	import std.meta : staticIndexOf;
@@ -165,9 +174,9 @@ package(mcp) JsonNode schemaNode(T, bool omitNull, Ancestors...)()
 				`^-?[0-9]{4,}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])T` ~ timeOfDayPattern[1 .. $]);
 	else static if (isInstanceOf!(Nullable, T))
 	{
-		auto inner = schemaNode!(TemplateArgsOf!T[0], omitNull, Ancestors)();
-		static if (omitNull)
-			return inner;
+		auto inner = schemaNode!(TemplateArgsOf!T[0], use, Ancestors)();
+		static if (use == SchemaUse.input)
+			return admitNull(inner);
 		else
 			return anyOfNode(inner, typeNode("null"));
 	}
@@ -175,7 +184,7 @@ package(mcp) JsonNode schemaNode(T, bool omitNull, Ancestors...)()
 	{
 		JsonNode[] members;
 		static foreach (V; TemplateArgsOf!T)
-			members ~= schemaNode!(V, omitNull, Ancestors)();
+			members ~= schemaNode!(V, use, Ancestors)();
 		return anyOfNode(members);
 	}
 	else static if (isFieldwiseStruct!T)
@@ -193,7 +202,7 @@ package(mcp) JsonNode schemaNode(T, bool omitNull, Ancestors...)()
 			{
 				{
 					alias member = __traits(getMember, T, field);
-					auto prop = schemaNode!(typeof(member), omitNull, Ancestors, T)();
+					auto prop = schemaNode!(typeof(member), use, Ancestors, T)();
 					static if (hasUDA!(member, fieldDescription))
 						prop.set("description", JsonNode(getUDAs!(member,
 								fieldDescription)[0].value));
@@ -212,7 +221,7 @@ package(mcp) JsonNode schemaNode(T, bool omitNull, Ancestors...)()
 	else static if (isArray!T && !isSomeString!T)
 	{
 		auto s = typeNode("array");
-		s.set("items", schemaNode!(typeof(T.init[0]), omitNull, Ancestors)());
+		s.set("items", schemaNode!(typeof(T.init[0]), use, Ancestors)());
 		static if (isStaticArray!T)
 		{
 			s.set("minItems", JsonNode(long(T.length)));
@@ -223,7 +232,7 @@ package(mcp) JsonNode schemaNode(T, bool omitNull, Ancestors...)()
 	else static if (isAssociativeArray!T && isSomeString!(KeyType!T))
 	{
 		auto s = typeNode("object");
-		s.set("additionalProperties", schemaNode!(ValueType!T, omitNull, Ancestors)());
+		s.set("additionalProperties", schemaNode!(ValueType!T, use, Ancestors)());
 		return s;
 	}
 	else
@@ -231,7 +240,7 @@ package(mcp) JsonNode schemaNode(T, bool omitNull, Ancestors...)()
 		import jsonschema : generate = jsonSchemaOf, GeneratorSettings;
 
 		// (emitSchemaKeyword: false, inlineSubschemas: true, nullableOmitsNull)
-		enum settings = GeneratorSettings(false, true, omitNull);
+		enum settings = GeneratorSettings(false, true, use == SchemaUse.input);
 		auto s = generate!(T, settings)();
 		// Binding rejects a value outside an integer type's range, so a type
 		// narrower than `int`, and `uint`, advertise that range. `int` and the
@@ -262,6 +271,43 @@ private JsonNode typeNode(string type) pure
 	auto s = JsonNode.emptyObject();
 	s.set("type", JsonNode(type));
 	return s;
+}
+
+/// `s` widened to also accept JSON `null`, kept a single flat node so a client
+/// still sees the plain shape of the value: a `type` gains `"null"` (becoming
+/// `[type, "null"]`) and an `enum` gains a `null` member; a schema with no
+/// `type` but an `anyOf` (a `SumType`) gains a `{"type": "null"}` member; a
+/// schema constraining neither (`Json`) already admits `null`.
+private JsonNode admitNull(JsonNode s) pure
+{
+	if (auto t = s.get("type"))
+	{
+		if (t.isString)
+		{
+			auto types = JsonNode.emptyArray();
+			types.append(*t);
+			types.append(JsonNode("null"));
+			*t = types;
+		}
+		else if (t.isArray && !containsNode(*t, JsonNode("null")))
+			t.append(JsonNode("null"));
+		if (auto e = s.get("enum"))
+			if (!containsNode(*e, JsonNode(null)))
+				e.append(JsonNode(null));
+	}
+	else if (auto a = s.get("anyOf"))
+		a.append(typeNode("null"));
+	return s;
+}
+
+private bool containsNode(const JsonNode array, const JsonNode member) pure nothrow
+{
+	import jsonschema.node : jsonEquals;
+
+	foreach (ref e; array.array_)
+		if (jsonEquals(e, member))
+			return true;
+	return false;
 }
 
 private JsonNode anyOfNode(JsonNode[] members...) pure
@@ -552,16 +598,16 @@ unittest  // bindJson rejects an object missing an undefaulted floating-point fi
 
 unittest  // a bounded integer schema carries its type's minimum and maximum
 {
-	auto u8 = schemaOf!(ubyte, true)();
+	auto u8 = schemaOf!(ubyte, SchemaUse.input)();
 	assert(u8["minimum"].get!long == 0 && u8["maximum"].get!long == 255, u8.toString);
-	auto u16 = schemaOf!(ushort, true)();
+	auto u16 = schemaOf!(ushort, SchemaUse.input)();
 	assert(u16["maximum"].get!long == ushort.max, u16.toString);
-	auto i8 = schemaOf!(byte, true)();
+	auto i8 = schemaOf!(byte, SchemaUse.input)();
 	assert(i8["minimum"].get!long == -128 && i8["maximum"].get!long == 127, i8.toString);
-	auto i16 = schemaOf!(short, true)();
+	auto i16 = schemaOf!(short, SchemaUse.input)();
 	assert(i16["minimum"].get!long == short.min
 			&& i16["maximum"].get!long == short.max, i16.toString);
-	auto u32 = schemaOf!(uint, true)();
+	auto u32 = schemaOf!(uint, SchemaUse.input)();
 	assert(u32["maximum"].get!long == uint.max, u32.toString);
 }
 
@@ -575,11 +621,11 @@ unittest  // a value outside a bounded integer type's range does not bind
 
 unittest  // a static array schema pins its length with minItems and maxItems
 {
-	auto s = schemaOf!(int[3], true)();
+	auto s = schemaOf!(int[3], SchemaUse.input)();
 	assert(s["type"].get!string == "array");
 	assert(s["minItems"].get!long == 3, s.toString);
 	assert(s["maxItems"].get!long == 3, s.toString);
-	assert("minItems" !in schemaOf!(int[], true)());
+	assert("minItems" !in schemaOf!(int[], SchemaUse.input)());
 }
 
 unittest  // an undefaulted struct field whose struct type has a defaulted member is required
