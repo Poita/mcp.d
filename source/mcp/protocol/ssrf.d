@@ -663,8 +663,8 @@ private string stripPortAndBrackets(string host) @safe pure nothrow @nogc
 ///   classified directly and `pinnedIp` is the RFC 5952 rendering of the parsed
 ///   bytes (unbracketed, no port, zone id kept). An unparseable literal is
 ///   `privateOrLinkLocal` with an empty `pinnedIp` (fail CLOSED).
-/// - `localhost` and `::1` are classified as loopback; `pinnedIp` is the host
-///   verbatim.
+/// - `localhost` is classified as loopback and pinned to `127.0.0.1`, so the
+///   connection never re-resolves the name.
 /// - A registered hostname is resolved; EVERY returned A/AAAA address is
 ///   classified and `pinnedIp` is set to the first one. If ANY resolved address
 ///   is loopback/private/link-local the result is `privateOrLinkLocal` (resolved
@@ -704,7 +704,7 @@ AddressClass classifyHost(string host, out string pinnedIp) @safe
 
 	if (bare == "localhost")
 	{
-		pinnedIp = host;
+		pinnedIp = "127.0.0.1";
 		return AddressClass.loopback;
 	}
 
@@ -1423,7 +1423,8 @@ unittest  // classifyHost leaves an unparseable IPv6 literal unpinned
 unittest  // classifyHost classes loopback hosts without resolving
 {
 	string pin;
-	assert(classifyHost("localhost", pin) == AddressClass.loopback && pin == "localhost");
+	assert(classifyHost("localhost", pin) == AddressClass.loopback && pin == "127.0.0.1");
+	assert(classifyHost("localhost:8080", pin) == AddressClass.loopback && pin == "127.0.0.1");
 	assert(classifyHost("127.0.0.1", pin) == AddressClass.loopback && pin == "127.0.0.1");
 	assert(classifyHost("[::1]", pin) == AddressClass.loopback && pin == "::1");
 	assert(classifyHost("127.0.0.1:8765", pin) == AddressClass.loopback);
@@ -1596,6 +1597,12 @@ unittest  // allowLoopback permits the explicit loopback dev allowance over plai
 	assert(pinnedConnectAddress("127.0.0.1", false, SsrfPolicy.allowLoopback).ok);
 	assert(pinnedConnectAddress("localhost", false, SsrfPolicy.allowLoopback).ok);
 	assert(pinnedConnectAddress("[::1]", false, SsrfPolicy.allowLoopback).ok);
+}
+
+unittest  // pinnedConnectAddress pins localhost to the numeric loopback address
+{
+	const r = pinnedConnectAddress("localhost:8080", false, SsrfPolicy.allowLoopback);
+	assert(r.ok && r.pinnedIp == "127.0.0.1" && r.sniHost == "localhost");
 }
 
 unittest  // allowLoopback still rejects loopback over https and private/link-local hosts
