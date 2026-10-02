@@ -48,6 +48,9 @@ private __gshared bool _ranStdio;
 /// Requires a running vibe event loop; `serveStdio` runs the read loop on the
 /// CURRENT task and blocks until end-of-input, then waits up to
 /// `opts.drainTimeout` for request handlers still running to write their replies.
+///
+/// `readLine` owns line framing, so `opts.maxLineBytes` is not applied here: a
+/// caller reading an untrusted stream bounds its own lines (`runStdio` does).
 void serveStdio(McpServer server, string delegate() @safe readLine,
 		void delegate(string) @safe writeLine, StdioOptions opts = StdioOptions.init)
 {
@@ -304,9 +307,9 @@ private void replyToRequest(McpServer server, void delegate(string) @safe sink,
 /// `StreamableHttpOptions` for the HTTP transport.
 struct StdioOptions
 {
-	/// Bounds a single inbound line; an oversized frame is dropped (its bytes are
-	/// skipped up to the next newline) so one misbehaving frame cannot exhaust
-	/// memory.
+	/// Bounds a single inbound stdin line in `runStdio`; an oversized frame is
+	/// dropped (its bytes are skipped up to the next newline) so one misbehaving
+	/// frame cannot exhaust memory. `serveStdio` leaves framing to its `readLine`.
 	size_t maxLineBytes = defaultMaxLineBytes;
 
 	/// How long the transport waits, once stdin reaches end-of-input, for request
@@ -322,15 +325,6 @@ struct StdioOptions
 	/// whose handling or reply write threw, an unreadable input. stdout carries
 	/// only MCP messages, so this defaults to stderr when null.
 	void delegate(string) @safe nothrow onError;
-}
-
-/// Serve `server` over stdio with default options except for `maxLineBytes`
-/// (see `StdioOptions.maxLineBytes`).
-void runStdio(McpServer server, size_t maxLineBytes = defaultMaxLineBytes)
-{
-	StdioOptions opts;
-	opts.maxLineBytes = maxLineBytes;
-	runStdio(server, opts);
 }
 
 /// Serve `server` over stdio using `settings.stdio`. Blocks until stdin closes.
@@ -375,7 +369,7 @@ void runStdio(McpServer server, ServerSettings settings)
 /// carrying its id when one is found in its first bytes (else null), and the loop
 /// continues so one misbehaving frame neither exhausts memory nor kills the server.
 /// At end-of-input, handlers still running get up to `opts.drainTimeout` to reply.
-void runStdio(McpServer server, StdioOptions opts)
+void runStdio(McpServer server, StdioOptions opts = StdioOptions.init)
 {
 	const maxLineBytes = opts.maxLineBytes;
 	import vibe.core.core : runTask, runEventLoop, exitEventLoop;
