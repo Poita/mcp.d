@@ -1446,13 +1446,20 @@ final class McpServer : ServerCore
 	/// subscriptions). Returns the number of streams reached (0 or 1).
 	private size_t writeStdioListen(string method, Json params) @safe
 	{
-		if (stdioListenSink is null)
-			return 0;
 		string uri;
 		if (method == "notifications/resources/updated" && params.type == Json.Type.object)
 			if (auto u = "uri" in params)
 				if (u.type == Json.Type.string)
 					uri = u.get!string;
+		return writeStdioListen(method, params, uri);
+	}
+
+	/// As `writeStdioListen(method, params)`, filtering on the given resource `uri`
+	/// ("" for a notification not about one resource).
+	private size_t writeStdioListen(string method, Json params, string uri) @safe
+	{
+		if (stdioListenSink is null)
+			return 0;
 		if (!stdioListenFilter_.accepts(method, uri))
 			return 0;
 		auto note = withListenSubscriptionId(makeNotification(method, params),
@@ -1720,22 +1727,9 @@ final class McpServer : ServerCore
 	/// sessions / listen streams reached.
 	private size_t notifyChange(string method, Json params, string uri) @safe
 	{
-		size_t delivered;
-		// Stdio `subscriptions/listen` channel (2026-07-28): the single stdout channel
-		// carries change notifications too, stamped with the listen subscriptionId.
-		// Delivery is driven by the stdio listen stream's OWN recorded filter
-		// (`stdioListenFilter_`, the single stdio connection) via `accepts(method, uri)`
-		// — so a stdio listener subscribed to uriA does NOT receive an update for uriB
-		// (per-URI), via the per-stream `ListenFilter`.
-		// Without this branch a stdio listener receives nothing, since there is no
-		// `pushChannel` on the stdio transport.
-		if (stdioListenSink !is null && stdioListenFilter_.accepts(method, uri))
-		{
-			auto note = withListenSubscriptionId(makeNotification(method,
-					params), stdioListenSubscriptionId);
-			stdioListenSink(note.toString());
-			delivered++;
-		}
+		// The stdio transport has no `pushChannel`; its listen stream filters by
+		// its own per-URI `ListenFilter`.
+		size_t delivered = writeStdioListen(method, params, uri);
 		if (pushChannel !is null)
 		{
 			// Listener-driven delivery: every open stream decides for itself.
