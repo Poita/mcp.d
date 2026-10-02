@@ -274,7 +274,7 @@ Json withRequestLogLevel(Json params, string level) @safe
 /// factories stay stable as options accumulate (rather than growing a positional
 /// argument per knob). Fields scoped to a particular transport are documented as
 /// such; other transports ignore them. Pass it to `McpClient.http` / `stdio` /
-/// `spawn` / `spawnSibling`.
+/// `spawn` / `spawnSibling`, or to the constructor for a custom `ClientTransport`.
 struct ClientSettings
 {
 	/// Client identity advertised to the server during initialization.
@@ -767,23 +767,32 @@ final class McpClient : ClientProtocol
 	/// `onNotification`.
 	void delegate(string uri) @safe onResourceUpdated;
 
-	/// Construct over an explicit `ClientTransport`. The client installs its
-	/// inbound dispatcher (and, for the HTTP transport, the per-message header /
-	/// cancelled-response callbacks) on the transport.
-	this(ClientTransport transport, Implementation clientInfo = ClientSettings.init.clientInfo) @safe
+	/// Construct over an explicit `ClientTransport`, configured by `settings`. The
+	/// client installs its inbound dispatcher on the transport and tells it the
+	/// request timeout. The settings that configure how a transport is built
+	/// (`connectTimeout`, `maxInFlight`, `maxMessageBytes`, `tls`) are the caller's
+	/// to apply to `transport` and are ignored here. A null `settings.cache` installs
+	/// an in-memory store; an empty `settings.cacheServer` keys this client's cache
+	/// entries under a per-client value.
+	this(ClientTransport transport, ClientSettings settings = ClientSettings.init) @safe
 	{
 		this.transport = transport;
-		this.clientInfo = clientInfo;
-		// Caching is on by default: install the in-memory store and the wall clock.
-		// Factories override the store from `ClientSettings`; `setCache`/
-		// `setDefaultCacheTtl`/`setCacheClock` adjust them at runtime.
-		cacheStore_ = new InMemoryCacheStore();
-		cacheServer_ = () @trusted {
+		this.clientInfo = settings.clientInfo;
+		cacheStore_ = settings.cache !is null ? settings.cache : new InMemoryCacheStore();
+		defaultCacheTtl_ = settings.defaultCacheTtl;
+		cachePartition_ = settings.cachePartition;
+		cacheServer_ = settings.cacheServer.length ? settings.cacheServer : () @trusted {
 			import std.conv : to;
 
 			return "client:" ~ (cast(size_t) cast(void*) this).to!string;
 		}();
 		now_ = () @safe => Clock.currTime();
+		eventSettings_ = settings.events;
+		resetTimeoutOnProgress_ = settings.resetTimeoutOnProgress;
+		maxTotalTimeout_ = settings.maxTotalTimeout;
+		taskPollInterval_ = settings.taskPollInterval;
+		taskTimeout_ = settings.taskTimeout;
+		maxTaskPollInterval_ = settings.maxTaskPollInterval;
 		transport.setInboundHandler(&dispatchInbound);
 		// Hand the transport this client as its `ClientProtocol`: it pulls the
 		// protocol-derived request headers (`headersFor`) and the cancelled-response
@@ -791,28 +800,7 @@ final class McpClient : ClientProtocol
 		// schema-lookup logic and the cancellation set stay here and no transport has
 		// to be a concrete type the client downcasts to.
 		transport.setProtocol(this);
-	}
-
-	/// Apply the cache-related `ClientSettings` to a freshly constructed client and
-	/// return it (for fluent use in the factories). A null `settings.cache` keeps
-	/// the constructor's default in-memory store; a non-null value (including
-	/// `noCache`) replaces it.
-	private McpClient applySettings(ClientSettings settings) @safe
-	{
-		if (settings.cache !is null)
-			cacheStore_ = settings.cache;
-		defaultCacheTtl_ = settings.defaultCacheTtl;
-		cachePartition_ = settings.cachePartition;
-		if (settings.cacheServer.length)
-			cacheServer_ = settings.cacheServer;
-		eventSettings_ = settings.events;
 		requestTimeout = settings.requestTimeout;
-		resetTimeoutOnProgress_ = settings.resetTimeoutOnProgress;
-		maxTotalTimeout_ = settings.maxTotalTimeout;
-		taskPollInterval_ = settings.taskPollInterval;
-		taskTimeout_ = settings.taskTimeout;
-		maxTaskPollInterval_ = settings.maxTaskPollInterval;
-		return this;
 	}
 
 	private Duration taskPollInterval_ = ClientSettings.init.taskPollInterval;
@@ -862,9 +850,9 @@ final class McpClient : ClientProtocol
 		transport.setConnectTimeout(settings.connectTimeout);
 		transport.setMaxMessageBytes(settings.maxMessageBytes);
 		transport.setTlsTrust(settings.tls);
-		auto c = new McpClient(transport, settings.clientInfo);
-		c.cacheServer_ = url;
-		return c.applySettings(settings);
+		if (!settings.cacheServer.length)
+			settings.cacheServer = url;
+		return new McpClient(transport, settings);
 	}
 
 	/// Build a client over the stdio transport, exchanging newline-delimited
@@ -878,8 +866,7 @@ final class McpClient : ClientProtocol
 	static McpClient stdio(string delegate() @safe readLine,
 			void delegate(string) @safe writeLine, ClientSettings settings = ClientSettings.init) @safe
 	{
-		return (new McpClient(new StdioClientTransport(readLine, writeLine), settings.clientInfo))
-			.applySettings(settings);
+		return new McpClient(new StdioClientTransport(readLine, writeLine), settings);
 	}
 
 	/// Launch an MCP server as a subprocess and build a client over its
@@ -894,10 +881,9 @@ final class McpClient : ClientProtocol
 	{
 		import std.array : join;
 
-		auto c = new McpClient(spawnStdioTransport(command,
-				settings.maxMessageBytes), settings.clientInfo);
-		c.cacheServer_ = "stdio:" ~ command.join(" ");
-		return c.applySettings(settings);
+		if (!settings.cacheServer.length)
+			settings.cacheServer = "stdio:" ~ command.join(" ");
+		return new McpClient(spawnStdioTransport(command, settings.maxMessageBytes), settings);
 	}
 
 	/// Launch an MCP server binary that ships *next to this executable* and build a
@@ -9174,6 +9160,34 @@ unittest  // connect() populates serverCapabilities/serverInfo/serverInstruction
 	assert(c.serverInfo().version_ == "2.0");
 	assert(!c.serverInstructions().isNull);
 	assert(c.serverInstructions().get == "hello");
+}
+
+unittest  // a client over a custom transport applies every ClientSettings knob
+{
+	auto t = new RecordingClientTransport();
+	ClientSettings s;
+	s.clientInfo = Implementation("custom", "9.9");
+	s.requestTimeout = 5.seconds;
+	s.resetTimeoutOnProgress = false;
+	s.maxTotalTimeout = 7.seconds;
+	s.taskPollInterval = 2.seconds;
+	s.taskTimeout = 3.seconds;
+	s.maxTaskPollInterval = 4.seconds;
+	s.cacheServer = "svc";
+	s.cachePartition = "alice";
+	s.defaultCacheTtl = 9.seconds;
+	auto c = new McpClient(t, s);
+	assert(c.clientInfo.name == "custom");
+	assert(t.requestTimeout == 5.seconds, "the transport must learn the request timeout");
+	assert(c.requestTimeout == 5.seconds);
+	assert(!c.resetTimeoutOnProgress_);
+	assert(c.maxTotalTimeout_ == 7.seconds);
+	assert(c.taskPollInterval_ == 2.seconds);
+	assert(c.taskTimeout_ == 3.seconds);
+	assert(c.maxTaskPollInterval_ == 4.seconds);
+	assert(c.cacheServer_ == "svc");
+	assert(c.cachePartition_ == "alice");
+	assert(c.defaultCacheTtl_ == 9.seconds);
 }
 
 unittest  // connect() leaves the client unnegotiated when discovery finds no mutual version
