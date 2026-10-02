@@ -10,7 +10,7 @@ import vibe.data.serialization : serializeWithPolicy, deserializeWithPolicy;
 import mcp.protocol.types;
 import mcp.protocol.capabilities : Icon;
 import mcp.protocol.modern : CacheHint, CacheScope;
-import mcp.server.server : McpServer;
+import mcp.server.server : McpServer, TaskToolOptions;
 import mcp.server.responses : ToolResponse;
 import mcp.server.context;
 import mcp.server.task_context : TaskContext;
@@ -859,14 +859,13 @@ private void registerTaskMethod(string memberName, alias overload, alias parent)
 	// corresponding server default.
 	import core.time : Duration;
 
-	Nullable!Duration ttl;
-	Nullable!Duration pollInterval;
+	TaskToolOptions opts;
 	static foreach (a; __traits(getAttributes, overload))
 	{
 		static if (is(typeof(a) == taskTtl))
-			ttl = a.value;
+			opts.create.ttl = a.value;
 		else static if (is(typeof(a) == taskPollInterval))
-			pollInterval = a.value;
+			opts.create.pollInterval = a.value;
 	}
 
 	// The executor runs on each dispatch: it reconstitutes the typed arguments
@@ -891,7 +890,7 @@ private void registerTaskMethod(string memberName, alias overload, alias parent)
 		}
 		else
 			return toToolResult(__traits(getMember, parent, memberName)(argv.expand)).toJson();
-	}, ttl, pollInterval);
+	}, opts);
 }
 
 /// Register a typed `@event` pull/fetch type. The method must have the shape
@@ -3529,7 +3528,9 @@ unittest  // @taskTool UDA: tool is listed with an input schema derived from its
 	import mcp.server.task_context : SyncTaskDispatcher;
 
 	auto s = new McpServer("t", "1");
-	s.enableTasks(null, TaskOptions.init, new SyncTaskDispatcher());
+	TaskOptions taskOpts;
+	taskOpts.dispatcher = new SyncTaskDispatcher();
+	s.enableTasks(taskOpts);
 	registerHandlers(s, new TaskUdaApi);
 
 	auto tools = s.handle(Message(makeRequest(Json(1), "tools/list",
@@ -3551,7 +3552,7 @@ unittest  // @taskTool UDA: tools/call returns a task the executor completes
 	import mcp.server.task_context : SyncTaskDispatcher;
 
 	auto s = new McpServer("t", "1");
-	s.enableTasks(null, TaskOptions.init, new SyncTaskDispatcher());
+	s.enableTasks(TaskOptions(null, new SyncTaskDispatcher()));
 	registerHandlers(s, new TaskUdaApi);
 
 	Json p = Json.emptyObject;
@@ -3581,7 +3582,7 @@ unittest  // @taskTool UDA: a missing required argument (schema validation off) 
 
 	auto s = new McpServer("t", "1");
 	s.disableInputSchemaValidation();
-	s.enableTasks(null, TaskOptions.init, new SyncTaskDispatcher());
+	s.enableTasks(TaskOptions(null, new SyncTaskDispatcher()));
 	registerHandlers(s, new TaskUdaApi);
 
 	Json p = Json.emptyObject;
@@ -3605,7 +3606,7 @@ unittest  // @taskTool UDA: a mid-task elicitation suspends and resumes via task
 	import mcp.server.task_context : SyncTaskDispatcher;
 
 	auto s = new McpServer("t", "1");
-	s.enableTasks(null, TaskOptions.init, new SyncTaskDispatcher());
+	s.enableTasks(TaskOptions(null, new SyncTaskDispatcher()));
 	registerHandlers(s, new TaskUdaApi);
 
 	Json p = Json.emptyObject;
@@ -4540,7 +4541,7 @@ unittest  // @ui on a @taskTool attaches _meta.ui to its descriptor
 	import mcp.server.task_context : SyncTaskDispatcher;
 
 	auto s = new McpServer("t", "1");
-	s.enableTasks(null, TaskOptions.init, new SyncTaskDispatcher());
+	s.enableTasks(TaskOptions(null, new SyncTaskDispatcher()));
 	registerHandlers(s, new UiTaskApi);
 	auto t = s.handle(MakeListMessage()).get["result"]["tools"][0];
 	assert(t["_meta"]["ui"]["resourceUri"].get!string == "ui://demo/widget", t.toString);

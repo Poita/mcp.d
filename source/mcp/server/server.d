@@ -69,6 +69,19 @@ struct RegisteredTool
 	Validator outputValidator; /// ditto
 }
 
+/// How `McpServer.registerTaskTool` creates and gates the tasks of one tool.
+struct TaskToolOptions
+{
+	/// Each task's TTL and suggested poll cadence (null inherits the runtime's
+	/// defaults). Each task's owner is the creating request's principal, so
+	/// `create.owner` is ignored.
+	TaskCreateOptions create;
+	/// What a client that did not declare the Tasks extension gets: `optional`
+	/// runs the executor inline and returns its result as a plain tool result,
+	/// `required` rejects the call with -32021.
+	TaskSupport support = TaskSupport.optional;
+}
+
 /// A registered direct resource: descriptor + reader producing its contents.
 struct RegisteredResource
 {
@@ -1174,18 +1187,17 @@ final class McpServer : ServerCore
 
 	/// Enable the SEP-2663 MCP Tasks extension (`io.modelcontextprotocol/tasks`).
 	/// Advertises the extension in `server/discover` capabilities (modern only) and
-	/// routes `tasks/get` / `tasks/update` / `tasks/cancel` against `store`
-	/// (default: in-memory). `opts` tunes the ID generator, default TTL / poll
-	/// interval, and TTL sweep cadence. `dispatcher` decides where a `@taskTool`
-	/// executor runs (default: an in-process fiber; supply a queue-backed
-	/// dispatcher for a durable, multi-node deployment). The runtime emits
+	/// routes `tasks/get` / `tasks/update` / `tasks/cancel` against `opts.store`
+	/// (default: in-memory). `opts` also picks the `dispatcher` that decides where
+	/// a `@taskTool` executor runs (default: an in-process fiber; supply a
+	/// queue-backed dispatcher for a durable, multi-node deployment) and tunes the
+	/// ID generator, default TTL / poll interval, and TTL sweep cadence. The runtime emits
 	/// `notifications/tasks` on status changes to the task owner's streams (for
 	/// a task created without an authenticated principal, only over stdio; HTTP
 	/// clients poll `tasks/get`). Returns the `TaskRuntime` so tools can create and resolve tasks.
 	/// Throws on a `stateful` server, which never negotiates the modern protocol
 	/// the extension requires.
-	TaskRuntime enableTasks(TaskStore store = null,
-			TaskOptions opts = TaskOptions.init, TaskDispatcher dispatcher = null) @safe
+	TaskRuntime enableTasks(TaskOptions opts = TaskOptions.init) @safe
 	{
 		if (mode_ == ServerMode.stateful)
 			throw new Exception("enableTasks() is not available on a stateful server: the"
@@ -1193,8 +1205,9 @@ final class McpServer : ServerCore
 					~ " 2026-07-28. Construct the server with McpServer.stateless() instead.");
 		if (taskRuntime_ !is null)
 			taskRuntime_.stopSweeper();
-		taskRuntime_ = new TaskRuntime((store is null) ? new InMemoryTaskStore() : store, opts);
-		taskDispatcher_ = (dispatcher is null) ? new InProcessTaskDispatcher() : dispatcher;
+		taskRuntime_ = new TaskRuntime(opts);
+		taskDispatcher_ = (opts.dispatcher is null) ? new InProcessTaskDispatcher()
+			: opts.dispatcher;
 		taskRuntime_.onStatusChange((Json detailed, string owner) @safe {
 			notifyPrincipal(owner, "notifications/tasks", detailed);
 		});
@@ -1215,31 +1228,25 @@ final class McpServer : ServerCore
 	/// Register a `@taskTool` tool: a tool whose `tools/call` returns a task handle
 	/// immediately and runs `executor` asynchronously via the dispatcher. The
 	/// executor is stored by `descriptor.name` so the dispatcher can re-invoke it
-	/// on each `tasks/update`. `ttl` / `pollInterval` seed the task's TTL and
-	/// suggested poll cadence (null inherits the runtime's defaults). `support`
-	/// says what a client that did not declare the Tasks extension gets:
-	/// `optional` (the default) runs the executor inline and returns its result as
-	/// a plain tool result, `required` rejects the call with -32021. Requires
-	/// `enableTasks` to have been called first. Used by the UDA reflection layer;
-	/// callable directly for dynamic task tools.
+	/// on each `tasks/update`. `opts` sets each task's TTL / poll cadence and
+	/// what a client without the Tasks extension gets (see `TaskToolOptions`).
+	/// Requires `enableTasks` to have been called first. Used by the UDA
+	/// reflection layer; callable directly for dynamic task tools.
 	void registerTaskTool(Tool descriptor, TaskExecutor executor,
-			Nullable!Duration ttl = Nullable!Duration.init,
-			Nullable!Duration pollInterval = Nullable!Duration.init,
-			TaskSupport support = TaskSupport.optional) @safe
+			TaskToolOptions opts = TaskToolOptions.init) @safe
 	{
 		if (taskRuntime_ is null)
 			throw internalError("registerTaskTool requires enableTasks() first");
 		const toolName = descriptor.name;
-		const ttlDur = ttl;
-		const pollDur = pollInterval;
+		const create = opts.create;
 		// The tool is registered first so a name clash throws before the
 		// executor map changes.
 		registerTool(descriptor, (Json args, RequestContext ctx) @safe {
-			return startTask(toolName, args, ctx, ttlDur, pollDur);
+			return startTask(toolName, args, ctx, create);
 		});
 		registerTaskExecutor(descriptor.name, executor);
-		setToolTaskSupport(descriptor.name, support == TaskSupport.none
-				? TaskSupport.optional : support);
+		setToolTaskSupport(descriptor.name, opts.support == TaskSupport.none
+				? TaskSupport.optional : opts.support);
 	}
 
 	/// Register the executor that drives tasks created under `name`, without
@@ -1271,14 +1278,15 @@ final class McpServer : ServerCore
 	/// requesting principal, dispatch it, and return the `CreateTaskResult`
 	/// (`resultType: "task"`) as the tool response. The task is durably stored
 	/// before this returns, so a `tasks/get` for the returned id resolves at
-	/// once. `input` is the executor's durable input (`TaskContext.inputJson`).
+	/// once. `input` is the executor's durable input (`TaskContext.inputJson`);
+	/// `opts` sets its TTL and poll cadence (its owner is always the requesting
+	/// principal).
 	/// A request whose client did not declare the Tasks extension cannot receive
 	/// a task handle, so the executor instead runs to completion on the calling
 	/// fiber and its result is returned as an ordinary tool result. Throws when
 	/// `enableTasks` was not called or no executor is registered under `name`.
 	ToolResponse startTask(string name, Json input, RequestContext ctx,
-			Nullable!Duration ttl = Nullable!Duration.init,
-			Nullable!Duration pollInterval = Nullable!Duration.init) @safe
+			TaskCreateOptions opts = TaskCreateOptions.init) @safe
 	{
 		import mcp.protocol.tasks : makeCreateTaskResult;
 
@@ -1290,8 +1298,8 @@ final class McpServer : ServerCore
 			return ToolResponse.complete(runTaskToolInline(name, input, ctx));
 		// The task is bound to the creating request's authenticated principal
 		// (if any), so every later tasks/* request must come from the same one.
-		auto seed = taskRuntime_.createFor(name, input, TaskCreateOptions(ttl,
-				pollInterval, requestPrincipal(ctx)));
+		opts.owner = requestPrincipal(ctx);
+		auto seed = taskRuntime_.createFor(name, input, opts);
 		taskDispatcher_.dispatch(seed.taskId, &runTaskExecutorById);
 		return ToolResponse.task(makeCreateTaskResult(seed));
 	}
@@ -6953,6 +6961,14 @@ unittest  // server/discover under the modern protocol still serves the discover
 	assert(resp["result"]["_meta"][MetaKey.serverInfo]["name"].get!string == "disc-srv");
 }
 
+// Task options whose executors run synchronously on the dispatching call.
+version (unittest) private TaskOptions syncTasks() @safe
+{
+	TaskOptions o;
+	o.dispatcher = new SyncTaskDispatcher();
+	return o;
+}
+
 version (unittest) private Message stdioListenReq(long id, Json meta = Json.undefined) @safe
 {
 	if (meta.type == Json.Type.undefined)
@@ -7891,7 +7907,7 @@ version (unittest) private McpServer twoQuestionTaskServer(out int* runs) @safe
 	import mcp.protocol.mrtr : InputRequest;
 
 	auto s = new McpServer("t", "1");
-	s.enableTasks(null, TaskOptions.init, new SyncTaskDispatcher());
+	s.enableTasks(syncTasks());
 	Tool desc;
 	desc.name = "ask2";
 	desc.inputSchema = Json(["type": Json("object")]);
@@ -7989,7 +8005,7 @@ unittest  // tasks/update for an unknown taskId is -32602
 unittest  // registerTaskTool: tools/call returns a task handle the executor completes
 {
 	auto s = new McpServer("t", "1");
-	s.enableTasks(null, TaskOptions.init, new SyncTaskDispatcher());
+	s.enableTasks(syncTasks());
 	Tool desc;
 	desc.name = "dbl";
 	desc.inputSchema = Json(["type": Json("object")]);
@@ -8043,7 +8059,7 @@ version (unittest)
 		import mcp.protocol.mrtr : InputRequest;
 
 		auto s = new McpServer("t", "1");
-		s.enableTasks(null, TaskOptions.init, new SyncTaskDispatcher());
+		s.enableTasks(syncTasks());
 		Tool desc;
 		desc.name = "gate";
 		desc.inputSchema = Json(["type": Json("object")]);
@@ -8175,7 +8191,7 @@ unittest  // tasks/get, tasks/update, tasks/cancel are -32021 for a client witho
 unittest  // a task tool called without the extension runs synchronously and returns a plain result
 {
 	auto s = new McpServer("t", "1");
-	s.enableTasks(null, TaskOptions.init, new SyncTaskDispatcher());
+	s.enableTasks(syncTasks());
 	Tool desc;
 	desc.name = "dbl";
 	desc.inputSchema = Json(["type": Json("object")]);
@@ -8203,7 +8219,7 @@ unittest  // a task tool run inline for a client without the extension emits no 
 	import std.algorithm : canFind;
 
 	auto s = new McpServer("t", "1");
-	s.enableTasks(null, TaskOptions.init, new SyncTaskDispatcher());
+	s.enableTasks(syncTasks());
 	Tool desc;
 	desc.name = "slow";
 	desc.inputSchema = Json(["type": Json("object")]);
@@ -8235,7 +8251,7 @@ unittest  // a task tool run inline for a client without the extension emits no 
 unittest  // a synchronous task-tool call validates arguments before running the executor
 {
 	auto s = new McpServer("t", "1");
-	s.enableTasks(null, TaskOptions.init, new SyncTaskDispatcher());
+	s.enableTasks(syncTasks());
 	Tool desc;
 	desc.name = "dbl";
 	desc.inputSchema = Json([
@@ -8258,7 +8274,7 @@ unittest  // a synchronous task-tool result is checked against the outputSchema
 {
 	auto s = new McpServer("t", "1");
 	s.enableOutputSchemaValidation();
-	s.enableTasks(null, TaskOptions.init, new SyncTaskDispatcher());
+	s.enableTasks(syncTasks());
 	Tool desc;
 	desc.name = "typed";
 	desc.inputSchema = Json(["type": Json("object")]);
@@ -8281,7 +8297,8 @@ unittest  // a synchronous task-tool call leaves no task record behind
 	TaskOptions o;
 	o.idGenerator = () @safe => "inline-1";
 	auto s = new McpServer("t", "1");
-	s.enableTasks(null, o, new SyncTaskDispatcher());
+	o.dispatcher = new SyncTaskDispatcher();
+	s.enableTasks(o);
 	Tool desc;
 	desc.name = "noop";
 	desc.inputSchema = Json(["type": Json("object")]);
@@ -8307,13 +8324,15 @@ unittest  // a synchronous task-tool call leaves no task record behind
 unittest  // a task tool that requires the extension rejects a client without it with -32021
 {
 	auto s = new McpServer("t", "1");
-	s.enableTasks(null, TaskOptions.init, new SyncTaskDispatcher());
+	s.enableTasks(syncTasks());
 	Tool desc;
 	desc.name = "must-task";
 	desc.inputSchema = Json(["type": Json("object")]);
+	TaskToolOptions required;
+	required.support = TaskSupport.required;
 	s.registerTaskTool(desc, (TaskContext tc) @safe => Json([
 		"content": Json.emptyArray
-	]), Nullable!Duration.init, Nullable!Duration.init, TaskSupport.required);
+	]), required);
 
 	auto resp = s.handle(modernReqNoTasks(1, "tools/call",
 			Json(["name": Json("must-task"), "arguments": Json.emptyObject]))).get;
@@ -8329,7 +8348,7 @@ unittest  // a task tool that requires the extension rejects a client without it
 unittest  // an inline task tool observes its request's cancellation through tc.cancelRequested
 {
 	auto s = new McpServer("t", "1");
-	s.enableTasks(null, TaskOptions.init, new SyncTaskDispatcher());
+	s.enableTasks(syncTasks());
 	Tool desc;
 	desc.name = "slow";
 	desc.inputSchema = Json(["type": Json("object")]);
@@ -8353,7 +8372,7 @@ unittest  // an inline task tool observes its request's cancellation through tc.
 unittest  // an inline task tool cannot detach: the client gets -32021 naming the extension
 {
 	auto s = new McpServer("t", "1");
-	s.enableTasks(null, TaskOptions.init, new SyncTaskDispatcher());
+	s.enableTasks(syncTasks());
 	Tool desc;
 	desc.name = "handoff";
 	desc.inputSchema = Json(["type": Json("object")]);
@@ -8389,7 +8408,7 @@ unittest  // a handler-built task result is rejected with -32021 for a client wi
 unittest  // a synchronous fall-through surfaces a failed task as its JSON-RPC error
 {
 	auto s = new McpServer("t", "1");
-	s.enableTasks(null, TaskOptions.init, new SyncTaskDispatcher());
+	s.enableTasks(syncTasks());
 	Tool desc;
 	desc.name = "boom";
 	desc.inputSchema = Json(["type": Json("object")]);
@@ -8408,7 +8427,7 @@ unittest  // startTask lets an MRTR tool gather input and then escalate to a tas
 	import mcp.protocol.mrtr : InputRequest;
 
 	auto s = new McpServer("t", "1");
-	s.enableTasks(null, TaskOptions.init, new SyncTaskDispatcher());
+	s.enableTasks(syncTasks());
 	s.registerTaskExecutor("escalate", (TaskContext tc) @safe {
 		const name = tc.inputJson()["user_name"].get!string;
 		return Json([
@@ -8465,7 +8484,7 @@ version (unittest) private McpServer makeEscalatingServer(TaskSupport support) @
 	import mcp.protocol.mrtr : InputRequest;
 
 	auto s = new McpServer("t", "1");
-	s.enableTasks(null, TaskOptions.init, new SyncTaskDispatcher());
+	s.enableTasks(syncTasks());
 	s.registerTaskExecutor("greet", (TaskContext tc) @safe {
 		const name = tc.inputJson()["user_name"].get!string;
 		return Json([
@@ -8600,7 +8619,7 @@ unittest  // registerTaskTool with a clashing name leaves the existing executor 
 	import std.exception : assertThrown;
 
 	auto s = new McpServer("t", "1");
-	s.enableTasks(null, TaskOptions.init, new SyncTaskDispatcher());
+	s.enableTasks(syncTasks());
 	Tool desc;
 	desc.name = "dup";
 	s.registerTaskTool(desc,
@@ -8625,7 +8644,7 @@ unittest  // registerTaskTool: a mid-task input_required resumes on tasks/update
 	import mcp.protocol.mrtr : InputRequest;
 
 	auto s = new McpServer("t", "1");
-	s.enableTasks(null, TaskOptions.init, new SyncTaskDispatcher());
+	s.enableTasks(syncTasks());
 	Tool desc;
 	desc.name = "gate";
 	desc.inputSchema = Json(["type": Json("object")]);

@@ -158,7 +158,10 @@ void main(string[] args) @safe
 	//   final class QueueTaskDispatcher : TaskDispatcher {
 	//       void dispatch(string taskId, void delegate(string) @safe run) { queue.publish(taskId); }
 	//   }
-	//   server.enableTasks(new RedisTaskStore(...), TaskOptions.init, new QueueTaskDispatcher(...));
+	//   TaskOptions opts;
+	//   opts.store = new RedisTaskStore(...);
+	//   opts.dispatcher = new QueueTaskDispatcher(...);
+	//   server.enableTasks(opts);
 	//
 	server.enableTasks();
 

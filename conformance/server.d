@@ -965,10 +965,12 @@ private void registerTaskFixtures(McpServer server) @safe
 	Tool failing = {
 		name: "failing_job", description: nullable("Always fails as a tool error")
 	};
+	TaskToolOptions required;
+	required.support = TaskSupport.required;
 	server.registerTaskTool(failing, (TaskContext tc) @safe {
 		sleep(1000.msecs);
 		return taskText("the job failed", true);
-	}, Nullable!Duration.init, Nullable!Duration.init, TaskSupport.required);
+	}, required);
 
 	// protocol_error_job: a protocol-level failure (status failed + error).
 	Tool protoErr = {

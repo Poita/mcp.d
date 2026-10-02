@@ -10,6 +10,7 @@ import mcp.internal.clock : systemNowIso;
 import mcp.protocol.tasks;
 import mcp.protocol.errors : McpException, ErrorCode, toErrorJson, internalError;
 import mcp.server.context : RequestContext;
+import mcp.server.task_context : TaskDispatcher;
 import mcp.server.task_store : TaskStore, TaskRecord, InMemoryTaskStore,
 	TaskIdGenerator, defaultTaskIdGenerator;
 
@@ -20,7 +21,12 @@ import mcp.server.task_store : TaskStore, TaskRecord, InMemoryTaskStore,
 /// until the store removes it.
 enum Duration unlimitedTaskTtl = Duration.max;
 
-/// Tuning for the task runtime. `idGenerator` mints task IDs (default
+/// Configuration for the task runtime. `store` holds every task's durable state
+/// (default: a fresh `InMemoryTaskStore`; supply a shared store for a multi-node
+/// deployment). `dispatcher` decides where a task executor runs when
+/// `McpServer.enableTasks` drives it (default: an in-process fiber; supply a
+/// queue-backed dispatcher for a durable deployment); a bare `TaskRuntime`
+/// ignores it. `idGenerator` mints task IDs (default
 /// `defaultTaskIdGenerator`). `defaultTtl` / `defaultPollInterval` seed a task's
 /// TTL / suggested poll cadence when a creator does not specify them. A task's
 /// TTL is how long its record is kept once it settles (`unlimitedTaskTtl` keeps
@@ -34,6 +40,8 @@ enum Duration unlimitedTaskTtl = Duration.max;
 /// injectable clock returning an ISO-8601 timestamp; null uses the system clock.
 struct TaskOptions
 {
+	TaskStore store;
+	TaskDispatcher dispatcher;
 	TaskIdGenerator idGenerator;
 	Duration defaultTtl = 10.minutes;
 	Duration defaultPollInterval = 5.seconds;
@@ -79,9 +87,9 @@ final class TaskRuntime
 	// client ever learns.
 	private bool[string] silenced_;
 
-	this(TaskStore store, TaskOptions opts) @safe
+	this(TaskOptions opts) @safe
 	{
-		store_ = (store is null) ? new InMemoryTaskStore() : store;
+		store_ = (opts.store is null) ? new InMemoryTaskStore() : opts.store;
 		opts_ = opts;
 		if (opts_.idGenerator is null)
 			opts_.idGenerator = () @safe => defaultTaskIdGenerator();
@@ -706,7 +714,7 @@ unittest  // create yields a working task with seeded ttl/poll and timestamps
 {
 	TaskOptions o;
 	o.nowIso = () @safe => "2026-06-07T10:30:00Z";
-	auto rt = new TaskRuntime(new InMemoryTaskStore(), o);
+	auto rt = new TaskRuntime(o);
 	auto t = rt.create();
 	assert(t.status == TaskStatus.working);
 	assert(t.taskId.length > 0);
@@ -717,14 +725,14 @@ unittest  // create yields a working task with seeded ttl/poll and timestamps
 
 unittest  // create honors explicit ttl/poll overrides
 {
-	auto rt = new TaskRuntime(new InMemoryTaskStore(), TaskOptions.init);
+	auto rt = new TaskRuntime(TaskOptions.init);
 	auto t = rt.create(TaskCreateOptions(nullable(1_000.msecs), nullable(250.msecs)));
 	assert(t.ttlMs.get == 1_000 && t.pollIntervalMs.get == 250);
 }
 
 unittest  // createFor records the executor toolName and durable input
 {
-	auto rt = new TaskRuntime(new InMemoryTaskStore(), TaskOptions.init);
+	auto rt = new TaskRuntime(TaskOptions.init);
 	auto t = rt.createFor("word_count", Json(["text": Json("hi there")]));
 	assert(rt.toolName(t.taskId) == "word_count");
 	assert(rt.executorInput(t.taskId)["text"].get!string == "hi there");
@@ -732,7 +740,7 @@ unittest  // createFor records the executor toolName and durable input
 
 unittest  // complete stores the result and getDetailed inlines it
 {
-	auto rt = new TaskRuntime(new InMemoryTaskStore(), TaskOptions.init);
+	auto rt = new TaskRuntime(TaskOptions.init);
 	auto t = rt.create();
 	Json result = Json([
 		"content": Json([Json(["type": Json("text"), "text": Json("done")])])
@@ -745,7 +753,7 @@ unittest  // complete stores the result and getDetailed inlines it
 
 unittest  // fail stores the JSON-RPC error and getDetailed inlines it
 {
-	auto rt = new TaskRuntime(new InMemoryTaskStore(), TaskOptions.init);
+	auto rt = new TaskRuntime(TaskOptions.init);
 	auto t = rt.create();
 	rt.fail(t.taskId, Json(["code": Json(-32000), "message": Json("boom")]));
 	auto d = rt.getDetailed(t.taskId);
@@ -755,7 +763,7 @@ unittest  // fail stores the JSON-RPC error and getDetailed inlines it
 
 unittest  // fail from an McpException records its code, message, and data
 {
-	auto rt = new TaskRuntime(new InMemoryTaskStore(), TaskOptions.init);
+	auto rt = new TaskRuntime(TaskOptions.init);
 	auto t = rt.create();
 	rt.fail(t.taskId, internalError("deploy failed", Json(["ref": Json("abc")])));
 	auto d = rt.getDetailed(t.taskId);
@@ -767,7 +775,7 @@ unittest  // fail from an McpException records its code, message, and data
 
 unittest  // requireInput surfaces inputRequests and deliverInput records responses
 {
-	auto rt = new TaskRuntime(new InMemoryTaskStore(), TaskOptions.init);
+	auto rt = new TaskRuntime(TaskOptions.init);
 	auto t = rt.create();
 	Json reqs = Json(["k1": Json(["method": Json("elicitation/create")])]);
 	rt.requireInput(t.taskId, reqs);
@@ -781,7 +789,7 @@ unittest  // requireInput surfaces inputRequests and deliverInput records respon
 
 unittest  // a manual (executor-less) task cancels immediately
 {
-	auto rt = new TaskRuntime(new InMemoryTaskStore(), TaskOptions.init);
+	auto rt = new TaskRuntime(TaskOptions.init);
 	auto t = rt.create();
 	rt.cancel(t.taskId);
 	assert(rt.cancelRequested(t.taskId));
@@ -790,7 +798,7 @@ unittest  // a manual (executor-less) task cancels immediately
 
 unittest  // an executor-backed task cancels cooperatively (flag set, status unchanged)
 {
-	auto rt = new TaskRuntime(new InMemoryTaskStore(), TaskOptions.init);
+	auto rt = new TaskRuntime(TaskOptions.init);
 	auto t = rt.createFor("slow", Json.undefined);
 	rt.cancel(t.taskId);
 	assert(rt.cancelRequested(t.taskId));
@@ -802,7 +810,7 @@ unittest  // an executor-backed task cancels cooperatively (flag set, status unc
 
 unittest  // complete does not override an already-cancelled task
 {
-	auto rt = new TaskRuntime(new InMemoryTaskStore(), TaskOptions.init);
+	auto rt = new TaskRuntime(TaskOptions.init);
 	auto t = rt.create();
 	rt.cancel(t.taskId);
 	rt.complete(t.taskId, Json.emptyObject);
@@ -811,7 +819,7 @@ unittest  // complete does not override an already-cancelled task
 
 unittest  // checkpoints persist and read back
 {
-	auto rt = new TaskRuntime(new InMemoryTaskStore(), TaskOptions.init);
+	auto rt = new TaskRuntime(TaskOptions.init);
 	auto t = rt.createFor("multi", Json.undefined);
 	rt.putCheckpoint(t.taskId, "stage", Json("approved"));
 	assert(rt.getCheckpoint(t.taskId, "stage").get!string == "approved");
@@ -822,7 +830,7 @@ unittest  // getDetailed throws -32602 with the taskId for an unknown task
 {
 	import std.exception : collectException;
 
-	auto rt = new TaskRuntime(new InMemoryTaskStore(), TaskOptions.init);
+	auto rt = new TaskRuntime(TaskOptions.init);
 	auto ex = cast(McpException) collectException(rt.getDetailed("nope"));
 	assert(ex !is null);
 	assert(ex.code == ErrorCode.invalidParams);
@@ -830,7 +838,7 @@ unittest  // getDetailed throws -32602 with the taskId for an unknown task
 
 unittest  // onStatusChange fires with the DetailedTask on each transition
 {
-	auto rt = new TaskRuntime(new InMemoryTaskStore(), TaskOptions.init);
+	auto rt = new TaskRuntime(TaskOptions.init);
 	int calls;
 	string lastStatus;
 	rt.onStatusChange((Json d, string owner) @safe {
@@ -845,7 +853,7 @@ unittest  // onStatusChange fires with the DetailedTask on each transition
 
 unittest  // a throwing status-change sink neither fails the transition nor reaches the caller
 {
-	auto rt = new TaskRuntime(new InMemoryTaskStore(), TaskOptions.init);
+	auto rt = new TaskRuntime(TaskOptions.init);
 	rt.onStatusChange((Json d, string owner) @safe {
 		throw new Exception("sink closed");
 	});
@@ -860,7 +868,7 @@ unittest  // a throwing status-change sink neither fails the transition nor reac
 
 unittest  // a status transition clears the previous status message
 {
-	auto rt = new TaskRuntime(new InMemoryTaskStore(), TaskOptions.init);
+	auto rt = new TaskRuntime(TaskOptions.init);
 	auto done = rt.createFor("t", Json.undefined);
 	rt.progress(done.taskId, "halfway");
 	rt.complete(done.taskId, Json.emptyObject);
@@ -890,7 +898,7 @@ unittest  // requireInput rejects an empty request set and leaves the task worki
 {
 	import std.exception : collectException;
 
-	auto rt = new TaskRuntime(new InMemoryTaskStore(), TaskOptions.init);
+	auto rt = new TaskRuntime(TaskOptions.init);
 	auto t = rt.createFor("gate", Json.undefined);
 	auto ex = cast(McpException) collectException(rt.requireInput(t.taskId, Json.emptyObject));
 	assert(ex !is null && ex.code == ErrorCode.internalError);
@@ -904,7 +912,7 @@ unittest  // a unique-id collision from a bad generator is retried, then errors
 
 	TaskOptions o;
 	o.idGenerator = () @safe => "dup"; // always the same id
-	auto rt = new TaskRuntime(new InMemoryTaskStore(), o);
+	auto rt = new TaskRuntime(o);
 	auto first = rt.create();
 	assert(first.taskId == "dup");
 	auto ex = cast(McpException) collectException(rt.create());
@@ -917,8 +925,8 @@ unittest  // STATELESSNESS: two runtimes sharing one store see each other's stat
 	// a different node (here, a second TaskRuntime over the same store) resolves a
 	// task created/advanced by the first — result, inputRequests, and responses.
 	auto store = new InMemoryTaskStore();
-	auto nodeA = new TaskRuntime(store, TaskOptions.init);
-	auto nodeB = new TaskRuntime(store, TaskOptions.init);
+	auto nodeA = new TaskRuntime(TaskOptions(store));
+	auto nodeB = new TaskRuntime(TaskOptions(store));
 
 	// A creates and an executor on A requires input; B must see input_required.
 	auto t = nodeA.createFor("deploy", Json(["build": Json("v9")]));
@@ -952,7 +960,8 @@ unittest  // a terminal task expires ttl after it settled: tasks/get then report
 	TaskOptions o;
 	o.nowIso = () @safe => now;
 	auto store = new InMemoryTaskStore();
-	auto rt = new TaskRuntime(store, o);
+	o.store = store;
+	auto rt = new TaskRuntime(o);
 	auto t = rt.create(TaskCreateOptions(nullable(10_000.msecs)));
 	now = "2026-06-07T10:00:05Z";
 	rt.complete(t.taskId, Json.emptyObject);
@@ -970,7 +979,8 @@ unittest  // a non-terminal task never expires; its ttl starts once it settles
 	TaskOptions o;
 	o.nowIso = () @safe => now;
 	auto store = new InMemoryTaskStore();
-	auto rt = new TaskRuntime(store, o);
+	o.store = store;
+	auto rt = new TaskRuntime(o);
 	auto t = rt.create(TaskCreateOptions(nullable(1_000.msecs)));
 	now = "2026-06-07T12:00:00Z";
 	assert(rt.sweepExpired() == 0);
@@ -985,7 +995,7 @@ unittest  // a non-terminal task never expires; its ttl starts once it settles
 unittest  // cancelRequested reports true once the task record is gone, so its executor stops
 {
 	auto store = new InMemoryTaskStore();
-	auto rt = new TaskRuntime(store, TaskOptions.init);
+	auto rt = new TaskRuntime(TaskOptions(store));
 	auto t = rt.createFor("slow", Json.undefined);
 	assert(!rt.cancelRequested(t.taskId));
 	store.remove(t.taskId);
@@ -999,7 +1009,8 @@ unittest  // sweepExpired removes settled records past their ttl and keeps the r
 	TaskOptions o;
 	o.nowIso = () @safe => now;
 	auto store = new InMemoryTaskStore();
-	auto rt = new TaskRuntime(store, o);
+	o.store = store;
+	auto rt = new TaskRuntime(o);
 	auto done = rt.create(TaskCreateOptions(nullable(1_000.msecs)));
 	auto fresh = rt.create(TaskCreateOptions(nullable(60_000.msecs)));
 	auto running = rt.create(TaskCreateOptions(nullable(1_000.msecs)));
@@ -1017,7 +1028,7 @@ unittest  // cancelling a running executor's task records the request without a 
 	string now = "2026-06-07T10:00:00Z";
 	TaskOptions o;
 	o.nowIso = () @safe => now;
-	auto rt = new TaskRuntime(new InMemoryTaskStore(), o);
+	auto rt = new TaskRuntime(o);
 	int notified;
 	rt.onStatusChange((Json detailed, string owner) @safe { notified++; });
 	auto t = rt.createFor("tool", Json.emptyObject);
@@ -1035,7 +1046,7 @@ unittest  // stopSweeper ends the sweep loop, including one a restart replaced
 	int clockReads;
 	TaskOptions o;
 	o.nowIso = () @safe { clockReads++; return "2026-06-07T10:00:00Z"; };
-	auto rt = new TaskRuntime(new InMemoryTaskStore(), o);
+	auto rt = new TaskRuntime(o);
 	int beforeStop, afterStop;
 	runTask(() nothrow @safe {
 		try
@@ -1065,7 +1076,8 @@ unittest  // a task with an unlimited ttl never expires
 	TaskOptions o;
 	o.nowIso = () @safe => now;
 	auto store = new InMemoryTaskStore();
-	auto rt = new TaskRuntime(store, o);
+	o.store = store;
+	auto rt = new TaskRuntime(o);
 	auto t = rt.create();
 	TaskRecord r = store.get(t.taskId).get;
 	r.meta.ttlMs = Nullable!long.init;
@@ -1082,7 +1094,8 @@ unittest  // a task created with unlimitedTaskTtl has a null ttl and is kept for
 	TaskOptions o;
 	o.nowIso = () @safe => now;
 	auto store = new InMemoryTaskStore();
-	auto rt = new TaskRuntime(store, o);
+	o.store = store;
+	auto rt = new TaskRuntime(o);
 	auto t = rt.create(TaskCreateOptions(nullable(unlimitedTaskTtl)));
 	assert(t.ttlMs.isNull);
 	rt.complete(t.taskId, Json.emptyObject);
@@ -1095,7 +1108,7 @@ unittest  // a defaultTtl of unlimitedTaskTtl makes tasks unlimited unless a ttl
 {
 	TaskOptions o;
 	o.defaultTtl = unlimitedTaskTtl;
-	auto rt = new TaskRuntime(new InMemoryTaskStore(), o);
+	auto rt = new TaskRuntime(o);
 	assert(rt.create().ttlMs.isNull);
 	assert(rt.create(TaskCreateOptions(nullable(1_000.msecs))).ttlMs.get == 1_000);
 }
@@ -1109,7 +1122,8 @@ unittest  // a task unsettled past maxUnsettledAge fails, stops its executor, th
 	o.nowIso = () @safe => now;
 	o.maxUnsettledAge = 1.hours;
 	auto store = new InMemoryTaskStore();
-	auto rt = new TaskRuntime(store, o);
+	o.store = store;
+	auto rt = new TaskRuntime(o);
 	string[] seen;
 	rt.onStatusChange((Json d, string owner) @safe {
 		seen ~= d["status"].get!string;
@@ -1135,7 +1149,8 @@ unittest  // the sweep fails a task unsettled past maxUnsettledAge
 	o.nowIso = () @safe => now;
 	o.maxUnsettledAge = 1.hours;
 	auto store = new InMemoryTaskStore();
-	auto rt = new TaskRuntime(store, o);
+	o.store = store;
+	auto rt = new TaskRuntime(o);
 	auto t = rt.createFor("slow", Json.undefined);
 	rt.requireInput(t.taskId, Json([
 			"k": Json(["method": Json("elicitation/create")])
@@ -1151,7 +1166,7 @@ unittest  // a task whose cancel never settled is cancelled, not failed, at maxU
 	TaskOptions o;
 	o.nowIso = () @safe => now;
 	o.maxUnsettledAge = 1.hours;
-	auto rt = new TaskRuntime(new InMemoryTaskStore(), o);
+	auto rt = new TaskRuntime(o);
 	auto t = rt.createFor("slow", Json.undefined);
 	rt.cancel(t.taskId);
 	assert(rt.getDetailed(t.taskId)["status"].get!string == "working");
@@ -1165,7 +1180,7 @@ unittest  // a zero maxUnsettledAge never fails an unsettled task
 	TaskOptions o;
 	o.nowIso = () @safe => now;
 	o.maxUnsettledAge = Duration.zero;
-	auto rt = new TaskRuntime(new InMemoryTaskStore(), o);
+	auto rt = new TaskRuntime(o);
 	auto t = rt.createFor("slow", Json.undefined);
 	now = "2027-06-07T10:00:00Z";
 	assert(rt.sweepExpired() == 0);
@@ -1182,7 +1197,7 @@ unittest  // deliverInput rejects a key the task has not requested and records n
 {
 	import std.exception : collectException;
 
-	auto rt = new TaskRuntime(new InMemoryTaskStore(), TaskOptions.init);
+	auto rt = new TaskRuntime(TaskOptions.init);
 	auto t = rt.createFor("gate", Json.undefined);
 	auto none = cast(McpException) collectException(rt.deliverInput(t.taskId, Json([
 		"a": Json(1)
@@ -1205,7 +1220,7 @@ unittest  // progress, requireInput, and resumeWorking leave a terminal task unt
 	string now = "2026-06-07T10:00:00Z";
 	TaskOptions o;
 	o.nowIso = () @safe => now;
-	auto rt = new TaskRuntime(new InMemoryTaskStore(), o);
+	auto rt = new TaskRuntime(o);
 	auto t = rt.create();
 	rt.cancel(t.taskId);
 	int notified;
@@ -1283,7 +1298,7 @@ version (unittest) private final class RacingTaskStore : TaskStore
 unittest  // a cancel racing a completion does not overwrite the stored result
 {
 	auto store = new RacingTaskStore();
-	auto rt = new TaskRuntime(store, TaskOptions.init);
+	auto rt = new TaskRuntime(TaskOptions(store));
 	auto t = rt.createFor("slow", Json.undefined);
 	store.beforeNextSwap = () @safe {
 		rt.complete(t.taskId, Json([
@@ -1301,7 +1316,7 @@ unittest  // each status notification carries the state its own transition commi
 	import std.algorithm : sort;
 
 	auto store = new RacingTaskStore();
-	auto rt = new TaskRuntime(store, TaskOptions.init);
+	auto rt = new TaskRuntime(TaskOptions(store));
 	string[] seen;
 	rt.onStatusChange((Json d, string owner) @safe {
 		seen ~= d["status"].get!string;
@@ -1318,7 +1333,7 @@ unittest  // each status notification carries the state its own transition commi
 unittest  // concurrent tasks/update deliveries both keep their answers
 {
 	auto store = new RacingTaskStore();
-	auto rt = new TaskRuntime(store, TaskOptions.init);
+	auto rt = new TaskRuntime(TaskOptions(store));
 	auto t = rt.createFor("gate", Json.undefined);
 	rt.requireInput(t.taskId, Json([
 			"a": Json(["method": Json("elicitation/create")]),
@@ -1335,7 +1350,7 @@ unittest  // concurrent tasks/update deliveries both keep their answers
 
 unittest  // only one of two racing resumers moves the task back to working
 {
-	auto rt = new TaskRuntime(new InMemoryTaskStore(), TaskOptions.init);
+	auto rt = new TaskRuntime(TaskOptions.init);
 	auto t = rt.createFor("gate", Json.undefined);
 	rt.requireInput(t.taskId, Json([
 			"a": Json(["method": Json("elicitation/create")])
@@ -1348,7 +1363,7 @@ unittest  // deliverInput rejects non-object inputResponses with -32602
 {
 	import std.exception : collectException;
 
-	auto rt = new TaskRuntime(new InMemoryTaskStore(), TaskOptions.init);
+	auto rt = new TaskRuntime(TaskOptions.init);
 	auto t = rt.createFor("gate", Json.undefined);
 	rt.requireInput(t.taskId, Json([
 			"a": Json(["method": Json("elicitation/create")])
@@ -1361,7 +1376,7 @@ unittest  // deliverInput rejects answers for a terminal task with -32602
 {
 	import std.exception : collectException;
 
-	auto rt = new TaskRuntime(new InMemoryTaskStore(), TaskOptions.init);
+	auto rt = new TaskRuntime(TaskOptions.init);
 	auto t = rt.create();
 	rt.complete(t.taskId, Json.emptyObject);
 	auto ex = cast(McpException) collectException(rt.deliverInput(t.taskId,

@@ -354,7 +354,7 @@ unittest  // runTaskExecutor completes a task with the executor's result
 	import mcp.server.task_store : InMemoryTaskStore;
 	import mcp.server.task_runtime : TaskOptions;
 
-	auto rt = new TaskRuntime(new InMemoryTaskStore(), TaskOptions.init);
+	auto rt = new TaskRuntime(TaskOptions.init);
 	auto t = rt.createFor("echo", Json(["v": Json(7)]));
 	runTaskExecutor(rt, t.taskId, (TaskContext tc) @safe {
 		return Json(["structuredContent": Json(["v": Json(7)])]);
@@ -369,7 +369,7 @@ unittest  // a throwing status-change sink leaves a suspended task input_require
 	import mcp.server.task_store : InMemoryTaskStore;
 	import mcp.server.task_runtime : TaskOptions;
 
-	auto rt = new TaskRuntime(new InMemoryTaskStore(), TaskOptions.init);
+	auto rt = new TaskRuntime(TaskOptions.init);
 	rt.onStatusChange((Json d, string owner) @safe {
 		throw new Exception("stdout closed");
 	});
@@ -387,7 +387,7 @@ unittest  // an executor whose task record is removed mid-run stops without fail
 	import mcp.server.task_runtime : TaskOptions;
 
 	auto store = new InMemoryTaskStore();
-	auto rt = new TaskRuntime(store, TaskOptions.init);
+	auto rt = new TaskRuntime(TaskOptions(store));
 	auto t = rt.createFor("slow", Json.undefined);
 	bool sawCancel;
 	runTaskExecutor(rt, t.taskId, (TaskContext tc) @safe {
@@ -404,7 +404,7 @@ unittest  // an executor suspending with no input requests fails the task
 	import mcp.server.task_store : InMemoryTaskStore;
 	import mcp.server.task_runtime : TaskOptions;
 
-	auto rt = new TaskRuntime(new InMemoryTaskStore(), TaskOptions.init);
+	auto rt = new TaskRuntime(TaskOptions.init);
 	auto t = rt.createFor("gate", Json.undefined);
 	runTaskExecutor(rt, t.taskId, (TaskContext tc) @safe {
 		return tc.requireInput([]);
@@ -417,7 +417,7 @@ unittest  // requireInput suspends into input_required; re-run completes after a
 	import mcp.server.task_store : InMemoryTaskStore;
 	import mcp.server.task_runtime : TaskOptions;
 
-	auto rt = new TaskRuntime(new InMemoryTaskStore(), TaskOptions.init);
+	auto rt = new TaskRuntime(TaskOptions.init);
 	auto t = rt.createFor("gate", Json.undefined);
 
 	// The executor needs an "ok" answer before it can finish.
@@ -446,7 +446,7 @@ unittest  // detach stops the dispatch without completing; the task stays workin
 	import mcp.server.task_store : InMemoryTaskStore;
 	import mcp.server.task_runtime : TaskOptions;
 
-	auto rt = new TaskRuntime(new InMemoryTaskStore(), TaskOptions.init);
+	auto rt = new TaskRuntime(TaskOptions.init);
 	auto t = rt.createFor("deploy", Json.undefined);
 	runTaskExecutor(rt, t.taskId, delegate Json(TaskContext tc) @safe {
 		return tc.detach();
@@ -465,7 +465,7 @@ unittest  // detach(statusMessage) records a working status message
 	import mcp.server.task_store : InMemoryTaskStore;
 	import mcp.server.task_runtime : TaskOptions;
 
-	auto rt = new TaskRuntime(new InMemoryTaskStore(), TaskOptions.init);
+	auto rt = new TaskRuntime(TaskOptions.init);
 	auto t = rt.createFor("deploy", Json.undefined);
 	runTaskExecutor(rt, t.taskId, delegate Json(TaskContext tc) @safe {
 		return tc.detach("deploying");
@@ -480,7 +480,7 @@ unittest  // an executor that throws fails the task with a JSON-RPC error
 	import mcp.server.task_store : InMemoryTaskStore;
 	import mcp.server.task_runtime : TaskOptions;
 
-	auto rt = new TaskRuntime(new InMemoryTaskStore(), TaskOptions.init);
+	auto rt = new TaskRuntime(TaskOptions.init);
 	auto t = rt.createFor("boom", Json.undefined);
 	runTaskExecutor(rt, t.taskId, delegate Json(TaskContext tc) @safe {
 		throw new Exception("kaboom");
@@ -495,7 +495,7 @@ unittest  // a cancel observed during the run marks the task cancelled, not comp
 	import mcp.server.task_store : InMemoryTaskStore;
 	import mcp.server.task_runtime : TaskOptions;
 
-	auto rt = new TaskRuntime(new InMemoryTaskStore(), TaskOptions.init);
+	auto rt = new TaskRuntime(TaskOptions.init);
 	auto t = rt.createFor("slow", Json.undefined);
 	rt.cancel(t.taskId); // sets the cooperative flag (executor-backed: status stays working)
 	runTaskExecutor(rt, t.taskId, (TaskContext tc) @safe {
@@ -510,7 +510,7 @@ unittest  // an executor that throws after a cancel was requested ends the task 
 	import mcp.server.task_store : InMemoryTaskStore;
 	import mcp.server.task_runtime : TaskOptions;
 
-	auto rt = new TaskRuntime(new InMemoryTaskStore(), TaskOptions.init);
+	auto rt = new TaskRuntime(TaskOptions.init);
 	auto t = rt.createFor("slow", Json.undefined);
 	runTaskExecutor(rt, t.taskId, delegate Json(TaskContext tc) @safe {
 		rt.cancel(tc.taskId);
@@ -525,7 +525,7 @@ unittest  // an executor that throws an McpException after a cancel ends the tas
 	import mcp.server.task_runtime : TaskOptions;
 	import mcp.protocol.errors : internalError;
 
-	auto rt = new TaskRuntime(new InMemoryTaskStore(), TaskOptions.init);
+	auto rt = new TaskRuntime(TaskOptions.init);
 	auto t = rt.createFor("slow", Json.undefined);
 	runTaskExecutor(rt, t.taskId, delegate Json(TaskContext tc) @safe {
 		rt.cancel(tc.taskId);
@@ -539,7 +539,7 @@ unittest  // cancelling a task suspended for input cancels it at once
 	import mcp.server.task_store : InMemoryTaskStore;
 	import mcp.server.task_runtime : TaskOptions;
 
-	auto rt = new TaskRuntime(new InMemoryTaskStore(), TaskOptions.init);
+	auto rt = new TaskRuntime(TaskOptions.init);
 	auto t = rt.createFor("gate", Json.undefined);
 	runTaskExecutor(rt, t.taskId, (TaskContext tc) @safe {
 		return tc.requireInput([InputRequest.elicitation("ok", "Proceed?")]);
@@ -555,7 +555,7 @@ unittest  // cancelling a detached task cancels it at once; a later completion i
 	import mcp.server.task_store : InMemoryTaskStore;
 	import mcp.server.task_runtime : TaskOptions;
 
-	auto rt = new TaskRuntime(new InMemoryTaskStore(), TaskOptions.init);
+	auto rt = new TaskRuntime(TaskOptions.init);
 	auto t = rt.createFor("deploy", Json.undefined);
 	runTaskExecutor(rt, t.taskId, delegate Json(TaskContext tc) @safe {
 		return tc.detach("deploying");
@@ -571,7 +571,7 @@ unittest  // requireInput after a cancel was requested cancels instead of suspen
 	import mcp.server.task_store : InMemoryTaskStore;
 	import mcp.server.task_runtime : TaskOptions;
 
-	auto rt = new TaskRuntime(new InMemoryTaskStore(), TaskOptions.init);
+	auto rt = new TaskRuntime(TaskOptions.init);
 	auto t = rt.createFor("gate", Json.undefined);
 	runTaskExecutor(rt, t.taskId, (TaskContext tc) @safe {
 		rt.cancel(tc.taskId); // arrives while the executor is running
@@ -585,7 +585,7 @@ unittest  // detach after a cancel was requested cancels instead of detaching
 	import mcp.server.task_store : InMemoryTaskStore;
 	import mcp.server.task_runtime : TaskOptions;
 
-	auto rt = new TaskRuntime(new InMemoryTaskStore(), TaskOptions.init);
+	auto rt = new TaskRuntime(TaskOptions.init);
 	auto t = rt.createFor("deploy", Json.undefined);
 	runTaskExecutor(rt, t.taskId, delegate Json(TaskContext tc) @safe {
 		rt.cancel(tc.taskId);
@@ -599,7 +599,7 @@ unittest  // an executor that swallows its suspension still leaves the task inpu
 	import mcp.server.task_store : InMemoryTaskStore;
 	import mcp.server.task_runtime : TaskOptions;
 
-	auto rt = new TaskRuntime(new InMemoryTaskStore(), TaskOptions.init);
+	auto rt = new TaskRuntime(TaskOptions.init);
 	auto t = rt.createFor("gate", Json.undefined);
 	runTaskExecutor(rt, t.taskId, (TaskContext tc) @safe {
 		try
@@ -617,7 +617,7 @@ unittest  // an executor that swallows its detach leaves the task working
 	import mcp.server.task_store : InMemoryTaskStore;
 	import mcp.server.task_runtime : TaskOptions;
 
-	auto rt = new TaskRuntime(new InMemoryTaskStore(), TaskOptions.init);
+	auto rt = new TaskRuntime(TaskOptions.init);
 	auto t = rt.createFor("deploy", Json.undefined);
 	runTaskExecutor(rt, t.taskId, delegate Json(TaskContext tc) @safe {
 		try
@@ -635,7 +635,7 @@ unittest  // re-requesting an input key discards its earlier answer, so only a f
 	import mcp.server.task_store : InMemoryTaskStore;
 	import mcp.server.task_runtime : TaskOptions;
 
-	auto rt = new TaskRuntime(new InMemoryTaskStore(), TaskOptions.init);
+	auto rt = new TaskRuntime(TaskOptions.init);
 	auto t = rt.createFor("retry", Json.undefined);
 	TaskExecutor exec = (TaskContext tc) @safe {
 		if (!tc.hasInput("x"))
@@ -663,7 +663,7 @@ unittest  // re-requesting one key keeps the answers to other keys from earlier 
 	import mcp.server.task_store : InMemoryTaskStore;
 	import mcp.server.task_runtime : TaskOptions;
 
-	auto rt = new TaskRuntime(new InMemoryTaskStore(), TaskOptions.init);
+	auto rt = new TaskRuntime(TaskOptions.init);
 	auto t = rt.createFor("two", Json.undefined);
 	rt.requireInput(t.taskId, Json([
 			"a": Json(["method": Json("elicitation/create")])
@@ -681,7 +681,7 @@ unittest  // checkpoint state survives a suspension and is restored on re-run
 	import mcp.server.task_store : InMemoryTaskStore;
 	import mcp.server.task_runtime : TaskOptions;
 
-	auto rt = new TaskRuntime(new InMemoryTaskStore(), TaskOptions.init);
+	auto rt = new TaskRuntime(TaskOptions.init);
 	auto t = rt.createFor("multi", Json.undefined);
 
 	TaskExecutor exec = (TaskContext tc) @safe {
