@@ -451,9 +451,12 @@ enum string upstreamRefreshTokenClaim = "upstream_refresh_token";
 /// for loopback hosts (`127.0.0.1`, `[::1]`, `localhost`) per RFC 8252 §7.3. All
 /// other schemes (including `http` to a non-loopback host, and custom/private-use
 /// schemes) are rejected so the upstream code can never be relayed over an
-/// open-redirect-prone or interceptable channel.
+/// open-redirect-prone or interceptable channel. A URI carrying a fragment is
+/// rejected too (RFC 6749 §3.1.2).
 bool isAllowedRedirectScheme(string redirectUri) @safe
 {
+	if (redirectUri.indexOf('#') >= 0)
+		return false;
 	if (redirectUri.startsWith("https://"))
 		return true;
 	if (redirectUri.startsWith("http://"))
@@ -464,13 +467,19 @@ bool isAllowedRedirectScheme(string redirectUri) @safe
 	return false;
 }
 
+/// The host of the authority that begins `authorityAndRest` (the text after
+/// `scheme://`). The authority ends at the first `/`, `?` or `#` (RFC 3986 §3.2),
+/// or `\`, which browsers treat as a path separator in http URLs, so an `@` in
+/// the path, query or fragment is never mistaken for a userinfo delimiter.
 private string hostOf(string authorityAndRest) @safe
 {
+	import std.string : indexOfAny, lastIndexOf;
+
 	auto s = authorityAndRest;
-	const slash = s.indexOf('/');
-	if (slash >= 0)
-		s = s[0 .. slash];
-	const at = s.indexOf('@');
+	const end = s.indexOfAny("/?#\\");
+	if (end >= 0)
+		s = s[0 .. end];
+	const at = s.lastIndexOf('@');
 	if (at >= 0)
 		s = s[at + 1 .. $];
 	if (s.startsWith("["))
@@ -1985,6 +1994,26 @@ unittest  // SCHEME ALLOWLIST: http to a non-loopback host is rejected
 {
 	assert(!isAllowedRedirectScheme("http://app.example.com/cb"));
 	assert(!isAllowedRedirectScheme("http://evil.test/cb"));
+}
+
+unittest  // SCHEME ALLOWLIST: userinfo after a fragment, query or backslash does not make a host loopback
+{
+	assert(!isAllowedRedirectScheme("http://evil.example#@127.0.0.1/cb"));
+	assert(!isAllowedRedirectScheme("http://evil.example?@localhost/cb"));
+	assert(!isAllowedRedirectScheme("http://evil.example\\@localhost/cb"));
+	assert(!isAllowedRedirectScheme("http://evil.example?x=@[::1]"));
+}
+
+unittest  // SCHEME ALLOWLIST: a redirect URI carrying a fragment is rejected (RFC 6749 §3.1.2)
+{
+	assert(!isAllowedRedirectScheme("https://app.example.com/cb#frag"));
+	assert(!isAllowedRedirectScheme("http://127.0.0.1:8765/cb#"));
+}
+
+unittest  // SCHEME ALLOWLIST: genuine userinfo before a loopback host still parses to that host
+{
+	assert(isAllowedRedirectScheme("http://user@127.0.0.1:8765/cb?x=1"));
+	assert(!isAllowedRedirectScheme("http://127.0.0.1@evil.example/cb"));
 }
 
 unittest  // SCHEME ALLOWLIST: a custom/private-use scheme is rejected
