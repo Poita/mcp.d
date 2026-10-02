@@ -3705,53 +3705,102 @@ final class McpServer : ServerCore
 /// expression taking the remaining segments.
 bool matchUriTemplate(string tmpl, string uri, out string[string] params) @safe
 {
-	import std.string : indexOf;
+	auto m = UriTemplateMatcher(tmpl, uri);
+	return m.match(0, 0, params);
+}
 
-	size_t ti = 0, ui = 0;
-	while (ti < tmpl.length)
+/// Backtracking matcher behind `matchUriTemplate`. An expression's extent is
+/// ambiguous when its trailing literal (or the next expression's operator
+/// prefix) recurs in the URI, so each candidate end is tried shortest first,
+/// backtracking when the rest of the template fails. Binding never reads the
+/// values bound so far, so a failed (template, URI) position pair fails for
+/// every path that reaches it and is memoised; the bind attempts are also
+/// capped so a hostile URI cannot make matching expensive.
+private struct UriTemplateMatcher
+{
+	/// The most expression bindings one match may attempt.
+	enum maxAttempts = 1024;
+
+	string tmpl;
+	string uri;
+	bool[ulong] failed;
+	size_t attempts;
+
+	this(string tmpl, string uri) @safe
 	{
+		this.tmpl = tmpl;
+		this.uri = uri;
+	}
+
+	/// Match `tmpl[ti .. $]` against `uri[ui .. $]`, updating `params` only on
+	/// success.
+	bool match(size_t ti, size_t ui, ref string[string] params) @safe
+	{
+		import std.string : indexOf;
+
+		if (ti == tmpl.length)
+			return ui == uri.length;
+		const key = (cast(ulong) ti << 32) | ui;
+		if (key in failed)
+			return false;
 		if (tmpl[ti] != '{')
 		{
-			const litStart = ti;
-			while (ti < tmpl.length && tmpl[ti] != '{')
-				ti++;
-			const lit = tmpl[litStart .. ti];
-			if (ui + lit.length > uri.length || uri[ui .. ui + lit.length] != lit)
-				return false;
-			ui += lit.length;
-			continue;
+			const brace = tmpl[ti .. $].indexOf('{');
+			const lit = tmpl[ti .. brace < 0 ? $ : ti + brace];
+			if (uri.length - ui >= lit.length && uri[ui .. ui + lit.length] == lit
+					&& match(ti + lit.length, ui + lit.length, params))
+				return true;
+			failed[key] = true;
+			return false;
 		}
 		const close = tmpl[ti .. $].indexOf('}');
 		if (close < 0)
 			return false;
 		const expr = tmpl[ti + 1 .. ti + close];
-		ti += close + 1;
+		const next = ti + close + 1;
+		foreach (end; candidateEnds(next, ui))
+		{
+			if (++attempts > maxAttempts)
+				return false;
+			auto attempt = params.dup;
+			if (bindUriExpression(expr, uri[ui .. end], attempt) && match(next, end, attempt))
+			{
+				params = attempt;
+				return true;
+			}
+		}
+		failed[key] = true;
+		return false;
+	}
 
-		// The expression's extent ends at the next literal, or — when another
-		// expression follows directly — at that expression's operator prefix.
-		size_t litEnd = ti;
-		while (litEnd < tmpl.length && tmpl[litEnd] != '{')
-			litEnd++;
-		const lit = tmpl[ti .. litEnd];
-		size_t end = uri.length;
+	/// The URI offsets at which the expression starting at `ui` may end: each
+	/// occurrence of the literal at `tmpl[next .. $]`, or - when another
+	/// expression follows directly - each occurrence of its operator prefix and
+	/// the end of the URI; with nothing after it, the end of the URI.
+	private size_t[] candidateEnds(size_t next, size_t ui) @safe
+	{
+		import std.string : indexOf;
+
+		size_t[] ends;
+		const brace = tmpl[next .. $].indexOf('{');
+		const lit = tmpl[next .. brace < 0 ? $ : next + brace];
 		if (lit.length)
 		{
-			const pos = uri[ui .. $].indexOf(lit);
-			if (pos < 0)
-				return false;
-			end = ui + pos;
+			size_t from = ui;
+			for (ptrdiff_t pos; (pos = uri[from .. $].indexOf(lit)) >= 0; from += pos + 1)
+				ends ~= from + pos;
 		}
-		else if (ti + 1 < tmpl.length && uriTemplatePrefixOps.indexOf(tmpl[ti + 1]) >= 0)
+		else if (next + 1 < tmpl.length && uriTemplatePrefixOps.indexOf(tmpl[next + 1]) >= 0)
 		{
-			const pos = uri[ui .. $].indexOf(tmpl[ti + 1]);
-			if (pos >= 0)
-				end = ui + pos;
+			foreach (i; ui .. uri.length)
+				if (uri[i] == tmpl[next + 1])
+					ends ~= i;
+			ends ~= uri.length;
 		}
-		if (!bindUriExpression(expr, uri[ui .. end], params))
-			return false;
-		ui = end;
+		else
+			ends ~= uri.length;
+		return ends;
 	}
-	return ui == uri.length;
 }
 
 /// RFC 6570 operators whose expansion begins with the operator character itself.
@@ -3930,6 +3979,37 @@ unittest  // segment and reserved expressions reject a '.' or '..' path segment
 	assert(!matchUriTemplate("res://x/{+path}", "res://x/a%2F..%2Fetc", params));
 	assert(matchUriTemplate("res://x/{+path}", "res://x/a/b.c/d", params));
 	assert(params["path"] == "a/b.c/d");
+}
+
+unittest  // a reserved expression spans a later occurrence of its trailing literal
+{
+	string[string] params;
+	assert(matchUriTemplate("res://{+path}/meta", "res://a/meta/b/meta", params));
+	assert(params["path"] == "a/meta/b");
+}
+
+unittest  // matching backtracks over an earlier expression's literal choice
+{
+	string[string] params;
+	assert(matchUriTemplate("res://{+a}-{b}.txt", "res://x-y/z-w.txt", params));
+	assert(params["a"] == "x-y/z");
+	assert(params["b"] == "w");
+	string[string] none;
+	assert(!matchUriTemplate("res://{+a}-{b}.txt", "res://x-y/z-w.md", none));
+	assert(none.length == 0);
+}
+
+unittest  // backtracking over a URI full of ambiguous literals stays bounded
+{
+	import std.array : replicate;
+	import std.datetime.stopwatch : StopWatch, AutoStart;
+	import core.time : seconds;
+
+	string[string] params;
+	auto sw = StopWatch(AutoStart.yes);
+	assert(!matchUriTemplate("res://{+a}-{+b}-{+c}-{+d}.txt",
+			"res://" ~ "-".replicate(20_000), params));
+	assert(sw.peek < 2.seconds);
 }
 
 unittest  // a simple {var} rejects a percent-encoded '/' (no encoded traversal)
