@@ -399,8 +399,13 @@ void mountMcp(URLRouter router, McpServer server,
 void mountLegacyHttpSse(URLRouter router, McpServer server,
 		StreamableHttpOptions opts = StreamableHttpOptions.init) @safe
 {
-	auto channel = new LegacySseChannel(opts.legacyMessagePath, opts.streamLimits);
-	channel.coord.requestTimeout = opts.serverRequestTimeout;
+	// Each legacy stream also listens on the server's push channel, so `notify*`
+	// and server pings reach legacy clients; sharing its coordinator lets the
+	// replies POSTed here resolve those pings.
+	auto fresh = new StreamCoordinator;
+	fresh.requestTimeout = opts.serverRequestTimeout;
+	auto push = ensurePushChannel(server, fresh, opts.replayHistory);
+	auto channel = new LegacySseChannel(opts.legacyMessagePath, opts.streamLimits, push.coordinator);
 	mountCorsPreflight(router, opts.legacySsePath, "GET", opts);
 	mountCorsPreflight(router, opts.legacyMessagePath, "POST", opts);
 
@@ -417,7 +422,7 @@ void mountLegacyHttpSse(URLRouter router, McpServer server,
 			res.writeBody("Too many open streams", "text/plain");
 			return;
 		}
-		handleLegacyGet(channel, principalOf(token), res);
+		handleLegacyGet(server, channel, push, principalOf(token), res);
 	});
 
 	router.post(opts.legacyMessagePath, (HTTPServerRequest req, HTTPServerResponse res) @safe {
@@ -497,11 +502,14 @@ final class LegacySseChannel
 	/// ctx.listRoots registers here; the client's reply POST resolves the waiter.
 	StreamCoordinator coord;
 
-	this(string endpointPath, StreamLimits limits = StreamLimits.init) @safe
+	/// `coord` correlates server->client requests; pass the server's push channel
+	/// coordinator so requests the server issues through its push channel are
+	/// resolved by the replies POSTed here. Null creates a private one.
+	this(string endpointPath, StreamLimits limits = StreamLimits.init, StreamCoordinator coord = null) @safe
 	{
 		this.endpointPath = endpointPath;
 		this.limits = limits;
-		this.coord = new StreamCoordinator;
+		this.coord = coord !is null ? coord : new StreamCoordinator;
 	}
 
 	/// Whether the channel holds as many open streams as `maxLegacyStreams`.
@@ -700,7 +708,11 @@ private void holdSessionStream(void delegate(string) @safe writeFrame, ServerPus
 /// leading `endpoint` event), then hold the connection open with SSE comment
 /// heartbeats so a client disconnect terminates the loop and drops the listener.
 /// The stream is bound to `principal`, the authenticated subject of the GET.
-private void handleLegacyGet(LegacySseChannel channel, string principal, HTTPServerResponse res) @safe
+/// It also listens on `push`, the server's push channel, under its own session
+/// token, so server notifications and requests reach it as `message` events;
+/// `notifications/resources/updated` is gated on the stream's own subscriptions.
+private void handleLegacyGet(McpServer server, LegacySseChannel channel,
+		ServerPushChannel push, string principal, HTTPServerResponse res) @safe
 {
 	res.contentType = "text/event-stream";
 	applySseStreamHeaders(res, false);
@@ -716,7 +728,15 @@ private void handleLegacyGet(LegacySseChannel channel, string principal, HTTPSer
 	scope (exit)
 		channel.removeListener(listenerId);
 
-	runSseHeartbeat(writeFrame);
+	const sessionId = channel.sessionIdFor(listenerId);
+	const pushId = push.addListener((string frame) @safe {
+		writeFrame("event: message\n" ~ frame);
+	}, Json.init, ListenFilter.init, "", server.sessionPushEligibility(
+			channel.connStateFor(sessionId, principal)), sessionId, principal, false);
+	scope (exit)
+		push.removeListener(pushId);
+
+	holdSessionStream(writeFrame, push, pushId, null, sessionId, 15.seconds);
 }
 
 /// Process a single JSON-RPC message (or 2024-11-05 batch) POSTed to the legacy
@@ -5437,6 +5457,100 @@ unittest  // legacy POST past the per-stream in-flight cap is refused, but a rep
 			break;
 		yield();
 	}
+}
+
+version (unittest) private HTTPServerResponse legacyRequest(URLRouter router,
+		HTTPMethod method, string path, OutputStream sink, string body_ = "") @safe
+{
+	import vibe.http.server : createTestHTTPServerRequest,
+		createTestHTTPServerResponse, TestHTTPResponseMode;
+	import vibe.inet.url : URL;
+	import vibe.stream.memory : createMemoryStream;
+
+	auto buf = () @trusted { return cast(ubyte[]) body_.dup; }();
+	auto req = createTestHTTPServerRequest(URL("http://127.0.0.1" ~ path),
+			method, createMemoryStream(buf, false));
+	req.headers["Host"] = "127.0.0.1";
+	req.headers["Content-Type"] = "application/json";
+	auto res = createTestHTTPServerResponse(sink, null, TestHTTPResponseMode.bodyOnly);
+	router.handleRequest(req, res);
+	return res;
+}
+
+version (unittest) import vibe.core.stream : OutputStream;
+
+unittest  // legacy HTTP+SSE streams receive server notifications and answer server pings
+{
+	import core.time : msecs;
+	import std.algorithm : canFind;
+	import std.string : indexOf;
+	import vibe.core.core : runTask, sleep, exitEventLoop, runEventLoop;
+	import vibe.data.json : parseJsonString;
+	import vibe.stream.memory : createMemoryOutputStream;
+
+	auto server = McpServer.stateful("t", "1");
+	server.enableToolsListChanged();
+	auto router = new URLRouter;
+	StreamableHttpOptions opts;
+	mountLegacyHttpSse(router, server, opts);
+
+	auto sse = createMemoryOutputStream();
+	string text() @trusted
+	{
+		return cast(string) sse.data.idup;
+	}
+
+	size_t listChanged, updates;
+	bool pinged;
+	string failure;
+	runTask(() @safe nothrow{
+		try
+			legacyRequest(router, HTTPMethod.GET, "/sse", sse);
+		catch (Exception)
+		{
+		}
+	});
+	runTask(() @safe nothrow{
+		try
+		{
+			sleep(50.msecs);
+			const marker = "sessionId=";
+			const at = text.indexOf(marker) + marker.length;
+			const sid = text[at .. text.indexOf("\n", at)];
+			legacyRequest(router, HTTPMethod.POST, "/message?sessionId=" ~ sid,
+				createMemoryOutputStream(), initializeBody("2024-11-05"));
+			sleep(50.msecs);
+			listChanged = server.notifyToolsListChanged();
+			updates = server.notifyResourceUpdated("file:///never-subscribed");
+
+			runTask(() @safe nothrow{
+				try
+				{
+					import std.algorithm : find, startsWith;
+					import std.string : lineSplitter;
+
+					sleep(50.msecs);
+					auto line = text.lineSplitter.find!(l => l.startsWith("data: ")
+					&& l.canFind(`"method":"ping"`));
+					const id = parseJsonString(line.front["data: ".length .. $])["id"];
+					legacyRequest(router, HTTPMethod.POST, "/message?sessionId=" ~ sid,
+					createMemoryOutputStream(),
+					`{"jsonrpc":"2.0","id":` ~ id.toString ~ `,"result":{}}`);
+				}
+				catch (Exception e)
+					failure = e.msg;
+			});
+			server.pingClient(sid, 2.seconds);
+			pinged = true;
+		}
+		catch (Exception e)
+			failure = e.msg;
+		exitEventLoop();
+	});
+	runEventLoop();
+	assert(listChanged == 1 && text.canFind("notifications/tools/list_changed"), text);
+	assert(updates == 0, "resources/updated reaches only a stream subscribed to the URI");
+	assert(pinged, failure);
 }
 
 unittest  // a legacy GET past the stream cap is refused with 503

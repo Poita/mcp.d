@@ -470,6 +470,10 @@ final class ServerPushChannel : PushChannel
 		/// that request's events, so fan-out and session requests skip it, and it
 		/// ends once the request's stream closes.
 		bool postStream;
+		/// Whether the stream's events carry SSE ids and are kept for a
+		/// `Last-Event-ID` resume. A stream whose transport cannot resume (the
+		/// legacy HTTP+SSE stream) keeps no history.
+		bool replayable = true;
 	}
 
 	private static final class ListenerClosed
@@ -594,10 +598,14 @@ final class ServerPushChannel : PushChannel
 	/// fresh ordinal, so a normal GET opens a brand-new stream. The MUST NOT —
 	/// "replay messages that would have been delivered on a different stream" — is
 	/// honoured because replay is keyed strictly on the id's ordinal.
+	///
+	/// When `replayable` is false the stream's events carry no SSE id and no
+	/// history is kept for it, for a transport that cannot resume a stream.
 	long addListener(void delegate(string frame) @safe write, Json subscriptionId = Json.init,
 			ListenFilter filter = ListenFilter.init, string resumeFrom = "",
 			bool delegate(string method,
-				string uri) @safe plainEligible = null, string ownerToken = "", string principal = "") @safe
+				string uri) @safe plainEligible = null, string ownerToken = "",
+			string principal = "", bool replayable = true) @safe
 	{
 		return () @trusted {
 			auto lWriteMtx = new TaskMutex;
@@ -615,11 +623,11 @@ final class ServerPushChannel : PushChannel
 
 				id = nextListenerId++;
 				const group = filter.active ? "\0listen-" ~ id.to!string : ownerToken;
-				listeners ~= Listener(id, write, subscriptionId, filter, plainEligible,
-						ownerToken, lWriteMtx, principal, group, new ListenerClosed);
+				listeners ~= Listener(id, write, subscriptionId, filter, plainEligible, ownerToken,
+						lWriteMtx, principal, group, new ListenerClosed, false, replayable);
 
 				long resumeOrdinal, resumeSeq;
-				const parsed = parseEventId(resumeFrom, resumeOrdinal, resumeSeq);
+				const parsed = replayable && parseEventId(resumeFrom, resumeOrdinal, resumeSeq);
 				// A running POST stream that no longer holds every event after the
 				// cursor cannot be resumed: a server->client request among the lost
 				// events could never be answered. The stream is marked lost, so such a
@@ -1087,7 +1095,7 @@ final class ServerPushChannel : PushChannel
 				if (!present)
 					return false; // removed by a concurrent path before we reached it
 
-				const eid = ordinal.to!string ~ "-" ~ seq.to!string;
+				const eid = l.replayable ? ordinal.to!string ~ "-" ~ seq.to!string : "";
 				const frame = formatSseEvent(eid, withListenSubscriptionId(msg, l.subscriptionId));
 				try
 				{
@@ -1113,7 +1121,8 @@ final class ServerPushChannel : PushChannel
 				{
 					if (l.id !in live)
 						return true; // removed during the write; do not resurrect
-					recordHistory(ordinal, seq, frame);
+					if (l.replayable)
+						recordHistory(ordinal, seq, frame);
 					nextSeq[ordinal] = seq + 1;
 				}
 				return true;
