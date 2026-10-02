@@ -628,6 +628,12 @@ final class TaskRuntime
 		return resumed;
 	}
 
+	/// The stored record for `id`, or null when unknown or expired.
+	package(mcp) Nullable!TaskRecord recordOf(string id) @safe
+	{
+		return fetch(id);
+	}
+
 	/// The responses delivered so far for a task (keyed by input-request key).
 	Json[string] takenInput(string id) @safe
 	{

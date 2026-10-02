@@ -78,7 +78,7 @@ struct TaskContext
 	/// reads identical input whether on its first run or a re-dispatch elsewhere.
 	Json inputJson() @safe
 	{
-		return rt_.executorInput(taskId_);
+		return snapshot().executorInput;
 	}
 
 	/// Set the task's human-readable status message (visible via `tasks/get`).
@@ -101,15 +101,13 @@ struct TaskContext
 	/// Whether an answer for `key` has been delivered via `tasks/update`.
 	bool hasInput(string key) @safe
 	{
-		auto m = rt_.takenInput(taskId_);
-		return (key in m) !is null;
+		return (key in snapshot().inputs) !is null;
 	}
 
 	/// The raw delivered answer for `key`, or `undefined` if not yet present.
 	Json input(string key) @safe
 	{
-		auto m = rt_.takenInput(taskId_);
-		if (auto p = key in m)
+		if (auto p = key in snapshot().inputs)
 			return *p;
 		return Json.undefined;
 	}
@@ -124,22 +122,24 @@ struct TaskContext
 	/// available when the executor is re-invoked.
 	void checkpoint(T)(string key, T value) @safe
 	{
-		rt_.putCheckpoint(taskId_, key, serializeToJson(value));
+		auto j = serializeToJson(value);
+		rt_.putCheckpoint(taskId_, key, j);
+		snapshot().checkpoints[key] = j;
 	}
 
 	/// Whether a checkpoint exists under `key`.
 	bool hasCheckpoint(string key) @safe
 	{
-		return rt_.getCheckpoint(taskId_, key).type != Json.Type.undefined;
+		return (key in snapshot().checkpoints) !is null;
 	}
 
 	/// Read a previously stored checkpoint, decoded as `T`. Throws if absent.
 	T restore(T)(string key) @safe
 	{
-		auto j = rt_.getCheckpoint(taskId_, key);
-		if (j.type == Json.Type.undefined)
+		auto p = key in snapshot().checkpoints;
+		if (p is null)
 			throw new McpException(ErrorCode.internalError, "no checkpoint stored under key: " ~ key);
-		return deserializeJson!T(j);
+		return deserializeJson!T(*p);
 	}
 
 	/// Suspend the executor pending client input. Persists `requests` as the
@@ -187,6 +187,29 @@ struct TaskContext
 		throw new TaskDetached(taskId_);
 	}
 
+	/// The task's durable input, delivered answers and checkpoints, read from the
+	/// store once per dispatch. Answers cannot change while the executor runs (a
+	/// running task has no outstanding input requests, so `tasks/update` is
+	/// refused), and checkpoints change only through this context, which updates
+	/// the snapshot as it writes.
+	private DispatchOutcome snapshot() @safe
+	{
+		if (outcome_ is null)
+			outcome_ = new DispatchOutcome();
+		if (!outcome_.loaded)
+		{
+			auto r = rt_.recordOf(taskId_);
+			if (!r.isNull)
+			{
+				outcome_.executorInput = r.get.executorInput;
+				outcome_.inputs = r.get.inputResponses;
+				outcome_.checkpoints = r.get.checkpoints;
+			}
+			outcome_.loaded = true;
+		}
+		return outcome_;
+	}
+
 	/// `detach` that also records a human-readable working status message (visible
 	/// on the next `tasks/get`).
 	noreturn detach(string statusMessage) @safe
@@ -198,10 +221,14 @@ struct TaskContext
 
 /// Shared by every copy of a `TaskContext`, so the dispatcher sees that the
 /// executor suspended or detached even if the executor swallowed the unwinding
-/// exception.
+/// exception, and every copy reads the same per-dispatch record snapshot.
 private final class DispatchOutcome
 {
 	bool unwound;
+	bool loaded;
+	Json executorInput;
+	Json[string] inputs;
+	Json[string] checkpoints;
 }
 
 /// A registered task executor: given its `TaskContext`, it produces the final
@@ -698,4 +725,70 @@ unittest  // checkpoint state survives a suspension and is restored on re-run
 	runTaskExecutor(rt, t.taskId, exec);
 	auto d = rt.getDetailed(t.taskId);
 	assert(d["result"]["structuredContent"]["state"].get!string == "carried");
+}
+
+unittest  // an executor's input and checkpoint reads share one store read per dispatch
+{
+	import mcp.server.task_store : TaskStore, InMemoryTaskStore, TaskRecord;
+	import mcp.server.task_runtime : TaskOptions;
+
+	static final class CountingStore : TaskStore
+	{
+		InMemoryTaskStore inner;
+		size_t gets;
+
+		this() @safe
+		{
+			inner = new InMemoryTaskStore();
+		}
+
+		bool put(TaskRecord r) @safe
+		{
+			return inner.put(r);
+		}
+
+		Nullable!TaskRecord get(string id) @safe
+		{
+			gets++;
+			return inner.get(id);
+		}
+
+		bool compareAndSwap(TaskRecord r, ulong expected) @safe
+		{
+			return inner.compareAndSwap(r, expected);
+		}
+
+		void remove(string id) @safe
+		{
+			inner.remove(id);
+		}
+
+		size_t removeIf(scope bool delegate(const TaskRecord) @safe pred) @safe
+		{
+			return inner.removeIf(pred);
+		}
+	}
+
+	auto store = new CountingStore();
+	TaskOptions o;
+	o.store = store;
+	auto rt = new TaskRuntime(o);
+	auto t = rt.createFor("reader", Json(["n": Json(1)]));
+	rt.putCheckpoint(t.taskId, "seen", Json(true));
+	runTaskExecutor(rt, t.taskId, (TaskContext tc) @safe {
+		const before = store.gets;
+		foreach (_; 0 .. 5)
+		{
+			assert(tc.inputJson()["n"].get!int == 1);
+			assert(!tc.hasInput("x"));
+			assert(tc.input("x").type == Json.Type.undefined);
+			assert(tc.hasCheckpoint("seen"));
+			assert(tc.restore!bool("seen"));
+		}
+		assert(store.gets - before == 1, "reads after the first must come from the snapshot");
+		tc.checkpoint("later", 2);
+		assert(tc.restore!int("later") == 2);
+		return Json(["content": Json.emptyArray]);
+	});
+	assert(rt.getDetailed(t.taskId)["status"].get!string == "completed");
 }
