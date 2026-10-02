@@ -27,6 +27,18 @@ import mcp.protocol.capabilities : ClientCapabilities, ClientCapability;
 /// The HTTP header carrying the session id (basic/transports §Session Management).
 enum SessionHeader = "Mcp-Session-Id";
 
+/// Caps on the long-lived streams and concurrent work one mount accepts, so a
+/// client cannot exhaust the server's fibers and sockets. `0` disables a cap.
+struct StreamLimits
+{
+	/// Open legacy HTTP+SSE GET streams at once; past it a GET is answered 503.
+	size_t maxLegacyStreams = 1_000;
+	/// Requests dispatched concurrently from one legacy HTTP+SSE stream; past it
+	/// a POST is answered 429. A client's reply to a server->client request is
+	/// never refused.
+	size_t maxLegacyInFlight = 16;
+}
+
 /// Configuration for the Streamable HTTP server transport.
 struct StreamableHttpOptions
 {
@@ -122,6 +134,9 @@ struct StreamableHttpOptions
 	/// caps on `Mcp-Session-Id` sessions. An `initialize` that would exceed a
 	/// cap when every session that could make room is busy is answered 503.
 	SessionLimits sessionLimits;
+
+	/// Caps on concurrent streams and legacy dispatches.
+	StreamLimits streamLimits;
 }
 
 /// The well-known path (RFC 9728 §3) at which a protected resource server
@@ -348,7 +363,7 @@ void mountMcp(URLRouter router, McpServer server,
 void mountLegacyHttpSse(URLRouter router, McpServer server,
 		StreamableHttpOptions opts = StreamableHttpOptions.init) @safe
 {
-	auto channel = new LegacySseChannel(opts.legacyMessagePath);
+	auto channel = new LegacySseChannel(opts.legacyMessagePath, opts.streamLimits);
 	channel.coord.requestTimeout = opts.serverRequestTimeout;
 	mountCorsPreflight(router, opts.legacySsePath, "GET", opts);
 	mountCorsPreflight(router, opts.legacyMessagePath, "POST", opts);
@@ -359,6 +374,13 @@ void mountLegacyHttpSse(URLRouter router, McpServer server,
 		TokenInfo token;
 		if (!guardAuth(req, res, opts, token))
 			return;
+		if (channel.full)
+		{
+			res.statusCode = HTTPStatus.serviceUnavailable;
+			res.headers["Retry-After"] = "30";
+			res.writeBody("Too many open streams", "text/plain");
+			return;
+		}
 		handleLegacyGet(channel, principalOf(token), res);
 	});
 
@@ -382,10 +404,18 @@ void mountLegacyHttpSse(URLRouter router, McpServer server,
 			res.writeBody("Missing sessionId query parameter", "text/plain");
 			return;
 		}
-		if (!dispatchLegacyPost(server, channel, sessionId, payload, token))
+		final switch (dispatchLegacyPost(server, channel, sessionId, payload, token))
 		{
+		case LegacyPostOutcome.accepted:
+			break;
+		case LegacyPostOutcome.unknownStream:
 			res.statusCode = HTTPStatus.notFound;
 			res.writeBody("Unknown or closed session", "text/plain");
+			return;
+		case LegacyPostOutcome.tooManyRequests:
+			res.statusCode = HTTPStatus.tooManyRequests;
+			res.headers["Retry-After"] = "1";
+			res.writeBody("Too many requests in flight on this stream", "text/plain");
 			return;
 		}
 		// All subsequent client messages are POSTed here; the response (if any)
@@ -423,15 +453,48 @@ final class LegacySseChannel
 	private string endpointPath;
 	private Listener[] listeners;
 	private long nextId = 1;
+	private StreamLimits limits;
+	/// Requests currently dispatched per stream session token.
+	private size_t[string] inFlight;
 	/// Correlates server->client requests with the client's reply POSTs, keyed by
 	/// (sessionId, requestId). A handler that blocks in ctx.sample/ctx.elicit/
 	/// ctx.listRoots registers here; the client's reply POST resolves the waiter.
 	StreamCoordinator coord;
 
-	this(string endpointPath) @safe
+	this(string endpointPath, StreamLimits limits = StreamLimits.init) @safe
 	{
 		this.endpointPath = endpointPath;
+		this.limits = limits;
 		this.coord = new StreamCoordinator;
+	}
+
+	/// Whether the channel holds as many open streams as `maxLegacyStreams`.
+	bool full() const @safe
+	{
+		return limits.maxLegacyStreams != 0 && listeners.length >= limits.maxLegacyStreams;
+	}
+
+	/// Claim a dispatch slot on the stream `sessionId`, returning false when it
+	/// already runs `maxLegacyInFlight` requests. Pair with `releaseDispatch`.
+	bool tryAcquireDispatch(string sessionId) @safe
+	{
+		auto n = inFlight.get(sessionId, 0);
+		if (limits.maxLegacyInFlight != 0 && n >= limits.maxLegacyInFlight)
+			return false;
+		inFlight[sessionId] = n + 1;
+		return true;
+	}
+
+	/// Release a slot claimed by `tryAcquireDispatch`.
+	void releaseDispatch(string sessionId) @safe
+	{
+		if (auto n = sessionId in inFlight)
+		{
+			if (*n <= 1)
+				inFlight.remove(sessionId);
+			else
+				(*n)--;
+		}
 	}
 
 	/// Register an open GET SSE stream. A fresh per-stream session token and a
@@ -639,21 +702,45 @@ bool handleLegacyPostBody(McpServer server, LegacySseChannel channel,
 	auto conn = channel.connStateFor(sessionId, principalOf(token));
 	if (conn is null)
 		return false;
-
 	ParsedInput input;
+	if (parseLegacyPayload(channel, sessionId, payload, input))
+		handleLegacyInput(server, channel, sessionId, conn, input, token);
+	return true;
+}
+
+/// Parse a legacy POST body. A malformed one is answered with a JSON-RPC error
+/// on the stream `sessionId`, and false is returned.
+private bool parseLegacyPayload(LegacySseChannel channel, string sessionId,
+		string payload, out ParsedInput input) @safe
+{
 	try
 		input = parseAny(payload);
 	catch (McpException e)
 	{
 		channel.deliverTo(sessionId, makeErrorResponse(Json(null), e).toString());
-		return true;
+		return false;
 	}
 	catch (Exception e)
 	{
 		channel.deliverTo(sessionId, makeErrorResponse(Json(null), parseError(e.msg)).toString());
-		return true;
+		return false;
 	}
+	return true;
+}
 
+/// Whether `input` is a single client reply to a server->client request.
+private bool isLegacyReply(ref const ParsedInput input) @safe
+{
+	return !input.isBatch && input.messages.length == 1
+		&& (input.messages[0].kind == MessageKind.response
+				|| input.messages[0].kind == MessageKind.errorResponse);
+}
+
+/// Dispatch a parsed legacy POST against the stream `sessionId` and its
+/// connection state `conn`, delivering any response on the stream.
+private void handleLegacyInput(McpServer server, LegacySseChannel channel,
+		string sessionId, ConnectionState conn, ParsedInput input, TokenInfo token) @safe
+{
 	// Push any out-of-band server frame (progress, log, server->client request)
 	// onto the originating SSE stream, and issue server->client requests through
 	// the channel coordinator, blocking until the client's reply POST arrives.
@@ -713,7 +800,7 @@ bool handleLegacyPostBody(McpServer server, LegacySseChannel channel,
 		auto resp = dispatch(input.messages[0]);
 		if (!resp.isNull)
 			channel.deliverTo(sessionId, resp.get.toString());
-		return true;
+		return;
 	}
 
 	Json responses = Json.emptyArray;
@@ -733,7 +820,14 @@ bool handleLegacyPostBody(McpServer server, LegacySseChannel channel,
 	}
 	if (responses.type == Json.Type.object || responses.length)
 		channel.deliverTo(sessionId, responses.toString());
-	return true;
+}
+
+/// What became of a message POSTed to the legacy message endpoint.
+enum LegacyPostOutcome
+{
+	accepted, /// dispatched (or answered on the stream with a parse error)
+	unknownStream, /// no open stream owned by the caller has the session token
+	tooManyRequests, /// the stream already runs `StreamLimits.maxLegacyInFlight` requests
 }
 
 /// Accept a message POSTed to the legacy message endpoint and dispatch it on a
@@ -741,23 +835,39 @@ bool handleLegacyPostBody(McpServer server, LegacySseChannel channel,
 /// travel over the GET stream, so the POST is acknowledged without waiting for
 /// the handler: a client that sends POSTs one at a time can then answer a
 /// server->client request (elicitation, sampling, roots) the handler blocks on.
-/// Returns false — dispatching nothing — when no open stream owned by `token`'s
-/// principal has `sessionId`.
-bool dispatchLegacyPost(McpServer server, LegacySseChannel channel,
+/// A request is refused when its stream already runs as many requests as the
+/// channel's `StreamLimits.maxLegacyInFlight`; a client reply only wakes its
+/// waiter, so it is handled at once and never refused.
+LegacyPostOutcome dispatchLegacyPost(McpServer server, LegacySseChannel channel,
 		string sessionId, string payload, TokenInfo token = TokenInfo.invalid()) @safe
 {
 	import vibe.core.core : runTask;
 	import vibe.core.log : logError;
 
-	if (channel.connStateFor(sessionId, principalOf(token)) is null)
-		return false;
+	auto conn = channel.connStateFor(sessionId, principalOf(token));
+	if (conn is null)
+		return LegacyPostOutcome.unknownStream;
+	ParsedInput input;
+	if (!parseLegacyPayload(channel, sessionId, payload, input))
+		return LegacyPostOutcome.accepted;
+	if (isLegacyReply(input))
+	{
+		handleLegacyInput(server, channel, sessionId, conn, input, token);
+		return LegacyPostOutcome.accepted;
+	}
+	if (!channel.tryAcquireDispatch(sessionId))
+		return LegacyPostOutcome.tooManyRequests;
 	runTask(() nothrow{
 		try
-			cast(void) handleLegacyPostBody(server, channel, sessionId, payload, token);
+		{
+			scope (exit)
+				channel.releaseDispatch(sessionId);
+			handleLegacyInput(server, channel, sessionId, conn, input, token);
+		}
 		catch (Exception e)
 			logError("legacy HTTP+SSE dispatch failed: %s", e.msg);
 	});
-	return true;
+	return LegacyPostOutcome.accepted;
 }
 
 /// The `_meta.progressToken` of a request's params, or `Json.undefined`.
@@ -5068,7 +5178,8 @@ unittest  // legacy POST acknowledges before a blocking handler finishes
 	bool returned;
 	runTask(() nothrow{
 		try
-			accepted = dispatchLegacyPost(server, ch, sid, `{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"slow","arguments":{}}}`);
+			accepted = dispatchLegacyPost(server, ch, sid, `{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"slow","arguments":{}}}`) == LegacyPostOutcome
+				.accepted;
 		catch (Exception)
 		{
 		}
@@ -5093,7 +5204,113 @@ unittest  // legacy POST for an unknown stream is rejected without dispatching
 {
 	auto server = McpServer.stateful("t", "1");
 	auto ch = new LegacySseChannel("/message");
-	assert(!dispatchLegacyPost(server, ch, "no-such-session", initializeBody("2024-11-05")));
+	assert(dispatchLegacyPost(server, ch, "no-such-session",
+			initializeBody("2024-11-05")) == LegacyPostOutcome.unknownStream);
+}
+
+unittest  // legacy POST past the per-stream in-flight cap is refused, but a reply still lands
+{
+	import std.algorithm : canFind;
+	import vibe.core.core : yield;
+	import mcp.protocol.types : Tool, CallToolResult;
+	import mcp.server.responses : ToolResponse;
+
+	auto server = McpServer.stateful("t", "1");
+	bool release;
+	Tool descriptor;
+	descriptor.name = "slow";
+	server.registerTool(descriptor, (Json args, RequestContext ctx) @safe {
+		while (!release)
+			yield();
+		CallToolResult r;
+		return ToolResponse.complete(r);
+	});
+	StreamLimits limits;
+	limits.maxLegacyInFlight = 1;
+	auto ch = new LegacySseChannel("/message", limits);
+	string[] frames;
+	const sid = ch.sessionIdFor(ch.addListener((string f) @safe { frames ~= f; }));
+	string call(int id) @safe
+	{
+		import std.conv : to;
+
+		return `{"jsonrpc":"2.0","id":` ~ id.to!string
+			~ `,"method":"tools/call","params":{"name":"slow","arguments":{}}}`;
+	}
+
+	assert(dispatchLegacyPost(server, ch, sid, call(3)) == LegacyPostOutcome.accepted);
+	foreach (_; 0 .. 16)
+		yield();
+	assert(dispatchLegacyPost(server, ch, sid, call(4)) == LegacyPostOutcome.tooManyRequests);
+	assert(dispatchLegacyPost(server, ch, sid,
+			`{"jsonrpc":"2.0","id":99,"result":{}}`) == LegacyPostOutcome.accepted,
+			"a client reply must never be refused");
+
+	release = true;
+	foreach (_; 0 .. 4096)
+	{
+		if (frames.length == 2)
+			break;
+		yield();
+	}
+	assert(frames.length == 2 && frames[1].canFind("\"id\":3"));
+	assert(dispatchLegacyPost(server, ch, sid, call(5)) == LegacyPostOutcome.accepted);
+	foreach (_; 0 .. 4096)
+	{
+		if (frames.length == 3)
+			break;
+		yield();
+	}
+}
+
+unittest  // a legacy GET past the stream cap is refused with 503
+{
+	import core.time : msecs;
+	import vibe.core.core : runTask, sleep, exitEventLoop, runEventLoop;
+	import vibe.http.server : createTestHTTPServerRequest,
+		createTestHTTPServerResponse, TestHTTPResponseMode;
+	import vibe.inet.url : URL;
+	import vibe.stream.memory : createMemoryOutputStream, createMemoryStream;
+
+	auto server = McpServer.stateful("t", "1");
+	auto router = new URLRouter;
+	StreamableHttpOptions opts;
+	opts.streamLimits.maxLegacyStreams = 1;
+	mountLegacyHttpSse(router, server, opts);
+
+	HTTPServerResponse open(HTTPServerResponse res) @safe
+	{
+		auto req = createTestHTTPServerRequest(URL("http://127.0.0.1/sse"),
+				HTTPMethod.GET, createMemoryStream(null, false));
+		req.headers["Host"] = "127.0.0.1";
+		router.handleRequest(req, res);
+		return res;
+	}
+
+	auto first = createTestHTTPServerResponse(createMemoryOutputStream(), null,
+			TestHTTPResponseMode.bodyOnly);
+	int second;
+	runTask(() @safe nothrow{
+		try
+			open(first);
+		catch (Exception)
+		{
+		}
+	});
+	runTask(() @safe nothrow{
+		try
+		{
+			sleep(100.msecs);
+			second = open(createTestHTTPServerResponse(createMemoryOutputStream(),
+				null, TestHTTPResponseMode.bodyOnly)).statusCode;
+		}
+		catch (Exception)
+		{
+		}
+		exitEventLoop();
+	});
+	runEventLoop();
+	assert(second == HTTPStatus.serviceUnavailable);
 }
 
 unittest  // closing a legacy GET stream fails the server->client request awaiting it
