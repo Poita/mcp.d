@@ -38,7 +38,11 @@ struct SkillDirOptions
 	/// path (e.g. drop `*.pyc`). `null` includes everything except dot-prefixed
 	/// files and directories (`.git/`, `.DS_Store`). A filter replaces that
 	/// default: it is consulted for every file, dot-prefixed ones included, so it
-	/// can opt them back in and must exclude any it does not want. Note a
+	/// can opt them back in and must exclude any it does not want. Directories
+	/// are offered too, as their path with a trailing `/` (`node_modules/`):
+	/// returning `false` prunes the whole tree unread, so a filter that keeps
+	/// only some files must still accept the directories holding them. An
+	/// excluded symlink is skipped; an included one is rejected. Note a
 	/// filtered-out nested `SKILL.md` is neither served nor published as a
 	/// nested skill.
 	bool delegate(string relPath) @safe include;
@@ -422,9 +426,17 @@ private void walkInto(string base, string rel, ref RawFile[] files, ref size_t t
 	foreach (entry; listDir(here))
 	{
 		const childRel = rel.length ? rel ~ "/" ~ entry.name : entry.name;
-		// Without an include filter, dot-prefixed entries (.git/, .DS_Store) are
-		// skipped whole; a filter sees them and decides for itself.
-		if (include is null && entry.name.length && entry.name[0] == '.')
+		// The filter runs before anything else, so an excluded directory is
+		// pruned unwalked and an excluded symlink is skipped rather than
+		// rejected. Without an include filter, dot-prefixed entries (.git/,
+		// .DS_Store) are skipped whole; a filter sees them and decides for
+		// itself, a directory as its path with a trailing `/`.
+		if (include is null)
+		{
+			if (entry.name.length && entry.name[0] == '.')
+				continue;
+		}
+		else if (!include(entry.isDir && !entry.isSymlink ? childRel ~ "/" : childRel))
 			continue;
 		if (entry.isSymlink)
 			throw new Exception(
@@ -443,8 +455,6 @@ private void walkInto(string base, string rel, ref RawFile[] files, ref size_t t
 		// other file (and possibly published as its own entry — see
 		// `buildNestedEntries`).
 		if (entry.name == "SKILL.md" && rel.length == 0)
-			continue;
-		if (include !is null && !include(childRel))
 			continue;
 
 		// `files` excludes the root SKILL.md, which counts as a resource too.
@@ -1120,6 +1130,54 @@ unittest  // an include filter opts dot-prefixed paths back in
 	assert(manifestPaths(s) == [
 		"SKILL.md", ".config/settings.json", "references/FORMS.md"
 	], manifestPaths(s).text);
+}
+
+version (unittest) private void makeSymlink(string target, string link) @trusted
+{
+	import std.file : symlink;
+
+	symlink(target, link);
+}
+
+unittest  // an include filter that excludes a directory prunes it unwalked
+{
+	import std.algorithm : canFind, startsWith;
+
+	const root = tmpRoot("prune", "pdf-forms");
+	writeSkillFixture(root);
+	scope (exit)
+		removeTree(root);
+	writeNestedDir(root ~ "/node_modules/.bin");
+	makeSymlink(root ~ "/references/FORMS.md", root ~ "/node_modules/.bin/tool");
+
+	string[] offered;
+	auto s = new McpServer("t", "1");
+	SkillDirOptions opts;
+	opts.include = (string p) @safe {
+		offered ~= p;
+		return !p.startsWith("node_modules");
+	};
+	registerSkillDir(s, root, opts);
+	assert(manifestPaths(s) == ["SKILL.md", "references/FORMS.md"], manifestPaths(s).text);
+	assert(offered.canFind("node_modules/"), offered.text);
+	assert(!offered.canFind!(p => p.startsWith("node_modules/.bin")), offered.text);
+}
+
+unittest  // a symlink the include filter excludes is skipped rather than rejected
+{
+	import std.algorithm : endsWith;
+
+	const root = tmpRoot("skiplink", "pdf-forms");
+	writeSkillFixture(root);
+	scope (exit)
+		removeTree(root);
+	makeSymlink(root ~ "/references/FORMS.md", root ~ "/references/link.md");
+
+	auto s = new McpServer("t", "1");
+	SkillDirOptions opts;
+	opts.include = (string p) @safe => !p.endsWith("link.md");
+	registerSkillDir(s, root, opts);
+	assert(manifestPaths(s) == ["SKILL.md", "references/FORMS.md"], manifestPaths(s).text);
 }
 
 unittest  // registerSkillDir rejects a directory whose name != frontmatter name
