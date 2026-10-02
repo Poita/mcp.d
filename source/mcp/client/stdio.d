@@ -371,9 +371,30 @@ final class StdioClientTransport : ClientTransport
 	/// `-SIGTERM` / `-SIGKILL`). Safe to call once.
 	version (Posix) package int closeProcess(Duration termGrace, Duration killGrace) @safe
 	{
+		++closeProcessRuns_;
+		const status = stopProcess(termGrace, killGrace);
+		releaseProcess();
+		return status;
+	}
+
+	/// Release the reaped child's stdout pipe and process handle, so the event
+	/// driver holds no handle for them at exit. The read loop reads that pipe, so
+	/// it is stopped first; closing the pipe under a pending read is unsafe.
+	version (Posix) private void releaseProcess() @safe
+	{
+		// The child is gone, so its stdout is at end-of-input and the loop exits
+		// promptly; the grace only bounds a grandchild still holding the pipe.
+		if (channel !is null && started && !channel.stopReadLoop(1.seconds))
+			return;
+		() @trusted { pipes.stdout.close(); destroy(*pipes); }();
+	}
+
+	/// Run the stdio shutdown sequence on the owned child and return its exit
+	/// status.
+	version (Posix) private int stopProcess(Duration termGrace, Duration killGrace) @safe
+	{
 		import core.sys.posix.signal : SIGTERM, SIGKILL;
 
-		++closeProcessRuns_;
 		auto p = pipes;
 		// Step 0: close the child's stdin so a well-behaved server sees EOF and exits.
 		() @trusted { p.stdin.close(); }();
@@ -986,6 +1007,45 @@ version (Posix) unittest  // McpClient.spawn bounds the server's stdout lines by
 		client.close();
 	});
 	assert(msg.canFind("closed"), "an over-long line must close the channel, got: " ~ msg);
+}
+
+version (Posix) unittest  // close() releases the child's stdout pipe and process handle after the read loop stops
+{
+	import eventcore.core : eventDriver;
+
+	inLoop(() @safe {
+		// `cat` echoes the notification, so the read loop is live (parked reading
+		// stdout) when close() runs.
+		auto transport = spawnStdioTransport(["cat"]);
+		transport.sendOneway(parseJsonString(`{"jsonrpc":"2.0","method":"notifications/x"}`));
+		auto stdoutFd = () @trusted { return transport.pipes.stdout.tupleof[0]; }();
+		auto pid = () @trusted { return transport.pipes.process.tupleof[0]; }();
+		assert(eventDriver.pipes.isValid(stdoutFd) && eventDriver.processes.isValid(pid));
+		transport.close();
+		assert(!transport.channel.readLoopRunning, "the read loop must have stopped");
+		assert(!eventDriver.pipes.isValid(stdoutFd), "the stdout pipe must be released");
+		assert(!eventDriver.processes.isValid(pid), "the process handle must be released");
+	});
+}
+
+version (Posix) unittest  // close() stops a read loop parked on a stdout pipe a grandchild keeps open
+{
+	import core.time : seconds;
+	import std.datetime.stopwatch : StopWatch, AutoStart;
+	import eventcore.core : eventDriver;
+
+	inLoop(() @safe {
+		// The backgrounded `sleep` inherits stdout and outlives the child, so the
+		// read loop never sees end-of-input and has to be interrupted.
+		auto transport = spawnStdioTransport(["sh", "-c", "sleep 3 & cat"]);
+		transport.sendOneway(parseJsonString(`{"jsonrpc":"2.0","method":"notifications/x"}`));
+		auto stdoutFd = () @trusted { return transport.pipes.stdout.tupleof[0]; }();
+		auto sw = StopWatch(AutoStart.yes);
+		transport.close();
+		assert(sw.peek < 3.seconds, "close() must not wait for the grandchild");
+		assert(!transport.channel.readLoopRunning);
+		assert(!eventDriver.pipes.isValid(stdoutFd));
+	});
 }
 
 version (Posix) unittest  // close() is idempotent: a second call does not re-run the child shutdown

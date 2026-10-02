@@ -4,6 +4,7 @@ import core.time : Duration, seconds;
 
 import vibe.core.core : runTask;
 import vibe.core.sync : TaskMutex;
+import vibe.core.task : Task;
 import vibe.data.json : Json;
 
 import mcp.protocol.jsonrpc;
@@ -54,6 +55,10 @@ final class DuplexChannel
 	private DuplexCoordinator coord;
 	private TaskMutex writeMutex;
 	private bool closed_;
+	private Task readTask_;
+	// Set by `stopReadLoop`: the read loop exits at its next iteration and a read
+	// it was interrupted out of is not reported as a failure.
+	private bool stopping_;
 
 	/// Receives a description of each failure the read loop survives or ends on
 	/// (an unreadable input, a line whose handling threw). Defaults to stderr, the
@@ -110,7 +115,39 @@ final class DuplexChannel
 	/// loop (`runEventLoop`).
 	void start() @safe
 	{
-		runTask(&readLoop);
+		readTask_ = runTask(&readLoop);
+	}
+
+	/// Whether the read loop started by `start` is still running.
+	bool readLoopRunning() const @safe nothrow
+	{
+		return readTask_.running;
+	}
+
+	/// End the read loop started by `start` and wait for it to exit, so the
+	/// transport can release the byte stream the loop reads without racing it.
+	/// The loop gets `grace` to reach end-of-input by itself; a read still
+	/// pending after that is interrupted. Returns false only when called from
+	/// the read loop itself, which cannot wait for its own exit.
+	bool stopReadLoop(Duration grace) @safe
+	{
+		import core.time : msecs;
+		import std.datetime.stopwatch : StopWatch, AutoStart;
+		import vibe.core.core : sleep;
+		import vibe.core.task : Task;
+
+		if (!readTask_.running)
+			return true;
+		if (readTask_ == Task.getThis())
+			return false;
+		stopping_ = true;
+		auto sw = StopWatch(AutoStart.yes);
+		while (readTask_.running && sw.peek < grace)
+			sleep(1.msecs);
+		if (readTask_.running)
+			readTask_.interrupt();
+		readTask_.joinUninterruptible();
+		return true;
 	}
 
 	/// Run the read loop inline on the current task (does not spawn a task).
@@ -123,7 +160,7 @@ final class DuplexChannel
 
 	private void readLoop() @safe nothrow
 	{
-		for (;;)
+		while (!stopping_)
 		{
 			string line;
 			try
@@ -132,10 +169,11 @@ final class DuplexChannel
 			{
 				// An unreadable input cannot recover, so the loop ends as at
 				// end-of-input, but the failure is reported rather than hidden.
-				reportError("readLoop: read failed: " ~ e.msg);
+				if (!stopping_)
+					reportError("readLoop: read failed: " ~ e.msg);
 				break;
 			}
-			if (line is null)
+			if (line is null || stopping_)
 				break;
 			if (line.length == 0)
 				continue; // blank line, ignore
