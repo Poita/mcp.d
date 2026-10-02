@@ -245,6 +245,14 @@ private void registerResourceFixtures(McpServer server) @safe
 	server.registerResource(staticBinary, () @safe => ResourceContents.makeBlob(
 			"test://static-binary", "image/png", onePixelPng));
 
+	// The resources-subscribe/-unsubscribe scenarios subscribe to this URI.
+	Resource watched = {
+		uri: "test://watched-resource", name: "Watched Resource", description: nullable("A resource clients subscribe to for update notifications"),
+		mimeType: nullable("text/plain")
+	};
+	server.registerResource(watched, () @safe => ResourceContents.makeText(
+			"test://watched-resource", "text/plain", "Watched resource content."));
+
 	ResourceTemplate tpl = {
 		uriTemplate: "test://template/{id}/data", name: "Template Data", description: nullable(
 				"Parameterized data resource"), mimeType: nullable("application/json")
