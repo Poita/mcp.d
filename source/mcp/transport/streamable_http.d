@@ -1764,9 +1764,9 @@ private void handleListenStream(McpServer server, StreamCoordinator coord, Messa
 	// acknowledgement) is stamped with it in
 	// `params._meta["io.modelcontextprotocol/subscriptionId"]` (modern
 	// basic/utilities/subscriptions).
-	const listenerId = push.addListener((string frame) @safe {
+	const listenerId = addListenStreamListener(push, (string frame) @safe {
 		writeFrame(frame);
-	}, msg.id, streamFilter, "", null, "", principal);
+	}, msg.id, streamFilter, principal);
 	// Drop the listener when the stream ends so the channel self-heals.
 	scope (exit)
 		push.removeListener(listenerId);
@@ -1782,6 +1782,17 @@ private void handleListenStream(McpServer server, StreamCoordinator coord, Messa
 			subscriptionsAcknowledgedNotification(server.acknowledgedSubsetFor(streamFilter)));
 
 	runSseHeartbeat(&writeFrame.opCall);
+}
+
+/// Register a `subscriptions/listen` stream on `push`: its notifications are
+/// stamped with `subscriptionId`, delivered by `filter`, and scoped to
+/// `principal`. The stream keeps no replay history and its events carry no SSE
+/// id, since a listen stream is never resumed (2026-07-28 has no
+/// `Last-Event-ID`, and a stateless server serves no GET to resume on).
+private long addListenStreamListener(ServerPushChannel push, void delegate(
+		string) @safe write, Json subscriptionId, ListenFilter filter, string principal) @safe
+{
+	return push.addListener(write, subscriptionId, filter, "", null, "", principal, false);
 }
 
 /// Whether `method` opens a modern `events/stream` push response.
@@ -5671,7 +5682,8 @@ unittest  // modern subscriptions/listen: ack first, then opted-in change notifi
 	ListenFilter streamFilter;
 	streamFilter.active = true;
 	streamFilter.toolsListChanged = true;
-	const lid = push.addListener((string f) @safe { frames ~= f; }, m.id, streamFilter);
+	const lid = addListenStreamListener(push, (string f) @safe { frames ~= f; },
+			m.id, streamFilter, "");
 	push.emitTo(lid, subscriptionsAcknowledgedNotification(
 			server.acknowledgedSubsetFor(reqState.listenFilter)));
 	assert(frames.length == 1);
@@ -5695,6 +5707,24 @@ unittest  // modern subscriptions/listen: ack first, then opted-in change notifi
 	server.enableResourcesListChanged();
 	assert(server.notifyResourcesListChanged() == 0);
 	assert(frames.length == 2);
+}
+
+unittest  // a subscriptions/listen stream's events carry no SSE id: it is never resumed
+{
+	import mcp.transport.sse_context : StreamCoordinator;
+	import std.algorithm : canFind;
+
+	auto server = new McpServer("t", "1");
+	server.enableToolsListChanged();
+	auto push = ensurePushChannel(server, new StreamCoordinator);
+	string[] frames;
+	ListenFilter filter;
+	filter.active = true;
+	filter.toolsListChanged = true;
+	addListenStreamListener(push, (string f) @safe { frames ~= f; }, Json(1), filter, "");
+	assert(server.notifyToolsListChanged() == 1);
+	assert(frames.length == 1);
+	assert(!frames[0].canFind("id: "), frames[0]);
 }
 
 unittest  // legacy POST acknowledges before a blocking handler finishes
