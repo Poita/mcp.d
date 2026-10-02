@@ -2991,9 +2991,11 @@ final class McpServer : ServerCore
 
 		// A directory's direct children: registered resources whose URI sits one
 		// path segment below `prefix` are files; a deeper resource contributes its
-		// first segment as a synthesized subdirectory (reported once).
+		// first segment as a synthesized subdirectory. Each URI is reported once,
+		// as the registered file when one also has resources beneath it.
 		Resource[] children;
-		bool[string] seenDirs;
+		Resource[string] dirs;
+		bool[string] fileUris;
 		foreach (uri; resources.keys)
 		{
 			if (uri.length <= prefix.length || uri[0 .. prefix.length] != prefix)
@@ -3013,6 +3015,7 @@ final class McpServer : ServerCore
 				Resource child = resources[uri].descriptor;
 				child.name = rest;
 				children ~= child;
+				fileUris[uri] = true;
 			}
 			else
 			{
@@ -3021,16 +3024,18 @@ final class McpServer : ServerCore
 				if (slash == 0)
 					continue;
 				const childUri = prefix ~ rest[0 .. slash];
-				if (childUri in seenDirs)
+				if (childUri in dirs)
 					continue;
-				seenDirs[childUri] = true;
 				Resource d;
 				d.uri = childUri;
 				d.name = rest[0 .. slash];
 				d.mimeType = directoryMimeType;
-				children ~= d;
+				dirs[childUri] = d;
 			}
 		}
+		foreach (uri, d; dirs)
+			if (uri !in fileUris)
+				children ~= d;
 
 		// The method applies only to directory resources: a URI that names no
 		// subtree (a file, or an unknown URI) is reported as -32602, the same code
@@ -8614,6 +8619,22 @@ unittest  // modern: a requestState-only input-required result bypasses output-s
 	assert("error" !in resp);
 	assert(resp["result"]["resultType"].get!string == "input_required");
 	assert(resp["result"]["requestState"].get!string == "resume-here");
+}
+
+unittest  // resources/directory/read reports a URI that is both a file and a subdirectory once
+{
+	auto s = new McpServer("t", "1");
+	s.enableDirectoryRead();
+	foreach (u; ["s://d/a", "s://d/a/b", "s://d/c"])
+	{
+		Resource r = {uri: u, name: u};
+		s.registerResource(r, () @safe => ResourceContents.makeText(u, "text/plain", "x"));
+	}
+	auto res = s.handle(modernReq(1, "resources/directory/read",
+			Json(["uri": Json("s://d")]))).get["result"]["resources"];
+	assert(res.length == 2);
+	assert(res[0]["uri"].get!string == "s://d/a");
+	assert(res[1]["uri"].get!string == "s://d/c");
 }
 
 unittest  // modern resources/read unknown uri uses invalidParams (-32602)
