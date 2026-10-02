@@ -618,7 +618,9 @@ precise constraint; use `double` for a field that should accept fractional value
 An optional tool parameter is left out of `required`; declare it `Nullable!T` (whose
 schema also admits an explicit `null`, as LLM clients often send one) or give it a
 D default value (`int page = 1`), which is also emitted as the property's
-`"default"`. A `Nullable` parameter mirrored into a header with `@mcpHeader` keeps
+`"default"`. A `@schemaDefault(v)` parameter is optional too: `v` is advertised
+as its `"default"` and is what an omitted argument binds to, over any D default
+(likewise for a struct field). A `Nullable` parameter mirrored into a header with `@mcpHeader` keeps
 the bare primitive type `x-mcp-header` requires. A parameter is named on the wire
 like a struct field, minus one trailing `_`, so `string version_` is the `version`
 argument (and `@describeParam` / `@mcpHeader` name it `"version"`).

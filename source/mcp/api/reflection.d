@@ -216,6 +216,16 @@ private template ParamAttributes(alias func, size_t i)
 		alias ParamAttributes = all;
 }
 
+/// The `@schemaDefault` UDAs attached to parameter `i` of `func`.
+private template ParamSchemaDefaults(alias func, size_t i)
+{
+	import jsonschema.attributes : SchemaDefault;
+	import std.meta : Filter;
+
+	enum isDefault(alias a) = !is(a) && isInstanceOf!(SchemaDefault, typeof(a));
+	alias ParamSchemaDefaults = Filter!(isDefault, ParamAttributes!(func, i));
+}
+
 /// Whether `A` is one of the `jsonschema` facet UDA types, which describe a
 /// parameter or struct field.
 private template isSchemaFacet(A)
@@ -446,10 +456,11 @@ private Json parametersSchema(alias func)() @safe
 					}
 				props[names[i]] = ps;
 			}
-			// A parameter is required only when it is neither Nullable nor carries a
-			// declared D-level default value. ParameterDefaultValueTuple gives
-			// `void` for params without a default.
-			static if (!isInstanceOf!(Nullable, P) && is(defs[i] == void))
+			// A parameter is required only when it is not Nullable and has neither
+			// a declared D-level default value nor a @schemaDefault.
+			// ParameterDefaultValueTuple gives `void` for params without a default.
+			static if (!isInstanceOf!(Nullable, P) && is(defs[i] == void)
+					&& !ParamSchemaDefaults!(func, i).length)
 				required ~= Json(names[i]);
 		}
 	}
@@ -709,12 +720,22 @@ private string bindToolArgs(alias overload)(Json args, ref Tuple!(BoundParameter
 	{
 		static if (!is(P : RequestContext) && !is(P == TaskContext))
 		{
-			static if (is(defs[i] == void) && !isInstanceOf!(Nullable, P))
+			static if (is(defs[i] == void) && !isInstanceOf!(Nullable, P)
+					&& !ParamSchemaDefaults!(overload, i).length)
 				if (!argPresent(args, names[i]))
 					return "argument '" ~ names[i] ~ "': required argument is missing";
 			try
 			{
-				static if (is(defs[i] == void))
+				// An omitted argument takes its advertised default: a @schemaDefault
+				// when present, else the D default.
+				static if (ParamSchemaDefaults!(overload, i).length)
+				{
+					if (argPresent(args, names[i]))
+						setBound(argv[i], marshalArg!P(args, names[i]));
+					else
+						setBound(argv[i], cast(P) ParamSchemaDefaults!(overload, i)[0].value);
+				}
+				else static if (is(defs[i] == void))
 					setBound(argv[i], marshalArg!P(args, names[i]));
 				else
 					setBound(argv[i], marshalArgDefault!(P, defs[i])(args, names[i]));
@@ -4493,6 +4514,32 @@ version (unittest) private final class MethodTitleApi
 	{
 		return "";
 	}
+}
+
+version (unittest) private final class SchemaDefaultParamApi
+{
+	@tool("sum", "Sum with a schema-defaulted addend")
+	int sum(int n, @schemaDefault(7) int x, @schemaDefault(5) int y = 2)@safe
+	{
+		return n + x + y;
+	}
+}
+
+unittest  // a @schemaDefault parameter is optional in the input schema
+{
+	auto s = parametersSchema!(SchemaDefaultParamApi.sum)();
+	assert(s["required"] == Json([Json("n")]), s.toString);
+	assert(s["properties"]["x"]["default"].get!long == 7, s.toString);
+}
+
+unittest  // an omitted @schemaDefault argument binds to the advertised default
+{
+	auto s = new McpServer("t", "1");
+	registerHandlers(s, new SchemaDefaultParamApi);
+	auto r = callToolArgs(s, "sum", `{"n":1}`);
+	assert(r["structuredContent"]["result"].get!int == 13, r.toString);
+	r = callToolArgs(s, "sum", `{"n":1,"x":0,"y":0}`);
+	assert(r["structuredContent"]["result"].get!int == 1, r.toString);
 }
 
 unittest  // a JSON Schema facet on a handler method is rejected at compile time
