@@ -37,6 +37,40 @@ struct StreamLimits
 	/// a POST is answered 429. A client's reply to a server->client request is
 	/// never refused.
 	size_t maxLegacyInFlight = 16;
+	/// Standalone GET streams open at once on one session; past it a GET is
+	/// answered 429.
+	size_t maxGetStreamsPerSession = 4;
+	/// `subscriptions/listen` and `events/stream` response streams open at once
+	/// across the mount; past it such a request is answered 503.
+	size_t maxPushStreams = 1_000;
+}
+
+/// Counts a mount's open streams of one kind against a cap (`0`: unbounded).
+private final class StreamGate
+{
+	private size_t open;
+	private size_t max;
+
+	this(size_t max) @safe
+	{
+		this.max = max;
+	}
+
+	/// Claim a stream slot, returning false when the cap is reached. Pair with
+	/// `release`.
+	bool tryAcquire() @safe
+	{
+		if (max != 0 && open >= max)
+			return false;
+		open++;
+		return true;
+	}
+
+	void release() @safe
+	{
+		if (open > 0)
+			open--;
+	}
 }
 
 /// Configuration for the Streamable HTTP server transport.
@@ -223,6 +257,7 @@ void mountMcp(URLRouter router, McpServer server,
 	auto sessions = server.mode == ServerMode.stateful ? new SessionManager(opts.sessionLimits)
 		: null;
 	auto statelessInFlight = sessions is null ? new StatelessInFlight : null;
+	auto pushStreams = new StreamGate(opts.streamLimits.maxPushStreams);
 
 	// This mount owns a single fallback `ConnectionState`, which the server core
 	// threads through dispatch and reads back for the notify/push path. It is the
@@ -276,7 +311,8 @@ void mountMcp(URLRouter router, McpServer server,
 		string payload;
 		if (!readPostBody(req, res, opts.maxRequestBytes, payload))
 			return;
-		handlePost(server, coord, sessions, statelessInFlight, token, payload, req, res);
+		handlePost(server, coord, sessions, statelessInFlight, pushStreams,
+			token, payload, req, res);
 	});
 	if (sessions !is null)
 		sessions.onExpire = (string sid) @safe { push.closeSession(sid); };
@@ -286,7 +322,7 @@ void mountMcp(URLRouter router, McpServer server,
 		TokenInfo token;
 		if (!guardAuth(req, res, opts, token))
 			return;
-		handleGet(server, push, sessions, opts.reconnectDelayMs, principalOf(token), req, res);
+		handleGet(server, push, sessions, opts, principalOf(token), req, res);
 	});
 	router.match(HTTPMethod.DELETE, opts.path, (HTTPServerRequest req,
 			HTTPServerResponse res) @safe {
@@ -1357,7 +1393,7 @@ private string principalOf(TokenInfo token) @safe
 }
 
 private void handleGet(McpServer server, ServerPushChannel push, SessionManager sessions,
-		uint reconnectDelayMs, string principal, HTTPServerRequest req, HTTPServerResponse res) @safe
+		StreamableHttpOptions opts, string principal, HTTPServerRequest req, HTTPServerResponse res) @safe
 {
 	// The GET that opens the standalone stream is a subsequent HTTP request and
 	// is subject to the same rule as the POST path: an invalid or unsupported
@@ -1430,6 +1466,14 @@ private void handleGet(McpServer server, ServerPushChannel push, SessionManager 
 					"text/plain");
 			return;
 		}
+		const cap = opts.streamLimits.maxGetStreamsPerSession;
+		if (cap != 0 && sessions.openStreams(sid) >= cap)
+		{
+			res.statusCode = HTTPStatus.tooManyRequests;
+			res.headers["Retry-After"] = "1";
+			res.writeBody("Too many open streams on this session", "text/plain");
+			return;
+		}
 		getConn = sessions.stateFor(sid);
 		ownerToken = sid;
 		sessions.streamOpened(sid);
@@ -1476,10 +1520,10 @@ private void handleGet(McpServer server, ServerPushChannel push, SessionManager 
 	// after opening) when configured, so the client has cached the reconnect
 	// delay before any server-initiated close. Version-gated to 2025-11-25 only,
 	// so other revisions' wire output is unchanged.
-	if (reconnectDelayMs > 0 && getConn !is null && sendsRetryOnClose(getConn.negotiated))
+	if (opts.reconnectDelayMs > 0 && getConn !is null && sendsRetryOnClose(getConn.negotiated))
 	{
 		try
-			writeFrame(formatRetryEvent(reconnectDelayMs));
+			writeFrame(formatRetryEvent(opts.reconnectDelayMs));
 		catch (Exception)
 		{
 		}
@@ -1992,8 +2036,19 @@ private bool readPostBody(HTTPServerRequest req, HTTPServerResponse res,
 	return true;
 }
 
-private void handlePost(McpServer server, StreamCoordinator coord, SessionManager sessions,
-		StatelessInFlight statelessInFlight,
+/// Answer a `subscriptions/listen` or `events/stream` request with 503 because
+/// the mount already holds `StreamLimits.maxPushStreams` such streams.
+private void refuseTooManyPushStreams(HTTPServerResponse res, Json id) @safe
+{
+	res.statusCode = HTTPStatus.serviceUnavailable;
+	res.headers["Retry-After"] = "30";
+	res.writeBody(makeErrorResponse(id,
+			internalError("too many open notification streams")).toString(), "application/json");
+}
+
+private void handlePost(McpServer server, StreamCoordinator coord,
+		SessionManager sessions, StatelessInFlight statelessInFlight,
+		StreamGate pushStreams,
 		TokenInfo token, string payload, HTTPServerRequest req, HTTPServerResponse res) @safe
 {
 
@@ -2260,6 +2315,13 @@ private void handlePost(McpServer server, StreamCoordinator coord, SessionManage
 						eventStreamNotAcceptable()).toString(), "application/json");
 				return;
 			}
+			if (!pushStreams.tryAcquire())
+			{
+				refuseTooManyPushStreams(res, msg.id);
+				return;
+			}
+			scope (exit)
+				pushStreams.release();
 			handleListenStream(server, coord, msg, res,
 					req.headers.get(HttpHeader.protocolVersion, ""), connToken, principalOf(token));
 			return;
@@ -2280,6 +2342,13 @@ private void handlePost(McpServer server, StreamCoordinator coord, SessionManage
 						eventStreamNotAcceptable()).toString(), "application/json");
 				return;
 			}
+			if (!pushStreams.tryAcquire())
+			{
+				refuseTooManyPushStreams(res, msg.id);
+				return;
+			}
+			scope (exit)
+				pushStreams.release();
 			handleEventsStream(server, msg, res, token.valid ? token.subject : "");
 			return;
 		}
@@ -4411,6 +4480,113 @@ unittest  // the version gate rejects a version the server does not serve
 	assert(e !is null && e.code == ErrorCode.unsupportedProtocolVersion);
 	assert(e.data["supported"].length == 1);
 	assert(postProtocolVersionGate("2025-11-25", legacyOnly) is null);
+}
+
+unittest  // a GET past the per-session stream cap is refused with 429
+{
+	import core.time : msecs;
+	import vibe.core.core : runTask, sleep, exitEventLoop, runEventLoop;
+	import vibe.http.server : createTestHTTPServerResponse, TestHTTPResponseMode;
+	import vibe.stream.memory : createMemoryOutputStream;
+
+	auto server = McpServer.stateful("t", "1");
+	auto router = new URLRouter;
+	StreamableHttpOptions opts;
+	opts.streamLimits.maxGetStreamsPerSession = 1;
+	mountMcp(router, server, opts);
+	const sid = initSession(router);
+
+	HTTPServerResponse get() @safe
+	{
+		auto res = createTestHTTPServerResponse(createMemoryOutputStream(),
+				null, TestHTTPResponseMode.bodyOnly);
+		router.handleRequest(sessionReq(HTTPMethod.GET, sid, "", "text/event-stream"), res);
+		return res;
+	}
+
+	int second;
+	runTask(() @safe nothrow{
+		try
+			get();
+		catch (Exception)
+		{
+		}
+	});
+	runTask(() @safe nothrow{
+		try
+		{
+			sleep(100.msecs);
+			second = get().statusCode;
+			router.handleRequest(sessionReq(HTTPMethod.DELETE, sid),
+				createTestHTTPServerResponse(createMemoryOutputStream(),
+				null, TestHTTPResponseMode.bodyOnly));
+			sleep(100.msecs);
+		}
+		catch (Exception)
+		{
+		}
+		exitEventLoop();
+	});
+	runEventLoop();
+	assert(second == HTTPStatus.tooManyRequests);
+}
+
+unittest  // a subscriptions/listen past the push-stream cap is refused with 503
+{
+	import core.time : msecs;
+	import vibe.core.core : runTask, sleep, exitEventLoop, runEventLoop;
+	import vibe.http.server : createTestHTTPServerResponse, TestHTTPResponseMode;
+	import vibe.stream.memory : createMemoryOutputStream;
+
+	auto server = McpServer.stateless("t", "1");
+	server.enableToolsListChanged();
+	auto router = new URLRouter;
+	StreamableHttpOptions opts;
+	opts.streamLimits.maxPushStreams = 1;
+	mountMcp(router, server, opts);
+
+	Json meta = Json.emptyObject;
+	meta[MetaKey.protocolVersion] = "2026-07-28";
+	meta[MetaKey.clientCapabilities] = Json.emptyObject;
+	Json params = Json.emptyObject;
+	params["notifications"] = Json(["toolsListChanged": Json(true)]);
+	params["_meta"] = meta;
+	const body_ = makeRequest(Json(1), "subscriptions/listen", params).toString();
+
+	HTTPServerResponse listen() @safe
+	{
+		auto res = createTestHTTPServerResponse(createMemoryOutputStream(),
+				null, TestHTTPResponseMode.bodyOnly);
+		router.handleRequest(makeInitPostReq(body_,
+				[
+					"Accept": "application/json, text/event-stream",
+					"MCP-Protocol-Version": "2026-07-28",
+					HttpHeader.method: "subscriptions/listen",
+		]), res);
+		return res;
+	}
+
+	int second;
+	runTask(() @safe nothrow{
+		try
+			listen();
+		catch (Exception)
+		{
+		}
+	});
+	runTask(() @safe nothrow{
+		try
+		{
+			sleep(100.msecs);
+			second = listen().statusCode;
+		}
+		catch (Exception)
+		{
+		}
+		exitEventLoop();
+	});
+	runEventLoop();
+	assert(second == HTTPStatus.serviceUnavailable);
 }
 
 unittest  // a stateful server answers a body-signalled 2026-07-28 subscriptions/listen with 400

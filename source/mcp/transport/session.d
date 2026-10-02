@@ -479,6 +479,14 @@ final class SessionManager
 			p.streams++;
 	}
 
+	/// Number of standalone GET streams open on session `id`.
+	size_t openStreams(string id) @safe
+	{
+		if (auto p = sessions.get(id, false))
+			return p.streams;
+		return 0;
+	}
+
 	/// Record that a standalone GET stream on session `id` closed.
 	void streamClosed(string id) @safe
 	{
