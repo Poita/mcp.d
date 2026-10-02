@@ -3,10 +3,15 @@
 *.obj
 *.a
 *.lib
+# Windows build outputs: executables, debug databases, incremental-link and
+# export files.
+*.exe
+*.pdb
+*.ilk
+*.exp
 # dub build/test output binaries at the package root (named after the dub
 # package + config, e.g. mcp-d, mcp-d-test-library, mcp-d-test-application).
 # Pattern-based so a package rename does not silently un-ignore them.
-/mcp
 /mcp-d
 *-test-library
 *-test-library-*
@@ -18,7 +23,6 @@ conformance-results/
 # build artifacts
 conformance-server
 conformance-client
-calculator
 
 # generated API documentation (see scripts/gen-docs.sh)
 /docs/
