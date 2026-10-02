@@ -36,7 +36,7 @@ public import mcp.protocol.events;
 
 // --- Server / client entry points ---
 public import mcp.server.task_store;
-public import mcp.server.task_runtime : TaskOptions, TaskRuntime;
+public import mcp.server.task_runtime : TaskOptions, TaskRuntime, unlimitedTaskTtl;
 public import mcp.server.task_context : TaskContext, TaskExecutor, TaskDispatcher,
 	InProcessTaskDispatcher, SyncTaskDispatcher, TaskSuspended, TaskDetached;
 public import mcp.server.event_store;
