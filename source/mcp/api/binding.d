@@ -224,7 +224,7 @@ package(mcp) JsonNode schemaNode(T, SchemaUse use, Ancestors...)()
 			s.set("required", required);
 		return s;
 	}
-	else static if (isArray!T && !isSomeString!T)
+	else static if (isArray!T && !isSomeString!T && !is(T == enum))
 	{
 		auto s = typeNode("array");
 		s.set("items", schemaNode!(typeof(T.init[0]), use, Ancestors)());
@@ -398,7 +398,7 @@ package(mcp) T bindJson(T)(Json v, string path = "")
 		}
 		return result;
 	}
-	else static if (isArray!T && !isSomeString!T)
+	else static if (isArray!T && !isSomeString!T && !is(T == enum))
 	{
 		if (v.type != Json.Type.array)
 			throw new BindException(located(path, "expected a JSON array"));
@@ -752,4 +752,42 @@ unittest  // bindJson falls back to a converting SumType member when none matche
 
 	alias N = SumType!(string, double);
 	assert(bindJson!N(Json(3)).match!((string _) => false, (double d) => d == 3));
+}
+
+version (unittest) private enum Shade : string
+{
+	light = "L",
+	dark = "D",
+}
+
+unittest  // a string-based enum field is described by member name
+{
+	static struct S
+	{
+		Shade shade;
+	}
+
+	auto s = schemaOf!(S, SchemaUse.input)();
+	auto p = s["properties"]["shade"];
+	assert(p["type"].get!string == "string", s.toString);
+	assert(p["enum"].length == 2 && p["enum"][0].get!string == "light", s.toString);
+}
+
+unittest  // a string-based enum field binds from its member name
+{
+	import std.exception : assertThrown;
+	import vibe.data.json : parseJsonString;
+
+	static struct S
+	{
+		Shade shade;
+	}
+
+	assert(bindJson!S(parseJsonString(`{"shade":"dark"}`)).shade == Shade.dark);
+	assertThrown!BindException(bindJson!S(parseJsonString(`{"shade":"D"}`)));
+}
+
+unittest  // bindString reads a string-based enum by member name
+{
+	assert(bindString!Shade("light") == Shade.light);
 }

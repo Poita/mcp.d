@@ -4393,3 +4393,32 @@ unittest  // parameters whose names differ only by a trailing underscore are rej
 	auto s = new McpServer("t", "1");
 	static assert(!__traits(compiles, registerHandlers(s, new SharedWireNameApi)));
 }
+
+version (unittest) private enum Tone : string
+{
+	soft = "s",
+	loud = "l",
+}
+
+version (unittest) private final class StringEnumApi
+{
+	@tool("speak", "Speak in a tone")
+	string speak(Tone tone, Tone fallback = Tone.soft) @safe
+	{
+		import std.conv : to;
+
+		return tone.to!string ~ "/" ~ fallback.to!string;
+	}
+}
+
+unittest  // a string-based enum parameter is advertised and bound by member name
+{
+	auto s = new McpServer("t", "1");
+	registerHandlers(s, new StringEnumApi);
+	auto tools = s.handle(MakeListMessage()).get["result"]["tools"];
+	auto props = tools[0]["inputSchema"]["properties"];
+	assert(props["tone"]["enum"][1].get!string == "loud", props.toString);
+	assert(props["fallback"]["default"].get!string == "soft", props.toString);
+	auto r = callToolArgs(s, "speak", `{"tone":"loud"}`);
+	assert(r["content"][0]["text"].get!string == "loud/soft", r.toString);
+}
