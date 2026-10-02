@@ -2343,7 +2343,8 @@ unittest  // with the proxy and an authenticated MCP mount, the MCP mount alone 
 	mountMcp(router, McpServer.stateless("t", "1"), opts);
 
 	auto req = createTestHTTPServerRequest(
-			URL("https://mcp.example.com/.well-known/oauth-protected-resource"), HTTPMethod.OPTIONS);
+			URL("https://mcp.example.com/.well-known/oauth-protected-resource/mcp"),
+			HTTPMethod.OPTIONS);
 	req.headers["Origin"] = "https://app.example.com";
 	req.headers["Access-Control-Request-Method"] = "GET";
 	req.headers["Access-Control-Request-Headers"] = "MCP-Protocol-Version";

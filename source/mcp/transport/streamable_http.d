@@ -139,7 +139,9 @@ struct StreamableHttpOptions
 	/// audience), returns `401` with a `WWW-Authenticate: Bearer` header carrying
 	/// the `resource_metadata` URL on failure, returns `403 insufficient_scope`
 	/// when a required scope is missing, and serves the RFC 9728 Protected
-	/// Resource Metadata document at `/.well-known/oauth-protected-resource`.
+	/// Resource Metadata document at its path-inserted well-known URL
+	/// (`protectedResourceMetadataPath`: `/.well-known/oauth-protected-resource`
+	/// followed by the `auth.resource` path).
 	/// Validated token info is surfaced to handlers via `RequestContext.auth`.
 	/// When unset (the default) the transport performs no token checks.
 	ResourceServerConfig auth;
@@ -215,9 +217,33 @@ struct StreamableHttpOptions
 	StreamLimits streamLimits;
 }
 
-/// The well-known path (RFC 9728 §3) at which a protected resource server
-/// publishes its OAuth 2.0 Protected Resource Metadata document.
+/// The well-known path prefix (RFC 9728 §3) under which a protected resource
+/// server publishes its OAuth 2.0 Protected Resource Metadata document.
 enum ProtectedResourceMetadataPath = "/.well-known/oauth-protected-resource";
+
+/// The path of the Protected Resource Metadata document for `resource` (RFC 9728
+/// §3.1): `ProtectedResourceMetadataPath` followed by the resource identifier's
+/// path, its query and fragment dropped, so two resources on one host publish
+/// separate documents. A resource with no path uses the bare prefix. With no
+/// `resource` configured the MCP endpoint `mcpPath` is the resource.
+string protectedResourceMetadataPath(string resource, string mcpPath) @safe
+{
+	import std.algorithm : findSplitBefore;
+	import std.string : indexOf;
+
+	string path = mcpPath;
+	if (resource.length)
+	{
+		const sep = resource.indexOf("://");
+		auto rest = sep >= 0 ? resource[sep + 3 .. $] : resource;
+		const slash = rest.indexOf('/');
+		path = slash >= 0 ? rest[slash .. $] : "";
+		path = path.findSplitBefore("?")[0].findSplitBefore("#")[0];
+	}
+	while (path.length && path[$ - 1] == '/')
+		path = path[0 .. $ - 1];
+	return ProtectedResourceMetadataPath ~ path;
+}
 
 /// Validate that an auth-enabled `ResourceServerConfig` can publish a
 /// spec-compliant Protected Resource Metadata document before the transport
@@ -329,14 +355,14 @@ void mountMcp(URLRouter router, McpServer server,
 	// fetch it before it holds a token.
 	if (opts.auth.enabled)
 	{
-		router.get(ProtectedResourceMetadataPath, (HTTPServerRequest req,
-				HTTPServerResponse res) @safe {
+		const prmPath = protectedResourceMetadataPath(opts.auth.resource, opts.path);
+		router.get(prmPath, (HTTPServerRequest req, HTTPServerResponse res) @safe {
 			res.headers["Access-Control-Allow-Origin"] = "*";
 			res.statusCode = HTTPStatus.ok;
 			res.writeJsonBody(opts.auth.metadata().toJson());
 		});
-		router.match(HTTPMethod.OPTIONS, ProtectedResourceMetadataPath,
-				(HTTPServerRequest req, HTTPServerResponse res) @safe {
+		router.match(HTTPMethod.OPTIONS, prmPath, (HTTPServerRequest req,
+				HTTPServerResponse res) @safe {
 			res.headers["Access-Control-Allow-Origin"] = "*";
 			res.headers["Access-Control-Allow-Methods"] = "GET";
 			res.headers["Access-Control-Allow-Headers"] = "MCP-Protocol-Version";
@@ -1370,6 +1396,7 @@ private string resourceMetadataUrl(scope HTTPServerRequest req, StreamableHttpOp
 {
 	import std.string : startsWith;
 
+	const prmPath = protectedResourceMetadataPath(opts.auth.resource, opts.path);
 	// In unvalidated (reverse-proxy) mode the client-controlled Host is untrusted,
 	// so the operator-configured `resource` origin is the PRIMARY source: prefer it
 	// whenever it is set, falling back to the Host only when no resource is
@@ -1379,7 +1406,7 @@ private string resourceMetadataUrl(scope HTTPServerRequest req, StreamableHttpOp
 	if (!opts.validateHost)
 	{
 		if (auto fromResource = resourceOrigin(opts.auth.resource))
-			return fromResource ~ ProtectedResourceMetadataPath;
+			return fromResource ~ prmPath;
 	}
 
 	const host = req.headers.get("Host", "");
@@ -1389,12 +1416,12 @@ private string resourceMetadataUrl(scope HTTPServerRequest req, StreamableHttpOp
 	{
 		const scheme = req.headers.get("X-Forwarded-Proto",
 				isLoopbackHostname(stripPort(host)) ? "http" : "https");
-		return scheme ~ "://" ~ host ~ ProtectedResourceMetadataPath;
+		return scheme ~ "://" ~ host ~ prmPath;
 	}
 	// No usable Host header: derive the origin from the configured resource identifier.
 	if (auto fromResource = resourceOrigin(opts.auth.resource))
-		return fromResource ~ ProtectedResourceMetadataPath;
-	return ProtectedResourceMetadataPath;
+		return fromResource ~ prmPath;
+	return prmPath;
 }
 
 /// The scheme://host[:port] origin of a configured RFC 8707 `resource` identifier
@@ -6319,17 +6346,62 @@ unittest  // CORS: any origin may read the Protected Resource Metadata document
 	mountMcp(router, server, opts);
 
 	auto get = corsRequest(router, HTTPMethod.GET,
-			["Origin": "https://app.example.com"], "", ProtectedResourceMetadataPath);
+			["Origin": "https://app.example.com"], "", ProtectedResourceMetadataPath ~ "/mcp");
 	assert(get.statusCode == 200);
 	assert(get.headers.get("Access-Control-Allow-Origin", "") == "*");
 
 	auto preflight = corsRequest(router, HTTPMethod.OPTIONS, [
 		"Origin": "https://app.example.com",
 		"Access-Control-Request-Method": "GET"
-	], "", ProtectedResourceMetadataPath);
+	], "", ProtectedResourceMetadataPath ~ "/mcp");
 	assert(preflight.statusCode == 204);
 	assert(preflight.headers.get("Access-Control-Allow-Origin", "") == "*");
 	assert(preflight.headers.get("Access-Control-Allow-Methods", "") == "GET");
+}
+
+unittest  // the Protected Resource Metadata is served at the RFC 9728 path-inserted URL the 401 names
+{
+	import std.algorithm : canFind;
+
+	StreamableHttpOptions opts;
+	opts.auth.validator = (string t) @safe => TokenInfo.invalid();
+	opts.auth.resource = "https://mcp.example.com/tenant-a/mcp";
+	opts.auth.authorizationServers = ["https://auth.example.com"];
+	opts.path = "/tenant-a/mcp";
+	opts.allowedHosts = ["mcp.example.com"];
+	auto router = new URLRouter;
+	mountMcp(router, McpServer.stateless("t", "1"), opts);
+
+	auto doc = corsRequest(router, HTTPMethod.GET, ["Host": "mcp.example.com"],
+			"", "/.well-known/oauth-protected-resource/tenant-a/mcp");
+	assert(doc.statusCode == 200);
+	auto root = corsRequest(router, HTTPMethod.GET,
+			["Host": "mcp.example.com"], "", "/.well-known/oauth-protected-resource");
+	assert("Access-Control-Allow-Origin" !in root.headers,
+			"a resource with a path is not published at the root");
+
+	auto challenge = corsRequest(router, HTTPMethod.POST,
+			[
+				"Host": "mcp.example.com",
+				"Content-Type": "application/json",
+				"Accept": "application/json, text/event-stream",
+	], initializeBody(), "/tenant-a/mcp");
+	assert(challenge.statusCode == 401);
+	const www = challenge.headers.get("WWW-Authenticate", "");
+	assert(www.canFind(`resource_metadata="https://mcp.example.com/.well-known/oauth-protected-resource/tenant-a/mcp"`),
+			www);
+}
+
+unittest  // a resource without a path keeps its metadata at the well-known root
+{
+	assert(protectedResourceMetadataPath("https://mcp.example.com",
+			"/mcp") == ProtectedResourceMetadataPath);
+	assert(protectedResourceMetadataPath("https://mcp.example.com/",
+			"/mcp") == ProtectedResourceMetadataPath);
+	assert(protectedResourceMetadataPath("https://mcp.example.com/mcp?x=1#f",
+			"/other") == ProtectedResourceMetadataPath ~ "/mcp");
+	// With no configured resource the MCP endpoint itself is the resource.
+	assert(protectedResourceMetadataPath("", "/mcp") == ProtectedResourceMetadataPath ~ "/mcp");
 }
 
 unittest  // stateless: notifications/cancelled reaches the same principal's in-flight request only

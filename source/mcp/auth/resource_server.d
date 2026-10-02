@@ -99,8 +99,8 @@ enum AuthFailure
 /// When `validator` is set on the Streamable HTTP transport, every MCP request
 /// must carry a valid `Authorization: Bearer` token; otherwise the transport
 /// replies 401 with a `WWW-Authenticate` header pointing at the Protected
-/// Resource Metadata document, which it serves at
-/// `/.well-known/oauth-protected-resource`.
+/// Resource Metadata document, which it serves at the RFC 9728 path-inserted
+/// `/.well-known/oauth-protected-resource<resource path>`.
 struct ResourceServerConfig
 {
 	/// Validates a presented bearer token. Required to enable auth; when null the

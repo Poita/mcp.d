@@ -27,8 +27,8 @@ everything else automatically:
 - **401 + `WWW-Authenticate`** when no/invalid token is presented — the
   challenge carries `resource_metadata="…"` and a `scope="mcp:read"` hint
   (RFC 6750 §3, RFC 9728 §5.1).
-- **Protected Resource Metadata** served at
-  `/.well-known/oauth-protected-resource` (RFC 9728) advertising `resource`,
+- **Protected Resource Metadata** served at the path-inserted
+  `/.well-known/oauth-protected-resource/mcp` (RFC 9728 §3.1) advertising `resource`,
   `authorization_servers`, and `scopes_supported`.
 - **RFC 8707 audience binding** — a token whose `aud` does not name this server
   is rejected (`401 invalid_token`).

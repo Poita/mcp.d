@@ -8,8 +8,8 @@
  * `ResourceServerConfig.validator`, and from there the Streamable HTTP transport
  *   - replies `401` with a `WWW-Authenticate: Bearer ... resource_metadata=...,
  *     scope=...` challenge when no/invalid token is presented,
- *   - serves the RFC 9728 Protected Resource Metadata document at
- *     `/.well-known/oauth-protected-resource`,
+ *   - serves the RFC 9728 Protected Resource Metadata document at the
+ *     path-inserted `/.well-known/oauth-protected-resource/mcp`,
  *   - enforces the RFC 8707 audience binding (a token must name THIS resource),
  *   - enforces the server-wide required scope (`mcp:read`), returning
  *     `403 insufficient_scope` otherwise, and
@@ -142,7 +142,7 @@ void main(string[] args)
 
 	() @trusted {
 		stderr.writefln("auth-example server listening on http://%s:%d/mcp", host, port);
-		stderr.writefln("  PRM: http://%s:%d/.well-known/oauth-protected-resource", host, port);
+		stderr.writefln("  PRM: http://%s:%d/.well-known/oauth-protected-resource/mcp", host, port);
 	}();
 	runStreamableHttp(server, opts);
 }

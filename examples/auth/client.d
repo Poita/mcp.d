@@ -228,7 +228,7 @@ int run() @safe
 		int status;
 		string body_;
 		() @trusted {
-			requestHTTP(baseOrigin ~ "/.well-known/oauth-protected-resource",
+			requestHTTP(baseOrigin ~ "/.well-known/oauth-protected-resource/mcp",
 					(scope HTTPClientRequest req) { req.method = HTTPMethod.GET; },
 					(scope HTTPClientResponse res) {
 				status = res.statusCode;

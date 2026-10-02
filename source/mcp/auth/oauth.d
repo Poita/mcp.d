@@ -222,7 +222,7 @@ struct ProtectedResourceMetadata
 	}
 
 	/// Serialize to the RFC 9728 metadata document a protected resource server
-	/// publishes at `/.well-known/oauth-protected-resource`. `resource` and
+	/// publishes under `/.well-known/oauth-protected-resource`. `resource` and
 	/// `authorization_servers` are always present; `scopes_supported` is emitted
 	/// only when non-empty.
 	Json toJson() const @safe
