@@ -1710,7 +1710,8 @@ final class HttpClientTransport : ClientTransport
 				// One response per connection: `close` lets a non-streamed answer
 				// (an error body) be read to end-of-stream.
 				const req = buildHttpRequest("POST", ep.path, ep.hostHeader,
-						"text/event-stream", "close", true, reqHeaders, null, body);
+						"application/json, text/event-stream", "close", true,
+						reqHeaders, null, body);
 				conn.write(cast(const(ubyte)[]) req);
 
 				const status = parseHttpStatus(cast(string) readLine(conn, maxHeaderLineBytes).idup);
@@ -4417,6 +4418,30 @@ unittest  // a reply to a server->client request is sent while every in-flight p
 	});
 	assert(failure.length == 0, "scenario failed: " ~ failure);
 	assert(replied, "the ping reply must not wait for the request POST's permit");
+}
+
+unittest  // a subscriptions/listen POST accepts both JSON and SSE responses
+{
+	string accept;
+	auto r = new URLRouter;
+	r.post("/mcp", (HTTPServerRequest req, HTTPServerResponse res) @safe {
+		accept = req.headers.get("Accept", "");
+		auto resp = parseJsonString(`{"jsonrpc":"2.0","error":{"code":-32601,"message":"no"}}`);
+		resp["id"] = requestJson(req)["id"];
+		res.writeBody(resp.toString(), "application/json");
+	});
+	const failure = runAgainstFakeServer(r, (string url) @safe {
+		auto t = new HttpClientTransport(url);
+		scope (exit)
+			t.close();
+		try
+			t.openListen(makeRequest(Json(1), "subscriptions/listen", Json.emptyObject));
+		catch (McpException)
+		{
+		}
+	});
+	assert(failure.length == 0, "scenario failed: " ~ failure);
+	assert(accept == "application/json, text/event-stream", "Accept was: " ~ accept);
 }
 
 unittest  // HttpEndpoint.hostHeader omits only the scheme's default port
