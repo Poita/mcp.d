@@ -333,14 +333,15 @@ interface RequestContext
 	/// Typed convenience over `inputResponses`: decode the MRTR answer the client
 	/// attached for `id` into `T` via `T.fromJson` (e.g. `ElicitResult`,
 	/// `CreateMessageResult`, `ListRootsResult` — matching the `InputRequest`
-	/// kind the server issued). Returns `T.fromJson(Json.emptyObject)` when no
-	/// answer is present for `id`.
+	/// kind the server issued). Throws `invalidParams` (-32602) when the client
+	/// sent no answer for `id`; check `hasInputResponse(id)` first where an answer
+	/// is optional.
 	T inputResponseAs(T)(string id) @safe
 	{
 		auto m = inputResponses();
 		if (auto p = id in m)
 			return T.fromJson(*p);
-		return T.fromJson(Json.emptyObject);
+		throw invalidParams("no input response for '" ~ id ~ "'");
 	}
 
 	/// Decode the opaque MRTR `requestState` as JSON into `T`. The server owns the
@@ -1089,6 +1090,15 @@ unittest  // inputResponseAs!T decodes a typed answer from the MRTR inputRespons
 	auto r = probe.inputResponseAs!ElicitResult("q1");
 	assert(r.action == ElicitAction.accept);
 	assert(r.content["name"].get!string == "Ada");
+}
+
+unittest  // inputResponseAs!T throws -32602 when the client sent no answer for the id
+{
+	import std.exception : collectException;
+
+	auto probe = new ElicitProbe;
+	auto e = cast(McpException) collectException(probe.inputResponseAs!ElicitResult("q1"));
+	assert(e !is null && e.code == ErrorCode.invalidParams);
 }
 
 unittest  // listRoots() sends roots/list and parses the typed result
