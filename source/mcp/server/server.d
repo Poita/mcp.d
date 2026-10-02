@@ -5819,7 +5819,8 @@ unittest  // handleRaw answers valid members of a mixed batch and errors malform
 	s.handle(req(1, "initialize", params));
 
 	// The middle member has a wrong jsonrpc version: it must not discard the two
-	// valid requests. Expect three responses — two results plus one null-id error.
+	// valid requests. Expect three responses — two results plus an error that
+	// carries the bad member's id.
 	auto outText = s.handleRaw(`[{"jsonrpc":"2.0","id":1,"method":"ping"},
 		{"jsonrpc":"1.0","id":99,"method":"ping"},
 		{"jsonrpc":"2.0","id":2,"method":"ping"}]`);
@@ -5827,18 +5828,18 @@ unittest  // handleRaw answers valid members of a mixed batch and errors malform
 	assert(arr.type == Json.Type.array);
 	assert(arr.length == 3);
 
-	bool sawId1, sawId2, sawNullError;
+	bool sawId1, sawId2, sawError99;
 	foreach (i; 0 .. arr.length)
 	{
 		auto r = arr[i];
-		if (r["id"].type == Json.Type.null_ && "error" in r)
-			sawNullError = r["error"]["code"].get!int == ErrorCode.invalidRequest;
-		else if (r["id"].type == Json.Type.int_ && r["id"].get!int == 1)
+		if (r["id"] == Json(99) && "error" in r)
+			sawError99 = r["error"]["code"].get!int == ErrorCode.invalidRequest;
+		else if (r["id"] == Json(1))
 			sawId1 = true;
-		else if (r["id"].type == Json.Type.int_ && r["id"].get!int == 2)
+		else if (r["id"] == Json(2))
 			sawId2 = true;
 	}
-	assert(sawId1 && sawId2 && sawNullError);
+	assert(sawId1 && sawId2 && sawError99);
 }
 
 unittest  // registering a tool whose name already exists throws

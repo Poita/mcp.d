@@ -91,15 +91,8 @@ private void validateEnvelope(Json j) @safe
 {
 	if (j.type != Json.Type.object)
 		throw invalidRequest("JSON-RPC message must be an object");
-	if (("jsonrpc" !in j) || j["jsonrpc"].type != Json.Type.string
-			|| j["jsonrpc"].get!string != "2.0")
-		throw invalidRequest("Missing or invalid jsonrpc version (expected \"2.0\")");
-	// A present `method` must be a string. Without this guard a non-string method
-	// (number, object, array, boolean, null) is classified by presence alone and
-	// later read with `.get!string`, throwing an uncaught JSONException instead of
-	// yielding a clean -32600 across every transport.
-	if (("method" in j) && j["method"].type != Json.Type.string)
-		throw invalidRequest("`method` must be a string");
+	// The id is validated first so every later envelope error on a request
+	// can carry it.
 	// A message bearing a `method` with an explicit `id:null` is neither a valid
 	// request (the spec requires a request id that is not null) nor a
 	// notification (which omits `id` entirely). Reject it so the peer receives a
@@ -125,6 +118,16 @@ private void validateEnvelope(Json j) @safe
 		if (v != cast(long) v)
 			throw invalidRequest("JSON-RPC id MUST NOT have a fractional part");
 	}
+	if (("jsonrpc" !in j) || j["jsonrpc"].type != Json.Type.string
+			|| j["jsonrpc"].get!string != "2.0")
+		throw requestError(j,
+				invalidRequest("Missing or invalid jsonrpc version (expected \"2.0\")"));
+	// A present `method` must be a string. Without this guard a non-string method
+	// (number, object, array, boolean, null) is classified by presence alone and
+	// later read with `.get!string`, throwing an uncaught JSONException instead of
+	// yielding a clean -32600 across every transport.
+	if (("method" in j) && j["method"].type != Json.Type.string)
+		throw requestError(j, invalidRequest("`method` must be a string"));
 	// JSON-RPC 2.0 §4.2: `params`, when present, MUST be a structured value
 	// (object or array); a primitive is an invalid request. MCP further defines
 	// every request's and notification's params as an object, so by-position
@@ -633,6 +636,32 @@ unittest  // a params error carries a request's id and a null id for a notificat
 	auto note = collectException!McpException(
 			parseMessage(`{"jsonrpc":"2.0","method":"notifications/x","params":[]}`));
 	assert(note.code == ErrorCode.invalidParams && errorReplyId(note).type == Json.Type.null_);
+}
+
+unittest  // a bad jsonrpc version on a request carries the request's id
+{
+	import std.exception : collectException;
+
+	auto ex = collectException!McpException(
+			parseMessage(`{"jsonrpc":"1.0","id":5,"method":"ping"}`));
+	assert(ex.code == ErrorCode.invalidRequest && errorReplyId(ex) == Json(5));
+}
+
+unittest  // a non-string method on a request carries the request's id
+{
+	import std.exception : collectException;
+
+	auto ex = collectException!McpException(parseMessage(`{"jsonrpc":"2.0","id":"x","method":42}`));
+	assert(ex.code == ErrorCode.invalidRequest && errorReplyId(ex) == Json("x"));
+}
+
+unittest  // an invalid id is reported with a null reply id
+{
+	import std.exception : collectException;
+
+	auto ex = collectException!McpException(
+			parseMessage(`{"jsonrpc":"1.0","id":true,"method":"ping"}`));
+	assert(ex.code == ErrorCode.invalidRequest && errorReplyId(ex).type == Json.Type.null_);
 }
 
 unittest  // a batch member with array params is reported as a -32602 member error
