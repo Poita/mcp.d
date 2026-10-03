@@ -2653,14 +2653,17 @@ final class EventsRuntime
 		bool hasUserinfo;
 		if (!parseAuthority(url, scheme, host, port, path, hasUserinfo) || hasUserinfo)
 			return false;
+		import std.algorithm : canFind;
 		import std.conv : to;
 
-		const origin = scheme ~ "://" ~ host ~ ":" ~ port.to!string;
+		// The parser yields an IPv6 literal unbracketed; the authority needs the
+		// brackets back to keep its colons apart from the port's.
+		const hostPart = host.canFind(':') ? "[" ~ host ~ "]" : host;
+		const origin = scheme ~ "://" ~ hostPart ~ ":" ~ port.to!string;
 		auto entry = origin in wellKnown_;
 		if (entry is null || now - entry.fetchedAtMs >= opts_.wellKnownCacheTtl.total!"msecs")
 		{
-			wellKnown_[origin] = WellKnownReceivers(fetchWellKnownReceivers(scheme,
-					host, port), now);
+			wellKnown_[origin] = WellKnownReceivers(fetchWellKnownReceivers(origin), now);
 			entry = origin in wellKnown_;
 		}
 		foreach (prefix; entry.prefixes)
@@ -2669,15 +2672,15 @@ final class EventsRuntime
 		return false;
 	}
 
-	// GET the receiver document at the origin and return the prefixes it declares
-	// (empty on any failure). The URL is rebuilt from parsed components, so the
-	// fetch targets exactly the origin the callback resolves to.
-	private string[] fetchWellKnownReceivers(string scheme, string host, ushort port) @safe
+	// GET the receiver document at `origin` (`scheme://host:port`, rebuilt from
+	// the callback's parsed components so the fetch targets exactly the origin
+	// the callback resolves to) and return the prefixes it declares (empty on any
+	// failure).
+	private string[] fetchWellKnownReceivers(string origin) @safe
 	{
-		import std.conv : to;
 		import vibe.data.json : parseJsonString;
 
-		const docUrl = scheme ~ "://" ~ host ~ ":" ~ port.to!string ~ wellKnownReceiverPath;
+		const docUrl = origin ~ wellKnownReceiverPath;
 		if (!callbackHostAllowed(docUrl, opts_.allowPrivateCallbackHosts))
 			return null;
 		WebhookHttpResult res;
@@ -8172,4 +8175,16 @@ unittest  // a deferred delivery is not overtaken by its subscription's later ev
 	runAll();
 	auto ids = ft.eventPosts().map!(p => parseJsonString(p.body)["eventId"].get!string).array;
 	assert(ids == ["evt_1", "evt_1", "evt_2", "evt_3"]);
+}
+
+unittest  // the well-known receiver document of an IPv6-literal callback is fetched from a bracketed host
+{
+	auto ft = new FakeWebhookTransport();
+	ft.echoChallenge = false; // a challenge, if sent, would fail
+	ft.wellKnownBody = `{"receivers": ["/hooks/"]}`;
+	auto rt = engineRuntime(ft);
+	rt.subscribeWebhook(webhookSub("n", "https://[2001:db8::1]/hooks/c1"), "user-1");
+	rt.emit(EventOccurrence("evt_1", "n", "t"));
+	assert(ft.gets.length == 1 && ft.gets[0] == "https://[2001:db8::1]:443" ~ wellKnownReceiverPath);
+	assert(ft.eventPosts().length == 1);
 }
