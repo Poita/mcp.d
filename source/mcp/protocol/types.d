@@ -1307,8 +1307,9 @@ struct CallToolResult
 	/// with enums written by member name, matching the reflected output schema and
 	/// `structuredContentAs!T`. `structuredContent` must be an object, so a
 	/// fieldwise-serialized struct is emitted as itself and every other value
-	/// (scalars, arrays, `Nullable`, `Json`, custom-serialized structs) is wrapped
-	/// as `{"result": value}`. When `content` is null it defaults to a single
+	/// (scalars, arrays, `Nullable`, `Json`, `SumType`, custom-serialized structs)
+	/// is wrapped as `{"result": value}`. A `SumType`, at any depth, is written as
+	/// the value it holds. When `content` is null it defaults to a single
 	/// text block carrying that JSON, so a structured result also has a
 	/// human-readable content fallback for clients that ignore `structuredContent`.
 	static CallToolResult structured(T)(T value, Content[] content = null) @safe

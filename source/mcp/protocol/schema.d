@@ -45,10 +45,10 @@ Json jsonSchemaOf(T)()
 /// Derived schemas describe enums as `{type:"string", enum:[names…]}`, so both
 /// directions of marshalling must agree: struct params/returns and bare-enum
 /// values are (de)serialized by-name. The policy only defines
-/// `toRepresentation`/`fromRepresentation` for enums, so vibe's
-/// `isPolicySerializable` is false for every other type and the default
-/// behaviour is preserved (it still recurses into nested struct/array fields,
-/// applying this rule to any enum found at any depth).
+/// `toRepresentation`/`fromRepresentation` for enums and `SumType`s (see the
+/// `SumType` arm below), so vibe's `isPolicySerializable` is false for every
+/// other type and the default behaviour is preserved (it still recurses into
+/// nested struct/array fields, applying this rule at any depth).
 template EnumByNamePolicy(T) if (is(T == enum))
 {
 	import std.conv : to;
@@ -62,6 +62,92 @@ template EnumByNamePolicy(T) if (is(T == enum))
 	{
 		return s.to!T;
 	}
+}
+
+/// The `std.sumtype.SumType` arm of `EnumByNamePolicy`: a `SumType` is written
+/// as the value it currently holds (serialized under this same policy), matching
+/// the `anyOf` of its member schemas that derived schemas advertise. Reading
+/// prefers a member whose serialized form has the JSON value's own type (an
+/// integer reads as `int`, not `double`), else takes the first member that
+/// accepts the value.
+template EnumByNamePolicy(T) if (isSumType!T)
+{
+	static Json toRepresentation(T v)
+	{
+		import std.sumtype : match;
+		import vibe.data.json : JsonSerializer;
+		import vibe.data.serialization : serializeWithPolicy;
+
+		return v.match!(held => () @trusted {
+			return serializeWithPolicy!(JsonSerializer, EnumByNamePolicy)(held);
+		}());
+	}
+
+	static T fromRepresentation(Json j)
+	{
+		import std.meta : AliasSeq;
+		import std.traits : TemplateArgsOf;
+		import vibe.data.json : JsonSerializer;
+		import vibe.data.serialization : deserializeWithPolicy, serializeWithPolicy;
+
+		static foreach (exact; AliasSeq!(true, false))
+		{
+			static foreach (V; TemplateArgsOf!T)
+			{
+				try
+				{
+					auto v = () @trusted {
+						return deserializeWithPolicy!(JsonSerializer, EnumByNamePolicy, V)(j);
+					}();
+					if (!exact || ()@trusted {
+							return serializeWithPolicy!(JsonSerializer, EnumByNamePolicy)(v);
+						}().type == j.type)
+						return T(v);
+				}
+				catch (Exception)
+				{
+				}
+			}
+		}
+		throw new Exception("JSON value matches none of the types in " ~ T.stringof);
+	}
+}
+
+private enum isSumType(T) = imported!"std.sumtype".isSumType!T;
+
+unittest  // a SumType is written as the value it holds, at any depth
+{
+	import std.sumtype : SumType;
+	import vibe.data.json : JsonSerializer;
+	import vibe.data.serialization : serializeWithPolicy;
+
+	alias U = SumType!(int, string);
+	static struct S
+	{
+		U u;
+		U[] us;
+	}
+
+	auto j = () @trusted {
+		return serializeWithPolicy!(JsonSerializer, EnumByNamePolicy)(S(U("a"), [
+				U(1), U("b")
+		]));
+	}();
+	assert(j["u"] == Json("a"), j.toString);
+	assert(j["us"] == Json([Json(1), Json("b")]), j.toString);
+}
+
+unittest  // a SumType reads back as the member matching the JSON value's own type
+{
+	import std.sumtype : SumType, has;
+	import vibe.data.json : JsonSerializer;
+	import vibe.data.serialization : deserializeWithPolicy;
+
+	alias N = SumType!(double, int);
+	auto n = () @trusted {
+		return deserializeWithPolicy!(JsonSerializer, EnumByNamePolicy, N)(Json(3));
+	}();
+	assert(n.has!int);
 }
 
 /// True when `F` is a scalar permitted as an elicitation form field: a

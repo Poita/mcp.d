@@ -4635,3 +4635,58 @@ unittest  // a JSON Schema facet on a handler method is rejected at compile time
 	auto s = new McpServer("t", "1");
 	static assert(!__traits(compiles, registerHandlers(s, new MethodTitleApi)));
 }
+
+version (unittest) private Json callToolResult(McpServer s, string name, Json arguments) @safe
+{
+	import mcp.protocol.jsonrpc : Message, makeRequest;
+
+	Json p = Json.emptyObject;
+	p["name"] = name;
+	p["arguments"] = arguments;
+	return s.handle(Message(makeRequest(Json(1), "tools/call", p))).get["result"];
+}
+
+version (unittest) private struct SumHolder
+{
+	import std.sumtype : SumType;
+
+	string label;
+	SumType!(int, string) value;
+}
+
+version (unittest) private final class SumTypeResultApi
+{
+	import std.sumtype : SumType;
+
+	@tool("pick", "Return a number or a word")
+	SumType!(int, string) pick(bool word) @safe
+	{
+		alias R = SumType!(int, string);
+		return word ? R("seven") : R(7);
+	}
+
+	@tool("tagged", "Return a struct holding a SumType")
+	SumHolder tagged() @safe
+	{
+		return SumHolder("x", typeof(SumHolder.value)("held"));
+	}
+}
+
+unittest  // a SumType tool result serializes as the value it holds
+{
+	auto s = new McpServer("t", "1");
+	registerHandlers(s, new SumTypeResultApi);
+	auto n = callToolResult(s, "pick", Json(["word": Json(false)]));
+	assert(n["structuredContent"]["result"] == Json(7), n.toString);
+	auto w = callToolResult(s, "pick", Json(["word": Json(true)]));
+	assert(w["structuredContent"]["result"] == Json("seven"), w.toString);
+}
+
+unittest  // a SumType field of a struct tool result serializes as the value it holds
+{
+	auto s = new McpServer("t", "1");
+	registerHandlers(s, new SumTypeResultApi);
+	auto r = callToolResult(s, "tagged", Json.emptyObject);
+	assert(r["structuredContent"]["value"] == Json("held"), r.toString);
+	assert(r["structuredContent"]["label"] == Json("x"), r.toString);
+}
