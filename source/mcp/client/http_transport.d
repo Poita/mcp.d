@@ -1642,8 +1642,10 @@ final class HttpClientTransport : ClientTransport
 	/// else a backoff that grows while attempts make no progress — resuming with
 	/// the latest `Last-Event-ID`, until `close()`. A 401 that rejects the bearer
 	/// is reported to the bearer provider's `onRejected` first, so the reconnect
-	/// carries a fresh token. A 405 (the server offers no standalone stream) or a
-	/// 404 (no stream at the endpoint, or the session is gone) ends the reader.
+	/// carries a fresh token; a 401 that no refresh answers ends the reader. Any
+	/// other 4xx except 408 and 429 would recur on every attempt (a 405: the
+	/// server offers no standalone stream; a 404: no stream at the endpoint, or
+	/// the session is gone), so it ends the reader too.
 	private void runServerStream() @safe
 	{
 		import core.time : msecs;
@@ -1712,7 +1714,8 @@ final class HttpClientTransport : ClientTransport
 					wwwAuthenticate = head.wwwAuthenticate;
 					if (status != 200)
 					{
-						refused = status == 404 || status == 405;
+						refused = status >= 400 && status < 500 && status != 408
+							&& status != 429 && status != 401;
 						return;
 					}
 
@@ -1747,15 +1750,9 @@ final class HttpClientTransport : ClientTransport
 				}
 				break;
 			}
-			if (sentBearer.length && isRejectedBearer(status, wwwAuthenticate))
-			{
-				// A failed refresh is retried on the next rejection, after the backoff.
-				try
-					bearerProvider.onRejected(sentBearer);
-				catch (Exception)
-				{
-				}
-			}
+			if (status == 401 && !(sentBearer.length && isRejectedBearer(status,
+					wwwAuthenticate) && refreshBearer(sentBearer)))
+				break;
 			// A stream that delivered events was healthy: restart the backoff.
 			if (sawData)
 				backoff = 250.msecs;
@@ -5666,4 +5663,83 @@ unittest  // openListen surfaces the 401 when the bearer refresh fails
 	assert(failure.length == 0, "scenario failed: " ~ failure);
 	assert(status == 401);
 	assert(attempts == 1);
+}
+
+version (unittest)
+{
+	/// Answer every standalone GET with `status` and count the attempts the
+	/// server-stream reader makes within about a second, returning that count and
+	/// whether the reader is still running.
+	private int serverStreamAttempts(int status, BearerProvider provider, out bool stillAlive)
+	{
+		import core.time : msecs, MonoTime;
+		import vibe.core.core : sleep;
+
+		int gets;
+		auto r = new URLRouter;
+		r.get("/mcp", (HTTPServerRequest req, HTTPServerResponse res) @safe {
+			gets++;
+			res.headers["WWW-Authenticate"] = `Bearer error="invalid_token"`;
+			res.statusCode = status;
+			res.writeBody("");
+		});
+		bool alive;
+		const failure = runAgainstFakeServer(r, (string url) @safe {
+			auto t = new HttpClientTransport(url);
+			scope (exit)
+				t.close();
+			t.setBearerProvider(provider);
+			t.startServerStream();
+			const until = MonoTime.currTime + 1200.msecs;
+			while (MonoTime.currTime < until)
+				sleep(50.msecs);
+			alive = t.serverStreamAlive;
+		});
+		assert(failure.length == 0, "scenario failed: " ~ failure);
+		stillAlive = alive;
+		return gets;
+	}
+}
+
+unittest  // the standalone GET stream stops on a 403
+{
+	bool alive;
+	assert(serverStreamAttempts(403, BearerProvider.init, alive) == 1);
+	assert(!alive);
+}
+
+unittest  // the standalone GET stream stops on a 400
+{
+	bool alive;
+	assert(serverStreamAttempts(400, BearerProvider.init, alive) == 1);
+	assert(!alive);
+}
+
+unittest  // the standalone GET stream stops on a 401 with no bearer provider
+{
+	bool alive;
+	assert(serverStreamAttempts(401, BearerProvider.init, alive) == 1);
+	assert(!alive);
+}
+
+unittest  // the standalone GET stream stops on a 401 whose bearer refresh fails
+{
+	bool alive;
+	assert(serverStreamAttempts(401, BearerProvider(() @safe => "tok",
+			(string tok) @safe => false), alive) == 1);
+	assert(!alive);
+}
+
+unittest  // the standalone GET stream reconnects after a 401 whose bearer refresh succeeds
+{
+	bool alive;
+	assert(serverStreamAttempts(401, BearerProvider(() @safe => "tok",
+			(string tok) @safe => true), alive) > 1);
+}
+
+unittest  // the standalone GET stream keeps reconnecting through a 429
+{
+	bool alive;
+	assert(serverStreamAttempts(429, BearerProvider.init, alive) > 1);
+	assert(alive);
 }
