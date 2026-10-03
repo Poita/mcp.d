@@ -249,6 +249,101 @@ package(mcp) JsonNode schemaNode(T, SchemaUse use, Ancestors...)()
 	}
 }
 
+/// Why `T` cannot be described by `schemaOf` and bound from JSON (`use` is
+/// `input`) or written as JSON (`output`), or `null` when it can. The reason
+/// starts with the offending type, which may be nested anywhere inside `T` (a
+/// struct field, an array element, a `Nullable` or `SumType` member), so a
+/// handler can be rejected with a diagnostic naming it. `Ancestors` are the
+/// enclosing struct types; a recursive type is left to `schemaNode` to reject.
+package(mcp) string unsupportedTypeReason(T, SchemaUse use, Ancestors...)()
+{
+	import std.datetime.date : DateTime, TimeOfDay;
+	import std.meta : staticIndexOf;
+	import std.sumtype : isSumType;
+	import std.typecons : Tuple;
+
+	static if (is(T == Json) || is(T == TimeOfDay) || is(T == DateTime)
+			|| staticIndexOf!(T, Ancestors) >= 0)
+		return null;
+	else static if (isInstanceOf!(Tuple, T))
+		return T.stringof ~ ": a Tuple has no JSON Schema; use a struct with named fields";
+	else static if (isInstanceOf!(Nullable, T))
+		return unsupportedTypeReason!(TemplateArgsOf!T[0], use, Ancestors)();
+	else static if (isSumType!T)
+	{
+		static foreach (V; TemplateArgsOf!T)
+			if (auto r = unsupportedTypeReason!(V, use, Ancestors)())
+				return r;
+		return null;
+	}
+	else static if (isFieldwiseStruct!T)
+	{
+		import jsonschema.attributes : SchemaDefault;
+
+		static foreach (field; FieldNameTuple!T)
+		{
+			static if (isBoundField!(T, field))
+			{
+				static foreach (d; getUDAs!(__traits(getMember, T, field), SchemaDefault))
+					static if (!isDefaultFor!(typeof(__traits(getMember, T,
+							field)), typeof(d.value)))
+						return T.stringof ~ "." ~ field
+							~ ": its @schemaDefault value of type " ~ typeof(d.value)
+								.stringof ~ " does not convert to " ~ typeof(__traits(getMember,
+										T, field)).stringof;
+				if (auto r = unsupportedTypeReason!(typeof(__traits(getMember,
+						T, field)), use, Ancestors, T)())
+					return r;
+			}
+		}
+		return null;
+	}
+	else static if (is(T == enum) || is(T == bool) || isIntegral!T || isSomeString!T)
+		return null;
+	else static if (isFloatingPoint!T)
+		return use == SchemaUse.input && is(Unqual!T == real)
+			? T.stringof ~ ": a real argument cannot be read from JSON; use double" : null;
+	else static if (isArray!T)
+		return unsupportedTypeReason!(typeof(T.init[0]), use, Ancestors)();
+	else static if (isAssociativeArray!T)
+	{
+		static if (!isSomeString!(KeyType!T))
+			return T.stringof ~ ": JSON object keys are strings, so the key type must be a string";
+		else
+			return unsupportedTypeReason!(ValueType!T, use, Ancestors)();
+	}
+	else static if (is(T == struct))
+		return null; // custom-serialized, such as SysTime or Date
+	else
+		return T.stringof ~ ": the type has no JSON representation";
+}
+
+/// Whether a `@schemaDefault` value of type `V` can be the default of a `P`: it
+/// converts to `P` (or, for a `Nullable`, to the type it wraps) without losing
+/// a fractional part to an integer.
+package(mcp) template isDefaultFor(P, V)
+{
+	static if (isInstanceOf!(Nullable, P))
+		alias Target = TemplateArgsOf!P[0];
+	else
+		alias Target = P;
+	enum isDefaultFor = is(typeof(cast(P) V.init)) && !(isFloatingPoint!V
+				&& !isFloatingPoint!Target);
+}
+
+/// The value of the `@schemaDefault` UDA `uda` as a `P`, rejected at compile
+/// time when it does not convert (see `isDefaultFor`).
+package(mcp) P defaultAs(P, alias uda)()
+{
+	alias V = typeof(uda.value);
+	static assert(isDefaultFor!(P, V),
+			"a @schemaDefault value of type " ~ V.stringof ~ " does not convert to " ~ P.stringof);
+	static if (isDefaultFor!(P, V))
+		return cast(P) uda.value;
+	else
+		return P.init;
+}
+
 /// The `HH:MM:SS` form vibe reads and writes a `TimeOfDay` in. `TimeOfDay` and
 /// `DateTime` carry no UTC offset, so they are described by patterns rather
 /// than the RFC 3339 `time` / `date-time` formats, which require one.
@@ -375,9 +470,8 @@ package(mcp) T bindJson(T)(Json v, string path = "")
 					if (isPresent!FT(p))
 						setBound(__traits(getMember, result, field), bindJson!FT(*p, fieldPath));
 					else static if (hasUDA!(__traits(getMember, T, field), SchemaDefault))
-						setBound(__traits(getMember, result, field),
-								cast(FT) getUDAs!(__traits(getMember, T, field), SchemaDefault)[0]
-									.value);
+						setBound(__traits(getMember, result, field), defaultAs!(FT,
+								getUDAs!(__traits(getMember, T, field), SchemaDefault)[0])());
 					else static if (isRequiredField!(T, field))
 						throw new BindException("missing required field '" ~ fieldPath ~ "'");
 				}
@@ -791,4 +885,67 @@ unittest  // an omitted @schemaDefault field binds to the advertised default
 unittest  // bindString reads a string-based enum by member name
 {
 	assert(bindString!Shade("light") == Shade.light);
+}
+
+version (unittest) private class NotJson
+{
+}
+
+unittest  // a type with no JSON form is reported as unsupported, naming the offending type
+{
+	import std.typecons : Tuple;
+
+	static struct HoldsClass
+	{
+		NotJson c;
+	}
+
+	static assert(unsupportedTypeReason!(NotJson, SchemaUse.input)().length);
+	static assert(unsupportedTypeReason!(int*, SchemaUse.input)().length);
+	static assert(unsupportedTypeReason!(void delegate(), SchemaUse.input)().length);
+	static assert(unsupportedTypeReason!(char, SchemaUse.input)().length);
+	static assert(unsupportedTypeReason!(Tuple!(int, string), SchemaUse.output)().length);
+	static assert(unsupportedTypeReason!(real, SchemaUse.input)().length);
+	static assert(unsupportedTypeReason!(int[int], SchemaUse.input)().length);
+	static assert(unsupportedTypeReason!(Nullable!(char)[], SchemaUse.input)().length);
+	enum nested = unsupportedTypeReason!(HoldsClass, SchemaUse.input)();
+	static assert(nested.length && nested[0 .. NotJson.stringof.length] == NotJson.stringof, nested);
+}
+
+unittest  // a type with a JSON form is not reported as unsupported
+{
+	import std.datetime.systime : SysTime;
+	import std.sumtype : SumType;
+
+	static struct Rec
+	{
+		int a;
+		string[] b;
+		Nullable!double c;
+		SumType!(int, string) d;
+		SysTime when;
+		Json raw;
+		Shade shade;
+	}
+
+	static assert(unsupportedTypeReason!(Rec, SchemaUse.input)() is null);
+	static assert(unsupportedTypeReason!(int[string], SchemaUse.input)() is null);
+	static assert(unsupportedTypeReason!(real, SchemaUse.output)() is null);
+	static assert(unsupportedTypeReason!(string, SchemaUse.input)() is null);
+}
+
+unittest  // a struct field whose @schemaDefault does not convert to its type is reported
+{
+	import jsonschema : schemaDefault;
+
+	static struct S
+	{
+		@schemaDefault("abc") int n;
+	}
+
+	static assert(unsupportedTypeReason!(S, SchemaUse.input)().length);
+	static assert(isDefaultFor!(Nullable!int, int));
+	static assert(isDefaultFor!(double, int));
+	static assert(!isDefaultFor!(int, double));
+	static assert(!isDefaultFor!(int, string));
 }

@@ -647,6 +647,12 @@ is predictable when porting a hand-built server):
 | `Nullable!T` (elicitation field) | `<T>`, made optional by omission from `required` |
 | `Nullable!T` (output schema) | `{"anyOf": [<T>, {"type": "null"}]}` |
 
+A parameter, field, or return type with no JSON form — a class, pointer,
+delegate, `char`, `std.typecons.Tuple`, an associative array keyed by a
+non-string, or a `real` parameter (use `double`) — is rejected at compile time
+with a message naming the handler and parameter, as is a `@schemaDefault` whose
+value does not convert to the parameter's type.
+
 Integer types map to `"integer"` (not `"number"`) deliberately — it is the more
 precise constraint; use `double` for a field that should accept fractional values.
 An optional tool parameter is left out of `required`; declare it `Nullable!T` (whose

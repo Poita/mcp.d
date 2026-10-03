@@ -20,7 +20,7 @@ import mcp.server.events_runtime : EventRegistration, EventCheck;
 import mcp.api.attributes;
 import mcp.api.apps : UiToolMeta, setUiToolMeta;
 import mcp.api.skills : Skill, registerSkill;
-import mcp.api.binding : bindJson, bindString, schemaNode, schemaOf,
+import mcp.api.binding : bindJson, bindString, defaultAs, schemaNode, schemaOf,
 	SchemaUse, setBound, wireName;
 import mcp.protocol.schema;
 import mcp.protocol.jsonhelpers : isFieldwiseStruct;
@@ -264,6 +264,46 @@ private void checkParamNames(alias func)()
 	}
 }
 
+/// Reject an argument parameter of `func` whose type cannot be bound from JSON,
+/// or whose `@schemaDefault` value does not convert to its type, with a
+/// diagnostic naming the handler, the parameter, and the offending type rather
+/// than an error from deep inside schema generation or binding.
+private void checkParamTypes(alias func)()
+{
+	import mcp.api.binding : isDefaultFor, unsupportedTypeReason;
+
+	alias ids = ParameterIdentifierTuple!func;
+	static foreach (i, P; BoundParameters!func)
+	{
+		static if (!is(P : RequestContext) && !is(P == TaskContext))
+		{
+			static assert(unsupportedTypeReason!(P, SchemaUse.input)() is null,
+					"parameter '" ~ ids[i] ~ "' of '" ~ __traits(identifier,
+						func) ~ "' has type " ~ P.stringof ~ ", which cannot be bound from JSON ("
+					~ unsupportedTypeReason!(P, SchemaUse.input)() ~ ")");
+			static foreach (d; ParamSchemaDefaults!(func, i))
+				static assert(isDefaultFor!(P, typeof(d.value)),
+						"the @schemaDefault value of type " ~ typeof(d.value)
+							.stringof ~ " on parameter '" ~ ids[i] ~ "' of '" ~ __traits(identifier,
+								func) ~ "' does not convert to its type " ~ P.stringof);
+		}
+	}
+}
+
+/// Reject a tool method `func` whose return type cannot be written as
+/// structured JSON, naming the handler and the offending type.
+private void checkToolReturnType(alias func)()
+{
+	import mcp.api.binding : unsupportedTypeReason;
+
+	alias R = ReturnType!func;
+	static if (!isUnstructuredReturn!R)
+		static assert(unsupportedTypeReason!(R, SchemaUse.output)() is null,
+				"tool '" ~ __traits(identifier,
+					func) ~ "' returns " ~ R.stringof ~ ", which cannot be written as JSON ("
+				~ unsupportedTypeReason!(R, SchemaUse.output)() ~ ")");
+}
+
 /// Reject any method-level `@describeParam` or `@mcpHeader` UDA whose
 /// `parameter` does not name a schema parameter of `func`. A parameter that is
 /// not declared at all, or one that is an injected context parameter (a trailing
@@ -348,6 +388,7 @@ private Json parametersSchema(alias func)() @safe
 	import std.traits : ParameterDefaultValueTuple;
 
 	checkParamNames!func();
+	checkParamTypes!func();
 	validateParamUdas!func();
 
 	alias names = ParamWireNames!func;
@@ -535,8 +576,7 @@ T argsAs(T)(Json arguments) @safe
 /// `structuredContent` is always an object.
 private Json outputSchemaOf(R)() @safe
 {
-	static if (is(R == CallToolResult) || is(R == ToolResponse)
-			|| isSomeString!R || is(R == void) || is(R == Content) || is(R == Content[]))
+	static if (isUnstructuredReturn!R)
 		return Json.undefined;
 	else static if (isFieldwiseStruct!R)
 		return schemaOf!(R, SchemaUse.output);
@@ -551,6 +591,11 @@ private Json outputSchemaOf(R)() @safe
 		return s;
 	}
 }
+
+/// Whether a tool returning `R` produces no structured output: it returns
+/// text, `Content`, or nothing, or builds its own result.
+private enum isUnstructuredReturn(R) = is(R == CallToolResult) || is(R == ToolResponse)
+	|| isSomeString!R || is(R == void) || is(R == Content) || is(R == Content[]);
 
 /// Wrap a tool method's return value into a `CallToolResult`. The structured
 /// result mirrors `outputSchemaOf!R`: fieldwise structs serialize to an object;
@@ -715,7 +760,7 @@ private string bindToolArgs(alias overload)(Json args, ref Tuple!(BoundParameter
 					if (argPresent(args, names[i]))
 						setBound(argv[i], marshalArg!P(args, names[i]));
 					else
-						setBound(argv[i], cast(P) ParamSchemaDefaults!(overload, i)[0].value);
+						setBound(argv[i], defaultAs!(P, ParamSchemaDefaults!(overload, i)[0])());
 				}
 				else static if (is(defs[i] == void))
 					setBound(argv[i], marshalArg!P(args, names[i]));
@@ -749,6 +794,7 @@ private Tool toolDescriptor(alias overload, A)(A attr) @safe
 		descriptor.description = nullable(attr.description);
 	if (attr.title.length)
 		descriptor.title = nullable(attr.title);
+	checkToolReturnType!overload();
 	descriptor.inputSchema = parametersSchema!overload();
 	auto outSchema = outputSchemaOf!(ReturnType!overload)();
 	if (outSchema.type == Json.Type.object)
@@ -956,6 +1002,7 @@ private void registerPromptMethod(string memberName, alias overload, alias paren
 		McpServer server, prompt attr) @safe
 {
 	checkParamNames!overload();
+	checkParamTypes!overload();
 	validateParamUdas!overload();
 
 	Prompt descriptor;
@@ -1010,7 +1057,7 @@ private void registerPromptMethod(string memberName, alias overload, alias paren
 						throw invalidParams("argument '" ~ names[i] ~ "': " ~ e.msg);
 				}
 				else
-					setBound(argv[i], cast(P) ParamSchemaDefaults!(overload, i)[0].value);
+					setBound(argv[i], defaultAs!(P, ParamSchemaDefaults!(overload, i)[0])());
 			}
 			else static if (is(defs[i] == void))
 			{
@@ -1132,6 +1179,7 @@ private void registerTemplateMethod(string memberName, alias overload,
 		descriptor.title = nullable(attr.title);
 
 	checkParamNames!overload();
+	checkParamTypes!overload();
 	// Every bound parameter must name a template variable; any other name would
 	// silently receive an empty or default value on every read.
 	static foreach (i, P; BoundParameters!overload)
@@ -4689,4 +4737,78 @@ unittest  // a SumType field of a struct tool result serializes as the value it 
 	auto r = callToolResult(s, "tagged", Json.emptyObject);
 	assert(r["structuredContent"]["value"] == Json("held"), r.toString);
 	assert(r["structuredContent"]["label"] == Json("x"), r.toString);
+}
+
+version (unittest) private final class RealParamApi
+{
+	@tool("f", "f")
+	string f(real x) @safe
+	{
+		return "";
+	}
+}
+
+version (unittest) private final class TupleReturnApi
+{
+	@tool("f", "f")
+	Tuple!(int, string) f() @safe
+	{
+		return typeof(return)(1, "a");
+	}
+}
+
+version (unittest) private final class ClassParamApi
+{
+	@tool("f", "f")
+	string f(RealParamApi other) @safe
+	{
+		return "";
+	}
+}
+
+version (unittest) private final class MismatchedDefaultApi
+{
+	import jsonschema : schemaDefault;
+
+	@tool("f", "f")
+	string f(@schemaDefault("abc") int x)@safe
+	{
+		return "";
+	}
+}
+
+version (unittest) private final class FractionalIntDefaultApi
+{
+	import jsonschema : schemaDefault;
+
+	@tool("f", "f")
+	string f(@schemaDefault(2.5) int x)@safe
+	{
+		return "";
+	}
+}
+
+unittest  // a real parameter is rejected at compile time
+{
+	auto s = new McpServer("t", "1");
+	static assert(!__traits(compiles, registerHandlers(s, new RealParamApi)));
+}
+
+unittest  // a Tuple return is rejected at compile time
+{
+	auto s = new McpServer("t", "1");
+	static assert(!__traits(compiles, registerHandlers(s, new TupleReturnApi)));
+}
+
+unittest  // a class parameter is rejected at compile time
+{
+	auto s = new McpServer("t", "1");
+	static assert(!__traits(compiles, registerHandlers(s, new ClassParamApi)));
+}
+
+unittest  // a @schemaDefault whose value does not convert to the parameter type is rejected
+{
+	auto s = new McpServer("t", "1");
+	static assert(!__traits(compiles, registerHandlers(s, new MismatchedDefaultApi)));
+	static assert(!__traits(compiles, registerHandlers(s, new FractionalIntDefaultApi)));
 }
