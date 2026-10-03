@@ -755,6 +755,7 @@ enum size_t defaultMaxQueuedStreamBytes = 1024 * 1024;
 /// and every later write throws, so the push channel drops the stream.
 private final class SseWriter
 {
+	import core.time : MonoTime;
 	import vibe.core.sync : LocalManualEvent, createManualEvent;
 	import vibe.core.task : Task;
 
@@ -766,6 +767,9 @@ private final class SseWriter
 	private bool closing;
 	private bool started;
 	private Task writer;
+	/// When the writer began its in-progress socket write (`MonoTime.init`
+	/// while it is not writing).
+	private MonoTime writingSince;
 	private LocalManualEvent wake;
 	private LocalManualEvent drained;
 	private LocalManualEvent finished;
@@ -784,21 +788,25 @@ private final class SseWriter
 	}
 
 	/// Queue `frame` for writing. When `maxQueued` bytes are already waiting, the
-	/// writer gets up to `queueStallTimeout` to make room, since a burst queued
-	/// without yielding outruns even a healthy client; a client still not reading
-	/// by then is deemed gone. Throws once the stream has failed.
+	/// writer gets until `queueStallTimeout` after it began its current socket
+	/// write to make room, since a burst queued without yielding outruns even a
+	/// healthy client; a client still not reading by then is deemed gone. The
+	/// deadline is anchored to the stalled write rather than to this call, so
+	/// streams that stalled together give up together and a fan-out across them
+	/// waits about one timeout in all. Throws once the stream has failed.
 	void opCall(string frame) @safe
 	{
-		import core.time : MonoTime;
 		import vibe.core.core : runTask;
 
 		if (dead)
 			throw new Exception("SSE stream closed");
 		if (maxQueued != 0 && queued > 0 && queued + frame.length > maxQueued)
 		{
-			const deadline = MonoTime.currTime + queueStallTimeout;
+			const called = MonoTime.currTime;
 			while (!dead && queued > 0 && queued + frame.length > maxQueued)
 			{
+				const deadline = (writingSince == MonoTime.init ? called : writingSince)
+					+ queueStallTimeout;
 				const left = deadline - MonoTime.currTime;
 				if (left <= Duration.zero)
 				{
@@ -836,11 +844,13 @@ private final class SseWriter
 				}
 				auto batch = queue;
 				queue = null;
+				writingSince = MonoTime.currTime;
 				() @trusted {
 					foreach (frame; batch)
 						res.bodyWriter.write(cast(const(ubyte)[]) frame);
 					res.bodyWriter.flush();
 				}();
+				writingSince = MonoTime.init;
 				foreach (frame; batch)
 					queued -= frame.length;
 				drained.emit();
@@ -4114,6 +4124,59 @@ unittest  // a stalled SSE reader blocks neither notify nor other streams, and i
 			"a stalled reader must hold up notify only until its queue gives up on it");
 	assert(received == 40, "a healthy stream must receive every notification");
 	assert(remaining == 1, "a stream whose client stopped reading must be dropped");
+}
+
+unittest  // several stalled SSE readers hold up a fan-out for one stall timeout, not one each
+{
+	import core.time : MonoTime, msecs;
+	import std.array : replicate;
+	import vibe.core.core : runTask, sleep, exitEventLoop, runEventLoop;
+	import vibe.http.server : createTestHTTPServerResponse, TestHTTPResponseMode;
+
+	auto ch = new ServerPushChannel(new StreamCoordinator);
+	StallingSink[] sinks;
+	void delegate(string) @safe writerFor(StallingSink sink) @safe
+	{
+		auto w = sseFrameWriter(createTestHTTPServerResponse(sink, null,
+				TestHTTPResponseMode.bodyOnly));
+		return (string f) @safe { w(f); };
+	}
+
+	foreach (i; 0 .. 4)
+	{
+		sinks ~= new StallingSink;
+		ch.addListener(writerFor(sinks[$ - 1]), Json.init, ListenFilter.init,
+				"", null, "S" ~ cast(char)('0' + i));
+	}
+
+	Duration took;
+	size_t remaining;
+	runTask(() @safe nothrow{
+		try
+		{
+			const big = Json("x".replicate(64 * 1024));
+			const started = MonoTime.currTime;
+			foreach (_; 0 .. 40)
+				ch.notify("notifications/message", Json(["data": big]));
+			took = MonoTime.currTime - started;
+			remaining = ch.listenerCount;
+		}
+		catch (Exception)
+		{
+		}
+		foreach (s; sinks)
+			s.released = true;
+		try
+			sleep(50.msecs);
+		catch (Exception)
+		{
+		}
+		exitEventLoop();
+	});
+	runEventLoop();
+	assert(took < SseWriter.queueStallTimeout + 1.seconds,
+			"stalled readers must not each add a stall timeout to the fan-out");
+	assert(remaining == 0, "every stream whose client stopped reading must be dropped");
 }
 
 unittest  // localhost hosts are accepted, foreign hosts rejected
