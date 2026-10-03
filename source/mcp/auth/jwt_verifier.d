@@ -295,7 +295,7 @@ package TokenInfo validateClaims(JwtVerifierConfig cfg, Json payload, long now) 
 		return reject("iss does not match the configured issuer");
 
 	auto auds = audiences(payload);
-	if (cfg.audience.length && !auds.canFind(cfg.audience))
+	if (cfg.audience.length && !includesAudience(auds, cfg.audience))
 		return reject("aud does not include the configured audience");
 
 	auto scopes = tokenScopes(payload);
@@ -904,6 +904,18 @@ package string[] audiences(Json payload) @safe
 	return result;
 }
 
+/// Whether `auds` names `audience`, comparing both in RFC 8707 canonical form
+/// (`canonicalResourceUri`) so a configured resource differing only in host
+/// case, a trailing slash, or an explicit default port still matches.
+package bool includesAudience(const string[] auds, string audience) @safe
+{
+	import std.algorithm : any;
+	import mcp.auth.oauth : canonicalResourceUri;
+
+	const want = canonicalResourceUri(audience);
+	return auds.any!(a => canonicalResourceUri(a) == want);
+}
+
 /// Split a space-delimited scope string into individual scopes, dropping empty
 /// elements so an empty or all-whitespace claim yields no scopes (an empty
 /// string would otherwise split into a spurious single `""` scope). Shared with
@@ -1251,6 +1263,18 @@ unittest  // the wrong audience is rejected
 
 	auto ti = verifyToken(cfg, testRs256Jwt, cache, 1_700_001_000);
 	assert(!ti.valid);
+}
+
+unittest  // the audience is compared in canonical form (case of scheme+host, trailing slash, default port)
+{
+	JwtVerifierConfig cfg;
+	cfg.allowAnyIssuer = true;
+	cfg.audience = "HTTPS://MCP.Example.com:443/mcp/";
+	auto payload = parseJsonString(`{"iss":"https://any.example","aud":"https://mcp.example.com/mcp","sub":"u","exp":1700003600}`);
+	assert(validateClaims(cfg, payload, 1_700_001_000).valid);
+
+	cfg.audience = "https://mcp.example.com/MCP";
+	assert(!validateClaims(cfg, payload, 1_700_001_000).valid);
 }
 
 unittest  // a missing required scope is rejected

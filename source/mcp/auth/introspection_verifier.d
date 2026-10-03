@@ -18,7 +18,7 @@ import std.algorithm : canFind;
 
 import vibe.data.json : Json, parseJsonString;
 
-import mcp.auth.jwt_verifier : audiences, currentUnixTime, jsonStr, splitScopes;
+import mcp.auth.jwt_verifier : audiences, currentUnixTime, includesAudience, jsonStr, splitScopes;
 import mcp.auth.oauth : TokenEndpointAuthMethod, basicAuthHeader, secureRequestHTTP;
 import mcp.auth.resource_server : TokenInfo, TokenValidator;
 import mcp.protocol.ssrf : SsrfPolicy;
@@ -171,7 +171,7 @@ TokenInfo introspectionResult(IntrospectionConfig cfg, string responseJson) @saf
 		return TokenInfo.invalid();
 
 	auto auds = audiences(doc);
-	if (cfg.audience.length && !auds.canFind(cfg.audience))
+	if (cfg.audience.length && !includesAudience(auds, cfg.audience))
 		return TokenInfo.invalid();
 
 	auto scopes = introspectionScopes(doc);
@@ -487,6 +487,15 @@ unittest  // a matching audience is accepted
 	cfg.audience = "https://mcp.example.com/mcp";
 	auto ti = introspectionResult(cfg, `{"active":true,"aud":["https://mcp.example.com/mcp"]}`);
 	assert(ti.valid);
+}
+
+unittest  // the configured audience is compared in canonical form
+{
+	IntrospectionConfig cfg;
+	cfg.audience = "https://MCP.example.com/mcp/";
+	assert(introspectionResult(cfg, `{"active":true,"aud":"https://mcp.example.com/mcp"}`).valid);
+	assert(!introspectionResult(cfg,
+			`{"active":true,"aud":"https://mcp.example.com/other"}`).valid);
 }
 
 unittest  // a missing required scope is rejected
