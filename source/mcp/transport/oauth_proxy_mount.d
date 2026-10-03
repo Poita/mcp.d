@@ -59,6 +59,7 @@ import vibe.http.common : HTTPMethod;
 import mcp.auth.oauth : isValidClientIdMetadataUrl, TokenSet;
 import mcp.auth.oauth_proxy : ConsentRequiredException, InvalidClientIdMetadataException,
 	InvalidRedirectUriException, OAuthProxy, OAuthProxyConfig, RelayedCodeBinding;
+import mcp.protocol.jsonrpc : parseUntrustedJson;
 import mcp.protocol.ssrf : SsrfPolicy;
 
 @safe:
@@ -1112,7 +1113,7 @@ private bool tryReadJsonBody(scope HTTPServerRequest req, out Json body_) @safe
 			body_ = Json.emptyObject;
 			return true;
 		}
-		body_ = parseJsonString(payload);
+		body_ = parseUntrustedJson(payload);
 		return true;
 	}
 	catch (Exception e)
@@ -1144,7 +1145,7 @@ private Json parseJsonBody(string payload) @safe
 	if (payload.length == 0)
 		return Json.emptyObject;
 	try
-		return parseJsonString(payload);
+		return parseUntrustedJson(payload);
 	catch (Exception)
 		return Json.emptyObject;
 }
@@ -2737,6 +2738,43 @@ unittest  // /register rejects a malformed JSON body with 400 invalid_client_met
 	const body_ = () @trusted { return cast(string) sink.data; }();
 	assert(res.statusCode == 400);
 	assert(body_.canFind("invalid_client_metadata"));
+}
+
+unittest  // /register rejects a body nested past the depth cap with 400 invalid_client_metadata
+{
+	import std.algorithm : canFind;
+	import std.array : replicate;
+	import vibe.http.common : HTTPMethod;
+	import vibe.http.server : createTestHTTPServerRequest,
+		createTestHTTPServerResponse, TestHTTPResponseMode;
+	import vibe.inet.url : URL;
+	import vibe.stream.memory : createMemoryOutputStream, createMemoryStream;
+
+	auto proxy = mountSampleProxy();
+	auto router = new URLRouter;
+	mountOAuthRegister(router, proxy);
+
+	const json = `{"redirect_uris":["http://localhost:5000/cb"],"x":` ~ "[".replicate(
+			1000) ~ "]".replicate(1000) ~ `}`;
+	auto payload = () @trusted { return cast(ubyte[]) json.dup; }();
+	auto req = createTestHTTPServerRequest(URL("https://mcp.example.com/register"),
+			HTTPMethod.POST, createMemoryStream(payload, false));
+	auto sink = createMemoryOutputStream();
+	auto res = createTestHTTPServerResponse(sink, null, TestHTTPResponseMode.bodyOnly);
+	router.handleRequest(req, res);
+
+	const body_ = () @trusted { return cast(string) sink.data; }();
+	assert(res.statusCode == 400);
+	assert(body_.canFind("invalid_client_metadata"));
+}
+
+unittest  // an upstream token response nested past the depth cap parses as an empty object
+{
+	import std.array : replicate;
+
+	const deep = "[".replicate(1000) ~ "]".replicate(1000);
+	const j = parseJsonBody(`{"access_token":"at","x":` ~ deep ~ `}`);
+	assert(j.type == Json.Type.object && j.length == 0);
 }
 
 unittest  // /register rejects a redirect_uri /authorize would never accept with 400 invalid_redirect_uri
