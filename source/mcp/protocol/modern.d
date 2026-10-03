@@ -215,7 +215,9 @@ struct CacheHint
 /// untouched (matching the sibling `withCache`/`withSubscriptionId`). Every
 /// modern result identifies its server, so this runs at one dispatch chokepoint
 /// rather than per result type. An identity-less `info` and a non-object result
-/// pass through unchanged; an existing key is never overwritten.
+/// pass through unchanged. The key is reserved for MCP and owned by the SDK, so
+/// a value already present (e.g. one a handler put in its result `_meta`) is
+/// replaced: a handler cannot impersonate another server.
 Json withServerInfo(Json result, Implementation info) @safe
 {
 	if (result.type != Json.Type.object)
@@ -225,8 +227,6 @@ Json withServerInfo(Json result, Implementation info) @safe
 	Json out_ = result.clone();
 	Json meta = ("_meta" in out_ && out_["_meta"].type == Json.Type.object) ? out_["_meta"]
 		: Json.emptyObject;
-	if (MetaKey.serverInfo in meta)
-		return result;
 	meta[MetaKey.serverInfo] = info.toJson();
 	out_["_meta"] = meta;
 	return out_;
@@ -352,6 +352,26 @@ unittest  // RequestMeta.fromParams ignores non-object clientInfo and clientCapa
 	assert(m.clientInfo.version_ == "");
 	assert(!m.clientCapabilities.sampling);
 	assert(!m.clientCapabilities.roots);
+}
+
+unittest  // withServerInfo replaces a handler-supplied serverInfo with the server's identity
+{
+	import vibe.data.json : parseJsonString;
+
+	auto spoofed = parseJsonString(`{"content":[],"_meta":{"` ~ MetaKey.serverInfo
+			~ `":{"name":"evil","version":"6.6.6"},"com.example/trace":"t1"}}`);
+	auto j = withServerInfo(spoofed, Implementation("srv", "1.0"));
+	assert(j["_meta"][MetaKey.serverInfo]["name"].get!string == "srv");
+	assert(j["_meta"][MetaKey.serverInfo]["version"].get!string == "1.0");
+	// Unreserved user keys survive, and the input is left untouched.
+	assert(j["_meta"]["com.example/trace"].get!string == "t1");
+	assert(spoofed["_meta"][MetaKey.serverInfo]["name"].get!string == "evil");
+}
+
+unittest  // withServerInfo stamps serverInfo into a result with no _meta
+{
+	auto j = withServerInfo(Json(["content": Json.emptyArray]), Implementation("srv", "1.0"));
+	assert(j["_meta"][MetaKey.serverInfo]["name"].get!string == "srv");
 }
 
 unittest  // DiscoverResult round-trips
