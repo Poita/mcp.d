@@ -518,13 +518,19 @@ package bool jwkUsableForSig(Jwk jwk) @safe
 
 /// Convert a JWK to a PEM SubjectPublicKeyInfo public key. Supports RSA (n/e)
 /// and EC P-256 (crv/x/y, RFC 7518), the key types RS256 and ES256 verify with.
-/// Returns null for unsupported keys.
+/// Returns null for unsupported keys and for key material that is not valid
+/// base64url, so one malformed key never invalidates the rest of a JWKS.
 package string jwkToPem(Jwk jwk) @trusted
 {
-	if (jwk.kty == "RSA")
-		return rsaJwkToPem(jwk);
-	if (jwk.kty == "EC")
-		return ecJwkToPem(jwk);
+	try
+	{
+		if (jwk.kty == "RSA")
+			return rsaJwkToPem(jwk);
+		if (jwk.kty == "EC")
+			return ecJwkToPem(jwk);
+	}
+	catch (Exception)
+		return null;
 	return null;
 }
 
@@ -739,8 +745,18 @@ package final class JwksCache : KeySource
 			return;
 		lastAttemptAt = t;
 		const doc = fetcher !is null ? fetcher(uri) : fetchJwks(uri, policy);
-		if (doc.length)
+		if (doc.length == 0)
+			return;
+		// An unparseable document is handled like a failed fetch: logged, with
+		// the cached keys kept, rather than failing the request that triggered it.
+		try
 			load(doc);
+		catch (Exception e)
+		{
+			import vibe.core.log : logWarn;
+
+			logWarn("JWKS from %s could not be parsed; keeping the cached keys: %s", uri, e.msg);
+		}
 	}
 
 	/// Populate the cache from a raw JWKS document (also the test seam).
@@ -1970,6 +1986,26 @@ unittest  // a refetched JWKS with no usable keys keeps the previously cached ke
 		~ `","e":"` ~ testRsaE ~ `"}]}`;
 	s.clock += 300;
 	assert(s.cache.keysFor("rsa-1").length == 1, "an empty key set must not evict the cached keys");
+	assert(s.fetches == 2);
+}
+
+unittest  // a JWK with undecodable key material is skipped without discarding the rest of the document
+{
+	auto s = new ScriptedJwks(
+			`{"keys":[{"kty":"RSA","kid":"bad","n":"!!not base64!!","e":"AQAB"},`
+			~ `{"kty":"EC","kid":"bad-ec","crv":"P-256","x":"%%%","y":"` ~ testEcY
+			~ `"},` ~ `{"kty":"RSA","kid":"rsa-1","n":"` ~ testRsaN ~ `","e":"` ~ testRsaE ~ `"}]}`);
+	assert(s.cache.keysFor("rsa-1").length == 1);
+}
+
+unittest  // a refetched JWKS that is not valid JSON keeps the cached keys and does not throw
+{
+	auto s = new ScriptedJwks(rsaOnlyJwks);
+	assert(s.cache.keysFor("rsa-1").length == 1);
+
+	s.served = `{not valid json`;
+	s.clock += 300;
+	assert(s.cache.keysFor("rsa-1").length == 1);
 	assert(s.fetches == 2);
 }
 
