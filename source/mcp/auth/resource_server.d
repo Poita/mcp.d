@@ -32,12 +32,17 @@ struct TokenInfo
 	/// The spec (basic/authorization §Access Token Privilege Restriction) requires
 	/// servers to "reject tokens that do not include them in the audience claim",
 	/// so an empty audience does NOT satisfy the binding: a token must explicitly
-	/// name `resource` to be treated as issued for this server.
+	/// name `resource` to be treated as issued for this server. Both sides are
+	/// compared in canonical form (`canonicalResourceUri`: lowercase scheme and
+	/// host, no fragment or trailing slash), the form clients send as their
+	/// resource indicator.
 	bool hasAudience(string resource) const @safe
 	{
-		import std.algorithm : canFind;
+		import std.algorithm : any;
+		import mcp.auth.oauth : canonicalResourceUri;
 
-		return audience.canFind(resource);
+		const want = canonicalResourceUri(resource);
+		return audience.any!(a => canonicalResourceUri(a) == want);
 	}
 
 	/// A convenience constructor for a rejected token.
@@ -108,8 +113,9 @@ struct ResourceServerConfig
 	TokenValidator validator;
 
 	/// The canonical resource identifier for this server (RFC 8707). When set,
-	/// the transport enforces that a validated token's audience includes it, and
-	/// publishes it as `resource` in the metadata document.
+	/// the transport enforces that a validated token's audience includes it
+	/// (compared in canonical form, so a trailing slash or host case does not
+	/// matter), and publishes it as `resource` in the metadata document.
 	///
 	/// REQUIRED for spec compliance: basic/authorization §Access Token Privilege
 	/// Restriction says MCP servers MUST reject tokens that do not name them in the
@@ -488,6 +494,48 @@ unittest  // RFC 8707: a token whose audience includes the resource is accepted
 	};
 	TokenInfo info;
 	assert(authorize(cfg, "Bearer good", info) == AuthFailure.none);
+}
+
+unittest  // RFC 8707: a configured resource with a trailing slash accepts the canonical audience
+{
+	ResourceServerConfig cfg;
+	cfg.resource = "https://mcp.example.com/mcp/";
+	cfg.validator = (string t) {
+		TokenInfo ti;
+		ti.valid = true;
+		ti.audience = ["https://mcp.example.com/mcp"];
+		return ti;
+	};
+	TokenInfo info;
+	assert(authorize(cfg, "Bearer good", info) == AuthFailure.none);
+}
+
+unittest  // RFC 8707: a configured resource with an uppercase host accepts the canonical audience
+{
+	ResourceServerConfig cfg;
+	cfg.resource = "https://MCP.Example.com/mcp";
+	cfg.validator = (string t) {
+		TokenInfo ti;
+		ti.valid = true;
+		ti.audience = ["https://mcp.example.com/mcp"];
+		return ti;
+	};
+	TokenInfo info;
+	assert(authorize(cfg, "Bearer good", info) == AuthFailure.none);
+}
+
+unittest  // RFC 8707: canonical comparison is not a prefix match
+{
+	ResourceServerConfig cfg;
+	cfg.resource = "https://mcp.example.com/mcp";
+	cfg.validator = (string t) {
+		TokenInfo ti;
+		ti.valid = true;
+		ti.audience = ["https://mcp.example.com", "https://mcp.example.com/MCP"];
+		return ti;
+	};
+	TokenInfo info;
+	assert(authorize(cfg, "Bearer good", info) == AuthFailure.invalidToken);
 }
 
 unittest  // RFC 8707: an empty audience is rejected when a resource is configured

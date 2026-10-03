@@ -1143,6 +1143,11 @@ OAuthSession useOAuth(McpClient client, string mcpEndpoint, OAuthLogin opts) @sa
 	// protected-resource-metadata document); stay lenient on the 2025-03-26
 	// origin fallback.
 	const located = oauth.discoverIssuer(mcpEndpoint, opts.wwwAuthenticate);
+	// RFC 9728: the protected-resource metadata names the resource the server
+	// protects, which may be a parent of the endpoint (`prmResourceMatches`); that
+	// is the audience the server checks, so it is the resource indicator to send.
+	if (located.fromProtectedResourceMetadata && located.metadata.resource.length)
+		oauth.resource = canonicalResourceUri(located.metadata.resource);
 	auto as_ = oauth.discoverAuthServer(located.issuer, located.fromProtectedResourceMetadata);
 	opts.scopes = loginScopes(opts, located.metadata);
 
@@ -2462,6 +2467,8 @@ version (unittest)
 		string base;
 		int refreshCalls;
 		bool failRefresh;
+		/// The PRM `resource`; empty selects `base ~ "/mcp"`.
+		string prmResource;
 
 		void stop() @trusted
 		{
@@ -2485,8 +2492,8 @@ version (unittest)
 				scope HTTPServerResponse res) @safe {
 			const b = srv.base;
 			if (req.path.canFind("oauth-protected-resource"))
-				res.writeBody(`{"resource":"` ~ b ~ `/mcp","authorization_servers":["` ~ b ~ `"]}`,
-					"application/json");
+				res.writeBody(`{"resource":"` ~ (srv.prmResource.length ? srv.prmResource
+					: b ~ "/mcp") ~ `","authorization_servers":["` ~ b ~ `"]}`, "application/json");
 			else if (req.path.canFind("authorization-server"))
 				res.writeBody(`{"issuer":"` ~ b ~ `","authorization_endpoint":"` ~ b
 					~ `/authorize","token_endpoint":"` ~ b ~ `/token","registration_endpoint":"`
@@ -2521,6 +2528,30 @@ version (unittest)
 		srv.base = "http://127.0.0.1:" ~ srv.listener.bindAddresses[0].port.to!string;
 		return srv;
 	}
+}
+
+unittest  // useOAuth requests the resource the protected-resource metadata names
+{
+	import core.time : msecs;
+	import std.algorithm : canFind;
+	import std.exception : assertThrown;
+	import std.uri : encodeComponent;
+
+	auto srv = startIssuerTestAuthServer();
+	scope (exit)
+		srv.stop();
+	// The server protects its whole origin; the MCP endpoint is a path beneath it.
+	srv.prmResource = srv.base;
+	const endpoint = srv.base ~ "/mcp";
+
+	string authUrl;
+	OAuthLogin opts;
+	opts.store = new MemoryTokenStore();
+	opts.callbackTimeout = 50.msecs;
+	opts.openBrowser = (string url) @safe { authUrl = url; };
+
+	assertThrown(useOAuth(McpClient.http(endpoint), endpoint, opts));
+	assert((authUrl ~ "&").canFind("resource=" ~ encodeComponent(srv.base) ~ "&"), authUrl);
 }
 
 unittest  // useOAuth never sends a refresh token to an authorization server other than its issuer

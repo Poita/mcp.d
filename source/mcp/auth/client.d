@@ -85,7 +85,9 @@ final class OAuthClient
 	/// authorization server advertises support, so `authorizationUrl`,
 	/// `exchangeCode`, `refresh`, `clientCredentials`, `tokenExchange`, and
 	/// `jwtBearerGrant` reject an empty value.
-	/// `useOAuth` sets this to the canonical MCP server URI automatically.
+	/// `useOAuth` sets this automatically: to the canonical `resource` named by
+	/// the server's protected-resource metadata (which may be a parent of the
+	/// endpoint), else to the canonical MCP server URI.
 	string resource;
 	/// The client's redirect URI for the auth-code flow. The default names the
 	/// `127.0.0.1` literal (RFC 8252 §8.3), as `loopbackRedirectUri` does.
