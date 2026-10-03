@@ -135,6 +135,7 @@ private void registerOverload(string memberName, alias overload, alias parent)(M
 {
 	static if (hasHandlerUda!overload())
 	{
+		checkHandlerVisibility!(memberName, overload)();
 		checkHandlerSafety!(memberName, overload)();
 		checkMethodFacets!(memberName, overload)();
 		checkUdaPlacement!(memberName, overload)();
@@ -199,6 +200,18 @@ private bool hasHandlerUda(alias f)()
 		static if (!is(a) && isHandlerUda!(typeof(a)))
 			found = true;
 	return found;
+}
+
+/// Reject a handler that is not `public` (or `export`): the registered
+/// callbacks are generated in this module and call it from here, so a private,
+/// package, or protected one would otherwise fail with an access error inside
+/// the SDK rather than at the annotated method.
+private void checkHandlerVisibility(string memberName, alias f)()
+{
+	enum visibility = __traits(getVisibility, f);
+	static assert(visibility == "public" || visibility == "export",
+			"handler '" ~ memberName ~ "' is " ~ visibility
+			~ ", but the SDK calls it from outside its declaring " ~ "scope; make it public");
 }
 
 /// Reject a handler that is not `@safe` (or `@trusted`): the registered
@@ -5642,4 +5655,34 @@ unittest  // @fieldDescription on a resource-template parameter is rejected at c
 {
 	auto s = new McpServer("t", "1");
 	static assert(!__traits(compiles, registerHandlers(s, new TemplateDescriptionApi)));
+}
+
+version (unittest) private final class PrivateHandlerApi
+{
+	@tool("hidden", "A private handler")
+	private string hidden() @safe
+	{
+		return "";
+	}
+}
+
+version (unittest) private final class ProtectedHandlerApi
+{
+	@prompt("guarded", "A protected handler")
+	protected string guarded() @safe
+	{
+		return "";
+	}
+}
+
+unittest  // a private handler method is rejected at compile time
+{
+	auto s = new McpServer("t", "1");
+	static assert(!__traits(compiles, registerHandlers(s, new PrivateHandlerApi)));
+}
+
+unittest  // a protected handler method is rejected at compile time
+{
+	auto s = new McpServer("t", "1");
+	static assert(!__traits(compiles, registerHandlers(s, new ProtectedHandlerApi)));
 }
