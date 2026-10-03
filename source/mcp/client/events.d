@@ -8,6 +8,7 @@ module mcp.client.events;
 
 import std.base64 : Base64;
 import vibe.data.json : Json, parseJsonString;
+import mcp.protocol.jsonrpc : parseUntrustedJson;
 
 import standardwebhooks : Webhook;
 import mcp.protocol.events : EventOccurrence, isControlEnvelope, EventControl,
@@ -162,7 +163,7 @@ final class WebhookReceiver
 	{
 		Json j;
 		try
-			j = parseJsonString(body);
+			j = parseUntrustedJson(body);
 		catch (Exception)
 			return ReceiverResponse(400, "");
 
@@ -337,6 +338,27 @@ unittest  // a signed delivery whose body is not an event occurrence is rejected
 		auto headers = signDeliveryHeaders(signing, body);
 		assert(rx.processDelivery(body, headers).status == 400, body);
 	}
+	assert(!delivered);
+}
+
+unittest  // a signed delivery nested past the depth cap is rejected with 400
+{
+	import std.array : replicate;
+
+	auto rx = new WebhookReceiver();
+	rx.verifyTimestamp = false;
+	bool delivered;
+	rx.register("sub_1", testSecret, (EventOccurrence occ) @safe {
+		delivered = true;
+	});
+	const 
+	body = `{"eventId":"evt_1","name":"incident.created","timestamp":"t","data":{"x":`
+		~ "[".replicate(1000) ~ "]".replicate(1000) ~ `}}`;
+	DeliverySigning signing = {
+		secret: testSecret, messageId: "evt_1", timestamp: 1700, subscriptionId: "sub_1"
+	};
+	auto headers = signDeliveryHeaders(signing, body);
+	assert(rx.processDelivery(body, headers).status == 400);
 	assert(!delivered);
 }
 

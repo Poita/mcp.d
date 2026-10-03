@@ -1271,9 +1271,11 @@ struct CallToolResult
 	/// not the expected path. The value is untrusted, so a malformed payload throws.
 	T requestStateAs(T)() const @safe
 	{
+		import mcp.protocol.jsonrpc : parseUntrustedJson;
+
 		if (requestState.length == 0)
 			return T.init;
-		return deserializeJson!T(parseJsonString(requestState));
+		return deserializeJson!T(parseUntrustedJson(requestState));
 	}
 
 	/// Assert this is a success result. Returns normally when `!isError`; when
@@ -4334,6 +4336,17 @@ unittest  // CallToolResult.requestStateAs!T returns T.init when no requestState
 
 	CallToolResult r;
 	assert(r.requestStateAs!State.topic == "");
+}
+
+unittest  // CallToolResult.requestStateAs!T rejects a requestState nested past the depth cap
+{
+	import std.array : replicate;
+	import std.exception : assertThrown;
+	import vibe.data.json : JSONException;
+
+	CallToolResult r;
+	r.requestState = "[".replicate(1000) ~ "]".replicate(1000);
+	assertThrown!JSONException(r.requestStateAs!Json);
 }
 
 unittest  // Resource emits annotations (audience/priority/lastModified)
