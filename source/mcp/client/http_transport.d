@@ -565,6 +565,8 @@ final class HttpClientTransport : ClientTransport
 	/// `ended` with no `error`.
 	void close() @safe
 	{
+		import mcp.client.client : TransportClosedException;
+
 		closeRequested = true;
 		// Close every stream socket and interrupt its reader, so a reader parked on
 		// `conn.read` unblocks at once even where closing a socket does not wake a
@@ -576,7 +578,7 @@ final class HttpClientTransport : ClientTransport
 			legacyStreamSlot.abort();
 		// Abort every in-flight request, which closes the socket carrying its
 		// response and interrupts the task awaiting it.
-		auto closed = internalError("HTTP transport closed");
+		auto closed = new TransportClosedException("HTTP transport closed");
 		foreach (id, r; inflightPosts)
 			r.abort(closed);
 		foreach (slot; postSockets)
@@ -587,7 +589,7 @@ final class HttpClientTransport : ClientTransport
 		// immediately instead of waiting out the timeout on a closing transport.
 		foreach (id, w; legacyWaiters)
 			if (!w.got && w.err is null)
-				w.err = internalError("legacy HTTP+SSE transport closing");
+				w.err = closed;
 		// Wake both the per-request waiters and any pending endpoint-discovery wait.
 		notifyLegacy();
 		// The readers are stopped first, so none reconnects without the session id
@@ -2056,6 +2058,7 @@ final class HttpClientTransport : ClientTransport
 	private Json legacyRpc(Json message, long expectId) @safe
 	{
 		import vibe.core.task : InterruptException, Task;
+		import mcp.client.client : TransportClosedException;
 
 		auto waiter = new LegacyWaiter;
 		waiter.result = Json.undefined;
@@ -2100,7 +2103,7 @@ final class HttpClientTransport : ClientTransport
 			throw waiter.err;
 		if (waiter.got)
 			return waiter.result;
-		throw internalError("legacy HTTP+SSE transport closing");
+		throw new TransportClosedException("HTTP transport closed");
 	}
 
 	/// Read the legacy GET SSE stream over a raw TCP connection, dispatching
@@ -5742,4 +5745,55 @@ unittest  // the standalone GET stream keeps reconnecting through a 429
 	bool alive;
 	assert(serverStreamAttempts(429, BearerProvider.init, alive) > 1);
 	assert(alive);
+}
+
+unittest  // close() fails an in-flight request with TransportClosedException
+{
+	import core.time : msecs, MonoTime;
+	import vibe.core.core : runTask, sleep;
+	import mcp.client.client : TransportClosedException;
+
+	bool release;
+	auto r = new URLRouter;
+	r.post("/mcp", (HTTPServerRequest req, HTTPServerResponse res) @safe {
+		const until = MonoTime.currTime + 5.seconds;
+		while (!release && MonoTime.currTime < until)
+			sleep(20.msecs);
+		res.writeBody("");
+	});
+	McpException caught;
+	const failure = runAgainstFakeServer(r, (string url) @safe {
+		scope (exit)
+			release = true;
+		auto t = new HttpClientTransport(url);
+		bool done;
+		runTask(() nothrow{
+			try
+				t.deliver(makeRequest(Json(7), "tools/list", Json.emptyObject), 7);
+			catch (McpException e)
+				caught = e;
+			catch (Exception)
+			{
+			}
+			done = true;
+		});
+		sleep(200.msecs);
+		t.close();
+		const until = MonoTime.currTime + 3.seconds;
+		while (!done && MonoTime.currTime < until)
+			sleep(20.msecs);
+	});
+	assert(failure.length == 0, "scenario failed: " ~ failure);
+	assert(cast(TransportClosedException) caught !is null, caught is null ? "no error" : caught.msg);
+}
+
+unittest  // close() fails an outstanding legacy waiter with TransportClosedException
+{
+	import mcp.client.client : TransportClosedException;
+
+	auto t = new HttpClientTransport("http://host:8080/mcp");
+	auto pending = new LegacyWaiter;
+	t.legacyWaiters[1] = pending;
+	t.close();
+	assert(cast(TransportClosedException) pending.err !is null);
 }
