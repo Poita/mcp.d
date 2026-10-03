@@ -146,7 +146,7 @@ interface PushChannel
 	size_t broadcast(string method, Json params, string uri = "", bool plainEligible = true) @safe;
 
 	/// Like `notify`, but only to streams opened by `principal` (the authenticated
-	/// token subject; "" selects unauthenticated streams).
+	/// token subject). An empty `principal` reaches no stream.
 	size_t notifyPrincipal(string principal, string method, Json params) @safe;
 
 	/// Deliver a notification to a single stream of the session `sessionToken`,

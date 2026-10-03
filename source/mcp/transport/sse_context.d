@@ -976,11 +976,15 @@ final class ServerPushChannel : PushChannel
 	}
 
 	/// Broadcast a notification to only the streams opened by `principal` (the
-	/// authenticated token subject; "" selects unauthenticated streams), once per
-	/// delivery group. Used for notifications whose payload belongs to one
-	/// principal, such as `notifications/tasks` carrying a task's result.
+	/// authenticated token subject), once per delivery group. Used for
+	/// notifications whose payload belongs to one principal, such as
+	/// `notifications/tasks` carrying a task's result. An empty `principal`
+	/// reaches no stream: unauthenticated streams share no identity, so a
+	/// payload owned by one must not reach the others.
 	size_t notifyPrincipal(string principal, string method, Json params) @safe
 	{
+		if (principal.length == 0)
+			return 0;
 		return fanOut(makeNotification(method, params),
 				(ref const Listener l) @safe => l.principal == principal
 				&& listenerEligible(l, method, notificationUri(method, params), true));
@@ -2122,6 +2126,20 @@ unittest  // notifyPrincipal reaches only the streams authenticated as that prin
 	assert(alice.canFind("t1"));
 	assert(bob.length == 0, "another principal's stream must not see the task");
 	assert(anon.length == 0, "an unauthenticated stream must not see an owned task");
+}
+
+unittest  // notifyPrincipal with an empty principal reaches no stream
+{
+	auto ch = new ServerPushChannel(new StreamCoordinator);
+	string anon1, anon2;
+	ListenFilter f;
+	f.active = true;
+	ch.addListener((string fr) @safe { anon1 = fr; }, Json("l-1"), f);
+	ch.addListener((string fr) @safe { anon2 = fr; }, Json("l-2"), f);
+	assert(ch.notifyPrincipal("", "notifications/tasks", Json([
+				"taskId": Json("t1")
+	])) == 0);
+	assert(anon1.length == 0 && anon2.length == 0);
 }
 
 unittest  // MODE 3 requestOnSession: a reply on session B does NOT resolve session A's pending request
