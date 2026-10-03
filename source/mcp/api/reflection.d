@@ -19,7 +19,7 @@ import mcp.server.event_context : EventContext, EventResult, Event, EventBatch, 
 import mcp.server.events_runtime : EventRegistration, EventCheck;
 import mcp.api.attributes;
 import mcp.api.apps : UiToolMeta, setUiToolMeta;
-import mcp.api.skills : Skill, registerSkill;
+import mcp.api.skills : Skill, isValidSkillPath, registerSkill;
 import mcp.api.binding : bindJson, bindString, defaultAs, schemaNode, schemaOf,
 	SchemaUse, setBound, wireName;
 import mcp.protocol.schema;
@@ -128,9 +128,23 @@ private void registerAnnotatedMembers(alias root, alias parent)(McpServer server
 						else static if (is(typeof(attr) == resourceTemplate))
 							registerTemplateMethod!(memberName, overload, parent, attr)(server);
 						else static if (is(typeof(attr) == skill))
+						{
+							static assert(isValidSkillPath(attr.path),
+									"@skill on '" ~ memberName ~ "' has the invalid skill path \""
+									~ attr.path ~ "\"; its final segment must be lowercase alphanumeric "
+									~ "with single hyphens (1..64 chars), after optional "
+									~ "non-empty prefix segments");
 							registerSkillMethod!(memberName, overload, parent)(server, attr);
+						}
 						else static if (is(typeof(attr) == skillDir))
+						{
+							static assert(attr.path.length == 0 || isValidSkillPath(attr.path),
+									"@skillDir on '" ~ memberName ~ "' has the invalid skill path \""
+									~ attr.path ~ "\"; its final segment must be lowercase alphanumeric "
+									~ "with single hyphens (1..64 chars), after optional "
+									~ "non-empty prefix segments");
 							registerSkillDirMethod!(memberName, overload, parent)(server, attr);
+						}
 					}
 				}
 			}
@@ -5266,4 +5280,34 @@ unittest  // an explicit null for a defaulted Nullable prompt argument binds as 
 	pp["arguments"] = Json(["topic": Json(null)]);
 	auto r = s.handle(Message(makeRequest(Json(2), "prompts/get", pp))).get["result"];
 	assert(r["messages"][0]["content"]["text"] == Json("unset"), r.toString);
+}
+
+version (unittest) private final class InvalidSkillPathApi
+{
+	@skill("Not A Name", "An invalid skill path")
+	string instructions() @safe
+	{
+		return "# Body\n";
+	}
+}
+
+version (unittest) private final class InvalidSkillDirPathApi
+{
+	@skillDir("office//pdf-forms")
+	string dir() @safe
+	{
+		return "skills/pdf-forms";
+	}
+}
+
+unittest  // an invalid @skill path is rejected at compile time
+{
+	auto s = new McpServer("t", "1");
+	static assert(!__traits(compiles, registerHandlers(s, new InvalidSkillPathApi)));
+}
+
+unittest  // an invalid non-empty @skillDir path is rejected at compile time
+{
+	auto s = new McpServer("t", "1");
+	static assert(!__traits(compiles, registerHandlers(s, new InvalidSkillDirPathApi)));
 }
