@@ -271,9 +271,10 @@ private string htmlEscape(string s) @safe
 		.replace("\"", "&quot;");
 }
 
-/// A thread-safe in-memory store mapping a proxy `state` to the client's
+/// An in-memory store mapping a proxy `state` to the client's
 /// pending-authorization details. Entries are consumed (single use) on lookup so
-/// a relayed callback cannot be replayed.
+/// a relayed callback cannot be replayed. It does no locking: it is used from
+/// the fibers of the server's single event-loop thread, like `OAuthProxy`.
 ///
 /// The store is bounded so the unauthenticated `/authorize` route cannot grow
 /// process memory without limit: each entry carries an insertion timestamp, and
@@ -293,7 +294,6 @@ final class ProxyStateStore
 	/// oldest entries are evicted so a flood cannot exhaust memory inside the TTL.
 	enum size_t defaultMaxEntries = 10_000;
 
-	// `synchronized(this)` serializes access; the container itself does no locking.
 	private BoundedExpiringMap!ProxyAuthState entries;
 
 	this() @safe
@@ -311,34 +311,28 @@ final class ProxyStateStore
 	/// Record the client's authorization details under the proxy `state`.
 	void put(string proxyState, ProxyAuthState st) @safe
 	{
-		synchronized (this)
-			entries.put(proxyState, st);
+		entries.put(proxyState, st);
 	}
 
 	/// Consume and return the details for `proxyState`, setting `found`.
 	ProxyAuthState take(string proxyState, out bool found) @safe
 	{
-		synchronized (this)
-			return entries.take(proxyState, found);
+		return entries.take(proxyState, found);
 	}
 
 	/// Return the details for `proxyState` without consuming them, setting
 	/// `found`.
 	ProxyAuthState peek(string proxyState, out bool found) @safe
 	{
-		synchronized (this)
-		{
-			auto p = entries.get(proxyState, false);
-			found = p !is null;
-			return found ? *p : ProxyAuthState.init;
-		}
+		auto p = entries.get(proxyState, false);
+		found = p !is null;
+		return found ? *p : ProxyAuthState.init;
 	}
 
 	/// Number of live pending authorizations (test/diagnostic use).
 	size_t length() @safe
 	{
-		synchronized (this)
-			return entries.length;
+		return entries.length;
 	}
 }
 

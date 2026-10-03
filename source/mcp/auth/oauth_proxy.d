@@ -1180,6 +1180,11 @@ alias ClientIdMetadataFetcher = ClientIdMetadataDocument delegate(string clientI
 /// the issued token — should set `OAuthProxyConfig.issueToken` + `tokenStore` to
 /// switch to ISSUE-OWN-TOKEN (broker) mode, where the proxy mints its own opaque
 /// MCP token for the client and keeps the upstream token server-side.
+///
+/// The proxy and its default in-memory stores do no locking: like the rest of
+/// the server, they are used from the fibers of one vibe.d event-loop thread.
+/// Serving the router with `HTTPServerOption.distribute` or worker threads is
+/// unsupported.
 final class OAuthProxy
 {
 	private OAuthProxyConfig cfg;
@@ -1516,8 +1521,7 @@ final class OAuthProxy
 	/// code to the client, so a later `/token` can be checked by `redeemCode`.
 	void recordRelayedCode(string code, RelayedCodeBinding binding) @safe
 	{
-		synchronized (this)
-			relayedCodes.put(code, binding);
+		relayedCodes.put(code, binding);
 		// A DCR client that got this far has consented and signed in, so its
 		// registration is retained ahead of never-used ones.
 		if (binding.clientId.length == 0)
@@ -1531,8 +1535,7 @@ final class OAuthProxy
 	{
 		if (refreshToken.length == 0)
 			return;
-		synchronized (this)
-			relayedRefreshTokens.put(refreshTokenKey(refreshToken), true);
+		relayedRefreshTokens.put(refreshTokenKey(refreshToken), true);
 	}
 
 	/// Consume the record of a relayed `refreshToken`, returning whether this
@@ -1548,8 +1551,7 @@ final class OAuthProxy
 		if (refreshToken.length == 0)
 			return false;
 		bool found;
-		synchronized (this)
-			cast(void) relayedRefreshTokens.take(refreshTokenKey(refreshToken), found);
+		cast(void) relayedRefreshTokens.take(refreshTokenKey(refreshToken), found);
 		return found;
 	}
 
@@ -1579,8 +1581,7 @@ final class OAuthProxy
 			return false;
 		bool found;
 		RelayedCodeBinding binding;
-		synchronized (this)
-			binding = relayedCodes.take(code, found);
+		binding = relayedCodes.take(code, found);
 		if (!found || binding.codeChallenge.length == 0)
 			return false;
 		const expectedClientId = binding.clientId.length ? binding.clientId : cfg.upstreamClientId;
