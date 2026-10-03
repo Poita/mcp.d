@@ -3905,11 +3905,11 @@ final class McpServer : ServerCore
 ///   - `{#var}`: an optional `#`-prefixed fragment, which may contain `/`.
 ///   - `{/var}` / `{.var}`: optional `/`- or `.`-prefixed segments, one per
 ///     variable, none containing `/`.
-/// Outside a fragment, a value with a `.` or `..` path segment (raw or
-/// percent-encoded, delimited by `/` or `\`) does not match, so a captured value never walks out of the
-/// path the template names.
 ///   - `{;var}` / `{?var}` / `{&var}`: optional `name=value` pairs, only for the
 ///     variables the expression names, in any order.
+/// Outside a fragment, a value with a `.` or `..` path segment (raw or
+/// percent-encoded, delimited by `/` or `\`) does not match, so a captured
+/// value never walks out of the path the template names.
 /// Values are percent-decoded per RFC 3986; a malformed escape does not match.
 /// Comma-separated variable lists are supported. A prefix modifier (`:n`) caps
 /// its variable's decoded value at `n` code points. An explode modifier (`*`) on
@@ -4135,6 +4135,8 @@ private bool bindUriExpression(string expr, string s, ref string[string] params)
 			string v;
 			if (!decodeUriValue(eq < 0 ? "" : pair[eq + 1 .. $], true, v))
 				return false;
+			if (hasDotSegment(v))
+				return false;
 			if (!withinPrefix(idx, v))
 				return false;
 			params[name] = v;
@@ -4262,6 +4264,30 @@ unittest  // a reserved expression rejects a dot segment delimited by a backslas
 	assert(!matchUriTemplate("res://x/{+path}", "res://x/a/..\\..\\etc", params));
 	assert(!matchUriTemplate("res://x/{+path}", "res://x/a/..%5C..%5Cetc", params));
 	assert(!matchUriTemplate("res://x{/seg}", "res://x/..%5Cetc", params));
+}
+
+unittest  // a query expression rejects a dot-segment value, raw or percent-encoded
+{
+	string[string] params;
+	assert(!matchUriTemplate("file:///docs{?path}", "file:///docs?path=../../etc/passwd", params));
+	assert(!matchUriTemplate("file:///docs{?path}",
+			"file:///docs?path=%2e%2e%2f%2e%2e%2fetc", params));
+	assert(matchUriTemplate("file:///docs{?path}", "file:///docs?path=a/b.c", params));
+	assert(params["path"] == "a/b.c");
+}
+
+unittest  // a query-continuation expression rejects a dot-segment value
+{
+	string[string] params;
+	assert(!matchUriTemplate("res://x?a=1{&path}", "res://x?a=1&path=a/../../etc", params));
+	assert(!matchUriTemplate("res://x?a=1{&path}", "res://x?a=1&path=..%5Cetc", params));
+}
+
+unittest  // a path-parameter expression rejects a dot-segment value
+{
+	string[string] params;
+	assert(!matchUriTemplate("res://x{;path}", "res://x;path=..", params));
+	assert(!matchUriTemplate("res://x{;path}", "res://x;path=%2E%2E/etc", params));
 }
 
 unittest  // a reserved expression spans a later occurrence of its trailing literal
