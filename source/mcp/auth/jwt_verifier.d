@@ -100,6 +100,13 @@ struct JwtVerifierConfig
 	/// How long a fetched JWKS document is cached before being refetched.
 	Duration jwksCacheTtl = 300.seconds;
 
+	/// How long cached JWKS keys keep verifying tokens after the last
+	/// successful fetch while refetches fail. Past it the keys are dropped and
+	/// every token is rejected until the endpoint answers again, so a key the
+	/// IdP has revoked is not trusted indefinitely during an outage. Must be
+	/// at least `jwksCacheTtl`.
+	Duration jwksMaxStaleness = 3600.seconds;
+
 	/// The SSRF policy applied to the `jwksUri` fetch. The default requires
 	/// `https` to a public host (plain `http` only to loopback); an IdP on a
 	/// private network (e.g. `keycloak.internal` resolving to `10.x`) needs
@@ -130,7 +137,10 @@ TokenValidator jwtVerifier(JwtVerifierConfig cfg) @safe
 	enforce(cfg.issuer.length || cfg.allowAnyIssuer,
 			"jwtVerifier: set JwtVerifierConfig.issuer (or allowAnyIssuer to skip the iss check)");
 	enforce(cfg.jwksUri.length || cfg.staticPublicKeysPem.length, "jwtVerifier: set JwtVerifierConfig.jwksUri or staticPublicKeysPem; with neither, no token can verify");
+	enforce(cfg.jwksMaxStaleness >= cfg.jwksCacheTtl,
+			"jwtVerifier: JwtVerifierConfig.jwksMaxStaleness must be at least jwksCacheTtl");
 	auto cache = new JwksCache(cfg.jwksUri, cfg.jwksCacheTtl, cfg.ssrfPolicy);
+	cache.maxStaleness = cfg.jwksMaxStaleness;
 	return (string token) @safe {
 		return verifyOrInvalid(() @safe => verifyToken(cfg, token, cache, currentUnixTime()));
 	};
@@ -675,6 +685,15 @@ package final class JwksCache : KeySource
 	/// is remembered before the next attempt.
 	enum Duration minRefetchInterval = 10.seconds;
 
+	/// The default for `maxStaleness`.
+	enum Duration defaultMaxStaleness = 3600.seconds;
+
+	/// How long after the last successful fetch the cached keys stay usable
+	/// while refetches keep failing. Past it the keys are dropped, so a key the
+	/// IdP has revoked stops verifying tokens even if the JWKS endpoint stays
+	/// unreachable.
+	package Duration maxStaleness = defaultMaxStaleness;
+
 	private string uri;
 	private Duration ttl;
 	private SsrfPolicy policy;
@@ -715,6 +734,16 @@ package final class JwksCache : KeySource
 		const unknownKid = kid.length && (kid in pemByKid) is null;
 		if (stale || unknownKid)
 			refetch();
+		if (loaded && now() - fetchedAt >= cast(long) maxStaleness.total!"seconds")
+		{
+			import vibe.core.log : logWarn;
+
+			logWarn("JWKS from %s has not been refreshed within %s; dropping the cached keys",
+					uri, maxStaleness);
+			pemByKid = null;
+			allPems = null;
+			loaded = false;
+		}
 		return kidKeys(kid);
 	}
 
@@ -2031,6 +2060,36 @@ unittest  // a refetched JWKS that is not valid JSON keeps the cached keys and d
 	s.clock += 300;
 	assert(s.cache.keysFor("rsa-1").length == 1);
 	assert(s.fetches == 2);
+}
+
+unittest  // cached JWKS keys are dropped once refetches have failed for longer than the max staleness
+{
+	auto s = new ScriptedJwks(rsaOnlyJwks);
+	assert(s.cache.keysFor("rsa-1").length == 1);
+
+	// The IdP becomes unreachable: the stale keys keep serving for a while.
+	s.served = null;
+	s.clock += 300;
+	assert(s.cache.keysFor("rsa-1").length == 1);
+
+	s.clock += JwksCache.defaultMaxStaleness.total!"seconds";
+	assert(s.cache.keysFor("rsa-1").length == 0);
+
+	// Once the IdP recovers, the next attempt reloads the keys.
+	s.served = rsaOnlyJwks;
+	s.clock += JwksCache.minRefetchInterval.total!"seconds";
+	assert(s.cache.keysFor("rsa-1").length == 1);
+}
+
+unittest  // jwtVerifier refuses a JWKS max staleness shorter than the cache TTL
+{
+	import std.exception : assertThrown;
+
+	JwtVerifierConfig cfg;
+	cfg.issuer = "https://as.example.com";
+	cfg.jwksUri = "https://as.example.com/jwks";
+	cfg.jwksMaxStaleness = cfg.jwksCacheTtl - 1.seconds;
+	assertThrown(jwtVerifier(cfg));
 }
 
 unittest  // JwksCache single-flights concurrent fetches
