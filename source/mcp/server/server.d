@@ -745,8 +745,9 @@ final class McpServer : ServerCore
 	/// the currently authenticated subject, defending against replay/hijack).
 	///
 	/// Verification is fail-closed: a tampered, expired, wrong-subject, or
-	/// otherwise invalid blob is treated as if the client echoed NO state, so the
-	/// handler runs a fresh round and re-prompts (a warning is logged). The
+	/// otherwise invalid blob is treated as if the client echoed NO state and no
+	/// `inputResponses`, so the handler runs a fresh round and re-prompts (a
+	/// warning is logged). The
 	/// request is never errored and no rejection flag is exposed to the handler.
 	///
 	/// Provide a stable secret of at least 32 bytes via `sec.key`. When `sec.key`
@@ -2414,15 +2415,18 @@ final class McpServer : ServerCore
 		// requestState here, before the handler sees it. The identity it must be
 		// bound to is the request's authenticated subject (empty on stdio /
 		// in-process) and the tool/prompt name. On any verification failure the
-		// handler observes NO requestState (empty) and re-elicits; see
-		// `verifyIncomingRequestState`. When no codec is configured the raw value
-		// passes through unchanged. A request on a protocol without MRTR carries
-		// no retry state, so whatever the client put in those params is ignored.
+		// request runs as a fresh round: the handler observes neither the state
+		// nor the input responses answering the rejected round, and re-elicits;
+		// see `verifyIncomingRequestState`. When no codec is configured the raw
+		// value passes through unchanged. A request on a protocol without MRTR
+		// carries no retry state, so whatever the client put in those params is
+		// ignored.
 		const mrtr = effective.usesMRTR;
-		const incomingState = mrtr ? verifyIncomingRequestState(requestStateCodec_,
-				readRequestState(msg.params), msg.method, msg.params, ctx) : "";
+		const verifiedState = mrtr ? verifyIncomingRequestState(requestStateCodec_,
+				readRequestState(msg.params), msg.method, msg.params, ctx) : nullable("");
+		const incomingState = verifiedState.isNull ? "" : verifiedState.get;
 		Json[string] inputResponses;
-		if (mrtr)
+		if (mrtr && !verifiedState.isNull)
 			inputResponses = readInputResponses(msg.params);
 
 		// Install the per-request scope so handlers see the right statelessness
@@ -10816,6 +10820,38 @@ unittest  // secureRequestState: a tampered echoed blob re-elicits instead of re
 	assert("error" !in retry);
 	assert("inputRequests" in retry["result"]);
 	assert("date" in retry["result"]["inputRequests"]);
+}
+
+unittest  // secureRequestState: a rejected echoed blob also drops the round's inputResponses
+{
+	auto s = new McpServer("t", "1");
+	RequestStateSecurity sec;
+	sec.key = new ubyte[32];
+	sec.bindTo = RequestStateBinding.none;
+	s.secureRequestState(sec);
+	size_t seenResponses = size_t.max;
+	Tool probe = {name: "probe"};
+	s.registerTool(probe, (Json args, RequestContext ctx) @safe {
+		seenResponses = ctx.inputResponses().length;
+		CallToolResult r;
+		return ToolResponse.complete(r);
+	});
+
+	auto answer = InputResponse("date", Json([
+			"content": Json(["day": Json("friday")])
+	]));
+	Json meta = Json.emptyObject;
+	meta[MetaKey.protocolVersion] = "2026-07-28";
+	meta[MetaKey.clientInfo] = Json(["name": Json("c"), "version": Json("1")]);
+	meta[MetaKey.clientCapabilities] = Json.emptyObject;
+	Json params = Json.emptyObject;
+	params["name"] = "probe";
+	params["arguments"] = Json.emptyObject;
+	params["requestState"] = "v1.forged.blob";
+	params["inputResponses"] = inputResponsesToJson([answer]);
+	params["_meta"] = meta;
+	s.handle(Message(makeRequest(Json(25), "tools/call", params)));
+	assert(seenResponses == 0, "a fresh round must not see the rejected round's answers");
 }
 
 unittest  // no codec configured: outgoing requestState stays plaintext (wire unchanged)

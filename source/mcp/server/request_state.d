@@ -303,24 +303,21 @@ package string requestStateTarget(string method, Json params) @safe
 /// the codec enabled, a non-empty blob is decoded and verified against the
 /// request's authenticated subject and tool name; on success the inner state
 /// is returned, and on ANY failure (tamper / GCM auth fail / expiry /
-/// wrong-subject / unparseable) it fails closed to an empty string so the
-/// handler re-elicits, with a warning logged. The transparent re-elicit means
-/// no rejection is surfaced to the handler.
-package string verifyIncomingRequestState(RequestStateCodec codec, string raw,
-		string method, Json params, RequestContext ctx) @safe
+/// wrong-subject / unparseable) it fails closed to null, with a warning
+/// logged. The caller then runs the request as a fresh round, so no rejection
+/// is surfaced to the handler.
+package Nullable!string verifyIncomingRequestState(RequestStateCodec codec,
+		string raw, string method, Json params, RequestContext ctx) @safe
 {
 	import vibe.core.log : logWarn;
 
 	if (codec is null || raw.length == 0)
-		return raw;
+		return nullable(raw);
 	auto decoded = codec.decode(raw, requestStateSubject(ctx), requestStateTarget(method, params));
 	if (decoded.isNull)
-	{
 		logWarn("secureRequestState: rejected an echoed requestState on %s "
 				~ "(tamper, expiry, wrong-subject, or malformed); re-eliciting.", method);
-		return "";
-	}
-	return decoded.get;
+	return decoded;
 }
 
 /// Wrap an outgoing MRTR `requestState` on an input-required result. With no
@@ -705,6 +702,6 @@ unittest  // authSubjectAndTool rejects a requestState minted for another method
 	Json result = Json(["requestState": Json(`{"step":1}`)]);
 	const wire = secureOutgoingRequestState(codec, result, "prompts/get", params, ctx)["requestState"]
 		.get!string;
-	assert(verifyIncomingRequestState(codec, wire, "tools/call", params, ctx) == "");
-	assert(verifyIncomingRequestState(codec, wire, "prompts/get", params, ctx) == `{"step":1}`);
+	assert(verifyIncomingRequestState(codec, wire, "tools/call", params, ctx).isNull);
+	assert(verifyIncomingRequestState(codec, wire, "prompts/get", params, ctx).get == `{"step":1}`);
 }
