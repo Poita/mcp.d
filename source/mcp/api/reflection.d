@@ -766,7 +766,11 @@ private void applyResourceMetadata(alias overload, D)(ref D descriptor) @safe
 		static if (is(typeof(a) == audience))
 			descriptor.annotations.audience = a.roles;
 		else static if (is(typeof(a) == priority))
+		{
+			static assert(a.value >= 0.0 && a.value <= 1.0,
+					"@priority value must be in [0.0, 1.0], got " ~ a.value.stringof);
 			descriptor.annotations.priority = a.value;
+		}
 		else static if (is(typeof(a) == lastModified))
 			descriptor.annotations.lastModified = a.value;
 	}
@@ -5173,4 +5177,28 @@ unittest  // a tool, prompt, or resource returning a non-immutable or wide strin
 	rp["uri"] = "test://chars";
 	auto rr = s.handle(Message(makeRequest(Json(3), "resources/read", rp))).get["result"];
 	assert(rr["contents"][0]["text"] == Json("resource text"), rr.toString);
+}
+
+/// A `priority` built without its constructor's range check, standing in for
+/// one constructed where that check is compiled out.
+version (unittest) private priority uncheckedPriority(double v) @safe
+{
+	priority p;
+	p.value = v;
+	return p;
+}
+
+version (unittest) private final class OutOfRangePriorityApi
+{
+	@resource("test://p", "p") @uncheckedPriority(5.0)
+	string r() @safe
+	{
+		return "";
+	}
+}
+
+unittest  // an out-of-range @priority is rejected at registration even without contracts
+{
+	auto s = new McpServer("t", "1");
+	static assert(!__traits(compiles, registerHandlers(s, new OutOfRangePriorityApi)));
 }

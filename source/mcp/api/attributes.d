@@ -308,14 +308,17 @@ struct audience
 
 /// Positional value UDA declaring the importance `priority` (0.0..1.0) for a
 /// `@resource`- or `@resourceTemplate`-annotated method (the MCP
-/// `Annotations.priority` field). Absence leaves the priority unset.
+/// `Annotations.priority` field). Absence leaves the priority unset. A value
+/// outside that range is a compile-time error: the check runs whether or not
+/// contracts are compiled in.
 struct priority
 {
 	double value; /// importance 0.0 (least) .. 1.0 (most)
 
 	this(double value) @safe pure nothrow
-	in (value >= 0.0 && value <= 1.0, "@priority value must be in [0.0, 1.0]")
 	{
+		if (!(value >= 0.0 && value <= 1.0))
+			assert(0, "@priority value must be in [0.0, 1.0]");
 		this.value = value;
 	}
 }
@@ -493,7 +496,7 @@ unittest  // @priority accepts the boundary values 0.0 and 1.0
 	assert(priority(1.0).value == 1.0);
 }
 
-unittest  // @priority rejects out-of-range values via its contract
+unittest  // @priority rejects out-of-range values
 {
 	import core.exception : AssertError;
 
