@@ -7,6 +7,8 @@ import deimos.openssl.pem;
 import deimos.openssl.evp;
 import deimos.openssl.ecdsa;
 import deimos.openssl.bn;
+import deimos.openssl.ec;
+import deimos.openssl.obj_mac;
 
 // deimos/openssl gates EVP_DigestSign on OPENSSL_VERSION_AT_LEAST(1,1,1), which
 // requires the auto-detect binding. On Windows the posix-only preGenerateCommands
@@ -61,9 +63,11 @@ ubyte[] signRs256(string privateKeyPem, const(ubyte)[] data) @trusted
 }
 
 /// Detect the JWS algorithm to use for the given PKCS#8 private key PEM.
-/// Returns "RS256" for RSA keys and "ES256" for EC keys. Throws for unsupported
-/// key types. This drives the algorithm selection in makeClientAssertion so that
-/// callers do not have to specify the algorithm separately.
+/// Returns "RS256" for RSA keys and "ES256" for EC P-256 keys. Throws for
+/// unsupported key types and for EC keys on any other curve, since ES256 is
+/// defined only over P-256 (RFC 7518 §3.4). This drives the algorithm selection
+/// in makeClientAssertion so that callers do not have to specify the algorithm
+/// separately.
 private string detectKeyAlg(string privateKeyPem) @trusted
 {
 	auto bio = BIO_new_mem_buf(cast(void*) privateKeyPem.ptr, cast(int) privateKeyPem.length);
@@ -82,7 +86,18 @@ private string detectKeyAlg(string privateKeyPem) @trusted
 	if (baseId == EVP_PKEY_RSA)
 		return "RS256";
 	if (baseId == EVP_PKEY_EC)
+	{
+		auto ec = EVP_PKEY_get1_EC_KEY(pkey);
+		if (ec is null)
+			throw new Exception("openssl: failed to read EC private key");
+		scope (exit)
+			EC_KEY_free(ec);
+		auto group = EC_KEY_get0_group(ec);
+		if (group is null || EC_GROUP_get_curve_name(group) != NID_X9_62_prime256v1)
+			throw new Exception(
+					"makeClientAssertion: unsupported curve; EC keys must be on P-256 (ES256)");
 		return "ES256";
+	}
 	throw new Exception(
 			"makeClientAssertion: unsupported key type; only RSA and EC keys are supported");
 }
@@ -578,4 +593,22 @@ unittest  // makeClientAssertion emits RS256 when given an RSA private key
 	// RSA-2048 signature is 256 bytes.
 	auto sig = Base64URLNoPadding.decode(parts[2]);
 	assert(sig.length == 256, "RS256 signature must be 256 bytes for RSA-2048");
+}
+
+// A throwaway EC P-384 PKCS#8 private key, a curve ES256 does not permit.
+version (unittest) private enum testEcP384Pem = "-----BEGIN PRIVATE KEY-----\n"
+	~ "MIG2AgEAMBAGByqGSM49AgEGBSuBBAAiBIGeMIGbAgEBBDCxzjiPD+SeE/9yrhty\n"
+	~ "P0ziLjVvPcDrwPU5GpZwrLyTIvfRY/Fhs+OD3SdmBTD8r52hZANiAAQnbKnjd/3U\n"
+	~ "CfxAJY7GFYKOxWKmtzecL1FO5/ZhGRTj77sT495rhl4ZAUzUWHoLNUP3elguADjk\n"
+	~ "tzh53CdJ+j1rzOgvXv4cN4AZgcuJtLRdpu8H8CLKadnPx/PJXgCUTls=\n" ~ "-----END PRIVATE KEY-----\n";
+
+unittest  // makeClientAssertion rejects an EC key on a curve other than P-256 with a clear error
+{
+	import std.algorithm : canFind;
+	import std.exception : collectException;
+
+	auto e = collectException(makeClientAssertion("client-p384",
+			"https://as.example.com/token", testEcP384Pem, 1_700_000_000));
+	assert(e !is null, "a P-384 key must be rejected");
+	assert(e.msg.canFind("unsupported curve"), e.msg);
 }
