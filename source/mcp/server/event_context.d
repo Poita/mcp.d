@@ -87,8 +87,8 @@ struct EventBatch(P)
 {
 	Event!P[] events;
 	Nullable!string cursor;
-	bool hasMore;
 	bool truncated;
+	bool hasMore;
 
 	/// A batch with a fresh cursor (the common replayable case). The flags
 	/// follow the same order as `EventResult.of`.
@@ -247,6 +247,14 @@ unittest  // EventBatch.of takes truncated before hasMore, the same order as Eve
 	auto b = EventBatch!int.of([], "c1", true, false);
 	assert(b.truncated && !b.hasMore);
 	auto r = EventResult.of([], "c1", true, false);
+	assert(r.truncated == b.truncated && r.hasMore == b.hasMore);
+}
+
+unittest  // EventBatch and EventResult declare their flags in the same order
+{
+	auto b = EventBatch!int(null, nullable("c1"), true, false);
+	auto r = EventResult(null, nullable("c1"), true, false);
+	assert(b.truncated && !b.hasMore);
 	assert(r.truncated == b.truncated && r.hasMore == b.hasMore);
 }
 
