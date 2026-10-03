@@ -66,6 +66,11 @@ final class StdioClientTransport : ClientTransport
 		private ProcessPipes* pipes;
 	else version (Windows)
 		private WinChild* winChild;
+	// The owned child's exit status, once it is known to have exited on its own.
+	private Nullable!int childExitStatus_;
+	// How long end-of-input waits for the owned child to exit, so a request it
+	// leaves unanswered can report the child's exit status.
+	private enum Duration exitStatusGrace = 500.msecs;
 
 	/// Construct over a newline-delimited JSON-RPC channel. `readLine` returns the
 	/// next line from the server (without its terminator) or `null` at
@@ -284,7 +289,68 @@ final class StdioClientTransport : ClientTransport
 		}
 		if (!closed || cast(TransportClosedException) e || e.code != ErrorCode.internalError)
 			return e;
+		if (!childExitStatus_.isNull)
+			return new TransportClosedException(
+					e.msg ~ " (the server process exited with status " ~ statusText(
+					childExitStatus_.get) ~ ")");
 		return new TransportClosedException(e.msg);
+	}
+
+	private static string statusText(int status) @safe nothrow
+	{
+		import std.conv : to;
+
+		try
+			return status.to!string;
+		catch (Exception)
+			return "?";
+	}
+
+	/// The owned child closed its stdout: wait briefly for it to exit and record
+	/// its exit status, before the read loop fails the requests it left
+	/// unanswered. A child still running after the grace is left to `close()`.
+	private void noteChildEndOfInput() @safe nothrow
+	{
+		version (Posix)
+		{
+			if (pipes is null)
+				return;
+			try
+				childExitStatus_ = () @trusted {
+				return pipes.process.wait(exitStatusGrace);
+			}();
+			catch (Exception)
+			{
+			}
+		}
+		else version (Windows)
+		{
+			import std.process : tryWait;
+			import vibe.core.core : sleep;
+
+			if (winChild is null)
+				return;
+			try
+			{
+				Duration waited;
+				for (;;)
+				{
+					auto t = () @trusted { return tryWait(winChild.pid); }();
+					if (t.terminated)
+					{
+						childExitStatus_ = t.status;
+						return;
+					}
+					if (waited >= exitStatusGrace)
+						return;
+					sleep(10.msecs);
+					waited += 10.msecs;
+				}
+			}
+			catch (Exception)
+			{
+			}
+		}
 	}
 
 	void abort(long expectId, McpException reason) @safe
@@ -496,6 +562,7 @@ version (Posix) StdioClientTransport spawnStdioTransport(string[] args,
 	// for the shutdown sequence).
 	auto pipes = () @trusted { return new ProcessPipes; }();
 	() @trusted { *pipes = pipeProcess(args, Redirect.stdin | Redirect.stdout); }();
+	StdioClientTransport transport;
 
 	// Async, cooperative line read over the child's stdout: accumulate bytes until
 	// '\n' (stripping a trailing '\r'). (The byte source is already buffered by
@@ -512,7 +579,10 @@ version (Posix) StdioClientTransport spawnStdioTransport(string[] args,
 		for (;;)
 		{
 			if (()@trusted { return pipes.stdout.empty; }())
+			{
+				transport.noteChildEndOfInput();
 				return null;
+			}
 			() @trusted { pipes.stdout.read(one[], IOMode.once); }();
 			if (one[0] == '\n')
 				break;
@@ -531,7 +601,7 @@ version (Posix) StdioClientTransport spawnStdioTransport(string[] args,
 		() @trusted { pipes.stdin.write(bytes); pipes.stdin.flush(); }();
 	}
 
-	auto transport = new StdioClientTransport(&readLine, &writeLine);
+	transport = new StdioClientTransport(&readLine, &writeLine);
 	transport.attachProcess(pipes);
 	return transport;
 }
@@ -710,6 +780,7 @@ version (Windows) StdioClientTransport spawnStdioTransport(string[] args,
 	}();
 
 	child.writer = new ChildStdinWriter(writeHandle);
+	StdioClientTransport transport;
 
 	// Daemon reader: blocking ReadFile on the duplicated stdout handle, lines pushed
 	// to `lines`.
@@ -727,7 +798,9 @@ version (Windows) StdioClientTransport spawnStdioTransport(string[] args,
 	{
 		string line;
 		const got = () @trusted { return lines.tryConsumeOne(line); }();
-		return got ? line : null; // channel closed (EOF / over-long) -> end the loop
+		if (!got) // channel closed (EOF / over-long) -> end the loop
+			transport.noteChildEndOfInput();
+		return got ? line : null;
 	}
 
 	void writeLine(string s) @safe
@@ -735,7 +808,7 @@ version (Windows) StdioClientTransport spawnStdioTransport(string[] args,
 		child.writer.write(cast(const(ubyte)[])(s ~ "\n"));
 	}
 
-	auto transport = new StdioClientTransport(&readLine, &writeLine);
+	transport = new StdioClientTransport(&readLine, &writeLine);
 	transport.attachWinChild(child);
 	return transport;
 }
@@ -1154,6 +1227,26 @@ version (Posix) unittest  // close() is idempotent: a second call does not re-ru
 		transport.close();
 		assert(transport.closeProcessRuns() == 1, "second close() must be a no-op");
 	});
+}
+
+version (Posix) unittest  // a request to a server that exits on its own fails with its exit status
+{
+	import core.time : Duration;
+	import std.algorithm.searching : canFind;
+	import mcp.client.client : ClientSettings, TransportClosedException;
+
+	string msg;
+	inLoop(() @safe {
+		ClientSettings settings;
+		settings.requestTimeout = Duration.zero;
+		auto client = McpClient.spawn(["sh", "-c", "read line; exit 3"], settings);
+		try
+			client.ping();
+		catch (TransportClosedException e)
+			msg = e.msg;
+		client.close();
+	});
+	assert(msg.canFind("exited with status 3"), "the exit status must be reported, got: " ~ msg);
 }
 
 version (Posix) unittest  // partial fragment at EOF closes the channel cleanly, not via a spurious error write
