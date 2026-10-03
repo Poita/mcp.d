@@ -612,7 +612,9 @@ interface DeliveryQueue
 	/// Whether any job for `subscriptionId` is still queued (leased or not),
 	/// whichever node enqueued it. A node consults this before advancing a
 	/// subscription's watermark on a quiet poll, so it never moves past a
-	/// delivery another node still has in flight.
+	/// delivery another node still has in flight. It runs on every quiet fetch,
+	/// so an implementation should answer it from an index on the subscription
+	/// rather than by scanning the queue.
 	bool hasPendingFor(string subscriptionId) @safe;
 }
 
@@ -627,6 +629,7 @@ final class InMemoryDeliveryQueue : DeliveryQueue
 		Json job;
 		long leasedUntilMs;
 		ulong seq; /// enqueue order, so a lease hands jobs out first-in first-out
+		string subscriptionId;
 	}
 
 	private struct Slot
@@ -641,14 +644,17 @@ final class InMemoryDeliveryQueue : DeliveryQueue
 	// seq) is dead and skipped; dead slots are compacted away once they
 	// outnumber the live ones, so a lease walks jobs in order without sorting.
 	private Slot[] order_;
+	// Queued jobs per subscription, so `hasPendingFor` needs no scan.
+	private size_t[string] pendingBySub_;
 
 	bool enqueue(Delivery job) @safe
 	{
 		if ((job.jobId in entries_) !is null)
 			return false;
 		const seq = nextSeq_++;
-		entries_[job.jobId] = Entry(job.toJson().clone(), 0, seq);
+		entries_[job.jobId] = Entry(job.toJson().clone(), 0, seq, job.subscriptionId);
 		order_ ~= Slot(job.jobId, seq);
+		pendingBySub_[job.subscriptionId]++;
 		return true;
 	}
 
@@ -661,7 +667,7 @@ final class InMemoryDeliveryQueue : DeliveryQueue
 			auto e = slot.jobId in entries_;
 			if (e is null || e.seq != slot.seq)
 				continue;
-			const subId = e.job.getOr("subscriptionId", "");
+			const subId = e.subscriptionId;
 			if (e.leasedUntilMs > nowMs)
 			{
 				heldBack[subId] = true;
@@ -707,7 +713,14 @@ final class InMemoryDeliveryQueue : DeliveryQueue
 
 	void ack(string jobId) @safe
 	{
+		auto e = jobId in entries_;
+		if (e is null)
+			return;
+		const subId = e.subscriptionId;
 		entries_.remove(jobId);
+		if (auto n = subId in pendingBySub_)
+			if (--*n == 0)
+				pendingBySub_.remove(subId);
 		compact();
 	}
 
@@ -718,10 +731,7 @@ final class InMemoryDeliveryQueue : DeliveryQueue
 
 	bool hasPendingFor(string subscriptionId) @safe
 	{
-		foreach (ref e; entries_.byValue)
-			if (e.job.getOr("subscriptionId", "") == subscriptionId)
-				return true;
-		return false;
+		return (subscriptionId in pendingBySub_) !is null;
 	}
 }
 
@@ -734,6 +744,20 @@ unittest  // the in-memory delivery queue reports whether a subscription has job
 	q.lease(0, 1000, 0);
 	assert(q.hasPendingFor("s1")); // a leased job is still pending
 	q.ack("s1/e1");
+	assert(!q.hasPendingFor("s1"));
+}
+
+unittest  // the in-memory delivery queue keeps a subscription pending until its last job is acked
+{
+	auto q = new InMemoryDeliveryQueue();
+	q.enqueue(Delivery("s1/e1", "s1", EventOccurrence("e1", "n", "t"), 0));
+	q.enqueue(Delivery("s1/e2", "s1", EventOccurrence("e2", "n", "t"), 0));
+	assert(!q.enqueue(Delivery("s1/e2", "s1", EventOccurrence("e2", "n", "t"), 0)));
+	q.ack("s1/e1");
+	assert(q.hasPendingFor("s1"));
+	q.ack("s1/e1"); // acking twice does not drop another job's count
+	assert(q.hasPendingFor("s1"));
+	q.ack("s1/e2");
 	assert(!q.hasPendingFor("s1"));
 }
 
