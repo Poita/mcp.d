@@ -167,15 +167,15 @@ private void validateEnvelope(Json j) @safe
 	}
 	// JSON-RPC 2.0 §5.1: a response's `error` is an object with an integer `code`
 	// and a string `message`. Readers of an error response index those members
-	// directly, so any other shape is rejected here.
+	// directly and read `code` as an `int`, so any other shape is rejected here.
 	if (("method" !in j) && ("error" in j))
 	{
 		const err = j["error"];
 		if (err.type != Json.Type.object)
 			throw invalidRequest("Response `error` must be an object");
-		if ("code" !in err || (err["code"].type != Json.Type.int_
-				&& err["code"].type != Json.Type.bigInt))
-			throw invalidRequest("Response `error.code` must be an integer");
+		if ("code" !in err || err["code"].type != Json.Type.int_
+				|| err["code"].get!long < int.min || err["code"].get!long > int.max)
+			throw invalidRequest("Response `error.code` must be a 32-bit integer");
 		if ("message" !in err || err["message"].type != Json.Type.string)
 			throw invalidRequest("Response `error.message` must be a string");
 	}
@@ -682,6 +682,20 @@ unittest  // a response carrying both result and error is rejected
 
 	assertThrown!McpException(parseMessage(
 			`{"jsonrpc":"2.0","id":1,"result":{},"error":{"code":-1,"message":"x"}}`));
+}
+
+unittest  // an error response whose code is outside the int range is rejected
+{
+	import std.exception : assertThrown;
+
+	assertThrown!McpException(parseMessage(
+			`{"jsonrpc":"2.0","id":1,"error":{"code":4294967296,"message":"x"}}`));
+	assertThrown!McpException(parseMessage(
+			`{"jsonrpc":"2.0","id":1,"error":{"code":-2147483649,"message":"x"}}`));
+	assertThrown!McpException(parseMessage(
+			`{"jsonrpc":"2.0","id":1,"error":{"code":99999999999999999999,"message":"x"}}`));
+	auto m = parseMessage(`{"jsonrpc":"2.0","id":1,"error":{"code":-2147483648,"message":"x"}}`);
+	assert(m.raw["error"]["code"].get!int == int.min);
 }
 
 unittest  // a response carrying neither result nor error is rejected
