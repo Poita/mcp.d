@@ -1126,7 +1126,8 @@ final class EventsRuntime
 		if (regIsEmitOnly(p))
 			s.openHead_ = buffer_.headCursor();
 		// on_subscribe runs first: when it throws, no stream is left registered.
-		acquireLifecycle(*p, name, s.arguments, principal, subscriptionIdString(subscriptionId));
+		acquireLifecycle(*p, name, s.arguments, principal,
+				pushSubscriptionId(name, s.arguments, principal));
 		pushStreams_ ~= s;
 		return new PushHandle(this, s);
 	}
@@ -3249,6 +3250,14 @@ final class EventsRuntime
 		return "poll_" ~ sha256Hex(
 				principal ~ "\0" ~ name ~ "\0" ~ canonicalJsonString(arguments))[0 .. 16];
 	}
+
+	// As `pollSubscriptionId`: the client's JSON-RPC request id is chosen per
+	// connection, so two clients would otherwise collide on it.
+	private string pushSubscriptionId(string name, Json arguments, string principal) @safe
+	{
+		return "push_" ~ sha256Hex(
+				principal ~ "\0" ~ name ~ "\0" ~ canonicalJsonString(arguments))[0 .. 16];
+	}
 }
 
 /// Whether replacing JSON Schema `before` with `after` is additive: every property
@@ -3457,19 +3466,6 @@ string randomNonce() @safe
 string controlMessageId(string type) @safe
 {
 	return "msg_" ~ type ~ "_" ~ randomNonce();
-}
-
-/// The subscription id as a string, whether the JSON-RPC id was an integer or a
-/// string (used to label lifecycle-hook invocations).
-string subscriptionIdString(Json id) @safe
-{
-	import std.conv : to;
-
-	if (id.type == Json.Type.string)
-		return id.get!string;
-	if (id.type == Json.Type.int_)
-		return to!string(id.get!long);
-	return id.toString();
 }
 
 // ---------------------------------------------------------------------------
@@ -4654,6 +4650,24 @@ unittest  // a throwing on_unsubscribe does not stop the sweep expiring the othe
 	now += 10 * 60 * 1000;
 	rt.sweepPollLeases();
 	assert(unsubs == 2);
+}
+
+unittest  // two principals pushing with the same request id get distinct subscription ids
+{
+	import std.algorithm : startsWith;
+
+	auto rt = testRuntime();
+	EventRegistration reg = {descriptor: EventType("n"), emitOnly: true};
+	string[] ids;
+	reg.onSubscribe = (EventContext ctx, string id) @safe { ids ~= id; };
+	rt.register(reg);
+	openLive(rt, "n", Json.emptyObject, "alice", Json(1), (string m, Json p) @safe {
+	});
+	openLive(rt, "n", Json.emptyObject, "bob", Json(1), (string m, Json p) @safe {
+	});
+	assert(ids.length == 2);
+	assert(ids[0] != ids[1]);
+	assert(ids[0].startsWith("push_") && ids[1].startsWith("push_"));
 }
 
 unittest  // two principals polling the same arguments get distinct subscription ids

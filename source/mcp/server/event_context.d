@@ -156,6 +156,9 @@ struct FetchContext
 struct SubContext
 {
 	string principal;
+	/// Derived by the server from the subscription that first acquired the key,
+	/// never chosen by the client: `poll_…` and `push_…` hash the `(principal,
+	/// name, arguments)` key, `sub_…` (webhook) also the callback URL.
 	string subscriptionId;
 }
 
