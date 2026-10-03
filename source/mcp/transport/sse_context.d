@@ -2748,17 +2748,22 @@ final class HttpStreamContext : RequestContext, ConnectionScoped
 	// A client that stops reading fills the socket and parks the write, which
 	// would pin the handler and its session. The frame is therefore written in
 	// slices under a watchdog: when no slice is accepted within `sseStallTimeout`
-	// the connection is closed, failing the write.
+	// the watchdog interrupts the writing task, which cancels the pending socket
+	// write, and closes the connection. Closing alone does not wake a pending
+	// write on every event driver (Windows only sends a disconnect).
 	private void writeFrame(string frame) @safe
 	{
 		import std.algorithm : min;
 		import vibe.core.core : setTimer;
+		import vibe.core.task : Task;
 
 		if (disconnected_)
 			return;
 		enum size_t slice = 16 * 1024;
+		auto writer = Task.getThis();
 		auto watchdog = setTimer(sseStallTimeout, () nothrow @safe {
 			closeRawConnection(res);
+			writer.interrupt();
 		});
 		scope (exit)
 			watchdog.stop();
