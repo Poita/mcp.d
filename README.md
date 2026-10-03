@@ -470,7 +470,8 @@ share one backend. A `public` result lives under a shared key, so **every client
 hits the same entry** — the point of a shared cache. A `private` result is
 namespaced under the requesting client's `cachePartition` (a stable principal /
 tenant id you set in `ClientSettings`), so it is never served to another
-identity. A client with no `cachePartition` keeps its `private` results under a
+identity. A `cacheScope` the client does not recognize is treated as `private`.
+A client with no `cachePartition` keeps its `private` results under a
 partition unique to itself. Every entry is also keyed by server (`CacheKey.server`: the
 endpoint URL, the `spawn` command, or `ClientSettings.cacheServer`), so clients of
 different servers sharing one store never read each other's results.

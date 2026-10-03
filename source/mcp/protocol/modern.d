@@ -284,9 +284,9 @@ Json withCache(Json result, CacheHint hint) @safe
 }
 
 /// Parse a modern `CacheableResult` freshness hint from a result object. Reads
-/// `ttlMs` (accepting an integer, bigInt or float) and `cacheScope` (a string mapped to
-/// the `CacheScope` enum, defaulting to `public`). Returns null when no `ttlMs`
-/// field is present.
+/// `ttlMs` (accepting an integer, bigInt or float) and `cacheScope` (`public`
+/// when absent or `"public"`, `private` for any other value). Returns null when
+/// no `ttlMs` field is present.
 Nullable!CacheHint parseCacheHint(Json result) @safe
 {
 	if (result.type != Json.Type.object || "ttlMs" !in result)
@@ -320,11 +320,11 @@ Nullable!CacheHint parseCacheHint(Json result) @safe
 	else
 		return Nullable!CacheHint.init;
 	hint.ttl = ttlMs.msecs;
-	if ("cacheScope" in result && result["cacheScope"].type == Json.Type.string)
-	{
-		const s = result["cacheScope"].get!string;
-		hint.cacheScope = (s == "private") ? CacheScope.private_ : CacheScope.public_;
-	}
+	// Fail closed: a scope other than an absent field or "public" keeps the
+	// result out of shared caches.
+	if (auto s = "cacheScope" in result)
+		hint.cacheScope = (s.type == Json.Type.string
+				&& s.get!string == "public") ? CacheScope.public_ : CacheScope.private_;
 	return nullable(hint);
 }
 
@@ -596,6 +596,23 @@ unittest  // parseCacheHint accepts a float ttlMs (ms) and defaults cacheScope t
 	assert(!h.isNull);
 	assert(h.get.ttl == 1500.msecs);
 	assert(h.get.cacheScope == CacheScope.public_);
+}
+
+unittest  // parseCacheHint reads an unrecognized or non-string cacheScope as private
+{
+	foreach (scope_; [
+			Json("PRIVATE"), Json("shared"), Json(""), Json(1), Json(null)
+		])
+	{
+		Json r = Json.emptyObject;
+		r["ttlMs"] = 1000;
+		r["cacheScope"] = scope_;
+		assert(parseCacheHint(r).get.cacheScope == CacheScope.private_, scope_.toString);
+	}
+	Json r = Json.emptyObject;
+	r["ttlMs"] = 1000;
+	r["cacheScope"] = "public";
+	assert(parseCacheHint(r).get.cacheScope == CacheScope.public_);
 }
 
 unittest  // round-trip: CacheHint(5.seconds) -> wire ttlMs:5000 -> 5.seconds
