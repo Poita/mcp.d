@@ -1891,9 +1891,12 @@ final class McpServer : ServerCore
 		{
 			auto handle = kv.value;
 			auto s = handle.stream;
-			if (s.terminated)
+			if (s.terminated || !isOpenStdioEventStream(kv.key, handle))
 				continue;
 			eventsRuntime_.advancePushStream(s);
+			// advancePushStream can yield to a cancel that closes this stream.
+			if (!isOpenStdioEventStream(kv.key, handle))
+				continue;
 			if (nowMs - s.lastHeartbeatMs >= 15_000)
 			{
 				s.lastHeartbeatMs = nowMs;
@@ -1901,6 +1904,14 @@ final class McpServer : ServerCore
 						withSubscriptionId(heartbeatParams(s.cursor), s.subscriptionId));
 			}
 		}
+	}
+
+	/// Whether `handle` is still the open stdio push stream registered under
+	/// `key`; false once a `notifications/cancelled` has closed and removed it.
+	private bool isOpenStdioEventStream(string key, PushHandle handle) @safe
+	{
+		auto p = key in stdioEventStreams_;
+		return p !is null && *p is handle;
 	}
 
 	/// Whether any stdio `events/stream` push streams are open.
@@ -8070,6 +8081,49 @@ unittest  // tickStdioEventStreams iterates a snapshot, so a mid-tick cancel can
 	// ticks. No throw / corruption is the assertion.
 	s.tickStdioEventStreams(0);
 	assert(s.hasStdioEventStreams());
+}
+
+unittest  // a stdio events/stream cancelled mid-tick gets no heartbeat from that tick
+{
+	import mcp.server.event_context : EventContext, EventResult;
+	import mcp.server.events_runtime : EventRegistration;
+
+	auto s = new McpServer("t", "1");
+	s.enableEvents();
+
+	// A check-backed type whose check() cancels both streams during the tick, so
+	// each is cancelled after the tick snapshotted it but before its heartbeat.
+	bool cancelDuringTick;
+	EventRegistration reg;
+	reg.descriptor.name = "email.received";
+	reg.check = (EventContext ctx) @safe {
+		if (cancelDuringTick)
+		{
+			cancelDuringTick = false;
+			foreach (id; [1, 2])
+				s.handle(Message(makeNotification("notifications/cancelled",
+						Json(["requestId": Json(id)]))));
+		}
+		return EventResult.empty("c0");
+	};
+	s.registerEventType(reg);
+
+	string[] lines;
+	void sink(string line) @safe
+	{
+		lines ~= line;
+	}
+
+	Json params = Json.emptyObject;
+	params["name"] = "email.received";
+	s.tryServeStdioEventsStream(modernReq(1, "events/stream", params), &sink);
+	s.tryServeStdioEventsStream(modernReq(2, "events/stream", params), &sink);
+	const before = lines.length;
+	cancelDuringTick = true;
+
+	s.tickStdioEventStreams(100_000);
+	assert(!s.hasStdioEventStreams());
+	assert(lines.length == before, lines.length > before ? lines[before] : "");
 }
 
 unittest  // tickStdioEventStreams polls a check-backed stream and heartbeats only every 15s
