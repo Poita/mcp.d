@@ -70,55 +70,68 @@ private void registerAnnotatedMembers(alias root, alias parent)(McpServer server
 {
 	static foreach (memberName; __traits(allMembers, root))
 	{
-		static if (__traits(compiles, __traits(getOverloads, root, memberName)))
+		static if (__traits(compiles, __traits(getOverloads, root, memberName, true)))
 		{
-			static foreach (overload; __traits(getOverloads, root, memberName))
+			// Templates are included so a templated handler is rejected rather
+			// than silently left unregistered: its parameter types, and so its
+			// schema, are unknown until it is instantiated.
+			static foreach (overload; __traits(getOverloads, root, memberName, true))
 			{
-				static if (hasHandlerUda!overload())
+				static if (__traits(isTemplate, overload))
 				{
-					checkHandlerSafety!(memberName, overload)();
-					checkMethodFacets!(memberName, overload)();
-					checkUdaPlacement!(memberName, overload)();
+					static foreach (attr; __traits(getAttributes, overload))
+						static assert(!isHandlerAttribute!attr, "handler '" ~ memberName
+								~ "' is a template; a handler's parameter types must be fixed "
+								~ "to derive its schema, so declare it without template parameters");
 				}
-				static foreach (attr; __traits(getAttributes, overload))
+				else
 				{
-					static if (is(attr))
-						static assert(!isHandlerUda!attr, "@" ~ attr.stringof ~ " on '"
-								~ memberName ~ "' is missing its argument list (e.g. "
-								~ handlerUdaExample!attr ~ "); a bare @" ~ attr.stringof
-								~ " attaches the type, not a value, and registers nothing");
-					else static if (is(typeof(attr) == tool))
+					static if (hasHandlerUda!overload())
 					{
-						static assert(attr.name.length,
-								"@tool on '" ~ memberName ~ "' has an empty name");
-						registerToolMethod!(memberName, overload, parent)(server, attr);
+						checkHandlerSafety!(memberName, overload)();
+						checkMethodFacets!(memberName, overload)();
+						checkUdaPlacement!(memberName, overload)();
 					}
-					else static if (is(typeof(attr) == taskTool))
+					static foreach (attr; __traits(getAttributes, overload))
 					{
-						static assert(attr.name.length,
-								"@taskTool on '" ~ memberName ~ "' has an empty name");
-						registerTaskMethod!(memberName, overload, parent)(server, attr);
+						static if (is(attr))
+							static assert(!isHandlerUda!attr, "@" ~ attr.stringof ~ " on '"
+									~ memberName ~ "' is missing its argument list (e.g. "
+									~ handlerUdaExample!attr ~ "); a bare @" ~ attr.stringof
+									~ " attaches the type, not a value, and registers nothing");
+						else static if (is(typeof(attr) == tool))
+						{
+							static assert(attr.name.length,
+									"@tool on '" ~ memberName ~ "' has an empty name");
+							registerToolMethod!(memberName, overload, parent)(server, attr);
+						}
+						else static if (is(typeof(attr) == taskTool))
+						{
+							static assert(attr.name.length,
+									"@taskTool on '" ~ memberName ~ "' has an empty name");
+							registerTaskMethod!(memberName, overload, parent)(server, attr);
+						}
+						else static if (is(typeof(attr) == event))
+						{
+							static assert(attr.name.length,
+									"@event on '" ~ memberName ~ "' has an empty name");
+							registerEventMethod!(memberName, overload, parent)(server, attr);
+						}
+						else static if (is(typeof(attr) == prompt))
+						{
+							static assert(attr.name.length,
+									"@prompt on '" ~ memberName ~ "' has an empty name");
+							registerPromptMethod!(memberName, overload, parent)(server, attr);
+						}
+						else static if (is(typeof(attr) == resource))
+							registerResourceMethod!(memberName, overload, parent)(server, attr);
+						else static if (is(typeof(attr) == resourceTemplate))
+							registerTemplateMethod!(memberName, overload, parent, attr)(server);
+						else static if (is(typeof(attr) == skill))
+							registerSkillMethod!(memberName, overload, parent)(server, attr);
+						else static if (is(typeof(attr) == skillDir))
+							registerSkillDirMethod!(memberName, overload, parent)(server, attr);
 					}
-					else static if (is(typeof(attr) == event))
-					{
-						static assert(attr.name.length,
-								"@event on '" ~ memberName ~ "' has an empty name");
-						registerEventMethod!(memberName, overload, parent)(server, attr);
-					}
-					else static if (is(typeof(attr) == prompt))
-					{
-						static assert(attr.name.length,
-								"@prompt on '" ~ memberName ~ "' has an empty name");
-						registerPromptMethod!(memberName, overload, parent)(server, attr);
-					}
-					else static if (is(typeof(attr) == resource))
-						registerResourceMethod!(memberName, overload, parent)(server, attr);
-					else static if (is(typeof(attr) == resourceTemplate))
-						registerTemplateMethod!(memberName, overload, parent, attr)(server);
-					else static if (is(typeof(attr) == skill))
-						registerSkillMethod!(memberName, overload, parent)(server, attr);
-					else static if (is(typeof(attr) == skillDir))
-						registerSkillDirMethod!(memberName, overload, parent)(server, attr);
 				}
 			}
 		}
@@ -149,6 +162,16 @@ private void checkHandlerSafety(string memberName, alias f)()
 private enum isHandlerUda(A) = is(A == tool) || is(A == taskTool)
 	|| is(A == event) || is(A == prompt) || is(A == resource)
 	|| is(A == resourceTemplate) || is(A == skill) || is(A == skillDir);
+
+/// Whether the attribute `a` is a handler UDA, applied (`@tool(...)`) or bare
+/// (`@tool`).
+private template isHandlerAttribute(alias a)
+{
+	static if (is(a))
+		enum isHandlerAttribute = isHandlerUda!a;
+	else
+		enum isHandlerAttribute = isHandlerUda!(typeof(a));
+}
 
 /// An applied form of the handler UDA `A` with placeholder arguments, shown when
 /// `A` is attached bare.
@@ -5058,4 +5081,39 @@ unittest  // UDAs that fit their handler kind and parameter types still register
 {
 	auto s = new McpServer("t", "1");
 	registerHandlers(s, new FittingUdasApi);
+}
+
+version (unittest) private final class TemplatedToolApi
+{
+	@tool("f", "f")
+	string f(T)(T x) @safe
+	{
+		return "";
+	}
+}
+
+version (unittest) private final class TemplatedHelperApi
+{
+	@tool("g", "g")
+	string g(string s) @safe
+	{
+		return helper(s);
+	}
+
+	string helper(T)(T x) @safe
+	{
+		return x;
+	}
+}
+
+unittest  // a templated method carrying a handler UDA is rejected at compile time
+{
+	auto s = new McpServer("t", "1");
+	static assert(!__traits(compiles, registerHandlers(s, new TemplatedToolApi)));
+}
+
+unittest  // a templated method without a handler UDA is skipped
+{
+	auto s = new McpServer("t", "1");
+	registerHandlers(s, new TemplatedHelperApi);
 }
