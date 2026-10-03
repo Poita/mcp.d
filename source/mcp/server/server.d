@@ -1296,10 +1296,12 @@ final class McpServer : ServerCore
 	{
 		import mcp.protocol.tasks : makeCreateTaskResult;
 
+		// Both are server-author mistakes, so they throw a plain Exception that
+		// the tools/call path logs and masks rather than sending to the client.
 		if (taskRuntime_ is null)
-			throw internalError("startTask requires enableTasks() first");
+			throw new Exception("startTask requires enableTasks() first");
 		if ((name in taskExecutors_) is null)
-			throw internalError("startTask: no task executor registered under '" ~ name ~ "'");
+			throw new Exception("startTask: no task executor registered under '" ~ name ~ "'");
 		if (!acceptsTasks(ctx.clientCapabilities(), ctx.protocolVersion))
 			return ToolResponse.complete(runTaskToolInline(name, input, ctx));
 		// The task is bound to the creating request's authenticated principal
@@ -8754,6 +8756,34 @@ unittest  // startTask lets an MRTR tool gather input and then escalate to a tas
 	auto got = s.handle(modernReq(3, "tasks/get", Json(["taskId": Json(id)]))).get["result"];
 	assert(got["status"].get!string == "completed");
 	assert(got["result"]["content"][0]["text"].get!string == "Hello, Alice");
+}
+
+unittest  // startTask with an unregistered executor fails as a masked tool error, not a protocol error
+{
+	import std.algorithm.searching : canFind;
+
+	auto s = new McpServer("t", "1");
+	s.enableTasks(syncTasks());
+	Tool desc = {name: "go"};
+	s.registerTool(desc, (Json args, RequestContext ctx) @safe {
+		return s.startTask("missing_executor", Json.emptyObject, ctx);
+	});
+	auto resp = s.handle(modernReq(1, "tools/call", Json(["name": Json("go")]))).get;
+	assert("error" !in resp, "a server-author mistake must not surface as a JSON-RPC error");
+	assert(resp["result"]["isError"].get!bool);
+	assert(!resp.toString().canFind("missing_executor"));
+}
+
+unittest  // startTask before enableTasks fails as a masked tool error, not a protocol error
+{
+	auto s = new McpServer("t", "1");
+	Tool desc = {name: "go"};
+	s.registerTool(desc, (Json args, RequestContext ctx) @safe {
+		return s.startTask("x", Json.emptyObject, ctx);
+	});
+	auto resp = s.handle(modernReq(1, "tools/call", Json(["name": Json("go")]))).get;
+	assert("error" !in resp);
+	assert(resp["result"]["content"][0]["text"].get!string == "Internal error");
 }
 
 version (unittest) private McpServer makeEscalatingServer(TaskSupport support) @safe
