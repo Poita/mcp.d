@@ -197,6 +197,27 @@ package(mcp) JsonNode schemaNode(T, SchemaUse use, Ancestors...)()
 						prop.set("description", JsonNode(getUDAs!(member,
 								fieldDescription)[0].value));
 					applyUdaFacets!(__traits(getAttributes, member))(prop);
+					// An initializer differing from the type's `.init` is what an
+					// omitted field binds to, so an input advertises it as the
+					// `default` unless a @schemaDefault already set one.
+					static if (use == SchemaUse.input && hasCtInitializer!(T, field))
+					{
+						if (prop.get("default") is null
+								&& !isInitValue(__traits(getMember, T.init, field)))
+						{
+							import jsonschema.vibejson : vibeJsonToNode;
+							import mcp.protocol.schema : EnumByNamePolicy;
+							import vibe.data.json : JsonSerializer;
+							import vibe.data.serialization : serializeWithPolicy;
+
+							const d = () @trusted {
+								return serializeWithPolicy!(JsonSerializer, EnumByNamePolicy)(
+										__traits(getMember, T.init, field));
+							}();
+							if (d.type != Json.Type.null_ && d.type != Json.Type.undefined)
+								prop.set("default", vibeJsonToNode(d));
+						}
+					}
 					props.set(wireFieldName!(T, field), prop);
 					static if (isRequiredField!(T, field))
 						required.append(JsonNode(wireFieldName!(T, field)));
@@ -1148,4 +1169,34 @@ unittest  // an enum names its members when the value is not one of them
 
 	auto e = collectException!BindException(bindJson!Shade(Json("D")));
 	assert(e !is null && e.msg == `expected one of "light", "dark", got "D"`, e.msg);
+}
+
+unittest  // a struct field with a non-default initializer advertises it as its default
+{
+	static struct S
+	{
+		int limit = 10;
+		Shade shade = Shade.dark;
+		string name;
+		int zero;
+	}
+
+	auto s = schemaOf!(S, SchemaUse.input)();
+	assert(s["properties"]["limit"]["default"] == Json(10), s.toString);
+	assert(s["properties"]["shade"]["default"] == Json("dark"), s.toString);
+	assert("default" !in s["properties"]["name"], s.toString);
+	assert("default" !in s["properties"]["zero"], s.toString);
+}
+
+unittest  // a @schemaDefault takes precedence over a field's initializer as its default
+{
+	import jsonschema : schemaDefault;
+
+	static struct S
+	{
+		@schemaDefault(3) int limit = 10;
+	}
+
+	auto s = schemaOf!(S, SchemaUse.input)();
+	assert(s["properties"]["limit"]["default"] == Json(3), s.toString);
 }
