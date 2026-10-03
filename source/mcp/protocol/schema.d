@@ -69,7 +69,10 @@ template EnumByNamePolicy(T) if (is(T == enum))
 /// the `anyOf` of its member schemas that derived schemas advertise. Reading
 /// prefers a member whose serialized form has the JSON value's own type (an
 /// integer reads as `int`, not `double`), else takes the first member that
-/// accepts the value.
+/// accepts the value. Among members that read a JSON object, the one whose
+/// serialized form keeps the most of the object's keys wins, ties going to the
+/// one adding the fewest keys of its own, so a struct that silently drops
+/// fields loses to one that holds them all.
 template EnumByNamePolicy(T) if (isSumType!T)
 {
 	static Json toRepresentation(T v)
@@ -85,32 +88,64 @@ template EnumByNamePolicy(T) if (isSumType!T)
 
 	static T fromRepresentation(Json j)
 	{
-		import std.meta : AliasSeq;
 		import std.traits : TemplateArgsOf;
 		import vibe.data.json : JsonSerializer;
 		import vibe.data.serialization : deserializeWithPolicy, serializeWithPolicy;
 
-		static foreach (exact; AliasSeq!(true, false))
+		T[] best;
+		size_t bestKept, bestAdded;
+		static foreach (V; TemplateArgsOf!T)
 		{
-			static foreach (V; TemplateArgsOf!T)
+			try
 			{
-				try
+				auto v = () @trusted {
+					return deserializeWithPolicy!(JsonSerializer, EnumByNamePolicy, V)(j);
+				}();
+				auto back = () @trusted {
+					return serializeWithPolicy!(JsonSerializer, EnumByNamePolicy)(v);
+				}();
+				if (back.type == j.type)
 				{
-					auto v = () @trusted {
-						return deserializeWithPolicy!(JsonSerializer, EnumByNamePolicy, V)(j);
-					}();
-					if (!exact || ()@trusted {
-							return serializeWithPolicy!(JsonSerializer, EnumByNamePolicy)(v);
-						}().type == j.type)
+					if (j.type != Json.Type.object)
 						return T(v);
+					const kept = sharedKeyCount(j, back);
+					const added = back.length - kept;
+					if (!best.length || kept > bestKept || (kept == bestKept && added < bestAdded))
+					{
+						best = [T(v)];
+						bestKept = kept;
+						bestAdded = added;
+					}
 				}
-				catch (Exception)
-				{
-				}
+			}
+			catch (Exception)
+			{
+			}
+		}
+		if (best.length)
+			return best[0];
+		static foreach (V; TemplateArgsOf!T)
+		{
+			try
+				return T(() @trusted {
+					return deserializeWithPolicy!(JsonSerializer, EnumByNamePolicy, V)(j);
+				}());
+			catch (Exception)
+			{
 			}
 		}
 		throw new Exception("JSON value matches none of the types in " ~ T.stringof);
 	}
+}
+
+/// How many of object `a`'s keys object `b` also has.
+private size_t sharedKeyCount(Json a, Json b) @safe
+{
+	size_t n;
+	foreach (key; a.get!(Json[string]).byKey)
+		if (key in b)
+			n++;
+	return n;
 }
 
 private enum isSumType(T) = imported!"std.sumtype".isSumType!T;
@@ -148,6 +183,57 @@ unittest  // a SumType reads back as the member matching the JSON value's own ty
 		return deserializeWithPolicy!(JsonSerializer, EnumByNamePolicy, N)(Json(3));
 	}();
 	assert(n.has!int);
+}
+
+unittest  // a SumType of structs reads an object as the member that keeps every key
+{
+	import std.sumtype : SumType, has, match;
+	import vibe.data.json : JsonSerializer, parseJsonString;
+	import vibe.data.serialization : deserializeWithPolicy;
+
+	static struct A
+	{
+		int x;
+	}
+
+	static struct B
+	{
+		int x;
+		int y;
+	}
+
+	alias U = SumType!(A, B);
+	auto u = () @trusted {
+		return deserializeWithPolicy!(JsonSerializer, EnumByNamePolicy, U)(
+				parseJsonString(`{"x":1,"y":2}`));
+	}();
+	assert(u.has!B);
+	assert(u.match!((B b) => b.y, (A a) => -1) == 2);
+}
+
+unittest  // a SumType of structs prefers the member with no keys beyond the input's
+{
+	import std.sumtype : SumType, has;
+	import vibe.data.json : JsonSerializer, parseJsonString;
+	import vibe.data.serialization : deserializeWithPolicy, optional;
+
+	static struct B
+	{
+		int x;
+		@optional int y;
+	}
+
+	static struct A
+	{
+		int x;
+	}
+
+	alias U = SumType!(B, A);
+	auto u = () @trusted {
+		return deserializeWithPolicy!(JsonSerializer, EnumByNamePolicy, U)(
+				parseJsonString(`{"x":1}`));
+	}();
+	assert(u.has!A);
 }
 
 /// True when `F` is a scalar permitted as an elicitation form field: a
