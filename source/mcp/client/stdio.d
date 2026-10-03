@@ -61,7 +61,7 @@ final class StdioClientTransport : ClientTransport
 	// When spawned via `McpClient.spawn`, the owned subprocess pipes so `close()`
 	// can run the MCP stdio shutdown sequence (close stdin -> SIGTERM -> SIGKILL).
 	// Windows has no eventcore pipe driver, so it owns a `WinChild` (std.process
-	// pid + a blocking-reader thread) and shuts down via close-stdin -> terminate.
+	// pid + blocking reader and writer threads) and shuts down via close-stdin -> terminate.
 	version (Posix)
 		private ProcessPipes* pipes;
 	else version (Windows)
@@ -319,7 +319,7 @@ final class StdioClientTransport : ClientTransport
 		this.pipes = pipes;
 	}
 
-	/// Attach the owned Windows child (std.process pid + reader thread) so
+	/// Attach the owned Windows child (std.process pid + pipe threads) so
 	/// `close()` runs the close-stdin -> terminate shutdown. Set by the Windows
 	/// `spawnStdioTransport`.
 	version (Windows) package void attachWinChild(WinChild* c) @safe
@@ -421,7 +421,7 @@ final class StdioClientTransport : ClientTransport
 
 		++closeProcessRuns_;
 		auto c = winChild;
-		() @trusted { c.closeStdin(); }();
+		c.writer.close();
 
 		int status;
 		bool reaped;
@@ -464,6 +464,14 @@ final class StdioClientTransport : ClientTransport
 				}
 				c.reader.join(false);
 			}
+			// The writer thread ends once its queue is written or, for a child
+			// that stopped reading, once the child's exit fails its write.
+			while (c.writer.thread.isRunning)
+			{
+				c.writer.drain();
+				sleep(5.msecs);
+			}
+			c.writer.thread.join(false);
 		}();
 		return status;
 	}
@@ -530,44 +538,147 @@ version (Posix) StdioClientTransport spawnStdioTransport(string[] args,
 
 version (Windows)
 {
-	import std.stdio : File;
 	import core.sys.windows.windef : HANDLE;
 	import vibe.core.channel : Channel, createChannel;
 }
 
-/// Owned Windows child: the std.process pid plus the writable stdin handle.
-/// `close()` routes through `StdioClientTransport.closeWinChild`, which closes
-/// stdin (EOF), terminates the process, then drains the stdout channel and joins
-/// the reader daemon thread (see `pumpChildStdout`) so it cannot touch the GC
-/// during druntime shutdown.
+/// Owned Windows child: the std.process pid, the thread writing its stdin, and
+/// the thread reading its stdout. `close()` routes through
+/// `StdioClientTransport.closeWinChild`, which closes stdin (EOF), terminates the
+/// process, then drains both threads' channels and joins them (see
+/// `pumpChildStdout`, `ChildStdinWriter`) so neither can touch the GC during
+/// druntime shutdown.
 version (Windows) private struct WinChild
 {
 	import std.process : Pid;
 	import core.thread : Thread;
 
 	Pid pid;
-	File childStdin;
+	ChildStdinWriter writer;
 	// The daemon thread pumping the child's stdout, and the channel it feeds.
 	// closeWinChild drains the channel and joins the thread so no GC-touching
 	// daemon thread survives into druntime shutdown, which faults on Windows.
 	Thread reader;
 	Channel!string lines;
-	private bool stdinClosed_;
+}
 
-	void closeStdin() @system
+/// The thread writing the Windows child's stdin. Each line is handed to it
+/// through `jobs` and written with a blocking `WriteFile` on a handle the thread
+/// owns, so a child that stops reading parks only the writing fiber, never the
+/// event loop (whose read loop must keep draining the child's stdout for the
+/// child to make progress). Outcomes come back through `results` tagged with
+/// their line's sequence number, so a caller interrupted while waiting never
+/// leaves its outcome for the next caller.
+version (Windows) private final class ChildStdinWriter
+{
+	import core.thread : Thread;
+	import core.time : Duration;
+	import vibe.core.sync : TaskMutex;
+
+	private static struct Job
 	{
-		if (!stdinClosed_ && childStdin.isOpen)
-			childStdin.close();
-		stdinClosed_ = true;
+		ulong seq;
+		immutable(ubyte)[] bytes;
+	}
+
+	private static struct Outcome
+	{
+		ulong seq;
+		bool ok;
+	}
+
+	private HANDLE handle;
+	private Channel!Job jobs;
+	private Channel!Outcome results;
+	private TaskMutex mtx;
+	private ulong nextSeq;
+	Thread thread;
+
+	this(HANDLE h) @trusted
+	{
+		handle = h;
+		jobs = createChannel!Job();
+		results = createChannel!Outcome();
+		mtx = new TaskMutex;
+		thread = new Thread(&pump);
+		thread.isDaemon = true;
+		thread.start();
+	}
+
+	/// Write `bytes` on the writer thread, parking the calling fiber (not the
+	/// event-loop thread) until they are written. Throws when the write fails
+	/// or the writer has stopped.
+	void write(const(ubyte)[] bytes) @trusted
+	{
+		synchronized (mtx)
+		{
+			const seq = ++nextSeq;
+			jobs.put(Job(seq, bytes.idup));
+			Outcome r;
+			do
+			{
+				if (!results.tryConsumeOne(r))
+					throw new Exception("the child's stdin is closed");
+			}
+			while (r.seq < seq);
+			if (!r.ok)
+				throw new Exception("writing to the child's stdin failed");
+		}
+	}
+
+	/// Stop accepting lines; the thread closes the handle (EOF for the child)
+	/// once the queued ones are written.
+	void close() @trusted nothrow
+	{
+		try
+			jobs.close();
+		catch (Exception)
+		{
+		}
+	}
+
+	/// Discard outcomes nobody awaits, so the thread never parks handing one
+	/// back while it is being joined.
+	void drain() @trusted
+	{
+		Outcome r;
+		while (results.tryConsumeOne(r, Duration.zero))
+		{
+		}
+	}
+
+	private void pump() @system
+	{
+		import core.sys.windows.windef : DWORD;
+		import core.sys.windows.winbase : WriteFile, CloseHandle;
+
+		Job job;
+		while (jobs.tryConsumeOne(job))
+		{
+			bool ok = true;
+			size_t off;
+			while (ok && off < job.bytes.length)
+			{
+				DWORD wrote;
+				ok = WriteFile(handle, cast(const(void)*)(job.bytes.ptr + off),
+						cast(DWORD)(job.bytes.length - off), &wrote, null) != 0 && wrote != 0;
+				off += wrote;
+			}
+			results.put(Outcome(job.seq, ok));
+			if (!ok)
+				break;
+		}
+		CloseHandle(handle);
+		results.close();
 	}
 }
 
 /// Windows counterpart to the POSIX `spawnStdioTransport`. eventcore has no
-/// working pipe driver, so the child is launched with std.process and its stdout
-/// is read by a dedicated daemon thread that assembles newline-delimited lines and
+/// working pipe driver, so the child is launched with std.process, its stdout is
+/// read by a dedicated daemon thread that assembles newline-delimited lines and
 /// hands them to the cooperative read loop through a thread-safe vibe `Channel`
-/// (`readLine` drains it, yielding the fiber). Requests are written with a blocking
-/// `rawWrite` to the child's stdin.
+/// (`readLine` drains it, yielding the fiber), and its stdin is written by a
+/// dedicated thread (`ChildStdinWriter`) that `writeLine` hands each line to.
 version (Windows) StdioClientTransport spawnStdioTransport(string[] args,
 		size_t maxLineBytes = defaultMaxLineBytes) @safe
 {
@@ -581,21 +692,24 @@ version (Windows) StdioClientTransport spawnStdioTransport(string[] args,
 	auto child = () @trusted { return new WinChild; }();
 
 	// std.stdio.File is not safe to share across threads: its reference count is
-	// non-atomic, so handing the child-stdout File to the reader thread races the
-	// refcount and can close the handle. That closes our end of the pipe, and the
-	// server's writes then fail with ERROR_NO_DATA. Instead, duplicate the read
-	// handle into one the reader thread owns outright (and closes on EOF), letting
-	// the original File close with `pp`. The duplicate keeps the pipe's read end
-	// open, mirroring the server's raw-HANDLE ReadFile pump.
-	HANDLE readHandle;
+	// non-atomic, so handing a child-pipe File to a worker thread races the
+	// refcount and can close the handle under it. Instead, duplicate each pipe
+	// handle into one its thread owns outright (and closes when done), and let
+	// the original Files close here. The duplicates keep the pipe ends open,
+	// mirroring the server's raw-HANDLE pumps.
+	HANDLE readHandle, writeHandle;
 	() @trusted {
 		auto pp = pipeProcess(args, Redirect.stdin | Redirect.stdout);
 		child.pid = pp.pid;
-		child.childStdin = pp.stdin;
 		auto proc = GetCurrentProcess();
 		DuplicateHandle(proc, pp.stdout.windowsHandle, proc, &readHandle, 0,
 				FALSE, DUPLICATE_SAME_ACCESS);
+		DuplicateHandle(proc, pp.stdin.windowsHandle, proc, &writeHandle, 0,
+				FALSE, DUPLICATE_SAME_ACCESS);
+		pp.stdin.close();
 	}();
+
+	child.writer = new ChildStdinWriter(writeHandle);
 
 	// Daemon reader: blocking ReadFile on the duplicated stdout handle, lines pushed
 	// to `lines`.
@@ -618,10 +732,7 @@ version (Windows) StdioClientTransport spawnStdioTransport(string[] args,
 
 	void writeLine(string s) @safe
 	{
-		() @trusted {
-			child.childStdin.rawWrite(cast(const(ubyte)[])(s ~ "\n"));
-			child.childStdin.flush();
-		}();
+		child.writer.write(cast(const(ubyte)[])(s ~ "\n"));
 	}
 
 	auto transport = new StdioClientTransport(&readLine, &writeLine);
