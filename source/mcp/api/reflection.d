@@ -34,6 +34,10 @@ import mcp.protocol.jsonhelpers : isFieldwiseStruct;
 /// `obj` is a class instance, an interface, or a pointer to a struct: the
 /// registered handlers call its methods for the server's lifetime, so a struct
 /// passed by value is rejected — they would act on a copy.
+///
+/// An override (or interface implementation) without UDAs of its own takes the
+/// handler UDAs of the declaration it overrides, and calls dispatch virtually to
+/// the override.
 void registerHandlers(T)(McpServer server, T obj) @safe
 {
 	static if (is(T == U*, U) && is(U == struct))
@@ -85,69 +89,104 @@ private void registerAnnotatedMembers(alias root, alias parent)(McpServer server
 								~ "to derive its schema, so declare it without template parameters");
 				}
 				else
-				{
-					static if (hasHandlerUda!overload())
-					{
-						checkHandlerSafety!(memberName, overload)();
-						checkMethodFacets!(memberName, overload)();
-						checkUdaPlacement!(memberName, overload)();
-					}
-					static foreach (attr; __traits(getAttributes, overload))
-					{
-						static if (is(attr))
-							static assert(!isHandlerUda!attr, "@" ~ attr.stringof ~ " on '"
-									~ memberName ~ "' is missing its argument list (e.g. "
-									~ handlerUdaExample!attr ~ "); a bare @" ~ attr.stringof
-									~ " attaches the type, not a value, and registers nothing");
-						else static if (is(typeof(attr) == tool))
-						{
-							static assert(attr.name.length,
-									"@tool on '" ~ memberName ~ "' has an empty name");
-							registerToolMethod!(memberName, overload, parent)(server, attr);
-						}
-						else static if (is(typeof(attr) == taskTool))
-						{
-							static assert(attr.name.length,
-									"@taskTool on '" ~ memberName ~ "' has an empty name");
-							registerTaskMethod!(memberName, overload, parent)(server, attr);
-						}
-						else static if (is(typeof(attr) == event))
-						{
-							static assert(attr.name.length,
-									"@event on '" ~ memberName ~ "' has an empty name");
-							registerEventMethod!(memberName, overload, parent)(server, attr);
-						}
-						else static if (is(typeof(attr) == prompt))
-						{
-							static assert(attr.name.length,
-									"@prompt on '" ~ memberName ~ "' has an empty name");
-							registerPromptMethod!(memberName, overload, parent)(server, attr);
-						}
-						else static if (is(typeof(attr) == resource))
-							registerResourceMethod!(memberName, overload, parent)(server, attr);
-						else static if (is(typeof(attr) == resourceTemplate))
-							registerTemplateMethod!(memberName, overload, parent, attr)(server);
-						else static if (is(typeof(attr) == skill))
-						{
-							static assert(isValidSkillPath(attr.path),
-									"@skill on '" ~ memberName ~ "' has the invalid skill path \""
-									~ attr.path ~ "\"; its final segment must be lowercase alphanumeric "
-									~ "with single hyphens (1..64 chars), after optional "
-									~ "non-empty prefix segments");
-							registerSkillMethod!(memberName, overload, parent)(server, attr);
-						}
-						else static if (is(typeof(attr) == skillDir))
-						{
-							static assert(attr.path.length == 0 || isValidSkillPath(attr.path),
-									"@skillDir on '" ~ memberName ~ "' has the invalid skill path \""
-									~ attr.path ~ "\"; its final segment must be lowercase alphanumeric "
-									~ "with single hyphens (1..64 chars), after optional "
-									~ "non-empty prefix segments");
-							registerSkillDirMethod!(memberName, overload, parent)(server, attr);
-						}
-					}
-				}
+					registerOverload!(memberName, AnnotatedDecl!(root,
+							memberName, overload), parent)(server);
 			}
+		}
+	}
+}
+
+/// The declaration whose UDAs describe `overload`, a member `memberName` of
+/// `root`: `overload` itself when it carries a handler UDA or `root` is not a
+/// class, else the nearest declaration it overrides or implements, in a base
+/// class or an interface, that does. An override does not inherit its base
+/// declaration's UDAs, so the handler's metadata is read from that declaration
+/// while the call still dispatches virtually to the override.
+private template AnnotatedDecl(alias root, string memberName, alias overload)
+{
+	static if (!is(root == class) || hasHandlerUda!overload())
+		alias AnnotatedDecl = overload;
+	else
+	{
+		import std.meta : Filter;
+
+		template declsIn(S)
+		{
+			static if (__traits(hasMember, S, memberName))
+				alias declsIn = AliasSeq!(__traits(getOverloads, S, memberName));
+			else
+				alias declsIn = AliasSeq!();
+		}
+
+		enum isAnnotatedMatch(alias d) = is(Parameters!d == Parameters!overload)
+			&& hasHandlerUda!d();
+		alias matches = Filter!(isAnnotatedMatch, staticMap!(declsIn,
+				BaseClassesTuple!root, InterfacesTuple!root));
+		static if (matches.length)
+			alias AnnotatedDecl = matches[0];
+		else
+			alias AnnotatedDecl = overload;
+	}
+}
+
+/// Validate the handler UDAs on `overload` (member `memberName`) and register
+/// each one on `server`, dispatching calls through `parent`.
+private void registerOverload(string memberName, alias overload, alias parent)(McpServer server) @safe
+{
+	static if (hasHandlerUda!overload())
+	{
+		checkHandlerSafety!(memberName, overload)();
+		checkMethodFacets!(memberName, overload)();
+		checkUdaPlacement!(memberName, overload)();
+	}
+	static foreach (attr; __traits(getAttributes, overload))
+	{
+		static if (is(attr))
+			static assert(!isHandlerUda!attr,
+					"@" ~ attr.stringof ~ " on '" ~ memberName ~ "' is missing its argument list (e.g. "
+					~ handlerUdaExample!attr ~ "); a bare @" ~ attr.stringof
+					~ " attaches the type, not a value, and registers nothing");
+		else static if (is(typeof(attr) == tool))
+		{
+			static assert(attr.name.length, "@tool on '" ~ memberName ~ "' has an empty name");
+			registerToolMethod!(memberName, overload, parent)(server, attr);
+		}
+		else static if (is(typeof(attr) == taskTool))
+		{
+			static assert(attr.name.length, "@taskTool on '" ~ memberName ~ "' has an empty name");
+			registerTaskMethod!(memberName, overload, parent)(server, attr);
+		}
+		else static if (is(typeof(attr) == event))
+		{
+			static assert(attr.name.length, "@event on '" ~ memberName ~ "' has an empty name");
+			registerEventMethod!(memberName, overload, parent)(server, attr);
+		}
+		else static if (is(typeof(attr) == prompt))
+		{
+			static assert(attr.name.length, "@prompt on '" ~ memberName ~ "' has an empty name");
+			registerPromptMethod!(memberName, overload, parent)(server, attr);
+		}
+		else static if (is(typeof(attr) == resource))
+			registerResourceMethod!(memberName, overload, parent)(server, attr);
+		else static if (is(typeof(attr) == resourceTemplate))
+			registerTemplateMethod!(memberName, overload, parent, attr)(server);
+		else static if (is(typeof(attr) == skill))
+		{
+			static assert(isValidSkillPath(attr.path),
+					"@skill on '" ~ memberName ~ "' has the invalid skill path \""
+					~ attr.path ~ "\"; its final segment must be lowercase alphanumeric "
+					~ "with single hyphens (1..64 chars), after optional "
+					~ "non-empty prefix segments");
+			registerSkillMethod!(memberName, overload, parent)(server, attr);
+		}
+		else static if (is(typeof(attr) == skillDir))
+		{
+			static assert(attr.path.length == 0 || isValidSkillPath(attr.path),
+					"@skillDir on '" ~ memberName ~ "' has the invalid skill path \""
+					~ attr.path ~ "\"; its final segment must be lowercase alphanumeric "
+					~ "with single hyphens (1..64 chars), after optional "
+					~ "non-empty prefix segments");
+			registerSkillDirMethod!(memberName, overload, parent)(server, attr);
 		}
 	}
 }
@@ -5292,4 +5331,67 @@ unittest  // an invalid non-empty @skillDir path is rejected at compile time
 {
 	auto s = new McpServer("t", "1");
 	static assert(!__traits(compiles, registerHandlers(s, new InvalidSkillDirPathApi)));
+}
+
+version (unittest) private class AnnotatedBaseApi
+{
+	@tool("who", "Report which class handles the call")
+	string who() @safe
+	{
+		return "base";
+	}
+}
+
+version (unittest) private class OverridingApi : AnnotatedBaseApi
+{
+	override string who() @safe
+	{
+		return "derived";
+	}
+}
+
+version (unittest) private class FurtherOverridingApi : OverridingApi
+{
+	override string who() @safe
+	{
+		return "further";
+	}
+}
+
+unittest  // an override of an annotated base method registers with the base UDAs and dispatches virtually
+{
+	auto s = new McpServer("t", "1");
+	registerHandlers(s, new OverridingApi);
+	auto r = callToolArgs(s, "who", `{}`);
+	assert(r["content"][0]["text"].get!string == "derived", r.toString);
+}
+
+unittest  // an override two levels below the annotated declaration is still registered
+{
+	auto s = new McpServer("t", "1");
+	registerHandlers(s, new FurtherOverridingApi);
+	auto r = callToolArgs(s, "who", `{}`);
+	assert(r["content"][0]["text"].get!string == "further", r.toString);
+}
+
+version (unittest) private interface AnnotatedInterfaceApi
+{
+	@tool("ping", "Answer a ping")
+	string ping(string from) @safe;
+}
+
+version (unittest) private final class InterfaceImplApi : AnnotatedInterfaceApi
+{
+	string ping(string from) @safe
+	{
+		return "pong " ~ from;
+	}
+}
+
+unittest  // a class implementing an annotated interface method registers that tool
+{
+	auto s = new McpServer("t", "1");
+	registerHandlers(s, new InterfaceImplApi);
+	auto r = callToolArgs(s, "ping", `{"from":"a"}`);
+	assert(r["content"][0]["text"].get!string == "pong a", r.toString);
 }
