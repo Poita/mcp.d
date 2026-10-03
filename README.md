@@ -667,7 +667,11 @@ argument (and `@describeParam` / `@mcpHeader` name it `"version"`).
 Field/parameter constraints are added with UDAs: `@minimum` / `@maximum`,
 `@minLength` / `@maxLength`, `@pattern`, `@minItems` / `@maxItems`,
 `@schemaFormat` (JSON Schema `format`), `@title`, `@schemaDefault`, and
-`@fieldDescription`. An argument a tool does not declare is ignored; mark the
+`@fieldDescription`. A constraint that cannot apply to its type (`@minLength`
+on an `int`, `@minimum` on a `string`, `@minItems` on a scalar) is a compile
+error, as is a method-level UDA on a handler kind that does not read it (such as
+`@cacheable` on a `@tool`, `@readOnly` on a `@prompt`, or `@taskTtl` on a plain
+`@tool`). An argument a tool does not declare is ignored; mark the
 method `@strictArgs` to advertise `"additionalProperties": false` and reject one.
 
 ## MCP Apps (interactive UI)

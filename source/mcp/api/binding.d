@@ -291,6 +291,9 @@ package(mcp) string unsupportedTypeReason(T, SchemaUse use, Ancestors...)()
 							~ ": its @schemaDefault value of type " ~ typeof(d.value)
 								.stringof ~ " does not convert to " ~ typeof(__traits(getMember,
 										T, field)).stringof;
+				if (auto r = facetMismatch!(typeof(__traits(getMember, T, field)),
+						__traits(getAttributes, __traits(getMember, T, field)))())
+					return T.stringof ~ "." ~ field ~ ": " ~ r;
 				if (auto r = unsupportedTypeReason!(typeof(__traits(getMember,
 						T, field)), use, Ancestors, T)())
 					return r;
@@ -316,6 +319,59 @@ package(mcp) string unsupportedTypeReason(T, SchemaUse use, Ancestors...)()
 		return null; // custom-serialized, such as SysTime or Date
 	else
 		return T.stringof ~ ": the type has no JSON representation";
+}
+
+/// The first JSON Schema facet among `udas` that cannot constrain a `T`, as
+/// `@name`, or `null` when every facet fits: a string facet (`@minLength`,
+/// `@maxLength`, `@pattern`, `@schemaFormat`) needs a value written as a JSON
+/// string, `@minItems` / `@maxItems` an array, and `@minimum` / `@maximum` a
+/// number. A `Nullable` is judged by the type it wraps; `Json` and `SumType`
+/// values may take any shape, so every facet fits them.
+package(mcp) string facetMismatch(T, udas...)()
+{
+	import jsonschema.attributes : Maximum, Minimum, format, maxItems,
+		maxLength, minItems, minLength, pattern;
+	import std.datetime.date : Date, DateTime, TimeOfDay;
+	import std.datetime.systime : SysTime;
+	import std.sumtype : isSumType;
+
+	static if (isInstanceOf!(Nullable, T))
+		return facetMismatch!(TemplateArgsOf!T[0], udas)();
+	else static if (is(T == Json) || isSumType!T)
+		return null;
+	else
+	{
+		enum isString = isSomeString!T || is(T == enum) || is(T == SysTime)
+			|| is(T == Date) || is(T == DateTime) || is(T == TimeOfDay);
+		enum isList = isArray!T && !isString;
+		enum isNumber = (isIntegral!T || isFloatingPoint!T) && !is(T == enum);
+		static foreach (uda; udas)
+		{
+			static if (!is(uda))
+			{
+				static if (is(typeof(uda) == minLength)
+						|| is(typeof(uda) == maxLength)
+						|| is(typeof(uda) == pattern) || is(typeof(uda) == format))
+				{
+					if (!isString)
+						return "@" ~ typeof(uda).stringof ~ " applies only to a string";
+				}
+				else static if (is(typeof(uda) == minItems) || is(typeof(uda) == maxItems))
+				{
+					if (!isList)
+						return "@" ~ typeof(uda).stringof ~ " applies only to an array";
+				}
+				else static if (isInstanceOf!(Minimum, typeof(uda))
+						|| isInstanceOf!(Maximum, typeof(uda)))
+				{
+					if (!isNumber)
+						return "@" ~ (isInstanceOf!(Minimum, typeof(uda))
+								? "minimum" : "maximum") ~ " applies only to a number";
+				}
+			}
+		}
+		return null;
+	}
 }
 
 /// Whether a `@schemaDefault` value of type `V` can be the default of a `P`: it

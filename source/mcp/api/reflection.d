@@ -78,6 +78,7 @@ private void registerAnnotatedMembers(alias root, alias parent)(McpServer server
 				{
 					checkHandlerSafety!(memberName, overload)();
 					checkMethodFacets!(memberName, overload)();
+					checkUdaPlacement!(memberName, overload)();
 				}
 				static foreach (attr; __traits(getAttributes, overload))
 				{
@@ -229,6 +230,55 @@ private void checkMethodFacets(string memberName, alias f)()
 					~ "display title use @tool's title argument or @hintTitle)");
 }
 
+/// Reject a method-level MCP UDA on `f` that none of its handler kinds reads,
+/// so a misplaced one (`@cacheable` on a `@tool`, `@readOnly` on a `@prompt`)
+/// is an error rather than silently ignored.
+private void checkUdaPlacement(string memberName, alias f)()
+{
+	enum onTool = hasUDA!(f, tool) || hasUDA!(f, taskTool);
+	enum onTask = hasUDA!(f, taskTool);
+	enum onPrompt = hasUDA!(f, prompt);
+	enum onResource = hasUDA!(f, resource) || hasUDA!(f, resourceTemplate);
+	enum onEvent = hasUDA!(f, event);
+
+	static foreach (attr; __traits(getAttributes, f))
+	{
+		static if (__traits(isSame, attr, readOnly) || __traits(isSame, attr,
+				destructive) || __traits(isSame, attr, idempotent) || __traits(isSame,
+				attr, openWorld) || __traits(isSame, attr, strictArgs))
+			static assert(onTool, "@" ~ attr.stringof ~ " on '" ~ memberName
+					~ "' applies only to a @tool or @taskTool method");
+		else static if (!is(attr))
+		{
+			static if (is(typeof(attr) == hintTitle)
+					|| is(typeof(attr) == mcpHeader) || is(typeof(attr) == ui))
+				static assert(onTool, "@" ~ typeof(attr)
+						.stringof ~ " on '" ~ memberName
+						~ "' applies only to a @tool or @taskTool method");
+			else static if (is(typeof(attr) == taskTtl) || is(typeof(attr) == taskPollInterval))
+				static assert(onTask, "@" ~ typeof(attr)
+						.stringof ~ " on '" ~ memberName ~ "' applies only to a @taskTool method");
+			else static if (is(typeof(attr) == describeParam))
+				static assert(onTool || onPrompt, "@describeParam on '" ~ memberName
+						~ "' applies only to a @tool, @taskTool, or @prompt method");
+			else static if (is(typeof(attr) == audience)
+					|| is(typeof(attr) == priority)
+					|| is(typeof(attr) == lastModified) || is(typeof(attr) == cacheable))
+				static assert(onResource, "@" ~ typeof(attr).stringof ~ " on '" ~ memberName
+						~ "' applies only to a @resource or @resourceTemplate method");
+			else static if (is(typeof(attr) == icon) || is(typeof(attr) == meta))
+				static assert(onTool || onPrompt || onResource, "@" ~ typeof(attr)
+						.stringof ~ " on '" ~ memberName
+						~ "' applies only to a @tool, @taskTool, @prompt, @resource, or "
+						~ "@resourceTemplate method");
+			else static if (is(typeof(attr) == eventPollInterval))
+				static assert(onEvent,
+						"@eventPollInterval on '" ~ memberName
+						~ "' applies only to an @event method");
+		}
+	}
+}
+
 /// The wire names of `func`'s parameters, in order: each identifier with one
 /// trailing underscore dropped (see `wireName`), the names the input schema,
 /// prompt arguments, and URI template variables use.
@@ -270,7 +320,7 @@ private void checkParamNames(alias func)()
 /// than an error from deep inside schema generation or binding.
 private void checkParamTypes(alias func)()
 {
-	import mcp.api.binding : isDefaultFor, unsupportedTypeReason;
+	import mcp.api.binding : facetMismatch, isDefaultFor, unsupportedTypeReason;
 
 	alias ids = ParameterIdentifierTuple!func;
 	static foreach (i, P; BoundParameters!func)
@@ -281,6 +331,10 @@ private void checkParamTypes(alias func)()
 					"parameter '" ~ ids[i] ~ "' of '" ~ __traits(identifier,
 						func) ~ "' has type " ~ P.stringof ~ ", which cannot be bound from JSON ("
 					~ unsupportedTypeReason!(P, SchemaUse.input)() ~ ")");
+			static assert(facetMismatch!(P, ParamAttributes!(func, i))() is null,
+					"parameter '" ~ ids[i] ~ "' of '" ~ __traits(identifier,
+						func) ~ "' has type " ~ P.stringof ~ ", but " ~ facetMismatch!(P,
+						ParamAttributes!(func, i))());
 			static foreach (d; ParamSchemaDefaults!(func, i))
 				static assert(isDefaultFor!(P, typeof(d.value)),
 						"the @schemaDefault value of type " ~ typeof(d.value)
@@ -1001,6 +1055,11 @@ private GetPromptResult toPromptResult(R)(R ret) @safe
 private void registerPromptMethod(string memberName, alias overload, alias parent)(
 		McpServer server, prompt attr) @safe
 {
+	static foreach (P; BoundParameters!overload)
+		static assert(!is(P == TaskContext) && !is(P == EventContext)
+				&& !is(P == FetchContext),
+				"@prompt method '" ~ memberName ~ "' must not take a " ~ P.stringof
+				~ "; a prompt may take only a RequestContext besides its arguments");
 	checkParamNames!overload();
 	checkParamTypes!overload();
 	validateParamUdas!overload();
@@ -1178,6 +1237,10 @@ private void registerTemplateMethod(string memberName, alias overload,
 	if (attr.title.length)
 		descriptor.title = nullable(attr.title);
 
+	static foreach (P; BoundParameters!overload)
+		static assert(!is(P == TaskContext) && !is(P == EventContext) && !is(P == FetchContext),
+				"@resourceTemplate method '" ~ memberName ~ "' must not take a " ~ P.stringof
+				~ "; a resource template may take only a RequestContext besides its variables");
 	checkParamNames!overload();
 	checkParamTypes!overload();
 	// Every bound parameter must name a template variable; any other name would
@@ -4811,4 +4874,188 @@ unittest  // a @schemaDefault whose value does not convert to the parameter type
 	auto s = new McpServer("t", "1");
 	static assert(!__traits(compiles, registerHandlers(s, new MismatchedDefaultApi)));
 	static assert(!__traits(compiles, registerHandlers(s, new FractionalIntDefaultApi)));
+}
+
+version (unittest) private final class TaskTtlOnToolApi
+{
+	@tool("f", "f") @taskTtl(1.seconds)
+	string f() @safe
+	{
+		return "";
+	}
+}
+
+version (unittest) private final class CacheableOnToolApi
+{
+	@tool("f", "f") @cacheable(1.seconds)
+	string f() @safe
+	{
+		return "";
+	}
+}
+
+version (unittest) private final class UiOnResourceApi
+{
+	@resource("test://r", "r") @ui("ui://demo/widget")
+	string r() @safe
+	{
+		return "";
+	}
+}
+
+version (unittest) private final class ReadOnlyOnPromptApi
+{
+	@prompt("p", "p") @readOnly string p() @safe
+	{
+		return "";
+	}
+}
+
+version (unittest) private final class StrictArgsOnPromptApi
+{
+	@prompt("p", "p") @strictArgs string p(string topic) @safe
+	{
+		return topic;
+	}
+}
+
+version (unittest) private final class McpHeaderOnPromptApi
+{
+	@prompt("p", "p") @mcpHeader("topic", "Topic")
+	string p(string topic) @safe
+	{
+		return topic;
+	}
+}
+
+version (unittest) private final class DescribeParamOnTemplateApi
+{
+	@resourceTemplate("test://{id}", "t") @describeParam("nope", "missing")
+	string t(string id) @safe
+	{
+		return id;
+	}
+}
+
+version (unittest) private final class MinLengthOnIntApi
+{
+	@tool("f", "f")
+	string f(@minLength(2) int n)@safe
+	{
+		return "";
+	}
+}
+
+version (unittest) private final class MinimumOnStringApi
+{
+	@tool("f", "f")
+	string f(@minimum(2) string s)@safe
+	{
+		return s;
+	}
+}
+
+version (unittest) private struct MinItemsOnScalar
+{
+	@minItems(1) int n;
+}
+
+version (unittest) private final class MinItemsOnFieldApi
+{
+	@tool("f", "f")
+	string f(MinItemsOnScalar arg) @safe
+	{
+		return "";
+	}
+}
+
+version (unittest) private final class TaskContextPromptApi
+{
+	@prompt("p", "p")
+	string p(string topic, TaskContext tc) @safe
+	{
+		return topic;
+	}
+}
+
+version (unittest) private final class EventPollOnToolApi
+{
+	@tool("f", "f") @eventPollInterval(1.seconds)
+	string f() @safe
+	{
+		return "";
+	}
+}
+
+version (unittest) private final class FittingUdasApi
+{
+	@prompt("p", "p") @icon("https://example.com/p.png") @describeParam("topic", "what")
+	string p(@minLength(1) string topic)@safe
+	{
+		return topic;
+	}
+
+	@resourceTemplate("test://{id}", "t") @cacheable(1.seconds) @priority(0.5)
+	string t(string id) @safe
+	{
+		return id;
+	}
+}
+
+unittest  // @taskTtl on a plain @tool is rejected at compile time
+{
+	auto s = new McpServer("t", "1");
+	static assert(!__traits(compiles, registerHandlers(s, new TaskTtlOnToolApi)));
+}
+
+unittest  // @cacheable on a @tool is rejected at compile time
+{
+	auto s = new McpServer("t", "1");
+	static assert(!__traits(compiles, registerHandlers(s, new CacheableOnToolApi)));
+}
+
+unittest  // @ui on a @resource is rejected at compile time
+{
+	auto s = new McpServer("t", "1");
+	static assert(!__traits(compiles, registerHandlers(s, new UiOnResourceApi)));
+}
+
+unittest  // tool-only UDAs on a @prompt are rejected at compile time
+{
+	auto s = new McpServer("t", "1");
+	static assert(!__traits(compiles, registerHandlers(s, new ReadOnlyOnPromptApi)));
+	static assert(!__traits(compiles, registerHandlers(s, new StrictArgsOnPromptApi)));
+	static assert(!__traits(compiles, registerHandlers(s, new McpHeaderOnPromptApi)));
+}
+
+unittest  // @describeParam on a @resourceTemplate is rejected at compile time
+{
+	auto s = new McpServer("t", "1");
+	static assert(!__traits(compiles, registerHandlers(s, new DescribeParamOnTemplateApi)));
+}
+
+unittest  // a facet that does not fit its parameter or field type is rejected at compile time
+{
+	auto s = new McpServer("t", "1");
+	static assert(!__traits(compiles, registerHandlers(s, new MinLengthOnIntApi)));
+	static assert(!__traits(compiles, registerHandlers(s, new MinimumOnStringApi)));
+	static assert(!__traits(compiles, registerHandlers(s, new MinItemsOnFieldApi)));
+}
+
+unittest  // a TaskContext parameter on a @prompt is rejected at compile time
+{
+	auto s = new McpServer("t", "1");
+	static assert(!__traits(compiles, registerHandlers(s, new TaskContextPromptApi)));
+}
+
+unittest  // @eventPollInterval on a @tool is rejected at compile time
+{
+	auto s = new McpServer("t", "1");
+	static assert(!__traits(compiles, registerHandlers(s, new EventPollOnToolApi)));
+}
+
+unittest  // UDAs that fit their handler kind and parameter types still register
+{
+	auto s = new McpServer("t", "1");
+	registerHandlers(s, new FittingUdasApi);
 }
