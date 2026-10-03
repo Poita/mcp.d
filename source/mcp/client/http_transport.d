@@ -466,8 +466,10 @@ final class HttpClientTransport : ClientTransport
 	// until they return, so with every permit held they could never get one.
 	private Task[] handlerTasks;
 
+	/// Throws when `url` is not a valid `http(s)://host[:port][/path]` endpoint.
 	this(string url, uint maxInFlight = 0) @safe
 	{
+		parseHttpEndpoint(url);
 		this.url = url;
 		this.maxInFlight = maxInFlight;
 	}
@@ -2393,12 +2395,15 @@ private struct HttpEndpoint
 	}
 }
 
-/// Parse `scheme://host[:port][/path]` into its components, defaulting the port
-/// to 443 for a TLS scheme (https/wss) and 80 otherwise. An absent path becomes
-/// "/". Tolerates a missing scheme (treated as non-TLS). See `HttpEndpoint`.
+/// Parse `scheme://host[:port][/path][?query]` into its components, defaulting
+/// the port to 443 for a TLS scheme (https/wss) and 80 otherwise. The path keeps
+/// any query; an absent path becomes "/" and a fragment is dropped, as it never
+/// reaches the request target. Tolerates a missing scheme (treated as non-TLS).
+/// Throws on an empty host, userinfo (`user@host`), or a port that is not a
+/// number in 1-65535. See `HttpEndpoint`.
 private HttpEndpoint parseHttpEndpoint(string url) @safe
 {
-	import std.string : indexOf, toLower;
+	import std.string : indexOf, indexOfAny, toLower;
 	import std.conv : to;
 
 	HttpEndpoint ep;
@@ -2412,9 +2417,15 @@ private HttpEndpoint parseHttpEndpoint(string url) @safe
 	}
 	ep.tls = scheme == "https" || scheme == "wss";
 
-	const slash = rest.indexOf('/');
-	const hostPort = (slash < 0) ? rest : rest[0 .. slash];
-	ep.path = (slash < 0) ? "/" : rest[slash .. $];
+	const hash = rest.indexOf('#');
+	if (hash >= 0)
+		rest = rest[0 .. hash];
+	const authEnd = rest.indexOfAny("/?");
+	const hostPort = (authEnd < 0) ? rest : rest[0 .. authEnd];
+	ep.path = (authEnd < 0) ? "/" : rest[authEnd] == '?' ? "/"
+		~ rest[authEnd .. $] : rest[authEnd .. $];
+	if (hostPort.indexOf('@') >= 0)
+		throw new Exception("MCP endpoint URL must not carry userinfo: " ~ url);
 
 	const defaultPort = ep.tls ? cast(ushort) 443 : cast(ushort) 80;
 
@@ -2423,6 +2434,7 @@ private HttpEndpoint parseHttpEndpoint(string url) @safe
 	// brackets are kept on `ep.host` (the form the `Host` header needs); the SNI
 	// and connect paths strip them where the bare address is required.
 	string portText;
+	bool hasPort;
 	if (hostPort.length && hostPort[0] == '[')
 	{
 		const close = hostPort.indexOf(']');
@@ -2436,7 +2448,10 @@ private HttpEndpoint parseHttpEndpoint(string url) @safe
 			ep.host = hostPort[0 .. close + 1];
 			const after = hostPort[close + 1 .. $];
 			if (after.length && after[0] == ':')
+			{
+				hasPort = true;
 				portText = after[1 .. $];
+			}
 		}
 	}
 	else
@@ -2444,17 +2459,27 @@ private HttpEndpoint parseHttpEndpoint(string url) @safe
 		const colon = hostPort.indexOf(':');
 		ep.host = (colon < 0) ? hostPort : hostPort[0 .. colon];
 		if (colon >= 0)
+		{
+			hasPort = true;
 			portText = hostPort[colon + 1 .. $];
+		}
 	}
+	if (ep.host.length == 0)
+		throw new Exception("MCP endpoint URL has no host: " ~ url);
 
-	if (portText.length == 0)
+	if (!hasPort)
 		ep.port = defaultPort;
 	else
 	{
+		ushort port;
 		try
-			ep.port = portText.to!ushort;
+			port = portText.to!ushort;
 		catch (Exception)
-			ep.port = defaultPort;
+		{
+		}
+		if (port == 0)
+			throw new Exception("MCP endpoint URL has an invalid port: " ~ url);
+		ep.port = port;
 	}
 	return ep;
 }
@@ -2618,9 +2643,14 @@ private bool sameOrigin(string base, string candidate) @safe
 {
 	import std.string : toLower;
 
-	auto b = parseHttpEndpoint(base);
-	auto c = parseHttpEndpoint(candidate);
-	return b.tls == c.tls && b.host.toLower == c.host.toLower && b.port == c.port;
+	try
+	{
+		auto b = parseHttpEndpoint(base);
+		auto c = parseHttpEndpoint(candidate);
+		return b.tls == c.tls && b.host.toLower == c.host.toLower && b.port == c.port;
+	}
+	catch (Exception)
+		return false; // a malformed URL shares no origin
 }
 
 /// The components of a URI reference (RFC 3986 §3). A `has*` flag distinguishes
@@ -2798,6 +2828,37 @@ unittest  // parseHttpEndpoint defaults the port per scheme (443 for TLS)
 
 	auto bare = parseHttpEndpoint("host:9000/p");
 	assert(!bare.tls && bare.port == 9000 && bare.host == "host" && bare.path == "/p");
+}
+
+unittest  // parseHttpEndpoint rejects an invalid port and userinfo
+{
+	import std.exception : assertThrown;
+
+	assertThrown(parseHttpEndpoint("http://localhost:99999/mcp"));
+	assertThrown(parseHttpEndpoint("http://localhost:abc/mcp"));
+	assertThrown(parseHttpEndpoint("https://host:/mcp"));
+	assertThrown(parseHttpEndpoint("https://u:p@host/mcp"));
+	assertThrown(parseHttpEndpoint("https:///mcp"));
+}
+
+unittest  // parseHttpEndpoint ends the host at a query or fragment and drops the fragment
+{
+	auto q = parseHttpEndpoint("https://host?x=1");
+	assert(q.host == "host" && q.port == 443 && q.path == "/?x=1");
+
+	auto f = parseHttpEndpoint("https://host:8443#frag");
+	assert(f.host == "host" && f.port == 8443 && f.path == "/");
+
+	auto pf = parseHttpEndpoint("http://host/mcp?a=b#frag");
+	assert(pf.path == "/mcp?a=b");
+}
+
+unittest  // an HTTP transport rejects a malformed endpoint URL at construction
+{
+	import std.exception : assertThrown;
+
+	assertThrown(new HttpClientTransport("http://localhost:99999/mcp"));
+	assert(!sameOrigin("https://host/mcp", "https://u@host/messages"));
 }
 
 unittest  // parseHttpEndpoint keeps the explicit port and bracketed host for IPv6 literals

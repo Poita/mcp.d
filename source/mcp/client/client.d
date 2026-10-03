@@ -880,7 +880,8 @@ final class McpClient : ClientProtocol
 
 	/// Build a client over the Streamable HTTP transport at `url`. `settings`
 	/// carries the client identity plus the HTTP transport knobs (connect timeout
-	/// and in-flight cap); see `ClientSettings`.
+	/// and in-flight cap); see `ClientSettings`. Throws when `url` is not a valid
+	/// `http(s)://host[:port][/path]` endpoint (a bad port, userinfo, no host).
 	static McpClient http(string url, ClientSettings settings = ClientSettings.init) @safe
 	{
 		auto transport = new HttpClientTransport(url, settings.maxInFlight);
