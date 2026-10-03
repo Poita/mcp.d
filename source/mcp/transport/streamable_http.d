@@ -1585,7 +1585,7 @@ unittest  // resourceOrigin strips the path from a configured resource identifie
 /// stream, so a client whose `Accept` provably excludes that media type cannot
 /// consume what the server would send. A media type is admitted by an exact
 /// `text/event-stream` token, by the `text/*` subtype wildcard, or by the `*/*`
-/// full wildcard; quality and other parameters after a `;` are ignored. An empty
+/// full wildcard, unless the most specific matching range carries `q=0`. An empty
 /// value (no `Accept` header) is treated permissively as acceptable, since the
 /// transport never required clients to send one. Only a header that names media
 /// types and omits any matching one returns false.
@@ -1626,20 +1626,22 @@ unittest  // matching is case-insensitive and tolerant of surrounding whitespace
 /// Whether the given `Accept` request-header value admits an `application/json`
 /// response — the single-JSON reply a plain POST request receives. Matching
 /// mirrors `acceptsEventStream`: an exact `application/json` token, the
-/// `application/*` subtype wildcard, or the `*/*` full wildcard; quality and
-/// other `;`-parameters are ignored. An empty value (no `Accept`) is permissive.
+/// `application/*` subtype wildcard, or the `*/*` full wildcard, unless the
+/// most specific matching range carries `q=0`. An empty value (no `Accept`) is
+/// permissive.
 bool acceptsJson(string accept) @safe
 {
 	return acceptsMediaType(accept, "application", "json");
 }
 
 /// Whether the `Accept` value `accept` admits the media type `type/subtype`: an
-/// exact token, the `type/*` subtype wildcard, or the `*/*` full wildcard, with
-/// `;`-parameters ignored and case-insensitive matching. An empty value (no
-/// `Accept`) is permissive.
+/// exact token, the `type/*` subtype wildcard, or the `*/*` full wildcard,
+/// matched case-insensitively. The most specific matching range decides, and
+/// one weighted `q=0` excludes the type (RFC 9110 §12.5.1); other parameters
+/// are ignored. An empty value (no `Accept`) is permissive.
 private bool acceptsMediaType(string accept, string type, string subtype) @safe
 {
-	import std.algorithm : findSplitBefore, splitter;
+	import std.algorithm : splitter;
 	import std.string : strip, toLower;
 
 	auto trimmed = accept.strip;
@@ -1647,13 +1649,35 @@ private bool acceptsMediaType(string accept, string type, string subtype) @safe
 		return true;
 	const exact = type ~ "/" ~ subtype;
 	const anySubtype = type ~ "/*";
+	int best = -1; // specificity of the most specific matching range so far
+	bool admitted;
 	foreach (part; trimmed.splitter(','))
 	{
-		const token = part.findSplitBefore(";")[0].strip.toLower;
-		if (token == exact || token == anySubtype || token == "*/*")
-			return true;
+		auto fields = part.splitter(';');
+		const token = fields.front.strip.toLower;
+		fields.popFront();
+		const specificity = token == exact ? 2 : token == anySubtype ? 1 : token == "*/*" ? 0 : -1;
+		if (specificity < 0 || specificity < best)
+			continue;
+		bool positive = true;
+		foreach (param; fields)
+		{
+			import std.algorithm : findSplit;
+			import std.conv : to;
+
+			auto kv = param.findSplit("=");
+			if (kv[0].strip.toLower != "q")
+				continue;
+			try
+				positive = kv[2].strip.to!double > 0;
+			catch (Exception)
+			{
+			}
+		}
+		admitted = specificity > best ? positive : admitted || positive;
+		best = specificity;
 	}
-	return false;
+	return admitted;
 }
 
 unittest  // an Accept that names application/json (or a wildcard covering it) is admitted
@@ -2886,7 +2910,12 @@ private void handlePost(McpServer server, ServerPushChannel push,
 			// (400 for unsupported-version/header-mismatch, modern 404 for
 			// method-not-found); everything else rides on 200.
 			res.statusCode = httpStatusForResponse(j, isModernReq);
-			res.writeBody(j.toString(), "application/json");
+			// A client that accepts only text/event-stream gets the reply as a
+			// single SSE event, since it declared it cannot read a JSON body.
+			if (acceptsJson(req.headers.get("Accept", "")))
+				res.writeBody(j.toString(), "application/json");
+			else
+				res.writeBody(formatSseEvent("", j), "text/event-stream");
 		}
 		return;
 	}
@@ -5277,6 +5306,37 @@ version (unittest) private HTTPServerRequest sessionReq(HTTPMethod method,
 	auto req = makeInitPostReq(body_, h);
 	req.method = method;
 	return req;
+}
+
+unittest  // a POST accepting only text/event-stream gets its non-streamed reply as an SSE event
+{
+	import std.algorithm : canFind;
+	import vibe.http.server : createTestHTTPServerResponse, TestHTTPResponseMode;
+	import vibe.stream.memory : createMemoryOutputStream;
+
+	auto router = new URLRouter;
+	mountMcp(router, McpServer.stateful("t", "1"));
+	const sid = initSession(router);
+	auto sink = createMemoryOutputStream();
+	auto res = createTestHTTPServerResponse(sink, null, TestHTTPResponseMode.bodyOnly);
+	router.handleRequest(sessionReq(HTTPMethod.POST, sid,
+			`{"jsonrpc":"2.0","id":7,"method":"ping"}`, "text/event-stream"), res);
+	assert(res.statusCode == HTTPStatus.ok);
+	assert(res.headers.get("Content-Type", "").canFind("text/event-stream"));
+	const body_ = () @trusted { return cast(string) sink.data.idup; }();
+	assert(body_.canFind("data: ") && body_.canFind(`"id":7`), body_);
+}
+
+unittest  // an Accept range with q=0 excludes the media types it matches most specifically
+{
+	assert(!acceptsJson("application/json;q=0"));
+	assert(!acceptsJson("*/*, application/json; q=0"));
+	assert(!acceptsJson("application/*;q=0.0"));
+	assert(acceptsJson("application/json;q=0.5"));
+	assert(acceptsJson("*/*;q=0, application/json"));
+	assert(!acceptsEventStream("text/event-stream;q=0, application/json"));
+	assert(!postAccepted("application/json;q=0, text/event-stream;q=0"));
+	assert(postAccepted("application/json;q=0, text/event-stream"));
 }
 
 unittest  // a stateful GET whose Accept excludes text/event-stream is 406, not 405
