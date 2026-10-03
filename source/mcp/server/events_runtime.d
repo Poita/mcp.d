@@ -265,7 +265,6 @@ final class EventHandle(A, P)
 			o.data = serializePayload(e.payload);
 			if (e.cursor.length)
 				o.cursor = e.cursor;
-			rt_.stamp(o); // fill eventId/timestamp when the author left them empty
 			occs ~= o;
 		}
 		EventResult r;
@@ -988,7 +987,7 @@ final class EventsRuntime
 		}
 		else
 		{
-			auto er = p.check(ctx);
+			auto er = runCheck(p, ctx);
 			out_.events = er.events;
 			out_.cursor = er.cursor;
 			out_.truncated = er.truncated;
@@ -1602,7 +1601,7 @@ final class EventsRuntime
 		{
 			auto ctx = new EventContext(sub.fetchCursor, sub.arguments, sub.principal, maxAgeMs);
 			try
-				er = reg.check(ctx);
+				er = runCheck(*reg, ctx);
 			catch (Exception e)
 			{
 				// The upstream is unavailable: no replay, delivery continues live.
@@ -1667,7 +1666,7 @@ final class EventsRuntime
 				auto ctx = new EventContext(sub.fetchCursor, sub.arguments, sub.principal);
 				EventResult er;
 				try
-					er = reg.check(ctx);
+					er = runCheck(*reg, ctx);
 				catch (Exception e)
 				{
 					// A transient upstream failure: the next pass tries again.
@@ -3029,6 +3028,18 @@ final class EventsRuntime
 			occ.eventId = randomEventId();
 		if (occ.timestamp.length == 0)
 			occ.timestamp = opts_.nowIso();
+	}
+
+	// Run a type's check function and stamp the identity fields it left empty on
+	// each returned event: poll clients dedup on `eventId`, and the webhook outbox
+	// keys each delivery job on it, so id-less events would otherwise collapse
+	// into one job.
+	private EventResult runCheck(ref EventRegistration reg, EventContext ctx) @safe
+	{
+		auto er = reg.check(ctx);
+		foreach (ref occ; er.events)
+			stamp(occ);
+		return er;
 	}
 
 	private void touchPollLease(ref EventRegistration reg, string name,
@@ -7954,4 +7965,45 @@ unittest  // re-publishing an event id already queued does not wedge the waterma
 		deferred[i]();
 	assert(ft.eventPosts().length == 2);
 	assert(rt.webhookStore().get(r.id).get.cursor.get == seqCursor(3));
+}
+
+unittest  // a raw check's events with no eventId or timestamp are stamped on poll
+{
+	auto rt = new EventsRuntime();
+	EventRegistration reg;
+	reg.descriptor.name = "raw";
+	reg.check = (EventContext ctx) @safe {
+		EventOccurrence a, b;
+		a.name = b.name = "raw";
+		return EventResult.of([a, b], "c1");
+	};
+	rt.register(reg);
+	auto r = rt.poll("raw", Json.emptyObject, "u", nullable("c0"),
+			Nullable!long.init, Nullable!long.init);
+	assert(r.events.length == 2);
+	assert(r.events[0].eventId.length && r.events[1].eventId.length);
+	assert(r.events[0].eventId != r.events[1].eventId);
+	assert(r.events[0].timestamp.length && r.events[1].timestamp.length);
+}
+
+unittest  // a raw check's id-less events each reach a webhook subscriber
+{
+	auto ft = new FakeWebhookTransport();
+	auto rt = engineRuntime(ft);
+	EventRegistration reg;
+	reg.descriptor.name = "raw";
+	reg.check = (EventContext ctx) @safe {
+		if (ctx.isBootstrap())
+			return EventResult.empty("h0");
+		EventOccurrence a, b, c;
+		a.name = b.name = c.name = "raw";
+		return EventResult.of([a, b, c], "h1");
+	};
+	rt.register(reg);
+	auto p = webhookSub("raw", "https://proxy/hooks");
+	p.cursor = "h0";
+	rt.subscribeWebhook(p, "user-1");
+	assert(ft.eventPosts().length == 3);
+	rt.pollWebhookSubscriptions();
+	assert(ft.eventPosts().length == 6);
 }
