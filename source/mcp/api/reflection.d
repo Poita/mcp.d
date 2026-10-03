@@ -583,8 +583,20 @@ private bool argPresent(Json args, string name) @safe
 		&& args[name].type != Json.Type.undefined;
 }
 
+/// Whether argument `name` of a `P` parameter is an explicit JSON `null` that
+/// binds as unset: `P` is `Nullable`, so `null` is a value of its own rather
+/// than an omission that takes the parameter's default.
+private bool isExplicitNull(P)(Json args, string name) @safe
+{
+	static if (isInstanceOf!(Nullable, P))
+		return (name in args) !is null && args[name].type == Json.Type.null_;
+	else
+		return false;
+}
+
 /// Convert one JSON argument value into the parameter type `P`, falling back to
-/// the parameter's declared D-level default `def` when the argument is absent.
+/// the parameter's declared D-level default `def` when the argument is absent
+/// (an explicit `null` for a `Nullable` binds as unset).
 /// `def` is the value from `ParameterDefaultValueTuple` for this slot.
 private P marshalArgDefault(P, alias def, bool stringArgs = false)(Json args, string name) @safe
 {
@@ -594,6 +606,8 @@ private P marshalArgDefault(P, alias def, bool stringArgs = false)(Json args, st
 	}
 	else
 	{
+		if (isExplicitNull!P(args, name))
+			return P.init;
 		if (!argPresent(args, name))
 			return def;
 		return marshalArg!(P, stringArgs)(args, name);
@@ -842,7 +856,7 @@ private string bindToolArgs(alias overload)(Json args, ref Tuple!(BoundParameter
 				{
 					if (argPresent(args, names[i]))
 						setBound(argv[i], marshalArg!P(args, names[i]));
-					else
+					else if (!isExplicitNull!P(args, names[i]))
 						setBound(argv[i], defaultAs!(P, ParamSchemaDefaults!(overload, i)[0])());
 				}
 				else static if (is(defs[i] == void))
@@ -1146,7 +1160,7 @@ private void registerPromptMethod(string memberName, alias overload, alias paren
 					catch (Exception e)
 						throw invalidParams("argument '" ~ names[i] ~ "': " ~ e.msg);
 				}
-				else
+				else if (!isExplicitNull!P(args, names[i]))
 					setBound(argv[i], defaultAs!(P, ParamSchemaDefaults!(overload, i)[0])());
 			}
 			else static if (is(defs[i] == void))
@@ -5201,4 +5215,55 @@ unittest  // an out-of-range @priority is rejected at registration even without 
 {
 	auto s = new McpServer("t", "1");
 	static assert(!__traits(compiles, registerHandlers(s, new OutOfRangePriorityApi)));
+}
+
+version (unittest) private final class NullableDefaultApi
+{
+	import jsonschema : schemaDefault;
+
+	@tool("viaUda", "Nullable with a @schemaDefault")
+	string viaUda(@schemaDefault(5) Nullable!int n)@safe
+	{
+		import std.conv : to;
+
+		return n.isNull ? "unset" : n.get.to!string;
+	}
+
+	@tool("viaD", "Nullable with a D default")
+	string viaD(Nullable!int n = 5) @safe
+	{
+		import std.conv : to;
+
+		return n.isNull ? "unset" : n.get.to!string;
+	}
+
+	@prompt("p", "Nullable prompt argument with a @schemaDefault")
+	string p(@schemaDefault("x") Nullable!string topic)@safe
+	{
+		return topic.isNull ? "unset" : topic.get;
+	}
+}
+
+unittest  // an explicit null for a defaulted Nullable parameter binds as unset
+{
+	auto s = new McpServer("t", "1");
+	registerHandlers(s, new NullableDefaultApi);
+	Json nullArg = Json(["n": Json(null)]);
+	assert(callToolResult(s, "viaUda", nullArg)["content"][0]["text"] == Json("unset"));
+	assert(callToolResult(s, "viaD", nullArg)["content"][0]["text"] == Json("unset"));
+	assert(callToolResult(s, "viaUda", Json.emptyObject)["content"][0]["text"] == Json("5"));
+	assert(callToolResult(s, "viaD", Json.emptyObject)["content"][0]["text"] == Json("5"));
+}
+
+unittest  // an explicit null for a defaulted Nullable prompt argument binds as unset
+{
+	import mcp.protocol.jsonrpc : Message, makeRequest;
+
+	auto s = new McpServer("t", "1");
+	registerHandlers(s, new NullableDefaultApi);
+	Json pp = Json.emptyObject;
+	pp["name"] = "p";
+	pp["arguments"] = Json(["topic": Json(null)]);
+	auto r = s.handle(Message(makeRequest(Json(2), "prompts/get", pp))).get["result"];
+	assert(r["messages"][0]["content"]["text"] == Json("unset"), r.toString);
 }

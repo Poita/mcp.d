@@ -546,6 +546,8 @@ package(mcp) T bindJson(T)(Json v, string path = "")
 					auto p = key in v;
 					if (isPresent!FT(p))
 						setBound(__traits(getMember, result, field), bindJson!FT(*p, fieldPath));
+					else if (isInstanceOf!(Nullable, FT) && p !is null && p.type == Json.Type.null_)
+						setBound(__traits(getMember, result, field), FT.init);
 					else static if (hasUDA!(__traits(getMember, T, field), SchemaDefault))
 						setBound(__traits(getMember, result, field), defaultAs!(FT,
 								getUDAs!(__traits(getMember, T, field), SchemaDefault)[0])());
@@ -626,7 +628,8 @@ package(mcp) void setBound(X)(ref X dst, X value)
 }
 
 /// Whether a struct member's JSON value `p` counts as supplied. JSON `null`
-/// means absent except for a `Json` field, which binds `null` verbatim.
+/// means not supplied except for a `Json` field, which binds `null` verbatim; a
+/// `Nullable` field given `null` binds as unset rather than taking its default.
 private bool isPresent(FT)(const(Json)* p)
 {
 	if (p is null || p.type == Json.Type.undefined)
@@ -1199,4 +1202,21 @@ unittest  // a @schemaDefault takes precedence over a field's initializer as its
 
 	auto s = schemaOf!(S, SchemaUse.input)();
 	assert(s["properties"]["limit"]["default"] == Json(3), s.toString);
+}
+
+unittest  // an explicit null for a defaulted Nullable field binds as unset
+{
+	import jsonschema : schemaDefault;
+	import vibe.data.json : parseJsonString;
+
+	static struct S
+	{
+		@schemaDefault(5) Nullable!int a;
+		Nullable!int b = 7;
+	}
+
+	auto s = bindJson!S(parseJsonString(`{"a":null,"b":null}`));
+	assert(s.a.isNull && s.b.isNull);
+	auto d = bindJson!S(parseJsonString(`{}`));
+	assert(d.a.get == 5 && d.b.get == 7);
 }
