@@ -966,8 +966,8 @@ final class McpClient : ClientProtocol
 	void close() @safe
 	{
 		closed_ = true;
-		if (pollWakeInit_)
-			pollWake_.emit();
+		foreach (wake; pollWakes_)
+			wake.emit();
 		foreach (sub; liveSubscriptions_.keys)
 			sub.cancel();
 		liveSubscriptions_ = null;
@@ -2375,16 +2375,16 @@ final class McpClient : ClientProtocol
 			}
 		if (d <= Duration.zero || closed_)
 			return;
-		if (!pollWakeInit_)
-		{
-			pollWake_ = createManualEvent();
-			pollWakeInit_ = true;
-		}
-		const ec = pollWake_.emitCount;
+		auto wake = createManualEvent();
+		const key = nextPollWake_++;
+		pollWakes_[key] = wake;
+		scope (exit)
+			pollWakes_.remove(key);
+		const ec = wake.emitCount;
 		ulong hookKey;
 		if (cancellation !is null)
 		{
-			hookKey = cancellation.bind((string) @safe { pollWake_.emit(); });
+			hookKey = cancellation.bind((string) @safe { wake.emit(); });
 			if (cancellation.isCancelled)
 			{
 				cancellation.unbind(hookKey);
@@ -2394,13 +2394,15 @@ final class McpClient : ClientProtocol
 		scope (exit)
 			if (cancellation !is null)
 				cancellation.unbind(hookKey);
-		pollWake_.wait(d, ec);
+		wake.wait(d, ec);
 	}
 
-	// Woken by `close()` and by a cancelled task wait, so `taskPollSleep` never
-	// sleeps out a long poll interval after its caller has gone away.
-	private LocalManualEvent pollWake_;
-	private bool pollWakeInit_;
+	// One event per sleeping task poll, woken by its own wait's cancellation and
+	// by `close()`, so `taskPollSleep` never sleeps out a long poll interval
+	// after its caller has gone away, and one wait's cancellation leaves the
+	// others asleep.
+	private LocalManualEvent[ulong] pollWakes_;
+	private ulong nextPollWake_;
 
 	version (unittest) package void delegate(Duration) @safe onTaskSleepForTest;
 
@@ -5249,6 +5251,97 @@ unittest  // cancelling a task wait wakes it from a long poll interval
 	runEventLoop();
 	assert(code == ErrorCode.requestCancelled);
 	assert(took < 2.seconds, "a cancelled task wait must not sleep out the poll interval");
+}
+
+unittest  // cancelling one task wait does not wake another into an early poll
+{
+	import vibe.core.core : exitEventLoop, runEventLoop, runTask, sleep;
+
+	auto c = McpClient.http("http://localhost");
+	int[string] polls;
+	c.onRpcForTest = (string method, Json params) @safe {
+		if (method == "tasks/cancel")
+			return Json.emptyObject;
+		const id = params["taskId"].get!string;
+		polls[id] = polls.get(id, 0) + 1;
+		return Json([
+			"taskId": Json(id),
+			"status": Json("working"),
+			"pollIntervalMs": Json(30_000)
+		]);
+	};
+	auto first = new CancellationToken;
+	auto second = new CancellationToken;
+	int done;
+	foreach (pair; [["t1", "first"], ["t2", "second"]])
+	{
+		auto token = pair[1] == "first" ? first : second;
+		string id = pair[0];
+		runTask((string taskId, CancellationToken tok) nothrow{
+			scope (exit)
+				if (++done == 2)
+					exitEventLoop();
+			try
+				c.awaitTaskImpl(taskId, null, tok);
+			catch (Exception)
+			{
+			}
+		}, id, token);
+	}
+	runTask(() nothrow{
+		try
+		{
+			sleep(100.msecs);
+			first.cancel();
+			sleep(200.msecs);
+			second.cancel();
+		}
+		catch (Exception)
+		{
+		}
+	});
+	runEventLoop();
+	assert(polls["t2"] == 1, "another wait's cancellation must not wake this one");
+}
+
+unittest  // close() wakes every task wait from a long poll interval
+{
+	import core.time : MonoTime;
+	import vibe.core.core : exitEventLoop, runEventLoop, runTask, sleep;
+
+	auto c = McpClient.http("http://localhost");
+	c.onRpcForTest = (string method, Json params) @safe {
+		return Json([
+			"taskId": params["taskId"],
+			"status": Json("working"),
+			"pollIntervalMs": Json(30_000)
+		]);
+	};
+	const start = MonoTime.currTime;
+	int done;
+	foreach (string id; ["t1", "t2"])
+		runTask((string taskId) nothrow{
+			scope (exit)
+				if (++done == 2)
+					exitEventLoop();
+			try
+				c.awaitTaskImpl(taskId, null, null);
+			catch (Exception)
+			{
+			}
+		}, id);
+	runTask(() nothrow{
+		try
+		{
+			sleep(100.msecs);
+			c.close();
+		}
+		catch (Exception)
+		{
+		}
+	});
+	runEventLoop();
+	assert(MonoTime.currTime - start < 2.seconds, "close() must wake every sleeping task wait");
 }
 
 unittest  // awaitTask fails fast on input_required when no handler is given
