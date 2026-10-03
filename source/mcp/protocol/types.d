@@ -142,6 +142,7 @@ struct ResourceLink
 	Nullable!string description; /// optional human-readable description
 	Nullable!string title; /// optional human-readable display name
 	Nullable!long size; /// optional size in bytes of the linked resource
+	Icon[] icons; /// optional icons for display in user interfaces (2025-11-25+)
 	mixin ContentMetaFields;
 
 	Json toJson() const @safe
@@ -158,6 +159,13 @@ struct ResourceLink
 			j["mimeType"] = mimeType;
 		if (!size.isNull)
 			j["size"] = size.get;
+		if (icons.length)
+		{
+			Json arr = Json.emptyArray;
+			foreach (icon; icons)
+				arr ~= icon.toJson();
+			j["icons"] = arr;
+		}
 		emitMeta(j);
 		return j;
 	}
@@ -376,6 +384,17 @@ struct Content
 		return payload.match!((const ref ResourceLink c) => c.size, _ => Nullable!long.init);
 	}
 
+	/// The `icons` of a `resource_link` block (empty for every other kind).
+	Icon[] icons() const @safe
+	{
+		return payload.match!((const ref ResourceLink c) {
+			Icon[] dup;
+			foreach (icon; c.icons)
+				dup ~= icon.dup();
+			return dup;
+		}, _ => Icon[].init);
+	}
+
 	string id() const @safe
 	{
 		return payload.match!((const ref ToolUseContent c) => c.id, _ => "");
@@ -445,6 +464,11 @@ struct Content
 			{
 				static if (is(typeof(x.tupleof[i]) == Annotations))
 					x.tupleof[i] = c.tupleof[i].dup;
+				else static if (is(typeof(x.tupleof[i]) == Icon[]))
+				{
+					foreach (icon; c.tupleof[i])
+						x.tupleof[i] ~= icon.dup();
+				}
 				else
 					x.tupleof[i] = c.tupleof[i];
 			}
@@ -482,6 +506,18 @@ struct Content
 		Content c = dupSelf();
 		c.payload.match!((ref ResourceLink x) { x.title = t; }, (ref _) {
 			throw new Exception("withTitle is only valid on resource_link content");
+		});
+		return c;
+	}
+
+	/// Attach optional `icons` to a `resource_link` content block (`ResourceLink`
+	/// extends `Resource`, which carries icons from 2025-11-25). Returns a copy.
+	/// Only valid for the `resourceLink` kind.
+	Content withIcons(Icon[] icons) const @safe
+	{
+		Content c = dupSelf();
+		c.payload.match!((ref ResourceLink x) { x.icons = icons; }, (ref _) {
+			throw new Exception("withIcons is only valid on resource_link content");
 		});
 		return c;
 	}
@@ -625,6 +661,7 @@ struct Content
 	///   both introduced in v2025-06-18, so for any older peer (v2024-11-05 or
 	///   v2025-03-26) the `_meta` key is dropped and `annotations.lastModified`
 	///   is stripped. An embedded resource's own `_meta` is dropped likewise.
+	///   A resource link's `icons` (2025-11-25) are dropped for older peers.
 	///
 	/// Mirrors the `Tool.forVersion` field-stripping pattern.
 	Content forVersion(ProtocolVersion v) const @safe
@@ -651,6 +688,8 @@ struct Content
 		// The embedded `resource` (ResourceContents) gained `_meta` in the same
 		// revision. It is held as raw Json shared with the source block, so strip
 		// a copy rather than mutating the original.
+		if (v < ProtocolVersion.v2025_11_25)
+			c.payload.match!((ref ResourceLink l) { l.icons = null; }, (ref _) {});
 		if (v < ProtocolVersion.v2025_06_18)
 			c.payload.match!((ref EmbeddedResource e) {
 				if (e.resource.type == Json.Type.object && "_meta" in e.resource)
@@ -731,6 +770,9 @@ struct Content
 			tryGet(j, "title", c.title);
 			tryGet(j, "description", c.description);
 			tryGetWhole(j, "size", c.size);
+			if ("icons" in j && j["icons"].type == Json.Type.array)
+				foreach (i; 0 .. j["icons"].length)
+					c.icons ~= Icon.fromJson(j["icons"][i]);
 			c.parseMeta(j);
 			return Content(c);
 		case "resource":
@@ -1803,6 +1845,34 @@ unittest  // resource link round-trips description/title/size through fromJson
 	assert(!back.description.isNull && back.description.get == "d");
 	assert(!back.title.isNull && back.title.get == "t");
 	assert(!back.size.isNull && back.size.get == 7);
+}
+
+unittest  // resource link round-trips icons through fromJson and toJson
+{
+	auto j = parseJsonString(`{"type":"resource_link","uri":"file:///a","name":"a",
+		"icons":[{"src":"https://example.com/a.png","mimeType":"image/png","sizes":["16x16"]}]}`);
+	auto out_ = Content.fromJson(j).toJson();
+	assert("icons" in out_);
+	assert(out_["icons"].length == 1);
+	assert(out_["icons"][0]["src"].get!string == "https://example.com/a.png");
+	assert(out_["icons"][0]["sizes"][0].get!string == "16x16");
+}
+
+unittest  // withIcons attaches icons that the icons accessor returns
+{
+	Icon icon = {src: "https://example.com/a.png"};
+	auto c = Content.makeResourceLink("file:///a", "a").withIcons([icon]);
+	assert(c.icons.length == 1 && c.icons[0].src == "https://example.com/a.png");
+	assert(Content.makeText("t").icons.length == 0);
+}
+
+unittest  // resource link icons are stripped for peers older than 2025-11-25
+{
+	auto j = parseJsonString(`{"type":"resource_link","uri":"file:///a","name":"a",
+		"icons":[{"src":"https://example.com/a.png"}]}`);
+	auto c = Content.fromJson(j);
+	assert("icons" !in c.forVersion(ProtocolVersion.v2025_06_18).toJson());
+	assert("icons" in c.forVersion(ProtocolVersion.v2025_11_25).toJson());
 }
 
 unittest  // resource link emits and parses _meta
