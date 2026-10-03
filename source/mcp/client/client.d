@@ -448,6 +448,7 @@ private final class InFlightRequest
 	// What was left of the `requestTimeout` window when `pauseDeadlines` paused it.
 	Duration remaining;
 	string progressKey; // the request's progress token rendered as JSON, or empty
+	bool modern; // whether the request was sent with modern framing
 	McpException abortReason;
 	void* owner; // the fiber awaiting the response
 	uint paused; // server->client handlers currently running on this request's behalf
@@ -1099,21 +1100,14 @@ final class McpClient : ClientProtocol
 	/// framing (the `MCP-Protocol-Version` modern header and a modern
 	/// `_meta.protocolVersion`). Without it the server falls back to its stable
 	/// default and answers methodNotFound, so an undecorated probe can never select
-	/// modern. This stamps modern framing on the single probe request only and then
-	/// restores the prior state: `connect` commits modern state once it has chosen
-	/// a mutually supported modern version.
+	/// modern. This stamps modern framing on the probe request alone, leaving the
+	/// session's framing untouched for requests other tasks send meanwhile; the
+	/// transport and `headersFor` read it off the request. `connect` commits modern
+	/// state once it has chosen a mutually supported modern version.
 	private DiscoverResult discoverProbe() @safe
 	{
-		const priorUseModern = useModern;
-		const priorNegotiated = negotiated;
-		useModern = true;
-		negotiated = ProtocolVersion.v2026_07_28;
-		scope (exit)
-		{
-			useModern = priorUseModern;
-			negotiated = priorNegotiated;
-		}
-		return DiscoverResult.fromJson(rpc("server/discover", Json.emptyObject));
+		return DiscoverResult.fromJson(rpc("server/discover", Json.emptyObject,
+				nullable(ProtocolVersion.v2026_07_28)));
 	}
 
 	/// Attach an OAuth bearer access token, sent as `Authorization: Bearer
@@ -3587,7 +3581,11 @@ final class McpClient : ClientProtocol
 	/// what later lets a `notifications/elicitation/complete` for one of those ids
 	/// correlate (in `dispatchNotification`) and be forwarded to the application
 	/// rather than dropped as "unknown".
-	private Json rpc(string method, Json params) @safe
+	///
+	/// `framing` sends the request with modern framing at that version whatever
+	/// the session's own framing; null uses the session's.
+	private Json rpc(string method, Json params,
+			Nullable!ProtocolVersion framing = Nullable!ProtocolVersion.init) @safe
 	{
 		ensureNotReleased();
 		try
@@ -3596,13 +3594,15 @@ final class McpClient : ClientProtocol
 				if (onRpcForTest !is null)
 					return onRpcForTest(method, params);
 			const id = nextId++;
-			if (useModern)
-				params = injectModernMeta(params);
+			const modern = !framing.isNull || useModern;
+			if (modern)
+				params = injectModernMeta(params, framing.isNull ? negotiated : framing.get);
 			auto message = makeRequest(Json(id), method, params);
 			auto token = callTokens_.get(currentFiberKey(), null);
 			if (token !is null && token.isCancelled)
 				throw cancelledError(token.reason);
 			auto req = beginRequest(id, params);
+			req.modern = modern;
 			scope (exit)
 				endRequest(id, req);
 			ulong hookKey;
@@ -3715,11 +3715,15 @@ final class McpClient : ClientProtocol
 	/// NOT cancel).
 	private void abortRequest(long id, McpException reason, string cancelReason) @safe
 	{
+		bool modern = useModern;
 		if (auto r = id in inFlight_)
+		{
 			(*r).abortReason = reason;
+			modern = (*r).modern;
+		}
 		transport.abort(id, reason);
 		if (id != initializeRequestId || initializeRequestId == 0)
-			signalCancellation(id, cancelReason);
+			signalCancellation(id, cancelReason, modern);
 	}
 
 	/// Restart the deadline of every in-flight request whose progress token
@@ -3897,15 +3901,21 @@ final class McpClient : ClientProtocol
 	/// capabilities) to a request's params.
 	private Json injectModernMeta(Json params) @safe
 	{
+		return injectModernMeta(params, negotiated);
+	}
+
+	/// `injectModernMeta` framing the request at `version_`.
+	private Json injectModernMeta(Json params, ProtocolVersion version_) @safe
+	{
 		if (params.type != Json.Type.object)
 			params = Json.emptyObject;
 		Json meta = ("_meta" in params && params["_meta"].type == Json.Type.object) ? params["_meta"] : Json
 			.emptyObject;
-		meta[MetaKey.protocolVersion] = negotiated.toWire;
+		meta[MetaKey.protocolVersion] = version_.toWire;
 		meta[MetaKey.clientInfo] = clientInfo.toJson();
-		// Project to the negotiated (2026-07-28) wire shape: modern has no top-level
+		// Project to the request's (2026-07-28) wire shape: modern has no top-level
 		// client `tasks` capability, so it is folded into the `extensions` map.
-		meta[MetaKey.clientCapabilities] = effectiveCapabilities().forVersion(negotiated).toJson();
+		meta[MetaKey.clientCapabilities] = effectiveCapabilities().forVersion(version_).toJson();
 		// Modern per-request logging opt-in: stamp the sticky default level (set via
 		// `setLogLevel`) unless this request already carries an explicit
 		// `MetaKey.logLevel` (a per-request override via `withRequestLogLevel` / an
@@ -4011,7 +4021,7 @@ final class McpClient : ClientProtocol
 		if (requestId in inFlight_)
 			abortRequest(requestId, cancelledError(reason), reason);
 		else
-			signalCancellation(requestId, reason);
+			signalCancellation(requestId, reason, useModern);
 	}
 
 	/// Drop the ids `isCancelled` already consumed from `cancelledOrder_`, keeping
@@ -4027,7 +4037,7 @@ final class McpClient : ClientProtocol
 	/// Record `requestId` as cancelled (so a late response is dropped) and signal
 	/// it to the server: `notifications/cancelled`, or nothing more over a modern
 	/// Streamable HTTP transport, where closing the request's stream is the signal.
-	private void signalCancellation(long requestId, string reason) @safe
+	private void signalCancellation(long requestId, string reason, bool modern) @safe
 	{
 		// Already tracked: nothing to add (and avoid a duplicate order entry).
 		if (requestId !in cancelledRequests_)
@@ -4057,12 +4067,12 @@ final class McpClient : ClientProtocol
 			if (cancelledOrder_.length > 2 * live)
 				compactCancelledOrder();
 		}
-		// Over a modern Streamable HTTP transport, closing the request's SSE response
-		// stream is itself the cancellation signal and no `notifications/cancelled`
-		// is sent (basic/transports §Sending Messages, Note); the local tracking
-		// above still drops a late response. stdio and legacy HTTP send the
-		// notification as the cancellation signal.
-		if (transport.cancelsByStreamClose())
+		// For a modern request over Streamable HTTP, closing the request's SSE
+		// response stream is itself the cancellation signal and no
+		// `notifications/cancelled` is sent (basic/transports §Sending Messages,
+		// Note); the local tracking above still drops a late response. stdio and
+		// earlier-protocol requests send the notification as the signal.
+		if (modern && transport.cancelsByStreamClose())
 			return;
 		Json params = Json.emptyObject;
 		params["requestId"] = requestId;
@@ -4113,10 +4123,16 @@ final class McpClient : ClientProtocol
 	/// cache in the client rather than the transport.
 	string[string] headersFor(Json message) @safe
 	{
+		import mcp.client.transport : modernFraming;
+
 		string[string] headers;
-		if (useModern)
+		// A request framed as modern on its own (`connect`'s probe) is routed as
+		// one whatever the session's framing.
+		ProtocolVersion framed;
+		const ownFraming = modernFraming(message, framed);
+		if (useModern || ownFraming)
 		{
-			headers[HttpHeader.protocolVersion] = negotiated.toWire;
+			headers[HttpHeader.protocolVersion] = ownFraming ? framed.toWire : negotiated.toWire;
 			if (message.type != Json.Type.object || "method" !in message)
 				return headers; // no message (GET stream) or a response: version only
 			const method = message["method"].get!string;
@@ -6605,7 +6621,7 @@ unittest  // a modern Streamable-HTTP client cancels by closing the stream, not 
 {
 	auto t = new HttpClientTransport("http://localhost", 8);
 	auto c = new McpClient(t);
-	t.setModernProtocol(true); // negotiated the modern (2026-07-28) protocol
+	c.enableModern(); // negotiated the modern (2026-07-28) protocol
 	bool postedCancelled;
 	c.onNotifyForTest = (Json message) @safe {
 		if (message["method"].get!string == "notifications/cancelled")
@@ -9497,6 +9513,31 @@ unittest  // connect() leaves the client unnegotiated when discovery finds no mu
 	assert(c.protocolVersion == before, "a failed connect must not leave a negotiated version");
 	assert(!transport.modern);
 	assert(!c.useModern, "a failed connect must not leave modern framing on");
+}
+
+unittest  // connect()'s discover probe frames only itself as modern
+{
+	auto transport = new RecordingClientTransport();
+	auto c = new McpClient(transport);
+	string[string] probeHeaders, otherHeaders;
+	transport.responder = (Json message, long expectId) @safe {
+		probeHeaders = c.headersFor(message);
+		// A request another task sends while the probe is in flight.
+		otherHeaders = c.headersFor(makeRequest(Json(99), "tools/list", Json.emptyObject));
+		DiscoverResult d;
+		d.supportedVersions = ["1999-01-01"];
+		return d.toJson();
+	};
+	try
+		c.connect();
+	catch (McpException)
+	{
+	}
+	assert(probeHeaders.get(HttpHeader.method, "") == "server/discover",
+			"the probe must carry the modern routing headers");
+	assert(probeHeaders.get(HttpHeader.protocolVersion, "") == ProtocolVersion.v2026_07_28.toWire);
+	assert(HttpHeader.method !in otherHeaders,
+			"a concurrent request must not pick up the probe's modern framing");
 }
 
 unittest  // discover() on a modern session adopts the server's capabilities, identity and instructions

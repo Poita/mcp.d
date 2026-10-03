@@ -19,7 +19,7 @@ import mcp.protocol.jsonrpc;
 import mcp.protocol.errors;
 import mcp.protocol.mrtr : isHeaderValueUnsafe;
 import mcp.protocol.ssrf : FetchOptions, TlsTrust;
-import mcp.client.transport : BearerProvider, ClientTransport, ClientProtocol;
+import mcp.client.transport : BearerProvider, ClientTransport, ClientProtocol, modernFraming;
 import mcp.client.subscription : SubscriptionStream, ListenGate;
 
 /// A request rejected at the HTTP layer: the server answered with a non-success
@@ -494,12 +494,12 @@ final class HttpClientTransport : ClientTransport
 		modernProtocol = modern;
 	}
 
-	/// A modern Streamable HTTP client cancels by closing the request's SSE response
-	/// stream; the modern sends no `notifications/cancelled` over HTTP. Legacy HTTP
-	/// (legacy) still uses the notification.
+	/// A modern request over Streamable HTTP is cancelled by closing its SSE
+	/// response stream; the modern protocol sends no `notifications/cancelled`
+	/// over HTTP. The legacy HTTP+SSE transport carries no modern request.
 	bool cancelsByStreamClose() @safe
 	{
-		return modernProtocol;
+		return !legacyMode;
 	}
 
 	/// Bound each raw `connectTCP` by `timeout`. A connect that cannot complete in
@@ -910,7 +910,10 @@ final class HttpClientTransport : ClientTransport
 		// modern server answers the GET with 405), so a modern session never resumes.
 		enum maxIdleResumes = 3;
 		string failure;
-		if (!modernProtocol)
+		import mcp.protocol.versions : ProtocolVersion;
+
+		ProtocolVersion framed;
+		if (!modernProtocol && !modernFraming(message, framed))
 		{
 			auto backoff = 250.msecs;
 			size_t idle;
@@ -4365,6 +4368,36 @@ unittest  // a request that times out while its rejected bearer is being refresh
 	assert(failure.length == 0, "scenario failed: " ~ failure);
 	assert(timedOut);
 	assert(took < 1500.msecs, "a timeout during the bearer refresh must not be lost");
+}
+
+unittest  // a timed-out connect() probe is cancelled by closing its stream, not by notifications/cancelled
+{
+	import core.time : msecs;
+	import vibe.core.core : sleep;
+	import mcp.client.client : ClientSettings, McpClient, RequestTimeoutException;
+
+	string[] notifications;
+	auto router = answeringRouter((Json req, HTTPServerResponse res) @safe {
+		sleep(1.seconds);
+		res.statusCode = 500;
+		res.writeBody("", "text/plain");
+	}, (Json n) @safe { notifications ~= n["method"].get!string; });
+	bool timedOut;
+	const failure = runAgainstFakeServer(router, (string url) @safe {
+		ClientSettings s;
+		s.requestTimeout = 200.msecs;
+		auto client = McpClient.http(url, s);
+		scope (exit)
+			client.close();
+		try
+			client.connect();
+		catch (RequestTimeoutException)
+			timedOut = true;
+		sleep(100.msecs);
+	});
+	assert(failure.length == 0, "scenario failed: " ~ failure);
+	assert(timedOut);
+	assert(notifications.length == 0, "the modern probe must not be cancelled with a notification");
 }
 
 unittest  // a 401 for a reason other than the token itself is not retried

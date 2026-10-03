@@ -5,6 +5,7 @@ import vibe.data.json : Json;
 
 import mcp.protocol.errors : McpException;
 import mcp.protocol.jsonrpc : Message;
+import mcp.protocol.versions : ProtocolVersion;
 
 public import mcp.client.subscription : SubscriptionStream, SubscriptionFilter;
 
@@ -61,6 +62,34 @@ interface ClientProtocol
 /// `deliver`, which sends the request and returns its correlated result (or
 /// throws `McpException` on an error response), dispatching anything else it sees
 /// in the meantime to the inbound handler.
+/// The modern protocol version request `message` declares in its
+/// `_meta.protocolVersion`, so a transport and the client read a request's
+/// framing off the request itself rather than off shared session state (which
+/// `McpClient.connect`'s probe does not change). False when it declares no
+/// modern version.
+package bool modernFraming(Json message, out ProtocolVersion version_) @safe nothrow
+{
+	import mcp.protocol.mrtr : MetaKey;
+	import mcp.protocol.versions : isModern, tryParseVersion;
+
+	try
+	{
+		if (message.type != Json.Type.object || "params" !in message)
+			return false;
+		auto params = message["params"];
+		if (params.type != Json.Type.object || "_meta" !in params)
+			return false;
+		auto meta = params["_meta"];
+		if (meta.type != Json.Type.object || MetaKey.protocolVersion !in meta
+				|| meta[MetaKey.protocolVersion].type != Json.Type.string)
+			return false;
+		return tryParseVersion(meta[MetaKey.protocolVersion].get!string, version_)
+			&& version_.isModern;
+	}
+	catch (Exception)
+		return false;
+}
+
 interface ClientTransport
 {
 	/// Send a JSON-RPC request `requestMessage` and return its result `Json`
@@ -127,12 +156,14 @@ interface ClientTransport
 	/// the HTTP transport also bounds each one-way POST by it. A no-op on stdio.
 	void setRequestTimeout(Duration timeout) @safe;
 
-	/// Whether this transport signals request cancellation by closing the request's
-	/// stream rather than by sending `notifications/cancelled`. True only for a modern
-	/// Streamable HTTP transport: the modern (basic/transports §Sending Messages, Note)
-	/// defines no client-to-server `notifications/cancelled` over Streamable HTTP —
-	/// closing the SSE response stream is itself the cancellation signal. stdio and
-	/// legacy HTTP send the notification, so they return false.
+	/// Whether this transport signals the cancellation of a modern (2026-07-28)
+	/// request by closing the request's stream rather than by sending
+	/// `notifications/cancelled`. True for Streamable HTTP: the modern protocol
+	/// (basic/transports §Sending Messages, Note) defines no client-to-server
+	/// `notifications/cancelled` over Streamable HTTP — closing the SSE response
+	/// stream is itself the cancellation signal. stdio and the legacy HTTP+SSE
+	/// transport send the notification, so they return false. A request of an
+	/// earlier protocol is always cancelled with the notification.
 	bool cancelsByStreamClose() @safe;
 
 	/// Release transport resources: stdio terminates the subprocess (when one was
