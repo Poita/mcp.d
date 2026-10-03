@@ -55,9 +55,10 @@ struct SkillFile
 }
 
 /// A declarative skill: a `SKILL.md` (its `instructions` body, with frontmatter
-/// synthesized from `path`'s final segment, `description`, and `metadata`) plus
-/// any supporting `files`. Register it with `registerSkill`; the `@skill` UDA
-/// builds one of these from an annotated method.
+/// synthesized from `path`'s final segment, `description`, the optional
+/// `license` / `compatibility` / `allowedTools`, and `metadata`) plus any
+/// supporting `files`. Register it with `registerSkill`; the `@skill` UDA builds
+/// one of these from an annotated method.
 struct Skill
 {
 	/// The skill path: a `/`-separated locator whose final segment is the skill
@@ -71,6 +72,13 @@ struct Skill
 	/// extensions (none are currently defined).
 	string[string] metadata;
 	SkillFile[] files; /// optional supporting files served as sibling resources
+	string license; /// optional `license`: a license name or bundled license file
+	/// Optional `compatibility`: the environment the skill needs (at most 500
+	/// characters), e.g. "Requires git and network access".
+	string compatibility;
+	/// Optional `allowed-tools`: the space-delimited tools the skill may use
+	/// without asking, e.g. "Bash(git:*) Read".
+	string allowedTools;
 
 	/// The skill name: the final segment of `path`, per SEP-2640's requirement
 	/// that the last `<skill-path>` segment equal the frontmatter `name`.
@@ -78,6 +86,104 @@ struct Skill
 	{
 		return skillName(path);
 	}
+
+	/// The frontmatter this skill's `SKILL.md` and entry carry.
+	SkillFrontmatter frontmatter() @safe
+	{
+		return SkillFrontmatter(name, description, license, compatibility, allowedTools, metadata);
+	}
+}
+
+/// The YAML frontmatter of a synthesized `SKILL.md`, per the Agent Skills
+/// format: the required `name` and `description` plus the optional `license`,
+/// `compatibility`, `allowed-tools`, and `metadata`, each emitted only when set.
+struct SkillFrontmatter
+{
+	string name; /// the skill name (the final segment of its path)
+	string description; /// what the skill does and when to use it (1..1024 characters)
+	string license; /// optional license name or bundled license file
+	string compatibility; /// optional environment requirements (at most 500 characters)
+	string allowedTools; /// optional space-delimited pre-approved tools (`allowed-tools`)
+	string[string] metadata; /// optional extra string pairs under `metadata:`
+
+	/// Why this frontmatter breaks the Agent Skills limits (see
+	/// `skillFieldProblem`), or `null` when it is within them.
+	string problem() const @safe pure
+	{
+		return skillFieldProblem(description, compatibility);
+	}
+
+	/// The frontmatter as a JSON object, matching the YAML `toYaml` renders:
+	/// the verbatim `frontmatter` SEP-2640 requires in each skill entry.
+	Json toJson() const @safe
+	{
+		import std.algorithm : sort;
+
+		Json fm = Json.emptyObject;
+		fm["name"] = name;
+		fm["description"] = description;
+		if (license.length)
+			fm["license"] = license;
+		if (compatibility.length)
+			fm["compatibility"] = compatibility;
+		if (allowedTools.length)
+			fm["allowed-tools"] = allowedTools;
+		if (metadata.length)
+		{
+			Json m = Json.emptyObject;
+			foreach (key; metadata.keys.sort)
+				m[key] = metadata[key];
+			fm["metadata"] = m;
+		}
+		return fm;
+	}
+
+	/// The frontmatter as a `---`-fenced YAML block. The `name` is emitted
+	/// unquoted (it is constrained to a URI-safe token); every other value is
+	/// YAML-quoted so any content is safe.
+	string toYaml() const @safe
+	{
+		import std.array : Appender;
+		import std.algorithm : sort;
+
+		Appender!string a;
+		a ~= "---\n";
+		a ~= "name: " ~ name ~ "\n";
+		a ~= "description: " ~ yamlQuote(description) ~ "\n";
+		if (license.length)
+			a ~= "license: " ~ yamlQuote(license) ~ "\n";
+		if (compatibility.length)
+			a ~= "compatibility: " ~ yamlQuote(compatibility) ~ "\n";
+		if (allowedTools.length)
+			a ~= "allowed-tools: " ~ yamlQuote(allowedTools) ~ "\n";
+		if (metadata.length)
+		{
+			a ~= "metadata:\n";
+			// Emit keys in a stable (sorted) order so the rendered SKILL.md is
+			// deterministic regardless of the associative array's iteration order.
+			foreach (key; metadata.keys.sort)
+				a ~= "  " ~ yamlQuote(key) ~ ": " ~ yamlQuote(metadata[key]) ~ "\n";
+		}
+		a ~= "---\n";
+		return a.data;
+	}
+}
+
+/// Why a skill's `description` or `compatibility` breaks the Agent Skills
+/// limits — a `description` must be 1..1024 characters and a `compatibility` at
+/// most 500, counted in code points — or `null` when both are within them.
+/// Usable at compile time.
+string skillFieldProblem(string description, string compatibility) @safe pure
+{
+	import std.utf : count;
+
+	if (description.length == 0)
+		return "a skill description must not be empty";
+	if (count(description) > 1024)
+		return "a skill description must be at most 1024 characters";
+	if (count(compatibility) > 500)
+		return "a skill compatibility must be at most 500 characters";
+	return null;
 }
 
 /// The final segment of a skill path — the skill's `name`. For `acme/billing/refunds`
@@ -241,53 +347,11 @@ private string yamlQuote(string s) @safe pure
 	return a.data;
 }
 
-/// Render a complete `SKILL.md`: the YAML frontmatter (synthesized from `name`,
-/// `description`, and any `metadata`) followed by the `instructions` body. The
-/// `name` is emitted unquoted (it is constrained to a URI-safe token); the
-/// description and metadata values are YAML-quoted so any content is safe.
-string skillMarkdown(string name, string description, string instructions,
-		string[string] metadata = null) @safe
+/// Render a complete `SKILL.md`: the YAML frontmatter `fm` followed by the
+/// `instructions` body.
+string skillMarkdown(SkillFrontmatter fm, string instructions) @safe
 {
-	import std.array : Appender;
-	import std.algorithm : sort;
-
-	Appender!string a;
-	a ~= "---\n";
-	a ~= "name: " ~ name ~ "\n";
-	a ~= "description: " ~ yamlQuote(description) ~ "\n";
-	if (metadata.length)
-	{
-		a ~= "metadata:\n";
-		// Emit keys in a stable (sorted) order so the rendered SKILL.md is
-		// deterministic regardless of the associative array's iteration order.
-		foreach (key; metadata.keys.sort)
-			a ~= "  " ~ yamlQuote(key) ~ ": " ~ yamlQuote(metadata[key]) ~ "\n";
-	}
-	a ~= "---\n\n";
-	a ~= instructions;
-	return a.data;
-}
-
-/// The skill's frontmatter rendered as a JSON object, matching the YAML
-/// `skillMarkdown` synthesizes: `name` and `description` always, plus a nested
-/// `metadata` object when present. This is the verbatim `frontmatter` SEP-2640
-/// requires in each skill entry — identical in content to the `SKILL.md` it
-/// describes.
-private Json frontmatterJson(string name, string description, string[string] metadata) @safe
-{
-	import std.algorithm : sort;
-
-	Json fm = Json.emptyObject;
-	fm["name"] = name;
-	fm["description"] = description;
-	if (metadata.length)
-	{
-		Json m = Json.emptyObject;
-		foreach (key; metadata.keys.sort)
-			m[key] = metadata[key];
-		fm["metadata"] = m;
-	}
-	return fm;
+	return fm.toYaml() ~ "\n" ~ instructions;
 }
 
 /// Advertise the SEP-2640 skills extension on `server`, committing it to the
@@ -346,10 +410,11 @@ private ResourceContents delegate() @safe makeFileReader(SkillFile f, string uri
 /// `path` is not a valid skill path (see `isValidSkillPath`).
 void registerSkill(McpServer server, Skill skill) @safe
 {
-	const name = skill.name;
-	registerSkillResources(server, skill.path, skillMarkdown(name, skill.description,
-			skill.instructions, skill.metadata), frontmatterJson(name,
-			skill.description, skill.metadata), skill.files);
+	auto fm = skill.frontmatter;
+	if (auto problem = fm.problem)
+		throw new Exception("skill '" ~ skill.path ~ "': " ~ problem);
+	registerSkillResources(server, skill.path, skillMarkdown(fm,
+			skill.instructions), fm.toJson(), skill.files);
 }
 
 /// The shared registration core both `registerSkill` (which synthesizes the
@@ -506,11 +571,20 @@ struct DynamicSkill
 	string delegate() @safe instructions;
 	/// Optional extra frontmatter under `metadata:` (see `Skill.metadata`).
 	string[string] metadata;
+	string license; /// optional `license` (see `Skill.license`)
+	string compatibility; /// optional `compatibility` (see `Skill.compatibility`)
+	string allowedTools; /// optional `allowed-tools` (see `Skill.allowedTools`)
 
 	/// The skill name: the final segment of `path`.
 	string name() const @safe pure
 	{
 		return skillName(path);
+	}
+
+	/// The fixed frontmatter every read of this skill's `SKILL.md` carries.
+	SkillFrontmatter frontmatter() @safe
+	{
+		return SkillFrontmatter(name, description, license, compatibility, allowedTools, metadata);
 	}
 }
 
@@ -527,6 +601,9 @@ void registerDynamicSkill(McpServer server, DynamicSkill skill) @safe
 	if (skill.instructions is null)
 		throw new Exception("registerDynamicSkill: '" ~ skill.path
 				~ "' has no instructions delegate");
+	auto fm = skill.frontmatter;
+	if (auto problem = fm.problem)
+		throw new Exception("skill '" ~ skill.path ~ "': " ~ problem);
 
 	const name = skill.name;
 	const uri = skillUri(skill.path);
@@ -538,13 +615,12 @@ void registerDynamicSkill(McpServer server, DynamicSkill skill) @safe
 	descriptor.name = name;
 	descriptor.description = nullable(skill.description);
 	descriptor.mimeType = nullable(skillMimeType);
-	// Copied into locals so the reader closure captures values, not the struct.
-	string description = skill.description;
-	string[string] metadata = skill.metadata;
+	// The frontmatter is fixed, so it is rendered once; only the body is
+	// regenerated per read.
+	const header = skillMarkdown(fm, "");
 	auto body_ = skill.instructions;
 	server.registerResource(descriptor, () @safe {
-		return ResourceContents.makeText(uri, skillMimeType,
-			skillMarkdown(name, description, body_(), metadata));
+		return ResourceContents.makeText(uri, skillMimeType, header ~ body_());
 	});
 	// The entry is added last, after the resource is in place, so a throw here
 	// leaves no listed-but-unserved skill; the resource is rolled back to match.
@@ -553,7 +629,7 @@ void registerDynamicSkill(McpServer server, DynamicSkill skill) @safe
 
 	Json entry = Json.emptyObject;
 	entry["uri"] = uri;
-	entry["frontmatter"] = frontmatterJson(name, description, metadata);
+	entry["frontmatter"] = fm.toJson();
 	entry["resources"] = "dynamic";
 	addSkillEntry(server, entry);
 	server.enableSkills();
@@ -757,15 +833,15 @@ unittest  // skillDigest renders a lowercase sha256:<hex> of the bytes
 
 unittest  // skillMarkdown synthesizes frontmatter with name/description and body
 {
-	auto md = skillMarkdown("git-workflow", "Follow Git conventions",
-			"# Git Workflow\n\n1. Branch.\n");
+	auto md = skillMarkdown(SkillFrontmatter("git-workflow",
+			"Follow Git conventions"), "# Git Workflow\n\n1. Branch.\n");
 	assert(md == "---\nname: git-workflow\ndescription: \"Follow Git conventions\"\n---\n\n"
 			~ "# Git Workflow\n\n1. Branch.\n");
 }
 
 unittest  // skillMarkdown quotes/escapes a description with special characters
 {
-	auto md = skillMarkdown("x", `He said "hi"`, "body");
+	auto md = skillMarkdown(SkillFrontmatter("x", `He said "hi"`), "body");
 	import std.algorithm : canFind;
 
 	assert(md.canFind(`description: "He said \"hi\""`));
@@ -776,9 +852,8 @@ unittest  // skillMarkdown round-trips control and line-separator characters thr
 	import mcp.api.skill_dir : parseSkillFrontmatter;
 
 	const desc = "a\rb\tc\x01d\x1Fe\x7Ff\u0085g\u2028h\u2029i\\j\"k\nl";
-	auto fm = parseSkillFrontmatter(skillMarkdown("x", desc, "body", [
-		"k\r": "v\x02"
-	]));
+	auto fm = parseSkillFrontmatter(skillMarkdown(SkillFrontmatter("x", desc,
+metadata: ["k\r": "v\x02"]), "body"));
 	assert(fm["description"].get!string == desc);
 	assert(fm["metadata"]["k\r"].get!string == "v\x02");
 }
@@ -787,7 +862,7 @@ unittest  // skillMarkdown frontmatter lines contain no raw control characters
 {
 	import std.algorithm : any;
 
-	auto md = skillMarkdown("x", "a\rb\x01c\x7F", "body");
+	auto md = skillMarkdown(SkillFrontmatter("x", "a\rb\x01c\x7F"), "body");
 	auto front = md[0 .. md.length - "body".length];
 	assert(!front.any!(c => c != '\n' && (c < 0x20 || c == 0x7F)));
 }
@@ -795,7 +870,7 @@ unittest  // skillMarkdown frontmatter lines contain no raw control characters
 unittest  // skillMarkdown emits metadata in a deterministic sorted order
 {
 	string[string] meta = ["zeta": "1", "alpha": "2"];
-	auto md = skillMarkdown("x", "d", "body", meta);
+	auto md = skillMarkdown(SkillFrontmatter("x", "d", metadata: meta), "body");
 	import std.string : indexOf;
 
 	const a = md.indexOf(`"alpha"`);
@@ -2046,4 +2121,106 @@ unittest  // a skill registration that throws registering its resource leaves th
 	auto caps = s.handle(Message(makeRequest(Json(1), "server/discover",
 			params))).get["result"]["capabilities"];
 	assert("extensions" !in caps || skillsExtensionKey !in caps["extensions"], caps.toString);
+}
+
+version (unittest) private Json listedSkill(McpServer s) @safe
+{
+	import mcp.protocol.jsonrpc : Message, makeRequest;
+
+	return s.handle(Message(makeRequest(Json(1), "skills/list",
+			Json.emptyObject))).get["result"]["skills"][0];
+}
+
+version (unittest) private string servedSkillMd(McpServer s, string path) @safe
+{
+	import mcp.protocol.jsonrpc : Message, makeRequest;
+
+	Json rp = Json.emptyObject;
+	rp["uri"] = skillUri(path);
+	return s.handle(Message(makeRequest(Json(2), "resources/read", rp)))
+		.get["result"]["contents"][0]["text"].get!string;
+}
+
+unittest  // a Skill's license, compatibility, and allowed-tools reach SKILL.md and its entry
+{
+	import std.algorithm.searching : canFind;
+	import mcp.api.skill_dir : parseSkillFrontmatter;
+
+	auto s = new McpServer("t", "1");
+	Skill sk = {
+		path: "pdf-forms", description: "Fill PDF forms", instructions: "# Body\n", license: "Apache-2.0",
+		compatibility: "Requires poppler", allowedTools: "Bash(pdftk:*) Read"
+	};
+	registerSkill(s, sk);
+
+	auto fm = listedSkill(s)["frontmatter"];
+	assert(fm["license"].get!string == "Apache-2.0", fm.toString);
+	assert(fm["compatibility"].get!string == "Requires poppler", fm.toString);
+	assert(fm["allowed-tools"].get!string == "Bash(pdftk:*) Read", fm.toString);
+	// The served SKILL.md frontmatter parses to the same object as the entry's.
+	assert(parseSkillFrontmatter(servedSkillMd(s, "pdf-forms")) == fm);
+}
+
+unittest  // a Skill without the optional fields omits them from its frontmatter
+{
+	auto s = new McpServer("t", "1");
+	registerSkill(s, Skill("plain", "A plain skill", "# Body\n"));
+	auto fm = listedSkill(s)["frontmatter"];
+	assert("license" !in fm && "compatibility" !in fm && "allowed-tools" !in fm, fm.toString);
+}
+
+unittest  // a DynamicSkill's license, compatibility, and allowed-tools reach its entry and SKILL.md
+{
+	import std.algorithm.searching : canFind;
+
+	auto s = new McpServer("t", "1");
+	DynamicSkill dyn = {
+		path: "live", description: "Live skill", instructions: () @safe => "# Body\n",
+		license: "MIT", compatibility: "Any", allowedTools: "Read"
+	};
+	registerDynamicSkill(s, dyn);
+	auto fm = listedSkill(s)["frontmatter"];
+	assert(fm["license"].get!string == "MIT" && fm["allowed-tools"].get!string == "Read");
+	assert(servedSkillMd(s, "live").canFind("license: \"MIT\""));
+}
+
+unittest  // a Skill with an empty description is rejected
+{
+	import std.exception : assertThrown;
+
+	auto s = new McpServer("t", "1");
+	assertThrown(registerSkill(s, Skill("x", "", "# Body\n")));
+}
+
+unittest  // a Skill description over 1024 characters is rejected
+{
+	import std.array : replicate;
+	import std.exception : assertNotThrown, assertThrown;
+
+	auto s = new McpServer("t", "1");
+	assertThrown(registerSkill(s, Skill("x", "é".replicate(1025), "# Body\n")));
+	assertNotThrown(registerSkill(s, Skill("y", "é".replicate(1024), "# Body\n")));
+}
+
+unittest  // a Skill compatibility over 500 characters is rejected
+{
+	import std.array : replicate;
+	import std.exception : assertThrown;
+
+	auto s = new McpServer("t", "1");
+	Skill sk = {
+		path: "x", description: "d", instructions: "# Body\n", compatibility: "c".replicate(501)
+	};
+	assertThrown(registerSkill(s, sk));
+}
+
+unittest  // a DynamicSkill with an empty description is rejected
+{
+	import std.exception : assertThrown;
+
+	auto s = new McpServer("t", "1");
+	DynamicSkill dyn = {
+		path: "x", description: "", instructions: () @safe => "# Body\n"
+	};
+	assertThrown(registerDynamicSkill(s, dyn));
 }

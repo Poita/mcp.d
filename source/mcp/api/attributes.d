@@ -232,17 +232,28 @@ struct resource
 /// `skills/get` methods. `path` is a `/`-separated locator whose final segment is the skill
 /// name; that segment must be lowercase alphanumeric with single hyphens
 /// (1..64 chars), per the Agent Skills spec. Preceding segments are an optional
-/// organizational prefix (e.g. `acme/billing/refunds`).
+/// organizational prefix (e.g. `acme/billing/refunds`). `description` must be
+/// 1..1024 characters and `compatibility` at most 500, or registration is a
+/// compile error; `license`, `compatibility`, and `allowedTools` (the
+/// `allowed-tools` field) are optional frontmatter, in that order.
+///
+/// The method is called once, by `registerHandlers`, and its result is served
+/// for the server's lifetime: a skill is a static value whose content digest
+/// must stay stable. For a body generated on each read, use
+/// `registerDynamicSkill`.
 ///
 /// Example:
 /// ---
-/// @skill("git-workflow", "Follow this team's Git conventions")
+/// @skill("git-workflow", "Follow this team's Git conventions", "MIT")
 /// string gitWorkflow() @safe { return "# Git Workflow\n\n1. Branch from main.\n"; }
 /// ---
 struct skill
 {
 	string path;
 	string description;
+	string license; /// optional `license` frontmatter
+	string compatibility; /// optional `compatibility` frontmatter (at most 500 characters)
+	string allowedTools; /// optional `allowed-tools` frontmatter (space-delimited)
 }
 
 /// UDA marking a method as an MCP skill served from a local directory (SEP-2640).

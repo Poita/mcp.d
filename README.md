@@ -980,7 +980,12 @@ capability), and publishes a conformant entry — the SKILL.md `uri`, the verbat
 skill with the `sha256` digest and byte `size` of the content it serves — via
 `skills/list` and `skills/get`. The skill path's final segment is the skill
 name; a leading prefix (`acme/billing/refunds`) is an optional organizational
-namespace.
+namespace. The description must be 1..1024 characters; the optional `license`,
+`compatibility` (at most 500 characters), and `allowedTools` (`allowed-tools`)
+frontmatter fields follow it — `@skill("x", "…", "MIT")` — or are set on a
+`Skill` / `DynamicSkill`. The method runs once, at `registerHandlers`, and its
+body is served for the server's lifetime (use `registerDynamicSkill` for a body
+generated per read).
 
 ```d
 final class Skills

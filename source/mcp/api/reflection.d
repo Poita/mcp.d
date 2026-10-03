@@ -19,7 +19,7 @@ import mcp.server.event_context : EventContext, EventResult, Event, EventBatch, 
 import mcp.server.events_runtime : EventRegistration, EventCheck;
 import mcp.api.attributes;
 import mcp.api.apps : UiToolMeta, setUiToolMeta, ensureApps;
-import mcp.api.skills : Skill, isValidSkillPath, registerSkill;
+import mcp.api.skills : Skill, isValidSkillPath, registerSkill, skillFieldProblem;
 import mcp.api.binding : bindJson, bindString, defaultAs, schemaNode, schemaOf,
 	SchemaUse, setBound, wireName;
 import mcp.protocol.schema;
@@ -178,6 +178,9 @@ private void registerOverload(string memberName, alias overload, alias parent)(M
 					~ attr.path ~ "\"; its final segment must be lowercase alphanumeric "
 					~ "with single hyphens (1..64 chars), after optional "
 					~ "non-empty prefix segments");
+			static assert(skillFieldProblem(attr.description, attr.compatibility) is null,
+					"@skill on '" ~ memberName ~ "': " ~ skillFieldProblem(attr.description,
+						attr.compatibility));
 			registerSkillMethod!(memberName, overload, parent)(server, attr);
 		}
 		else static if (is(typeof(attr) == skillDir))
@@ -1523,6 +1526,9 @@ private void registerSkillMethod(string memberName, alias overload, alias parent
 	Skill sk;
 	sk.path = attr.path;
 	sk.description = attr.description;
+	sk.license = attr.license;
+	sk.compatibility = attr.compatibility;
+	sk.allowedTools = attr.allowedTools;
 	sk.instructions = __traits(getMember, parent, memberName)();
 	registerSkill(server, sk);
 }
@@ -5839,4 +5845,58 @@ unittest  // @meta and @ui merge into one _meta object
 	auto t = s.handle(MakeListMessage()).get["result"]["tools"][0];
 	assert(t["_meta"]["category"].get!string == "art", t.toString);
 	assert(t["_meta"]["ui"]["resourceUri"].get!string == "ui://demo/widget", t.toString);
+}
+
+version (unittest) private final class EmptySkillDescriptionApi
+{
+	@skill("blank", "")
+	string instructions() @safe
+	{
+		return "# Body\n";
+	}
+}
+
+version (unittest) private final class LongSkillDescriptionApi
+{
+	import std.array : replicate;
+
+	@skill("long", "d".replicate(1025))
+	string instructions() @safe
+	{
+		return "# Body\n";
+	}
+}
+
+unittest  // an @skill with an empty description is rejected at compile time
+{
+	auto s = new McpServer("t", "1");
+	static assert(!__traits(compiles, registerHandlers(s, new EmptySkillDescriptionApi)));
+}
+
+unittest  // an @skill description over 1024 characters is rejected at compile time
+{
+	auto s = new McpServer("t", "1");
+	static assert(!__traits(compiles, registerHandlers(s, new LongSkillDescriptionApi)));
+}
+
+unittest  // @skill carries license, compatibility, and allowed-tools into the frontmatter
+{
+	import mcp.protocol.jsonrpc : Message, makeRequest;
+
+	@safe final class LicensedSkillApi
+	{
+		@skill("licensed", "A licensed skill", "MIT", "Needs git", "Bash(git:*)")
+		string instructions() @safe
+		{
+			return "# Body\n";
+		}
+	}
+
+	auto s = new McpServer("t", "1");
+	registerHandlers(s, new LicensedSkillApi);
+	auto fm = s.handle(Message(makeRequest(Json(1), "skills/list",
+			Json.emptyObject))).get["result"]["skills"][0]["frontmatter"];
+	assert(fm["license"].get!string == "MIT", fm.toString);
+	assert(fm["compatibility"].get!string == "Needs git", fm.toString);
+	assert(fm["allowed-tools"].get!string == "Bash(git:*)", fm.toString);
 }
