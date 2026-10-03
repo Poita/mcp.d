@@ -49,15 +49,6 @@ string toWire(ProtocolVersion v) pure nothrow
 	}
 }
 
-/// Parse a wire string into a ProtocolVersion, or throw if unknown.
-ProtocolVersion parseVersion(string s) pure
-{
-	ProtocolVersion v;
-	if (!tryParseVersion(s, v))
-		throw new Exception("Unknown MCP protocol version: " ~ s);
-	return v;
-}
-
 /// Parse a wire string; returns false (without throwing) if unknown. Only
 /// dated tokens are versions: the spec's "draft" label names whatever the next
 /// unreleased revision currently is, never a version a peer can negotiate.
@@ -115,10 +106,6 @@ bool isLegacy(ProtocolVersion v) pure nothrow
 	return v < ProtocolVersion.v2026_07_28;
 }
 
-/// Modern uses per-request `_meta` (protocolVersion/clientInfo/clientCapabilities)
-/// instead of an `initialize` handshake.
-alias usesPerRequestMeta = isModern;
-
 /// Modern implements `server/discover`.
 alias supportsDiscover = isModern;
 
@@ -140,13 +127,12 @@ int resourceNotFoundCode(ProtocolVersion v) pure nothrow
 
 unittest  // wire string round-trips for every version
 {
-	import std.exception : assertThrown;
-
 	assert(ProtocolVersion.v2024_11_05.toWire == "2024-11-05");
 	assert(ProtocolVersion.v2026_07_28.toWire == "2026-07-28");
-	assert("2025-06-18".parseVersion == ProtocolVersion.v2025_06_18);
-	assert("2026-07-28".parseVersion == ProtocolVersion.v2026_07_28);
-	assertThrown("1999-01-01".parseVersion);
+	ProtocolVersion v;
+	assert("2025-06-18".tryParseVersion(v) && v == ProtocolVersion.v2025_06_18);
+	assert("2026-07-28".tryParseVersion(v) && v == ProtocolVersion.v2026_07_28);
+	assert(!"1999-01-01".tryParseVersion(v));
 }
 
 unittest  // tryParseVersion does not throw on unknown
@@ -212,11 +198,8 @@ unittest  // 2026-07-28 is the latest stable version; 2025-11-25 the latest lega
 
 unittest  // "draft" is not a wire token: the released revision is addressed by its date only
 {
-	import std.exception : assertThrown;
-
 	ProtocolVersion v;
 	assert(!"draft".tryParseVersion(v));
-	assertThrown("draft".parseVersion);
 	// An initialize handshake naming "draft" is an unknown version and falls back
 	// to the latest legacy revision, like any other unknown token.
 	assert(negotiate("draft") == latestLegacy);

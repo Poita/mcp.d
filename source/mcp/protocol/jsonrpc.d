@@ -276,54 +276,6 @@ Json makeRequest(Json id, string method, Json params = Json.undefined) @safe
 	return j;
 }
 
-/// Render a JSON-RPC request id (a string or a number per the spec) to a stable
-/// string form. Used where an id must be carried as a string value — e.g. the
-/// modern `subscriptions/listen` id stamped into outbound notifications'
-/// `_meta["io.modelcontextprotocol/subscriptionId"]`. A string id is returned
-/// verbatim; a numeric id is rendered as its decimal text; anything else (null /
-/// absent) yields an empty string.
-string rpcIdString(Json id) @safe
-{
-	import std.conv : to;
-
-	switch (id.type)
-	{
-	case Json.Type.string:
-		return id.get!string;
-	case Json.Type.int_:
-		return id.get!long
-			.to!string;
-	case Json.Type.bigInt:
-		return id.toString();
-	case Json.Type.float_:
-		immutable v = id.get!double;
-		if (v != cast(long) v)
-			throw invalidRequest("JSON-RPC id MUST NOT have a fractional part");
-		return (cast(long) v).to!string;
-	default:
-		return "";
-	}
-}
-
-unittest  // rpcIdString renders string and numeric ids, empties null
-{
-	assert(rpcIdString(Json("abc")) == "abc");
-	assert(rpcIdString(Json(42)) == "42");
-	assert(rpcIdString(Json(null)) == "");
-}
-
-unittest  // rpcIdString rejects a float id with a fractional part
-{
-	import std.exception : assertThrown;
-
-	assertThrown!McpException(rpcIdString(Json(1.5)));
-}
-
-unittest  // rpcIdString accepts a whole-number float id and renders it as an integer
-{
-	assert(rpcIdString(Json(3.0)) == "3");
-}
-
 unittest  // parseMessage rejects a request with a fractional float id
 {
 	import std.exception : assertThrown;

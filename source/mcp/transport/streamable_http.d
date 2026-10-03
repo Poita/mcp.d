@@ -5921,7 +5921,7 @@ unittest  // modern subscriptions/listen: ack first, then opted-in change notifi
 	assert(frames[0].canFind("toolsListChanged"));
 	// The ack is the FIRST message and carries the subscriptionId (the listen id).
 	assert(frames[0].canFind(cast(string) MetaKey.subscriptionId));
-	assert(frames[0].canFind(rpcIdString(m.id)));
+	assert(frames[0].canFind(m.id.toString()));
 
 	// An opted-in change notification is delivered onto the open stream, also
 	// stamped with the subscriptionId.
@@ -5929,7 +5929,7 @@ unittest  // modern subscriptions/listen: ack first, then opted-in change notifi
 	assert(frames.length == 2);
 	assert(frames[1].canFind("notifications/tools/list_changed"));
 	assert(frames[1].canFind(cast(string) MetaKey.subscriptionId));
-	assert(frames[1].canFind(rpcIdString(m.id)));
+	assert(frames[1].canFind(m.id.toString()));
 
 	// A change type the client did NOT opt into is suppressed (no new frame).
 	server.enableResourcesListChanged();
