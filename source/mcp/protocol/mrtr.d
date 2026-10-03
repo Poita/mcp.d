@@ -785,12 +785,21 @@ struct InputRequest
 
 	/// Read `params["url"]` as a string (`""` when absent) — the reader
 	/// counterpart to the `elicitationUrl` builder. Non-empty only for url-mode
-	/// elicitation requests (`params["mode"] == "url"`).
+	/// elicitation requests (`params["mode"] == "url"`). Throws -32602 when the
+	/// url is present but not a valid http(s) URL, since the client would
+	/// otherwise navigate to a server-chosen `javascript:` or `file:` target.
 	string url() @safe
 	{
+		import mcp.protocol.errors : invalidParams;
+
 		if (params.type == Json.Type.object && "url" in params
 				&& params["url"].type == Json.Type.string)
-			return params["url"].get!string;
+		{
+			const u = params["url"].get!string;
+			if (!isValidElicitationUrl(u))
+				throw invalidParams("URL-mode elicitation requires a valid http(s) url");
+			return u;
+		}
 		return "";
 	}
 
@@ -1918,6 +1927,21 @@ unittest  // InputRequest.elicitationUrl readers round-trip url and message
 	auto ir = InputRequest.elicitationUrl("e1", "msg", "https://example.com/consent");
 	assert(ir.url() == "https://example.com/consent");
 	assert(ir.elicitationMessage() == "msg");
+}
+
+unittest  // InputRequest.url rejects a server-sent url that is not a valid web URL
+{
+	import std.exception : collectException;
+	import mcp.protocol.errors : ErrorCode, McpException;
+
+	Json p = Json.emptyObject;
+	p["mode"] = "url";
+	p["message"] = "msg";
+	p["url"] = "javascript:alert(1)";
+	auto ir = InputRequest.fromJson("e1",
+			Json(["method": Json("elicitation/create"), "params": p]));
+	auto e = collectException!McpException(ir.url());
+	assert(e !is null && e.code == ErrorCode.invalidParams);
 }
 
 unittest  // InputRequest.elicitationUrl rejects empty url as a local error

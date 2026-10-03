@@ -3,7 +3,7 @@ module mcp.protocol.types;
 import std.typecons : Nullable, nullable;
 import vibe.data.json : Json, parseJsonString, deserializeJson, serializeToJson;
 import mcp.protocol.capabilities;
-import mcp.protocol.errors : ErrorCode, McpException;
+import mcp.protocol.errors : ErrorCode, McpException, invalidParams, isValidElicitationUrl;
 import mcp.protocol.versions : ProtocolVersion, toWire;
 import mcp.protocol.jsonhelpers : getOr, tryGet, requireObject, tryNumber;
 import mcp.protocol.tasks : Task, makeCreateTaskResult, isCreateTaskResult;
@@ -3671,6 +3671,10 @@ struct ElicitParams
 			p.requestedSchema = j["requestedSchema"];
 		tryGet(j, "url", p.url);
 		tryGet(j, "elicitationId", p.elicitationId);
+		// A URL-mode request drives browser navigation, so a non-web or
+		// malformed `url` from the server is refused before any handler sees it.
+		if (p.isUrl && !isValidElicitationUrl(p.url))
+			throw invalidParams("URL-mode elicitation requires a valid http(s) url");
 		return p;
 	}
 }
@@ -3968,6 +3972,21 @@ unittest  // ElicitParams parses a url-mode request and preserves raw
 	assert(parsed.url == "https://example.com/consent");
 	assert(parsed.elicitationId == "e1");
 	assert("requestedSchema" !in parsed.raw); // raw is the original params
+}
+
+unittest  // ElicitParams rejects a url-mode request whose url is not a valid web URL
+{
+	import std.exception : collectException;
+
+	foreach (url; ["javascript:alert(1)", "file:///etc/passwd", "not a url", ""])
+	{
+		Json p = Json.emptyObject;
+		p["mode"] = "url";
+		p["message"] = "Approve";
+		p["url"] = url;
+		auto e = collectException!McpException(ElicitParams.fromJson(p));
+		assert(e !is null && e.code == ErrorCode.invalidParams, url);
+	}
 }
 
 unittest  // ElicitParams.toJson omits mode for the form default
