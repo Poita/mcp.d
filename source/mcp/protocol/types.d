@@ -1254,9 +1254,7 @@ struct CallToolResult
 		else
 			const Json src = structuredContent["result"];
 		try
-			return () @trusted {
 			return deserializeWithPolicy!(JsonSerializer, EnumByNamePolicy, T)(src);
-		}();
 		catch (McpException e)
 			throw e;
 		catch (Exception e)
@@ -1276,9 +1274,7 @@ struct CallToolResult
 	{
 		if (requestState.length == 0)
 			return T.init;
-		return () @trusted {
-			return deserializeJson!T(parseJsonString(requestState));
-		}();
+		return deserializeJson!T(parseJsonString(requestState));
 	}
 
 	/// Assert this is a success result. Returns normally when `!isError`; when
@@ -1323,9 +1319,7 @@ struct CallToolResult
 		import vibe.data.serialization : serializeWithPolicy;
 
 		CallToolResult r;
-		Json sc = () @trusted {
-			return serializeWithPolicy!(JsonSerializer, EnumByNamePolicy)(value);
-		}();
+		Json sc = serializeWithPolicy!(JsonSerializer, EnumByNamePolicy)(value);
 		static if (!isFieldwiseStruct!T)
 		{
 			Json wrapped = Json.emptyObject;
@@ -3724,9 +3718,7 @@ struct ElicitResult
 
 		ElicitResult r;
 		r.action = ElicitAction.accept;
-		r.content = () @trusted {
-			return serializeWithPolicy!(JsonSerializer, EnumByNamePolicy)(value);
-		}();
+		r.content = serializeWithPolicy!(JsonSerializer, EnumByNamePolicy)(value);
 		return r;
 	}
 
@@ -3822,9 +3814,7 @@ struct ElicitResult
 		if (content.type != Json.Type.object)
 			return T.init;
 		try
-			return () @trusted {
 			return deserializeWithPolicy!(JsonSerializer, EnumByNamePolicy, T)(content);
-		}();
 		catch (McpException e)
 			throw e;
 		catch (Exception e)

@@ -1036,11 +1036,11 @@ void delegate(TLSContext) @safe nothrow tlsContextSetup(TlsTrust trust) @safe
 /// Throws `invalidRequest` when the URL is unsafe under `policy` (insecure
 /// scheme for `blockInternal`/`allowLoopback`, an internal IP-literal/resolved address, or an
 /// unresolvable host — fail CLOSED), and `internalError` when the request
-/// times out. `@trusted` because the vibe HTTP client API is `@system`.
+/// times out.
 void secureRequestHTTP(string url, SsrfPolicy policy,
-		scope void delegate(scope HTTPClientRequest) requester,
-		scope void delegate(scope HTTPClientResponse) responder,
-		FetchOptions options = FetchOptions.init) @trusted
+		scope void delegate(scope HTTPClientRequest) @safe requester,
+		scope void delegate(scope HTTPClientResponse) @safe responder,
+		FetchOptions options = FetchOptions.init) @safe
 {
 	import mcp.protocol.errors : internalError;
 	import vibe.core.core : setTimer, Timer;
@@ -1077,8 +1077,8 @@ void secureRequestHTTP(string url, SsrfPolicy policy,
 
 /// The body of `secureRequestHTTP`: vet, pin and perform the request.
 private void fetchPinned(string url, SsrfPolicy policy,
-		scope void delegate(scope HTTPClientRequest) requester,
-		scope void delegate(scope HTTPClientResponse) responder, FetchOptions options) @trusted
+		scope void delegate(scope HTTPClientRequest) @safe requester,
+		scope void delegate(scope HTTPClientResponse) @safe responder, FetchOptions options) @safe
 {
 	import mcp.protocol.errors : invalidRequest;
 	import vibe.inet.url : URL;
@@ -2003,4 +2003,25 @@ unittest  // a connection opened with insecureSkipVerify is never reused by a ve
 	{
 	}
 	assert(!reached, "a verifying request must not ride an unverified pooled connection");
+}
+
+unittest  // secureRequestHTTP rejects a @system requester delegate at compile time
+{
+	static assert(!__traits(compiles, secureRequestHTTP("https://example.com",
+			SsrfPolicy.blockInternal, (scope HTTPClientRequest req) @system {}, null)));
+}
+
+unittest  // secureRequestHTTP rejects a @system responder delegate at compile time
+{
+	static assert(!__traits(compiles, secureRequestHTTP("https://example.com",
+			SsrfPolicy.blockInternal, null, (scope HTTPClientResponse res) @system {
+			})));
+}
+
+unittest  // secureRequestHTTP is callable from @safe code with @safe delegates
+{
+	static assert(__traits(compiles, () @safe {
+			secureRequestHTTP("https://example.com", SsrfPolicy.blockInternal,
+			(scope HTTPClientRequest req) {}, (scope HTTPClientResponse res) {});
+		}));
 }

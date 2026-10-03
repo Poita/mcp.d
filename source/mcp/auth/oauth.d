@@ -954,8 +954,9 @@ bool isSecureFetchUrlResolved(string url, SsrfPolicy policy) @safe
 /// vetted numeric address (preserving Host header + TLS SNI), and fail CLOSED
 /// on any target `policy` rejects. Throws `invalidRequest` when the URL is
 /// unsafe.
-void secureRequestHTTP(string url, SsrfPolicy policy, scope void delegate(
-		scope HTTPClientRequest) requester, scope void delegate(scope HTTPClientResponse) responder) @safe
+void secureRequestHTTP(string url, SsrfPolicy policy,
+		scope void delegate(scope HTTPClientRequest) @safe requester,
+		scope void delegate(scope HTTPClientResponse) @safe responder) @safe
 {
 	import mcp.protocol.ssrf : connectorRequest = secureRequestHTTP;
 
