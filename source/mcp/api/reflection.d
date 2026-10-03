@@ -640,13 +640,19 @@ private Json parametersSchema(alias func)() @safe
 	return s;
 }
 
-/// Whether argument `name` is meaningfully present in `args`: keyed, and neither
-/// JSON `null` nor `undefined`. The canonical absent/null/undefined predicate
-/// shared by the defaulting and Nullable marshalling paths.
-private bool argPresent(Json args, string name) @safe
+/// Whether argument `name` of a `P` parameter is meaningfully present in
+/// `args`: keyed, not `undefined`, and not JSON `null` unless `P` is `Json`,
+/// which binds `null` verbatim as a value its empty schema admits. The
+/// canonical absent/null/undefined predicate shared by the defaulting and
+/// Nullable marshalling paths.
+private bool argPresent(P)(Json args, string name) @safe
 {
-	return (name in args) !is null && args[name].type != Json.Type.null_
-		&& args[name].type != Json.Type.undefined;
+	if ((name in args) is null || args[name].type == Json.Type.undefined)
+		return false;
+	static if (is(P == Json))
+		return true;
+	else
+		return args[name].type != Json.Type.null_;
 }
 
 /// Whether argument `name` of a `P` parameter is an explicit JSON `null` that
@@ -674,7 +680,7 @@ private P marshalArgDefault(P, alias def, bool stringArgs = false)(Json args, st
 	{
 		if (isExplicitNull!P(args, name))
 			return P.init;
-		if (!argPresent(args, name))
+		if (!argPresent!P(args, name))
 			return def;
 		return marshalArg!(P, stringArgs)(args, name);
 	}
@@ -691,7 +697,7 @@ private P marshalArg(P, bool stringArgs = false)(Json args, string name) @safe
 	}
 	else
 	{
-		if (!argPresent(args, name))
+		if (!argPresent!P(args, name))
 			return P.init;
 		static if (stringArgs)
 			if (args[name].type == Json.Type.string)
@@ -915,7 +921,7 @@ private string bindToolArgs(alias overload)(Json args, ref Tuple!(BoundParameter
 		{
 			static if (is(defs[i] == void) && !isInstanceOf!(Nullable, P)
 					&& !ParamSchemaDefaults!(overload, i).length)
-				if (!argPresent(args, names[i]))
+				if (!argPresent!P(args, names[i]))
 					return "argument '" ~ names[i] ~ "': required argument is missing";
 			try
 			{
@@ -923,7 +929,7 @@ private string bindToolArgs(alias overload)(Json args, ref Tuple!(BoundParameter
 				// when present, else the D default.
 				static if (ParamSchemaDefaults!(overload, i).length)
 				{
-					if (argPresent(args, names[i]))
+					if (argPresent!P(args, names[i]))
 						setBound(argv[i], marshalArg!P(args, names[i]));
 					else if (!isExplicitNull!P(args, names[i]))
 						setBound(argv[i], defaultAs!(P, ParamSchemaDefaults!(overload, i)[0])());
@@ -1295,7 +1301,7 @@ private void registerPromptMethod(string memberName, alias overload, alias paren
 			else static if (ParamSchemaDefaults!(overload, i).length)
 			{
 				// An omitted argument takes its advertised @schemaDefault.
-				if (argPresent(args, names[i]))
+				if (argPresent!P(args, names[i]))
 				{
 					try
 						setBound(argv[i], marshalArg!(P, true)(args, names[i]));
@@ -1316,7 +1322,7 @@ private void registerPromptMethod(string memberName, alias overload, alias paren
 				// marshaller are passed through unchanged so an inner
 				// invalidParams is not double-wrapped.
 				static if (!isInstanceOf!(Nullable, P))
-					if (!argPresent(args, names[i]))
+					if (!argPresent!P(args, names[i]))
 						throw invalidParams(
 							"Missing required argument '" ~ names[i] ~ "' for prompt: " ~ attr.name);
 				try
@@ -5747,4 +5753,31 @@ unittest  // enableEvents after an event type is registered throws rather than d
 	registerHandlers(s, new EventUdaApi);
 	assertThrown(s.enableEvents());
 	assert(s.events().has("email.received"));
+}
+
+version (unittest) private final class NullJsonParamApi
+{
+	@tool("kind", "Report the JSON type of a value")
+	string kind(Json value) @safe
+	{
+		return value.type == Json.Type.null_ ? "null" : "other";
+	}
+}
+
+unittest  // a Json parameter binds an explicit null rather than reporting it missing
+{
+	auto s = new McpServer("t", "1");
+	registerHandlers(s, new NullJsonParamApi);
+	auto r = callToolArgs(s, "kind", `{"value":null}`);
+	assert(!("isError" in r && r["isError"].get!bool), r.toString);
+	assert(r["content"][0]["text"].get!string == "null", r.toString);
+}
+
+unittest  // a Json parameter left out is still a missing required argument
+{
+	auto s = new McpServer("t", "1");
+	s.disableInputSchemaValidation();
+	registerHandlers(s, new NullJsonParamApi);
+	auto r = callToolArgs(s, "kind", `{}`);
+	assert(r["isError"].get!bool, r.toString);
 }
