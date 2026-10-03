@@ -850,7 +850,9 @@ reaches live streams and webhook subscribers but never a poller. The handle also
 lifecycle hooks (start an author-owned live source task in `onSubscribe` that
 `publish`es, and stop it in `onUnsubscribe`) and `pollInterval`. A poller's lease
 lasts `EventsOptions.pollLeaseTtl` or two poll intervals, whichever is longer, so
-`onUnsubscribe` fires only once a poller stops polling. The hooks fire **exactly once per `(principal, name,
+`onUnsubscribe` fires only once a poller stops polling. A poll that sets no
+`maxEvents` returns at most `EventsOptions.pollDefaultMaxEvents` (100) events, and
+a larger request is clamped to `pollMaxEvents` (1000). The hooks fire **exactly once per `(principal, name,
 arguments)` per node**: the lifecycle refcount is node-local. A webhook subscription
 fires `onSubscribe` on the node that creates it and on every node that registers the
 hook while the subscription is in the `WebhookSubscriptionStore`, so a node restarted

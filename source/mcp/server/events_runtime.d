@@ -368,6 +368,8 @@ struct EventsOptions
 	Duration pollLeaseTtl = 5.minutes; /// minimum poll subscription lease window (drives on_unsubscribe); a lease always spans at least two of the type's poll intervals
 	int pollMaxLeasesPerPrincipal = 1000; /// cap on distinct live poll subscriptions one principal may hold (0 = unlimited)
 	int pollMaxAnonymousLeases = 10_000; /// cap on distinct live poll subscriptions all unauthenticated callers hold together (0 = unlimited)
+	long pollDefaultMaxEvents = 100; /// batch cap for an `events/poll` that sets no (or a zero) `maxEvents` (0 = uncapped)
+	long pollMaxEvents = 1000; /// largest `maxEvents` an `events/poll` may ask for; larger values are clamped (0 = no limit)
 	Duration webhookTtlCap = 30.minutes; /// max granted webhook TTL (clamps suggestions down)
 	Duration webhookMinTtl = 1.minutes; /// min granted webhook TTL (clamps tiny suggestions up)
 	bool allowNoExpiry; /// permit `ttlMs:null` no-expiry grants (construction throws unless the store is `durable`)
@@ -1012,7 +1014,20 @@ final class EventsRuntime
 
 		touchPollLease(*p, name, arguments, principal);
 
-		return runPoll(*p, name, arguments, principal, cursor, maxAgeMs, maxEvents);
+		return runPoll(*p, name, arguments, principal, cursor, maxAgeMs, pollBatchCap(maxEvents));
+	}
+
+	// The batch cap an `events/poll` runs with: the client's `maxEvents`, or the
+	// configured default when it set none, clamped to the configured maximum.
+	private Nullable!long pollBatchCap(Nullable!long requested) @safe
+	{
+		Nullable!long cap = requested;
+		if (cap.isNull || cap.get < 1)
+			cap = opts_.pollDefaultMaxEvents > 0
+				? nullable(opts_.pollDefaultMaxEvents) : Nullable!long.init;
+		if (opts_.pollMaxEvents > 0 && (cap.isNull || cap.get > opts_.pollMaxEvents))
+			cap = opts_.pollMaxEvents;
+		return cap;
 	}
 
 	// The poll body without lease bookkeeping: read the ring buffer (emit-only) or
@@ -5140,6 +5155,46 @@ unittest  // typed onFetch receives the poll's maxEvents cap
 	rt.poll("incident.created", Json.emptyObject, "", nullable("c0"),
 			Nullable!long.init, nullable(7L));
 	assert(!seen.isNull && seen.get == 7);
+}
+
+unittest  // a poll without maxEvents is capped at the configured default
+{
+	import std.conv : to;
+
+	EventsOptions o;
+	o.nowMs = () @safe => 1_000_000L;
+	o.nowIso = () @safe => "t";
+	o.pollDefaultMaxEvents = 3;
+	auto rt = new EventsRuntime(null, o);
+	EventRegistration reg = {descriptor: EventType("n"), emitOnly: true};
+	rt.register(reg);
+	auto first = rt.poll("n", Json.emptyObject, "", Nullable!string.init,
+			Nullable!long.init, Nullable!long.init);
+	foreach (i; 0 .. 5)
+		rt.emit(EventOccurrence("e" ~ i.to!string, "n", "t"));
+	auto r = rt.poll("n", Json.emptyObject, "", first.cursor,
+			Nullable!long.init, Nullable!long.init);
+	assert(r.events.length == 3 && r.hasMore);
+}
+
+unittest  // a poll's maxEvents is clamped to the configured maximum
+{
+	import std.conv : to;
+
+	EventsOptions o;
+	o.nowMs = () @safe => 1_000_000L;
+	o.nowIso = () @safe => "t";
+	o.pollMaxEvents = 2;
+	Nullable!long seen;
+	auto rt = new EventsRuntime(null, o);
+	rt.define!(DemoArgs, DemoPayload)("incident.created")
+		.onFetch((DemoArgs args, scope FetchContext ctx) @safe {
+			seen = ctx.maxEvents;
+			return EventBatch!DemoPayload.empty("c0");
+		});
+	rt.poll("incident.created", Json.emptyObject, "", nullable("c0"),
+			Nullable!long.init, nullable(50L));
+	assert(!seen.isNull && seen.get == 2);
 }
 
 unittest  // a check that ignores maxEvents is capped, resuming after the last delivered event

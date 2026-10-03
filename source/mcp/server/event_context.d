@@ -127,7 +127,7 @@ struct FetchContext
 {
 	Nullable!string cursor; /// resume position; null = from now
 	Nullable!long maxAgeMs; /// replay floor; null = unbounded
-	Nullable!long maxEvents; /// batch cap; null = server default
+	Nullable!long maxEvents; /// batch cap: the client's `maxEvents` clamped to `EventsOptions.pollMaxEvents`, else `pollDefaultMaxEvents`; null = uncapped
 	string principal; /// authenticated subject ("" if unauthenticated)
 
 	/// True when the client passed `cursor: null` (start from now).
