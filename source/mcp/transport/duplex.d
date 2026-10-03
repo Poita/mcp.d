@@ -250,6 +250,17 @@ final class DuplexChannel
 			send(makeErrorResponse(Json(null), error));
 	}
 
+	/// Wake the outbound request that `reply` (a response or error response)
+	/// answers. A batch handed to `onInboundBatch` passes its reply members here,
+	/// since the handler dispatches requests and notifications only.
+	void resolveReply(Message reply) @safe
+	{
+		if (reply.kind == MessageKind.response)
+			coord.resolve(reply.id, reply.result, Json.undefined);
+		else if (reply.kind == MessageKind.errorResponse)
+			coord.resolve(reply.id, Json.undefined, reply.error);
+	}
+
 	private void routeMessage(Message m) @safe
 	{
 		final switch (m.kind)

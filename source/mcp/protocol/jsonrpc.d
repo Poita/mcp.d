@@ -264,6 +264,50 @@ ParsedInput parseAny(string text) @safe
 	return ParsedInput(false, [parseMessage(text)]);
 }
 
+/// Split the client replies out of the batch text `raw`: each well-formed
+/// response or error response member is passed to `onReply`, and the text of a
+/// batch holding the remaining members, in their original order, is returned
+/// for the server core to dispatch. A server core answers requests and
+/// notifications only, so a reply left in the batch would never reach the
+/// handler awaiting it. Returns `raw` unchanged when it is not a parseable batch
+/// or holds no reply, and `null` when it holds nothing but replies.
+string takeBatchReplies(string raw, scope void delegate(Message) @safe onReply) @safe
+{
+	import std.string : strip, startsWith;
+
+	if (!raw.strip.startsWith("["))
+		return raw;
+	Json arr;
+	try
+		arr = parseJsonString(raw);
+	catch (Exception)
+		return raw;
+	if (arr.type != Json.Type.array)
+		return raw;
+	Json[] rest;
+	bool tookReply;
+	foreach (i; 0 .. arr.length)
+	{
+		auto item = arr[i];
+		bool wellFormed = true;
+		try
+			validateEnvelope(item);
+		catch (McpException)
+			wellFormed = false;
+		const kind = wellFormed ? Message(item).kind : MessageKind.request;
+		if (kind == MessageKind.response || kind == MessageKind.errorResponse)
+		{
+			onReply(Message(item));
+			tookReply = true;
+		}
+		else
+			rest ~= item;
+	}
+	if (!tookReply)
+		return raw;
+	return rest.length ? Json(rest).toString() : null;
+}
+
 /// Build a request object.
 Json makeRequest(Json id, string method, Json params = Json.undefined) @safe
 {
@@ -658,4 +702,34 @@ unittest  // a well-formed error object with data is accepted
 			`{"jsonrpc":"2.0","id":1,"error":{"code":-32602,"message":"bad","data":[1]}}`);
 	assert(m.kind == MessageKind.errorResponse);
 	assert(m.error["code"].get!long == -32602);
+}
+
+unittest  // takeBatchReplies hands replies to onReply and keeps the other members in order
+{
+	Json[] replies;
+	const rest = takeBatchReplies(`[{"jsonrpc":"2.0","id":1,"method":"ping"},`
+			~ `{"jsonrpc":"2.0","id":7,"result":{}},{"jsonrpc":"2.0","method":"n"},`
+			~ `{"jsonrpc":"2.0","id":8,"error":{"code":-1,"message":"no"}}]`, (Message m) @safe {
+		replies ~= m.id;
+	});
+	assert(replies == [Json(7), Json(8)]);
+	auto arr = parseJsonString(rest);
+	assert(arr.length == 2 && arr[0]["method"].get!string == "ping"
+			&& arr[1]["method"].get!string == "n");
+}
+
+unittest  // takeBatchReplies returns null for a batch of replies only
+{
+	assert(takeBatchReplies(`[{"jsonrpc":"2.0","id":7,"result":{}}]`, (Message) @safe {
+		}) is null);
+}
+
+unittest  // takeBatchReplies leaves a batch without replies, or a single message, untouched
+{
+	const batch = `[{"jsonrpc":"2.0","id":1,"method":"ping"}]`;
+	const single = `{"jsonrpc":"2.0","id":7,"result":{}}`;
+	bool called;
+	assert(takeBatchReplies(batch, (Message) @safe { called = true; }) is batch);
+	assert(takeBatchReplies(single, (Message) @safe { called = true; }) is single);
+	assert(!called);
 }

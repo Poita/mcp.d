@@ -2435,7 +2435,13 @@ private void handlePost(McpServer server, ServerPushChannel push,
 		// 2025-03-26 back-compat: the non-streaming batch path (no in-flight
 		// server->client traffic), dispatched against the resolved state so the
 		// legacy path is actually reachable for a session that negotiated 2025-03-26.
-		const txt = server.handleRaw(payload, reqState, cancelScope, token);
+		// Client replies in the batch wake their server->client waiters (scoped to
+		// this POST's session, as for a single reply) and only the rest is
+		// dispatched.
+		const rest = takeBatchReplies(payload, (Message m) @safe {
+			coord.resolve(m.id, m.result, m.error, connToken);
+		});
+		const txt = rest is null ? "" : server.handleRaw(rest, reqState, cancelScope, token);
 		if (txt.length == 0)
 		{
 			res.statusCode = HTTPStatus.accepted;
@@ -2872,6 +2878,35 @@ unittest  // with auth on, every member of a 2025-03-26 batch sees the caller's 
 	auto arr = parseJsonString(reply);
 	assert(arr[0]["result"]["content"][0]["text"].get!string == "alice",
 			"a batch member must run under the request's authenticated principal: " ~ reply);
+}
+
+unittest  // a client reply inside a 2025-03-26 batch resolves the waiting server->client request
+{
+	import core.time : msecs;
+	import std.conv : to;
+	import vibe.http.server : createTestHTTPServerResponse, TestHTTPResponseMode;
+	import vibe.stream.memory : createMemoryOutputStream;
+	import vibe.data.json : parseJsonString;
+	import mcp.transport.sse_context : StreamCoordinator, ensurePushChannel;
+
+	auto server = new McpServer("t", "1");
+	auto coord = new StreamCoordinator;
+	ensurePushChannel(server, coord);
+	auto router = new URLRouter;
+	mountMcp(router, server);
+	const id = coord.alloc();
+	coord.register(id);
+
+	auto sink = createMemoryOutputStream();
+	auto res = createTestHTTPServerResponse(sink, null, TestHTTPResponseMode.bodyOnly);
+	router.handleRequest(makeInitPostReq(`[{"jsonrpc":"2.0","id":` ~ id.to!string
+			~ `,"result":{"answer":42}},{"jsonrpc":"2.0","id":"p","method":"ping"}]`,
+			["Accept": "application/json, text/event-stream"]), res);
+	const reply = () @trusted { return cast(string) sink.data.idup; }();
+	assert(res.statusCode == HTTPStatus.ok, reply);
+	auto arr = parseJsonString(reply);
+	assert(arr.length == 1 && arr[0]["id"].get!string == "p", reply);
+	assert(coord.await(id, 10.msecs)["answer"].get!int == 42);
 }
 
 unittest  // the standalone GET SSE stream uses the same session gate as POST/DELETE

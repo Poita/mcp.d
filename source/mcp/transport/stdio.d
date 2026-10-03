@@ -3,7 +3,8 @@ module mcp.transport.stdio;
 import core.time : Duration, seconds;
 import vibe.data.json : Json;
 
-import mcp.protocol.jsonrpc : Message;
+import mcp.protocol.jsonrpc : Message, takeBatchReplies;
+import mcp.protocol.versions : ProtocolVersion;
 import mcp.server.server;
 import mcp.server.settings : ServerSettings;
 import mcp.transport.coordinator : defaultServerRequestTimeout;
@@ -177,6 +178,12 @@ void serveStdio(McpServer server, string delegate() @safe readLine,
 	// stall the read loop, and `handleRaw` returns the one aggregated array frame.
 	void onInboundBatch(string raw) @safe
 	{
+		// Client replies in a batch the version gate admits wake their waiters
+		// here, on the read loop, and only the rest goes to `handleRaw`.
+		if (server.negotiatedVersion < ProtocolVersion.v2025_06_18)
+			raw = takeBatchReplies(raw, &channel.resolveReply);
+		if (raw is null)
+			return;
 		inflight.start();
 		runTask((string text) nothrow{
 			try
@@ -2031,6 +2038,66 @@ unittest  // stdio: a tool calling ctx.elicit is answered over the same stdio ch
 		}
 	}
 	assert(sawResult, "tools/call reply with the elicited value was never produced");
+}
+
+unittest  // stdio: a client reply inside a batch wakes the handler awaiting it
+{
+	import mcp.protocol.types : ElicitAction;
+
+	auto s = McpServer.stateful("stdio-peer", "1.0");
+	Tool ask = {name: "ask"};
+	s.registerTool(ask, (Json args, RequestContext ctx) @safe {
+		auto reply = ctx.elicit("What is your name?", Json([
+				"type": Json("object")
+		]));
+		CallToolResult r;
+		r.content = [
+			Content.makeText(reply.action == ElicitAction.accept
+				? "hi:" ~ reply.content["name"].get!string : "(declined)")
+		];
+		return r;
+	});
+
+	string[] outputs;
+	withServer(s, (ServerLink link) @safe {
+		link.feed(`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{"elicitation":{}},"clientInfo":{"name":"t","version":"1"}}}`);
+		link.feed(`{"jsonrpc":"2.0","method":"notifications/initialized"}`);
+		link.feed(`{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"ask"}}`);
+		foreach (_; 0 .. 12)
+			yield();
+		long elicitId = -1;
+		foreach (o; link.outbound)
+		{
+			auto j = parseJsonString(o);
+			if (j.type == Json.Type.object && "method" in j
+				&& j["method"].get!string == "elicitation/create")
+				elicitId = j["id"].get!long;
+		}
+		assert(elicitId >= 0, "server never emitted elicitation/create");
+		Json reply = Json.emptyObject;
+		reply["jsonrpc"] = "2.0";
+		reply["id"] = elicitId;
+		reply["result"] = Json([
+			"action": Json("accept"),
+			"content": Json(["name": Json("Ada")])
+		]);
+		link.feed(`[` ~ reply.toString() ~ `,{"jsonrpc":"2.0","id":3,"method":"ping"}]`);
+		foreach (_; 0 .. 16)
+			yield();
+		outputs = link.outbound.dup;
+	});
+
+	bool sawResult, sawPingArray;
+	foreach (o; outputs)
+	{
+		auto j = parseJsonString(o);
+		if (j.type == Json.Type.array)
+			sawPingArray = j.length == 1 && j[0]["id"].get!int == 3;
+		else if ("id" in j && j["id"].get!int == 2 && "result" in j)
+			sawResult = j["result"]["content"][0]["text"].get!string == "hi:Ada";
+	}
+	assert(sawResult, "the batched elicitation reply never reached the waiting handler");
+	assert(sawPingArray, "the batch's request members must still be answered as an array");
 }
 
 unittest  // stdio: notifications/cancelled mid-handler is observed via the in-flight token
