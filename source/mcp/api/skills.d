@@ -392,6 +392,33 @@ package(mcp) void addSkillEntry(McpServer server, Json entry) @safe
 	index.byUri[uri] = entry;
 }
 
+/// Remove the skill registered at `path`: its entry, every resource its entry
+/// lists (or its `SKILL.md` alone for a dynamic skill), and the entry of any
+/// nested skill whose `SKILL.md` is among those resources. Undoes a
+/// `registerSkill`, `registerDynamicSkill`, or `registerSkillDir`; does nothing
+/// when no skill is registered at `path`.
+package(mcp) void unregisterSkill(McpServer server, string path) @safe
+{
+	auto index = server.ensureSkillIndex();
+	const uri = skillUri(path);
+	auto entry = uri in index.byUri;
+	if (entry is null)
+		return;
+	const manifest = (*entry)["resources"];
+	index.byUri.remove(uri);
+	if (manifest.type != Json.Type.array)
+	{
+		server.removeResource(uri);
+		return;
+	}
+	foreach (i; 0 .. manifest.length)
+	{
+		const fileUri = manifest[i]["uri"].get!string;
+		server.removeResource(fileUri);
+		index.byUri.remove(fileUri);
+	}
+}
+
 // Build a resource reader that closes over its file/uri by PARAMETER. Capturing a
 // foreach-body local directly in the lambda would share a single closure frame
 // across iterations — every reader would then serve the last file registered — so

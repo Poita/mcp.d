@@ -601,7 +601,10 @@ a whole module with `registerModule!(my.module)(server)` — the input schema (f
 the parameter types) and output schema (from the return type) are derived at
 compile time, and arguments/results are marshalled for you. A handler may take a
 trailing `RequestContext` parameter to report progress, log, or call back to the
-client (sampling/elicitation). For tools whose schema is only known at runtime,
+client (sampling/elicitation). Registration is all or nothing: when one handler
+fails to register (a name already taken, a missing `@skillDir` directory), the
+handlers that call registered before it are removed again before the exception
+propagates. For tools whose schema is only known at runtime,
 drop to `server.registerTool(Tool, delegate)` / `registerResource` /
 `registerPrompt`, which receive the raw `Json`; `argsAs!T(arguments)` binds that
 `Json` into a typed struct with the same rules the UDA layer uses, throwing a

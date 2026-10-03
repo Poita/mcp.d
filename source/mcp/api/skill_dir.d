@@ -74,7 +74,9 @@ struct SkillDirOptions
 /// total size exceeds the configured caps, or (`publishNested`) a nested
 /// `SKILL.md` fails the same frontmatter/naming validation as a top-level one.
 /// Validation runs before registration, so a throw leaves the server unchanged.
-void registerSkillDir(McpServer server, string dir, SkillDirOptions options = SkillDirOptions.init) @safe
+/// Returns the skill path the directory was registered under.
+string registerSkillDir(McpServer server, string dir, SkillDirOptions options = SkillDirOptions
+		.init) @safe
 {
 	import std.base64 : Base64;
 
@@ -146,6 +148,7 @@ void registerSkillDir(McpServer server, string dir, SkillDirOptions options = Sk
 	registerSkillResources(server, path, skillMd, frontmatter, files);
 	foreach (entry; nestedEntries)
 		addSkillEntry(server, entry);
+	return path;
 }
 
 /// The name of the directory `dir` refers to, with `.`/`..` segments and

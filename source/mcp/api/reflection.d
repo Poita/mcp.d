@@ -19,7 +19,8 @@ import mcp.server.event_context : EventContext, EventResult, Event, EventBatch, 
 import mcp.server.events_runtime : EventRegistration, EventCheck;
 import mcp.api.attributes;
 import mcp.api.apps : UiToolMeta, setUiToolMeta, ensureApps;
-import mcp.api.skills : Skill, isValidSkillPath, registerSkill, skillFieldProblem;
+import mcp.api.skills : Skill, isValidSkillPath, registerSkill,
+	skillFieldProblem, unregisterSkill;
 import mcp.api.binding : bindJson, bindString, defaultAs, schemaNode, schemaOf,
 	SchemaUse, setBound, wireName;
 import mcp.protocol.schema;
@@ -38,17 +39,53 @@ import mcp.protocol.jsonhelpers : isFieldwiseStruct;
 /// An override (or interface implementation) without UDAs of its own takes the
 /// handler UDAs of the declaration it overrides, and calls dispatch virtually to
 /// the override.
+///
+/// Registration is all or nothing: when one handler fails to register (a name
+/// already taken, a missing `@skillDir` directory, ...), the handlers this call
+/// registered before it are removed again and the exception propagates.
+/// Extensions those handlers enabled stay enabled.
 void registerHandlers(T)(McpServer server, T obj) @safe
 {
+	Rollback rollback;
+	scope (failure)
+		rollback.run();
 	static if (is(T == U*, U) && is(U == struct))
-		registerAnnotatedMembers!(U, obj)(server);
+		registerAnnotatedMembers!(U, obj)(server, rollback);
 	else
 	{
 		static assert(is(T == class) || is(T == interface),
 				"registerHandlers needs a class instance or a pointer to a struct, not "
 				~ T.stringof ~ "; a struct passed by value is copied, so its handlers would not "
 				~ "see or update the original (allocate it with new and pass the pointer)");
-		registerAnnotatedMembers!(T, obj)(server);
+		registerAnnotatedMembers!(T, obj)(server, rollback);
+	}
+}
+
+/// The handlers one registration call has added so far, each as the action that
+/// removes it again, so a failure part-way through can undo the call.
+private struct Rollback
+{
+	private void delegate() @safe[] undos;
+
+	/// Record `undo` as the removal of a handler just registered.
+	void add(void delegate() @safe undo) @safe
+	{
+		undos ~= undo;
+	}
+
+	/// Remove every recorded handler, newest first. An undo that throws is
+	/// skipped so the rest still run and the original failure propagates.
+	void run() @safe
+	{
+		foreach_reverse (undo; undos)
+		{
+			try
+				undo();
+			catch (Exception)
+			{
+			}
+		}
+		undos = null;
 	}
 }
 
@@ -60,9 +97,10 @@ void registerHandlers(T)(McpServer server, T obj) @safe
 /// Free functions cannot receive a `RequestContext` via `this`, so a context
 /// must be taken as an explicit parameter (exactly as opt-in methods do).
 /// Non-function members and functions without a recognized UDA are skipped.
+/// Registration is all or nothing, as for `registerHandlers`.
 void registerModule(alias mod)(McpServer server) @safe
 {
-	registerAnnotatedMembers!(mod, mod)(server);
+	registerModules!mod(server);
 }
 
 /// Walk every overload of every member of `root` and dispatch each recognized
@@ -70,7 +108,8 @@ void registerModule(alias mod)(McpServer server) @safe
 /// `parent` is the symbol member calls resolve against — `(T, obj)` for an
 /// instance, `(mod, mod)` for a module's free functions. Members without a
 /// recognized UDA are skipped.
-private void registerAnnotatedMembers(alias root, alias parent)(McpServer server) @safe
+private void registerAnnotatedMembers(alias root, alias parent)(McpServer server,
+		ref Rollback rollback) @safe
 {
 	static foreach (memberName; __traits(allMembers, root))
 	{
@@ -90,7 +129,7 @@ private void registerAnnotatedMembers(alias root, alias parent)(McpServer server
 				}
 				else
 					registerOverload!(memberName, AnnotatedDecl!(root,
-							memberName, overload), parent)(server);
+							memberName, overload), parent)(server, rollback);
 			}
 		}
 	}
@@ -130,8 +169,10 @@ private template AnnotatedDecl(alias root, string memberName, alias overload)
 }
 
 /// Validate the handler UDAs on `overload` (member `memberName`) and register
-/// each one on `server`, dispatching calls through `parent`.
-private void registerOverload(string memberName, alias overload, alias parent)(McpServer server) @safe
+/// each one on `server`, dispatching calls through `parent`, recording in
+/// `rollback` how to remove each again.
+private void registerOverload(string memberName, alias overload, alias parent)(
+		McpServer server, ref Rollback rollback) @safe
 {
 	static if (hasHandlerUda!overload())
 	{
@@ -151,26 +192,38 @@ private void registerOverload(string memberName, alias overload, alias parent)(M
 		{
 			static assert(attr.name.length, "@tool on '" ~ memberName ~ "' has an empty name");
 			registerToolMethod!(memberName, overload, parent)(server, attr);
+			rollback.add(() @safe { server.removeTool(attr.name); });
 		}
 		else static if (is(typeof(attr) == taskTool))
 		{
 			static assert(attr.name.length, "@taskTool on '" ~ memberName ~ "' has an empty name");
 			registerTaskMethod!(memberName, overload, parent)(server, attr);
+			rollback.add(() @safe { server.removeTool(attr.name); });
 		}
 		else static if (is(typeof(attr) == event))
 		{
 			static assert(attr.name.length, "@event on '" ~ memberName ~ "' has an empty name");
 			registerEventMethod!(memberName, overload, parent)(server, attr);
+			rollback.add(() @safe { server.events.unregister(attr.name); });
 		}
 		else static if (is(typeof(attr) == prompt))
 		{
 			static assert(attr.name.length, "@prompt on '" ~ memberName ~ "' has an empty name");
 			registerPromptMethod!(memberName, overload, parent)(server, attr);
+			rollback.add(() @safe { server.removePrompt(attr.name); });
 		}
 		else static if (is(typeof(attr) == resource))
+		{
 			registerResourceMethod!(memberName, overload, parent)(server, attr);
+			rollback.add(() @safe { server.removeResource(attr.uri); });
+		}
 		else static if (is(typeof(attr) == resourceTemplate))
+		{
 			registerTemplateMethod!(memberName, overload, parent, attr)(server);
+			rollback.add(() @safe {
+				server.removeResourceTemplate(attr.uriTemplate);
+			});
+		}
 		else static if (is(typeof(attr) == skill))
 		{
 			static assert(isValidSkillPath(attr.path),
@@ -182,6 +235,7 @@ private void registerOverload(string memberName, alias overload, alias parent)(M
 					"@skill on '" ~ memberName ~ "': " ~ skillFieldProblem(attr.description,
 						attr.compatibility));
 			registerSkillMethod!(memberName, overload, parent)(server, attr);
+			rollback.add(() @safe { unregisterSkill(server, attr.path); });
 		}
 		else static if (is(typeof(attr) == skillDir))
 		{
@@ -190,7 +244,8 @@ private void registerOverload(string memberName, alias overload, alias parent)(M
 					~ attr.path ~ "\"; its final segment must be lowercase alphanumeric "
 					~ "with single hyphens (1..64 chars), after optional "
 					~ "non-empty prefix segments");
-			registerSkillDirMethod!(memberName, overload, parent)(server, attr);
+			const dirSkillPath = registerSkillDirMethod!(memberName, overload, parent)(server, attr);
+			rollback.add(() @safe { unregisterSkill(server, dirSkillPath); });
 		}
 	}
 }
@@ -262,8 +317,11 @@ private template handlerUdaExample(A)
 /// functions of several modules in one call.
 void registerModules(mods...)(McpServer server) @safe
 {
+	Rollback rollback;
+	scope (failure)
+		rollback.run();
 	static foreach (mod; mods)
-		registerModule!mod(server);
+		registerAnnotatedMembers!(mod, mod)(server, rollback);
 }
 
 /// The parameter types of `func` with top-level qualifiers removed, so an `in`,
@@ -1533,7 +1591,7 @@ private void registerSkillMethod(string memberName, alias overload, alias parent
 	registerSkill(server, sk);
 }
 
-private void registerSkillDirMethod(string memberName, alias overload, alias parent)(
+private string registerSkillDirMethod(string memberName, alias overload, alias parent)(
 		McpServer server, skillDir attr) @safe
 {
 	import std.traits : ReturnType;
@@ -1550,7 +1608,7 @@ private void registerSkillDirMethod(string memberName, alias overload, alias par
 
 	SkillDirOptions options;
 	options.path = attr.path;
-	registerSkillDir(server, __traits(getMember, parent, memberName)(), options);
+	return registerSkillDir(server, __traits(getMember, parent, memberName)(), options);
 }
 
 version (unittest)
@@ -5899,4 +5957,93 @@ unittest  // @skill carries license, compatibility, and allowed-tools into the f
 	assert(fm["license"].get!string == "MIT", fm.toString);
 	assert(fm["compatibility"].get!string == "Needs git", fm.toString);
 	assert(fm["allowed-tools"].get!string == "Bash(git:*)", fm.toString);
+}
+
+version (unittest) private final class PartlyClashingApi
+{
+	@tool("fresh", "Registered before the clash")
+	string fresh() @safe
+	{
+		return "";
+	}
+
+	@prompt("fresh-prompt", "Registered before the clash")
+	string freshPrompt() @safe
+	{
+		return "";
+	}
+
+	@resource("test://fresh", "Fresh")
+	string freshResource() @safe
+	{
+		return "";
+	}
+
+	@skill("fresh-skill", "Registered before the clash")
+	string freshSkill() @safe
+	{
+		return "# Body\n";
+	}
+
+	@tool("taken", "Collides with a tool already on the server")
+	string taken() @safe
+	{
+		return "";
+	}
+}
+
+unittest  // a registerHandlers that throws part-way leaves none of its handlers registered
+{
+	import std.exception : assertThrown;
+	import mcp.protocol.jsonrpc : Message, makeRequest;
+
+	auto s = new McpServer("t", "1");
+	Tool existing;
+	existing.name = "taken";
+	existing.inputSchema = parseJsonString(`{"type":"object"}`);
+	s.registerTool(existing, (Json args, RequestContext ctx) @safe => CallToolResult.text("old"));
+
+	assertThrown(registerHandlers(s, new PartlyClashingApi));
+
+	auto tools = s.handle(MakeListMessage()).get["result"]["tools"];
+	assert(tools.length == 1 && tools[0]["name"].get!string == "taken", tools.toString);
+	auto prompts = s.handle(Message(makeRequest(Json(1), "prompts/list",
+			Json.emptyObject))).get["result"]["prompts"];
+	assert(prompts.length == 0, prompts.toString);
+	auto resources = s.handle(Message(makeRequest(Json(2), "resources/list",
+			Json.emptyObject))).get["result"]["resources"];
+	assert(resources.length == 0, resources.toString);
+	auto skills = s.handle(Message(makeRequest(Json(3), "skills/list",
+			Json.emptyObject))).get["result"]["skills"];
+	assert(skills.length == 0, skills.toString);
+}
+
+version (unittest) private final class MissingSkillDirApi
+{
+	@tool("before-dir", "Registered before the missing directory")
+	string beforeDir() @safe
+	{
+		return "";
+	}
+
+	@skillDir()
+	string dir() @safe
+	{
+		return "/nonexistent/mcp-d-missing-skill-dir";
+	}
+}
+
+unittest  // a missing @skillDir directory leaves the earlier handlers unregistered
+{
+	import std.exception : assertThrown;
+
+	auto s = new McpServer("t", "1");
+	assertThrown(registerHandlers(s, new MissingSkillDirApi));
+	auto tools = s.handle(MakeListMessage()).get["result"]["tools"];
+	assert(tools.length == 0, tools.toString);
+	// The rolled-back names are free again.
+	Tool t;
+	t.name = "before-dir";
+	t.inputSchema = parseJsonString(`{"type":"object"}`);
+	s.registerTool(t, (Json args, RequestContext ctx) @safe => CallToolResult.text(""));
 }
