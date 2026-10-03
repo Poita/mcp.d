@@ -190,13 +190,17 @@ private void registerOverload(string memberName, alias overload, alias parent)(
 					~ " attaches the type, not a value, and registers nothing");
 		else static if (is(typeof(attr) == tool))
 		{
-			static assert(attr.name.length, "@tool on '" ~ memberName ~ "' has an empty name");
+			static assert(isValidToolName(attr.name),
+					"@tool on '" ~ memberName ~ "' has the name '" ~ attr.name ~ "'; "
+					~ toolNameRule);
 			registerToolMethod!(memberName, overload, parent)(server, attr);
 			rollback.add(() @safe { server.removeTool(attr.name); });
 		}
 		else static if (is(typeof(attr) == taskTool))
 		{
-			static assert(attr.name.length, "@taskTool on '" ~ memberName ~ "' has an empty name");
+			static assert(isValidToolName(attr.name),
+					"@taskTool on '" ~ memberName ~ "' has the name '"
+					~ attr.name ~ "'; " ~ toolNameRule);
 			registerTaskMethod!(memberName, overload, parent)(server, attr);
 			rollback.add(() @safe { server.removeTool(attr.name); });
 		}
@@ -427,6 +431,23 @@ private void checkUdaPlacement(string memberName, alias f)()
 						~ "' applies only to an @event method");
 		}
 	}
+}
+
+private enum toolNameRule = "a tool name must be 1..128 characters of "
+	~ "A-Z, a-z, 0-9, '_', '-', and '.'";
+
+/// Whether `name` follows the MCP tool-naming guidance (2025-11-25 onward): 1..128
+/// characters, each an ASCII letter, digit, underscore, hyphen, or dot.
+private bool isValidToolName(string name) @safe pure nothrow @nogc
+{
+	import std.ascii : isAlphaNum;
+
+	if (name.length == 0 || name.length > 128)
+		return false;
+	foreach (char c; name)
+		if (!(isAlphaNum(c) || c == '_' || c == '-' || c == '.'))
+			return false;
+	return true;
 }
 
 /// The wire names of `func`'s parameters, in order: each identifier with one
@@ -5188,6 +5209,65 @@ unittest  // a lossy or non-member @schemaDefault on a parameter is rejected at 
 	auto s = new McpServer("t", "1");
 	assert(!__traits(compiles, registerHandlers(s, new OutOfRangeDefaultApi)));
 	assert(!__traits(compiles, registerHandlers(s, new NonMemberEnumDefaultApi)));
+}
+
+version (unittest) private final class SpacedToolNameApi
+{
+	@tool("get weather", "f")
+	string f() @safe
+	{
+		return "";
+	}
+}
+
+version (unittest) private final class LongToolNameApi
+{
+	import std.array : replicate;
+
+	@tool("x".replicate(129), "f")
+	string f() @safe
+	{
+		return "";
+	}
+}
+
+version (unittest) private final class MaxLengthToolNameApi
+{
+	import std.array : replicate;
+
+	@tool("x".replicate(128), "f")
+	string f() @safe
+	{
+		return "";
+	}
+}
+
+version (unittest) private final class SlashedTaskToolNameApi
+{
+	@taskTool("jobs/run", "f")
+	string f() @safe
+	{
+		return "";
+	}
+}
+
+version (unittest) private final class PunctuatedToolNameApi
+{
+	@tool("Admin.get_user-v2", "f")
+	string f() @safe
+	{
+		return "";
+	}
+}
+
+unittest  // a @tool or @taskTool name outside 1..128 of [A-Za-z0-9_.-] is rejected at compile time
+{
+	auto s = new McpServer("t", "1");
+	assert(!__traits(compiles, registerHandlers(s, new SpacedToolNameApi)));
+	assert(!__traits(compiles, registerHandlers(s, new LongToolNameApi)));
+	assert(!__traits(compiles, registerHandlers(s, new SlashedTaskToolNameApi)));
+	registerHandlers(s, new PunctuatedToolNameApi);
+	registerHandlers(s, new MaxLengthToolNameApi);
 }
 
 version (unittest) private final class TaskTtlOnToolApi

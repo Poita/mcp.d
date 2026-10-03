@@ -19,11 +19,13 @@ import mcp.protocol.modern : CacheScope;
 /// }
 /// ---
 ///
-/// An optional human-readable `title` may be supplied for display purposes; it
-/// is independent of the programmatic `name`. To declare behavioral hints
-/// (readOnlyHint, destructiveHint, ...), attach the marker UDAs `@readOnly`,
-/// `@destructive`, `@idempotent`, `@openWorld` (and `@hintTitle(...)` for the
-/// annotation-level title) to the same method.
+/// The `name` must be 1..128 characters of ASCII letters, digits, `_`, `-`, and
+/// `.` (the MCP tool-naming guidance), or registration is a compile error; this
+/// applies to `@taskTool` too. An optional human-readable `title` may be
+/// supplied for display purposes; it is independent of the programmatic `name`.
+/// To declare behavioral hints (readOnlyHint, destructiveHint, ...), attach the
+/// marker UDAs `@readOnly`, `@destructive`, `@idempotent`, `@openWorld` (and
+/// `@hintTitle(...)` for the annotation-level title) to the same method.
 struct tool
 {
 	string name;
