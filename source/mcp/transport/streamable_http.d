@@ -40,6 +40,16 @@ struct StreamLimits
 	/// Standalone GET streams open at once on one session; past it a GET is
 	/// answered 429.
 	size_t maxGetStreamsPerSession = 4;
+	/// Standalone GET streams open at once across the mount; past it a GET is
+	/// answered 503. A session holding a GET stream is never evicted, so keep
+	/// this well below `SessionLimits.maxSessions`: the gap is the room left for
+	/// new sessions once every GET slot is taken.
+	size_t maxGetStreams = 1_000;
+	/// Standalone GET streams one authenticated principal holds open at once
+	/// across all its sessions; past it that principal's GET is answered 429, so
+	/// one client cannot take every `maxGetStreams` slot. Unauthenticated callers
+	/// share no principal and are bounded only by `maxGetStreams`.
+	size_t maxGetStreamsPerPrincipal = 100;
 	/// `subscriptions/listen` and `events/stream` response streams open at once
 	/// across the mount; past it such a request is answered 503.
 	size_t maxPushStreams = 1_000;
@@ -305,7 +315,8 @@ unittest  // a disabled (no-validator) config is never rejected, even with no AS
 ///     server->client SSE stream wired to the server-push channel
 ///     (`McpServer.notify`): 400 without `Mcp-Session-Id`, 404 for an unknown
 ///     session, 406 when Accept excludes `text/event-stream`, 429 past
-///     `StreamLimits.maxGetStreamsPerSession`. A stateless
+///     `StreamLimits.maxGetStreamsPerSession` or `maxGetStreamsPerPrincipal`,
+///     503 past `maxGetStreams`. A stateless
 ///     server keeps no session to push on, so GET is always 405 (`Allow: POST`).
 ///   - DELETE: on a stateful server, terminates the session named by
 ///     `Mcp-Session-Id` (204; 400 without the header, 404 for an unknown
@@ -334,6 +345,8 @@ void mountMcp(URLRouter router, McpServer server,
 	auto statelessInFlight = sessions is null ? new StatelessInFlight : null;
 	auto pushStreams = new StreamGate(opts.streamLimits.maxPushStreams,
 			opts.streamLimits.maxPushStreamsPerPrincipal);
+	auto getStreams = new StreamGate(opts.streamLimits.maxGetStreams,
+			opts.streamLimits.maxGetStreamsPerPrincipal);
 
 	// This mount owns a single fallback `ConnectionState`, which the server core
 	// threads through dispatch and reads back for the notify/push path. It is the
@@ -398,7 +411,7 @@ void mountMcp(URLRouter router, McpServer server,
 		TokenInfo token;
 		if (!guardAuth(req, res, opts, token))
 			return;
-		handleGet(server, push, sessions, opts, principalOf(token), req, res);
+		handleGet(server, push, sessions, getStreams, opts, principalOf(token), req, res);
 	});
 	router.match(HTTPMethod.DELETE, opts.path, (HTTPServerRequest req,
 			HTTPServerResponse res) @safe {
@@ -1606,7 +1619,8 @@ private string principalOf(TokenInfo token) @safe
 	return token.valid ? token.subject : "";
 }
 
-private void handleGet(McpServer server, ServerPushChannel push, SessionManager sessions,
+private void handleGet(McpServer server, ServerPushChannel push,
+		SessionManager sessions, StreamGate getStreams,
 		StreamableHttpOptions opts, string principal, HTTPServerRequest req, HTTPServerResponse res) @safe
 {
 	// The GET that opens the standalone stream is a subsequent HTTP request and
@@ -1688,13 +1702,26 @@ private void handleGet(McpServer server, ServerPushChannel push, SessionManager 
 			res.writeBody("Too many open streams on this session", "text/plain");
 			return;
 		}
+		if (const why = getStreams.tryAcquire(principal))
+		{
+			const mine = why == StreamGate.Refusal.principal;
+			res.statusCode = mine ? HTTPStatus.tooManyRequests : HTTPStatus.serviceUnavailable;
+			res.headers["Retry-After"] = "30";
+			res.writeBody(mine
+					? "Too many open streams for this principal" : "Too many open streams",
+					"text/plain");
+			return;
+		}
 		getConn = sessions.stateFor(sid);
 		ownerToken = sid;
 		sessions.streamOpened(sid);
 	}
 	scope (exit)
 		if (sessions !is null)
+		{
 			sessions.streamClosed(ownerToken);
+			getStreams.release(principal);
+		}
 
 	// Open a long-lived SSE stream wired to the server-push channel, so the
 	// server can deliver unsolicited notifications/requests outside any POST.
@@ -5084,6 +5111,132 @@ unittest  // a GET past the per-session stream cap is refused with 429
 	});
 	runEventLoop();
 	assert(second == HTTPStatus.tooManyRequests);
+}
+
+unittest  // a GET past the mount-wide stream cap is refused with 503, whatever its session
+{
+	import core.time : msecs;
+	import vibe.core.core : runTask, sleep, exitEventLoop, runEventLoop;
+	import vibe.http.server : createTestHTTPServerResponse, TestHTTPResponseMode;
+	import vibe.stream.memory : createMemoryOutputStream;
+
+	auto server = McpServer.stateful("t", "1");
+	auto router = new URLRouter;
+	StreamableHttpOptions opts;
+	opts.streamLimits.maxGetStreams = 1;
+	mountMcp(router, server, opts);
+	const first = initSession(router);
+	const other = initSession(router);
+
+	HTTPServerResponse get(string sid) @safe
+	{
+		auto res = createTestHTTPServerResponse(createMemoryOutputStream(),
+				null, TestHTTPResponseMode.bodyOnly);
+		router.handleRequest(sessionReq(HTTPMethod.GET, sid, "", "text/event-stream"), res);
+		return res;
+	}
+
+	int second;
+	runTask(() @safe nothrow{
+		try
+			get(first);
+		catch (Exception)
+		{
+		}
+	});
+	runTask(() @safe nothrow{
+		try
+		{
+			sleep(100.msecs);
+			second = get(other).statusCode;
+			router.handleRequest(sessionReq(HTTPMethod.DELETE, first),
+				createTestHTTPServerResponse(createMemoryOutputStream(),
+				null, TestHTTPResponseMode.bodyOnly));
+			sleep(100.msecs);
+		}
+		catch (Exception)
+		{
+		}
+		exitEventLoop();
+	});
+	runEventLoop();
+	assert(second == HTTPStatus.serviceUnavailable);
+}
+
+unittest  // a GET past the per-principal stream cap is refused with 429
+{
+	import core.time : msecs;
+	import vibe.core.core : runTask, sleep, exitEventLoop, runEventLoop;
+	import vibe.http.server : createTestHTTPServerResponse, TestHTTPResponseMode;
+	import vibe.stream.memory : createMemoryOutputStream;
+
+	auto server = McpServer.stateful("t", "1");
+	auto router = new URLRouter;
+	StreamableHttpOptions opts;
+	opts.streamLimits.maxGetStreamsPerPrincipal = 1;
+	opts.auth.allowAnyAudience = true;
+	opts.auth.authorizationServers = ["https://auth.example.com"];
+	opts.auth.validator = (string t) @safe {
+		TokenInfo info;
+		info.valid = true;
+		info.subject = t;
+		return info;
+	};
+	mountMcp(router, server, opts);
+
+	HTTPServerResponse send(HTTPMethod method, string who, string sid, string body_ = "") @safe
+	{
+		string[string] h = [
+			"Accept": method == HTTPMethod.GET
+			? "text/event-stream" : "application/json, text/event-stream",
+			"Authorization": "Bearer " ~ who, "MCP-Protocol-Version": "2025-11-25"
+		];
+		if (sid.length)
+			h[SessionHeader] = sid;
+		auto req = makeInitPostReq(body_, h);
+		req.method = method;
+		auto res = createTestHTTPServerResponse(createMemoryOutputStream(),
+				null, TestHTTPResponseMode.bodyOnly);
+		router.handleRequest(req, res);
+		return res;
+	}
+
+	const a1 = send(HTTPMethod.POST, "alice", "", initializeBody()).headers[SessionHeader];
+	const a2 = send(HTTPMethod.POST, "alice", "", initializeBody()).headers[SessionHeader];
+	const b1 = send(HTTPMethod.POST, "bob", "", initializeBody()).headers[SessionHeader];
+	int alicesSecond;
+	string bobs;
+	runTask(() @safe nothrow{
+		try
+			send(HTTPMethod.GET, "alice", a1);
+		catch (Exception)
+		{
+		}
+	});
+	runTask(() @safe nothrow{
+		try
+			bobs = send(HTTPMethod.GET, "bob", b1).contentType;
+		catch (Exception)
+		{
+		}
+	});
+	runTask(() @safe nothrow{
+		try
+		{
+			sleep(100.msecs);
+			alicesSecond = send(HTTPMethod.GET, "alice", a2).statusCode;
+			send(HTTPMethod.DELETE, "alice", a1);
+			send(HTTPMethod.DELETE, "bob", b1);
+			sleep(100.msecs);
+		}
+		catch (Exception)
+		{
+		}
+		exitEventLoop();
+	});
+	runEventLoop();
+	assert(alicesSecond == HTTPStatus.tooManyRequests);
+	assert(bobs == "text/event-stream", "another principal still gets a stream");
 }
 
 unittest  // a subscriptions/listen past the push-stream cap is refused with 503
