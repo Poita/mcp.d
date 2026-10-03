@@ -326,7 +326,8 @@ unittest  // a disabled (no-validator) config is never rejected, even with no AS
 /// only; an unsupported `MCP-Protocol-Version` on either is 400.
 ///
 /// On a stateless server a `notifications/cancelled` POST reaches only requests
-/// of the same authenticated principal. Unauthenticated callers cannot be told
+/// of the same authenticated principal, and none when several of that
+/// principal's in-flight requests share the id. Unauthenticated callers cannot be told
 /// apart, so their requests ignore `notifications/cancelled`; a 2026-07-28
 /// client still cancels by closing the response stream.
 void mountMcp(URLRouter router, McpServer server,
@@ -2420,9 +2421,10 @@ private void handlePost(McpServer server, ServerPushChannel push,
 	// Per-connection cancellation scope. A request and its later
 	// `notifications/cancelled` arrive on SEPARATE POSTs, so both must resolve to
 	// the same in-flight registry key. A stateful request is scoped by its
-	// `Mcp-Session-Id`; a stateless one by its authenticated principal, in the
-	// mount's shared `StatelessInFlight` registry. An unauthenticated stateless
-	// request cannot be cancelled by a later POST, since any caller could forge it.
+	// `Mcp-Session-Id`; a stateless one by a scope of its own in the mount's
+	// shared `StatelessInFlight` registry, which routes the principal's
+	// `notifications/cancelled` to it. An unauthenticated stateless request
+	// cannot be cancelled by a later POST, since any caller could forge it.
 	const connToken = (sessions !is null) ? req.headers.get(SessionHeader, "") : "";
 	const cancelScope = (sessions !is null) ? connToken : statelessInFlight.scopeFor(
 			principalOf(token));
@@ -2474,6 +2476,28 @@ private void handlePost(McpServer server, ServerPushChannel push,
 		const rest = takeBatchReplies(payload, (Message m) @safe {
 			coord.resolve(m.id, m.result, m.error, connToken);
 		});
+		// On a stateless mount the batch runs under a scope of its own: a
+		// `notifications/cancelled` member is also routed to the principal's
+		// request on another POST, and the batch's requests are tracked so a later
+		// POST's cancel can reach them.
+		if (statelessInFlight !is null)
+		{
+			const principal = principalOf(token);
+			foreach (m; input.messages)
+				if (m.kind == MessageKind.notification && m.method == "notifications/cancelled"
+						&& m.params.type == Json.Type.object && "requestId" in m.params)
+					server.handle(m,
+							new HttpScopedContext(statelessInFlight.cancelScopeFor(principal,
+								m.params["requestId"]), statelessInFlight.share(new ConnectionState)));
+			foreach (m; input.messages)
+				if (m.kind == MessageKind.request)
+					statelessInFlight.track(principal, m.id, cancelScope);
+		}
+		scope (exit)
+			if (statelessInFlight !is null)
+				foreach (m; input.messages)
+					if (m.kind == MessageKind.request)
+						statelessInFlight.untrack(principalOf(token), m.id, cancelScope);
 		const txt = rest is null ? "" : server.handleRaw(rest, reqState, cancelScope, token);
 		if (txt.length == 0)
 		{
@@ -2532,7 +2556,12 @@ private void handlePost(McpServer server, ServerPushChannel push,
 		// cancellation token in the SAME in-flight registry the request side used.
 		ConnectionState noteState = sessions !is null
 			? sessions.stateFor(connToken) : statelessInFlight.share(new ConnectionState);
-		server.handle(msg, new HttpScopedContext(cancelScope, noteState));
+		// A stateless cancel runs under the scope of the one request it names.
+		const noteScope = sessions is null && msg.method == "notifications/cancelled"
+			&& msg.params.type == Json.Type.object
+			&& "requestId" in msg.params ? statelessInFlight.cancelScopeFor(
+					principalOf(token), msg.params["requestId"]) : cancelScope;
+		server.handle(msg, new HttpScopedContext(noteScope, noteState));
 		res.statusCode = HTTPStatus.accepted;
 		res.writeBody("", "text/plain");
 		return;
@@ -2713,6 +2742,11 @@ private void handlePost(McpServer server, ServerPushChannel push,
 			ctx.enableReplay(push);
 		scope (exit)
 			ctx.endReplay();
+		if (statelessInFlight !is null)
+			statelessInFlight.track(principalOf(token), msg.id, cancelScope);
+		scope (exit)
+			if (statelessInFlight !is null)
+				statelessInFlight.untrack(principalOf(token), msg.id, cancelScope);
 		auto resp = server.handle(msg, ctx);
 		// Modern basic/utilities/cancellation §Transport-Specific Cancellation: on
 		// Streamable HTTP "Closing the SSE response stream is the cancellation
@@ -4557,16 +4591,22 @@ private ConnectionState postState(McpServer server, SessionManager sessions,
 /// The in-flight cancellation registry a stateless mount shares across its
 /// POSTs. Each stateless request gets a fresh `ConnectionState`, so without a
 /// shared registry a `notifications/cancelled` arriving on a later POST could
-/// never find the request it names. Keys are scoped by the authenticated
-/// principal (see `scopeFor`), so one principal cannot cancel another's
-/// requests. Unauthenticated callers cannot be told apart, so each of their
-/// requests gets a scope of its own that no `notifications/cancelled` matches.
+/// never find the request it names. Every POST gets a scope of its own (see
+/// `scopeFor`), so two requests can never clobber each other's registration.
+/// An authenticated principal's `notifications/cancelled` is routed by
+/// `cancelScopeFor` to the one in-flight request of that principal carrying the
+/// named id, so one principal cannot cancel another's requests; when several of
+/// its requests (say, from two clients) share the id, the cancel is ambiguous
+/// and cancels none of them. Unauthenticated callers cannot be told apart, so
+/// no `notifications/cancelled` reaches their requests.
 private final class StatelessInFlight
 {
 	import mcp.server.context : CancellationToken;
 
 	private CancellationToken[string] tokens;
-	private ulong nextAnonymous;
+	/// The scopes of the requests in flight, keyed by principal and request id.
+	private string[][string] scopesById;
+	private ulong nextScope;
 
 	this() @safe
 	{
@@ -4577,15 +4617,75 @@ private final class StatelessInFlight
 		tokens.remove("");
 	}
 
-	/// The connection token scoping `principal`'s requests in the registry. An
-	/// unauthenticated caller ("") gets a fresh, unshared scope per call.
+	/// A fresh connection token scoping one POST's requests in the registry.
 	string scopeFor(string principal) @safe
 	{
 		import std.conv : to;
 
+		const n = (nextScope++).to!string;
 		if (principal.length == 0)
-			return "\x1eanonymous\x1e" ~ (nextAnonymous++).to!string;
-		return "\x1estateless\x1e" ~ principal;
+			return "\x1eanonymous\x1e" ~ n;
+		return "\x1estateless\x1e" ~ principal ~ "\x1e" ~ n;
+	}
+
+	/// Record that the request `id` of `principal` runs under `scope_`, so a later
+	/// `notifications/cancelled` naming it can find it. Pair with `untrack`.
+	void track(string principal, Json id, string scope_) @safe
+	{
+		const key = idKeyOf(principal, id);
+		if (key.length)
+			scopesById[key] ~= scope_;
+	}
+
+	/// Forget a request recorded by `track`.
+	void untrack(string principal, Json id, string scope_) @safe
+	{
+		import std.algorithm : countUntil, remove;
+
+		const key = idKeyOf(principal, id);
+		if (auto scopes = key in scopesById)
+		{
+			const i = (*scopes).countUntil(scope_);
+			if (i >= 0)
+				*scopes = (*scopes).remove(i);
+			if ((*scopes).length == 0)
+				scopesById.remove(key);
+		}
+	}
+
+	/// The scope a `notifications/cancelled` from `principal` naming `requestId`
+	/// is dispatched under: that of the principal's only in-flight request with
+	/// the id, else a fresh scope that matches nothing (no such request, several
+	/// of them, or an unauthenticated caller).
+	string cancelScopeFor(string principal, Json requestId) @safe
+	{
+		if (auto scopes = idKeyOf(principal, requestId) in scopesById)
+			if ((*scopes).length == 1)
+				return (*scopes)[0];
+		return scopeFor("");
+	}
+
+	/// The `scopesById` key for request `id` of `principal`, or "" when the
+	/// caller is unauthenticated or the id is not a string or number.
+	private static string idKeyOf(string principal, Json id) @safe
+	{
+		import std.conv : to;
+
+		if (principal.length == 0)
+			return "";
+		// The length prefix keeps every (principal, id) pair distinct whatever
+		// characters either holds.
+		const who = principal.length.to!string ~ ":" ~ principal;
+		switch (id.type)
+		{
+		case Json.Type.string:
+			return who ~ "s:" ~ id.get!string;
+		case Json.Type.int_:
+		case Json.Type.bigInt:
+			return who ~ "i:" ~ id.toString();
+		default:
+			return "";
+		}
 	}
 
 	/// Point `state`'s in-flight registry at the shared table and return it.
@@ -7076,6 +7176,84 @@ unittest  // stateless: notifications/cancelled reaches the same principal's in-
 	assert(!cancelledByOther, "another principal must not cancel the request");
 	assert(cancelled, "the requesting principal's notifications/cancelled must reach it");
 	assert(callStatus == 202, "a cancelled request sends no response");
+}
+
+unittest  // stateless: a cancel naming an id two of one principal's requests share cancels neither
+{
+	import vibe.core.core : runTask, runEventLoop, exitEventLoop, yield;
+	import mcp.protocol.types : Tool, CallToolResult;
+	import mcp.server.responses : ToolResponse;
+
+	StreamableHttpOptions opts;
+	opts.auth.allowAnyAudience = true;
+	opts.auth.authorizationServers = ["https://auth.example.com"];
+	opts.auth.validator = (string t) @safe {
+		TokenInfo info;
+		info.valid = true;
+		info.subject = "alice";
+		return info;
+	};
+	auto server = McpServer.stateless("t", "1");
+	bool[string] cancelled, release;
+	Tool descriptor;
+	descriptor.name = "wait";
+	server.registerTool(descriptor, (Json args, RequestContext ctx) @safe {
+		const who = args["who"].get!string;
+		while (!release.get(who, false) && !ctx.isCancelled())
+			yield();
+		cancelled[who] = ctx.isCancelled();
+		CallToolResult r;
+		return ToolResponse.complete(r);
+	});
+	auto router = new URLRouter;
+	mountMcp(router, server, opts);
+
+	string[string] headers = [
+		"Accept": "application/json, text/event-stream",
+		"Content-Type": "application/json",
+		"MCP-Protocol-Version": "2025-06-18", "Authorization": "Bearer tok",
+	];
+	enum cancel5 = `{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":5}}`;
+	void call(string who) @safe nothrow
+	{
+		try
+			corsRequest(router, HTTPMethod.POST, headers, `{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"wait","arguments":{"who":"` ~ who ~ `"}}}`);
+		catch (Exception)
+		{
+		}
+	}
+
+	bool ambiguousCancelled;
+	runTask(() nothrow{ call("a"); });
+	runTask(() nothrow{ call("b"); });
+	runTask(() nothrow{
+		try
+		{
+			foreach (_; 0 .. 8)
+				yield();
+			corsRequest(router, HTTPMethod.POST, headers, cancel5);
+			foreach (_; 0 .. 8)
+				yield();
+			ambiguousCancelled = ("a" in cancelled) !is null || ("b" in cancelled) !is null;
+			release["a"] = true;
+			foreach (_; 0 .. 16)
+				yield();
+			corsRequest(router, HTTPMethod.POST, headers, cancel5);
+			foreach (_; 0 .. 16)
+				yield();
+			release["b"] = true;
+			foreach (_; 0 .. 16)
+				yield();
+		}
+		catch (Exception)
+		{
+		}
+		exitEventLoop();
+	});
+	runEventLoop();
+	assert(!ambiguousCancelled, "an ambiguous cancel must cancel neither request");
+	assert(!cancelled["a"], "the request that finished was never cancelled");
+	assert(cancelled["b"], "once its id is unambiguous again, the remaining request is cancellable");
 }
 
 unittest  // stateless: an unauthenticated caller cannot cancel another caller's request
