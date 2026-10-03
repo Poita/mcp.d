@@ -80,18 +80,18 @@ final class EventHandle(A, P)
 	import mcp.protocol.schema : EnumByNamePolicy;
 
 	private EventsRuntime rt_;
-	private EventRegistration reg_;
+	private string name_;
 
-	private this(EventsRuntime rt, EventRegistration reg) @safe
+	private this(EventsRuntime rt, string name) @safe
 	{
 		rt_ = rt;
-		reg_ = reg;
+		name_ = name;
 	}
 
 	/// The event type name.
 	string name() const @safe nothrow
 	{
-		return reg_.descriptor.name;
+		return name_;
 	}
 
 	/// Publish a typed payload: fans out to node-local stream/poll subscribers and
@@ -102,7 +102,7 @@ final class EventHandle(A, P)
 	void publish(P payload) @safe
 	{
 		EventOccurrence occ;
-		occ.name = reg_.descriptor.name;
+		occ.name = name_;
 		occ.data = serializePayload(payload);
 		rt_.emit(occ);
 	}
@@ -115,7 +115,7 @@ final class EventHandle(A, P)
 	void publish(P payload, string eventId, string timestamp = "") @safe
 	{
 		EventOccurrence occ;
-		occ.name = reg_.descriptor.name;
+		occ.name = name_;
 		occ.data = serializePayload(payload);
 		occ.eventId = eventId;
 		occ.timestamp = timestamp;
@@ -126,7 +126,8 @@ final class EventHandle(A, P)
 	/// typed batch. Backs poll directly and stream/webhook via the runtime's loop.
 	EventHandle onFetch(EventBatch!P delegate(A args, scope FetchContext ctx) @safe fetch) @safe
 	{
-		reg_.check = (EventContext ctx) @safe {
+		auto reg = rt_.liveRegistration(name_);
+		reg.check = (EventContext ctx) @safe {
 			FetchContext fc;
 			fc.cursor = ctx.cursor;
 			fc.maxAgeMs = ctx.maxAgeMs;
@@ -134,18 +135,19 @@ final class EventHandle(A, P)
 			fc.principal = ctx.principal;
 			return toResult(fetch(argsOf(ctx.arguments), fc));
 		};
-		reg_.emitOnly = false;
-		rt_.register(reg_);
+		reg.emitOnly = false;
+		rt_.register(reg);
 		return this;
 	}
 
 	/// Per-subscription filter: whether a subscription with `args` receives `payload`.
 	EventHandle match(bool delegate(A args, P payload) @safe pred) @safe
 	{
-		reg_.match = (EventContext ctx, EventOccurrence ev) @safe {
+		auto reg = rt_.liveRegistration(name_);
+		reg.match = (EventContext ctx, EventOccurrence ev) @safe {
 			return pred(argsOf(ctx.arguments), deserializePayload(ev.data));
 		};
-		rt_.register(reg_);
+		rt_.register(reg);
 		return this;
 	}
 
@@ -157,7 +159,8 @@ final class EventHandle(A, P)
 	/// shape a copy of the emitted occurrence).
 	EventHandle transform(EventOccurrence delegate(A args, P payload) @safe shaper) @safe
 	{
-		reg_.transform = (EventContext ctx, EventOccurrence ev) @safe {
+		auto reg = rt_.liveRegistration(name_);
+		reg.transform = (EventContext ctx, EventOccurrence ev) @safe {
 			auto shaped = shaper(argsOf(ctx.arguments), deserializePayload(ev.data));
 			// Preserve the routing/identity fields the runtime owns when the author left
 			// them unset, so a shaper that only rewrites `data` keeps the event's id,
@@ -172,7 +175,7 @@ final class EventHandle(A, P)
 				shaped.cursor = ev.cursor;
 			return shaped;
 		};
-		rt_.register(reg_);
+		rt_.register(reg);
 		return this;
 	}
 
@@ -183,7 +186,7 @@ final class EventHandle(A, P)
 	EventOccurrence fromPayload(P payload) @safe
 	{
 		EventOccurrence o;
-		o.name = reg_.descriptor.name;
+		o.name = name_;
 		o.data = serializePayload(payload);
 		return o;
 	}
@@ -200,10 +203,11 @@ final class EventHandle(A, P)
 	/// Write the hook to be idempotent across nodes.
 	EventHandle onSubscribe(void delegate(A args, scope SubContext ctx) @safe hook) @safe
 	{
-		reg_.onSubscribe = (EventContext ctx, string id) @safe {
+		auto reg = rt_.liveRegistration(name_);
+		reg.onSubscribe = (EventContext ctx, string id) @safe {
 			hook(argsOf(ctx.arguments), subContext(ctx, id));
 		};
-		rt_.register(reg_);
+		rt_.register(reg);
 		return this;
 	}
 
@@ -216,18 +220,20 @@ final class EventHandle(A, P)
 	/// shared-store atomic refcount is future work.
 	EventHandle onUnsubscribe(void delegate(A args, scope SubContext ctx) @safe hook) @safe
 	{
-		reg_.onUnsubscribe = (EventContext ctx, string id) @safe {
+		auto reg = rt_.liveRegistration(name_);
+		reg.onUnsubscribe = (EventContext ctx, string id) @safe {
 			hook(argsOf(ctx.arguments), subContext(ctx, id));
 		};
-		rt_.register(reg_);
+		rt_.register(reg);
 		return this;
 	}
 
 	/// Suggested client poll cadence for this type.
 	EventHandle pollInterval(Duration d) @safe
 	{
-		reg_.pollInterval = d;
-		rt_.register(reg_);
+		auto reg = rt_.liveRegistration(name_);
+		reg.pollInterval = d;
+		rt_.register(reg);
 		return this;
 	}
 
@@ -237,12 +243,13 @@ final class EventHandle(A, P)
 	/// Chainable.
 	EventHandle disable(DeliveryMode[] modes...) @safe
 	{
+		auto reg = rt_.liveRegistration(name_);
 		import std.algorithm : canFind;
 
 		foreach (m; modes)
-			if (!reg_.disabledModes.canFind(m))
-				reg_.disabledModes ~= m;
-		rt_.register(reg_);
+			if (!reg.disabledModes.canFind(m))
+				reg.disabledModes ~= m;
+		rt_.register(reg);
 		return this;
 	}
 
@@ -260,7 +267,7 @@ final class EventHandle(A, P)
 		{
 			EventOccurrence o;
 			o.eventId = e.eventId;
-			o.name = reg_.descriptor.name;
+			o.name = name_;
 			o.timestamp = e.timestamp;
 			o.data = serializePayload(e.payload);
 			if (e.cursor.length)
@@ -699,6 +706,18 @@ final class EventsRuntime
 		onListChanged_ = cb;
 	}
 
+	// A copy of `name`'s current registration, for an `EventHandle` setter to
+	// amend and re-register. Reading the live entry keeps changes made since the
+	// handle was created (by `register` or another handle); a type no longer
+	// registered throws, so a stale handle cannot bring it back.
+	private EventRegistration liveRegistration(string name) @safe
+	{
+		auto p = name in types_;
+		if (p is null)
+			throw new Exception("Event type " ~ name ~ " is not registered");
+		return *p;
+	}
+
 	/// Register (or replace) an event type.
 	void register(EventRegistration reg) @safe
 	{
@@ -867,7 +886,7 @@ final class EventsRuntime
 		reg.descriptor.payloadSchema = jsonSchemaOf!P;
 		reg.emitOnly = true;
 		register(reg);
-		return new EventHandle!(A, P)(this, reg);
+		return new EventHandle!(A, P)(this, name);
 	}
 
 	/// Whether `name` is a registered event type.
@@ -3677,7 +3696,7 @@ unittest  // successive EventHandle.disable calls accumulate without duplicates
 	auto h = rt.define!(DemoArgs, DemoPayload)("x");
 	h.disable(DeliveryMode.poll).disable(DeliveryMode.push).disable(DeliveryMode.poll);
 	assert(rt.effectiveDelivery("x") == [DeliveryMode.webhook]);
-	assert(h.reg_.disabledModes.length == 2);
+	assert(rt.types_["x"].disabledModes.length == 2);
 }
 
 unittest  // EventHandle.webhookOnly leaves only webhook delivery
@@ -8187,4 +8206,27 @@ unittest  // the well-known receiver document of an IPv6-literal callback is fet
 	rt.emit(EventOccurrence("evt_1", "n", "t"));
 	assert(ft.gets.length == 1 && ft.gets[0] == "https://[2001:db8::1]:443" ~ wellKnownReceiverPath);
 	assert(ft.eventPosts().length == 1);
+}
+
+unittest  // an EventHandle setter on an unregistered type throws rather than re-registering it
+{
+	import std.exception : assertThrown;
+
+	auto rt = testRuntime();
+	auto h = rt.define!(DemoArgs, DemoPayload)("x");
+	rt.unregister("x");
+	assertThrown(h.match((DemoArgs a, DemoPayload p) @safe => true));
+	assert(!rt.has("x"));
+}
+
+unittest  // an EventHandle setter keeps changes made through the raw register()
+{
+	auto rt = testRuntime();
+	auto h = rt.define!(DemoArgs, DemoPayload)("x");
+	auto raw = rt.types_["x"];
+	raw.descriptor.description = "set via register";
+	rt.register(raw);
+	h.pollInterval(5.seconds);
+	assert(rt.types_["x"].descriptor.description == "set via register");
+	assert(rt.types_["x"].pollInterval.get == 5.seconds);
 }
