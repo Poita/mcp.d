@@ -453,10 +453,12 @@ string selectScope(string wwwAuthScope, const string[] scopesSupported) @safe
 }
 
 /// The canonical resource indicator (RFC 8707) for an MCP server: the endpoint
-/// URL with a lowercased scheme+authority, any fragment dropped, and a single
+/// URL with a lowercased scheme+authority, the scheme's default port (`:443`
+/// for https, `:80` for http) removed, any fragment dropped, and a single
 /// trailing slash stripped. The MCP "Canonical Server URI" rules prefer the
-/// no-trailing-slash form. ASCII case is folded in place (rather than via
-/// `toLower`) to keep this `pure nothrow`.
+/// no-trailing-slash form. The authority ends at the first `/` or `?`, so a
+/// query directly after the host keeps its case. ASCII case is folded in place
+/// (rather than via `toLower`) to keep this `pure nothrow`.
 string canonicalResourceUri(string mcpEndpoint) @safe pure nothrow
 {
 	import std.string : indexOf;
@@ -470,8 +472,13 @@ string canonicalResourceUri(string mcpEndpoint) @safe pure nothrow
 	if (schemeEnd < 0)
 		return s;
 	const afterScheme = schemeEnd + 3;
-	const slash = s[afterScheme .. $].indexOf('/');
-	const hostEnd = (slash < 0) ? s.length : afterScheme + slash;
+	size_t hostEnd = s.length;
+	foreach (i; afterScheme .. s.length)
+		if (s[i] == '/' || s[i] == '?')
+		{
+			hostEnd = i;
+			break;
+		}
 	char[] buf = new char[s.length];
 	foreach (i, ch; s)
 	{
@@ -479,6 +486,21 @@ string canonicalResourceUri(string mcpEndpoint) @safe pure nothrow
 		if (i < hostEnd && c >= 'A' && c <= 'Z')
 			c = cast(char)(c + 32);
 		buf[i] = c;
+	}
+	// The port follows the last ':' that comes after any IPv6 literal's ']'.
+	const authority = buf[afterScheme .. hostEnd];
+	ptrdiff_t colon = -1;
+	foreach (i, c; authority)
+		if (c == ':')
+			colon = i;
+		else if (c == ']')
+			colon = -1;
+	if (colon >= 0)
+	{
+		const scheme = buf[0 .. schemeEnd];
+		const port = authority[colon + 1 .. $];
+		if ((scheme == "https" && port == "443") || (scheme == "http" && port == "80"))
+			buf = buf[0 .. afterScheme + colon] ~ buf[hostEnd .. $];
 	}
 	return () @trusted { return cast(string) buf; }();
 }
@@ -663,6 +685,28 @@ unittest  // canonical resource URI lowercases scheme+host, drops fragment + tra
 	assert(canonicalResourceUri("https://mcp.example.com/mcp/") == "https://mcp.example.com/mcp");
 	assert(canonicalResourceUri("https://mcp.example.com#frag") == "https://mcp.example.com");
 	assert(canonicalResourceUri("https://mcp.example.com") == "https://mcp.example.com");
+}
+
+unittest  // canonical resource URI drops the scheme's default port
+{
+	assert(canonicalResourceUri("https://mcp.example.com:443/mcp") == "https://mcp.example.com/mcp");
+	assert(canonicalResourceUri("http://localhost:80/mcp") == "http://localhost/mcp");
+	assert(canonicalResourceUri("HTTPS://MCP.Example.com:443") == "https://mcp.example.com");
+	assert(canonicalResourceUri("https://[::1]:443/mcp") == "https://[::1]/mcp");
+	// A non-default port, or another scheme's default, is kept.
+	assert(canonicalResourceUri(
+			"http://mcp.example.com:443/mcp") == "http://mcp.example.com:443/mcp");
+	assert(canonicalResourceUri(
+			"https://mcp.example.com:80/mcp") == "https://mcp.example.com:80/mcp");
+	assert(canonicalResourceUri("https://[::1]:8443/mcp") == "https://[::1]:8443/mcp");
+}
+
+unittest  // canonical resource URI ends the authority at a query, leaving the query's case intact
+{
+	assert(canonicalResourceUri(
+			"https://MCP.Example.com?Tenant=ABC") == "https://mcp.example.com?Tenant=ABC");
+	assert(canonicalResourceUri(
+			"https://mcp.example.com:443?Tenant=ABC") == "https://mcp.example.com?Tenant=ABC");
 }
 
 version (unittest) private Json parseJson(string s) @safe
