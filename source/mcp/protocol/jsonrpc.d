@@ -184,12 +184,16 @@ private void validateEnvelope(Json j) @safe
 /// The deepest array/object nesting accepted in JSON text from a peer.
 enum maxJsonNestingDepth = 128;
 
-/// Parse JSON text from an untrusted peer. The vibe.d parser recurses once per
-/// nested array or object, so the nesting depth is checked with a flat scan
-/// first: deeper input is rejected instead of overflowing the stack. Throws a
-/// -32700 `McpException` for over-deep or invalid JSON.
-Json parseJsonBounded(string text) @safe
+/// Parse JSON text from an untrusted source (a network peer, an upstream server,
+/// a decoded token). The vibe.d parser recurses once per nested array or
+/// object, so the nesting depth is checked with a flat scan first: deeper input
+/// is rejected instead of overflowing the stack. Throws `JSONException` for
+/// over-deep or invalid JSON, as `parseJsonString` does, so callers outside
+/// JSON-RPC keep their own error mapping.
+Json parseUntrustedJson(string text) @safe
 {
+	import vibe.data.json : JSONException;
+
 	size_t depth;
 	bool inString;
 	for (size_t i = 0; i < text.length; i++)
@@ -211,16 +215,23 @@ Json parseJsonBounded(string text) @safe
 			{
 				import std.conv : to;
 
-				throw parseError(
-						"Invalid JSON: nesting deeper than "
-						~ maxJsonNestingDepth.to!string ~ " levels");
+				throw new JSONException(
+						"nesting deeper than " ~ maxJsonNestingDepth.to!string ~ " levels");
 			}
 		}
 		else if ((c == ']' || c == '}') && depth > 0)
 			depth--;
 	}
+	return parseJsonString(text);
+}
+
+/// Parse JSON text from a JSON-RPC peer with the nesting bound of
+/// `parseUntrustedJson`. Throws a -32700 `McpException` for over-deep or
+/// invalid JSON.
+Json parseJsonBounded(string text) @safe
+{
 	try
-		return parseJsonString(text);
+		return parseUntrustedJson(text);
 	catch (Exception e)
 		throw parseError("Invalid JSON: " ~ e.msg);
 }
@@ -405,6 +416,30 @@ unittest  // parseJsonBounded reports invalid JSON as a parse error
 
 	auto e = collectException!McpException(parseJsonBounded("{nope"));
 	assert(e !is null && e.code == ErrorCode.parseError);
+}
+
+unittest  // parseUntrustedJson rejects nesting beyond the depth cap as a JSONException
+{
+	import std.array : replicate;
+	import std.exception : collectException;
+	import vibe.data.json : JSONException;
+
+	auto e = collectException!JSONException(parseUntrustedJson("[".replicate(1000)));
+	assert(e !is null);
+	assert(e.msg == "nesting deeper than 128 levels");
+}
+
+unittest  // parseUntrustedJson reports invalid JSON as a JSONException
+{
+	import std.exception : assertThrown;
+	import vibe.data.json : JSONException;
+
+	assertThrown!JSONException(parseUntrustedJson("{nope"));
+}
+
+unittest  // parseUntrustedJson parses JSON within the depth cap
+{
+	assert(parseUntrustedJson(`{"a":[1,{"b":2}]}`)["a"][1]["b"].get!int == 2);
 }
 
 unittest  // parseMessage rejects a request with a fractional float id
