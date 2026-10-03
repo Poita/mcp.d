@@ -445,7 +445,7 @@ private final class InFlightRequest
 	MonoTime deadline = MonoTime.max;
 	// When `maxTotalTimeout` ends; `MonoTime.max` when there is no cap.
 	MonoTime hardDeadline = MonoTime.max;
-	// What was left of the window when `pauseDeadlines` stopped the timer.
+	// What was left of the `requestTimeout` window when `pauseDeadlines` paused it.
 	Duration remaining;
 	string progressKey; // the request's progress token rendered as JSON, or empty
 	McpException abortReason;
@@ -3626,9 +3626,12 @@ final class McpClient : ClientProtocol
 		import std.conv : to;
 
 		auto r = id in inFlight_;
-		if (r is null || (*r).abortReason !is null || (*r).paused)
+		if (r is null || (*r).abortReason !is null)
 			return;
 		const capped = MonoTime.currTime >= (*r).hardDeadline;
+		// A paused request answers only to its `maxTotalTimeout` cap.
+		if ((*r).paused && !capped)
+			return;
 		abortRequest(id,
 				new RequestTimeoutException("Request " ~ id.to!string ~ " timed out after " ~ (capped
 					? maxTotalTimeout_.toString() ~ " (maxTotalTimeout)" : requestTimeout_.toString())),
@@ -3680,7 +3683,9 @@ final class McpClient : ClientProtocol
 	/// current task is the one whose response stream carried the server request
 	/// (HTTP); when there is none (a shared read loop, as on stdio) the server
 	/// request cannot be attributed, so every in-flight request is paused.
-	/// Returns the paused requests for `resumeDeadlines`.
+	/// The `maxTotalTimeout` cap stays armed while paused, so a handler that
+	/// never returns cannot hold a capped request open. Returns the paused
+	/// requests for `resumeDeadlines`.
 	private InFlightRequest[] pauseDeadlines() @safe nothrow
 	{
 		InFlightRequest[] related;
@@ -3696,9 +3701,12 @@ final class McpClient : ClientProtocol
 		{
 			if (r.paused++ == 0 && r.armed)
 			{
-				r.timer.stop();
 				if (r.deadline != MonoTime.max)
 					r.remaining = r.deadline > now ? r.deadline - now : Duration.zero;
+				if (r.hardDeadline != MonoTime.max)
+					r.timer.rearm(r.hardDeadline > now ? r.hardDeadline - now : Duration.zero);
+				else
+					r.timer.stop();
 			}
 		}
 		return related;
@@ -3706,8 +3714,7 @@ final class McpClient : ClientProtocol
 
 	/// Restart the deadlines `pauseDeadlines` stopped, once no handler holds them
 	/// paused, with the `requestTimeout` time that was left when they paused. The
-	/// `maxTotalTimeout` cap keeps running throughout, so a request whose cap
-	/// passed while paused times out at once.
+	/// `maxTotalTimeout` cap keeps running throughout.
 	private void resumeDeadlines(InFlightRequest[] paused) @safe nothrow
 	{
 		const now = MonoTime.currTime;

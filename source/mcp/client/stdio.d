@@ -1394,6 +1394,54 @@ unittest  // ClientSettings.maxTotalTimeout caps a stdio request that keeps repo
 	assert(took < 1200.msecs, "progress must not extend a request past maxTotalTimeout");
 }
 
+unittest  // maxTotalTimeout fails a stdio request while a server request on its behalf is unanswered
+{
+	import core.time : msecs, seconds, MonoTime, Duration;
+	import vibe.core.core : sleep;
+	import mcp.client.client : ClientSettings, RequestTimeoutException;
+	import mcp.protocol.types : ListRootsResult;
+
+	auto toClient = new TestLines;
+	auto toServer = new TestLines;
+	bool timedOut;
+	Duration took;
+	const failure = inLoopCapturing(() @safe {
+		ClientSettings s;
+		s.requestTimeout = Duration.zero;
+		s.maxTotalTimeout = 400.msecs;
+		auto client = McpClient.stdio(() @safe => toClient.take(), (string l) @safe {
+			toServer.put(l);
+		}, s);
+		// The roots/list handler stands in for one waiting on an absent user.
+		client.onListRoots = () @safe {
+			sleep(2.seconds);
+			return ListRootsResult.init;
+		};
+		runTask(() nothrow{
+			try
+			{
+				toServer.take();
+				toClient.put(makeRequest(Json(1000), "roots/list", Json.emptyObject).toString());
+			}
+			catch (Exception)
+			{
+			}
+		});
+		const start = MonoTime.currTime;
+		try
+			client.callTool("hang", Json.emptyObject);
+		catch (RequestTimeoutException)
+			timedOut = true;
+		took = MonoTime.currTime - start;
+		sleep(2.seconds);
+		toClient.closeEnd();
+	});
+	assert(failure.length == 0, failure);
+	assert(timedOut);
+	assert(took < 1200.msecs,
+			"a pending server request must not hold a request past maxTotalTimeout");
+}
+
 unittest  // cancelling a call's CancellationToken fails it at once and sends notifications/cancelled
 {
 	import core.time : msecs, seconds, MonoTime, Duration;
