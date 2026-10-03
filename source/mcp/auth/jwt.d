@@ -244,8 +244,8 @@ enum jwtBearerAssertionType = "urn:ietf:params:oauth:client-assertion-type:jwt-b
 /// is fixed to RFC 7523 client-assertion shape with iss==sub==clientId), this
 /// lets the issuer, subject, audience and scope vary independently. String
 /// claims are populated into the payload via `Json`, so they are escaped rather
-/// than interpolated. Empty `iss`/`aud`/`sub`/`scope`/`kid` are omitted; the
-/// time claims (`iat`/`nbf`/`exp`) are emitted only when non-zero.
+/// than interpolated. Empty `iss`/`aud`/`sub`/`scope`/`kid` are omitted, as
+/// are `iat`/`nbf` when zero; `exp` is required.
 struct JwtClaims
 {
 	string iss; /// `iss` — token issuer (omitted if empty).
@@ -254,7 +254,7 @@ struct JwtClaims
 	string scope_; /// `scope` — space-delimited granted scopes (omitted if empty).
 	long iat; /// `iat` — issued-at (seconds since epoch; omitted if 0).
 	long nbf; /// `nbf` — not-before (seconds since epoch; omitted if 0).
-	long exp; /// `exp` — expiry (seconds since epoch; omitted if 0).
+	long exp; /// `exp` — expiry (seconds since epoch; required, must be positive).
 	string kid; /// JWS `kid` header parameter (omitted if empty).
 }
 
@@ -263,8 +263,12 @@ struct JwtClaims
 /// `makeClientAssertion`: the payload is assembled with `Json` (so string claims
 /// are JSON-escaped, never interpolated) and string claims are rejected up front
 /// if they contain control characters, reusing the same injection-hardening.
+/// Throws when `claims.exp` is not positive: a token without an expiry would be
+/// valid forever, and the SDK's `jwtVerifier` rejects one.
 string mintJwtEs256(string privateKeyPem, JwtClaims claims) @safe
 {
+	if (claims.exp <= 0)
+		throw new Exception("mintJwtEs256: exp must be set to a positive expiry time");
 	foreach (s; [claims.iss, claims.aud, claims.sub, claims.scope_, claims.kid])
 		if (containsControlChar(s))
 			throw new Exception("mintJwtEs256: claim contains control characters");
@@ -288,8 +292,7 @@ string mintJwtEs256(string privateKeyPem, JwtClaims claims) @safe
 		payloadJson["iat"] = claims.iat;
 	if (claims.nbf != 0)
 		payloadJson["nbf"] = claims.nbf;
-	if (claims.exp != 0)
-		payloadJson["exp"] = claims.exp;
+	payloadJson["exp"] = claims.exp;
 
 	const header = headerJson.toString();
 	const payload = payloadJson.toString();
@@ -455,6 +458,7 @@ unittest  // mintJwtEs256 JSON-escapes a subject containing a quote rather than 
 	JwtClaims claims;
 	claims.iss = "https://auth.example.com";
 	claims.sub = `x","admin":"true`;
+	claims.exp = 1_700_003_600;
 	auto jwt = mintJwtEs256(testEcPem, claims);
 	auto parts = jwt.split('.');
 	auto payloadStr = () @trusted {
@@ -465,7 +469,7 @@ unittest  // mintJwtEs256 JSON-escapes a subject containing a quote rather than 
 	assert(j["admin"].type == Json.Type.undefined);
 }
 
-unittest  // mintJwtEs256 omits empty string claims and zero time claims
+unittest  // mintJwtEs256 omits empty string claims and zero iat/nbf
 {
 	import std.array : split;
 	import std.base64 : Base64URLNoPadding;
@@ -474,6 +478,7 @@ unittest  // mintJwtEs256 omits empty string claims and zero time claims
 	JwtClaims claims;
 	claims.iss = "https://auth.example.com";
 	claims.sub = "user-42";
+	claims.exp = 1_700_003_600;
 	auto jwt = mintJwtEs256(testEcPem, claims);
 	auto parts = jwt.split('.');
 	auto payloadStr = () @trusted {
@@ -484,13 +489,25 @@ unittest  // mintJwtEs256 omits empty string claims and zero time claims
 	assert(j["scope"].type == Json.Type.undefined);
 	assert(j["iat"].type == Json.Type.undefined);
 	assert(j["nbf"].type == Json.Type.undefined);
-	assert(j["exp"].type == Json.Type.undefined);
+	assert(j["exp"].get!long == 1_700_003_600);
 
 	auto headerStr = () @trusted {
 		return (cast(char[]) Base64URLNoPadding.decode(parts[0])).idup;
 	}();
 	auto h = parseJsonString(headerStr);
 	assert(h["kid"].type == Json.Type.undefined);
+}
+
+unittest  // mintJwtEs256 refuses claims without a positive exp
+{
+	import std.exception : assertThrown;
+
+	JwtClaims claims;
+	claims.iss = "https://auth.example.com";
+	claims.sub = "user-42";
+	assertThrown(mintJwtEs256(testEcPem, claims));
+	claims.exp = -1;
+	assertThrown(mintJwtEs256(testEcPem, claims));
 }
 
 unittest  // mintJwtEs256 fails closed on control characters in a claim
@@ -500,6 +517,7 @@ unittest  // mintJwtEs256 fails closed on control characters in a claim
 	JwtClaims claims;
 	claims.iss = "https://auth.example.com";
 	claims.sub = "bad\nsub";
+	claims.exp = 1_700_003_600;
 	assertThrown(mintJwtEs256(testEcPem, claims));
 }
 
