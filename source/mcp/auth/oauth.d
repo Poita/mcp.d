@@ -1659,13 +1659,13 @@ string basicAuthHeader(string clientId, string clientSecret) @safe
 private TokenSet parseTokenResponse(int status, string responseBody) @safe
 {
 	import std.conv : to;
-	import vibe.data.json : parseJsonString;
 	import mcp.protocol.errors : invalidRequest;
+	import mcp.protocol.jsonrpc : parseUntrustedJson;
 
 	if (status < 200 || status >= 300)
 		throw invalidRequest("token endpoint returned HTTP " ~ status.to!string ~ (
 				responseBody.length ? ": " ~ responseBody : ""));
-	return TokenSet.fromJson(parseJsonString(responseBody));
+	return TokenSet.fromJson(parseUntrustedJson(responseBody));
 }
 
 /// Upper bound on an OAuth/discovery response body (metadata documents, DCR and
@@ -1870,6 +1870,16 @@ unittest  // parseTokenResponse decodes a 2xx body into a populated TokenSet
 	assert(ts.expiresIn == 3600);
 	assert(ts.refreshToken == "RT");
 	assert(ts.scope_ == "a b");
+}
+
+unittest  // parseTokenResponse rejects a 2xx body nested past the depth cap
+{
+	import std.array : replicate;
+	import std.exception : assertThrown;
+
+	const deep = "[".replicate(1000) ~ "]".replicate(1000);
+	assertThrown(parseTokenResponse(200,
+			`{"access_token":"AT","token_type":"Bearer","x":` ~ deep ~ `}`));
 }
 
 unittest  // exchangeAuthCode refuses a token response larger than maxAuthResponseBytes
