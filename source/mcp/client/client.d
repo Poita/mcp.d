@@ -3084,6 +3084,8 @@ final class McpClient : ClientProtocol
 				endManagedStream(sub, ms, handlerFailure(o));
 		}, (EventControl c) @safe {
 			ms.lastFrameMs = eventNowMs();
+			if (!sub.active)
+				return;
 			sub.advanceCursor(c.cursor);
 			if (c.kind == EventControlKind.terminated)
 				sub.markTerminated();
@@ -3144,6 +3146,13 @@ final class McpClient : ClientProtocol
 			try
 			{
 				openManagedStream(sub, ms, sub.cursor());
+				// The subscription can end while the open blocks; its teardown
+				// closed only the stream it saw, so close the new one here.
+				if (!sub.active || closed_)
+				{
+					ms.stream.close();
+					return;
+				}
 				// A stream that is already over came back without its leading frame.
 				failures = shortLived || ms.stream.ended ? failures + 1 : 0;
 			}
@@ -8984,10 +8993,14 @@ version (unittest)
 		// When set, openListen returns a stream the server already ended cleanly,
 		// as one that closes before its leading frame.
 		bool listensEndAtOpen;
+		// Run inside each openListen, as a caller acting while the open blocks.
+		void delegate() @safe onListen;
 
 		SubscriptionStream openListen(Json message) @safe
 		{
 			listens ~= message;
+			if (onListen !is null)
+				onListen();
 			if (listenFailures.length)
 			{
 				auto e = listenFailures[0];
@@ -10485,6 +10498,31 @@ unittest  // a quiet managed stream is reopened from the last cursor after strea
 	assert(t.listens.length == 2); // reopened exactly once
 	assert(t.listens[1]["params"]["cursor"].get!string == "c9");
 	assert(events == 2);
+}
+
+unittest  // a managed stream cancelled while its reopen is in flight closes the reopened stream
+{
+	auto t = new RecordingClientTransport();
+	auto c = new McpClient(t);
+	long now = 0;
+	c.onEventNowForTest = () @safe => now;
+	int controls;
+	auto sub = c.subscribeStream(StreamParams("incident.created"), null, (EventControl ctrl) @safe {
+		controls++;
+	});
+	t.streams[0].finish();
+	t.onListen = () @safe { sub.cancel(); };
+	int wakes;
+	c.onStreamWatchSleepForTest = (Duration d) @safe {
+		assert(++wakes < 10, "the watchdog kept running after cancel");
+		now += 200_000;
+	};
+	c.runStreamWatchdog(sub);
+	assert(t.listens.length == 2);
+	assert(t.streams[1].ended, "a stream reopened after cancel must be closed");
+	c.dispatchInbound(Message(makeNotification(eventsHeartbeatNotification,
+			withSubscriptionId(heartbeatParams(nullable("c1")), Json(2)))));
+	assert(controls == 0, "onControl must not run after cancel");
 }
 
 unittest  // a managed stream whose reopen is refused with a non-transient error stops reconnecting
