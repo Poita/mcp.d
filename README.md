@@ -335,6 +335,7 @@ is resolved.
 | `subscriptions/listen` (2026-07-28) | yes (self-contained stream) | n/a (modern-only) | no (2026-07-28 refused with -32022) |
 | Server->client `elicit`/`sample`/`roots` | forbidden (error; MRTR instead) | forbidden (error) | yes |
 | `logging/setLevel` | n/a (per-request `_meta`) | forbidden (-32601) | yes (session-scoped) |
+| `listChanged` in capabilities | yes (via `subscriptions/listen`) | never advertised (no channel to notify on) | yes |
 | Session id minted | never | never | yes |
 
 The `subscribe` capability advertisement follows the same rule: a stateless server

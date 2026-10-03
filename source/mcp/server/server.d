@@ -3685,6 +3685,19 @@ final class McpServer : ServerCore
 		InitializeResult result;
 		result.protocolVersion = conn.negotiated.toWire;
 		result.capabilities = capabilities().forVersion(conn.negotiated);
+		// A stateless server has no channel to push a 2025-era list_changed
+		// notification on (no stdio session, no HTTP GET stream), so it does not
+		// promise one. Its modern clients learn of list changes through
+		// `subscriptions/listen` instead, advertised via `server/discover`.
+		if (mode_ == ServerMode.stateless)
+		{
+			if (!result.capabilities.tools.isNull)
+				result.capabilities.tools.get.listChanged = false;
+			if (!result.capabilities.resources.isNull)
+				result.capabilities.resources.get.listChanged = false;
+			if (!result.capabilities.prompts.isNull)
+				result.capabilities.prompts.get.listChanged = false;
+		}
 		result.serverInfo = serverInfo_.forVersion(conn.negotiated);
 		result.instructions = instructions;
 		return result.toJson();
@@ -4450,6 +4463,51 @@ unittest  // initialize negotiates the requested version and reports server info
 	assert(resp["result"]["protocolVersion"].get!string == "2025-06-18");
 	assert(resp["result"]["serverInfo"]["name"].get!string == "test-srv");
 	assert(resp["result"]["capabilities"]["tools"].type == Json.Type.object);
+}
+
+version (unittest) private Json legacyInitParams() @safe
+{
+	Json params = Json.emptyObject;
+	params["protocolVersion"] = "2025-11-25";
+	params["capabilities"] = Json.emptyObject;
+	params["clientInfo"] = Json(["name": Json("c"), "version": Json("1")]);
+	return params;
+}
+
+version (unittest) private McpServer withListChanged(McpServer s) @safe
+{
+	s.registerTool(Tool("noop"), (Json) @safe => CallToolResult());
+	s.registerResource(Resource("res://x", "x"), () @safe => ResourceContents.init);
+	s.registerPrompt(Prompt("p"), (Json, RequestContext) @safe => GetPromptResult.init);
+	s.enableToolsListChanged();
+	s.enableResourcesListChanged();
+	s.enablePromptsListChanged();
+	return s;
+}
+
+unittest  // a stateless server does not advertise listChanged to a 2025-era client it cannot notify
+{
+	auto s = withListChanged(McpServer.stateless("t", "1"));
+	auto caps = s.handle(req(1, "initialize", legacyInitParams())).get["result"]["capabilities"];
+	assert("listChanged" !in caps["tools"]);
+	assert("listChanged" !in caps["resources"]);
+	assert("listChanged" !in caps["prompts"]);
+}
+
+unittest  // a stateful server advertises listChanged to a 2025-era client
+{
+	auto s = withListChanged(McpServer.stateful("t", "1"));
+	auto caps = s.handle(req(1, "initialize", legacyInitParams())).get["result"]["capabilities"];
+	assert(caps["tools"]["listChanged"].get!bool);
+	assert(caps["resources"]["listChanged"].get!bool);
+	assert(caps["prompts"]["listChanged"].get!bool);
+}
+
+unittest  // a stateless server keeps listChanged in its modern server/discover capabilities
+{
+	auto s = withListChanged(McpServer.stateless("t", "1"));
+	auto caps = s.handle(modernReq(1, "server/discover")).get["result"]["capabilities"];
+	assert(caps["tools"]["listChanged"].get!bool);
 }
 
 unittest  // a second initialize on an already-initialized stateful session is rejected
