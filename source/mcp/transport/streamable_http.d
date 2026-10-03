@@ -2317,7 +2317,10 @@ private McpException validatePostRequestHeaders(HTTPServerRequest req,
 			.params["name"].get!string : "";
 		auto schema = server.toolInputSchema(tname);
 		auto args = ("arguments" in msg.params) ? msg.params["arguments"] : Json.emptyObject;
-		return validateParamHeaders(schema, args, (string h) => req.headers.get(h, ""));
+		return validateParamHeaders(schema, args, (string h) {
+			auto v = h in req.headers;
+			return v is null ? Nullable!string.init : Nullable!string(*v);
+		});
 	}
 
 	return null;
@@ -6291,8 +6294,9 @@ unittest  // an empty agreed subset still produces an empty params.notifications
 }
 
 /// Render a primitive JSON value as its `Mcp-Param-*` header string. Per the
-/// modern `x-mcp-header` constraints, only `integer`, `string`, and `boolean` are
-/// permitted; `number` (float) and any other type are NOT mirror-able and are
+/// modern `x-mcp-header` constraints, only `integer` (including one beyond the
+/// `long` range), `string`, and `boolean` are permitted; `number` (float) and
+/// any other type are NOT mirror-able and are
 /// reported via `ok = false` so the caller can reject the request rather than
 /// silently stringify them.
 private string jsonScalarToString(Json v, out bool ok) @safe
@@ -6307,6 +6311,8 @@ private string jsonScalarToString(Json v, out bool ok) @safe
 	case Json.Type.int_:
 		return v.get!long
 			.to!string;
+	case Json.Type.bigInt:
+		return v.toString();
 	case Json.Type.bool_:
 		return v.get!bool ? "true" : "false";
 	default:
@@ -6340,9 +6346,11 @@ private Json resolveArgPath(Json args, const(string)[] path, out bool present) @
 /// carry the header. The annotation set itself is also validated against the
 /// modern value constraints (non-empty, HTTP token syntax, no CR/LF, primitive
 /// types only with `number` forbidden, case-insensitive uniqueness). Returns a
-/// `HeaderMismatch` exception on violation, else null.
+/// `HeaderMismatch` exception on violation, else null. `headerGet` returns a
+/// header's raw value, or null when the request does not carry it, so an empty
+/// string parameter matches a present but empty header.
 McpException validateParamHeaders(Json inputSchema, Json args,
-		scope string delegate(string) @safe headerGet) @safe
+		scope Nullable!string delegate(string) @safe headerGet) @safe
 {
 	import std.array : join;
 
@@ -6360,7 +6368,7 @@ McpException validateParamHeaders(Json inputSchema, Json args,
 		const pathStr = ph.path.join(".");
 		if (!present)
 		{
-			if (hv.length)
+			if (!hv.isNull)
 				return new McpException(ErrorCode.headerMismatch,
 						"Header " ~ headerName ~ " present but parameter '" ~ pathStr ~ "' absent");
 			continue;
@@ -6371,10 +6379,10 @@ McpException validateParamHeaders(Json inputSchema, Json args,
 			return new McpException(ErrorCode.headerMismatch,
 					"Parameter '" ~ pathStr ~ "' for header " ~ headerName
 					~ " is not a permitted x-mcp-header type (integer/string/boolean)");
-		if (hv.length == 0)
+		if (hv.isNull)
 			return new McpException(ErrorCode.headerMismatch,
 					"Missing required header " ~ headerName ~ " for parameter '" ~ pathStr ~ "'");
-		if (decodeHeaderValue(hv) != expected)
+		if (decodeHeaderValue(hv.get) != expected)
 			return new McpException(ErrorCode.headerMismatch,
 					"Header " ~ headerName ~ " does not match parameter '" ~ pathStr ~ "'");
 	}
@@ -6396,6 +6404,37 @@ version (unittest)
 		schema["properties"] = props;
 		return schema;
 	}
+
+	/// A header lookup result: `v`, or absent when `v` is empty.
+	private Nullable!string headerValue(string v) @safe
+	{
+		return v.length ? Nullable!string(v) : Nullable!string.init;
+	}
+}
+
+unittest  // x-mcp-header: an empty parameter value matches a present empty header
+{
+	auto schema = schemaWithHeaderParam();
+	Json args = Json(["region": Json("")]);
+	assert(validateParamHeaders(schema, args, (string h) => h == "Mcp-Param-Region"
+			? Nullable!string("") : Nullable!string.init) is null);
+	auto e = validateParamHeaders(schema, args, (string h) => Nullable!string.init);
+	assert(e !is null && e.code == ErrorCode.headerMismatch);
+}
+
+unittest  // x-mcp-header: a bigInt integer parameter is mirror-able
+{
+	import vibe.data.json : parseJsonString;
+
+	Json schema = Json.emptyObject;
+	schema["type"] = "object";
+	Json props = Json.emptyObject;
+	props["id"] = Json(["type": Json("integer"), "x-mcp-header": Json("Id")]);
+	schema["properties"] = props;
+	Json args = parseJsonString(`{"id":123456789012345678901234567890}`);
+	assert(args["id"].type == Json.Type.bigInt);
+	assert(validateParamHeaders(schema, args,
+			(string h) => headerValue("123456789012345678901234567890")) is null);
 }
 
 unittest  // x-mcp-header: matching header passes
@@ -6403,7 +6442,7 @@ unittest  // x-mcp-header: matching header passes
 	auto schema = schemaWithHeaderParam();
 	Json args = Json(["region": Json("us-west1"), "query": Json("SELECT 1")]);
 	auto e = validateParamHeaders(schema, args,
-			(string h) => h == "Mcp-Param-Region" ? "us-west1" : "");
+			(string h) => headerValue(h == "Mcp-Param-Region" ? "us-west1" : ""));
 	assert(e is null);
 }
 
@@ -6411,7 +6450,7 @@ unittest  // x-mcp-header: mismatched header is a HeaderMismatch
 {
 	auto schema = schemaWithHeaderParam();
 	Json args = Json(["region": Json("us-west1")]);
-	auto e = validateParamHeaders(schema, args, (string h) => "us-east1");
+	auto e = validateParamHeaders(schema, args, (string h) => headerValue("us-east1"));
 	assert(e !is null && e.code == ErrorCode.headerMismatch);
 }
 
@@ -6419,7 +6458,7 @@ unittest  // x-mcp-header: present param but missing header fails
 {
 	auto schema = schemaWithHeaderParam();
 	Json args = Json(["region": Json("us-west1")]);
-	auto e = validateParamHeaders(schema, args, (string h) => "");
+	auto e = validateParamHeaders(schema, args, (string h) => headerValue(""));
 	assert(e !is null && e.code == ErrorCode.headerMismatch);
 }
 
@@ -6430,7 +6469,8 @@ unittest  // x-mcp-header: non-ASCII value matched via base64-encoded header
 	auto schema = schemaWithHeaderParam();
 	Json args = Json(["region": Json("Zürich")]);
 	const enc = encodeHeaderValue("Zürich");
-	auto e = validateParamHeaders(schema, args, (string h) => h == "Mcp-Param-Region" ? enc : "");
+	auto e = validateParamHeaders(schema, args,
+			(string h) => headerValue(h == "Mcp-Param-Region" ? enc : ""));
 	assert(e is null);
 }
 
@@ -6453,10 +6493,10 @@ unittest  // x-mcp-header: nested object property is validated against header (a
 	Json args = Json(["filters": Json(["region": Json("us-west1")])]);
 	// matching nested header passes
 	auto ok = validateParamHeaders(schema, args,
-			(string h) => h == "Mcp-Param-Region" ? "us-west1" : "");
+			(string h) => headerValue(h == "Mcp-Param-Region" ? "us-west1" : ""));
 	assert(ok is null);
 	// mismatched nested header fails
-	auto bad = validateParamHeaders(schema, args, (string h) => "eu-west1");
+	auto bad = validateParamHeaders(schema, args, (string h) => headerValue("eu-west1"));
 	assert(bad !is null && bad.code == ErrorCode.headerMismatch);
 }
 
@@ -6471,7 +6511,7 @@ unittest  // x-mcp-header: number-typed annotation is rejected as a malformed sc
 	]);
 	schema["properties"] = props;
 	Json args = Json(["amount": Json(5)]);
-	auto e = validateParamHeaders(schema, args, (string h) => "5");
+	auto e = validateParamHeaders(schema, args, (string h) => headerValue("5"));
 	assert(e !is null && e.code == ErrorCode.headerMismatch);
 }
 
@@ -6484,7 +6524,7 @@ unittest  // x-mcp-header: duplicate (case-insensitive) values rejected as malfo
 	props["b"] = Json(["type": Json("string"), "x-mcp-header": Json("region")]);
 	schema["properties"] = props;
 	Json args = Json(["a": Json("x"), "b": Json("y")]);
-	auto e = validateParamHeaders(schema, args, (string h) => "");
+	auto e = validateParamHeaders(schema, args, (string h) => headerValue(""));
 	assert(e !is null && e.code == ErrorCode.headerMismatch);
 }
 
@@ -6499,7 +6539,7 @@ unittest  // x-mcp-header: CR/LF injection in annotation value rejected
 	]);
 	schema["properties"] = props;
 	Json args = Json(["region": Json("us-west1")]);
-	auto e = validateParamHeaders(schema, args, (string h) => "");
+	auto e = validateParamHeaders(schema, args, (string h) => headerValue(""));
 	assert(e !is null && e.code == ErrorCode.headerMismatch);
 }
 
