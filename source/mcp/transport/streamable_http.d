@@ -1014,6 +1014,16 @@ private bool isLegacyReply(ref const ParsedInput input) @safe
 				|| input.messages[0].kind == MessageKind.errorResponse);
 }
 
+/// Whether `input` holds at least one request, as opposed to only replies and
+/// notifications.
+private bool carriesRequest(ref const ParsedInput input) @safe
+{
+	foreach (ref m; input.messages)
+		if (m.kind == MessageKind.request)
+			return true;
+	return false;
+}
+
 /// Dispatch a parsed legacy POST against the stream `sessionId` and its
 /// connection state `conn`, delivering any response on the stream.
 private void handleLegacyInput(McpServer server, LegacySseChannel channel,
@@ -1115,7 +1125,9 @@ enum LegacyPostOutcome
 /// server->client request (elicitation, sampling, roots) the handler blocks on.
 /// A request is refused when its stream already runs as many requests as the
 /// channel's `StreamLimits.maxLegacyInFlight`; a client reply only wakes its
-/// waiter, so it is handled at once and never refused.
+/// waiter, so it is handled at once and never refused, and a payload without a
+/// request (a notification such as `notifications/cancelled`) runs without
+/// taking a slot, so it is never refused either.
 LegacyPostOutcome dispatchLegacyPost(McpServer server, LegacySseChannel channel,
 		string sessionId, string payload, TokenInfo token = TokenInfo.invalid()) @safe
 {
@@ -1133,13 +1145,15 @@ LegacyPostOutcome dispatchLegacyPost(McpServer server, LegacySseChannel channel,
 		handleLegacyInput(server, channel, sessionId, conn, input, token);
 		return LegacyPostOutcome.accepted;
 	}
-	if (!channel.tryAcquireDispatch(sessionId))
+	const needsSlot = carriesRequest(input);
+	if (needsSlot && !channel.tryAcquireDispatch(sessionId))
 		return LegacyPostOutcome.tooManyRequests;
 	runTask(() nothrow{
 		try
 		{
 			scope (exit)
-				channel.releaseDispatch(sessionId);
+				if (needsSlot)
+					channel.releaseDispatch(sessionId);
 			handleLegacyInput(server, channel, sessionId, conn, input, token);
 		}
 		catch (Exception e)
@@ -6092,6 +6106,46 @@ unittest  // legacy POST past the per-stream in-flight cap is refused, but a rep
 			break;
 		yield();
 	}
+}
+
+unittest  // legacy notifications/cancelled is accepted while the stream's in-flight cap is reached
+{
+	import vibe.core.core : yield;
+	import mcp.protocol.types : Tool, CallToolResult;
+	import mcp.server.responses : ToolResponse;
+
+	auto server = McpServer.stateful("t", "1");
+	bool cancelled, stop;
+	scope (exit)
+		stop = true;
+	Tool descriptor;
+	descriptor.name = "slow";
+	server.registerTool(descriptor, (Json args, RequestContext ctx) @safe {
+		while (!ctx.isCancelled && !stop)
+			yield();
+		cancelled = ctx.isCancelled;
+		CallToolResult r;
+		return ToolResponse.complete(r);
+	});
+	StreamLimits limits;
+	limits.maxLegacyInFlight = 1;
+	auto ch = new LegacySseChannel("/message", limits);
+	const sid = ch.sessionIdFor(ch.addListener((string) @safe {}));
+
+	assert(dispatchLegacyPost(server, ch, sid, `{"jsonrpc":"2.0","id":3,"method":"tools/call",`
+			~ `"params":{"name":"slow","arguments":{}}}`) == LegacyPostOutcome.accepted);
+	foreach (_; 0 .. 16)
+		yield();
+	assert(dispatchLegacyPost(server, ch, sid,
+			`{"jsonrpc":"2.0","method":"notifications/cancelled",` ~ `"params":{"requestId":3}}`)
+			== LegacyPostOutcome.accepted, "a notification must never be refused");
+	foreach (_; 0 .. 4096)
+	{
+		if (cancelled)
+			break;
+		yield();
+	}
+	assert(cancelled);
 }
 
 version (unittest) private HTTPServerResponse legacyRequest(URLRouter router,
