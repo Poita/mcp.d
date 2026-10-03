@@ -78,7 +78,7 @@ struct ServerSettings
 	bool inputSchemaValidation = true;
 
 	/// Reject a stateful session's requests (other than `ping`) that arrive before
-	/// its `notifications/initialized` with -32002 (calls `requireInitialized`).
+	/// its `notifications/initialized` with -32600 (calls `requireInitialized`).
 	/// Off by default: the lifecycle rule is a SHOULD. Setting it on a
 	/// `stateless` server makes `newServer()` throw.
 	bool requireInitialized;
@@ -416,7 +416,7 @@ version (unittest)
 	init["clientInfo"] = Json(["name": Json("c"), "version": Json("1")]);
 	server.handle(Message(makeRequest(Json(1), "initialize", init)));
 	auto early = server.handle(Message(makeRequest(Json(2), "tools/list", Json.emptyObject))).get;
-	assert(early["error"]["code"].get!int == -32002);
+	assert(early["error"]["code"].get!int == -32600);
 }
 
 @safe unittest

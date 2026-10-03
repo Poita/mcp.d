@@ -694,7 +694,7 @@ final class McpServer : ServerCore
 	/// (other than `ping`) before the client has sent `notifications/initialized`.
 	/// With this enabled, a stateful session that receives e.g. `tools/list` after
 	/// the `initialize` response but before `notifications/initialized` is rejected
-	/// with -32002. `initialize` and `ping` are always allowed. OFF by default
+	/// with -32600 Invalid Request. `initialize` and `ping` are always allowed. OFF by default
 	/// — the rule is a SHOULD and well-behaved clients send `initialized`
 	/// immediately. Throws on a stateless server, which has no per-session
 	/// `initialized` handshake to gate on.
@@ -2308,8 +2308,7 @@ final class McpServer : ServerCore
 		// probe permitted at any time).
 		if (requireInitialized_ && mode_ == ServerMode.stateful
 				&& !conn.initialized && msg.method != "initialize" && msg.method != "ping")
-			return nullable(makeErrorResponse(msg.id, new McpException(-32002,
-					"Server not initialized")));
+			return nullable(makeErrorResponse(msg.id, invalidRequest("Server not initialized")));
 
 		// Register a cancellation token for this request keyed by its id, so an
 		// inbound `notifications/cancelled` can flip it while the handler runs
@@ -4570,9 +4569,10 @@ unittest  // requireInitialized: a stateful request before notifications/initial
 	init["clientInfo"] = Json(["name": Json("c"), "version": Json("1")]);
 	s.handle(req(1, "initialize", init));
 
-	// tools/list before notifications/initialized -> -32002 Server not initialized.
+	// tools/list before notifications/initialized -> -32600 Server not initialized
+	// (-32002 is resource-not-found on the 2025-era protocols).
 	auto early = s.handle(req(2, "tools/list")).get;
-	assert(early["error"]["code"].get!int == -32002);
+	assert(early["error"]["code"].get!int == ErrorCode.invalidRequest);
 
 	// ping is always allowed, even before initialized.
 	auto pong = s.handle(req(3, "ping")).get;
