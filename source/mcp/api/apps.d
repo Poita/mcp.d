@@ -12,7 +12,7 @@ import mcp.protocol.types : Tool, Resource, ResourceContents;
 /// The MCP Apps extension identifier (the key under `capabilities.extensions`
 /// and the namespace these helpers serialize under). A host advertises support
 /// for interactive UI by declaring this extension during initialization.
-enum string mcpAppsExtensionKey = "io.modelcontextprotocol/ui";
+enum string appsExtensionKey = "io.modelcontextprotocol/ui";
 
 /// The MIME type a UI resource declares for HTML app content.
 enum string mcpAppMimeType = "text/html;profile=mcp-app";
@@ -230,7 +230,7 @@ void enableApps(McpServer server, string[] mimeTypes = null) @safe
 			arr ~= Json(m);
 	Json settings = Json.emptyObject;
 	settings["mimeTypes"] = arr;
-	server.enableExtension(mcpAppsExtensionKey, settings);
+	server.enableExtension(appsExtensionKey, settings);
 }
 
 /// Whether the client behind `ctx` advertised the MCP Apps extension (at
@@ -239,7 +239,7 @@ void enableApps(McpServer server, string[] mimeTypes = null) @safe
 bool clientSupportsApps(RequestContext ctx) @safe
 {
 	auto ext = ctx.clientCapabilities.extensions;
-	return ext.type == Json.Type.object && (mcpAppsExtensionKey in ext) !is null;
+	return ext.type == Json.Type.object && (appsExtensionKey in ext) !is null;
 }
 
 /// Optional settings for `registerUiResource`.
@@ -350,7 +350,7 @@ unittest  // Ui*.fromJson yields an empty value for non-object input
 
 unittest  // mcp-app constants carry the spec's literal strings
 {
-	assert(mcpAppsExtensionKey == "io.modelcontextprotocol/ui");
+	assert(appsExtensionKey == "io.modelcontextprotocol/ui");
 	assert(mcpAppMimeType == "text/html;profile=mcp-app");
 }
 
@@ -359,7 +359,7 @@ unittest  // the Apps extension negotiates from 2025-11-25
 	import mcp.protocol.capabilities : extensionMinVersion;
 	import mcp.protocol.versions : ProtocolVersion;
 
-	assert(extensionMinVersion(mcpAppsExtensionKey) == ProtocolVersion.v2025_11_25);
+	assert(extensionMinVersion(appsExtensionKey) == ProtocolVersion.v2025_11_25);
 }
 
 unittest  // UiResourceCsp emits only the non-empty domain lists
@@ -447,8 +447,8 @@ unittest  // enableApps surfaces the extension with its mimeTypes (2026-07-28)
 	auto caps = s.handle(Message(makeRequest(Json(1), "server/discover",
 			params))).get["result"]["capabilities"];
 
-	assert(mcpAppsExtensionKey in caps["extensions"]);
-	auto settings = caps["extensions"][mcpAppsExtensionKey];
+	assert(appsExtensionKey in caps["extensions"]);
+	auto settings = caps["extensions"][appsExtensionKey];
 	assert(settings["mimeTypes"][0].get!string == mcpAppMimeType);
 }
 
@@ -479,7 +479,7 @@ unittest  // clientSupportsApps reflects what the request's client advertised
 {
 	Json caps = Json.emptyObject;
 	Json ext = Json.emptyObject;
-	ext[mcpAppsExtensionKey] = Json(["mimeTypes": Json([Json(mcpAppMimeType)])]);
+	ext[appsExtensionKey] = Json(["mimeTypes": Json([Json(mcpAppMimeType)])]);
 	caps["extensions"] = ext;
 	assert(probeClientSupportsApps(caps));
 }

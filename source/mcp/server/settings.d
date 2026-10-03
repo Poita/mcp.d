@@ -279,7 +279,7 @@ version (unittest)
 @safe unittest
 {
 	// apps surfaces the MCP Apps extension capability.
-	import mcp.api.apps : mcpAppsExtensionKey;
+	import mcp.api.apps : appsExtensionKey;
 	import vibe.data.json : Json;
 
 	ServerSettings s;
@@ -287,7 +287,7 @@ version (unittest)
 	s.apps = true;
 	auto caps = s.newServer().capabilities();
 	assert(caps.extensions.type == Json.Type.object);
-	assert((mcpAppsExtensionKey in caps.extensions) !is null);
+	assert((appsExtensionKey in caps.extensions) !is null);
 }
 
 @safe unittest
