@@ -542,8 +542,9 @@ It discovers the protected-resource and authorization-server metadata, then:
 
 - **Reuses a stored token** for the endpoint when one is still valid, or redeems
   its refresh token, without opening a browser — unless it lacks one of the
-  requested scopes (a step-up after `insufficient_scope`), which needs a new
-  authorization.
+  scopes named by `OAuthLogin.scopes` or the challenge (a step-up after
+  `insufficient_scope`), which needs a new authorization. A token granted only
+  part of the fallback `scopes_supported` is still reused.
 - Otherwise **registers the client** — a pre-registered `OAuthLogin.clientId`, a
   Client ID Metadata Document (`clientIdMetadataUrl`, when the AS supports it), or
   Dynamic Client Registration — and **runs authorization-code + PKCE** in the system

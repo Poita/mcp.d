@@ -747,6 +747,21 @@ package string[] loginScopes(const OAuthLogin opts, const ProtectedResourceMetad
 	return selectScope(challengeScope, prm.scopesSupported).split();
 }
 
+/// The scopes a cached token must have been granted to be reused: those named
+/// explicitly by `opts.scopes` or by the step-up challenge in
+/// `opts.wwwAuthenticate`. The `scopes_supported` fallback of `loginScopes` is
+/// not required, since an AS may grant a subset of what it advertises.
+package string[] requiredScopes(const OAuthLogin opts) @safe
+{
+	import std.array : split;
+
+	if (opts.scopes.length)
+		return opts.scopes.dup;
+	if (opts.wwwAuthenticate.length)
+		return parseWwwAuthenticate(opts.wwwAuthenticate).scope_.split();
+	return null;
+}
+
 /// The default loopback redirect URI for a given port and path. It names the
 /// `127.0.0.1` literal the callback listener binds (RFC 8252 §8.3): `localhost`
 /// may resolve to `::1` first, where nothing is listening.
@@ -1192,6 +1207,7 @@ OAuthSession useOAuth(McpClient client, string mcpEndpoint, OAuthLogin opts) @sa
 	if (located.fromProtectedResourceMetadata && located.metadata.resource.length)
 		oauth.resource = canonicalResourceUri(located.metadata.resource);
 	auto as_ = oauth.discoverAuthServer(located.issuer, located.fromProtectedResourceMetadata);
+	const required = requiredScopes(opts);
 	opts.scopes = loginScopes(opts, located.metadata);
 
 	// Reuse a cached, still-valid token when present. A record from another
@@ -1205,9 +1221,9 @@ OAuthSession useOAuth(McpClient client, string mcpEndpoint, OAuthLogin opts) @sa
 	// registration (and the tokens bound to it) must be replaced.
 	if (cached.clientSecretExpired(now))
 		cached = StoredToken.init;
-	// A token lacking a requested scope (a step-up after `insufficient_scope`)
-	// cannot be reused or refreshed into one that has it.
-	const scopesGranted = cached.grantsScopes(opts.scopes);
+	// A token lacking an explicitly required scope (a step-up after
+	// `insufficient_scope`) cannot be reused or refreshed into one that has it.
+	const scopesGranted = cached.grantsScopes(required);
 	if (scopesGranted && cached.hasToken && !needsRefresh(cached, now))
 	{
 		return attachSession(client, new OAuthSession(oauth, as_,
@@ -1798,6 +1814,16 @@ unittest  // explicitly configured login scopes win over discovered ones
 	ProtectedResourceMetadata prm;
 	prm.scopesSupported = ["supported"];
 	assert(loginScopes(opts, prm) == ["mine"]);
+}
+
+unittest  // the scopes a cached token must cover exclude the scopes_supported fallback
+{
+	OAuthLogin opts;
+	assert(requiredScopes(opts).length == 0);
+	opts.wwwAuthenticate = `Bearer error="insufficient_scope", scope="files:write"`;
+	assert(requiredScopes(opts) == ["files:write"]);
+	opts.scopes = ["mine"];
+	assert(requiredScopes(opts) == ["mine"]);
 }
 
 unittest  // with nothing configured or discovered no scope is requested
@@ -2639,6 +2665,8 @@ version (unittest)
 		bool failRefresh;
 		/// The PRM `resource`; empty selects `base ~ "/mcp"`.
 		string prmResource;
+		/// The PRM `scopes_supported`; empty omits it.
+		string[] prmScopes;
 
 		void stop() @trusted
 		{
@@ -2662,8 +2690,19 @@ version (unittest)
 				scope HTTPServerResponse res) @safe {
 			const b = srv.base;
 			if (req.path.canFind("oauth-protected-resource"))
-				res.writeBody(`{"resource":"` ~ (srv.prmResource.length ? srv.prmResource
-					: b ~ "/mcp") ~ `","authorization_servers":["` ~ b ~ `"]}`, "application/json");
+			{
+				auto prm = Json.emptyObject;
+				prm["resource"] = srv.prmResource.length ? srv.prmResource : b ~ "/mcp";
+				prm["authorization_servers"] = Json([Json(b)]);
+				if (srv.prmScopes.length)
+				{
+					Json[] scopes;
+					foreach (sc; srv.prmScopes)
+						scopes ~= Json(sc);
+					prm["scopes_supported"] = Json(scopes);
+				}
+				res.writeBody(prm.toString(), "application/json");
+			}
 			else if (req.path.canFind("authorization-server"))
 				res.writeBody(`{"issuer":"` ~ b ~ `","authorization_endpoint":"` ~ b
 					~ `/authorize","token_endpoint":"` ~ b ~ `/token","registration_endpoint":"`
@@ -2985,6 +3024,65 @@ unittest  // useOAuth reuses a cached token whose scope covers the requested sco
 	};
 
 	assert(useOAuth(McpClient.http(endpoint), endpoint, opts).token.accessToken == "wide");
+}
+
+unittest  // useOAuth reuses a cached token granted a subset of the discovered scopes_supported
+{
+	import mcp.auth.oauth : canonicalResourceUri;
+
+	auto srv = startIssuerTestAuthServer();
+	scope (exit)
+		srv.stop();
+	srv.prmScopes = ["files:read", "files:write"];
+	const endpoint = srv.base ~ "/mcp";
+	const resource = canonicalResourceUri(endpoint);
+
+	auto store = new MemoryTokenStore();
+	StoredToken t;
+	t.accessToken = "subset";
+	t.scope_ = "files:read";
+	t.resource = resource;
+	t.issuer = srv.base;
+	store.save(resource, t);
+
+	OAuthLogin opts;
+	opts.store = store;
+	opts.openBrowser = (string url) @safe {
+		assert(0, "no interactive login expected");
+	};
+
+	assert(useOAuth(McpClient.http(endpoint), endpoint, opts).token.accessToken == "subset");
+}
+
+unittest  // useOAuth does not reuse a cached token lacking a step-up challenge's scope
+{
+	import core.time : msecs;
+	import std.exception : assertThrown;
+	import mcp.auth.oauth : canonicalResourceUri;
+
+	auto srv = startIssuerTestAuthServer();
+	scope (exit)
+		srv.stop();
+	const endpoint = srv.base ~ "/mcp";
+	const resource = canonicalResourceUri(endpoint);
+
+	auto store = new MemoryTokenStore();
+	StoredToken t;
+	t.accessToken = "narrow";
+	t.scope_ = "files:read";
+	t.resource = resource;
+	t.issuer = srv.base;
+	store.save(resource, t);
+
+	bool browserOpened;
+	OAuthLogin opts;
+	opts.store = store;
+	opts.wwwAuthenticate = `Bearer error="insufficient_scope", scope="files:write"`;
+	opts.callbackTimeout = 50.msecs;
+	opts.openBrowser = (string url) @safe { browserOpened = true; };
+
+	assertThrown(useOAuth(McpClient.http(endpoint), endpoint, opts));
+	assert(browserOpened);
 }
 
 unittest  // a refresh response that omits scope keeps the previously granted scope
