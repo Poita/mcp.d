@@ -37,7 +37,19 @@ struct RequestMeta
 				== Json.Type.string)
 			m.protocolVersion = meta[MetaKey.protocolVersion].get!string;
 		if (MetaKey.clientInfo in meta && meta[MetaKey.clientInfo].type == Json.Type.object)
-			m.clientInfo = Implementation.fromJson(meta[MetaKey.clientInfo]);
+		{
+			// Malformed icons are dropped rather than failing the request:
+			// `clientInfo` is informational and every caller relies on this
+			// parse not throwing.
+			auto info = meta[MetaKey.clientInfo].clone;
+			try
+				m.clientInfo = Implementation.fromJson(info);
+			catch (McpException)
+			{
+				info.remove("icons");
+				m.clientInfo = Implementation.fromJson(info);
+			}
+		}
 		if (MetaKey.clientCapabilities in meta
 				&& meta[MetaKey.clientCapabilities].type == Json.Type.object)
 		{
@@ -352,6 +364,22 @@ unittest  // RequestMeta.fromParams ignores non-object clientInfo and clientCapa
 	assert(m.clientInfo.version_ == "");
 	assert(!m.clientCapabilities.sampling);
 	assert(!m.clientCapabilities.roots);
+}
+
+unittest  // RequestMeta.fromParams drops malformed clientInfo icons and keeps the rest
+{
+	import vibe.data.json : parseJsonString;
+
+	foreach (icons; [`[42]`, `[{"src":"a","sizes":[1]}]`])
+	{
+		auto params = parseJsonString(
+				`{"_meta":{"` ~ MetaKey.clientInfo
+				~ `":{"name":"c","version":"1","icons":` ~ icons ~ `}}}`);
+		const m = RequestMeta.fromParams(params);
+		assert(m.clientInfo.name == "c");
+		assert(m.clientInfo.version_ == "1");
+		assert(m.clientInfo.icons.length == 0);
+	}
 }
 
 unittest  // withServerInfo replaces a handler-supplied serverInfo with the server's identity
