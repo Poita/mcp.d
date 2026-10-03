@@ -668,11 +668,16 @@ final class LegacySseChannel
 		return false;
 	}
 
-	/// Drop a listener (its GET stream closed).
+	/// Drop a listener (its GET stream closed), cancelling the requests in
+	/// flight on it: their replies have nowhere left to go.
 	void removeListener(long id) @safe
 	{
 		import std.algorithm : remove;
 
+		foreach (l; listeners)
+			if (l.id == id)
+				foreach (tok; l.connState.inFlight)
+					tok.cancel();
 		listeners = listeners.remove!(l => l.id == id);
 	}
 
@@ -3409,6 +3414,18 @@ unittest  // legacy channel: GET stream first receives the endpoint event, then 
 	assert(frames[1].canFind("\"id\":1"));
 	ch.removeListener(id);
 	assert(ch.listenerCount == 0);
+}
+
+unittest  // closing a legacy SSE stream cancels the requests in flight on it
+{
+	import mcp.server.context : CancellationToken;
+
+	auto ch = new LegacySseChannel("/message");
+	const id = ch.addListener((string) @safe {});
+	auto tok = new CancellationToken;
+	ch.connStateFor(ch.sessionIdFor(id)).inFlight["i:1"] = tok;
+	ch.removeListener(id);
+	assert(tok.cancelled, "a closed stream's in-flight request must be cancelled");
 }
 
 unittest  // legacy POST: a request is processed and its response pushed onto the SSE stream
