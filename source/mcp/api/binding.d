@@ -650,8 +650,8 @@ private bool isPresent(FT)(const(Json)* p)
 package(mcp) T bindString(T)(string raw, string path = "")
 {
 	import std.conv : to;
+	import mcp.protocol.jsonrpc : parseUntrustedJson;
 	import std.sumtype : isSumType;
-	import vibe.data.json : parseJsonString;
 
 	static if (isSomeString!T)
 		return raw.to!T;
@@ -670,7 +670,7 @@ package(mcp) T bindString(T)(string raw, string path = "")
 	{
 		Json doc;
 		try
-			doc = parseJsonString(raw);
+			doc = parseUntrustedJson(raw);
 		catch (Exception e)
 			throw new BindException(located(path, "expected a JSON document for " ~ T.stringof));
 		return bindJson!T(doc, path);
@@ -828,6 +828,17 @@ unittest  // bindString rejects a string that does not parse as the target type
 
 	assertThrown!BindException(bindString!int("abc"));
 	assertThrown!BindException(bindString!bool("yes"));
+}
+
+unittest  // bindString rejects an over-deep JSON document before parsing it
+{
+	import std.algorithm.searching : canFind;
+	import std.array : replicate;
+	import std.exception : collectException;
+
+	auto e = collectException!BindException(
+			bindString!(int[])("[".replicate(1000) ~ "]".replicate(1000)));
+	assert(e !is null && e.msg.canFind("expected a JSON document"), e is null ? "" : e.msg);
 }
 
 unittest  // bindJson binds a SumType to the first member type the value fits
