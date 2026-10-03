@@ -1434,6 +1434,8 @@ final class HttpClientTransport : ClientTransport
 				err = errorFrom(msg.error);
 			break;
 		case MessageKind.request:
+			dispatchOffReader(msg);
+			break;
 		case MessageKind.notification:
 			auto slot = expectId in inflightPosts;
 			PostRequest req = slot is null ? null : *slot;
@@ -1757,11 +1759,21 @@ final class HttpClientTransport : ClientTransport
 					readSseBody(conn, head.chunked, cursor, () @safe => closing,
 							(string eventType, string data) @safe {
 						sawData = true;
+						Message m;
+						try
+							m = Message(parseJsonBounded(data));
+						catch (Exception)
+							return;
+						if (m.kind == MessageKind.request)
+						{
+							dispatchOffReader(m);
+							return;
+						}
 						slot.inHandler++;
 						scope (exit)
 							slot.inHandler--;
 						try
-							dispatch(Message(parseJsonBounded(data)));
+							dispatch(m);
 						catch (Exception)
 						{
 						}
@@ -2004,6 +2016,11 @@ final class HttpClientTransport : ClientTransport
 							return;
 						}
 						markEstablished(true);
+						if (m.kind == MessageKind.request)
+						{
+							dispatchOffReader(m);
+							return;
+						}
 						slot.inHandler++;
 						scope (exit)
 							slot.inHandler--;
@@ -2275,12 +2292,14 @@ final class HttpClientTransport : ClientTransport
 			dispatchOffReader(m);
 	}
 
-	/// Run the inbound handler for `m` on its own task. Every legacy response
-	/// arrives on the one GET stream, so a handler that issues a request of its
-	/// own (a sampling handler calling a tool, say) would otherwise wait on a
-	/// response the blocked reader can never deliver. `runTask` switches to the
-	/// new task at once, so a handler that does not block finishes before the
-	/// next event is read and arrival order is kept.
+	/// Run the inbound handler for `m` on its own task, so the stream's reader
+	/// keeps reading while it runs: a later `notifications/cancelled` or progress
+	/// for the request reaches the client, and on the legacy transport, where
+	/// every response arrives on the one GET stream, a handler that issues a
+	/// request of its own (a sampling handler calling a tool, say) gets its
+	/// response. `runTask` switches to the new task at once, so a handler that
+	/// does not block finishes before the next event is read and arrival order is
+	/// kept.
 	private void dispatchOffReader(Message m) @safe
 	{
 		import vibe.core.core : runTask;
@@ -2292,7 +2311,7 @@ final class HttpClientTransport : ClientTransport
 			{
 				import vibe.core.log : logWarn;
 
-				logWarn("legacy HTTP+SSE: inbound handler threw: %s", e.msg);
+				logWarn("[mcp.client] inbound handler threw: %s", e.msg);
 			}
 		}, m);
 	}
@@ -5384,6 +5403,56 @@ unittest  // the raw-socket POST sends a Host header carrying the non-default po
 	assert(failure.length == 0, "scenario failed: " ~ failure);
 	assert(hosts.length >= 2);
 	assert(hosts.all!(h => h == expected), "Host must carry the port: " ~ hosts.to!string);
+}
+
+unittest  // a server request on a POST stream sees the server's cancellation sent after it on that stream
+{
+	import core.time : msecs, MonoTime;
+	import mcp.client.client : McpClient;
+	import mcp.protocol.types : ListRootsResult;
+	import vibe.core.core : sleep;
+
+	bool handlerDone, sawCancel;
+	auto r = new URLRouter;
+	r.post("/mcp", (HTTPServerRequest req, HTTPServerResponse res) @safe {
+		auto j = requestJson(req);
+		const method = ("method" in j) ? j["method"].get!string : "";
+		if (method == "initialize")
+			res.writeBody(initializeReply(j, "2025-11-25").toString(), "application/json");
+		else if ("id" !in j || method.length == 0)
+		{
+			res.statusCode = 202;
+			res.writeBody("", "text/plain");
+		}
+		else
+		{
+			writeSse(res, `data: {"jsonrpc":"2.0","id":"s1","method":"roots/list"}` ~ "\n\n" ~ `data: {"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":"s1"}}` ~ "\n\n");
+			const until = MonoTime.currTime + 3.seconds;
+			while (!handlerDone && MonoTime.currTime < until)
+				sleep(20.msecs);
+			writeSse(res, toolsListFrame(j["id"].get!long));
+		}
+	});
+	const failure = runAgainstFakeServer(r, (string url) @safe {
+		auto client = McpClient.http(url);
+		scope (exit)
+			client.close();
+		// Stands in for a handler waiting on a user, giving up once cancelled.
+		client.onListRoots = () @safe {
+			auto token = client.serverRequestCancellation();
+			const start = MonoTime.currTime;
+			while (!token.isCancelled && MonoTime.currTime - start < 1.seconds)
+				sleep(10.msecs);
+			sawCancel = token.isCancelled;
+			handlerDone = true;
+			return ListRootsResult.init;
+		};
+		client.initialize("2025-11-25");
+		client.listTools();
+	});
+	assert(failure.length == 0, "scenario failed: " ~ failure);
+	assert(sawCancel,
+			"the handler must see the cancellation that follows its request on the stream");
 }
 
 unittest  // a reply to a server->client request is sent while every in-flight permit is held
