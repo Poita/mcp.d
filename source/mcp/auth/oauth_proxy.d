@@ -121,7 +121,9 @@ struct OAuthProxyConfig
 	/// user approves it here. Defaults to `/consent`.
 	string consentPath = "/consent";
 
-	/// The scopes advertised in the metadata documents the proxy publishes.
+	/// The scopes advertised in the metadata documents the proxy publishes. When
+	/// set, these are also the only scopes `/authorize` forwards upstream; any
+	/// other requested scope is dropped (`forwardedScopes`).
 	string[] scopesSupported;
 
 	/// The `grant_types_supported` advertised in the published RFC 8414 AS
@@ -364,16 +366,41 @@ Json registrationResponseJson(const OAuthProxyConfig cfg, const string[] request
 // Authorize proxying
 // ===========================================================================
 
+/// The scopes from the space-delimited `scopeStr` that the proxy forwards
+/// upstream: each distinct requested scope, restricted to `cfg.scopesSupported`
+/// when that is set, so a client cannot reach upstream scopes the proxy does not
+/// advertise under the proxy's own upstream `client_id`. Dropping the rest is a
+/// partial grant RFC 6749 §3.3 permits.
+string[] forwardedScopes(const OAuthProxyConfig cfg, string scopeStr) @safe
+{
+	import std.algorithm : canFind, splitter;
+
+	string[] scopes;
+	foreach (sc; scopeStr.splitter(' '))
+	{
+		if (sc.length == 0 || scopes.canFind(sc))
+			continue;
+		if (cfg.scopesSupported.length && !cfg.scopesSupported.canFind(sc))
+			continue;
+		scopes ~= sc;
+	}
+	return scopes;
+}
+
 /// Build the upstream authorization redirect URL for a proxied `/authorize`
 /// request. The proxy substitutes its OWN fixed upstream `client_id` and fixed
-/// callback URL, forwarding the client-supplied PKCE `code_challenge`, scope,
-/// state, and (RFC 8707) resource. The client's real `redirect_uri` is NOT sent
-/// upstream — the proxy receives the code at its fixed callback and relays it.
+/// callback URL, forwarding the client-supplied PKCE `code_challenge`, the
+/// requested scopes it permits (`forwardedScopes`), state, and (RFC 8707)
+/// resource. The client's real `redirect_uri` is NOT sent upstream — the proxy
+/// receives the code at its fixed callback and relays it.
 string proxyAuthorizeUrl(const OAuthProxyConfig cfg, string codeChallenge,
 		string scopeStr, string state) @safe
 {
+	import std.array : join;
+
 	return buildAuthorizationUrl(cfg.upstreamAuthorizationEndpoint, cfg.upstreamClientId,
-			cfg.callbackUrl(), codeChallenge, scopeStr, cfg.resource, state);
+			cfg.callbackUrl(), codeChallenge, forwardedScopes(cfg, scopeStr)
+				.join(" "), cfg.resource, state);
 }
 
 // ===========================================================================
@@ -810,8 +837,9 @@ ClientIdMetadataDocument parseClientIdMetadataDocument(string clientIdUrl, strin
 // ===========================================================================
 
 /// Records that a user, in one particular browser, has approved a particular
-/// client to be forwarded to the upstream identity provider, and answers whether
-/// that browser has already approved that client.
+/// client to be forwarded to the upstream identity provider with a particular
+/// set of scopes, and answers whether that browser has already approved that
+/// client for a requested scope set.
 ///
 /// Because the proxy hands every DCR client the SAME fixed upstream
 /// `client_id`, the upstream IdP can see only one client and may auto-skip its
@@ -832,12 +860,17 @@ ClientIdMetadataDocument parseClientIdMetadataDocument(string clientIdUrl, strin
 ///     for a DCR client (the `client_id` is shared), or the stable `client_id`
 ///     URL for a SEP-991 CIMD client.
 ///
-/// An empty `consentSession` never has consent.
+/// Each approval also records the scopes the user saw and approved, so a later
+/// request for broader access re-prompts rather than riding on the earlier
+/// approval. An empty `consentSession` never has consent.
 interface ConsentStore
 {
-	bool hasConsent(string consentSession, string client) @safe;
+	/// Whether the browser approved `client` for every scope in `scopes`.
+	bool hasConsent(string consentSession, string client, const(string)[] scopes) @safe;
 
-	void grantConsent(string consentSession, string client) @safe;
+	/// Record the browser's approval of `client` for `scopes`, adding them to any
+	/// scopes it already approved for that client.
+	void grantConsent(string consentSession, string client, const(string)[] scopes) @safe;
 }
 
 /// Bounds for an `InMemoryConsentStore`.
@@ -892,6 +925,7 @@ final class InMemoryConsentStore : ConsentStore
 	}
 
 	private ulong[Key] approved; // key -> serial of its live grant
+	private string[][Key] approvedScopes; // key -> the scopes approved under it
 	private SlotQueue order;
 	private SlotQueue[string] orderByClient;
 	private size_t[string] countByClient;
@@ -909,22 +943,33 @@ final class InMemoryConsentStore : ConsentStore
 		this.opts = opts;
 	}
 
-	override bool hasConsent(string consentSession, string client) @safe
+	override bool hasConsent(string consentSession, string client, const(string)[] scopes) @safe
 	{
+		import std.algorithm : all, canFind;
+
 		if (consentSession.length == 0)
 			return false;
-		return (Key(consentSession, client) in approved) !is null;
+		auto granted = Key(consentSession, client) in approvedScopes;
+		return granted !is null && scopes.all!(sc => (*granted).canFind(sc));
 	}
 
-	override void grantConsent(string consentSession, string client) @safe
+	override void grantConsent(string consentSession, string client, const(string)[] scopes) @safe
 	{
+		import std.algorithm : canFind;
+
 		if (consentSession.length == 0)
 			return;
 		const k = Key(consentSession, client);
-		if (k in approved)
+		if (auto granted = k in approvedScopes)
+		{
+			foreach (sc; scopes)
+				if (!(*granted).canFind(sc))
+					*granted ~= sc;
 			return;
+		}
 		const slot = Slot(k, nextSerial++);
 		approved[k] = slot.serial;
+		approvedScopes[k] = scopes.dup;
 		order.slots ~= slot;
 		orderByClient.require(client).slots ~= slot;
 		const perClient = ++countByClient.require(client);
@@ -958,6 +1003,7 @@ final class InMemoryConsentStore : ConsentStore
 	private void remove(const Key k) @safe
 	{
 		approved.remove(k);
+		approvedScopes.remove(k);
 		auto n = k.client in countByClient;
 		if (--*n == 0)
 		{
@@ -1145,10 +1191,18 @@ final class OAuthProxy
 
 	/// Whether the browser identified by `consentSession` has already approved
 	/// `client` (a DCR client's `redirect_uri`, or a CIMD `client_id` URL) to be
-	/// forwarded to the upstream identity provider.
-	bool hasConsent(string consentSession, string client) @safe
+	/// forwarded to the upstream identity provider with every scope in `scopes`.
+	bool hasConsent(string consentSession, string client, const(string)[] scopes) @safe
 	{
-		return consentStore.hasConsent(consentSession, client);
+		return consentStore.hasConsent(consentSession, client, scopes);
+	}
+
+	/// The scopes of the space-delimited `scopeStr` this proxy forwards upstream
+	/// (see the free function `forwardedScopes`): the set a consent screen shows
+	/// and `grantConsent` records.
+	string[] forwardedScopes(string scopeStr) const @safe
+	{
+		return .forwardedScopes(cfg, scopeStr);
 	}
 
 	/// Record that the user in the browser identified by `consentSession` has
@@ -1156,10 +1210,12 @@ final class OAuthProxy
 	/// URL). Call this once the user approves on the proxy's own consent screen,
 	/// after verifying the approval came from that browser; subsequent
 	/// `authorize` calls from that browser for that client are then forwarded to
-	/// the upstream IdP. Other browsers still see the consent screen.
-	void grantConsent(string consentSession, string client) @safe
+	/// the upstream IdP for `scopes` (as `forwardedScopes` yields them). Other
+	/// browsers, and requests for scopes not yet approved, still see the consent
+	/// screen.
+	void grantConsent(string consentSession, string client, const(string)[] scopes) @safe
 	{
-		consentStore.grantConsent(consentSession, client);
+		consentStore.grantConsent(consentSession, client, scopes);
 	}
 
 	/// Build the upstream authorization redirect for a proxied `/authorize`,
@@ -1171,13 +1227,15 @@ final class OAuthProxy
 	/// overload enforces that: it throws `ConsentRequiredException` unless the
 	/// browser identified by `consentSession` has approved the client (identified
 	/// by its `clientRedirectUri`, the per-client identity the proxy holds since
-	/// the `client_id` is shared) via `grantConsent`. The integrator presents a
-	/// consent screen, records approval, then retries.
+	/// the `client_id` is shared) via `grantConsent` for every scope it would
+	/// forward (`forwardedScopes`), so a request for broader access than was
+	/// approved re-prompts. The integrator presents a consent screen, records
+	/// approval, then retries.
 	string authorize(string consentSession, string clientRedirectUri,
 			string codeChallenge, string scopeStr, string state) @safe
 	{
 		validateRedirectUri(clientRedirectUri);
-		if (!consentStore.hasConsent(consentSession, clientRedirectUri))
+		if (!consentStore.hasConsent(consentSession, clientRedirectUri, forwardedScopes(scopeStr)))
 			throw new ConsentRequiredException(clientRedirectUri);
 		return proxyAuthorizeUrl(cfg, codeChallenge, scopeStr, state);
 	}
@@ -1281,7 +1339,7 @@ final class OAuthProxy
 			throw new InvalidClientIdMetadataException(clientIdUrl,
 					"Client ID Metadata Documents are not enabled on this proxy");
 		validateClientIdMetadata(clientIdUrl, doc, clientRedirectUri);
-		if (!consentStore.hasConsent(consentSession, clientIdUrl))
+		if (!consentStore.hasConsent(consentSession, clientIdUrl, forwardedScopes(scopeStr)))
 			throw new ConsentRequiredException(clientIdUrl);
 		return proxyAuthorizeUrl(cfg, codeChallenge, scopeStr, state);
 	}
@@ -1611,7 +1669,9 @@ unittest  // CIMD AUTHORIZE: with a valid doc + consent on the client_id URL, fo
 	cfg.clientIdMetadataDocumentSupported = true;
 	auto proxy = new OAuthProxy(cfg);
 	auto doc = sampleCimdDoc();
-	proxy.grantConsent("browser-1", "https://app.example.com/oauth/client.json");
+	proxy.grantConsent("browser-1", "https://app.example.com/oauth/client.json", [
+		"read:user"
+	]);
 	auto url = proxy.authorizeWithClientIdMetadata("browser-1",
 			"https://app.example.com/oauth/client.json",
 			doc, "http://127.0.0.1:8765/callback", "CH", "read:user", "S");
@@ -1641,7 +1701,9 @@ unittest  // CIMD AUTHORIZE: an invalid document is rejected before the consent 
 	auto proxy = new OAuthProxy(cfg);
 	auto doc = sampleCimdDoc();
 	doc.clientId = "https://app.example.com/oauth/OTHER.json"; // mismatch
-	proxy.grantConsent("browser-1", "https://app.example.com/oauth/client.json");
+	proxy.grantConsent("browser-1", "https://app.example.com/oauth/client.json", [
+		"read:user"
+	]);
 	assertThrown!InvalidClientIdMetadataException(proxy.authorizeWithClientIdMetadata("browser-1",
 			"https://app.example.com/oauth/client.json",
 			doc, "http://127.0.0.1:8765/callback", "CH", "read:user", "S"));
@@ -1654,7 +1716,9 @@ unittest  // CIMD AUTHORIZE: refused when the proxy is not configured to support
 	auto cfg = sampleConfig(); // clientIdMetadataDocumentSupported defaults to false
 	auto proxy = new OAuthProxy(cfg);
 	auto doc = sampleCimdDoc();
-	proxy.grantConsent("browser-1", "https://app.example.com/oauth/client.json");
+	proxy.grantConsent("browser-1", "https://app.example.com/oauth/client.json", [
+		"read:user"
+	]);
 	assertThrown!InvalidClientIdMetadataException(proxy.authorizeWithClientIdMetadata("browser-1",
 			"https://app.example.com/oauth/client.json",
 			doc, "http://127.0.0.1:8765/callback", "CH", "read:user", "S"));
@@ -1866,6 +1930,26 @@ unittest  // proxied /authorize redirects to the UPSTREAM with the fixed client_
 	assert(url.canFind("resource=https%3A%2F%2Fmcp.example.com%2Fmcp"));
 }
 
+unittest  // proxied /authorize forwards only the scopes listed in scopesSupported
+{
+	import std.algorithm : canFind;
+
+	auto cfg = sampleConfig(); // scopesSupported: read:user, repo
+	auto url = proxyAuthorizeUrl(cfg, "CHALLENGE", "read:user admin:org repo", "S");
+	assert(url.canFind("scope=read%3Auser%20repo&"), url);
+	assert(!url.canFind("admin"), url);
+}
+
+unittest  // with no scopesSupported configured, the requested scopes are forwarded as-is
+{
+	import std.algorithm : canFind;
+
+	auto cfg = sampleConfig();
+	cfg.scopesSupported = null;
+	auto url = proxyAuthorizeUrl(cfg, "CHALLENGE", "read:user admin:org", "S");
+	assert(url.canFind("admin%3Aorg"), url);
+}
+
 unittest  // proxied /token exchanges the code upstream with fixed creds (client_secret_post)
 {
 	import std.algorithm : canFind;
@@ -2014,11 +2098,58 @@ unittest  // CONFUSED DEPUTY: after grantConsent the gated authorize forwards up
 	auto cfg = sampleConfig();
 	auto proxy = new OAuthProxy(cfg);
 	proxy.register(["http://localhost:5000/callback"]);
-	proxy.grantConsent("browser-1", "http://localhost:5000/callback");
+	proxy.grantConsent("browser-1", "http://localhost:5000/callback", [
+		"read:user"
+	]);
 	auto url = proxy.authorize("browser-1", "http://localhost:5000/callback",
 			"CH", "read:user", "S");
 	assert(url.startsWith("https://github.com/login/oauth/authorize?"));
 	assert(url.canFind("client_id=Iv1.upstream"));
+}
+
+unittest  // CONFUSED DEPUTY: consent for some scopes does not cover a request for broader ones
+{
+	import std.exception : assertThrown;
+
+	auto proxy = new OAuthProxy(sampleConfig());
+	proxy.register(["http://localhost:5000/callback"]);
+	proxy.grantConsent("browser-1", "http://localhost:5000/callback", [
+		"read:user"
+	]);
+	assertThrown!ConsentRequiredException(proxy.authorize("browser-1",
+			"http://localhost:5000/callback", "CH", "read:user repo", "S"));
+	cast(void) proxy.authorize("browser-1", "http://localhost:5000/callback",
+			"CH", "read:user", "S");
+}
+
+unittest  // CONFUSED DEPUTY: a scope the proxy would not forward needs no consent
+{
+	auto proxy = new OAuthProxy(sampleConfig());
+	proxy.register(["http://localhost:5000/callback"]);
+	proxy.grantConsent("browser-1", "http://localhost:5000/callback", [
+		"read:user"
+	]);
+	cast(void) proxy.authorize("browser-1", "http://localhost:5000/callback",
+			"CH", "read:user admin:org", "S");
+}
+
+unittest  // CONSENT STORE: a later grant adds scopes to the client's existing approval
+{
+	auto store = new InMemoryConsentStore();
+	store.grantConsent("b", "http://a/cb", ["read"]);
+	store.grantConsent("b", "http://a/cb", ["write"]);
+	assert(store.hasConsent("b", "http://a/cb", ["read", "write"]));
+	assert(store.hasConsent("b", "http://a/cb", []));
+	assert(!store.hasConsent("b", "http://a/cb", ["admin"]));
+}
+
+unittest  // CONSENT STORE: an evicted approval takes its scopes with it
+{
+	auto store = new InMemoryConsentStore(ConsentStoreOptions(1, 1));
+	store.grantConsent("b", "http://a/cb", ["read"]);
+	store.grantConsent("b", "http://c/cb", ["read"]); // evicts a
+	store.grantConsent("b", "http://a/cb", []);
+	assert(!store.hasConsent("b", "http://a/cb", ["read"]));
 }
 
 unittest  // CONFUSED DEPUTY: consent is per-client (one approval does not cover another)
@@ -2030,9 +2161,11 @@ unittest  // CONFUSED DEPUTY: consent is per-client (one approval does not cover
 	proxy.register([
 		"http://localhost:5000/callback", "http://localhost:6000/callback"
 	]);
-	proxy.grantConsent("browser-1", "http://localhost:5000/callback");
-	assert(proxy.hasConsent("browser-1", "http://localhost:5000/callback"));
-	assert(!proxy.hasConsent("browser-1", "http://localhost:6000/callback"));
+	proxy.grantConsent("browser-1", "http://localhost:5000/callback", [
+		"read:user"
+	]);
+	assert(proxy.hasConsent("browser-1", "http://localhost:5000/callback", null));
+	assert(!proxy.hasConsent("browser-1", "http://localhost:6000/callback", null));
 	assertThrown!ConsentRequiredException(proxy.authorize("browser-1",
 			"http://localhost:6000/callback", "CH", "read:user", "S"));
 }
@@ -2056,10 +2189,10 @@ unittest  // CONFUSED DEPUTY: the exception names the client redirect_uri needin
 unittest  // InMemoryConsentStore records and reports per-redirect-uri consent
 {
 	ConsentStore store = new InMemoryConsentStore();
-	assert(!store.hasConsent("browser-1", "http://a/cb"));
-	store.grantConsent("browser-1", "http://a/cb");
-	assert(store.hasConsent("browser-1", "http://a/cb"));
-	assert(!store.hasConsent("browser-1", "http://b/cb"));
+	assert(!store.hasConsent("browser-1", "http://a/cb", null));
+	store.grantConsent("browser-1", "http://a/cb", null);
+	assert(store.hasConsent("browser-1", "http://a/cb", null));
+	assert(!store.hasConsent("browser-1", "http://b/cb", null));
 }
 
 unittest  // CODE BINDING: a DCR client redeems a relayed code with its verifier, the shared client_id and its redirect_uri
@@ -2107,8 +2240,10 @@ unittest  // CONFUSED DEPUTY: consent granted in one browser does not cover anot
 
 	auto proxy = new OAuthProxy(sampleConfig());
 	proxy.register(["https://evil.example/cb"]);
-	proxy.grantConsent("attacker-browser", "https://evil.example/cb");
-	assert(!proxy.hasConsent("victim-browser", "https://evil.example/cb"));
+	proxy.grantConsent("attacker-browser", "https://evil.example/cb", [
+		"read:user"
+	]);
+	assert(!proxy.hasConsent("victim-browser", "https://evil.example/cb", null));
 	assertThrown!ConsentRequiredException(proxy.authorize("victim-browser",
 			"https://evil.example/cb", "CH", "read:user", "S"));
 }
@@ -2116,8 +2251,8 @@ unittest  // CONFUSED DEPUTY: consent granted in one browser does not cover anot
 unittest  // InMemoryConsentStore never records or reports consent for an empty browser session
 {
 	ConsentStore store = new InMemoryConsentStore();
-	store.grantConsent("", "http://a/cb");
-	assert(!store.hasConsent("", "http://a/cb"));
+	store.grantConsent("", "http://a/cb", null);
+	assert(!store.hasConsent("", "http://a/cb", null));
 }
 
 unittest  // a custom ConsentStore can be injected and is consulted by authorize
@@ -2126,7 +2261,7 @@ unittest  // a custom ConsentStore can be injected and is consulted by authorize
 
 	auto cfg = sampleConfig();
 	auto store = new InMemoryConsentStore();
-	store.grantConsent("browser-1", "http://localhost:9000/cb");
+	store.grantConsent("browser-1", "http://localhost:9000/cb", ["read:user"]);
 	auto proxy = new OAuthProxy(cfg, store);
 	proxy.register(["http://localhost:9000/cb"]);
 	auto url = proxy.authorize("browser-1", "http://localhost:9000/cb", "CH", "read:user", "S");
@@ -2139,7 +2274,7 @@ unittest  // REDIRECT VALIDATION: gated authorize rejects an unregistered redire
 
 	auto cfg = sampleConfig();
 	auto proxy = new OAuthProxy(cfg);
-	proxy.grantConsent("browser-1", "https://attacker.example/cb");
+	proxy.grantConsent("browser-1", "https://attacker.example/cb", ["read:user"]);
 	// Consent alone must not let an unregistered redirect_uri through.
 	assertThrown!InvalidRedirectUriException(proxy.authorize("browser-1",
 			"https://attacker.example/cb", "CH", "read:user", "S"));
@@ -2338,18 +2473,18 @@ unittest  // CONSENT STORE: a flood of approvals for one client cannot evict ano
 	opts.maxApprovals = 3;
 	opts.maxApprovalsPerClient = 2;
 	auto store = new InMemoryConsentStore(opts);
-	store.grantConsent("real-browser", "http://real/cb");
+	store.grantConsent("real-browser", "http://real/cb", null);
 	foreach (i; 0 .. 50)
 	{
 		import std.conv : to;
 
-		store.grantConsent("flood-" ~ i.to!string, "http://attacker/cb");
+		store.grantConsent("flood-" ~ i.to!string, "http://attacker/cb", null);
 	}
-	assert(store.hasConsent("real-browser", "http://real/cb"));
+	assert(store.hasConsent("real-browser", "http://real/cb", null));
 	// The flooding client keeps only its newest approvals.
-	assert(store.hasConsent("flood-49", "http://attacker/cb"));
-	assert(store.hasConsent("flood-48", "http://attacker/cb"));
-	assert(!store.hasConsent("flood-47", "http://attacker/cb"));
+	assert(store.hasConsent("flood-49", "http://attacker/cb", null));
+	assert(store.hasConsent("flood-48", "http://attacker/cb", null));
+	assert(!store.hasConsent("flood-47", "http://attacker/cb", null));
 }
 
 unittest  // CONSENT STORE: an approval evicted and granted again is not evicted early by its old slot
@@ -2357,14 +2492,14 @@ unittest  // CONSENT STORE: an approval evicted and granted again is not evicted
 	ConsentStoreOptions opts;
 	opts.maxApprovals = 2;
 	auto store = new InMemoryConsentStore(opts);
-	store.grantConsent("b1", "http://a/cb");
-	store.grantConsent("b1", "http://b/cb");
-	store.grantConsent("b1", "http://c/cb"); // evicts a
-	store.grantConsent("b1", "http://a/cb"); // evicts b; a is now the newest
-	store.grantConsent("b1", "http://d/cb"); // evicts c, not a
-	assert(store.hasConsent("b1", "http://a/cb"));
-	assert(!store.hasConsent("b1", "http://c/cb"));
-	assert(store.hasConsent("b1", "http://d/cb"));
+	store.grantConsent("b1", "http://a/cb", null);
+	store.grantConsent("b1", "http://b/cb", null);
+	store.grantConsent("b1", "http://c/cb", null); // evicts a
+	store.grantConsent("b1", "http://a/cb", null); // evicts b; a is now the newest
+	store.grantConsent("b1", "http://d/cb", null); // evicts c, not a
+	assert(store.hasConsent("b1", "http://a/cb", null));
+	assert(!store.hasConsent("b1", "http://c/cb", null));
+	assert(store.hasConsent("b1", "http://d/cb", null));
 }
 
 unittest  // CONSENT STORE: the consent store caps approvals, evicting the oldest first
@@ -2372,13 +2507,13 @@ unittest  // CONSENT STORE: the consent store caps approvals, evicting the oldes
 	ConsentStoreOptions opts;
 	opts.maxApprovals = 2;
 	auto store = new InMemoryConsentStore(opts);
-	store.grantConsent("browser-1", "http://a/cb");
-	store.grantConsent("browser-1", "http://b/cb");
+	store.grantConsent("browser-1", "http://a/cb", null);
+	store.grantConsent("browser-1", "http://b/cb", null);
 	// Third approval exceeds the cap of 2: the oldest ("a") is evicted.
-	store.grantConsent("browser-1", "http://c/cb");
-	assert(!store.hasConsent("browser-1", "http://a/cb"));
-	assert(store.hasConsent("browser-1", "http://b/cb"));
-	assert(store.hasConsent("browser-1", "http://c/cb"));
+	store.grantConsent("browser-1", "http://c/cb", null);
+	assert(!store.hasConsent("browser-1", "http://a/cb", null));
+	assert(store.hasConsent("browser-1", "http://b/cb", null));
+	assert(store.hasConsent("browser-1", "http://c/cb", null));
 }
 
 unittest  // CONSENT STORE: re-granting an existing consent does not consume cap headroom
@@ -2386,12 +2521,12 @@ unittest  // CONSENT STORE: re-granting an existing consent does not consume cap
 	ConsentStoreOptions opts;
 	opts.maxApprovals = 2;
 	auto store = new InMemoryConsentStore(opts);
-	store.grantConsent("browser-1", "http://a/cb");
-	store.grantConsent("browser-1", "http://a/cb"); // duplicate: no new slot used
-	store.grantConsent("browser-1", "http://b/cb");
+	store.grantConsent("browser-1", "http://a/cb", null);
+	store.grantConsent("browser-1", "http://a/cb", null); // duplicate: no new slot used
+	store.grantConsent("browser-1", "http://b/cb", null);
 	// "a" must still be present: the duplicate did not push it out of the cap.
-	assert(store.hasConsent("browser-1", "http://a/cb"));
-	assert(store.hasConsent("browser-1", "http://b/cb"));
+	assert(store.hasConsent("browser-1", "http://a/cb", null));
+	assert(store.hasConsent("browser-1", "http://b/cb", null));
 }
 
 unittest  // REDIRECT REGISTRY: a custom registry can be injected and is consulted by authorize
