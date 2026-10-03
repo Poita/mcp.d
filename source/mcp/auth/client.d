@@ -179,18 +179,19 @@ final class OAuthClient
 		if (wwwAuthenticateHeader.length)
 		{
 			const w = parseWwwAuthenticate(wwwAuthenticateHeader);
-			// RFC 9728: the attacker-influenced resource_metadata URL from the
-			// WWW-Authenticate challenge must be HTTPS (or plain-http loopback when
-			// the endpoint itself is on loopback), must not target an
-			// internal/link-local address, and its origin MUST match
-			// the MCP endpoint's origin before we fetch it.
+			// RFC 9728 §5.1: the resource_metadata URL from the WWW-Authenticate
+			// challenge may live on any origin. It is attacker-influenced, so it must
+			// be HTTPS (or plain-http loopback when the endpoint itself is on
+			// loopback) and must not target an internal/link-local address; the
+			// document it yields is then bound to the endpoint by the `resource`
+			// check below.
 			if (w.resourceMetadata.length && isSecureFetchUrl(w.resourceMetadata,
-					policyAnchoredAt(mcpEndpoint))
-					&& originOf(w.resourceMetadata) == originOf(mcpEndpoint))
+					policyAnchoredAt(mcpEndpoint)))
 				urls ~= w.resourceMetadata;
 		}
 		urls ~= protectedResourceMetadataUrls(mcpEndpoint);
-		// Every candidate shares the user-configured endpoint's origin.
+		// Every candidate is fetched under the policy the user-configured
+		// endpoint permits.
 		const prmPolicy = policyAnchoredAt(mcpEndpoint);
 
 		bool anyError;
@@ -1245,21 +1246,6 @@ unittest  // authorizeAndGetCode refuses an internal/plaintext authorize URL bef
 	assertThrown(c.authorizeAndGetCode(as_, "https://[::ffff:10.0.0.1]/authorize?x=1", "st"));
 }
 
-unittest  // discoverProtectedResource ignores a cross-origin resource_metadata URL
-{
-	// RFC 9728: a resource_metadata URL from WWW-Authenticate whose origin does
-	// not match the MCP endpoint origin must not be fetched. With no reachable
-	// well-known document either, discovery fails (rather than fetching the
-	// attacker-supplied URL).
-	import std.exception : assertThrown;
-
-	auto c = new OAuthClient();
-	const www = `Bearer resource_metadata="https://evil.example.com/.well-known/oauth-protected-resource"`;
-	// The MCP endpoint origin (loopback) differs from the challenge's origin, and
-	// the loopback well-known URLs are unreachable in the test, so discovery throws.
-	assertThrown(c.discoverProtectedResource("http://127.0.0.1:1/mcp", www));
-}
-
 unittest  // postParse treats a non-2xx token-endpoint response as an error
 {
 	import std.conv : to;
@@ -1574,6 +1560,64 @@ unittest  // discoverProtectedResource rejects a PRM document whose resource nam
 	assertThrown(c.discoverProtectedResource(srv.base ~ "/mcp"));
 	bool fromPrm;
 	assertThrown(c.resolveIssuer(srv.base ~ "/mcp", fromPrm));
+}
+
+unittest  // discoverProtectedResource fetches a cross-origin resource_metadata URL from the challenge
+{
+	import std.algorithm : canFind;
+
+	// The MCP server publishes no well-known document; its PRM lives on another
+	// origin, named only by the WWW-Authenticate challenge.
+	auto mcp = startLoopback((scope HTTPServerRequest req, scope HTTPServerResponse res) @safe {
+		res.statusCode = 404;
+		res.writeBody("", "text/plain");
+	});
+	scope (exit)
+		mcp.stop();
+	const endpoint = mcp.base ~ "/mcp";
+
+	auto meta = startLoopback((scope HTTPServerRequest req, scope HTTPServerResponse res) @safe {
+		if (req.requestURI == "/prm")
+			res.writeBody(
+				`{"resource":"` ~ endpoint ~ `","authorization_servers":["https://as.example"]}`,
+				"application/json");
+		else
+		{
+			res.statusCode = 404;
+			res.writeBody("", "text/plain");
+		}
+	});
+	scope (exit)
+		meta.stop();
+
+	auto c = new OAuthClient();
+	const www = `Bearer resource_metadata="` ~ meta.base ~ `/prm"`;
+	auto prm = c.discoverProtectedResource(endpoint, www);
+	assert(prm.resource == endpoint);
+	assert(prm.authorizationServers == ["https://as.example"]);
+}
+
+unittest  // a cross-origin resource_metadata document naming another resource is rejected
+{
+	import std.exception : assertThrown;
+
+	auto mcp = startLoopback((scope HTTPServerRequest req, scope HTTPServerResponse res) @safe {
+		res.statusCode = 404;
+		res.writeBody("", "text/plain");
+	});
+	scope (exit)
+		mcp.stop();
+
+	auto meta = startLoopback((scope HTTPServerRequest req, scope HTTPServerResponse res) @safe {
+		res.writeBody(`{"resource":"https://other.example/mcp",`
+			~ `"authorization_servers":["https://attacker-as.example"]}`, "application/json");
+	});
+	scope (exit)
+		meta.stop();
+
+	auto c = new OAuthClient();
+	const www = `Bearer resource_metadata="` ~ meta.base ~ `/prm"`;
+	assertThrown(c.discoverProtectedResource(mcp.base ~ "/mcp", www));
 }
 
 unittest  // prmResourceMatches accepts the endpoint itself or a path prefix of it on the same origin
