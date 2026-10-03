@@ -173,10 +173,10 @@ private final class PostRequest
 	ListenSocketSlot slot;
 	McpException aborted;
 	Task owner;
-	/// Nonzero while the owning task runs the client's handler for a
-	/// server->client request read off this stream. The abort then only closes
-	/// the socket, so application code is never interrupted; the read loop
-	/// observes `aborted` once the handler returns.
+	/// Nonzero while the owning task runs application code: the client's
+	/// handler for a server->client request read off this stream, or the bearer
+	/// provider. The abort then only closes the socket, so application code is
+	/// never interrupted; the request observes `aborted` once that code returns.
 	uint inHandler;
 
 	void abort(McpException reason) @safe nothrow
@@ -671,6 +671,8 @@ final class HttpClientTransport : ClientTransport
 
 	Json deliver(Json message, long expectId) @safe
 	{
+		import vibe.core.task : InterruptException, Task;
+
 		if (isInitialize(message))
 		{
 			// An initialize always opens a new session; the server assigns its id
@@ -683,18 +685,49 @@ final class HttpClientTransport : ClientTransport
 					"MCP session expired (server rejected a prior request with HTTP 404/410)");
 		if (legacyMode)
 			return legacyRpc(message, expectId);
-		// The token this request carries. A refresh between here and the send can
-		// only make it stale, and `onRejected` ignores a token already replaced.
-		const sentBearer = bearerProvider.onRejected !is null ? currentBearer() : null;
+		// Register the request before anything that can yield (the bearer
+		// provider's `token`, its `onRejected` refresh), so an `abort` landing
+		// there is recorded and fails the request rather than being lost.
+		auto req = new PostRequest;
+		req.owner = Task.getThis();
+		inflightPosts[expectId] = req;
+		scope (exit)
+			inflightPosts.remove(expectId);
 		try
-			return postAndAwait(message, expectId);
-		catch (HttpStatusException e)
 		{
-			if (sentBearer.length == 0 || !isRejectedBearer(e)
-					|| !bearerProvider.onRejected(sentBearer))
-				throw e;
+			// The token this request carries. A refresh between here and the send
+			// can only make it stale, and `onRejected` ignores a token already
+			// replaced. The provider runs shielded from an abort's interrupt, so a
+			// token refresh is never cut off part-way; the abort is observed once
+			// it returns.
+			string sentBearer;
+			if (bearerProvider.onRejected !is null)
+			{
+				req.inHandler++;
+				scope (exit)
+					req.inHandler--;
+				sentBearer = currentBearer();
+			}
+			try
+				return postAndAwait(message, expectId, req);
+			catch (HttpStatusException e)
+			{
+				if (sentBearer.length == 0 || !isRejectedBearer(e))
+					throw e;
+				req.inHandler++;
+				scope (exit)
+					req.inHandler--;
+				if (!bearerProvider.onRejected(sentBearer))
+					throw e;
+			}
+			return postAndAwait(message, expectId, req);
 		}
-		return postAndAwait(message, expectId);
+		catch (InterruptException e)
+		{
+			if (req.aborted !is null)
+				throw req.aborted;
+			throw e;
+		}
 	}
 
 	/// Whether `e` rejects the bearer token a request carried (RFC 6750 §3.1): a
@@ -805,24 +838,13 @@ final class HttpClientTransport : ClientTransport
 	/// SSE notifications and server->client requests in between. If the response
 	/// SSE stream closes before the final response and carried an SSE `retry:`
 	/// hint, wait that long and reconnect (resuming with `Last-Event-ID`), per
-	/// the Streamable HTTP resumability rules.
-	private Json postAndAwait(Json message, long expectId) @safe
+	/// the Streamable HTTP resumability rules. `req` carries the request's abort
+	/// state; a request already aborted is not sent.
+	private Json postAndAwait(Json message, long expectId, PostRequest req) @safe
 	{
-		import vibe.core.task : InterruptException, Task;
-
-		auto req = new PostRequest;
-		req.owner = Task.getThis();
-		inflightPosts[expectId] = req;
-		scope (exit)
-			inflightPosts.remove(expectId);
-		try
-			return awaitPostResponse(message, expectId, req);
-		catch (InterruptException e)
-		{
-			if (req.aborted !is null)
-				throw req.aborted;
-			throw e;
-		}
+		if (req.aborted !is null)
+			throw req.aborted;
+		return awaitPostResponse(message, expectId, req);
 	}
 
 	/// Send `message` and read the response with id `expectId` for `postAndAwait`,
@@ -4296,6 +4318,53 @@ unittest  // a rejected bearer with no replacement surfaces the 401 without a re
 		"tok"
 	]);
 	assert(attempts == 1);
+}
+
+unittest  // a request that times out while its rejected bearer is being refreshed fails at its deadline
+{
+	import core.time : MonoTime, msecs;
+	import vibe.core.core : sleep;
+	import mcp.client.client : ClientSettings, McpClient, RequestTimeoutException;
+
+	int seen;
+	auto router = answeringRouter((Json req, HTTPServerResponse res) @safe {
+		if (++seen == 1)
+		{
+			res.statusCode = 401;
+			res.headers["WWW-Authenticate"] = `Bearer error="invalid_token"`;
+			res.writeBody("", "text/plain");
+			return;
+		}
+		// The retried request is answered long after the client's deadline.
+		sleep(2.seconds);
+		Json result = Json.emptyObject;
+		result["tools"] = Json.emptyArray;
+		res.writeBody(makeResponse(req["id"], result).toString(), "application/json");
+	});
+	bool timedOut;
+	Duration took;
+	const failure = runAgainstFakeServer(router, (string url) @safe {
+		ClientSettings s;
+		s.requestTimeout = 300.msecs;
+		auto client = McpClient.http(url, s);
+		scope (exit)
+			client.close();
+		// The refresh outlasts the request's deadline.
+		client.setBearerProvider(BearerProvider(() @safe => "tok", (string t) @safe {
+				sleep(500.msecs);
+				return true;
+			}));
+		client.initialize("2025-11-25");
+		const start = MonoTime.currTime;
+		try
+			client.listTools();
+		catch (RequestTimeoutException)
+			timedOut = true;
+		took = MonoTime.currTime - start;
+	});
+	assert(failure.length == 0, "scenario failed: " ~ failure);
+	assert(timedOut);
+	assert(took < 1500.msecs, "a timeout during the bearer refresh must not be lost");
 }
 
 unittest  // a 401 for a reason other than the token itself is not retried
