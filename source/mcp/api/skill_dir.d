@@ -43,7 +43,8 @@ struct SkillDirOptions
 	/// are offered too, as their path with a trailing `/` (`node_modules/`):
 	/// returning `false` prunes the whole tree unread, so a filter that keeps
 	/// only some files must still accept the directories holding them. An
-	/// excluded symlink is skipped; an included one is rejected. Note a
+	/// excluded symlink is skipped; an included one is rejected (the root
+	/// `SKILL.md` must be a regular file whatever the filter says). Note a
 	/// filtered-out nested `SKILL.md` is neither served nor published as a
 	/// nested skill.
 	bool delegate(string relPath) @safe include;
@@ -82,6 +83,12 @@ void registerSkillDir(McpServer server, string dir, SkillDirOptions options = Sk
 	const skillMdPath = joinPath(dir, "SKILL.md");
 	if (!pathExists(skillMdPath))
 		throw new Exception("registerSkillDir: missing SKILL.md in " ~ dir);
+	// Checked before reading, and regardless of the include filter, which the
+	// walk consults first and so could otherwise exclude it from the walk's
+	// symlink rejection.
+	if (!isPlainFile(skillMdPath))
+		throw new Exception(
+				"registerSkillDir: SKILL.md must be a regular file, not a symlink: " ~ skillMdPath);
 
 	const skillMd = readTextFile(skillMdPath);
 	Json frontmatter = parseSkillFrontmatter(skillMd);
@@ -618,6 +625,14 @@ private bool pathExists(string p) @trusted
 	import std.file : exists;
 
 	return exists(p);
+}
+
+/// Whether `p` is itself a regular file: a symlink, even to one, is not.
+private bool isPlainFile(string p) @trusted
+{
+	import std.file : attrIsFile, getLinkAttributes;
+
+	return attrIsFile(getLinkAttributes(p));
 }
 
 private bool pathIsDir(string p) @trusted
@@ -1182,6 +1197,27 @@ version (Posix) unittest  // an include filter that excludes a directory prunes 
 	assert(manifestPaths(s) == ["SKILL.md", "references/FORMS.md"], manifestPaths(s).text);
 	assert(offered.canFind("node_modules/"), offered.text);
 	assert(!offered.canFind!(p => p.startsWith("node_modules/.bin")), offered.text);
+}
+
+version (Posix) unittest  // a symlinked root SKILL.md is rejected even when the include filter excludes it
+{
+	import std.exception : assertThrown;
+	import std.path : dirName;
+
+	const root = tmpRoot("rootlink", "pdf-forms");
+	writeSkillFixture(root);
+	scope (exit)
+		removeTree(root);
+	const outside = root.dirName ~ "/outside.md";
+	() @trusted { import std.file : rename;
+
+	rename(root ~ "/SKILL.md", outside); }();
+	makeSymlink(outside, root ~ "/SKILL.md");
+
+	auto s = new McpServer("t", "1");
+	SkillDirOptions opts;
+	opts.include = (string p) @safe => p != "SKILL.md";
+	assertThrown!Exception(registerSkillDir(s, root, opts));
 }
 
 version (Posix) unittest  // a symlink the include filter excludes is skipped rather than rejected
