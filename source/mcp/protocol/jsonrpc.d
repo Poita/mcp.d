@@ -425,14 +425,24 @@ Json makeNotification(string method, Json params = Json.undefined) @safe
 	return j;
 }
 
-/// Build a success response object.
+/// Build a success response object. An undefined `result` becomes `{}`, since
+/// assigning undefined would drop the member and leave a reply with neither
+/// `result` nor `error`.
 Json makeResponse(Json id, Json result) @safe
 {
 	Json j = Json.emptyObject;
 	j["jsonrpc"] = "2.0";
 	j["id"] = id;
-	j["result"] = result;
+	j["result"] = result.type == Json.Type.undefined ? Json.emptyObject : result;
 	return j;
+}
+
+unittest  // makeResponse with an undefined result still carries a result member
+{
+	const j = makeResponse(Json(1), Json.undefined);
+	assert("result" in j);
+	assert(j["result"] == Json.emptyObject);
+	assert(parseMessage(j.toString()).kind == MessageKind.response);
 }
 
 /// Build an error response object from an McpException.
