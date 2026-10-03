@@ -602,6 +602,25 @@ client (sampling/elicitation). For tools whose schema is only known at runtime,
 drop to `server.registerTool(Tool, delegate)` / `registerResource` /
 `registerPrompt`, which receive the raw `Json`.
 
+A tool reports a failure the model should see by throwing `ToolError` (or
+returning `CallToolResult.error(msg)`): the client receives a result with
+`isError: true` and that message as its text. Any other exception a tool handler
+throws is logged server-side and reaches the client as an `isError` result whose
+text is just `Internal error`, since its message may carry file paths, SQL, or
+other internals; `server.exposeInternalErrors()` (or
+`ServerSettings.exposeInternalErrors`) sends the real message instead, which is
+useful in development. An `McpException` becomes a JSON-RPC error.
+
+```d
+@tool("weather", "Current weather for a city")
+string weather(string city)
+{
+    if (city !in forecasts)
+        throw new ToolError("unknown city: " ~ city);
+    return forecasts[city];
+}
+```
+
 ### D type → JSON Schema mapping
 
 The compile-time schema generator maps D types as follows (so the emitted schema

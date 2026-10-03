@@ -17,6 +17,21 @@ import mcp.server.context : RequestContext;
 
 @safe:
 
+/// A tool execution failure whose message is written for the client. Thrown from
+/// a tool handler, it becomes a `CallToolResult` with `isError: true` and the
+/// message as its text content, so the model can see what went wrong and
+/// retry. Any other non-`McpException` a tool handler throws is logged
+/// server-side and reported as a generic "Internal error" tool result (its
+/// message is shown only after `McpServer.exposeInternalErrors`), since such a
+/// message can carry file paths, SQL, or other internals.
+class ToolError : Exception
+{
+	this(string msg, string file = __FILE__, size_t line = __LINE__) pure nothrow @safe
+	{
+		super(msg, file, line);
+	}
+}
+
 /// A tool handler receiving the parsed arguments and the per-request context.
 alias ToolHandler = CallToolResult delegate(Json arguments, RequestContext ctx) @safe;
 

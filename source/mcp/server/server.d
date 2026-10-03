@@ -33,8 +33,8 @@ import mcp.server.event_store : WebhookSubscriptionStore;
 import mcp.server.events_runtime : EventsRuntime, EventsOptions,
 	EventRegistration, PushHandle, PushStream;
 
-import mcp.server.responses : ToolHandler, MrtrToolHandler, ToolResponse,
-	PromptResponse, PromptHandler, MrtrPromptHandler, ResourceReader, TemplateReader;
+import mcp.server.responses : ToolHandler, MrtrToolHandler, ToolResponse, PromptResponse,
+	PromptHandler, MrtrPromptHandler, ResourceReader, TemplateReader, ToolError;
 
 // The push-integration unittests below exercise the server seam against the
 // real Streamable HTTP channel; the library build itself has no transport
@@ -708,7 +708,8 @@ final class McpServer : ServerCore
 	}
 
 	/// Send an unexpected (non-`McpException`) handler exception's message to the
-	/// client as the JSON-RPC internal error's `message`. Off by default: such a
+	/// client as the JSON-RPC internal error's `message` (or, for a tool handler,
+	/// as the `isError` result's text). Off by default: such a
 	/// message can carry file paths, SQL or other internals, so the client gets a
 	/// generic "Internal error" and the real message is logged server-side. Useful
 	/// in development.
@@ -3796,14 +3797,18 @@ final class McpServer : ServerCore
 		}
 		catch (McpException e)
 			throw e; // protocol-level errors propagate as JSON-RPC errors
+		catch (ToolError e)
+			return CallToolResult.error(e.msg).toJson();
 		catch (Exception e)
 		{
 			// Tool *execution* failures are reported as isError content, not
-			// protocol errors (per the MCP spec).
-			CallToolResult err;
-			err.content = [Content.makeText(e.msg)];
-			err.isError = true;
-			return err.toJson();
+			// protocol errors (per the MCP spec). An unexpected exception's
+			// message can carry internals, so it is logged and masked unless
+			// `exposeInternalErrors` was called.
+			import vibe.core.log : logError;
+
+			logError("tools/call %s: unhandled %s: %s", name, typeid(e).name, e.msg);
+			return CallToolResult.error(exposeInternalErrors_ ? e.msg : "Internal error").toJson();
 		}
 	}
 
@@ -5405,7 +5410,50 @@ unittest  // a tool handler that throws becomes an isError result, not a protoco
 	auto resp = s.handle(req(6, "tools/call", params)).get;
 	assert("error" !in resp);
 	assert(resp["result"]["isError"].get!bool);
+	assert(resp["result"]["content"][0]["text"].get!string == "Internal error");
+}
+
+unittest  // a throwing tool handler's message stays server-side by default
+{
+	import std.algorithm.searching : canFind;
+
+	auto s = new McpServer("t", "1");
+	Tool boom = {name: "boom"};
+	CallToolResult delegate(Json) @safe handler = (Json) {
+		throw new Exception("open /srv/secret.db failed");
+	};
+	s.registerTool(boom, handler);
+	auto resp = s.handle(req(6, "tools/call", Json(["name": Json("boom")]))).get;
+	assert(resp["result"]["isError"].get!bool);
+	assert(!resp.toString().canFind("secret"));
+}
+
+unittest  // exposeInternalErrors sends a throwing tool handler's message as isError content
+{
+	auto s = new McpServer("t", "1");
+	s.exposeInternalErrors();
+	Tool boom = {name: "boom"};
+	CallToolResult delegate(Json) @safe handler = (Json) {
+		throw new Exception("kaboom");
+	};
+	s.registerTool(boom, handler);
+	auto resp = s.handle(req(6, "tools/call", Json(["name": Json("boom")]))).get;
+	assert(resp["result"]["isError"].get!bool);
 	assert(resp["result"]["content"][0]["text"].get!string == "kaboom");
+}
+
+unittest  // a ToolError's message always reaches the client as isError content
+{
+	auto s = new McpServer("t", "1");
+	Tool boom = {name: "boom"};
+	CallToolResult delegate(Json) @safe handler = (Json) {
+		throw new ToolError("no such city");
+	};
+	s.registerTool(boom, handler);
+	auto resp = s.handle(req(6, "tools/call", Json(["name": Json("boom")]))).get;
+	assert("error" !in resp);
+	assert(resp["result"]["isError"].get!bool);
+	assert(resp["result"]["content"][0]["text"].get!string == "no such city");
 }
 
 unittest  // an unknown method yields method-not-found
