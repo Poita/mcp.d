@@ -246,7 +246,7 @@ private string postIntrospect(IntrospectionConfig cfg, string token) @trusted
 	// mitigation); secureRequestHTTP throws on a host `cfg.ssrfPolicy` rejects.
 	const body_ = introspectionBody(cfg, token);
 	string responseBody;
-	bool ok = false;
+	int status;
 	secureRequestHTTP(cfg.introspectionEndpoint, cfg.ssrfPolicy, (scope HTTPClientRequest req) {
 		req.method = HTTPMethod.POST;
 		req.headers["Content-Type"] = "application/x-www-form-urlencoded";
@@ -255,16 +255,18 @@ private string postIntrospect(IntrospectionConfig cfg, string token) @trusted
 			req.headers["Authorization"] = basicAuthHeader(cfg.clientId, cfg.clientSecret);
 		req.writeBody(cast(const(ubyte)[]) body_);
 	}, (scope HTTPClientResponse res) {
-		if (res.statusCode >= 200 && res.statusCode < 300)
-		{
+		status = res.statusCode;
+		if (status >= 200 && status < 300)
 			responseBody = res.bodyReader.readAllUTF8(false, maxIntrospectionBodyBytes);
-			ok = true;
-		}
 		else
 			res.dropBody();
 	});
-	if (!ok)
-		return null;
+	if (status < 200 || status >= 300)
+	{
+		import std.format : format;
+
+		throw new Exception(format("introspection endpoint returned HTTP %d", status));
+	}
 	return responseBody;
 }
 
@@ -881,4 +883,44 @@ unittest  // a caller mutating a cached result's claims, scopes, or audience lea
 	assert(third.claims["role"].get!string == "user");
 	assert(third.scopes == ["mcp:read"]);
 	assert(third.audience == ["https://mcp.example.com/mcp"]);
+}
+
+unittest  // a non-2xx introspection response is reported with its status code
+{
+	import std.algorithm : canFind;
+	import std.conv : to;
+	import vibe.core.core : runTask, runEventLoop, exitEventLoop;
+	import vibe.http.server : HTTPServerRequest, HTTPServerResponse,
+		HTTPServerSettings, listenHTTP;
+
+	string failure, thrown;
+	runTask(() @safe nothrow{
+		try
+		{
+			auto settings = new HTTPServerSettings;
+			settings.port = 0;
+			settings.bindAddresses = ["127.0.0.1"];
+			auto listener = listenHTTP(settings, (scope HTTPServerRequest req,
+				scope HTTPServerResponse res) @safe {
+				res.statusCode = 503;
+				res.writeBody("down for maintenance", "text/plain");
+			});
+			scope (exit)
+				() @trusted { listener.stopListening(); }();
+			IntrospectionConfig cfg;
+			cfg.introspectionEndpoint = "http://127.0.0.1:"
+				~ listener.bindAddresses[0].port.to!string ~ "/introspect";
+			try
+				cast(void) new HttpIntrospector(cfg).introspect("tok");
+			catch (Exception e)
+				thrown = e.msg;
+		}
+		catch (Exception e)
+			failure = e.msg;
+		exitEventLoop();
+	});
+	runEventLoop();
+
+	assert(failure.length == 0, failure);
+	assert(thrown.canFind("HTTP 503"), thrown);
 }
