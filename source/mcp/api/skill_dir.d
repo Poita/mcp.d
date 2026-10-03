@@ -98,9 +98,8 @@ string registerSkillDir(McpServer server, string dir, SkillDirOptions options = 
 		throw new Exception("registerSkillDir: skill directory exceeds maxTotalBytes");
 	const skillMd = readTextFile(skillMdPath);
 	Json frontmatter = parseSkillFrontmatter(skillMd);
-	if (!(frontmatter.type == Json.Type.object && "name" in frontmatter
-			&& frontmatter["name"].type == Json.Type.string))
-		throw new Exception("registerSkillDir: SKILL.md frontmatter must define a string 'name'");
+	if (const problem = frontmatterNameProblem(frontmatter))
+		throw new Exception("registerSkillDir: SKILL.md frontmatter " ~ problem);
 	// The Agent Skills spec requires both name and description.
 	if (!("description" in frontmatter && frontmatter["description"].type == Json.Type.string))
 		throw new Exception(
@@ -151,6 +150,19 @@ string registerSkillDir(McpServer server, string dir, SkillDirOptions options = 
 	return path;
 }
 
+/// Why `frontmatter` lacks a usable string `name`, or `null` when it has one. A
+/// `name` YAML reads as another type (`yes`, `null`, `123`, a date) gets a hint
+/// to quote it.
+private string frontmatterNameProblem(const Json frontmatter) @safe
+{
+	if (frontmatter.type != Json.Type.object || "name" !in frontmatter)
+		return "must define a string 'name'";
+	if (frontmatter["name"].type != Json.Type.string)
+		return "'name' must be a string, but YAML reads it as "
+			~ frontmatter["name"].toString ~ "; quote it (name: \"...\")";
+	return null;
+}
+
 /// The name of the directory `dir` refers to, with `.`/`..` segments and
 /// trailing separators resolved against the working directory.
 private string directoryName(string dir) @safe
@@ -183,9 +195,9 @@ private Json[] buildNestedEntries(McpServer server, string path, RawFile[] raws)
 			throw new Exception(
 					"registerSkillDir: nested SKILL.md is not valid UTF-8 text: " ~ r.path);
 		Json fm = parseSkillFrontmatter(cast(string) r.bytes);
-		if (!(fm.type == Json.Type.object && "name" in fm && fm["name"].type == Json.Type.string))
-			throw new Exception("registerSkillDir: nested SKILL.md frontmatter must "
-					~ "define a string 'name': " ~ r.path);
+		if (const problem = frontmatterNameProblem(fm))
+			throw new Exception(
+					"registerSkillDir: nested SKILL.md frontmatter " ~ problem ~ ": " ~ r.path);
 		if (!("description" in fm && fm["description"].type == Json.Type.string))
 			throw new Exception("registerSkillDir: nested SKILL.md frontmatter must "
 					~ "define a string 'description': " ~ r.path);
@@ -1322,6 +1334,37 @@ unittest  // registerSkillDir requires a string description in the frontmatter
 
 	auto s = new McpServer("t", "1");
 	assertThrown!Exception(registerSkillDir(s, root));
+}
+
+unittest  // a synthesized SKILL.md keeps a YAML-ambiguous name a string
+{
+	import mcp.api.skills : SkillFrontmatter, skillMarkdown;
+
+	foreach (name; ["yes", "on", "null", "123", "2024-01-01"])
+	{
+		auto fm = SkillFrontmatter(name, "d");
+		auto parsed = parseSkillFrontmatter(skillMarkdown(fm, "# Body\n"));
+		assert(parsed["name"].type == Json.Type.string, name);
+		assert(parsed == fm.toJson(), name);
+	}
+}
+
+unittest  // registerSkillDir names the fix when YAML reads the name as a non-string
+{
+	import std.algorithm : canFind;
+
+	const root = tmpRoot("yesname", "yes");
+	writeRawSkill(root, "---\nname: yes\ndescription: d\n---\n\n# Body\n");
+	scope (exit)
+		removeTree(root);
+
+	try
+	{
+		registerSkillDir(new McpServer("t", "1"), root);
+		assert(false, "expected registerSkillDir to throw");
+	}
+	catch (Exception e)
+		assert(e.msg.canFind("quote"), e.msg);
 }
 
 unittest  // an extension-less text file is served as text/plain, not an opaque blob

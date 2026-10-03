@@ -138,9 +138,9 @@ struct SkillFrontmatter
 		return fm;
 	}
 
-	/// The frontmatter as a `---`-fenced YAML block. The `name` is emitted
-	/// unquoted (it is constrained to a URI-safe token); every other value is
-	/// YAML-quoted so any content is safe.
+	/// The frontmatter as a `---`-fenced YAML block. Every value is YAML-quoted,
+	/// including `name`: a valid skill name such as `yes`, `null`, or `123`
+	/// would otherwise parse as a boolean, null, or number.
 	string toYaml() const @safe
 	{
 		import std.array : Appender;
@@ -148,7 +148,7 @@ struct SkillFrontmatter
 
 		Appender!string a;
 		a ~= "---\n";
-		a ~= "name: " ~ name ~ "\n";
+		a ~= "name: " ~ yamlQuote(name) ~ "\n";
 		a ~= "description: " ~ yamlQuote(description) ~ "\n";
 		if (license.length)
 			a ~= "license: " ~ yamlQuote(license) ~ "\n";
@@ -854,7 +854,7 @@ unittest  // skillMarkdown synthesizes frontmatter with name/description and bod
 {
 	auto md = skillMarkdown(SkillFrontmatter("git-workflow",
 			"Follow Git conventions"), "# Git Workflow\n\n1. Branch.\n");
-	assert(md == "---\nname: git-workflow\ndescription: \"Follow Git conventions\"\n---\n\n"
+	assert(md == "---\nname: \"git-workflow\"\ndescription: \"Follow Git conventions\"\n---\n\n"
 			~ "# Git Workflow\n\n1. Branch.\n");
 }
 
@@ -946,7 +946,7 @@ unittest  // registerSkill serves SKILL.md and skills/list carries a conformant 
 	const md = contents["text"].get!string;
 	import std.algorithm : canFind;
 
-	assert(md.canFind("name: git-workflow"));
+	assert(md.canFind(`name: "git-workflow"`));
 	assert(md.canFind("# Git Workflow"));
 
 	// skills/list carries the entry: verbatim frontmatter, the SKILL.md uri, and
@@ -1380,7 +1380,7 @@ unittest  // a dynamic skill's SKILL.md is generated on each read, under fixed f
 	const second = read();
 	assert(first.canFind("# Read 1") && second.canFind("# Read 2"));
 	// The frontmatter is fixed and identical to the entry's, however the body varies.
-	assert(first.canFind("name: counter") && second.canFind("name: counter"));
+	assert(first.canFind(`name: "counter"`) && second.canFind(`name: "counter"`));
 	assert(first.canFind(`"version": "1"`));
 	auto e = s.handle(Message(makeRequest(Json(3), "skills/list",
 			Json.emptyObject))).get["result"]["skills"][0];

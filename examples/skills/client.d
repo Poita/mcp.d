@@ -109,7 +109,7 @@ int main(string[] args) @safe
 
 		// --- 3. a @skill skill: synthesized frontmatter ---------------------
 		auto md = readSkill(client, "git-workflow");
-		check(md.canFind("name: git-workflow"), "SKILL.md frontmatter should carry the name");
+		check(md.canFind(`name: "git-workflow"`), "SKILL.md frontmatter should carry the name");
 		check(md.canFind("description: \"Follow this team's Git"),
 			"SKILL.md frontmatter should carry the description");
 		check(md.canFind("# Git Workflow"), "SKILL.md should carry the instructions body");

@@ -1976,7 +1976,7 @@ unittest  // @skill reflection: registerHandlers serves SKILL.md and lists the s
 	const md = contents["text"].get!string;
 	import std.algorithm : canFind;
 
-	assert(md.canFind("name: git-workflow"));
+	assert(md.canFind(`name: "git-workflow"`));
 	assert(md.canFind("# Git Workflow"));
 
 	// The skill is listed by skills/list.
