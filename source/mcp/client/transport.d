@@ -51,18 +51,6 @@ interface ClientProtocol
 	bool isCancelled(long id) @safe;
 }
 
-/// The transport seam under `McpClient`. The client speaks pure JSON-RPC and
-/// protocol logic; a `ClientTransport` carries the bytes — over Streamable HTTP
-/// (`HttpClientTransport`) or stdio (`StdioClientTransport`).
-///
-/// The client installs its inbound dispatcher via `setInboundHandler` (it passes
-/// `McpClient.dispatchInbound`); the transport invokes that handler for every
-/// interleaved notification and server->client request it reads on any stream.
-/// A response to a server->client request, and any client-originated
-/// notification, are sent with `sendOneway`. Per-request work goes through
-/// `deliver`, which sends the request and returns its correlated result (or
-/// throws `McpException` on an error response), dispatching anything else it sees
-/// in the meantime to the inbound handler.
 /// The modern protocol version request `message` declares in its
 /// `_meta.protocolVersion`, so a transport and the client read a request's
 /// framing off the request itself rather than off shared session state (which
@@ -91,6 +79,18 @@ package bool modernFraming(Json message, out ProtocolVersion version_) @safe not
 		return false;
 }
 
+/// The transport seam under `McpClient`. The client speaks pure JSON-RPC and
+/// protocol logic; a `ClientTransport` carries the bytes — over Streamable HTTP
+/// (`HttpClientTransport`) or stdio (`StdioClientTransport`).
+///
+/// The client installs its inbound dispatcher via `setInboundHandler` (it passes
+/// `McpClient.dispatchInbound`); the transport invokes that handler for every
+/// interleaved notification and server->client request it reads on any stream.
+/// A response to a server->client request, and any client-originated
+/// notification, are sent with `sendOneway`. Per-request work goes through
+/// `deliver`, which sends the request and returns its correlated result (or
+/// throws `McpException` on an error response), dispatching anything else it sees
+/// in the meantime to the inbound handler.
 interface ClientTransport
 {
 	/// Send a JSON-RPC request `requestMessage` and return its result `Json`
