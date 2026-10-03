@@ -99,7 +99,7 @@ package TokenValidator introspectionValidator(IntrospectionConfig cfg, Introspec
 			return TokenInfo.invalid();
 		if (cache !is null)
 			if (auto hit = cache.get(token, currentUnixTime()))
-				return *hit;
+				return detached(*hit);
 		TokenInfo ti;
 		try
 		{
@@ -115,9 +115,19 @@ package TokenValidator introspectionValidator(IntrospectionConfig cfg, Introspec
 			return TokenInfo.invalid();
 		}
 		if (ti.valid && cache !is null)
-			cache.put(token, ti, currentUnixTime());
+			cache.put(token, detached(ti), currentUnixTime());
 		return ti;
 	};
+}
+
+/// A deep copy of `ti`, so a request handler mutating its `claims`, `scopes`,
+/// or `audience` cannot alter a cached entry shared with later requests.
+private TokenInfo detached(TokenInfo ti) @safe
+{
+	ti.claims = ti.claims.clone();
+	ti.scopes = ti.scopes.dup;
+	ti.audience = ti.audience.dup;
+	return ti;
 }
 
 // ===========================================================================
@@ -849,4 +859,26 @@ unittest  // a failed introspection call is logged rather than silently rejected
 	assert(!v("tok").valid);
 	auto lines = () @trusted { return (cast() logger).lines; }();
 	assert(lines.any!(l => l.canFind("introspection endpoint unreachable")));
+}
+
+unittest  // a caller mutating a cached result's claims, scopes, or audience leaves the cache intact
+{
+	IntrospectionConfig cfg;
+	cfg.cacheTtl = 60.seconds;
+	auto stub = new StubIntrospector(`{"active":true,"sub":"u1","scope":"mcp:read","aud":"https://mcp.example.com/mcp","role":"user"}`);
+	auto v = stubVerifier(cfg, stub);
+
+	auto first = v("tok");
+	first.claims["role"] = "admin";
+	first.scopes[0] = "mcp:admin";
+	first.audience[0] = "https://evil.example";
+
+	auto second = v("tok");
+	second.claims["role"] = "admin";
+	second.scopes[0] = "mcp:admin";
+
+	auto third = v("tok");
+	assert(third.claims["role"].get!string == "user");
+	assert(third.scopes == ["mcp:read"]);
+	assert(third.audience == ["https://mcp.example.com/mcp"]);
 }
