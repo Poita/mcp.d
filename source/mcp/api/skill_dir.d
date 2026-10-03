@@ -90,6 +90,10 @@ void registerSkillDir(McpServer server, string dir, SkillDirOptions options = Sk
 		throw new Exception(
 				"registerSkillDir: SKILL.md must be a regular file, not a symlink: " ~ skillMdPath);
 
+	// Checked before reading, so an oversized SKILL.md is never slurped into
+	// memory just to be rejected.
+	if (fileSize(skillMdPath) > options.maxTotalBytes)
+		throw new Exception("registerSkillDir: skill directory exceeds maxTotalBytes");
 	const skillMd = readTextFile(skillMdPath);
 	Json frontmatter = parseSkillFrontmatter(skillMd);
 	if (!(frontmatter.type == Json.Type.object && "name" in frontmatter
@@ -642,11 +646,18 @@ private bool pathIsDir(string p) @trusted
 	return exists(p) && isDir(p);
 }
 
-private string readTextFile(string p) @trusted
+/// The contents of the file `p` as UTF-8 text. Throws, naming `p`, when they
+/// are not valid UTF-8.
+private string readTextFile(string p) @safe
 {
-	import std.file : readText;
+	import std.utf : UTFException, validate;
 
-	return readText(p);
+	auto text = cast(string) readBytes(p);
+	try
+		validate(text);
+	catch (UTFException)
+		throw new Exception("registerSkillDir: " ~ p ~ " is not valid UTF-8 text");
+	return text;
 }
 
 private immutable(ubyte)[] readBytes(string p) @trusted
@@ -1513,4 +1524,57 @@ unittest  // parseSkillFrontmatter still resolves a modest alias
 {
 	auto fm = parseSkillFrontmatter("---\nname: x\ndescription: &d hi\nagain: *d\n---\n");
 	assert(fm["again"].get!string == "hi", fm.toString);
+}
+
+version (unittest) private void writeSkillBytes(string root, const(ubyte)[] bytes) @trusted
+{
+	import std.file : exists, mkdirRecurse, rmdirRecurse, write;
+
+	if (exists(root))
+		rmdirRecurse(root);
+	mkdirRecurse(root);
+	write(root ~ "/SKILL.md", bytes);
+}
+
+unittest  // a SKILL.md over maxTotalBytes is rejected by its size before it is read
+{
+	import std.algorithm.searching : canFind;
+	import std.array : replicate;
+
+	const root = tmpRoot("oversize-md", "big-skill");
+	scope (exit)
+		removeTree(root);
+	// Invalid UTF-8 past the cap: a read before the size check fails on decoding.
+	writeSkillBytes(root,
+			cast(const(ubyte)[])("---\nname: big-skill\n".replicate(8)) ~ [
+				ubyte(0xFF)
+	]);
+	auto s = new McpServer("t", "1");
+	SkillDirOptions o;
+	o.maxTotalBytes = 16;
+	string msg;
+	try
+		registerSkillDir(s, root, o);
+	catch (Exception e)
+		msg = e.msg;
+	assert(msg.canFind("maxTotalBytes"), msg);
+}
+
+unittest  // a SKILL.md that is not UTF-8 is rejected with a message naming its path
+{
+	import std.algorithm.searching : canFind;
+
+	const root = tmpRoot("binary-md", "bin-skill");
+	scope (exit)
+		removeTree(root);
+	writeSkillBytes(root, cast(const(ubyte)[]) "---\nname: bin-skill\n" ~ [
+		ubyte(0xFF), ubyte(0xFE)
+	]);
+	auto s = new McpServer("t", "1");
+	string msg;
+	try
+		registerSkillDir(s, root);
+	catch (Exception e)
+		msg = e.msg;
+	assert(msg.canFind("SKILL.md") && msg.canFind("bin-skill") && msg.canFind("UTF-8"), msg);
 }
