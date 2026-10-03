@@ -1153,6 +1153,39 @@ private GetPromptResult toPromptResult(R)(R ret) @safe
 				"@prompt method must return GetPromptResult, PromptMessage[], or string");
 }
 
+/// Whether an empty string given for a prompt argument of type `P` stands for an
+/// omitted argument: prompt arguments travel as strings, so a client sends `""`
+/// for a field left blank, and that is a value only for a string (or `Json`)
+/// parameter, or a `Nullable` of one.
+private template emptyMeansAbsent(P)
+{
+	static if (isInstanceOf!(Nullable, P))
+		enum emptyMeansAbsent = emptyMeansAbsent!(TemplateArgsOf!P[0]);
+	else
+		enum emptyMeansAbsent = !isSomeString!P && !is(P == Json);
+}
+
+/// The prompt `arguments` of `func` with every empty-string value of a
+/// parameter whose type `emptyMeansAbsent` dropped, so it binds as omitted.
+private Json omitEmptyPromptArgs(alias func)(Json args) @safe
+{
+	if (args.type != Json.Type.object)
+		return args;
+	alias names = ParamWireNames!func;
+	Json kept = Json.emptyObject;
+	foreach (kv; args.byKeyValue)
+	{
+		bool blank;
+		static foreach (i, P; BoundParameters!func)
+			static if (!is(P : RequestContext) && emptyMeansAbsent!P)
+				blank |= kv.key == names[i] && kv.value.type == Json.Type.string
+					&& kv.value.get!string.length == 0;
+		if (!blank)
+			kept[kv.key] = kv.value;
+	}
+	return kept;
+}
+
 private void registerPromptMethod(string memberName, alias overload, alias parent)(
 		McpServer server, prompt attr) @safe
 {
@@ -1192,10 +1225,11 @@ private void registerPromptMethod(string memberName, alias overload, alias paren
 
 	applyIconsAndMeta!overload(descriptor);
 
-	server.registerPrompt(descriptor, (Json args, RequestContext ctx) @safe {
+	server.registerPrompt(descriptor, (Json rawArgs, RequestContext ctx) @safe {
 		import mcp.protocol.errors : McpException, invalidParams;
 		import mcp.server.responses : PromptResponse;
 
+		Json args = omitEmptyPromptArgs!overload(rawArgs);
 		Tuple!(BoundParameters!overload) argv;
 		static foreach (i, P; BoundParameters!overload)
 		{
@@ -1227,6 +1261,10 @@ private void registerPromptMethod(string memberName, alias overload, alias paren
 				// the resource-template path. Protocol errors thrown by the
 				// marshaller are passed through unchanged so an inner
 				// invalidParams is not double-wrapped.
+				static if (!isInstanceOf!(Nullable, P))
+					if (!argPresent(args, names[i]))
+						throw invalidParams(
+							"Missing required argument '" ~ names[i] ~ "' for prompt: " ~ attr.name);
 				try
 					setBound(argv[i], marshalArg!(P, true)(args, names[i]));
 				catch (McpException e)
@@ -5418,4 +5456,61 @@ unittest  // a class implementing an annotated interface method registers that t
 	registerHandlers(s, new InterfaceImplApi);
 	auto r = callToolArgs(s, "ping", `{"from":"a"}`);
 	assert(r["content"][0]["text"].get!string == "pong a", r.toString);
+}
+
+version (unittest) private final class EmptyPromptArgApi
+{
+	@prompt("page", "Prompt with optional typed arguments")
+	string page(Nullable!int limit, int count = 3, string note = "n") @safe
+	{
+		import std.conv : to;
+
+		return (limit.isNull ? "unset" : limit.get.to!string) ~ " "
+			~ count.to!string ~ " [" ~ note ~ "]";
+	}
+
+	@prompt("need", "Prompt with a required integer argument")
+	string need(int count) @safe
+	{
+		import std.conv : to;
+
+		return count.to!string;
+	}
+}
+
+unittest  // an empty string for an optional non-string prompt argument binds as omitted
+{
+	import mcp.protocol.jsonrpc : Message, makeRequest;
+
+	auto s = new McpServer("t", "1");
+	registerHandlers(s, new EmptyPromptArgApi);
+	Json pp = Json.emptyObject;
+	pp["name"] = "page";
+	pp["arguments"] = Json([
+		"limit": Json(""),
+		"count": Json(""),
+		"note": Json("")
+	]);
+	auto resp = s.handle(Message(makeRequest(Json(1), "prompts/get", pp))).get;
+	assert("error" !in resp, resp.toString);
+	assert(resp["result"]["messages"][0]["content"]["text"].get!string == "unset 3 []",
+			resp.toString);
+}
+
+unittest  // an empty string for a required non-string prompt argument is a missing argument
+{
+	import std.algorithm.searching : canFind;
+	import mcp.protocol.errors : ErrorCode;
+	import mcp.protocol.jsonrpc : Message, makeRequest;
+
+	auto s = new McpServer("t", "1");
+	registerHandlers(s, new EmptyPromptArgApi);
+	Json pp = Json.emptyObject;
+	pp["name"] = "need";
+	pp["arguments"] = Json(["count": Json("")]);
+	auto resp = s.handle(Message(makeRequest(Json(1), "prompts/get", pp))).get;
+	assert("error" in resp, resp.toString);
+	assert(resp["error"]["code"].get!int == ErrorCode.invalidParams);
+	assert(resp["error"]["message"].get!string.canFind("Missing required argument 'count'"),
+			resp.toString);
 }
