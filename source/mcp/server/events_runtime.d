@@ -2159,9 +2159,13 @@ final class EventsRuntime
 	private void deliverGuarded(Delivery job) @safe
 	{
 		bool settled;
+		// The highest attempt count deliverWithRetry persisted before it threw;
+		// counting on from the leased job's count would roll it back and let the
+		// job exceed webhookMaxAttempts across re-leases.
+		int persisted = job.attempt;
 		try
 		{
-			deliverWithRetry(job);
+			deliverWithRetry(job, persisted);
 			settled = true;
 		}
 		catch (Exception)
@@ -2169,7 +2173,7 @@ final class EventsRuntime
 		}
 		if (settled)
 			return;
-		const attempt = job.attempt + 1;
+		const attempt = max(persisted, job.attempt) + 1;
 		if (attempt >= opts_.webhookMaxAttempts)
 		{
 			// Dead-letter: bound total attempts, and settle the position so the
@@ -2257,8 +2261,9 @@ final class EventsRuntime
 	/// once the endpoint takes deliveries again. The job is acked (removed) only
 	/// once its position is settled — success, a 410 (which ends the subscription)
 	/// or 413, or exhaustion — never on a mere transient failure (so it survives to
-	/// be re-leased).
-	private void deliverWithRetry(Delivery job) @safe
+	/// be re-leased). `persistedAttempt` tracks the attempt count last persisted,
+	/// for a caller that recovers from a throw part-way through.
+	private void deliverWithRetry(Delivery job, ref int persistedAttempt) @safe
 	{
 		const subId = job.subscriptionId;
 		const occ = job.occ;
@@ -2319,6 +2324,7 @@ final class EventsRuntime
 		{
 			attempt++;
 			deliveryQueue_.touch(job.jobId, attempt, opts_.nowMs() + leaseMs);
+			persistedAttempt = attempt;
 			auto sn = webhookStore_.get(subId);
 			if (sn.isNull)
 			{
@@ -7663,6 +7669,41 @@ unittest  // a delivery whose store throws is dead-lettered, not looped invisibl
 	store.throwOnGet = false;
 	now += rt.opts_.deliveryLease.total!"msecs" + 1;
 	assert(queue.lease(now, 1000, 0).length == 0);
+}
+
+unittest  // a delivery that throws mid-retry keeps its attempt count, so attempts stay bounded
+{
+	auto ft = new FakeWebhookTransport();
+	ft.eventStatuses = [500, 500, 500, 500, 500, 500, 500, 500, 500, 500];
+	long now = 1_000_000;
+	int sleeps;
+	EventsOptions o;
+	o.nowMs = () @safe => now;
+	o.nowIso = () @safe => "t";
+	o.allowPrivateCallbackHosts = true;
+	o.webhookTransport = ft;
+	o.webhookMaxAttempts = 5;
+	o.deliveryExecutor = (void delegate() @safe job) @safe { job(); };
+	// The backoff after the third failed attempt throws, as a store or clock
+	// fault part-way through the retry loop would.
+	o.deliverySleep = (Duration d) @safe {
+		if (++sleeps == 3)
+			throw new Exception("interrupted");
+	};
+	auto rt = new EventsRuntime(null, o);
+	EventRegistration reg = {descriptor: EventType("n"), emitOnly: true};
+	rt.register(reg);
+	rt.subscribeWebhook(webhookSub("n", "https://proxy/hooks"), "user-1");
+	rt.emit(EventOccurrence("evt_1", "n", "t"));
+	assert(ft.eventPosts().length == 3);
+	// Re-drain past each lease, staying inside the subscription's grant.
+	foreach (i; 0 .. 3)
+	{
+		now += 9 * 60 * 1000;
+		rt.drainDeliveries();
+	}
+	assert(ft.eventPosts().length > 3); // the job was retried
+	assert(ft.eventPosts().length <= o.webhookMaxAttempts);
 }
 
 unittest  // a dead-lettered delivery settles its position so the watermark keeps advancing
