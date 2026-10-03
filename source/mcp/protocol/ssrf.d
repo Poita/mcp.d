@@ -716,12 +716,12 @@ AddressClass classifyHost(string host, out string pinnedIp) @safe
 	if (bare.length == 0)
 		return AddressClass.privateOrLinkLocal;
 
-	// Bracketed or bracketless IPv6 literal (contains ':').
+	// A bracketed host, or a bare one that still contains ':' after the port
+	// strip (two or more colons), is an IPv6 literal.
 	{
 		import std.string : indexOf;
 
-		if (host[0] == '[' || (bare.indexOf(':') >= 0 && bare.indexOf('.') < 0)
-				|| (bare.indexOf(':') >= 0 && bare.indexOf("::") >= 0))
+		if (host[0] == '[' || bare.indexOf(':') >= 0)
 		{
 			ubyte[16] bytes;
 			if (!parseIpv6Literal(bare, bytes))
@@ -836,9 +836,9 @@ AddressClass classifyHostLexical(string host) @safe pure nothrow @nogc
 	if (bare.length == 0)
 		return AddressClass.privateOrLinkLocal;
 
-	// Bracketed or bracketless IPv6 literal (contains ':').
-	if (host[0] == '[' || (bare.indexOf(':') >= 0 && bare.indexOf('.') < 0)
-			|| (bare.indexOf(':') >= 0 && bare.indexOf("::") >= 0))
+	// A bracketed host, or a bare one that still contains ':' after the port
+	// strip (two or more colons), is an IPv6 literal.
+	if (host[0] == '[' || bare.indexOf(':') >= 0)
 		return classifyIpv6Literal(bare);
 
 	if (isLocalhostName(bare))
@@ -1856,6 +1856,24 @@ unittest  // malformed IPv6 literals fail closed; an IPv4-mapped public address 
 	// A fully-specified (no "::") public global-unicast literal fills the entire
 	// hextet area and classifies public.
 	assert(classifyHostLexical("[2606:4700:4700:1:2:3:4:5]") == AddressClass.public_);
+}
+
+unittest  // a bracketless full-form IPv4-mapped IPv6 host classifies by its embedded address
+{
+	static immutable string[] internal = [
+		"0:0:0:0:0:ffff:169.254.169.254", "0:0:0:0:0:ffff:127.0.0.1",
+		"0:0:0:0:0:ffff:10.0.0.1",
+	];
+	foreach (h; internal)
+	{
+		assert(classifyHostLexical(h) != AddressClass.public_, h);
+		string pinned;
+		assert(classifyHost(h, pinned) != AddressClass.public_, h);
+	}
+	assert(classifyHostLexical("0:0:0:0:0:ffff:8.8.8.8") == AddressClass.public_);
+	string pinned;
+	assert(classifyHost("0:0:0:0:0:ffff:8.8.8.8", pinned) == AddressClass.public_);
+	assert(pinned == "::ffff:808:808", pinned);
 }
 
 unittest  // secureRequestHTTP enforces an overall deadline on a server that drip-feeds its response
