@@ -1654,8 +1654,9 @@ string basicAuthHeader(string clientId, string clientSecret) @safe
 }
 
 /// Parse a token-endpoint HTTP response: a non-2xx status is an error (the body,
-/// when present, is surfaced for diagnostics), otherwise decode the JSON body
-/// into a `TokenSet`.
+/// when present, is surfaced for diagnostics, and an RFC 6749 §5.2 `error` code
+/// is carried in the exception's `data` for `oauthErrorCode`), otherwise decode
+/// the JSON body into a `TokenSet`.
 private TokenSet parseTokenResponse(int status, string responseBody) @safe
 {
 	import std.conv : to;
@@ -1664,8 +1665,49 @@ private TokenSet parseTokenResponse(int status, string responseBody) @safe
 
 	if (status < 200 || status >= 300)
 		throw invalidRequest("token endpoint returned HTTP " ~ status.to!string ~ (
-				responseBody.length ? ": " ~ responseBody : ""));
+				responseBody.length ? ": " ~ responseBody : ""), oauthErrorData(responseBody));
 	return TokenSet.fromJson(parseUntrustedJson(responseBody));
+}
+
+/// The exception `data` for an OAuth error response body: `{"error": code}`
+/// when the body is a JSON object with a string `error` (RFC 6749 §5.2), else
+/// `Json.undefined`. `oauthErrorCode` reads it back.
+package(mcp) Json oauthErrorData(string responseBody) @safe nothrow
+{
+	import mcp.protocol.jsonrpc : parseUntrustedJson;
+
+	try
+	{
+		auto err = parseUntrustedJson(responseBody);
+		if (err.type == Json.Type.object && err["error"].type == Json.Type.string)
+		{
+			auto data = Json.emptyObject;
+			data["error"] = err["error"];
+			return data;
+		}
+	}
+	catch (Exception)
+	{
+	}
+	return Json.undefined;
+}
+
+/// The RFC 6749 §5.2 `error` code of a failed token request (for example
+/// `invalid_grant`), or empty when `e` did not come from an OAuth error response.
+string oauthErrorCode(const Exception e) @safe nothrow
+{
+	import mcp.protocol.errors : McpException;
+
+	auto me = cast(const McpException) e;
+	if (me is null || me.data.type != Json.Type.object)
+		return null;
+	try
+	{
+		auto code = me.data["error"];
+		return code.type == Json.Type.string ? code.get!string : null;
+	}
+	catch (Exception)
+		return null;
 }
 
 /// Upper bound on an OAuth/discovery response body (metadata documents, DCR and
@@ -1860,6 +1902,16 @@ unittest  // parseTokenResponse rejects a non-2xx status (RFC 6749 token error)
 
 	assertThrown!McpException(parseTokenResponse(400, `{"error":"invalid_grant"}`));
 	assertThrown!McpException(parseTokenResponse(500, ""));
+}
+
+unittest  // parseTokenResponse carries the OAuth error code of a rejected token request
+{
+	import std.exception : collectException;
+
+	assert(oauthErrorCode(collectException(parseTokenResponse(400,
+			`{"error":"invalid_grant"}`))) == "invalid_grant");
+	assert(oauthErrorCode(collectException(parseTokenResponse(502, "<html>"))) == "");
+	assert(oauthErrorCode(new Exception("network down")) == "");
 }
 
 unittest  // parseTokenResponse decodes a 2xx body into a populated TokenSet

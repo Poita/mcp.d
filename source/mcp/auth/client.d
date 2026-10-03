@@ -751,7 +751,8 @@ final class OAuthClient
 	// an Authorization header, and parse the response as JSON (empty body -> {}).
 	// Throws when the response status is not 2xx, naming `endpoint` (e.g.
 	// "Token endpoint") and surfacing the error body if present (consistent with
-	// tryGetJson which guards status the same way).
+	// tryGetJson which guards status the same way); an OAuth `error` code in the
+	// body is carried for `oauthErrorCode`.
 	private Json postParse(string endpoint, string url, string contentType,
 			scope const(ubyte)[] payload, string authHeader = null) @safe
 	{
@@ -769,7 +770,7 @@ final class OAuthClient
 			auto body = res.bodyReader.readAllUTF8(false, maxAuthResponseBytes);
 			if (res.statusCode / 100 != 2)
 				throw internalError(endpoint ~ " returned HTTP " ~ res.statusCode.to!string ~ (
-					body.length ? ": " ~ body : ""));
+					body.length ? ": " ~ body : ""), oauthErrorData(body));
 			result = body.length ? parseUntrustedJson(body) : Json.emptyObject;
 		});
 		return result;
@@ -1928,6 +1929,28 @@ unittest  // private_key_jwt: the JWT-bearer grant carries a client_assertion
 	as_.tokenEndpoint = srv.base ~ "/token";
 	c.jwtBearerGrant(as_, RegisteredClient("cid", ""), "the-assertion", "");
 	assert(lastForm.canFind("client_assertion="));
+}
+
+unittest  // a rejected refresh carries the OAuth error code for oauthErrorCode
+{
+	import std.exception : collectException;
+	import mcp.auth.oauth : oauthErrorCode;
+
+	auto srv = startLoopback((scope HTTPServerRequest req, scope HTTPServerResponse res) @safe {
+		res.statusCode = 400;
+		res.writeBody(`{"error":"invalid_grant"}`, "application/json");
+	});
+	scope (exit)
+		srv.stop();
+
+	auto c = new OAuthClient();
+	c.resource = "http://127.0.0.1:3000/mcp";
+	AuthorizationServerMetadata as_;
+	as_.issuer = "https://as.example.com";
+	as_.tokenEndpoint = srv.base ~ "/token";
+	auto e = collectException(c.refresh(as_, RegisteredClient("cid", ""), "dead-rt"));
+	assert(e !is null);
+	assert(oauthErrorCode(e) == "invalid_grant");
 }
 
 unittest  // client_secret_post: token exchange carries the client secret

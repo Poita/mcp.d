@@ -560,7 +560,11 @@ It discovers the protected-resource and authorization-server metadata, then:
 - **Refreshes transparently**: every request asks the returned `OAuthSession` for
   its bearer, which runs the refresh-token grant when the access token is within
   30 seconds of expiry and saves the new token. Concurrent refreshes are
-  single-flighted. A request the server rejects with `401 invalid_token` is
+  single-flighted, and a session first re-reads the store, so processes sharing
+  one token file adopt each other's refreshed tokens instead of replaying a
+  rotated refresh token. A refresh the AS answers with `invalid_grant` drops the
+  refresh token, so later requests fail fast until `useOAuth` signs in again. A
+  request the server rejects with `401 invalid_token` is
   refreshed and retried once; with no refresh token, or when the refreshed token
   is rejected too, the 401 (an `HttpStatusException` carrying the
   `WWW-Authenticate` challenge) reaches the caller, who can pass the challenge

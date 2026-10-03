@@ -963,48 +963,91 @@ final class OAuthSession
 	/// Refreshes are single-flighted: concurrent callers (fibers or threads) wait
 	/// for one in-flight refresh and share its result, so a rotating refresh token
 	/// is never presented twice (which an AS answers with `invalid_grant` and may
-	/// treat as token theft, revoking the whole token family).
+	/// treat as token theft, revoking the whole token family). Before refreshing,
+	/// the session re-reads the `TokenStore`, so a token another process sharing
+	/// the store has already refreshed (and the refresh token it rotated to) is
+	/// adopted rather than refreshed again with a stale refresh token.
+	///
+	/// A refresh the AS answers with `invalid_grant` drops the refresh token here
+	/// and in the store, so later calls throw demanding re-authentication instead
+	/// of presenting the dead refresh token again.
 	string bearerForRequest(long now) @safe
 	{
 		refreshLock_.lock();
 		scope (exit)
 			refreshLock_.unlock();
-		if (needsRefresh(token_, now, skew_))
+		if (!needsRefresh(token_, now, skew_))
+			return token_.accessToken;
+		if (adoptStoredToken() && !needsRefresh(token_, now, skew_))
+			return token_.accessToken;
+		if (token_.refreshToken.length == 0)
 		{
-			if (token_.refreshToken.length == 0)
-			{
-				if (token_.hasToken && token_.expiresAt == 0)
-					return token_.accessToken; // no expiry known, no refresh possible
-				throw internalError(
-						"OAuth access token has expired or was rejected and no refresh token "
-						~ "is available; call useOAuth again to re-authenticate");
-			}
-			auto ts = refreshFn_(token_.refreshToken);
-			if (ts.accessToken.length == 0)
-				throw internalError("OAuth token refresh returned no access token");
-			// Carry the registered client and the issuer forward so the persisted
-			// record can authenticate a later refresh at the same AS (the refresh
-			// response carries neither).
-			auto prev = token_;
-			auto issuer = prev.issuer.length ? prev.issuer : as_.issuer;
-			token_ = StoredToken.fromTokenSet(ts, resource_, now, prev.refreshToken);
-			refreshedOnRejection_ = rejectionPending_;
-			rejectionPending_ = false;
-			if (token_.scope_.length == 0)
-				token_.scope_ = prev.scope_;
-			if (prev.clientId.length)
-			{
-				token_.clientId = prev.clientId;
-				token_.clientSecret = prev.clientSecret;
-				token_.clientSecretExpiresAt = prev.clientSecretExpiresAt;
-			}
-			else
-				token_.clientId = client_.clientId;
-			token_.issuer = issuer;
-			if (store_ !is null)
-				store_.save(resource_, token_);
+			if (token_.hasToken && token_.expiresAt == 0)
+				return token_.accessToken; // no expiry known, no refresh possible
+			throw internalError(
+					"OAuth access token has expired or was rejected and no refresh token "
+					~ "is available; call useOAuth again to re-authenticate");
 		}
+		TokenSet ts;
+		try
+			ts = refreshFn_(token_.refreshToken);
+		catch (Exception e)
+		{
+			// Another process may have rotated the refresh token in the meantime;
+			// only a refresh token still current in the store is known dead.
+			if (oauthErrorCode(e) == "invalid_grant" && !adoptStoredToken())
+			{
+				token_.refreshToken = "";
+				if (store_ !is null)
+					store_.save(resource_, token_);
+			}
+			throw e;
+		}
+		if (ts.accessToken.length == 0)
+			throw internalError("OAuth token refresh returned no access token");
+		// Carry the registered client and the issuer forward so the persisted
+		// record can authenticate a later refresh at the same AS (the refresh
+		// response carries neither).
+		auto prev = token_;
+		auto issuer = prev.issuer.length ? prev.issuer : as_.issuer;
+		token_ = StoredToken.fromTokenSet(ts, resource_, now, prev.refreshToken);
+		refreshedOnRejection_ = rejectionPending_;
+		rejectionPending_ = false;
+		if (token_.scope_.length == 0)
+			token_.scope_ = prev.scope_;
+		if (prev.clientId.length)
+		{
+			token_.clientId = prev.clientId;
+			token_.clientSecret = prev.clientSecret;
+			token_.clientSecretExpiresAt = prev.clientSecretExpiresAt;
+		}
+		else
+			token_.clientId = client_.clientId;
+		token_.issuer = issuer;
+		if (store_ !is null)
+			store_.save(resource_, token_);
 		return token_.accessToken;
+	}
+
+	/// Replace the current token with the store's record for this resource when
+	/// that record differs and is bound to the same issuer and client (so its
+	/// refresh token is one this session's client may present). Returns whether a
+	/// record was adopted. The caller holds `refreshLock_`.
+	private bool adoptStoredToken() @safe
+	{
+		if (store_ is null)
+			return false;
+		auto stored = store_.load(resource_);
+		if (!stored.hasToken && stored.refreshToken.length == 0)
+			return false;
+		if (stored.issuer != token_.issuer || stored.clientId != token_.clientId)
+			return false;
+		if (stored.accessToken == token_.accessToken && stored.refreshToken == token_.refreshToken)
+			return false;
+		token_ = stored;
+		rejectionPending_ = false;
+		refreshedOnRejection_ = false;
+		return true;
 	}
 }
 
@@ -1828,6 +1871,133 @@ unittest  // OAuthSession refreshes an expired token via the injected refresh fn
 	assert(saved.accessToken == "new-access");
 	assert(saved.refreshToken == "rotated-refresh");
 	assert(saved.expiresAt == 5000 + 3600);
+}
+
+unittest  // a session adopts a still-valid token another process saved to the shared store
+{
+	auto store = new MemoryTokenStore();
+	StoredToken mine;
+	mine.accessToken = "old-access";
+	mine.refreshToken = "stale-refresh";
+	mine.expiresAt = 1000;
+	StoredToken theirs;
+	theirs.accessToken = "their-access";
+	theirs.refreshToken = "rotated-refresh";
+	theirs.expiresAt = 10_000;
+	store.save("https://mcp.example.com", theirs);
+
+	int calls;
+	TokenSet delegate(string) @safe refreshFn = (string rt) @safe {
+		++calls;
+		return TokenSet.init;
+	};
+	auto sess = new OAuthSession("https://mcp.example.com", mine, store, refreshFn);
+	assert(sess.bearerForRequest(5000) == "their-access");
+	assert(calls == 0);
+	assert(sess.token.refreshToken == "rotated-refresh");
+}
+
+unittest  // a session refreshes with the rotated refresh token another process saved
+{
+	auto store = new MemoryTokenStore();
+	StoredToken mine;
+	mine.accessToken = "old-access";
+	mine.refreshToken = "stale-refresh";
+	mine.expiresAt = 1000;
+	StoredToken theirs;
+	theirs.accessToken = "their-access";
+	theirs.refreshToken = "rotated-refresh";
+	theirs.expiresAt = 4000;
+	store.save("https://mcp.example.com", theirs);
+
+	string seenRefresh;
+	TokenSet delegate(string) @safe refreshFn = (string rt) @safe {
+		seenRefresh = rt;
+		TokenSet ts;
+		ts.accessToken = "new-access";
+		ts.expiresIn = 3600;
+		return ts;
+	};
+	auto sess = new OAuthSession("https://mcp.example.com", mine, store, refreshFn);
+	assert(sess.bearerForRequest(5000) == "new-access");
+	assert(seenRefresh == "rotated-refresh");
+}
+
+unittest  // a session ignores a stored token bound to another client
+{
+	auto store = new MemoryTokenStore();
+	StoredToken mine;
+	mine.accessToken = "old-access";
+	mine.refreshToken = "my-refresh";
+	mine.expiresAt = 1000;
+	mine.clientId = "client-a";
+	StoredToken theirs = mine;
+	theirs.accessToken = "their-access";
+	theirs.refreshToken = "their-refresh";
+	theirs.expiresAt = 10_000;
+	theirs.clientId = "client-b";
+	store.save("https://mcp.example.com", theirs);
+
+	string seenRefresh;
+	TokenSet delegate(string) @safe refreshFn = (string rt) @safe {
+		seenRefresh = rt;
+		TokenSet ts;
+		ts.accessToken = "new-access";
+		ts.expiresIn = 3600;
+		return ts;
+	};
+	auto sess = new OAuthSession("https://mcp.example.com", mine, store, refreshFn);
+	assert(sess.bearerForRequest(5000) == "new-access");
+	assert(seenRefresh == "my-refresh");
+}
+
+unittest  // an invalid_grant refresh drops the dead refresh token so later requests fail fast
+{
+	import std.exception : assertThrown;
+
+	auto store = new MemoryTokenStore();
+	StoredToken t;
+	t.accessToken = "old-access";
+	t.refreshToken = "dead-refresh";
+	t.expiresAt = 1000;
+	store.save("https://mcp.example.com", t);
+
+	int calls;
+	TokenSet delegate(string) @safe refreshFn = (string rt) @safe {
+		++calls;
+		auto data = Json.emptyObject;
+		data["error"] = "invalid_grant";
+		throw invalidRequest("token endpoint returned HTTP 400", data);
+	};
+	auto sess = new OAuthSession("https://mcp.example.com", t, store, refreshFn);
+	assertThrown(sess.bearerForRequest(5000));
+	assertThrown(sess.bearerForRequest(5001));
+	assert(calls == 1, "a refresh token the AS rejected is never presented again");
+	assert(store.load("https://mcp.example.com").refreshToken.length == 0);
+}
+
+unittest  // a transient refresh failure keeps the refresh token for a retry
+{
+	import std.exception : assertThrown;
+
+	auto store = new MemoryTokenStore();
+	StoredToken t;
+	t.accessToken = "old-access";
+	t.refreshToken = "good-refresh";
+	t.expiresAt = 1000;
+
+	int calls;
+	TokenSet delegate(string) @safe refreshFn = (string rt) @safe {
+		if (++calls == 1)
+			throw new Exception("network down");
+		TokenSet ts;
+		ts.accessToken = "new-access";
+		ts.expiresIn = 3600;
+		return ts;
+	};
+	auto sess = new OAuthSession("https://mcp.example.com", t, store, refreshFn);
+	assertThrown(sess.bearerForRequest(5000));
+	assert(sess.bearerForRequest(5001) == "new-access");
 }
 
 unittest  // concurrent bearerForRequest calls share a single refresh (rotating refresh tokens)
