@@ -246,7 +246,11 @@ Json parseSkillFrontmatter(string md) @safe
 }
 
 /// Convert a YAML document (dyaml) to a vibe `Json` value, preserving scalar
-/// types so the index frontmatter mirrors the authored YAML.
+/// types so the index frontmatter mirrors the authored YAML. The conversion
+/// expands every alias in place, so a few hundred bytes of nested aliases (a
+/// "billion laughs" document) could otherwise grow exponentially; it is bounded
+/// by a budget of nodes plus string bytes proportional to the document's size,
+/// which alias-free YAML always fits within.
 private Json yamlToJson(string yaml) @safe
 {
 	import dyaml : Loader;
@@ -254,29 +258,43 @@ private Json yamlToJson(string yaml) @safe
 	try
 	{
 		auto root = Loader.fromString(yaml).load();
-		return nodeToJson(root);
+		size_t budget = 4 * yaml.length + 4096;
+		return nodeToJson(root, budget);
 	}
 	catch (Exception e)
 		throw new Exception("registerSkillDir: invalid SKILL.md frontmatter YAML: " ~ e.msg);
 }
 
+/// Charge `cost` against the conversion `budget`, throwing once it runs out.
+private void spend(ref size_t budget, size_t cost) @safe
+{
+	if (cost > budget)
+		throw new Exception("the frontmatter expands too far through aliases");
+	budget -= cost;
+}
+
 // Templated on dyaml's Node so the converter need not name the type; recursion
 // re-deduces it. Scalars keep their YAML-inferred type (bool/int/float/null/string).
-private Json nodeToJson(N)(N node) @safe
+// Each node costs one unit of `budget`, and each key or string value its length.
+private Json nodeToJson(N)(N node, ref size_t budget) @safe
 {
 	import dyaml : NodeID, NodeType;
 
+	spend(budget, 1);
 	final switch (node.nodeID)
 	{
 	case NodeID.mapping:
 		Json o = Json.emptyObject;
 		foreach (string key, N value; node)
-			o[key] = nodeToJson(value);
+		{
+			spend(budget, key.length);
+			o[key] = nodeToJson(value, budget);
+		}
 		return o;
 	case NodeID.sequence:
 		Json a = Json.emptyArray;
 		foreach (N value; node)
-			a ~= nodeToJson(value);
+			a ~= nodeToJson(value, budget);
 		return a;
 	case NodeID.scalar:
 		switch (node.type)
@@ -311,7 +329,9 @@ private Json nodeToJson(N)(N node) @safe
 			// A bare merge key has no value of its own.
 			return Json(null);
 		default:
-			return Json(node.as!string);
+			const str = node.as!string;
+			spend(budget, str.length);
+			return Json(str);
 		}
 	case NodeID.invalid:
 		return Json(null);
@@ -1429,4 +1449,32 @@ unittest  // parseSkillFrontmatter accepts trailing whitespace after the opening
 {
 	auto fm = parseSkillFrontmatter("--- \t\r\nname: x\r\ndescription: d\r\n---\r\n\r\n# Body\r\n");
 	assert(fm["name"].get!string == "x", fm.toString);
+}
+
+unittest  // parseSkillFrontmatter rejects nested aliases that expand far beyond the document
+{
+	import std.exception : assertThrown;
+
+	enum md = "---\nname: x\ndescription: d\n" ~ "a: &a [x, x, x, x, x, x, x, x, x, x]\n"
+		~ "b: &b [*a, *a, *a, *a, *a, *a, *a, *a, *a, *a]\n"
+		~ "c: &c [*b, *b, *b, *b, *b, *b, *b, *b, *b, *b]\n"
+		~ "d: &d [*c, *c, *c, *c, *c, *c, *c, *c, *c, *c]\n"
+		~ "e: [*d, *d, *d, *d, *d, *d, *d, *d, *d, *d]\n---\n";
+	assertThrown(parseSkillFrontmatter(md));
+}
+
+unittest  // parseSkillFrontmatter rejects a long string repeated through aliases
+{
+	import std.array : replicate;
+	import std.exception : assertThrown;
+
+	const md = "---\nname: x\ndescription: d\nbig: &s " ~ "y".replicate(
+			4096) ~ "\nmany: [" ~ "*s, ".replicate(64) ~ "*s]\n---\n";
+	assertThrown(parseSkillFrontmatter(md));
+}
+
+unittest  // parseSkillFrontmatter still resolves a modest alias
+{
+	auto fm = parseSkillFrontmatter("---\nname: x\ndescription: &d hi\nagain: *d\n---\n");
+	assert(fm["again"].get!string == "hi", fm.toString);
 }
