@@ -844,11 +844,11 @@ package enum size_t maxClientIdMetadataBytes = 256 * 1024;
 /// string obtained any way.
 ClientIdMetadataDocument parseClientIdMetadataDocument(string clientIdUrl, string body) @safe
 {
-	import vibe.data.json : parseJsonString, Json;
+	import mcp.protocol.jsonrpc : parseUntrustedJson;
 
 	Json j;
 	try
-		j = parseJsonString(body);
+		j = parseUntrustedJson(body);
 	catch (Exception e)
 		throw new InvalidClientIdMetadataException(clientIdUrl,
 				"metadata document is not valid JSON");
@@ -1875,6 +1875,18 @@ unittest  // CIMD PARSE: a JSON body that is not an object is rejected
 
 	assertThrown!InvalidClientIdMetadataException(parseClientIdMetadataDocument(
 			"https://app.example.com/oauth/client.json", `["not","an","object"]`));
+}
+
+unittest  // CIMD PARSE: a document nested past the depth cap is rejected
+{
+	import std.array : replicate;
+	import std.exception : assertThrown;
+
+	const deep = "[".replicate(1000) ~ "]".replicate(1000);
+	assertThrown!InvalidClientIdMetadataException(
+			parseClientIdMetadataDocument("https://app.example.com/oauth/client.json",
+			`{"client_id":"https://app.example.com/oauth/client.json",`
+			~ `"redirect_uris":["http://127.0.0.1:8765/callback"],"x":` ~ deep ~ `}`));
 }
 
 unittest  // CIMD FETCH: an injected fetcher is consulted instead of the network

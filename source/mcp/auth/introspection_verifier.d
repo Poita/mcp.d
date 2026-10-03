@@ -21,6 +21,7 @@ import vibe.data.json : Json, parseJsonString;
 import mcp.auth.jwt_verifier : audiences, currentUnixTime, includesAudience, jsonStr, splitScopes;
 import mcp.auth.oauth : TokenEndpointAuthMethod, basicAuthHeader, secureRequestHTTP;
 import mcp.auth.resource_server : TokenInfo, TokenValidator;
+import mcp.protocol.jsonrpc : parseUntrustedJson;
 import mcp.protocol.ssrf : SsrfPolicy;
 
 @safe:
@@ -159,7 +160,7 @@ TokenInfo introspectionResult(IntrospectionConfig cfg, string responseJson) @saf
 {
 	Json doc;
 	try
-		doc = parseJsonString(responseJson);
+		doc = parseUntrustedJson(responseJson);
 	catch (Exception e)
 	{
 		import vibe.core.log : logWarn;
@@ -474,6 +475,15 @@ unittest  // a non-object / malformed response is invalid
 	IntrospectionConfig cfg;
 	assert(!introspectionResult(cfg, `"nope"`).valid);
 	assert(!introspectionResult(cfg, `not json at all`).valid);
+}
+
+unittest  // a response nested past the depth cap is invalid
+{
+	import std.array : replicate;
+
+	IntrospectionConfig cfg;
+	const deep = "[".replicate(1000) ~ "]".replicate(1000);
+	assert(!introspectionResult(cfg, `{"active":true,"sub":"u","x":` ~ deep ~ `}`).valid);
 }
 
 unittest  // aud may be an array of strings

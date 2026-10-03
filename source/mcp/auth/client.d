@@ -6,6 +6,7 @@ import vibe.http.common : HTTPMethod;
 import vibe.stream.operations : readAllUTF8;
 
 import mcp.protocol.errors;
+import mcp.protocol.jsonrpc : parseUntrustedJson;
 import mcp.protocol.ssrf : SsrfPolicy;
 import mcp.auth.oauth;
 
@@ -729,7 +730,7 @@ final class OAuthClient
 				auto body = res.bodyReader.readAllUTF8(false, maxAuthResponseBytes);
 				if (res.statusCode / 100 == 2 && body.length)
 				{
-					parsed = parseJsonString(body); // a throw here is a fetch error, caught below
+					parsed = parseUntrustedJson(body); // a throw here is a fetch error, caught below
 					outcome = FetchResult.ok;
 				}
 			});
@@ -769,7 +770,7 @@ final class OAuthClient
 			if (res.statusCode / 100 != 2)
 				throw internalError(endpoint ~ " returned HTTP " ~ res.statusCode.to!string ~ (
 					body.length ? ": " ~ body : ""));
-			result = body.length ? parseJsonString(body) : Json.emptyObject;
+			result = body.length ? parseUntrustedJson(body) : Json.emptyObject;
 		});
 		return result;
 	}
@@ -2046,4 +2047,48 @@ unittest  // authorizeAndGetCode refuses to skip state verification (an empty ex
 	AuthorizationServerMetadata as_;
 	as_.issuer = "https://as.example.com";
 	assertThrown(c.authorizeAndGetCode(as_, authzUrl, ""));
+}
+
+unittest  // discovery treats a protected-resource document nested past the depth cap as a fetch error
+{
+	import std.algorithm : canFind;
+	import std.array : replicate;
+	import std.exception : collectException;
+
+	const deep = "[".replicate(1000) ~ "]".replicate(1000);
+	LoopbackServer srv;
+	srv = startLoopback((scope HTTPServerRequest req, scope HTTPServerResponse res) @safe {
+		res.writeBody(`{"resource":"` ~ srv.base ~ `/mcp","authorization_servers":["`
+			~ srv.base ~ `"],"x":` ~ deep ~ `}`, "application/json");
+	});
+	scope (exit)
+		srv.stop();
+
+	auto c = new OAuthClient();
+	c.resource = srv.base ~ "/mcp";
+	auto e = collectException(c.discoverProtectedResource(srv.base ~ "/mcp"));
+	assert(e !is null && e.msg.canFind("discovery failed"));
+}
+
+unittest  // a token response nested past the depth cap is rejected
+{
+	import std.algorithm : canFind;
+	import std.array : replicate;
+	import std.exception : collectException;
+	import vibe.data.json : JSONException;
+
+	const deep = "[".replicate(1000) ~ "]".replicate(1000);
+	auto srv = startLoopback((scope HTTPServerRequest req, scope HTTPServerResponse res) @safe {
+		res.writeBody(`{"access_token":"at","token_type":"bearer","x":` ~ deep ~ `}`,
+			"application/json");
+	});
+	scope (exit)
+		srv.stop();
+
+	auto c = new OAuthClient();
+	c.resource = srv.base ~ "/mcp";
+	AuthorizationServerMetadata as_;
+	as_.tokenEndpoint = srv.base ~ "/token";
+	auto e = collectException!JSONException(c.refresh(as_, RegisteredClient("cid", ""), "rt"));
+	assert(e !is null && e.msg.canFind("nesting deeper"));
 }

@@ -443,7 +443,7 @@ package TokenValidator githubTokenVerifierWith(string clientId,
 {
 	import std.base64 : Base64;
 	import std.uri : encodeComponent;
-	import vibe.data.json : parseJsonString;
+	import mcp.protocol.jsonrpc : parseUntrustedJson;
 
 	enforce(clientId.length > 0, "githubTokenVerifier: clientId must be set.");
 	const url = "https://api.github.com/applications/" ~ encodeComponent(clientId) ~ "/token";
@@ -458,7 +458,7 @@ package TokenValidator githubTokenVerifierWith(string clientId,
 			const res = http(ProviderHttpRequest("POST", url, authorization, req.toString()));
 			if (res.status != 200)
 				return TokenInfo.invalid();
-			auto doc = parseJsonString(res.body);
+			auto doc = parseUntrustedJson(res.body);
 			if (doc.type != Json.Type.object || jsonString(doc["app"], "client_id") != clientId)
 				return TokenInfo.invalid();
 			TokenInfo ti;
@@ -498,7 +498,7 @@ package TokenValidator googleTokenVerifierWith(string clientId, ProviderHttp htt
 	import std.conv : to;
 	import std.datetime.systime : Clock;
 	import std.uri : encodeComponent;
-	import vibe.data.json : parseJsonString;
+	import mcp.protocol.jsonrpc : parseUntrustedJson;
 
 	enforce(clientId.length > 0, "googleTokenVerifier: clientId must be set.");
 	return (string token) @safe {
@@ -509,7 +509,7 @@ package TokenValidator googleTokenVerifierWith(string clientId, ProviderHttp htt
 				"https://oauth2.googleapis.com/tokeninfo?access_token=" ~ encodeComponent(token)));
 			if (res.status != 200)
 				return TokenInfo.invalid();
-			auto doc = parseJsonString(res.body);
+			auto doc = parseUntrustedJson(res.body);
 			if (doc.type != Json.Type.object)
 				return TokenInfo.invalid();
 			if (jsonString(doc, "aud") != clientId && jsonString(doc, "azp") != clientId)
@@ -1026,6 +1026,34 @@ unittest  // GITHUB: a live token issued to another OAuth app is rejected
 	fake.answer = (ProviderHttpRequest req) @safe => ProviderHttpResponse(200,
 			`{"app":{"client_id":"Iv1.other"},"user":{"login":"octocat"}}`);
 	assert(!v("gho_other_app").valid);
+}
+
+unittest  // GITHUB: a check-token response nested past the depth cap rejects the token
+{
+	import std.array : replicate;
+
+	const deep = "[".replicate(1000) ~ "]".replicate(1000);
+	auto fake = new FakeProviderHttp;
+	fake.answer = (ProviderHttpRequest req) @safe => ProviderHttpResponse(200,
+			`{"app":{"client_id":"Iv1.client"},"user":{"login":"octocat"},"x":` ~ deep ~ `}`);
+	auto v = githubTokenVerifierWith("Iv1.client", "ghsecret", fake.call());
+	assert(!v("gho_valid").valid);
+}
+
+unittest  // GOOGLE: a tokeninfo response nested past the depth cap rejects the token
+{
+	import std.array : replicate;
+	import std.conv : to;
+	import std.datetime.systime : Clock;
+
+	const exp = (Clock.currTime.toUnixTime + 3600).to!string;
+	const deep = "[".replicate(1000) ~ "]".replicate(1000);
+	auto fake = new FakeProviderHttp;
+	fake.answer = (ProviderHttpRequest req) @safe => ProviderHttpResponse(200,
+			`{"aud":"client.apps.googleusercontent.com","sub":"1234","exp":"`
+			~ exp ~ `","x":` ~ deep ~ `}`);
+	auto v = googleTokenVerifierWith("client.apps.googleusercontent.com", fake.call());
+	assert(!v("ya29.valid").valid);
 }
 
 unittest  // GITHUB: a failed check-token call rejects the token without throwing

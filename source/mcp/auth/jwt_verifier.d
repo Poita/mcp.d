@@ -34,6 +34,7 @@ static if (!is(typeof(EVP_DigestVerify)))
 			const(ubyte)* sig, size_t siglen, const(ubyte)* tbs, size_t tbslen);
 
 import mcp.auth.resource_server : TokenInfo, TokenValidator;
+import mcp.protocol.jsonrpc : parseUntrustedJson;
 import mcp.protocol.ssrf : SsrfPolicy;
 
 @safe:
@@ -483,7 +484,7 @@ package struct Jwk
 package Jwk[] parseJwks(string jwksJson) @safe
 {
 	Jwk[] result;
-	auto root = parseJsonString(jwksJson);
+	auto root = parseUntrustedJson(jwksJson);
 	if (root.type != Json.Type.object)
 		return result;
 	auto keys = root["keys"];
@@ -889,7 +890,7 @@ private Json decodeSegmentJson(string seg) @safe
 	{
 		auto bytes = base64UrlDecode(seg);
 		auto s = () @trusted { return (cast(char[]) bytes).idup; }();
-		return parseJsonString(s);
+		return parseUntrustedJson(s);
 	}
 	catch (Exception)
 		return Json.undefined;
@@ -2299,6 +2300,26 @@ unittest  // parseJwks tolerates a non-object root, a non-array keys member, and
 	assert(parseJwks(`{"keys":"not-an-array"}`).length == 0);
 	// Non-object array entries are skipped, leaving no usable keys.
 	assert(parseJwks(`{"keys":[1, "two", null]}`).length == 0);
+}
+
+unittest  // parseJwks rejects a document nested past the depth cap
+{
+	import std.array : replicate;
+	import std.exception : assertThrown;
+	import vibe.data.json : JSONException;
+
+	const deep = "[".replicate(1000) ~ "]".replicate(1000);
+	assertThrown!JSONException(parseJwks(`{"keys":[],"x":` ~ deep ~ `}`));
+}
+
+unittest  // a JWT segment nested past the depth cap decodes as undefined
+{
+	import std.array : replicate;
+	import std.base64 : Base64URLNoPadding;
+
+	const deep = `{"x":` ~ "[".replicate(1000) ~ "]".replicate(1000) ~ `}`;
+	const seg = Base64URLNoPadding.encode(cast(const(ubyte)[]) deep).idup;
+	assert(decodeSegmentJson(seg).type == Json.Type.undefined);
 }
 
 unittest  // jwkToPem returns null for an unsupported key type and for malformed RSA/EC material
