@@ -57,7 +57,8 @@ import vibe.http.router : URLRouter;
 import vibe.http.common : HTTPMethod;
 
 import mcp.auth.oauth : isValidClientIdMetadataUrl, TokenSet;
-import mcp.auth.oauth_proxy : ConsentRequiredException, InvalidClientIdMetadataException,
+import mcp.auth.oauth_proxy : BrokeredToken, ConsentRequiredException,
+	InvalidClientIdMetadataException,
 	InvalidRedirectUriException, OAuthProxy, OAuthProxyConfig, RelayedCodeBinding;
 import mcp.protocol.jsonrpc : parseUntrustedJson;
 import mcp.protocol.ssrf : SsrfPolicy;
@@ -941,7 +942,8 @@ void mountOAuthToken(URLRouter router, OAuthProxy proxy) @safe
 /// the upstream token server-side, and returns OUR token — never the upstream
 /// token. Refresh-token grants are refused with `unsupported_grant_type` in
 /// broker mode (the proxy issues non-refreshable opaque tokens), so the upstream
-/// token is never relayed to the client.
+/// token is never relayed to the client. When minting fails (the `issueToken`
+/// hook or the token store throws) the client gets a 500 `server_error`.
 ///
 /// An integrator building a spec-compliant token broker can also skip this leg
 /// and register their own `/token`, reusing `exchangeUpstream`.
@@ -1077,7 +1079,23 @@ in (exchange !is null)
 		{
 			import std.array : join;
 
-			const brokered = proxy.issueClientToken(TokenSet.fromJson(upstreamJson));
+			BrokeredToken brokered;
+			try
+				brokered = proxy.issueClientToken(TokenSet.fromJson(upstreamJson));
+			catch (Exception e)
+			{
+				import vibe.core.log : logWarn;
+
+				// The integrator's issueToken hook or the token store failed; the
+				// cause stays in the log rather than reaching the client.
+				logWarn("/token: minting a client token failed: %s", e.msg);
+				Json err = Json.emptyObject;
+				err["error"] = "server_error";
+				err["error_description"] = "the access token could not be issued";
+				res.statusCode = HTTPStatus.internalServerError;
+				res.writeJsonBody(err);
+				return;
+			}
 			res.statusCode = HTTPStatus.ok;
 			res.writeJsonBody(brokerTokenResponseJson(brokered.token,
 				brokered.expiresIn, brokered.issued.scopes.join(" ")));
@@ -3344,6 +3362,28 @@ unittest  // BROKER MOUNT: a 200 upstream response carrying an OAuth error mints
 	assert(res.status == 400);
 	assert(res.body_.canFind("bad_verification_code"));
 	assert(!res.body_.canFind("access_token"));
+}
+
+unittest  // BROKER MOUNT: an issueToken hook that throws is answered with a 500 JSON server_error
+{
+	import vibe.data.json : parseJsonString;
+
+	auto cfg = brokerMountConfig(new ReferenceTokenStore());
+	cfg.issueToken = (TokenSet upstream) @safe {
+		throw new Exception("user lookup failed");
+	};
+	auto proxy = new OAuthProxy(cfg);
+	auto router = new URLRouter;
+	mountOAuthToken(router, proxy,
+			fixedUpstream(`{"access_token":"gho_upstream","token_type":"bearer"}`));
+
+	const res = browserPost(router, "https://mcp.example.com/token",
+			redeemableCodeForm(proxy), "");
+	assert(res.status == 500);
+	const j = parseJsonString(res.body_);
+	assert(j["error"].get!string == "server_error");
+	assert(!res.body_.canFind("gho_upstream"));
+	assert(!res.body_.canFind("user lookup failed"));
 }
 
 unittest  // BROKER MOUNT: expires_in reflects the minted token's lifetime, not the upstream token's
