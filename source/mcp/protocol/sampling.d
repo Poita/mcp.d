@@ -96,22 +96,31 @@ struct SamplingMessage
 		requireObject(j, "SamplingMessage");
 		SamplingMessage m;
 		m.role = j.getOr("role", "");
-		// `content` may be a single block (object) or an array of blocks; accept
-		// both so a tool-loop follow-up (array of tool_use/tool_result blocks)
-		// round-trips without dropping any block.
-		if ("content" in j)
-		{
-			auto c = j["content"];
-			if (c.type == Json.Type.array)
-				foreach (i; 0 .. c.length)
-					m.contentBlocks ~= Content.fromJson(c[i]);
-			else
-				m.contentBlocks ~= Content.fromJson(c);
-		}
+		m.contentBlocks = requiredContentBlocks(j, "SamplingMessage");
 		if ("_meta" in j && j["_meta"].type == Json.Type.object)
 			m.meta = j["_meta"];
 		return m;
 	}
+}
+
+/// Parse the required `content` of a sampling message or result: a single block
+/// (object) or an array of blocks, so a tool-loop message carrying several
+/// tool_use/tool_result blocks round-trips. Throws -32602 when `content` is
+/// absent or an empty array.
+private Content[] requiredContentBlocks(Json j, string owner) @safe
+{
+	if ("content" !in j)
+		throw invalidParams(owner ~ " requires 'content'");
+	auto c = j["content"];
+	Content[] blocks;
+	if (c.type == Json.Type.array)
+		foreach (i; 0 .. c.length)
+			blocks ~= Content.fromJson(c[i]);
+	else
+		blocks ~= Content.fromJson(c);
+	if (blocks.length == 0)
+		throw invalidParams(owner ~ " requires at least one content block");
+	return blocks;
 }
 
 /// A hint for which model the client should select. `name` is a substring the
@@ -602,17 +611,7 @@ struct CreateMessageResult
 		requireObject(j, "CreateMessageResult");
 		CreateMessageResult r;
 		r.role = j.getOr("role", "");
-		// `content` may be a single block (object) or an array of blocks; accept
-		// both so a tool-use reply (array of tool_use blocks) round-trips.
-		if ("content" in j)
-		{
-			auto c = j["content"];
-			if (c.type == Json.Type.array)
-				foreach (i; 0 .. c.length)
-					r.contentBlocks ~= Content.fromJson(c[i]);
-			else
-				r.contentBlocks ~= Content.fromJson(c);
-		}
+		r.contentBlocks = requiredContentBlocks(j, "CreateMessageResult");
 		r.model = j.getOr("model", "");
 		tryGet(j, "stopReason", r.stopReason);
 		if ("_meta" in j && j["_meta"].type == Json.Type.object)
@@ -1401,6 +1400,26 @@ unittest  // ModelPreferences.fromJson rejects a non-numeric priority with -3260
 			ModelPreferences.fromJson(Json(["costPriority": Json("high")])));
 	assert(ex !is null && ex.code == ErrorCode.invalidParams);
 	assert(ModelPreferences.fromJson(Json(["speedPriority": Json(1)])).speedPriority.get == 1.0);
+}
+
+unittest  // SamplingMessage and CreateMessageResult fromJson reject absent or empty content with -32602
+{
+	import mcp.protocol.errors : ErrorCode;
+	import std.exception : collectException;
+	import vibe.data.json : parseJsonString;
+
+	static immutable string[] bodies = [
+		`{"role":"assistant","model":"m"}`,
+		`{"role":"assistant","model":"m","content":[]}`,
+	];
+	foreach (b; bodies)
+	{
+		auto e1 = cast(McpException) collectException(SamplingMessage.fromJson(parseJsonString(b)));
+		assert(e1 !is null && e1.code == ErrorCode.invalidParams, b);
+		auto e2 = cast(McpException) collectException(
+				CreateMessageResult.fromJson(parseJsonString(b)));
+		assert(e2 !is null && e2.code == ErrorCode.invalidParams, b);
+	}
 }
 
 unittest  // every sampling fromJson rejects a non-object value with -32602
