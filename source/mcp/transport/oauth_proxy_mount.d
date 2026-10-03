@@ -906,6 +906,11 @@ void mountOAuthToken(URLRouter router, OAuthProxy proxy) @safe
 /// relayed (`OAuthProxy.takeRelayedRefreshToken`); any other is refused with
 /// `invalid_grant`.
 ///
+/// In both modes a 2xx upstream response that carries an OAuth `error` member
+/// (GitHub answers a bad code this way) or no `access_token` is answered as an
+/// RFC 6749 §5.2 error: 400 with the upstream `error`/`error_description`, or
+/// 502 `server_error` when the upstream names no error.
+///
 /// In ISSUE-OWN-TOKEN (broker) mode (when the proxy's `issueToken` + `tokenStore`
 /// are set) the endpoint still exchanges upstream, but then mints the MCP
 /// server's OWN opaque token for the client via `proxy.issueClientToken`, keeps
@@ -1020,36 +1025,35 @@ in (exchange !is null)
 			return;
 		}
 
+		// Some IdPs (GitHub) report a failed exchange as a 2xx with an OAuth
+		// `error` body. A 2xx that carries an error, or no access_token, is
+		// answered as an RFC 6749 §5.2 error in both modes rather than relayed
+		// or minted from.
+		const is2xx = status >= 200 && status < 300;
+		const upstreamJson = is2xx ? parseJsonBody(responseBody) : Json.undefined;
+		if (is2xx)
+		{
+			Json err;
+			HTTPStatus errStatus;
+			if (upstreamTokenError(upstreamJson, err, errStatus))
+			{
+				proxy.recordRelayedRefreshToken(refreshToken);
+				res.statusCode = errStatus;
+				res.writeJsonBody(err);
+				return;
+			}
+		}
+
 		// In broker mode, mint OUR token for the client from the upstream response
 		// and keep the upstream token server-side — the client never sees the
 		// upstream token. (Broker-mode refresh grants are already refused above.)
 		// Otherwise — passthrough mode, or a non-2xx upstream — relay the upstream
 		// body to the client verbatim.
-		if (proxy.brokerEnabled() && !isRefresh && status >= 200 && status < 300)
+		if (proxy.brokerEnabled() && !isRefresh && is2xx)
 		{
-			// Some IdPs (GitHub) report a failed exchange as a 2xx with an OAuth
-			// `error` body, so a token is minted only for a response that carries
-			// an access_token and no error.
-			const upstreamJson = parseJsonBody(responseBody);
-			const upstreamError = upstreamJson.type == Json.Type.object
-				&& "error" in upstreamJson ? upstreamJson["error"] : Json.undefined;
-			const upstream = TokenSet.fromJson(upstreamJson);
-			if (upstreamError.type != Json.Type.undefined || upstream.accessToken.length == 0)
-			{
-				Json err = Json.emptyObject;
-				const errorCode = upstreamError.type == Json.Type.string
-					? upstreamError.get!string : "";
-				err["error"] = errorCode.length ? errorCode : "server_error";
-				if (auto d = "error_description" in upstreamJson)
-					if (d.type == Json.Type.string)
-						err["error_description"] = *d;
-				res.statusCode = errorCode.length ? HTTPStatus.badRequest : HTTPStatus.badGateway;
-				res.writeJsonBody(err);
-				return;
-			}
 			import std.array : join;
 
-			const brokered = proxy.issueClientToken(upstream);
+			const brokered = proxy.issueClientToken(TokenSet.fromJson(upstreamJson));
 			res.statusCode = HTTPStatus.ok;
 			res.writeJsonBody(brokerTokenResponseJson(brokered.token,
 				brokered.expiresIn, brokered.issued.scopes.join(" ")));
@@ -1059,12 +1063,34 @@ in (exchange !is null)
 		// A relayed refresh token (new, or rotated from the presented one) is
 		// remembered so the client can refresh with it; one the upstream did not
 		// rotate stays valid.
-		const relayedRefresh = status >= 200 && status < 300 ? relayedRefreshToken(responseBody)
-			: "";
+		const relayedRefresh = is2xx ? relayedRefreshToken(responseBody) : "";
 		proxy.recordRelayedRefreshToken(relayedRefresh.length ? relayedRefresh : refreshToken);
 		res.statusCode = cast(HTTPStatus) status;
 		res.writeBody(responseBody.length ? responseBody : "{}", "application/json");
 	});
+}
+
+/// Whether a 2xx upstream token response is in fact a failure: it carries an
+/// OAuth `error` member or no `access_token`. On failure `err` is the RFC 6749
+/// §5.2 body for the client — the upstream `error` code (400) when it names
+/// one, else `server_error` (502) — and `status` its HTTP status.
+private bool upstreamTokenError(const Json upstreamJson, out Json err, out HTTPStatus status) @safe
+{
+	const isObject = upstreamJson.type == Json.Type.object;
+	const upstreamError = isObject && "error" in upstreamJson ? upstreamJson["error"]
+		: Json.undefined;
+	if (upstreamError.type == Json.Type.undefined
+			&& TokenSet.fromJson(upstreamJson).accessToken.length)
+		return false;
+	const errorCode = upstreamError.type == Json.Type.string ? upstreamError.get!string : "";
+	err = Json.emptyObject;
+	err["error"] = errorCode.length ? errorCode : "server_error";
+	if (isObject)
+		if (auto d = "error_description" in upstreamJson)
+			if (d.type == Json.Type.string)
+				err["error_description"] = *d;
+	status = errorCode.length ? HTTPStatus.badRequest : HTTPStatus.badGateway;
+	return true;
 }
 
 /// The `refresh_token` an upstream token response carries, or empty.
@@ -3383,6 +3409,37 @@ unittest  // PASSTHROUGH REGRESSION: with no issueToken/tokenStore the upstream 
 	assert(res.statusCode == 200);
 	// Passthrough relays the upstream token to the client verbatim.
 	assert(body_.canFind("gho_upstream_secret"));
+}
+
+unittest  // PASSTHROUGH: a 200 upstream response carrying an OAuth error is answered 400
+{
+	import vibe.data.json : parseJsonString;
+
+	auto proxy = mountSampleProxy();
+	auto router = new URLRouter;
+	mountOAuthToken(router, proxy, fixedUpstream(`{"error":"bad_verification_code",`
+			~ `"error_description":"The code passed is incorrect or expired."}`));
+
+	const res = browserPost(router, "https://mcp.example.com/token",
+			redeemableCodeForm(proxy), "");
+	assert(res.status == 400);
+	const j = parseJsonString(res.body_);
+	assert(j["error"].get!string == "bad_verification_code");
+	assert(j["error_description"].get!string == "The code passed is incorrect or expired.");
+}
+
+unittest  // PASSTHROUGH: a 200 upstream response with no access_token is answered 502 server_error
+{
+	import vibe.data.json : parseJsonString;
+
+	auto proxy = mountSampleProxy();
+	auto router = new URLRouter;
+	mountOAuthToken(router, proxy, fixedUpstream(`{"token_type":"bearer"}`));
+
+	const res = browserPost(router, "https://mcp.example.com/token",
+			redeemableCodeForm(proxy), "");
+	assert(res.status == 502);
+	assert(parseJsonString(res.body_)["error"].get!string == "server_error");
 }
 
 unittest  // every /token response forbids caching (RFC 6749 §5.1)
