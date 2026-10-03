@@ -1117,7 +1117,8 @@ final class McpServer : ServerCore
 	/// the client signals its root list changed (client/roots: "Servers SHOULD
 	/// ... handle root list changes gracefully"). Mirrors the client-side
 	/// `onNotification` observer. Purely an application-facing callback; it does
-	/// not affect the JSON-RPC wire output for any protocol version.
+	/// not affect the JSON-RPC wire output for any protocol version: an exception
+	/// the observer throws is logged and otherwise ignored.
 	///
 	/// The observer itself receives no `RequestContext`: inbound notifications are
 	/// dispatched without one. To issue the `ctx.listRoots()` refresh, capture a
@@ -2784,17 +2785,35 @@ final class McpServer : ServerCore
 			break;
 		case "notifications/roots/list_changed":
 			if (onRootsListChanged_ !is null)
-				onRootsListChanged_();
+				runObserver(msg.method, () @safe { onRootsListChanged_(); });
 			if (onClientNotification_ !is null)
-				onClientNotification_(msg.method, msg.params);
+				runObserver(msg.method, () @safe {
+					onClientNotification_(msg.method, msg.params);
+				});
 			break;
 		default:
 			// Unconsumed client notifications are surfaced to the application
 			// observer (if any) and otherwise ignored, per JSON-RPC.
 			if (onClientNotification_ !is null)
-				onClientNotification_(msg.method, msg.params);
+				runObserver(msg.method, () @safe {
+					onClientNotification_(msg.method, msg.params);
+				});
 			break;
 		}
+	}
+
+	/// Run an application notification observer, logging rather than
+	/// propagating anything it throws: a notification has no reply to carry an
+	/// error, and an escaping exception would otherwise abort the transport's
+	/// handling of the batch or POST that carried it.
+	private static void runObserver(string method, scope void delegate() @safe observer) @safe
+	{
+		import vibe.core.log : logError;
+
+		try
+			observer();
+		catch (Exception e)
+			logError("%s observer: unhandled %s: %s", method, typeid(e).name, e.msg);
 	}
 
 	/// Honour an inbound `notifications/cancelled` (basic/utilities/cancellation):
@@ -5933,6 +5952,40 @@ unittest  // unrecognised client notifications are surfaced to the generic obser
 	auto out_ = s.handle(Message(makeNotification("notifications/something/unknown")));
 	assert(out_.isNull);
 	assert(seenMethod == "notifications/something/unknown");
+}
+
+unittest  // a throwing client-notification observer does not escape handle()
+{
+	auto s = new McpServer("t", "1");
+	s.setRootsListChangedHandler(() @safe { throw new Exception("roots boom"); });
+	s.setClientNotificationHandler((string method, Json params) @safe {
+		throw new Exception("observer boom");
+	});
+
+	auto out_ = s.handle(Message(makeNotification("notifications/roots/list_changed")));
+	assert(out_.isNull);
+	out_ = s.handle(Message(makeNotification("notifications/something/unknown")));
+	assert(out_.isNull);
+}
+
+unittest  // a throwing client-notification observer does not drop a batch's replies
+{
+	import vibe.data.json : parseJsonString;
+
+	auto s = makeTestServer();
+	Json params = Json.emptyObject;
+	params["protocolVersion"] = "2025-03-26";
+	params["capabilities"] = Json.emptyObject;
+	params["clientInfo"] = Json(["name": Json("c"), "version": Json("1")]);
+	s.handle(req(1, "initialize", params));
+	s.setRootsListChangedHandler(() @safe { throw new Exception("roots boom"); });
+
+	auto outText = s.handleRaw(`[{"jsonrpc":"2.0","id":1,"method":"ping"},
+		{"jsonrpc":"2.0","method":"notifications/roots/list_changed"}]`);
+	auto arr = parseJsonString(outText);
+	assert(arr.type == Json.Type.array);
+	assert(arr.length == 1);
+	assert(arr[0]["id"].get!int == 1);
 }
 
 unittest  // server-consumed notifications do NOT reach the generic client observer
