@@ -2792,6 +2792,22 @@ unittest  // a requestState-only CallToolResult is input-required and round-trip
 	assert("content" !in j);
 }
 
+unittest  // a result whose resultType is not input_required ignores stray MRTR fields
+{
+	import vibe.data.json : parseJsonString;
+
+	enum stray = `"inputRequests":{"r":{"method":"roots/list"}},"requestState":"s"`;
+	auto c = CallToolResult.fromJson(
+			parseJsonString(`{"resultType":"complete","content":[],` ~ stray ~ `}`));
+	assert(!c.isInputRequired());
+	auto rr = ReadResourceResult.fromJson(
+			parseJsonString(`{"resultType":"complete","contents":[],` ~ stray ~ `}`));
+	assert(!rr.isInputRequired);
+	auto gp = GetPromptResult.fromJson(
+			parseJsonString(`{"resultType":"complete","messages":[],` ~ stray ~ `}`));
+	assert(!gp.isInputRequired);
+}
+
 unittest  // a completed CallToolResult is not an InputRequiredResult
 {
 	CallToolResult r;

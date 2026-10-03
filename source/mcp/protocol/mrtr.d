@@ -917,9 +917,15 @@ void emitInputRequired(ref Json j, const(InputRequest)[] requests, string reques
 /// Parse the shared MRTR (SEP-2322) `InputRequiredResult` payload from `j` into
 /// `requests` and `requestState`. Inverse of `emitInputRequired`; shared by
 /// `InputRequiredResult.fromJson` and `CallToolResult.fromJson`. Both reads are
-/// guarded, so a `j` carrying neither field leaves the outputs untouched.
+/// guarded, so a `j` carrying neither field leaves the outputs untouched. A
+/// string `resultType` other than `"input_required"` declares the result
+/// complete, so any stray MRTR fields beside it are ignored; without a
+/// `resultType` the fields alone decide.
 void parseInputRequired(Json j, ref InputRequest[] requests, ref string requestState) @safe
 {
+	if ("resultType" in j && j["resultType"].type == Json.Type.string
+			&& j["resultType"].get!string != "input_required")
+		return;
 	if ("inputRequests" in j && j["inputRequests"].type == Json.Type.object)
 		requests = inputRequestsFromJson(j["inputRequests"]);
 	tryGet(j, "requestState", requestState);
