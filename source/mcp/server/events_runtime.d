@@ -1456,6 +1456,9 @@ final class EventsRuntime
 		auto grant = grantTtl(p, now);
 		sub.noExpiry = grant.isNull;
 		sub.expiresAtMs = grant.isNull ? 0 : grant.get;
+		// The refresh reports the health the client is refreshing from, including
+		// a suspension (active=false, failedSince) this refresh is about to lift.
+		const priorStatus = deliveryStatusFor(sub);
 		const reactivated = !sub.active;
 		sub.active = true;
 		// A reactivated subscription is judged on what happens next, not on the
@@ -1516,7 +1519,7 @@ final class EventsRuntime
 		// On a refresh, surface delivery health so the client can detect problems
 		// without a separate monitoring channel.
 		if (!isNew)
-			r.deliveryStatus = deliveryStatusFor(sub);
+			r.deliveryStatus = priorStatus;
 		return r;
 	}
 
@@ -6944,6 +6947,34 @@ unittest  // a sustained failure rate over the minimum sample suspends the subsc
 	assert(suspended.windowAttempts == 2 && suspended.windowFailures == 2);
 }
 
+unittest  // the refresh that reactivates a suspended subscription reports the suspension
+{
+	auto ft = new FakeWebhookTransport();
+	EventsOptions o;
+	o.nowMs = () @safe => 1_000_000L;
+	o.nowIso = () @safe => "t";
+	o.allowPrivateCallbackHosts = true;
+	o.webhookTransport = ft;
+	o.deliveryExecutor = (void delegate() @safe job) @safe { job(); };
+	o.deliverySleep = (Duration d) @safe {};
+	o.webhookMaxAttempts = 1;
+	o.webhookSuspension.minAttempts = 2;
+	auto rt = new EventsRuntime(null, o);
+	EventRegistration reg = {descriptor: EventType("n"), emitOnly: true};
+	rt.register(reg);
+	auto r = rt.subscribeWebhook(webhookSub("n", "https://proxy/hooks"), "user-1");
+	ft.eventStatuses = [500, 500];
+	rt.emit(EventOccurrence("evt_1", "n", "t"));
+	rt.emit(EventOccurrence("evt_2", "n", "t"));
+	assert(!rt.webhookStore().get(r.id).get.active);
+
+	auto refreshed = rt.subscribeWebhook(webhookSub("n", "https://proxy/hooks"), "user-1");
+	assert(!refreshed.deliveryStatus.isNull);
+	assert(!refreshed.deliveryStatus.get.active);
+	assert(!refreshed.deliveryStatus.get.failedSince.isNull);
+	assert(rt.webhookStore().get(r.id).get.active);
+}
+
 unittest  // a refresh that reactivates a suspended subscription starts a fresh failure window
 {
 	auto ft = new FakeWebhookTransport();
@@ -7154,7 +7185,8 @@ unittest  // events missed while suspended are signalled with a gap once a refre
 
 	// The refresh reactivates delivery and a gap tells the client what it missed.
 	auto refreshed = rt.subscribeWebhook(webhookSub("n", "https://proxy/hooks"), "user-1");
-	assert(!refreshed.deliveryStatus.isNull && refreshed.deliveryStatus.get.active);
+	assert(!refreshed.deliveryStatus.isNull && !refreshed.deliveryStatus.get.active);
+	assert(rt.webhookStore().get(r.id).get.active);
 	assert(ft.eventPosts().length == posts);
 	auto gapPosts = controlPostsOf(ft, "gap");
 	assert(gapPosts.length == gaps + 1);
