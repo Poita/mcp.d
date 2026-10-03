@@ -1580,8 +1580,12 @@ final class EventsRuntime
 			auto ctx = new EventContext(sub.fetchCursor, sub.arguments, sub.principal, maxAgeMs);
 			try
 				er = reg.check(ctx);
-			catch (Exception)
-				return false; // the upstream is unavailable: no replay, delivery continues live
+			catch (Exception e)
+			{
+				// The upstream is unavailable: no replay, delivery continues live.
+				logEventsError("webhook backfill check threw", e);
+				return false;
+			}
 			foreach (ref occ; er.events)
 				if (occ.cursor.isNull)
 					occ.cursor = er.cursor; // a batch-cursor event settles with its batch
@@ -1638,8 +1642,12 @@ final class EventsRuntime
 				EventResult er;
 				try
 					er = reg.check(ctx);
-				catch (Exception)
-					continue; // transient upstream failure: try again next pass
+				catch (Exception e)
+				{
+					// A transient upstream failure: the next pass tries again.
+					logEventsError("webhook poll check threw", e);
+					continue;
+				}
 				foreach (ref occ; er.events)
 					if (occ.cursor.isNull)
 						occ.cursor = er.cursor;
@@ -6067,6 +6075,43 @@ unittest  // a check-backed type is served over webhook by replaying from the cu
 	rt.pollWebhookSubscriptions();
 	assert(seen.length == 3);
 	assert(ft.eventPosts().length == 1); // quiet polls deliver nothing
+}
+
+unittest  // a check that throws during a webhook backfill is logged
+{
+	import std.algorithm : any, canFind;
+
+	auto rt = engineRuntime(new FakeWebhookTransport());
+	EventRegistration reg;
+	reg.descriptor.name = "email.received";
+	reg.check = (EventContext ctx) @safe {
+		if (ctx.isBootstrap())
+			return EventResult.empty("h0");
+		throw new Exception("mailbox API 503");
+	};
+	rt.register(reg);
+	auto p = webhookSub("email.received", "https://proxy/hooks");
+	p.cursor = "h0";
+	auto lines = captureLogs(() @safe { rt.subscribeWebhook(p, "user-1"); });
+	assert(lines.any!(l => l.canFind("mailbox API 503")));
+}
+
+unittest  // a check that throws during the poll-driven webhook pass is logged
+{
+	import std.algorithm : any, canFind;
+
+	auto rt = engineRuntime(new FakeWebhookTransport());
+	EventRegistration reg;
+	reg.descriptor.name = "email.received";
+	reg.check = (EventContext ctx) @safe {
+		if (ctx.isBootstrap())
+			return EventResult.empty("h0");
+		throw new Exception("mailbox API 503");
+	};
+	rt.register(reg);
+	rt.subscribeWebhook(webhookSub("email.received", "https://proxy/hooks"), "user-1");
+	auto lines = captureLogs(() @safe { rt.pollWebhookSubscriptions(); });
+	assert(lines.any!(l => l.canFind("mailbox API 503")));
 }
 
 unittest  // a poll-driven gap goes through verification: an unverified endpoint is sent no gap
