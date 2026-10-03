@@ -67,8 +67,11 @@ struct SamplingMessage
 
 	Json toJson() const @safe
 	{
-		if (contentBlocks.length == 0)
-			throw invalidParams("SamplingMessage requires at least one content block");
+		import std.exception : enforce;
+
+		// An empty message is a local builder mistake, so it is a plain Exception
+		// rather than a -32602 that would blame the peer.
+		enforce(contentBlocks.length > 0, "SamplingMessage requires at least one content block");
 		Json j = Json.emptyObject;
 		j["role"] = role;
 		// Preserve the single-object wire shape for the common one-block message
@@ -250,10 +253,12 @@ struct CreateMessageRequest
 		// `maxTokens` is REQUIRED by CreateMessageRequestParams in every spec
 		// version (schema.ts: `maxTokens: number;`, no `?`). Refuse to serialize a
 		// request that would omit it rather than silently emit spec-invalid params.
-		if (maxTokens.isNull)
-			throw invalidParams("CreateMessageRequest.maxTokens is required and must be set");
-		if (maxTokens.get < 0)
-			throw invalidParams("CreateMessageRequest.maxTokens must not be negative");
+		// This is a local builder mistake, so it is a plain Exception rather than
+		// a -32602 that would blame the peer.
+		import std.exception : enforce;
+
+		enforce(!maxTokens.isNull, "CreateMessageRequest.maxTokens is required and must be set");
+		enforce(maxTokens.get >= 0, "CreateMessageRequest.maxTokens must not be negative");
 		if (!modelPreferences.empty)
 			j["modelPreferences"] = modelPreferences.toJson();
 		if (!systemPrompt.isNull)
@@ -545,8 +550,11 @@ struct CreateMessageResult
 
 	Json toJson() const @safe
 	{
-		if (contentBlocks.length == 0)
-			throw invalidParams("CreateMessageResult requires at least one content block");
+		import std.exception : enforce;
+
+		// An empty result is a local builder mistake, so it is a plain Exception
+		// rather than a -32602 that would blame the peer.
+		enforce(contentBlocks.length > 0, "CreateMessageResult requires at least one content block");
 		Json j = Json.emptyObject;
 		j["role"] = role;
 		// Preserve the single-object wire shape for the common one-block reply
@@ -768,15 +776,13 @@ unittest  // CreateMessageRequest.toJson throws when the REQUIRED maxTokens is u
 	req.messages = [SamplingMessage("user", Content.makeText("hi"))];
 	assert(req.maxTokens.isNull);
 
-	bool threw;
-	try
-		cast(void) req.toJson();
-	catch (McpException e)
-	{
-		threw = true;
-		assert(e.code == ErrorCode.invalidParams);
-	}
-	assert(threw, "toJson must throw invalidParams when maxTokens is unset");
+	// A missing maxTokens is a local builder mistake, not bad peer params, so
+	// it surfaces as a plain Exception rather than a -32602 McpException.
+	import std.exception : collectException;
+
+	auto e = collectException(req.toJson());
+	assert(e !is null, "toJson must throw when maxTokens is unset");
+	assert(cast(McpException) e is null);
 }
 
 unittest  // CreateMessageRequest.toJson emits maxTokens once it is set
@@ -865,14 +871,16 @@ unittest  // CreateMessageRequest.fromJson rejects a negative or out-of-range ma
 	}
 }
 
-unittest  // CreateMessageRequest.toJson rejects a negative maxTokens with -32602
+unittest  // CreateMessageRequest.toJson rejects a negative maxTokens as a local error
 {
 	import std.exception : collectException;
 
 	CreateMessageRequest req;
+	req.messages = [SamplingMessage("user", Content.makeText("hi"))];
 	req.maxTokens = -5;
-	auto ex = cast(McpException) collectException(req.toJson());
-	assert(ex !is null && ex.code == ErrorCode.invalidParams);
+	auto e = collectException(req.toJson());
+	assert(e !is null);
+	assert(cast(McpException) e is null);
 }
 
 unittest  // CreateMessageRequest emits tools and toolChoice; omits when unset
@@ -1053,41 +1061,29 @@ unittest  // CreateMessageResult.text honours custom stopReason and role
 	assert(u.role == "user");
 }
 
-unittest  // SamplingMessage.toJson throws invalidParams when contentBlocks is empty
+unittest  // SamplingMessage.toJson throws a local error when contentBlocks is empty
 {
-	import mcp.protocol.errors : ErrorCode;
+	import std.exception : collectException;
 
 	SamplingMessage m;
 	m.role = "user";
 	// contentBlocks is empty — toJson must reject this rather than emit `"content": []`
-	bool threw;
-	try
-		cast(void) m.toJson();
-	catch (McpException e)
-	{
-		threw = true;
-		assert(e.code == ErrorCode.invalidParams);
-	}
-	assert(threw, "SamplingMessage.toJson must throw invalidParams when contentBlocks is empty");
+	auto e = collectException(m.toJson());
+	assert(e !is null, "SamplingMessage.toJson must throw when contentBlocks is empty");
+	assert(cast(McpException) e is null);
 }
 
-unittest  // CreateMessageResult.toJson throws invalidParams when contentBlocks is empty
+unittest  // CreateMessageResult.toJson throws a local error when contentBlocks is empty
 {
-	import mcp.protocol.errors : ErrorCode;
+	import std.exception : collectException;
 
 	CreateMessageResult r;
 	r.role = "assistant";
 	r.model = "m";
 	// contentBlocks is empty — toJson must reject this rather than emit `"content": []`
-	bool threw;
-	try
-		cast(void) r.toJson();
-	catch (McpException e)
-	{
-		threw = true;
-		assert(e.code == ErrorCode.invalidParams);
-	}
-	assert(threw, "CreateMessageResult.toJson must throw invalidParams when contentBlocks is empty");
+	auto e = collectException(r.toJson());
+	assert(e !is null, "CreateMessageResult.toJson must throw when contentBlocks is empty");
+	assert(cast(McpException) e is null);
 }
 
 unittest  // StopReason wire mapping is exact and reversible

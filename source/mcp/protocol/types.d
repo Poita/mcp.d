@@ -469,8 +469,7 @@ struct Content
 	{
 		Content c = dupSelf();
 		c.payload.match!((ref ResourceLink x) { x.description = d; }, (ref _) {
-			throw new McpException(ErrorCode.invalidParams,
-				"withDescription is only valid on resource_link content");
+			throw new Exception("withDescription is only valid on resource_link content");
 		});
 		return c;
 	}
@@ -482,8 +481,7 @@ struct Content
 	{
 		Content c = dupSelf();
 		c.payload.match!((ref ResourceLink x) { x.title = t; }, (ref _) {
-			throw new McpException(ErrorCode.invalidParams,
-				"withTitle is only valid on resource_link content");
+			throw new Exception("withTitle is only valid on resource_link content");
 		});
 		return c;
 	}
@@ -495,8 +493,7 @@ struct Content
 	{
 		Content c = dupSelf();
 		c.payload.match!((ref ResourceLink x) { x.size = s; }, (ref _) {
-			throw new McpException(ErrorCode.invalidParams,
-				"withSize is only valid on resource_link content");
+			throw new Exception("withSize is only valid on resource_link content");
 		});
 		return c;
 	}
@@ -516,8 +513,7 @@ struct Content
 	{
 		Content c = dupSelf();
 		c.payload.match!((ref ToolResultContent x) { x.isError = e; }, (ref _) {
-			throw new McpException(ErrorCode.invalidParams,
-				"withIsError is only valid on tool_result content");
+			throw new Exception("withIsError is only valid on tool_result content");
 		});
 		return c;
 	}
@@ -528,8 +524,7 @@ struct Content
 	{
 		Content c = dupSelf();
 		c.payload.match!((ref ToolResultContent x) { x.structuredContent = sc; }, (ref _) {
-			throw new McpException(ErrorCode.invalidParams,
-				"withStructuredContent is only valid on tool_result content");
+			throw new Exception("withStructuredContent is only valid on tool_result content");
 		});
 		return c;
 	}
@@ -1753,27 +1748,31 @@ unittest  // resource link omits description/title/size when unset
 	assert("size" !in j);
 }
 
-unittest  // withIsError on a non-tool_result kind throws a recoverable error
-{
-	import std.exception : assertThrown;
-
-	assertThrown!McpException(Content.makeText("x").withIsError(true));
-}
-
-unittest  // withStructuredContent on a non-tool_result kind throws a recoverable error
-{
-	import std.exception : assertThrown;
-
-	assertThrown!McpException(Content.makeText("x").withStructuredContent(Json.emptyObject));
-}
-
-unittest  // the misuse error carries the invalidParams code
+unittest  // withIsError on a non-tool_result kind throws a recoverable local error
 {
 	import std.exception : collectException;
 
-	auto e = collectException!McpException(Content.makeText("x").withSize(10));
+	auto e = collectException(Content.makeText("x").withIsError(true));
 	assert(e !is null);
-	assert(e.code == ErrorCode.invalidParams);
+	assert(cast(McpException) e is null);
+}
+
+unittest  // withStructuredContent on a non-tool_result kind throws a recoverable local error
+{
+	import std.exception : collectException;
+
+	auto e = collectException(Content.makeText("x").withStructuredContent(Json.emptyObject));
+	assert(e !is null);
+	assert(cast(McpException) e is null);
+}
+
+unittest  // the misuse error is a plain Exception, not a -32602 McpException
+{
+	import std.exception : collectException;
+
+	auto e = collectException(Content.makeText("x").withSize(10));
+	assert(e !is null);
+	assert(cast(McpException) e is null);
 }
 
 unittest  // resource link emits description (matches spec tools example)
@@ -1875,11 +1874,17 @@ unittest  // withDescription/withTitle/withSize reject non-resourceLink kinds
 {
 	// They are valid only on resource_link content. Applying them to another
 	// kind is a recoverable error that survives -release (not a process abort).
-	import std.exception : assertThrown;
+	import std.exception : collectException;
 
-	assertThrown!McpException(Content.makeText("hi").withDescription("x"));
-	assertThrown!McpException(Content.makeImage("d", "image/png").withTitle("t"));
-	assertThrown!McpException(Content.makeAudio("d", "audio/wav").withSize(5L));
+	foreach (e; [
+		collectException(Content.makeText("hi").withDescription("x")),
+		collectException(Content.makeImage("d", "image/png").withTitle("t")),
+		collectException(Content.makeAudio("d", "audio/wav").withSize(5L))
+	])
+	{
+		assert(e !is null);
+		assert(cast(McpException) e is null);
+	}
 }
 
 unittest  // image content uses data + mimeType

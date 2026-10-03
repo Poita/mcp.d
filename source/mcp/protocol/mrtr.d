@@ -5,7 +5,7 @@ import vibe.data.json : Json;
 
 import mcp.protocol.versions : ProtocolVersion;
 import mcp.protocol.sampling : CreateMessageRequest;
-import mcp.protocol.errors : isValidElicitationUrl, invalidParams;
+import mcp.protocol.errors : isValidElicitationUrl;
 import mcp.protocol.jsonhelpers : tryGet, requireObject;
 
 @safe:
@@ -732,13 +732,16 @@ struct InputRequest
 	/// form, the client is directed to a `url` to gather input out-of-band. The
 	/// modern `ElicitRequestURLParams` is `{mode:"url", message, url}` — correlation
 	/// is the MRTR `InputRequest.id`, so the request carries no `elicitationId`
-	/// (removed from 2026-07-28). `url` MUST be a non-empty valid absolute URI.
+	/// (removed from 2026-07-28). `url` MUST be a non-empty valid absolute URI;
+	/// otherwise this throws a plain `Exception` (a local programming error, not
+	/// a peer `-32602`).
 	static InputRequest elicitationUrl(string id, string message, string url) @safe
 	{
-		if (url.length == 0)
-			throw invalidParams("URL-mode elicitation requires a non-empty url");
-		if (!isValidElicitationUrl(url))
-			throw invalidParams("URL-mode elicitation requires a valid url (absolute URI): " ~ url);
+		import std.exception : enforce;
+
+		enforce(url.length > 0, "URL-mode elicitation requires a non-empty url");
+		enforce(isValidElicitationUrl(url),
+				"URL-mode elicitation requires a valid url (absolute URI): " ~ url);
 		Json p = Json.emptyObject;
 		p["mode"] = "url";
 		p["message"] = message;
@@ -1904,20 +1907,24 @@ unittest  // InputRequest.elicitationUrl readers round-trip url and message
 	assert(ir.elicitationMessage() == "msg");
 }
 
-unittest  // InputRequest.elicitationUrl rejects empty url
+unittest  // InputRequest.elicitationUrl rejects empty url as a local error
 {
-	import std.exception : assertThrown;
+	import std.exception : collectException;
 	import mcp.protocol.errors : McpException;
 
-	assertThrown!McpException(InputRequest.elicitationUrl("e", "m", ""));
+	auto e = collectException(InputRequest.elicitationUrl("e", "m", ""));
+	assert(e !is null);
+	assert(cast(McpException) e is null);
 }
 
-unittest  // InputRequest.elicitationUrl rejects a malformed (non-absolute) url
+unittest  // InputRequest.elicitationUrl rejects a malformed (non-absolute) url as a local error
 {
-	import std.exception : assertThrown;
+	import std.exception : collectException;
 	import mcp.protocol.errors : McpException;
 
-	assertThrown!McpException(InputRequest.elicitationUrl("e", "m", "not a url"));
+	auto e = collectException(InputRequest.elicitationUrl("e", "m", "not a url"));
+	assert(e !is null);
+	assert(cast(McpException) e is null);
 }
 
 unittest  // InputRequest.fromJson rejects a non-object request value with -32602
