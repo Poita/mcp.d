@@ -108,7 +108,7 @@ struct RequestStateSecurity
 /// wire; `decode` verifies an echoed blob and returns the inner state, or null
 /// when verification fails (the caller then treats it as no state and
 /// re-elicits). All crypto is fail-closed.
-final class RequestStateCodec
+package(mcp) final class RequestStateCodec
 {
 	private const ubyte[32] cipherKey;
 	private const ubyte[32] bindSubkey;
@@ -117,8 +117,11 @@ final class RequestStateCodec
 	private const Duration ttl;
 	private const RequestStateBinding bindTo;
 
+	/// Throws when `sec.key` is shorter than 32 bytes.
 	this(RequestStateSecurity sec) @safe
 	{
+		if (sec.key.length < 32)
+			throw new Exception("secureRequestState: key must be at least 32 bytes");
 		// Split the operator secret into independent sub-keys via HKDF-SHA256
 		// (RFC 5869) with distinct info labels, one per use, so the AES key, the
 		// bind-tag key and the payload-MAC key share no bytes even when the
@@ -532,6 +535,18 @@ version (unittest)
 		sec.bindTo = b;
 		return new RequestStateCodec(sec);
 	}
+}
+
+unittest  // the codec refuses a key shorter than 32 bytes
+{
+	import std.exception : assertThrown;
+
+	RequestStateSecurity sec;
+	assertThrown(new RequestStateCodec(sec));
+	sec.key = new ubyte[31];
+	assertThrown(new RequestStateCodec(sec));
+	sec.key = new ubyte[32];
+	new RequestStateCodec(sec);
 }
 
 unittest  // signed mode round-trips the inner state for the same subject

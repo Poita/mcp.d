@@ -780,8 +780,6 @@ final class McpServer : ServerCore
 					~ "verification on other instances or after a restart. Supply a "
 					~ "stable >=32-byte key for multi-instance/persistent deployments.");
 		}
-		else if (sec.key.length < 32)
-			throw new Exception("secureRequestState: key must be at least 32 bytes");
 		requestStateCodec_ = new RequestStateCodec(sec);
 	}
 
