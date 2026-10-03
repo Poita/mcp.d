@@ -134,6 +134,21 @@ private final class ListenSocketSlot
 		}
 	}
 
+	/// Close the attached socket but keep the slot open for the stream's next
+	/// connection; a cancel that already arrived still closes that one on `attach`.
+	void detach() @trusted nothrow
+	{
+		if (open)
+		{
+			open = false;
+			try
+				sock.close();
+			catch (Exception)
+			{
+			}
+		}
+	}
+
 	/// Close the socket and interrupt its reader, so a read parked on a silent
 	/// stream returns at once even where closing a socket does not wake a pending
 	/// read (the Windows event driver).
@@ -706,6 +721,17 @@ final class HttpClientTransport : ClientTransport
 			return false;
 		const error = parseWwwAuthenticate(wwwAuthenticate).error;
 		return error.length == 0 || error == "invalid_token";
+	}
+
+	/// Report the rejected bearer `sent` to the provider's `onRejected`,
+	/// returning whether a fresh token is now available. A throwing refresh
+	/// counts as a failed one.
+	private bool refreshBearer(string sent) @safe
+	{
+		try
+			return bearerProvider.onRejected(sent);
+		catch (Exception)
+			return false;
 	}
 
 	void sendOneway(Json message) @safe
@@ -1863,83 +1889,96 @@ final class HttpClientTransport : ClientTransport
 		() @trusted {
 			scope (exit)
 			{
+				slot.closeSocket();
 				stream.finish(failure);
 				markEstablished(false);
 			}
 			try
 			{
-				if (isCancelled())
-					return;
-				auto sock = connectTimed(pinnedHost, ep.port);
-				slot.attach(sock);
-				scope (exit)
-					slot.closeSocket();
-				// A cancel() that raced ahead of attach must still tear the socket down.
-				if (isCancelled())
-					return;
-				// Wrap in TLS for https/wss; plaintext is returned unwrapped.
-				auto conn = openClientStream(sock, ep.tls ? tlsContext() : null, ep.host);
-				scope (exit)
-					conn.release();
-
-				// One response per connection: `close` lets a non-streamed answer
-				// (an error body) be read to end-of-stream.
-				const req = buildHttpRequest("POST", ep.path, ep.hostHeader,
-						"application/json, text/event-stream", "close", true,
-						reqHeaders, null, body);
-				conn.write(cast(const(ubyte)[]) req);
-
-				const head = readResponseHead(conn);
-				const status = head.status;
-				const chunked = head.chunked;
-				const wwwAuthenticate = head.wwwAuthenticate;
-				if (status < 200 || status >= 300)
+				// A 401 rejecting the bearer is reported to the provider's
+				// `onRejected`, and the stream is opened once more with the
+				// refreshed token, as `deliver` does for a request.
+				for (bool mayRetry = true;; mayRetry = false)
 				{
-					failure = httpStatusError(status, readRemaining(conn,
-							chunked, maxMessageBytes), wwwAuthenticate);
-					return;
-				}
-				if (!head.sse)
-				{
-					// A plain JSON answer: the server answered the request outright
-					// instead of opening a stream.
-					const b = readRemaining(conn, chunked, maxMessageBytes);
-					try
+					if (isCancelled())
+						return;
+					const sentBearer = mayRetry
+						&& bearerProvider.onRejected !is null ? currentBearer() : null;
+					auto sock = connectTimed(pinnedHost, ep.port);
+					slot.attach(sock);
+					scope (exit)
+						slot.detach();
+					// A cancel() that raced ahead of attach must still tear the socket down.
+					if (isCancelled())
+						return;
+					// Wrap in TLS for https/wss; plaintext is returned unwrapped.
+					auto conn = openClientStream(sock, ep.tls ? tlsContext() : null, ep.host);
+					scope (exit)
+						conn.release();
+
+					// One response per connection: `close` lets a non-streamed answer
+					// (an error body) be read to end-of-stream.
+					const req = buildHttpRequest("POST", ep.path, ep.hostHeader,
+							"application/json, text/event-stream", "close",
+							true, reqHeaders, null, body);
+					conn.write(cast(const(ubyte)[]) req);
+
+					const head = readResponseHead(conn);
+					const status = head.status;
+					const chunked = head.chunked;
+					const wwwAuthenticate = head.wwwAuthenticate;
+					if (status < 200 || status >= 300)
 					{
-						if (!endsStream(parseMessage(b)))
-							failure = httpStatusError(status, b, wwwAuthenticate);
-					}
-					catch (Exception)
+						const b = readRemaining(conn, chunked, maxMessageBytes);
+						if (sentBearer.length && isRejectedBearer(status,
+								wwwAuthenticate) && refreshBearer(sentBearer))
+							continue;
 						failure = httpStatusError(status, b, wwwAuthenticate);
-					return;
-				}
-
-				// This stream consumes no resumption state; give the decoder its own
-				// throwaway cursor rather than a shared field.
-				SseCursor cursor;
-				bool answered;
-				readSseBody(conn, chunked, cursor, () @safe => answered
-						|| isCancelled(), (string eventType, string data) @safe {
-					Message m;
-					try
-						m = Message(parseJsonString(data));
-					catch (Exception)
-						return; // not a JSON-RPC message (keep-alive or comment)
-					if (endsStream(m))
-					{
-						answered = true;
 						return;
 					}
-					markEstablished(true);
-					slot.inHandler++;
-					scope (exit)
-						slot.inHandler--;
-					try
-						dispatch(m);
-					catch (Exception)
+					if (!head.sse)
 					{
+						// A plain JSON answer: the server answered the request outright
+						// instead of opening a stream.
+						const b = readRemaining(conn, chunked, maxMessageBytes);
+						try
+						{
+							if (!endsStream(parseMessage(b)))
+								failure = httpStatusError(status, b, wwwAuthenticate);
+						}
+						catch (Exception)
+							failure = httpStatusError(status, b, wwwAuthenticate);
+						return;
 					}
-				});
+
+					// This stream consumes no resumption state; give the decoder its own
+					// throwaway cursor rather than a shared field.
+					SseCursor cursor;
+					bool answered;
+					readSseBody(conn, chunked, cursor, () @safe => answered
+							|| isCancelled(), (string eventType, string data) @safe {
+						Message m;
+						try
+							m = Message(parseJsonString(data));
+						catch (Exception)
+							return; // not a JSON-RPC message (keep-alive or comment)
+						if (endsStream(m))
+						{
+							answered = true;
+							return;
+						}
+						markEstablished(true);
+						slot.inHandler++;
+						scope (exit)
+							slot.inHandler--;
+						try
+							dispatch(m);
+						catch (Exception)
+						{
+						}
+					});
+					return;
+				}
 			}
 			catch (Exception e)
 			{
@@ -5560,4 +5599,71 @@ unittest  // readSseBody frames a large single-line event in time linear in its 
 	const took = MonoTime.currTime - start;
 	assert(got == size);
 	assert(took < 2.seconds);
+}
+
+unittest  // openListen refreshes a rejected bearer token and retries the stream once
+{
+	string token = "old";
+	string[] rejected;
+	string[] seen;
+	auto r = new URLRouter;
+	r.post("/mcp", (HTTPServerRequest req, HTTPServerResponse res) @safe {
+		const auth = req.headers.get("Authorization", "");
+		seen ~= auth;
+		if (auth != "Bearer new")
+		{
+			res.headers["WWW-Authenticate"] = `Bearer error="invalid_token"`;
+			res.statusCode = 401;
+			res.writeBody("");
+			return;
+		}
+		writeSse(res,
+			`data: {"jsonrpc":"2.0","method":"notifications/subscriptions/acknowledged",`
+			~ `"params":{"notifications":{}}}` ~ "\n\n");
+	});
+	string error;
+	const failure = runAgainstFakeServer(r, (string url) @safe {
+		auto t = new HttpClientTransport(url);
+		scope (exit)
+			t.close();
+		t.setBearerProvider(BearerProvider(() @safe => token, (string tok) @safe {
+				rejected ~= tok;
+				token = "new";
+				return true;
+			}));
+		try
+			t.openListen(makeRequest(Json(1), "subscriptions/listen", Json.emptyObject));
+		catch (McpException e)
+			error = e.msg;
+	});
+	assert(failure.length == 0, "scenario failed: " ~ failure);
+	assert(error.length == 0, "openListen failed: " ~ error);
+	assert(rejected == ["old"]);
+	assert(seen == ["Bearer old", "Bearer new"]);
+}
+
+unittest  // openListen surfaces the 401 when the bearer refresh fails
+{
+	int attempts;
+	int status;
+	auto r = new URLRouter;
+	r.post("/mcp", (HTTPServerRequest req, HTTPServerResponse res) @safe {
+		attempts++;
+		res.headers["WWW-Authenticate"] = `Bearer error="invalid_token"`;
+		res.statusCode = 401;
+		res.writeBody("");
+	});
+	const failure = runAgainstFakeServer(r, (string url) @safe {
+		auto t = new HttpClientTransport(url);
+		scope (exit)
+			t.close();
+		t.setBearerProvider(BearerProvider(() @safe => "tok", (string tok) @safe => false));
+		try
+			t.openListen(makeRequest(Json(1), "subscriptions/listen", Json.emptyObject));
+		catch (HttpStatusException e)
+			status = e.status;
+	});
+	assert(failure.length == 0, "scenario failed: " ~ failure);
+	assert(status == 401);
+	assert(attempts == 1);
 }
