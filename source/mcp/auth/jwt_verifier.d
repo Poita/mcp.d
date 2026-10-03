@@ -762,6 +762,18 @@ package final class JwksCache : KeySource
 			if (jwk.kid.length)
 				newPemByKid[jwk.kid] = pem;
 		}
+		// A document with no usable key is treated like a failed fetch: the
+		// previous keys stay and the cache stays stale, so the next fetch is
+		// governed by `minRefetchInterval` rather than the full TTL.
+		if (newAllPems.length == 0)
+		{
+			import vibe.core.log : logWarn;
+
+			logWarn(
+					"JWKS from %s holds no usable signature-verification key; keeping the cached keys",
+					uri);
+			return;
+		}
 		// Swap atomically into the cache fields only after all parsing succeeds.
 		pemByKid = newPemByKid;
 		allPems = newAllPems;
@@ -1932,6 +1944,32 @@ unittest  // JwksCache negative-caches a failed fetch instead of refetching on e
 
 	s.clock += JwksCache.minRefetchInterval.total!"seconds";
 	s.cache.keysFor("rsa-1");
+	assert(s.fetches == 2);
+}
+
+unittest  // a JWKS with no usable keys leaves the cache stale so a kid-less token retries after minRefetchInterval
+{
+	auto s = new ScriptedJwks(`{"keys":[]}`);
+	assert(s.cache.keysFor("").length == 0);
+	assert(s.fetches == 1);
+
+	// The IdP publishes its key shortly after; a kid-less token must not wait out
+	// the full cache TTL to pick it up.
+	s.served = rsaOnlyJwks;
+	s.clock += JwksCache.minRefetchInterval.total!"seconds";
+	assert(s.cache.keysFor("").length == 1);
+	assert(s.fetches == 2);
+}
+
+unittest  // a refetched JWKS with no usable keys keeps the previously cached keys
+{
+	auto s = new ScriptedJwks(rsaOnlyJwks);
+	assert(s.cache.keysFor("rsa-1").length == 1);
+
+	s.served = `{"keys":[{"kty":"RSA","kid":"enc","use":"enc","n":"` ~ testRsaN
+		~ `","e":"` ~ testRsaE ~ `"}]}`;
+	s.clock += 300;
+	assert(s.cache.keysFor("rsa-1").length == 1, "an empty key set must not evict the cached keys");
 	assert(s.fetches == 2);
 }
 
