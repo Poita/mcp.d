@@ -402,9 +402,11 @@ void runStdio(McpServer server, ServerSettings settings)
 /// channel's serialized writer.
 ///
 /// `opts.maxLineBytes` bounds a single inbound line; an oversized frame is dropped
-/// (its bytes are skipped up to the next newline) and answered with a -32600 error
-/// carrying its id when one is found in its first bytes (else null), and the loop
-/// continues so one misbehaving frame neither exhausts memory nor kills the server.
+/// (its bytes are skipped up to the next newline) and the loop continues, so one
+/// misbehaving frame neither exhausts memory nor kills the server. A dropped
+/// request is answered with a -32600 error carrying its id when one is found in
+/// its first bytes (else null); a dropped notification gets no reply; a dropped
+/// response to a server->client request fails that request at once instead.
 /// At end-of-input, handlers still running get up to `opts.drainTimeout` to reply.
 void runStdio(McpServer server, StdioOptions opts = StdioOptions.init)
 {
@@ -456,24 +458,15 @@ void runStdio(McpServer server, StdioOptions opts = StdioOptions.init)
 
 	string readLine() @safe
 	{
-		import std.conv : to;
-		import mcp.protocol.errors : invalidRequest;
-		import mcp.protocol.jsonrpc : makeErrorResponse;
-
 		for (;;)
 		{
 			auto line = reader.next();
-			Json id;
-			if (!reader.takeOversized(id))
+			FrameHead head;
+			if (!reader.takeOversized(head))
 				return line;
-			// Answer the dropped frame so the peer's request does not hang.
-			try
-				writeLine(makeErrorResponse(id, invalidRequest(
-						"message exceeds the " ~ maxLineBytes.to!string ~ "-byte line limit"))
-						.toString());
-			catch (Exception)
-			{
-			}
+			auto substitute = answerOversized(head, maxLineBytes, &writeLine);
+			if (substitute !is null)
+				return substitute;
 			if (line is null)
 				return null;
 		}
@@ -1150,7 +1143,7 @@ private struct StdinLineReader
 	private size_t bufPos; // index of the next unconsumed byte in `buf`
 	private enum size_t idScanBytes = 4096;
 	private bool oversized_; // an over-long line was dropped since the last takeOversized
-	private Json oversizedId_; // its top-level JSON-RPC id, or null when unknown
+	private FrameHead oversizedHead_; // what the dropped line's first bytes reveal
 
 	this(StdioEnd inEnd, size_t maxLineBytes) @safe
 	{
@@ -1194,21 +1187,21 @@ private struct StdinLineReader
 		return nextWith(&refill);
 	}
 
-	// Whether an over-long line was dropped since the last call; if so `id` is its
-	// top-level JSON-RPC id (null when not found in the line's first bytes).
-	bool takeOversized(out Json id) @safe
+	// Whether an over-long line was dropped since the last call; if so `head` is
+	// what its first bytes reveal (its id is null when not found there).
+	bool takeOversized(out FrameHead head) @safe
 	{
 		if (!oversized_)
 			return false;
 		oversized_ = false;
-		id = oversizedId_;
+		head = oversizedHead_;
 		return true;
 	}
 
 	private void markOversized(const(ubyte)[] prefix) @safe
 	{
 		oversized_ = true;
-		oversizedId_ = topLevelJsonRpcId(prefix);
+		oversizedHead_ = scanFrameHead(prefix);
 	}
 
 	// The pure line-assembly state machine, parameterised on the buffer-refill
@@ -1288,15 +1281,24 @@ private struct StdinLineReader
 	}
 }
 
-/// Extract the top-level `"id"` of a JSON-RPC object from a (possibly
-/// truncated) prefix of its text: a number or string value at object depth 1,
-/// skipping nested objects/arrays and string contents. Returns JSON null when no
-/// such id appears in the prefix.
-private Json topLevelJsonRpcId(const(ubyte)[] text) @safe
+/// What the first bytes of a JSON-RPC object reveal about it: its top-level
+/// `"id"` and whether a top-level `"method"` or `"result"`/`"error"` key appears.
+private struct FrameHead
+{
+	Json id; /// a number or string id, or JSON null when none is found
+	bool hasMethod; /// a top-level `"method"` key: a request or notification
+	bool hasResult; /// a top-level `"result"` or `"error"` key: a response
+}
+
+/// Scan a (possibly truncated) prefix of a JSON-RPC object's text for its
+/// top-level keys, skipping nested objects/arrays and string contents.
+private FrameHead scanFrameHead(const(ubyte)[] text) @safe
 {
 	import std.conv : to, ConvException;
 	import vibe.data.json : parseJsonString, JSONException;
 
+	FrameHead head;
+	head.id = Json(null);
 	size_t i;
 	int depth;
 	bool expectValueForId;
@@ -1331,12 +1333,15 @@ private Json topLevelJsonRpcId(const(ubyte)[] text) @safe
 				break;
 			if (expectValueForId)
 			{
+				expectValueForId = false;
 				try
-					return parseJsonString(() @trusted {
+					head.id = parseJsonString(() @trusted {
 						return cast(string) text[startQuote .. i];
 					}());
 				catch (JSONException)
-					return Json(null);
+				{
+				}
+				continue;
 			}
 			if (depth == 1)
 			{
@@ -1347,6 +1352,7 @@ private Json topLevelJsonRpcId(const(ubyte)[] text) @safe
 		}
 		if (expectValueForId && (c == '-' || (c >= '0' && c <= '9')))
 		{
+			expectValueForId = false;
 			const start = i;
 			while (i < text.length && (text[i] == '-' || text[i] == '+'
 					|| text[i] == '.' || text[i] == 'e' || text[i] == 'E'
@@ -1355,19 +1361,24 @@ private Json topLevelJsonRpcId(const(ubyte)[] text) @safe
 			if (i >= text.length)
 				break; // cut off mid-number
 			try
-				return Json(() @trusted { return cast(string) text[start .. i]; }().to!long);
+				head.id = Json(() @trusted { return cast(string) text[start .. i]; }().to!long);
 			catch (ConvException)
-				return Json(null);
+			{
+			}
+			continue;
 		}
 		if (c == ':' && depth == 1 && afterKey)
 		{
 			expectValueForId = lastKey == "id";
+			if (lastKey == "method")
+				head.hasMethod = true;
+			else if (lastKey == "result" || lastKey == "error")
+				head.hasResult = true;
 			afterKey = false;
 		}
 		else if (c == '{' || c == '[')
 		{
-			if (expectValueForId)
-				return Json(null);
+			expectValueForId = false; // an object or array is not a valid id
 			depth++;
 		}
 		else if (c == '}' || c == ']')
@@ -1375,10 +1386,39 @@ private Json topLevelJsonRpcId(const(ubyte)[] text) @safe
 		else if (c == ',' && depth == 1)
 			expectValueForId = false;
 		else if (expectValueForId && c > ' ')
-			return Json(null); // true/false/null are not valid ids
+			expectValueForId = false; // true/false/null are not valid ids
 		i++;
 	}
-	return Json(null);
+	return head;
+}
+
+/// Respond to an over-long frame the reader dropped, from what its first bytes
+/// reveal. A request (or an id-bearing frame with no `"result"`/`"error"`) is
+/// answered with a -32600 error carrying its id, and a frame of unknown kind
+/// with a null-id one. A notification gets no reply. A response is never
+/// answered: the returned error-response line stands in for it so the request it
+/// replies to fails at once. Returns null when nothing stands in for the frame.
+private string answerOversized(FrameHead head, size_t maxLineBytes,
+		scope void delegate(string) @safe writeLine) @safe
+{
+	import std.conv : to;
+	import mcp.protocol.errors : internalError, invalidRequest;
+	import mcp.protocol.jsonrpc : makeErrorResponse;
+
+	const limit = maxLineBytes.to!string ~ "-byte line limit";
+	const hasId = head.id.type != Json.Type.null_;
+	if (head.hasResult)
+		return hasId ? makeErrorResponse(head.id,
+				internalError("the peer's response exceeds the " ~ limit)).toString() : null;
+	if (head.hasMethod && !hasId)
+		return null;
+	try
+		writeLine(makeErrorResponse(head.id,
+				invalidRequest("message exceeds the " ~ limit)).toString());
+	catch (Exception)
+	{
+	}
+	return null;
 }
 
 /// Decide whether a stdout write is a failure the channel must surface. A status
@@ -1433,9 +1473,9 @@ version (unittest)
 		for (;;)
 		{
 			auto s = reader.nextWith(&refill);
-			Json id;
-			if (reader.takeOversized(id))
-				oversizedIds ~= id;
+			FrameHead head;
+			if (reader.takeOversized(head))
+				oversizedIds ~= head.id;
 			if (s is null)
 				break;
 			if (s.length)
@@ -1548,6 +1588,77 @@ unittest  // StdinLineReader reports an over-long line cut off by EOF
 	drainLineReader(8, [cast(ubyte[]) `{"id":"abc","method":"xxxxxxxx"`.dup], ids);
 	assert(ids.length == 1);
 	assert(ids[0].get!string == "abc");
+}
+
+unittest  // scanFrameHead tells a request, a response and a notification apart by their top-level keys
+{
+	auto req = scanFrameHead(cast(
+			const(ubyte)[]) `{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"x`);
+	assert(req.id.get!long == 7 && req.hasMethod && !req.hasResult);
+
+	auto res = scanFrameHead(cast(
+			const(ubyte)[]) `{"jsonrpc":"2.0","result":{"method":"m","id":3},"id":"s-1"`);
+	assert(res.id.get!string == "s-1" && res.hasResult && !res.hasMethod,
+			"keys nested in the result do not count as top-level");
+
+	auto err = scanFrameHead(cast(const(ubyte)[]) `{"id":4,"error":{"code":1,"message":"aaaa`);
+	assert(err.id.get!long == 4 && err.hasResult);
+
+	auto note = scanFrameHead(
+			cast(const(ubyte)[]) `{"method":"notifications/progress","params":{"id":2,`);
+	assert(note.id.type == Json.Type.null_ && note.hasMethod && !note.hasResult);
+}
+
+version (unittest) private string[] oversizedReplies(FrameHead head, out string substitute) @safe
+{
+	string[] written;
+	substitute = answerOversized(head, 16, (string s) @safe { written ~= s; });
+	return written;
+}
+
+unittest  // an over-long request is answered with a -32600 error carrying its id
+{
+	import vibe.data.json : parseJsonString;
+
+	string substitute;
+	auto written = oversizedReplies(FrameHead(Json(5), true, false), substitute);
+	assert(substitute is null);
+	assert(written.length == 1);
+	auto reply = parseJsonString(written[0]);
+	assert(reply["id"].get!long == 5);
+	assert(reply["error"]["code"].get!long == -32600);
+}
+
+unittest  // an over-long response is not answered but fails the pending request it replies to
+{
+	import vibe.data.json : parseJsonString;
+
+	string substitute;
+	auto written = oversizedReplies(FrameHead(Json("srv-3"), false, true), substitute);
+	assert(written.length == 0, "a response must never be answered");
+	assert(substitute !is null, "the dropped response is replaced by an error response");
+	auto replaced = parseJsonString(substitute);
+	assert(replaced["id"].get!string == "srv-3");
+	assert("error" in replaced && "result" !in replaced);
+}
+
+unittest  // an over-long notification is dropped without a reply
+{
+	string substitute;
+	auto written = oversizedReplies(FrameHead(Json(null), true, false), substitute);
+	assert(written.length == 0);
+	assert(substitute is null);
+}
+
+unittest  // an over-long frame of unknown kind is answered with a null-id error
+{
+	import vibe.data.json : parseJsonString;
+
+	string substitute;
+	auto written = oversizedReplies(FrameHead(Json(null), false, false), substitute);
+	assert(substitute is null);
+	assert(written.length == 1);
+	assert(parseJsonString(written[0])["id"].type == Json.Type.null_);
 }
 
 version (Posix) unittest  // runStdio's adopt/releaseRef cycle leaves the original fd open with its O_NONBLOCK bit unchanged
