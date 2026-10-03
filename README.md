@@ -157,8 +157,8 @@ the one remaining check is the harness's own wire-schema validator rejecting any
   registration mechanism now that DCR is deprecated. The **client** advertises and uses an
   HTTPS-URL `client_id` when the AS supports it; the **server-side OAuth proxy** opts in via
   `OAuthProxyConfig.clientIdMetadataDocumentSupported`, advertising
-  `client_id_metadata_document_supported`, then fetching (SSRF-guarded, size-capped) and
-  validating the hosted document at `/authorize` — exact `client_id` match, required fields
+  `client_id_metadata_document_supported`, then fetching (SSRF-guarded, size-capped, cached —
+  failures included — and rate limited per host) and validating the hosted document at `/authorize` — exact `client_id` match, required fields
   (`client_id`, `client_name`, `redirect_uris`), and a redirect-URI allowlist sourced from the
   document — with confused-deputy consent keyed on the stable `client_id` URL. The consent
   screen surfaces the `client_name`, the `client_id` host, the redirect-URI hostname and the
