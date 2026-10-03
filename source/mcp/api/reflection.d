@@ -694,8 +694,10 @@ private CallToolResult toToolResult(R)(R ret) @safe if (!is(R == void))
 	}
 	else static if (isSomeString!R)
 	{
+		import std.conv : to;
+
 		CallToolResult r;
-		r.content = [Content.makeText(ret)];
+		r.content = [Content.makeText(ret.to!string)];
 		return r;
 	}
 	else
@@ -1066,8 +1068,10 @@ private GetPromptResult toPromptResult(R)(R ret) @safe
 	}
 	else static if (isSomeString!R)
 	{
+		import std.conv : to;
+
 		GetPromptResult r;
-		r.messages = [PromptMessage("user", Content.makeText(ret))];
+		r.messages = [PromptMessage("user", Content.makeText(ret.to!string))];
 		return r;
 	}
 	else
@@ -1176,7 +1180,11 @@ private ResourceContents toResourceContents(R)(R ret, string uri, string mimeTyp
 	static if (is(R == ResourceContents))
 		return ret;
 	else static if (isSomeString!R)
-		return ResourceContents.makeText(uri, mimeType, ret);
+	{
+		import std.conv : to;
+
+		return ResourceContents.makeText(uri, mimeType, ret.to!string);
+	}
 	else
 		static assert(false, "@resource method must return ResourceContents or string");
 }
@@ -5116,4 +5124,53 @@ unittest  // a templated method without a handler UDA is skipped
 {
 	auto s = new McpServer("t", "1");
 	registerHandlers(s, new TemplatedHelperApi);
+}
+
+version (unittest) private final class MutableStringApi
+{
+	@tool("chars", "Return a mutable char array")
+	char[] chars() @safe
+	{
+		return "abc".dup;
+	}
+
+	@tool("wide", "Return a wstring")
+	wstring wide() @safe
+	{
+		return "wide"w;
+	}
+
+	@prompt("p", "Return a const char slice")
+	const(char)[] p() @safe
+	{
+		return "prompt text";
+	}
+
+	@resource("test://chars", "chars", "text/plain")
+	char[] r() @safe
+	{
+		return "resource text".dup;
+	}
+}
+
+unittest  // a tool, prompt, or resource returning a non-immutable or wide string serves it as text
+{
+	import mcp.protocol.jsonrpc : Message, makeRequest;
+
+	auto s = new McpServer("t", "1");
+	registerHandlers(s, new MutableStringApi);
+	auto t = callToolResult(s, "chars", Json.emptyObject);
+	assert(t["content"][0]["text"] == Json("abc"), t.toString);
+	auto w = callToolResult(s, "wide", Json.emptyObject);
+	assert(w["content"][0]["text"] == Json("wide"), w.toString);
+
+	Json pp = Json.emptyObject;
+	pp["name"] = "p";
+	auto pr = s.handle(Message(makeRequest(Json(2), "prompts/get", pp))).get["result"];
+	assert(pr["messages"][0]["content"]["text"] == Json("prompt text"), pr.toString);
+
+	Json rp = Json.emptyObject;
+	rp["uri"] = "test://chars";
+	auto rr = s.handle(Message(makeRequest(Json(3), "resources/read", rp))).get["result"];
+	assert(rr["contents"][0]["text"] == Json("resource text"), rr.toString);
 }
