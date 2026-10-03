@@ -2266,8 +2266,13 @@ private bool readPostBody(HTTPServerRequest req, HTTPServerResponse res,
 	}
 	catch (Exception e)
 	{
+		import vibe.core.log : logDiagnostic;
+
+		// The stream's exception text can describe server internals, so it is
+		// logged here and the client gets a fixed message.
+		logDiagnostic("could not read a POST body: %s", e.msg);
 		writeJsonRpcError(res, HTTPStatus.badRequest,
-				invalidRequest("could not read the request body: " ~ e.msg));
+				invalidRequest("could not read the request body"));
 		return false;
 	}
 	auto text = () @trusted { return cast(string) raw; }();
@@ -5233,6 +5238,29 @@ unittest  // a POST body that fails to read for a reason other than size is a 40
 	assert(res.statusCode == HTTPStatus.badRequest);
 	const reply = () @trusted { return cast(string) sink.data.idup; }();
 	assert(parseJsonString(reply)["error"]["code"].get!int == ErrorCode.invalidRequest);
+}
+
+unittest  // a POST body read failure answers a fixed message, not the stream's exception text
+{
+	import std.algorithm.searching : canFind;
+	import vibe.data.json : parseJsonString;
+	import vibe.http.server : createTestHTTPServerRequest,
+		createTestHTTPServerResponse, TestHTTPResponseMode;
+	import vibe.inet.url : URL;
+	import vibe.stream.memory : createMemoryOutputStream;
+
+	auto router = new URLRouter;
+	mountMcp(router, new McpServer("t", "1"));
+	auto req = createTestHTTPServerRequest(URL("http://127.0.0.1/mcp"),
+			HTTPMethod.POST, new FailingBodyStream);
+	req.headers["Host"] = "127.0.0.1";
+	req.headers["Content-Type"] = "application/json";
+	auto sink = createMemoryOutputStream();
+	auto res = createTestHTTPServerResponse(sink, null, TestHTTPResponseMode.bodyOnly);
+	router.handleRequest(req, res);
+	const reply = () @trusted { return cast(string) sink.data.idup; }();
+	const message = parseJsonString(reply)["error"]["message"].get!string;
+	assert(!message.canFind("connection reset by peer"), message);
 }
 
 unittest  // a chunked POST body that grows past maxRequestBytes is a 413
