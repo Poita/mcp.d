@@ -8,7 +8,7 @@ module mcp.server.events_runtime;
 
 import core.time : Duration, seconds, minutes, msecs;
 import std.typecons : Nullable, nullable;
-import std.algorithm : sort;
+import std.algorithm : max, sort;
 import vibe.data.json : Json;
 
 import mcp.internal.background_loop : BackgroundLoop;
@@ -348,7 +348,7 @@ struct EventsOptions
 {
 	EmitBufferOptions emitBuffer; /// ring-buffer retention for emit-only poll
 	Duration defaultPollInterval = 30.seconds; /// seeds `nextPollMs` when a type sets none
-	Duration pollLeaseTtl = 5.minutes; /// poll subscription lease window (drives on_unsubscribe)
+	Duration pollLeaseTtl = 5.minutes; /// minimum poll subscription lease window (drives on_unsubscribe); a lease always spans at least two of the type's poll intervals
 	int pollMaxLeasesPerPrincipal = 1000; /// cap on distinct live poll subscriptions one principal may hold (0 = unlimited)
 	int pollMaxAnonymousLeases = 10_000; /// cap on distinct live poll subscriptions all unauthenticated callers hold together (0 = unlimited)
 	Duration webhookTtlCap = 30.minutes; /// max granted webhook TTL (clamps suggestions down)
@@ -2996,8 +2996,11 @@ final class EventsRuntime
 				fresh = false;
 			}
 		}
-		pollLeases_[key] = PollLease(name, principal, arguments, subId,
-				now + opts_.pollLeaseTtl.total!"msecs");
+		// The lease spans at least two advertised poll intervals, so a client
+		// polling on the cadence the server suggests (with some slack) never sees
+		// its subscription torn down and re-provisioned between polls.
+		const window = max(opts_.pollLeaseTtl.total!"msecs", 2 * nextPollMsFor(reg));
+		pollLeases_[key] = PollLease(name, principal, arguments, subId, now + window);
 		if (fresh)
 			pollLeaseCount_[principal] = pollLeaseCount_.get(principal, 0) + 1;
 	}
@@ -4283,6 +4286,37 @@ unittest  // poll lease fires on_subscribe on first sight and on_unsubscribe on 
 	assert(subs == 1 && unsubs == 0); // one subscribe, renewed not re-fired
 
 	now += 10 * 60 * 1000; // advance past the 5-minute lease
+	rt.sweepPollLeases();
+	assert(unsubs == 1);
+}
+
+unittest  // a poll lease outlives the advertised poll interval, so on-schedule polls keep it
+{
+	import core.time : minutes;
+
+	long now = 1_000_000;
+	auto rt = testRuntime(() @safe => now);
+	int subs, unsubs;
+	EventRegistration reg;
+	reg.descriptor.name = "slow.feed";
+	reg.pollInterval = 10.minutes; // longer than the 5-minute pollLeaseTtl
+	reg.check = (EventContext ctx) @safe => EventResult.empty("c");
+	reg.onSubscribe = (EventContext ctx, string id) @safe { subs++; };
+	reg.onUnsubscribe = (EventContext ctx, string id) @safe { unsubs++; };
+	rt.register(reg);
+
+	auto args = Json.emptyObject;
+	foreach (i; 0 .. 3)
+	{
+		auto r = rt.poll("slow.feed", args, "u", nullable("c"),
+				Nullable!long.init, Nullable!long.init);
+		assert(r.nextPollMs == 10 * 60 * 1000);
+		now += r.nextPollMs;
+		rt.sweepPollLeases();
+	}
+	assert(subs == 1 && unsubs == 0);
+
+	now += 60 * 60 * 1000; // a client that stops polling still lets the lease lapse
 	rt.sweepPollLeases();
 	assert(unsubs == 1);
 }
