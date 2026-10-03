@@ -856,7 +856,7 @@ final class McpServer : ServerCore
 	/// i.e. `connectionTokenOf(ctx)` of the request that called `elicitUrl` ("" on
 	/// a server without sessions). Returns the number of streams reached, or `0`
 	/// when that session has no GET stream open (or the server is not on a
-	/// Streamable HTTP transport). Throws `invalidParams` on an empty
+	/// Streamable HTTP transport). Throws an `Exception` on an empty
 	/// `elicitationId`, and on an empty `sessionId` from a stateful server with
 	/// a push channel attached.
 	///
@@ -868,11 +868,11 @@ final class McpServer : ServerCore
 	{
 		enum method = "notifications/elicitation/complete";
 		if (elicitationId.length == 0)
-			throw invalidParams(method ~ " requires a non-empty elicitationId");
+			throw new Exception(method ~ " requires a non-empty elicitationId");
 		// Every stream of a stateful HTTP server belongs to a session, and an
 		// empty token would let the notification land on an arbitrary one.
 		if (sessionId.length == 0 && mode_ == ServerMode.stateful && pushChannel !is null)
-			throw invalidParams(method ~ " on a stateful server requires the sessionId"
+			throw new Exception(method ~ " on a stateful server requires the sessionId"
 					~ " of the session that received the elicitation");
 		Json params = Json.emptyObject;
 		params["elicitationId"] = elicitationId;
@@ -11106,23 +11106,26 @@ unittest  // notifyElicitationComplete never reaches a stdio subscriptions/liste
 	assert(frames.length == before);
 }
 
-unittest  // notifyElicitationComplete rejects an empty elicitationId
+unittest  // notifyElicitationComplete rejects an empty elicitationId as API misuse, not a protocol error
 {
-	import std.exception : assertThrown;
+	import std.exception : collectException;
 
 	auto s = new McpServer("t", "1");
-	assertThrown!McpException(s.notifyElicitationComplete("", ""));
+	auto e = collectException(s.notifyElicitationComplete("", ""));
+	assert(e !is null);
+	assert(cast(McpException) e is null);
 }
 
 unittest  // a stateful HTTP server rejects notifyElicitationComplete without a session id
 {
-	import std.exception : assertThrown;
+	import std.exception : collectException;
 
 	auto s = McpServer.stateful("t", "1");
 	auto ch = ensurePushChannel(s, new StreamCoordinator);
 	string a;
 	ch.addListener((string f) @safe { a = f; }, Json(""), ListenFilter.init, "", null, "sess-A");
-	assertThrown!McpException(s.notifyElicitationComplete("", "elic-1"));
+	auto e = collectException(s.notifyElicitationComplete("", "elic-1"));
+	assert(e !is null && cast(McpException) e is null);
 	assert(a.length == 0, "an unnamed session must not reach some other session's stream");
 }
 
