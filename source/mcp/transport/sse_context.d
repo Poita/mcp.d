@@ -400,8 +400,8 @@ ServerPushChannel ensurePushChannel(McpServer server, StreamCoordinator coord,
 /// only when the byte bound leaves no other choice.
 struct ReplayHistoryOptions
 {
-	/// Streams whose history is kept, not counting the streams of POST requests
-	/// still running (`0`: unbounded).
+	/// Streams whose history is kept, not counting connected streams or the
+	/// streams of POST requests still running (`0`: unbounded).
 	size_t maxStreams = 64;
 	/// Events kept per stream, oldest discarded first (`0`: unbounded).
 	size_t maxEventsPerStream = 256;
@@ -542,7 +542,7 @@ final class ServerPushChannel : PushChannel
 	/// first. Bounds total retained memory across the mount's lifetime regardless
 	/// of how many short-lived GET streams connect and disconnect: a reconnecting
 	/// client still finds a recently-disconnected stream's buffer for
-	/// Last-Event-ID replay, but a stream not touched for
+	/// Last-Event-ID replay, but a disconnected stream not touched for
 	/// `limits.maxStreams` newer streams is evicted.
 	private long[] historyOrder;
 	private ReplayHistoryOptions limits;
@@ -754,8 +754,10 @@ final class ServerPushChannel : PushChannel
 				l.closed.evt.emit();
 			}
 		listeners = listeners.remove!(l => l.id == id);
+		bool leftHistory;
 		if (auto ord = id in streamOf)
 		{
+			leftHistory = (*ord in history) !is null;
 			// Nothing can resume or continue a stream with no replay history and
 			// no open POST, so its per-ordinal bookkeeping goes with its last
 			// listener.
@@ -776,6 +778,10 @@ final class ServerPushChannel : PushChannel
 		}
 		streamOf.remove(id);
 		live.remove(id);
+		// A stream left with no listener now counts against the history cap,
+		// unless a superseding listener is about to take its ordinal over.
+		if (leftHistory && successor == 0)
+			evictOldHistory();
 
 		// Fail exactly the in-flight server->client requests bound to this listener
 		// (not every pending waiter): other requests may be bound to surviving
@@ -909,7 +915,8 @@ final class ServerPushChannel : PushChannel
 
 	/// Number of stream ordinals currently retaining replay history. Exposed for
 	/// tests/diagnostics to verify the LRU bound; the value is at most
-	/// `ReplayHistoryOptions.maxStreams` plus the streams of running POST requests.
+	/// `ReplayHistoryOptions.maxStreams` plus the connected streams and the
+	/// streams of running POST requests.
 	size_t retainedHistoryStreams() @safe
 	{
 		return () @trusted {
@@ -1185,7 +1192,9 @@ final class ServerPushChannel : PushChannel
 		return entries !is null && entries.length > 0 && (*entries)[0].seq <= seq + 1;
 	}
 
-	/// Discard `ordinal`'s replay history and its owner attribution.
+	/// Discard `ordinal`'s replay history. Its owner attribution goes too unless
+	/// a listener is still attached: that stream keeps recording history and
+	/// stays resumable by, and closable with, its session.
 	private void dropHistory(long ordinal) @safe
 	{
 		import std.algorithm : remove, countUntil;
@@ -1197,11 +1206,12 @@ final class ServerPushChannel : PushChannel
 		const i = historyOrder.countUntil(ordinal);
 		if (i >= 0)
 			historyOrder = historyOrder.remove(i);
-		streamOwner.remove(ordinal);
 		bool attached;
 		foreach (lid, ord; streamOf)
 			if (ord == ordinal)
 				attached = true;
+		if (!attached)
+			streamOwner.remove(ordinal);
 		if (!attached && ordinal !in openStreams)
 			nextSeq.remove(ordinal);
 		if (ordinal !in openStreams)
@@ -1224,12 +1234,23 @@ final class ServerPushChannel : PushChannel
 	/// Evict the least-recently-used history ordinals once more than
 	/// `limits.maxStreams` finished streams are retained or the retained frames
 	/// exceed `limits.maxBytes`, so memory stays bounded however many
-	/// short-lived GET streams come and go. The streams of POST requests still
-	/// running are not counted against `maxStreams` and are evicted for bytes
-	/// only once no other stream is left, since losing one strands any
-	/// server->client request the client has not yet seen.
+	/// short-lived GET streams come and go. A stream is finished once no
+	/// listener is attached and no POST request is running on it; the others
+	/// are not counted against `maxStreams`, so a connected client can always
+	/// resume its stream. A running POST stream is evicted for bytes only once
+	/// no other stream is left, since losing one strands any server->client
+	/// request the client has not yet seen.
 	private void evictOldHistory() @safe
 	{
+		bool[long] attached;
+		foreach (lid, ord; streamOf)
+			attached[ord] = true;
+
+		bool isFinished(long ord)
+		{
+			return ord !in openStreams && ord !in attached;
+		}
+
 		// The oldest evictable ordinal, never the most recent one (whose event was
 		// just recorded): a finished stream first, else a running one when
 		// `includeOpen` is set. Returns -1 when there is none.
@@ -1247,7 +1268,7 @@ final class ServerPushChannel : PushChannel
 		{
 			size_t n;
 			foreach (ord; historyOrder)
-				if (ord !in openStreams)
+				if (isFinished(ord))
 					n++;
 			return n;
 		}
@@ -1256,7 +1277,7 @@ final class ServerPushChannel : PushChannel
 		{
 			long ord = -1;
 			foreach (o; historyOrder)
-				if (o !in openStreams)
+				if (isFinished(o))
 				{
 					ord = o;
 					break;
@@ -4247,6 +4268,50 @@ unittest  // the replay history limits are configurable
 		ch.removeListener(id);
 	}
 	assert(ch.retainedHistoryStreams == 2);
+}
+
+unittest  // a live GET stream stays resumable while more than maxStreams streams are connected
+{
+	import std.string : indexOf;
+
+	static string eventId(string frame) @safe
+	{
+		const start = frame.indexOf("id: ") + "id: ".length;
+		return frame[start .. start + frame[start .. $].indexOf('\n')];
+	}
+
+	static string ordinalOf(string id) @safe
+	{
+		return id[0 .. id.indexOf('-')];
+	}
+
+	ReplayHistoryOptions opts;
+	opts.maxStreams = 2;
+	auto ch = new ServerPushChannel(new StreamCoordinator, opts);
+	auto frames = new string[][](4);
+	static void delegate(string) @safe collector(string[][] frames, size_t i) @safe
+	{
+		return (string f) @safe { frames[i] ~= f; };
+	}
+
+	// One session per stream, so every stream receives each notification.
+	foreach (i; 0 .. 4)
+		ch.addListener(collector(frames, i), Json.init, ListenFilter.init, "",
+				null, "sess-" ~ cast(char)('0' + i));
+	ch.notify("notifications/message");
+	ch.notify("notifications/message");
+	foreach (i; 0 .. 4)
+		assert(frames[i].length == 2);
+
+	// The first stream reconnects after missing its second event.
+	const cursor = eventId(frames[0][0]);
+	string[] resumed;
+	ch.addListener((string f) @safe { resumed ~= f; }, Json.init,
+			ListenFilter.init, cursor, null, "sess-0");
+	assert(resumed.length == 1, "the missed event is replayed");
+	assert(eventId(resumed[0]) == eventId(frames[0][1]));
+	ch.notify("notifications/message");
+	assert(ordinalOf(eventId(resumed[$ - 1])) == ordinalOf(cursor));
 }
 
 unittest  // a live POST stream keeps its event ids monotonic after its replay history is evicted
