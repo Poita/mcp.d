@@ -2196,21 +2196,23 @@ final class EventsRuntime
 			deliverWithRetry(job, persisted);
 			settled = true;
 		}
-		catch (Exception)
-		{
-		}
+		catch (Exception e)
+			logEventsError("webhook delivery threw", e);
 		if (settled)
 			return;
 		const attempt = max(persisted, job.attempt) + 1;
 		if (attempt >= opts_.webhookMaxAttempts)
 		{
-			// Dead-letter: bound total attempts, and settle the position so the
-			// watermark is not held behind a job that will never be acked.
+			// Dead-letter: bound total attempts, settle the position so the
+			// watermark is not held behind a job that will never be acked, and
+			// owe the client a gap for the event it never received.
 			try
-				settlePosition(job.subscriptionId, job.jobId, job.occ.cursor);
+				abandonUndelivered(job);
 			catch (Exception e)
+			{
 				logEventsError("settling a dead-lettered delivery threw", e);
-			ackJob(job.jobId);
+				ackJob(job.jobId);
+			}
 		}
 		else
 			deliveryQueue_.touch(job.jobId, attempt,
@@ -8054,4 +8056,31 @@ unittest  // an onFetch event with no eventId gets the same id each time it is r
 		assert(first.events[i].eventId == replay.events[i].eventId);
 	assert(first.events[0].eventId != first.events[1].eventId);
 	assert(first.events[1].eventId != first.events[2].eventId);
+}
+
+unittest  // a dead-lettered delivery is logged and owed a gap
+{
+	import std.algorithm : any, canFind;
+
+	auto ft = new FakeWebhookTransport();
+	ft.throwEvents = 1;
+	EventsOptions o;
+	o.nowMs = () @safe => 1_000_000L;
+	o.nowIso = () @safe => "t";
+	o.allowPrivateCallbackHosts = true;
+	o.webhookTransport = ft;
+	o.webhookMaxAttempts = 1;
+	o.deliveryExecutor = (void delegate() @safe job) @safe { job(); };
+	o.deliverySleep = (Duration d) @safe {};
+	auto rt = new EventsRuntime(null, o);
+	EventRegistration reg = {descriptor: EventType("n"), emitOnly: true};
+	rt.register(reg);
+	rt.subscribeWebhook(webhookSub("n", "https://proxy/hooks"), "user-1");
+	auto lines = captureLogs(() @safe {
+		rt.emit(EventOccurrence("evt_1", "n", "t"));
+	});
+	assert(lines.any!(l => l.canFind("transport failure")));
+	rt.emit(EventOccurrence("evt_2", "n", "t"));
+	assert(ft.acceptedGaps.length == 1);
+	assert(ft.acceptedGaps[0]["cursor"].get!string == seqCursor(1));
 }
