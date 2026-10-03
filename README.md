@@ -470,8 +470,8 @@ share one backend. A `public` result lives under a shared key, so **every client
 hits the same entry** — the point of a shared cache. A `private` result is
 namespaced under the requesting client's `cachePartition` (a stable principal /
 tenant id you set in `ClientSettings`), so it is never served to another
-identity. The default per-client store leaves `cachePartition` empty and the
-distinction is moot. Every entry is also keyed by server (`CacheKey.server`: the
+identity. A client with no `cachePartition` keeps its `private` results under a
+partition unique to itself. Every entry is also keyed by server (`CacheKey.server`: the
 endpoint URL, the `spawn` command, or `ClientSettings.cacheServer`), so clients of
 different servers sharing one store never read each other's results.
 
@@ -484,9 +484,9 @@ ClientSettings sb; sb.cache = store; sb.cachePartition = "tenant-b";
 ```
 
 On `setBearerToken`, the client evicts only its **own** partition (the previous
-identity's `private` entries), sparing shared `public` entries and other
-principals' partitions; for the default per-client store that empty partition
-holds everything, so it behaves as a full clear.
+identity's `private` entries) from a store you supplied, sparing shared `public`
+entries and other principals' partitions; the default per-client store also drops
+its `public` entries, so it behaves as a full clear.
 
 **Per-call modes** via `RequestOptions.cacheMode`:
 

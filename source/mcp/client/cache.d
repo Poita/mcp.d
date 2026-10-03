@@ -28,9 +28,8 @@ import mcp.protocol.modern : CacheScope;
 /// both global and per-principal results without collision: a `public` result is
 /// stored under the empty partition (every client hits the same key — the point
 /// of a shared cache), while a `private` result is stored under the owning
-/// client's `cachePartition` (its principal id) so it is never served to another
-/// identity. A per-client store leaves `partition` empty and the distinction is
-/// moot.
+/// client's `cachePartition` (its principal id), or a partition unique to that
+/// client when it names none, so it is never served to another identity.
 ///
 /// `server` names the server the response came from (the client's endpoint URL,
 /// spawn command, or `ClientSettings.cacheServer`), so clients of different

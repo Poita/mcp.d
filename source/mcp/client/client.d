@@ -334,10 +334,10 @@ struct ClientSettings
 
 	/// This client's cache partition — a stable principal identifier (user / tenant
 	/// id) under which its `private`-scoped results are namespaced. Only relevant
-	/// when several clients share one `cache` backend: it keeps one principal's
-	/// `private` entries from being served to another, while `public` entries stay
-	/// shared (every client hits the same key). Empty (the default) treats the
-	/// store as per-client and is the right value for the default in-memory store.
+	/// when several clients share one `cache` backend: clients naming the same
+	/// partition share their `private` entries, while `public` entries are shared
+	/// by every client (they all hit the same key). Empty (the default) keeps this
+	/// client's `private` entries to itself.
 	string cachePartition = "";
 
 	/// The server identity this client's cache entries are keyed under, so a
@@ -709,9 +709,14 @@ final class McpClient : ClientProtocol
 	// cacheable results are stored, so a SHARED `cacheStore_` keeps one principal's
 	// private entries from being served to another. `public` results ignore it and
 	// live under the shared empty partition (every client hits the same key). Empty
-	// (the default) means the store is treated as per-client: public and private
-	// both land under "" and the distinction is moot.
+	// (the default) stores private results under `clientPartition_` instead.
 	private string cachePartition_;
+	// The private partition of a client with no `cachePartition_`: unique to this
+	// client, so "" (the public namespace) is never a private one.
+	private string clientPartition_;
+	// Whether `cacheStore_` was supplied by the caller and so may be shared with
+	// other clients, rather than installed for this client alone.
+	private bool sharedCache_;
 	// The server identity every physical cache key carries (`CacheKey.server`).
 	private string cacheServer_;
 	// Clock seam behind the cache's freshness check: `cachedFetch` stamps an entry
@@ -810,8 +815,14 @@ final class McpClient : ClientProtocol
 		this.transport = transport;
 		this.clientInfo = settings.clientInfo;
 		cacheStore_ = settings.cache !is null ? settings.cache : new InMemoryCacheStore();
+		sharedCache_ = settings.cache !is null;
 		defaultCacheTtl_ = settings.defaultCacheTtl;
 		cachePartition_ = settings.cachePartition;
+		clientPartition_ = () @trusted {
+			import std.uuid : randomUUID;
+
+			return "client:" ~ randomUUID().toString();
+		}();
 		cacheServer_ = settings.cacheServer.length ? settings.cacheServer : () @trusted {
 			import std.conv : to;
 
@@ -1103,14 +1114,7 @@ final class McpClient : ClientProtocol
 	{
 		transport.setBearerToken(token);
 		identityEpoch_++;
-		// The identity behind requests just changed; evict this client's own
-		// partition of this server's entries so a re-authenticated session cannot
-		// read the previous identity's `private` results. For the default
-		// per-client store the partition is "" and this drops every entry; for a
-		// shared store it leaves the shared `public` entries, other principals'
-		// partitions, and other servers' entries intact.
-		if (cacheStore_ !is null)
-			cacheStore_.invalidatePartition(cacheServer_, cachePartition_);
+		evictIdentityEntries();
 		clearToolIndex();
 	}
 
@@ -1123,9 +1127,22 @@ final class McpClient : ClientProtocol
 	{
 		transport.setBearerProvider(provider);
 		identityEpoch_++;
-		if (cacheStore_ !is null)
-			cacheStore_.invalidatePartition(cacheServer_, cachePartition_);
+		evictIdentityEntries();
 		clearToolIndex();
+	}
+
+	/// The identity behind requests just changed: evict this client's private
+	/// partition of this server's entries so a re-authenticated session cannot
+	/// read the previous identity's `private` results. A store installed for this
+	/// client alone also drops its `public` entries; a shared store keeps them,
+	/// along with other principals' partitions and other servers' entries.
+	private void evictIdentityEntries() @safe
+	{
+		if (cacheStore_ is null)
+			return;
+		cacheStore_.invalidatePartition(cacheServer_, privatePartition());
+		if (!sharedCache_)
+			cacheStore_.invalidatePartition(cacheServer_, "");
 	}
 
 	/// Perform the initialize handshake and send `notifications/initialized`.
@@ -1515,6 +1532,7 @@ final class McpClient : ClientProtocol
 	void setCache(CacheStore store) @safe
 	{
 		cacheStore_ = store is null ? new InMemoryCacheStore() : store;
+		sharedCache_ = store !is null;
 	}
 
 	/// The active response cache backend (never null), so callers can pre-seed or
@@ -1533,7 +1551,8 @@ final class McpClient : ClientProtocol
 
 	/// Set this client's cache partition — a stable principal id under which its
 	/// `private`-scoped results are namespaced in a shared `cache` backend (see
-	/// `ClientSettings.cachePartition`). Empty treats the store as per-client.
+	/// `ClientSettings.cachePartition`). Empty keeps `private` results to this
+	/// client alone.
 	void setCachePartition(string partition) @safe nothrow
 	{
 		cachePartition_ = partition;
@@ -1564,11 +1583,19 @@ final class McpClient : ClientProtocol
 
 	/// The partition a `public` result is stored under (the shared empty
 	/// partition, so every client hits the same key) versus a `private` one (this
-	/// client's `cachePartition`, isolating it from other identities).
+	/// client's `privatePartition`, isolating it from other identities).
 	private CacheKey scopedKey(CacheKey logical, CacheScope scope_) @safe
 	{
 		return CacheKey(logical.method, logical.key,
-				scope_ == CacheScope.private_ ? cachePartition_ : "", cacheServer_);
+				scope_ == CacheScope.private_ ? privatePartition() : "", cacheServer_);
+	}
+
+	/// The partition this client's `private` results live under: its
+	/// `cachePartition`, or a partition unique to this client when it has none.
+	/// Never "", which is the shared `public` namespace.
+	private string privatePartition() @safe nothrow
+	{
+		return cachePartition_.length ? cachePartition_ : clientPartition_;
 	}
 
 	/// A still-fresh entry under `key`, or null if absent or expired.
@@ -1581,8 +1608,8 @@ final class McpClient : ClientProtocol
 	}
 
 	/// Resolve the cache entry for `logical`, probing this client's own partition
-	/// first and then the shared/public one (only when partitioned, since
-	/// otherwise they coincide) — the same read order `cachedFetch` uses. `hitKey`
+	/// first and then the shared/public one — the same read order `cachedFetch`
+	/// uses. `hitKey`
 	/// reports the physical key that hit so callers can memoize against it. With
 	/// `requireFresh` (the default, used for serving cached responses) an expired
 	/// entry counts as a miss; without it the entry is returned regardless of
@@ -1594,22 +1621,19 @@ final class McpClient : ClientProtocol
 	{
 		if (cacheStore_ is null)
 			return Nullable!CacheEntry.init;
-		const ownKey = CacheKey(logical.method, logical.key, cachePartition_, cacheServer_);
+		const ownKey = scopedKey(logical, CacheScope.private_);
 		auto own = requireFresh ? freshEntry(ownKey) : cacheStore_.get(ownKey);
 		if (!own.isNull)
 		{
 			hitKey = ownKey;
 			return own;
 		}
-		if (cachePartition_.length)
+		const sharedKey = scopedKey(logical, CacheScope.public_);
+		auto shared_ = requireFresh ? freshEntry(sharedKey) : cacheStore_.get(sharedKey);
+		if (!shared_.isNull)
 		{
-			const sharedKey = scopedKey(logical, CacheScope.public_);
-			auto shared_ = requireFresh ? freshEntry(sharedKey) : cacheStore_.get(sharedKey);
-			if (!shared_.isNull)
-			{
-				hitKey = sharedKey;
-				return shared_;
-			}
+			hitKey = sharedKey;
+			return shared_;
 		}
 		return Nullable!CacheEntry.init;
 	}
@@ -1683,7 +1707,7 @@ final class McpClient : ClientProtocol
 		if (cacheStore_ is null || mode == CacheMode.bypass)
 			return fetch(uncacheable);
 		const sharedKey = scopedKey(logical, CacheScope.public_); // partition ""
-		const ownKey = CacheKey(logical.method, logical.key, cachePartition_, cacheServer_);
+		const ownKey = scopedKey(logical, CacheScope.private_);
 		if (mode == CacheMode.use)
 		{
 			CacheKey hitKey;
@@ -1771,8 +1795,7 @@ final class McpClient : ClientProtocol
 		if (cacheStore_ is null)
 			return;
 		cacheStore_.invalidate(CacheKey(method, key, "", cacheServer_));
-		if (cachePartition_.length)
-			cacheStore_.invalidate(CacheKey(method, key, cachePartition_, cacheServer_));
+		cacheStore_.invalidate(CacheKey(method, key, privatePartition(), cacheServer_));
 	}
 
 	/// `tools/call`. Per-request `progressToken` / `logLevel` / `onProgress` are
@@ -8773,6 +8796,42 @@ unittest  // an explicit cacheServer lets clients of one server share entries ac
 	a.listTools();
 	b.listTools();
 	assert(aCalls == 1 && bCalls == 0);
+}
+
+unittest  // unpartitioned clients of one server sharing a store never see each other's private results
+{
+	auto store = new InMemoryCacheStore();
+	int aCalls, bCalls;
+	auto a = sharedCacheClient(store, "", "private", aCalls);
+	auto b = sharedCacheClient(store, "", "private", bCalls);
+	a.listTools();
+	b.listTools();
+	assert(aCalls == 1 && bCalls == 1, "a private result must not be served to another client");
+	a.listTools();
+	assert(aCalls == 1, "a client still hits its own private result");
+}
+
+unittest  // an unpartitioned client's setBearerToken spares another client's public entries in a shared store
+{
+	auto store = new InMemoryCacheStore();
+	int aCalls, bCalls;
+	auto a = sharedCacheClient(store, "", "public", aCalls);
+	auto b = sharedCacheClient(store, "", "public", bCalls);
+	a.listTools();
+	b.setBearerToken("rotated");
+	a.listTools();
+	assert(aCalls == 1, "a shared public entry must survive another client's re-authentication");
+}
+
+unittest  // an unpartitioned client's setBearerToken evicts its own private results from a shared store
+{
+	auto store = new InMemoryCacheStore();
+	int calls;
+	auto a = sharedCacheClient(store, "", "private", calls);
+	a.listTools();
+	a.setBearerToken("rotated");
+	a.listTools();
+	assert(calls == 2);
 }
 
 version (unittest)
