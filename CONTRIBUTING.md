@@ -64,10 +64,14 @@ just            # list all recipes
 just build      # dub build
 just test       # dub test
 just fmt        # dub run dfmt -- --inplace source/ conformance/
-just lint       # ./scripts/dscanner-lint.sh
-just conformance-server   # build + run the server conformance suite
-just conformance-client   # build + run the client conformance suite
+just lint       # ./scripts/dscanner-lint.sh + ./scripts/check-readme-versions.sh
+just examples   # ./scripts/run-examples.sh (build + e2e-run every example)
+just docs       # ./scripts/gen-docs.sh (API docs into docs/)
+just conformance-build    # build the conformance server and client
+just conformance-server   # server conformance suite, both protocol revisions
+just conformance-client   # client conformance suite, both protocol revisions
 just conformance          # both suites
+just conformance-server-lane 2026-07-28   # one revision (likewise -client-lane)
 ```
 
 CI (`.github/workflows/ci.yml`) runs these jobs on every push and PR, and your
