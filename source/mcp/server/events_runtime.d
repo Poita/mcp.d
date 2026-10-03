@@ -346,10 +346,16 @@ final class EventHandle(A, P)
 /// a brief endpoint blip does not suspend a healthy subscription and a low-traffic
 /// one is not suspended on a handful of failures. A successful refresh
 /// reactivates a suspended subscription. `minAttempts == 0` never suspends.
+///
+/// A subscription's deliveries run one at a time, each retrying with backoff, so
+/// a dead endpoint yields at most about 40 attempts an hour under the default
+/// retry settings (`webhookMaxAttempts` 5, `webhookRetryBase` 30s). `minAttempts`
+/// must stay below what one window can produce or suspension never triggers;
+/// raise `window` alongside it, or lower it when slowing the retry schedule.
 struct WebhookSuspension
 {
 	Duration window = 60.minutes;
-	int minAttempts = 100;
+	int minAttempts = 20;
 	int failureRatePercent = 95;
 }
 
@@ -7016,10 +7022,49 @@ unittest  // the first failed attempt records lastError and failedSince before a
 	assert(sawError);
 }
 
+unittest  // the default suspension policy suspends a dead endpoint within one window
+{
+	import std.array : replicate;
+	import std.conv : to;
+
+	auto ft = new FakeWebhookTransport();
+	long clock = 1_000_000;
+	EventsOptions o;
+	o.nowMs = () @safe => clock;
+	o.nowIso = () @safe => "t";
+	o.allowPrivateCallbackHosts = true;
+	o.webhookTransport = ft;
+	o.deliveryExecutor = (void delegate() @safe job) @safe { job(); };
+	// Retry backoff advances the clock exactly as the real sleeps would.
+	o.deliverySleep = (Duration d) @safe { clock += d.total!"msecs"; };
+	auto rt = new EventsRuntime(null, o);
+	EventRegistration reg = {descriptor: EventType("n"), emitOnly: true};
+	rt.register(reg);
+	auto p = webhookSub("n", "https://proxy/hooks");
+	auto r = rt.subscribeWebhook(p, "user-1");
+	ft.eventStatuses = [500].replicate(1000);
+
+	const start = clock;
+	long refreshedAt = clock;
+	int i;
+	while (rt.webhookStore().get(r.id).get.active && clock - start < 60 * 60_000L)
+	{
+		// The client keeps its grant alive, as a live subscriber would.
+		if (clock - refreshedAt >= 10 * 60_000L)
+		{
+			rt.subscribeWebhook(p, "user-1");
+			refreshedAt = clock;
+		}
+		rt.emit(EventOccurrence("evt_" ~ (i++).to!string, "n", "t"));
+	}
+	assert(!rt.webhookStore().get(r.id).get.active,
+			"a dead endpoint must be suspended within one suspension window");
+}
+
 unittest  // failures below the minimum sample never suspend
 {
 	auto ft = new FakeWebhookTransport();
-	auto rt = engineRuntime(ft); // default policy: 100 attempts minimum
+	auto rt = engineRuntime(ft); // default policy: 20 attempts minimum
 	auto r = rt.subscribeWebhook(webhookSub("n", "https://proxy/hooks"), "user-1");
 	ft.eventStatuses = [500, 500, 500, 500, 500];
 	foreach (i; 0 .. 5)
