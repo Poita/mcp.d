@@ -1148,7 +1148,7 @@ private void handleLegacyInput(McpServer server, LegacySseChannel channel,
 			return Nullable!Json.init;
 		}
 		auto inner = new StdioContext(&sink, &serverRequest, conn.clientCaps,
-				legacyProgressToken(msg.params), conn.negotiated,
+				extractProgressToken(msg.params), conn.negotiated,
 				server.mode == ServerMode.stateless);
 		return server.handle(msg, new LegacySseContext(inner, sessionId, conn, token));
 	}
@@ -1242,18 +1242,6 @@ LegacyPostOutcome dispatchLegacyPost(McpServer server, LegacySseChannel channel,
 			logError("legacy HTTP+SSE dispatch failed: %s", e.msg);
 	});
 	return LegacyPostOutcome.accepted;
-}
-
-/// The `_meta.progressToken` of a request's params, or `Json.undefined`.
-private Json legacyProgressToken(Json params) @safe
-{
-	if (params.type == Json.Type.object && "_meta" in params)
-	{
-		auto meta = params["_meta"];
-		if (meta.type == Json.Type.object && "progressToken" in meta)
-			return meta["progressToken"];
-	}
-	return Json.undefined;
 }
 
 /// The `RequestContext` for one message on a legacy HTTP+SSE stream: it streams
