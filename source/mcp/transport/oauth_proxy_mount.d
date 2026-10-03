@@ -434,13 +434,13 @@ void mountOAuthMetadata(URLRouter router, OAuthProxy proxy) @safe
 	const asPath = authServerMetadataPath(proxy.config().baseUrl);
 
 	router.get(asPath, (HTTPServerRequest req, HTTPServerResponse res) @safe {
-		setMetadataCorsHeaders(res);
+		setAnyOriginCorsHeader(res);
 		res.statusCode = HTTPStatus.ok;
 		res.writeJsonBody(proxy.metadataJson());
 	});
 
 	router.match(HTTPMethod.OPTIONS, asPath, (HTTPServerRequest req, HTTPServerResponse res) @safe {
-		setMetadataCorsHeaders(res);
+		setAnyOriginCorsHeader(res);
 		res.headers["Access-Control-Allow-Methods"] = "GET, OPTIONS";
 		res.headers["Access-Control-Max-Age"] = "86400";
 		res.statusCode = HTTPStatus.noContent;
@@ -458,17 +458,36 @@ private string authServerMetadataPath(string issuer) @safe
 	return "/.well-known/oauth-authorization-server" ~ (path == "/" ? "" : path);
 }
 
-private void setMetadataCorsHeaders(scope HTTPServerResponse res) @safe
+private void setAnyOriginCorsHeader(scope HTTPServerResponse res) @safe
 {
 	res.headers["Access-Control-Allow-Origin"] = "*";
 }
 
+/// Answer CORS preflights for a POST-only OAuth endpoint at `path`. `/register`
+/// and `/token` authenticate with request parameters, never cookies, so any
+/// origin may call them and the responses carry `Access-Control-Allow-Origin: *`.
+private void mountPostPreflight(URLRouter router, string path) @safe
+{
+	router.match(HTTPMethod.OPTIONS, path, (HTTPServerRequest req, HTTPServerResponse res) @safe {
+		setAnyOriginCorsHeader(res);
+		res.headers["Access-Control-Allow-Methods"] = "POST, OPTIONS";
+		res.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization";
+		res.headers["Access-Control-Max-Age"] = "86400";
+		res.statusCode = HTTPStatus.noContent;
+		res.writeVoidBody();
+	});
+}
+
 /// Mount the RFC 7591 Dynamic Client Registration endpoint: echo the requested
 /// redirect_uris and hand back the fixed upstream client_id (public PKCE client).
+/// Like `/token`, it is CORS-enabled for any origin (with a preflight answered)
+/// so a browser-based MCP client can register cross-origin.
 void mountOAuthRegister(URLRouter router, OAuthProxy proxy) @safe
 {
 	const registerPath = pathOf(proxy.config().registrationEndpoint());
+	mountPostPreflight(router, registerPath);
 	router.post(registerPath, (HTTPServerRequest req, HTTPServerResponse res) @safe {
+		setAnyOriginCorsHeader(res);
 		Json body_;
 		if (!tryReadJsonBody(req, body_))
 		{
@@ -903,7 +922,9 @@ in (exchange !is null)
 	const tokenPath = pathOf(cfg.tokenEndpoint());
 	const upstreamTokenEndpoint = cfg.upstreamTokenEndpoint;
 
+	mountPostPreflight(router, tokenPath);
 	router.post(tokenPath, (HTTPServerRequest req, HTTPServerResponse res) @safe {
+		setAnyOriginCorsHeader(res);
 		// Token responses carry credentials and MUST NOT be cached (RFC 6749 §5.1).
 		res.headers["Cache-Control"] = "no-store";
 		res.headers["Pragma"] = "no-cache";
@@ -2605,6 +2626,64 @@ unittest  // CORS: a preflight to the AS metadata document is answered
 	assert(res.statusCode == 204);
 	assert(res.headers.get("Access-Control-Allow-Origin", "") == "*");
 	assert(res.headers.get("Access-Control-Allow-Methods", "").canFind("GET"));
+}
+
+unittest  // CORS: /register and /token responses are readable cross-origin
+{
+	import vibe.http.server : createTestHTTPServerRequest,
+		createTestHTTPServerResponse, TestHTTPResponseMode;
+	import vibe.inet.url : URL;
+	import vibe.stream.memory : createMemoryOutputStream, createMemoryStream;
+
+	auto proxy = mountSampleProxy();
+	auto router = new URLRouter;
+	mountOAuthRegister(router, proxy);
+	mountOAuthToken(router, proxy);
+
+	foreach (leg; [
+			["/register", `{"redirect_uris":["http://localhost:5000/cb"]}`],
+			["/token", "grant_type=password"]
+		])
+	{
+		auto reqBody = () @trusted { return cast(ubyte[]) leg[1].dup; }();
+		auto req = createTestHTTPServerRequest(URL("https://mcp.example.com" ~ leg[0]),
+				HTTPMethod.POST, createMemoryStream(reqBody, false));
+		req.headers["Origin"] = "https://app.example.com";
+		auto res = createTestHTTPServerResponse(createMemoryOutputStream(),
+				null, TestHTTPResponseMode.bodyOnly);
+		router.handleRequest(req, res);
+		assert(res.headers.get("Access-Control-Allow-Origin", "") == "*", leg[0]);
+	}
+}
+
+unittest  // CORS: a preflight to /register or /token is answered
+{
+	import std.algorithm : canFind;
+	import vibe.http.server : createTestHTTPServerRequest,
+		createTestHTTPServerResponse, TestHTTPResponseMode;
+	import vibe.inet.url : URL;
+	import vibe.stream.memory : createMemoryOutputStream;
+
+	auto proxy = mountSampleProxy();
+	auto router = new URLRouter;
+	mountOAuthRegister(router, proxy);
+	mountOAuthToken(router, proxy);
+
+	foreach (path; ["/register", "/token"])
+	{
+		auto req = createTestHTTPServerRequest(URL("https://mcp.example.com" ~ path),
+				HTTPMethod.OPTIONS);
+		req.headers["Origin"] = "https://app.example.com";
+		req.headers["Access-Control-Request-Method"] = "POST";
+		req.headers["Access-Control-Request-Headers"] = "content-type";
+		auto res = createTestHTTPServerResponse(createMemoryOutputStream(),
+				null, TestHTTPResponseMode.bodyOnly);
+		router.handleRequest(req, res);
+		assert(res.statusCode == 204, path);
+		assert(res.headers.get("Access-Control-Allow-Origin", "") == "*", path);
+		assert(res.headers.get("Access-Control-Allow-Methods", "").canFind("POST"), path);
+		assert(res.headers.get("Access-Control-Allow-Headers", "").canFind("Content-Type"), path);
+	}
 }
 
 unittest  // COMPOSE: the per-route helpers reproduce the /register leg
