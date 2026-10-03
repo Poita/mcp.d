@@ -178,20 +178,20 @@ final class ReferenceTokenStore
 /// issued subject/scopes/claims. A token issued without an audience is bound to
 /// `resource` (its audience becomes `[resource]`, satisfying the RFC 8707
 /// binding); a token issued with an explicit audience is accepted only when that
-/// audience names `resource`, so a store shared across resources never lets one
+/// audience names `resource` (compared in RFC 8707 canonical form), so a store shared across resources never lets one
 /// resource's token through at another. On a miss, expiry or audience mismatch it
 /// returns `TokenInfo.invalid()`.
 TokenValidator referenceTokenValidator(ReferenceTokenStore store, string resource) @safe
 in (store !is null)
 {
-	import std.algorithm : canFind;
+	import mcp.auth.jwt_verifier : includesAudience;
 
 	return (string token) @safe {
 		auto found = store.lookup(token);
 		if (found.isNull)
 			return TokenInfo.invalid();
 		auto t = found.get;
-		if (t.audience.length && !t.audience.canFind(resource))
+		if (t.audience.length && !includesAudience(t.audience, resource))
 			return TokenInfo.invalid();
 		TokenInfo info;
 		info.valid = true;
@@ -230,6 +230,18 @@ private long nowUnixSeconds() @safe
 
 	auto validate = referenceTokenValidator(store, "https://api.example.com");
 	assert(!validate(tok).valid);
+}
+
+@safe unittest  // referenceTokenValidator compares audiences in canonical resource form
+{
+	auto store = new ReferenceTokenStore();
+	IssuedToken t;
+	t.subject = "alice";
+	t.audience = ["HTTPS://API.example.com:443/"];
+	t.expiresAt = long.max;
+	const tok = store.issue(t);
+
+	assert(referenceTokenValidator(store, "https://api.example.com")(tok).valid);
 }
 
 @safe unittest  // a handler mutating the validated claims does not alter the stored token
