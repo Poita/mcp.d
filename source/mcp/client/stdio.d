@@ -9,7 +9,7 @@ import mcp.protocol.errors;
 import mcp.client.transport : BearerProvider, ClientTransport, ClientProtocol;
 import mcp.client.subscription : SubscriptionStream, ListenGate;
 import mcp.transport.duplex : DuplexChannel, defaultMaxLineBytes;
-import mcp.protocol.events : subscriptionIdMetaKey;
+import mcp.protocol.mrtr : MetaKey;
 
 @safe:
 
@@ -242,9 +242,9 @@ final class StdioClientTransport : ClientTransport
 				|| m.params.type != Json.Type.object || "_meta" !in m.params)
 			return;
 		auto meta = m.params["_meta"];
-		if (meta.type != Json.Type.object || subscriptionIdMetaKey !in meta)
+		if (meta.type != Json.Type.object || MetaKey.subscriptionId !in meta)
 			return;
-		const key = meta[subscriptionIdMetaKey].toString();
+		const key = meta[MetaKey.subscriptionId].toString();
 		if (auto action = key in pendingListens_)
 		{
 			auto run = *action;
@@ -793,13 +793,11 @@ version (unittest)
 	/// the stream, stamped with the listen id; other lines are ignored.
 	private void acknowledgeListen(TestLines toClient, string line) @safe
 	{
-		import mcp.protocol.events : subscriptionIdMetaKey;
-
 		auto m = parseJsonString(line);
 		if ("method" !in m || m["method"].get!string != "subscriptions/listen")
 			return;
 		Json meta = Json.emptyObject;
-		meta[subscriptionIdMetaKey] = m["id"];
+		meta[MetaKey.subscriptionId] = m["id"];
 		Json params = Json.emptyObject;
 		params["notifications"] = Json.emptyObject;
 		params["_meta"] = meta;

@@ -11,14 +11,9 @@ import std.typecons : Nullable, nullable;
 import vibe.data.json : Json;
 
 import mcp.protocol.jsonhelpers : getOr, tryGet, requireObject;
+import mcp.protocol.mrtr : MetaKey;
 
 @safe:
-
-/// The `_meta` key under which every `notifications/events/*` message carries the
-/// JSON-RPC id of its parent `events/stream` request, so a client holding several
-/// concurrent streams (notably on stdio, where they share one stdout) can route
-/// each notification to the right subscription (SEP-2575 correlation convention).
-enum string subscriptionIdMetaKey = "io.modelcontextprotocol/subscriptionId";
 
 /// JSON-RPC method names introduced by the extension.
 enum string eventsListMethod = "events/list";
@@ -711,8 +706,10 @@ Json streamEventsResult() @safe
 	return j;
 }
 
-/// Attach the `io.modelcontextprotocol/subscriptionId` correlation `_meta` to
-/// a notification's params, returning a copy. `subscriptionId` is the JSON-RPC
+/// Attach the `io.modelcontextprotocol/subscriptionId` (`MetaKey.subscriptionId`)
+/// correlation `_meta` to a notification's params, returning a copy. A client
+/// holding several concurrent streams (notably on stdio, where they share one
+/// stdout) routes each notification to its subscription by this key. `subscriptionId` is the JSON-RPC
 /// id of the request that opened the stream (`events/stream` or
 /// `subscriptions/listen`), carried verbatim so a numeric id stays numeric. An
 /// absent (`undefined`) or `null` id is a no-op and returns `params` unchanged.
@@ -723,7 +720,7 @@ Json withSubscriptionId(Json params, Json subscriptionId) @safe
 	Json p = params.type == Json.Type.object ? params.clone() : Json.emptyObject;
 	Json meta = ("_meta" in p && p["_meta"].type == Json.Type.object) ? p["_meta"]
 		: Json.emptyObject;
-	meta[subscriptionIdMetaKey] = subscriptionId;
+	meta[MetaKey.subscriptionId] = subscriptionId;
 	p["_meta"] = meta;
 	return p;
 }
@@ -1368,7 +1365,7 @@ unittest  // withSubscriptionId attaches the SEP-2575 correlation _meta (integer
 {
 	auto occ = EventOccurrence("e", "n", "t").toJson();
 	auto tagged = withSubscriptionId(occ, Json(1));
-	assert(tagged["_meta"][subscriptionIdMetaKey].get!int == 1);
+	assert(tagged["_meta"][MetaKey.subscriptionId].get!int == 1);
 	// original event fields preserved
 	assert(tagged["eventId"].get!string == "e");
 }
@@ -1379,7 +1376,7 @@ unittest  // withSubscriptionId merges into an existing _meta and supports strin
 	params["_meta"] = Json(["existing": Json("keep")]);
 	auto tagged = withSubscriptionId(params, Json("sub-7"));
 	assert(tagged["_meta"]["existing"].get!string == "keep");
-	assert(tagged["_meta"][subscriptionIdMetaKey].get!string == "sub-7");
+	assert(tagged["_meta"][MetaKey.subscriptionId].get!string == "sub-7");
 }
 
 unittest  // withSubscriptionId leaves params untagged when the id is absent or null
@@ -1392,7 +1389,7 @@ unittest  // withSubscriptionId leaves params untagged when the id is absent or 
 unittest  // withSubscriptionId stamps an empty-string id, which JSON-RPC allows
 {
 	auto tagged = withSubscriptionId(Json.emptyObject, Json(""));
-	assert(tagged["_meta"][subscriptionIdMetaKey].get!string == "");
+	assert(tagged["_meta"][MetaKey.subscriptionId].get!string == "");
 }
 
 unittest  // EventError round-trips code/message/data and tolerates a non-object

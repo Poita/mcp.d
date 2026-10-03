@@ -7518,7 +7518,7 @@ unittest  // events/subscribe without an authenticated principal is -32012 Forbi
 
 unittest  // stdio events/stream opens with an active frame, then delivers emitted events
 {
-	import mcp.protocol.events : subscriptionIdMetaKey, EventOccurrence;
+	import mcp.protocol.events : EventOccurrence;
 	import vibe.data.json : parseJsonString;
 
 	auto s = new McpServer("t", "1");
@@ -7537,7 +7537,7 @@ unittest  // stdio events/stream opens with an active frame, then delivers emitt
 	// first frame is notifications/events/active stamped with the request id
 	auto active = parseJsonString(lines[0]);
 	assert(active["method"].get!string == "notifications/events/active");
-	assert(active["params"]["_meta"][subscriptionIdMetaKey].get!long == 9);
+	assert(active["params"]["_meta"][MetaKey.subscriptionId].get!long == 9);
 
 	// an emitted event is delivered live on the same channel
 	rt.emit(EventOccurrence("evt_1", "incident.created", "", Json([
@@ -7546,7 +7546,7 @@ unittest  // stdio events/stream opens with an active frame, then delivers emitt
 	auto ev = parseJsonString(lines[$ - 1]);
 	assert(ev["method"].get!string == "notifications/events/event");
 	assert(ev["params"]["eventId"].get!string == "evt_1");
-	assert(ev["params"]["_meta"][subscriptionIdMetaKey].get!long == 9);
+	assert(ev["params"]["_meta"][MetaKey.subscriptionId].get!long == 9);
 }
 
 unittest  // stdio events/stream rejects a request id that already names an open stream

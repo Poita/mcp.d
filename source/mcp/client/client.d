@@ -4186,9 +4186,9 @@ final class McpClient : ClientProtocol
 		if (params.type != Json.Type.object || "_meta" !in params)
 			return false;
 		auto meta = params["_meta"];
-		if (meta.type != Json.Type.object || subscriptionIdMetaKey !in meta)
+		if (meta.type != Json.Type.object || MetaKey.subscriptionId !in meta)
 			return false;
-		const key = subscriptionKey(meta[subscriptionIdMetaKey]);
+		const key = subscriptionKey(meta[MetaKey.subscriptionId]);
 		auto h = key in eventStreams_;
 		if (h is null)
 			return false;

@@ -3833,6 +3833,8 @@ unittest  // emit-only poll reads the ring buffer
 
 unittest  // emit fans out to a matching push stream
 {
+	import mcp.protocol.mrtr : MetaKey;
+
 	auto rt = testRuntime();
 	EventRegistration reg;
 	reg.descriptor.name = "incident.created";
@@ -3850,7 +3852,7 @@ unittest  // emit fans out to a matching push stream
 	assert(deliveredMethod == eventsEventNotification);
 	assert(deliveredParams["eventId"].get!string == "evt1");
 	// the subscription id is carried in _meta
-	assert(deliveredParams["_meta"][subscriptionIdMetaKey].get!int == 1);
+	assert(deliveredParams["_meta"][MetaKey.subscriptionId].get!int == 1);
 	handle.close();
 }
 
@@ -3998,6 +4000,8 @@ unittest  // a push stream that falls too far behind is terminated as a slow con
 
 unittest  // advancePushStream delivers a recoverable error frame when the check throws, and stays open
 {
+	import mcp.protocol.mrtr : MetaKey;
+
 	auto rt = testRuntime();
 	bool fail = true;
 	EventRegistration reg;
@@ -4016,7 +4020,7 @@ unittest  // advancePushStream delivers a recoverable error frame when the check
 	assert(methods == [eventsErrorNotification]);
 	assert(params[0]["error"]["code"].get!int == -32603);
 	assert(params[0]["error"]["message"].get!string == "Internal error");
-	assert(params[0]["_meta"][subscriptionIdMetaKey].get!int == 7);
+	assert(params[0]["_meta"][MetaKey.subscriptionId].get!int == 7);
 	fail = false;
 	rt.advancePushStream(handle.stream); // still open: the next advance delivers
 	assert(methods[$ - 1] == eventsEventNotification);
@@ -4077,6 +4081,8 @@ unittest  // advancePushStream re-sends active{truncated:true} with the fresh cu
 
 unittest  // terminatePush sends a terminated frame, releases the subscription, and runs the transport hook
 {
+	import mcp.protocol.mrtr : MetaKey;
+
 	auto rt = testRuntime();
 	int unsubs;
 	EventRegistration reg;
@@ -4093,7 +4099,7 @@ unittest  // terminatePush sends a terminated frame, releases the subscription, 
 	rt.terminatePush(handle.stream, toErrorJson(forbidden("Access revoked")));
 	assert(methods == [eventsTerminatedNotification]);
 	assert(params[0]["error"]["code"].get!int == -32012);
-	assert(params[0]["_meta"][subscriptionIdMetaKey].get!int == 3);
+	assert(params[0]["_meta"][MetaKey.subscriptionId].get!int == 3);
 	assert(unsubs == 1 && hooked && handle.stream.terminated);
 	rt.emit(EventOccurrence("evt", "incident.created", "t"));
 	assert(methods.length == 1); // nothing further is delivered
