@@ -525,6 +525,14 @@ struct SubscribeOptions
 	Nullable!DeliveryMode delivery; /// force a mode instead of selecting one
 }
 
+/// The invalidation count of a logical cache entry and how many fetches for it
+/// are in flight.
+private struct CacheGeneration
+{
+	ulong generation;
+	uint inFlight;
+}
+
 /// A Model Context Protocol client, transport-agnostic.
 ///
 /// Speaks pure JSON-RPC + protocol logic over a `ClientTransport` (Streamable
@@ -595,11 +603,13 @@ final class McpClient : ClientProtocol
 	// It is re-derived whenever the underlying entry changes (a different
 	// physical key or expiry) and dropped when the entry is gone.
 	private Tool[string] storeToolIndex_;
-	// Invalidation count per logical cache entry (method + key). `cachedFetch`
-	// stores a result only when no invalidation for its entry arrived while the
-	// fetch was in flight, so a change notification is never overwritten by the
-	// stale response it raced with.
-	private ulong[string] cacheGenerations_;
+	// Invalidation state per logical cache entry (method + key) with a fetch in
+	// flight. `cachedFetch` stores a result only when no invalidation for its
+	// entry arrived while the fetch was in flight, so a change notification is
+	// never overwritten by the stale response it raced with. An entry lives only
+	// while a fetch for its key is outstanding, so the map stays bounded by the
+	// number of concurrent fetches.
+	private CacheGeneration[string] cacheGenerations_;
 	// Advanced whenever the identity behind requests changes (`setBearerToken`,
 	// `setBearerProvider`), so a cacheable read sent under the previous identity
 	// that completes afterwards is neither cached nor indexed for the new one.
@@ -1432,7 +1442,9 @@ final class McpClient : ClientProtocol
 
 	private ListToolsResult listToolsImpl(RequestOptions opts) @safe
 	{
-		const generation = cacheGeneration("tools/list", "");
+		const generation = beginCacheFetch("tools/list", "");
+		scope (exit)
+			endCacheFetch("tools/list", "");
 		const epoch = identityEpoch_;
 		auto acc = cachedFetch!ListToolsResult(CacheKey("tools/list", ""), opts.cacheMode, () @safe {
 			auto a = drainList!ListToolsResult("tools/list", Json.emptyObject,
@@ -1679,7 +1691,9 @@ final class McpClient : ClientProtocol
 			if (!hit.isNull)
 				return R.fromJson(hit.get.value);
 		}
-		const generation = cacheGeneration(logical.method, logical.key);
+		const generation = beginCacheFetch(logical.method, logical.key);
+		scope (exit)
+			endCacheFetch(logical.method, logical.key);
 		const epoch = identityEpoch_;
 		R result = fetch(uncacheable);
 		if (uncacheable || cacheGeneration(logical.method,
@@ -1707,17 +1721,45 @@ final class McpClient : ClientProtocol
 		return method ~ "\0" ~ key;
 	}
 
-	/// How many times the logical entry `method`/`key` has been invalidated.
+	/// How many times the logical entry `method`/`key` has been invalidated
+	/// since its oldest outstanding fetch began.
 	private ulong cacheGeneration(string method, string key) @safe
 	{
-		return cacheGenerations_.get(generationKey(method, key), 0);
+		if (auto g = generationKey(method, key) in cacheGenerations_)
+			return g.generation;
+		return 0;
+	}
+
+	/// Register a fetch for the logical entry `method`/`key`, returning its
+	/// current generation. Each call is paired with `endCacheFetch`.
+	private ulong beginCacheFetch(string method, string key) @safe
+	{
+		const k = generationKey(method, key);
+		if (auto g = k in cacheGenerations_)
+		{
+			g.inFlight++;
+			return g.generation;
+		}
+		cacheGenerations_[k] = CacheGeneration(0, 1);
+		return 0;
+	}
+
+	/// End a fetch registered by `beginCacheFetch`, dropping the entry's state
+	/// once no fetch for it remains.
+	private void endCacheFetch(string method, string key) @safe
+	{
+		const k = generationKey(method, key);
+		if (auto g = k in cacheGenerations_)
+			if (--g.inFlight == 0)
+				cacheGenerations_.remove(k);
 	}
 
 	/// Handle a server change notification for a logical entry: evict it and
 	/// advance its generation so an in-flight fetch does not re-store it.
 	private void invalidateLogical(string method, string key) @safe
 	{
-		cacheGenerations_[generationKey(method, key)]++;
+		if (auto g = generationKey(method, key) in cacheGenerations_)
+			g.generation++;
 		evictLogical(method, key);
 	}
 
@@ -10954,4 +10996,49 @@ unittest  // the webhook refresh loop re-subscribes before the grant expires
 	};
 	c.runWebhookRefreshLoop(sub, sp, first, null);
 	assert(subs == 1);
+}
+
+unittest  // change notifications for keys with no fetch in flight retain no invalidation state
+{
+	import std.conv : to;
+
+	auto c = McpClient.http("http://localhost");
+	foreach (i; 0 .. 100)
+	{
+		Json p = Json.emptyObject;
+		p["uri"] = "test://r" ~ i.to!string;
+		c.dispatchNotification("notifications/resources/updated", p);
+	}
+	c.dispatchNotification("notifications/tools/list_changed", Json.emptyObject);
+	assert(c.cacheGenerations_.length == 0);
+}
+
+unittest  // a resources/updated arriving while that resource's read is in flight keeps the stale result out of the cache
+{
+	auto c = McpClient.http("http://localhost");
+	int calls;
+	c.onRpcForTest = (string m, Json p) @safe {
+		Json r = Json.emptyObject;
+		if (m == "resources/read")
+		{
+			calls++;
+			if (calls == 1)
+			{
+				Json n = Json.emptyObject;
+				n["uri"] = "a";
+				c.dispatchNotification("notifications/resources/updated", n);
+			}
+			Json arr = Json.emptyArray;
+			arr ~= ResourceContents.makeText("a", "text/plain", "hi").toJson();
+			r["contents"] = arr;
+			r["ttlMs"] = 5000;
+		}
+		return r;
+	};
+	c.readResource("a");
+	c.readResource("a"); // the first result was not cached -> refetch
+	assert(calls == 2);
+	c.readResource("a"); // the second one was
+	assert(calls == 2);
+	assert(c.cacheGenerations_.length == 0);
 }
