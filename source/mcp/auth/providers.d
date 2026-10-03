@@ -358,8 +358,10 @@ package struct ProviderHttpRequest
 	string url;
 	/// The `Authorization` header value; empty sends none.
 	string authorization;
-	/// The JSON request body; empty sends none.
+	/// The request body; empty sends none.
 	string body;
+	/// The body's `Content-Type`.
+	string contentType = "application/json";
 }
 
 /// The status and body of a provider verifier's HTTP response.
@@ -393,7 +395,7 @@ private ProviderHttpResponse providerHttp(ProviderHttpRequest r) @trusted
 			req.headers["Authorization"] = r.authorization;
 		if (r.body.length)
 		{
-			req.headers["Content-Type"] = "application/json";
+			req.headers["Content-Type"] = r.contentType;
 			req.writeBody(cast(const(ubyte)[]) r.body);
 		}
 	}, (scope HTTPClientResponse res) {
@@ -477,8 +479,9 @@ package TokenValidator githubTokenVerifierWith(string clientId,
 }
 
 /// A `TokenValidator` for Google OAuth access tokens that accepts only tokens
-/// issued to the OAuth client `clientId`. Each call asks Google's tokeninfo
-/// endpoint (`https://oauth2.googleapis.com/tokeninfo`) and requires its `aud`
+/// issued to the OAuth client `clientId`. Each call POSTs the token as a form
+/// field to Google's tokeninfo endpoint (`https://oauth2.googleapis.com/tokeninfo`),
+/// keeping it out of the URL and so out of logged request errors, and requires its `aud`
 /// or `azp` to equal `clientId` and its `exp` to be in the future, so a live
 /// token granted to another client cannot be replayed here. The subject is the
 /// Google account id (`sub`), the scopes are the token's granted scopes, and
@@ -505,8 +508,9 @@ package TokenValidator googleTokenVerifierWith(string clientId, ProviderHttp htt
 		if (token.length == 0)
 			return TokenInfo.invalid();
 		return providerCheck("Google", () @safe {
-			const res = http(ProviderHttpRequest("GET",
-				"https://oauth2.googleapis.com/tokeninfo?access_token=" ~ encodeComponent(token)));
+			const res = http(ProviderHttpRequest("POST",
+				"https://oauth2.googleapis.com/tokeninfo", null,
+				"access_token=" ~ encodeComponent(token), "application/x-www-form-urlencoded"));
 			if (res.status != 200)
 				return TokenInfo.invalid();
 			auto doc = parseUntrustedJson(res.body);
@@ -1071,7 +1075,6 @@ unittest  // GITHUB: a failed check-token call rejects the token without throwin
 
 unittest  // GOOGLE: the verifier accepts a token whose tokeninfo aud or azp is this client
 {
-	import std.algorithm : canFind;
 	import std.conv : to;
 	import std.datetime.systime : Clock;
 
@@ -1086,8 +1089,26 @@ unittest  // GOOGLE: the verifier accepts a token whose tokeninfo aud or azp is 
 	assert(info.valid);
 	assert(info.subject == "1234");
 	assert(info.scopes == ["openid", "email"]);
-	assert(fake.last.method == "GET");
-	assert(fake.last.url.canFind("https://oauth2.googleapis.com/tokeninfo?access_token=ya29.valid"));
+}
+
+unittest  // GOOGLE: the token is POSTed as a form body, never placed in the tokeninfo URL
+{
+	import std.algorithm : canFind;
+	import std.conv : to;
+	import std.datetime.systime : Clock;
+
+	const exp = (Clock.currTime.toUnixTime + 3600).to!string;
+	auto fake = new FakeProviderHttp;
+	fake.answer = (ProviderHttpRequest req) @safe => ProviderHttpResponse(200,
+			`{"aud":"client.apps.googleusercontent.com","sub":"1234","exp":"` ~ exp ~ `"}`);
+	auto v = googleTokenVerifierWith("client.apps.googleusercontent.com", fake.call());
+
+	assert(v("ya29.valid/+=").valid);
+	assert(fake.last.method == "POST");
+	assert(fake.last.url == "https://oauth2.googleapis.com/tokeninfo");
+	assert(fake.last.contentType == "application/x-www-form-urlencoded");
+	assert(fake.last.body == "access_token=ya29.valid%2F%2B%3D");
+	assert(!fake.last.url.canFind("ya29"));
 }
 
 unittest  // GOOGLE: a live token issued to another client, or an expired one, is rejected
