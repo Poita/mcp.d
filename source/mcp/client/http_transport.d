@@ -2458,7 +2458,7 @@ private bool modernErrorFromBody(string body, out McpException err) @safe nothro
 			return false;
 		const m = ("message" in e && e["message"].type == Json.Type.string) ? e["message"]
 			.get!string : "server error";
-		err = new McpException(code, m, e);
+		err = new McpException(code, m, ("data" in e) ? e["data"] : Json.undefined);
 		return true;
 	}
 	catch (Exception)
@@ -2818,6 +2818,17 @@ unittest  // modernErrorFromBody surfaces a recognized modern JSON-RPC error
 			err));
 	assert(err !is null);
 	assert(err.code == ErrorCode.unsupportedProtocolVersion);
+	assert(err.data.type == Json.Type.object);
+	assert(err.data["supported"].type == Json.Type.array);
+	assert(err.data["supported"][0].get!string == "2025-11-25");
+}
+
+unittest  // modernErrorFromBody leaves data undefined when the error carries none
+{
+	McpException err;
+	assert(modernErrorFromBody(
+			`{"jsonrpc":"2.0","id":1,"error":{"code":-32601,"message":"Method not found"}}`, err));
+	assert(err.data.type == Json.Type.undefined);
 }
 
 unittest  // modernErrorFromBody surfaces a 404 method-not-found body

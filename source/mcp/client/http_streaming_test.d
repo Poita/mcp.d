@@ -612,3 +612,65 @@ unittest
 	assert(failure.length == 0, "the call failed while the client handler ran: " ~ failure);
 	assert(text == "1", "unexpected tool result: " ~ text);
 }
+
+// A modern server that does not serve the client's probe version answers
+// `server/discover` with HTTP 400 and an UnsupportedProtocolVersionError whose
+// `data.supported` lists what it does serve; connect() negotiates from that list
+// and runs the initialize handshake for the chosen stable version.
+unittest
+{
+	auto router = new URLRouter;
+	router.post("/mcp", (HTTPServerRequest req, HTTPServerResponse res) @safe {
+		auto msg = parseJsonString(req.bodyReader.readAllUTF8);
+		const method = msg["method"].get!string;
+		if ("id" !in msg)
+		{
+			res.statusCode = 202;
+			res.writeBody("");
+			return;
+		}
+		Json reply = Json.emptyObject;
+		reply["jsonrpc"] = "2.0";
+		reply["id"] = msg["id"];
+		if (method == "server/discover")
+		{
+			reply["error"] = parseJsonString(`{"code":-32022,"message":"Unsupported protocol version","data":{"supported":["2025-11-25"]}}`);
+			res.statusCode = 400;
+		}
+		else if (method == "initialize")
+			reply["result"] = parseJsonString(`{"protocolVersion":"2025-11-25","capabilities":{},"serverInfo":{"name":"fake","version":"1"}}`);
+		else
+			reply["error"] = parseJsonString(`{"code":-32601,"message":"Method not found"}`);
+		res.writeBody(reply.toString, "application/json");
+	});
+
+	auto settings = new HTTPServerSettings;
+	settings.port = 0;
+	settings.bindAddresses = ["127.0.0.1"];
+
+	string failure;
+	ProtocolVersion negotiated;
+
+	void delegate() @safe nothrow body_ = () @safe nothrow{
+		try
+		{
+			auto listener = listenHTTP(settings, router);
+			scope (exit)
+				() @trusted { listener.stopListening(); }();
+			const port = listener.bindAddresses[0].port;
+			auto client = McpClient.http("http://127.0.0.1:" ~ port.to!string ~ "/mcp");
+			scope (exit)
+				closeQuietly(client);
+			negotiated = client.connect();
+		}
+		catch (Exception e)
+			failure = e.msg;
+		exitEventLoop();
+	};
+
+	runTask(body_);
+	runEventLoop();
+
+	assert(failure.length == 0, "connect failed: " ~ failure);
+	assert(negotiated == ProtocolVersion.v2025_11_25);
+}
