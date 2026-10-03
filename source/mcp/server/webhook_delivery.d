@@ -287,11 +287,11 @@ private string hostOf(string url) @safe
 /// timing side-channel cannot leak the nonce.
 bool challengeEchoed(string body, string expected) @safe
 {
-	import vibe.data.json : parseJsonString;
+	import mcp.protocol.jsonrpc : parseUntrustedJson;
 
 	Json j;
 	try
-		j = parseJsonString(body);
+		j = parseUntrustedJson(body);
 	catch (Exception)
 		return false;
 	if (j.type != Json.Type.object || "challenge" !in j || j["challenge"].type != Json.Type.string)
@@ -557,6 +557,14 @@ unittest  // challengeEchoed accepts a matching echo and rejects mismatches
 	assert(!challengeEchoed(`{"challenge":"wrong"}`, "nonce123"));
 	assert(!challengeEchoed(`not json`, "nonce123"));
 	assert(!challengeEchoed(`{"other":"x"}`, "nonce123"));
+}
+
+unittest  // challengeEchoed rejects an echo nested past the depth cap
+{
+	import std.array : replicate;
+
+	const deep = "[".replicate(1000) ~ "]".replicate(1000);
+	assert(!challengeEchoed(`{"challenge":"nonce123","x":` ~ deep ~ `}`, "nonce123"));
 }
 
 unittest  // constantTimeEquals matches std equality semantics

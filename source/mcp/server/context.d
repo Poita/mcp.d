@@ -1,7 +1,7 @@
 module mcp.server.context;
 
 import std.typecons : Nullable;
-import vibe.data.json : Json, deserializeJson, parseJsonString;
+import vibe.data.json : Json, deserializeJson;
 
 import mcp.protocol.errors;
 import mcp.protocol.sampling : CreateMessageRequest, CreateMessageResult;
@@ -10,7 +10,7 @@ import mcp.protocol.types : ListRootsResult, ElicitResult, ElicitAction,
 import mcp.protocol.capabilities : ClientCapabilities, ClientCapability;
 import mcp.protocol.schema : elicitationSchemaOf, isFlatElicitationStruct;
 import mcp.auth.resource_server : TokenInfo;
-import mcp.protocol.jsonrpc : makeNotification;
+import mcp.protocol.jsonrpc : makeNotification, parseUntrustedJson;
 import mcp.protocol.versions : ProtocolVersion, latestLegacy, supportsProgressMessage;
 import mcp.server.connection : ConnectionState;
 
@@ -364,7 +364,7 @@ interface RequestContext
 		const raw = requestState();
 		if (raw.length == 0)
 			return T.init;
-		return deserializeJson!T(parseJsonString(raw));
+		return deserializeJson!T(parseUntrustedJson(raw));
 	}
 
 	/// Typed convenience over `log(string, Json, string)`: emit a
@@ -1518,6 +1518,17 @@ unittest  // requestStateAs!T returns T.init when requestState is empty
 
 	auto c = probe.requestStateAs!Cursor;
 	assert(c == Cursor.init);
+}
+
+unittest  // requestStateAs!T rejects a requestState nested past the depth cap
+{
+	import std.array : replicate;
+	import std.exception : assertThrown;
+	import vibe.data.json : JSONException;
+
+	auto probe = new StateProbe;
+	probe.state = "[".replicate(1000) ~ "]".replicate(1000);
+	assertThrown!JSONException(probe.requestStateAs!Json);
 }
 
 unittest  // typed log(LogLevel, string) emits the same frame as the string/Json form

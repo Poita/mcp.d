@@ -2704,7 +2704,7 @@ final class EventsRuntime
 	// failure).
 	private string[] fetchWellKnownReceivers(string origin) @safe
 	{
-		import vibe.data.json : parseJsonString;
+		import mcp.protocol.jsonrpc : parseUntrustedJson;
 
 		const docUrl = origin ~ wellKnownReceiverPath;
 		if (!callbackHostAllowed(docUrl, opts_.allowPrivateCallbackHosts))
@@ -2718,7 +2718,7 @@ final class EventsRuntime
 			return null;
 		Json j;
 		try
-			j = parseJsonString(res.body);
+			j = parseUntrustedJson(res.body);
 		catch (Exception)
 			return null;
 		if (j.type != Json.Type.object || "receivers" !in j || j["receivers"].type
@@ -6666,6 +6666,19 @@ unittest  // a callback outside the well-known document's prefixes still gets th
 	rt.emit(EventOccurrence("evt_1", "n", "t"));
 	assert(controlPostsOf(ft, "verification").length == 1);
 	assert(ft.eventPosts().length == 1); // the echoed challenge verified it
+}
+
+unittest  // a well-known document nested past the depth cap is ignored, so the callback gets the challenge
+{
+	import std.array : replicate;
+
+	auto ft = new FakeWebhookTransport();
+	ft.wellKnownBody = `{"receivers": ["/hooks/"],"x":` ~ "[".replicate(
+			1000) ~ "]".replicate(1000) ~ `}`;
+	auto rt = engineRuntime(ft);
+	rt.subscribeWebhook(webhookSub("n", "https://proxy/hooks/c1"), "user-1");
+	rt.emit(EventOccurrence("evt_1", "n", "t"));
+	assert(controlPostsOf(ft, "verification").length == 1);
 }
 
 unittest  // a well-known receiver prefix covers only whole path segments
