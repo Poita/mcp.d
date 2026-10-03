@@ -586,7 +586,10 @@ interface DeliveryQueue
 	/// Claim and return up to `maxJobs` (0 = no limit) of the jobs that are ready
 	/// at `nowMs` — unleased, or leased with an expired lease — oldest first,
 	/// marking each leased until `nowMs + leaseMs`. The limit keeps one node from
-	/// claiming a whole backlog that other nodes could be delivering.
+	/// claiming a whole backlog that other nodes could be delivering. A job is
+	/// not ready while an earlier job for the same subscription is still leased:
+	/// a subscription's deliveries go out in enqueue order, so one held back (in
+	/// flight, or deferred to a retry) is never overtaken by a later one.
 	Delivery[] lease(long nowMs, long leaseMs, size_t maxJobs) @safe;
 
 	/// Persist a job's `attempt` count and extend its lease to `leasedUntilMs`, so
@@ -652,10 +655,19 @@ final class InMemoryDeliveryQueue : DeliveryQueue
 	Delivery[] lease(long nowMs, long leaseMs, size_t maxJobs) @safe
 	{
 		Delivery[] result;
+		bool[string] heldBack; // subscriptions with an earlier job still leased
 		foreach (slot; order_)
 		{
 			auto e = slot.jobId in entries_;
-			if (e is null || e.seq != slot.seq || e.leasedUntilMs > nowMs)
+			if (e is null || e.seq != slot.seq)
+				continue;
+			const subId = e.job.getOr("subscriptionId", "");
+			if (e.leasedUntilMs > nowMs)
+			{
+				heldBack[subId] = true;
+				continue;
+			}
+			if ((subId in heldBack) !is null)
 				continue;
 			e.leasedUntilMs = nowMs + leaseMs;
 			result ~= Delivery.fromJson(e.job.clone());
@@ -819,11 +831,26 @@ unittest  // the in-memory delivery queue leases ready jobs in enqueue order
 	assert(leased[0].jobId == "c" && leased[1].jobId == "a" && leased[2].jobId == "b");
 }
 
+unittest  // the in-memory delivery queue holds a subscription's jobs behind an earlier leased one
+{
+	auto q = new InMemoryDeliveryQueue();
+	foreach (id; ["a1", "a2", "a3"])
+		q.enqueue(Delivery(id, "a", EventOccurrence(id, "n", "t"), 0));
+	q.enqueue(Delivery("b1", "b", EventOccurrence("b1", "n", "t"), 0));
+	auto first = q.lease(0, 1000, 1);
+	assert(first.length == 1 && first[0].jobId == "a1");
+	auto next = q.lease(0, 1000, 0);
+	assert(next.length == 1 && next[0].jobId == "b1"); // a2, a3 wait behind a1
+	q.ack("a1");
+	auto rest = q.lease(0, 1000, 0);
+	assert(rest.length == 2 && rest[0].jobId == "a2" && rest[1].jobId == "a3");
+}
+
 unittest  // the in-memory delivery queue leases at most maxJobs, oldest first
 {
 	auto q = new InMemoryDeliveryQueue();
 	foreach (id; ["c", "a", "b", "d"])
-		q.enqueue(Delivery(id, "s", EventOccurrence(id, "n", "t"), 0));
+		q.enqueue(Delivery(id, "s" ~ id, EventOccurrence(id, "n", "t"), 0));
 	auto first = q.lease(0, 1000, 2);
 	assert(first.length == 2 && first[0].jobId == "c" && first[1].jobId == "a");
 	auto rest = q.lease(0, 1000, 2);

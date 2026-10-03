@@ -2142,7 +2142,11 @@ final class EventsRuntime
 	// order, so a subscription's events never race or overtake one another and a
 	// burst of jobs for an unverified endpoint makes one verification attempt.
 	// Concurrency is thus one task per subscription with work. A job's lease is
-	// renewed as it starts, and the waiting jobs' leases after each delivery.
+	// renewed as it starts, and the waiting jobs' leases after each delivery. A
+	// job deferred to a later retry ends the run: the jobs behind it are released
+	// back to the queue, which holds them until the deferred job is delivered.
+	// When the run ends a drain is kicked, so jobs the queue held back behind
+	// this run's are claimed without waiting for the worker.
 	private void runSubscription(string subId) @safe
 	{
 		const leaseMs = opts_.deliveryLease.total!"msecs";
@@ -2155,6 +2159,7 @@ final class EventsRuntime
 					localJobs_.remove(j.jobId);
 			subscriptionRuns_.remove(subId);
 		}
+		bool ran;
 		for (;;)
 		{
 			auto q = subId in subscriptionRuns_;
@@ -2164,7 +2169,7 @@ final class EventsRuntime
 				// Marked idle first, so the drain starts a fresh run for this
 				// subscription's next jobs rather than queueing them behind this one.
 				runningSubscriptions_.remove(subId);
-				if (backlogged_)
+				if (backlogged_ || ran)
 				{
 					backlogged_ = false;
 					opts_.deliveryExecutor(() @safe { drainDeliveries(); });
@@ -2176,10 +2181,33 @@ final class EventsRuntime
 			scope (exit)
 				localJobs_.remove(job.jobId);
 			deliveryQueue_.renew(job.jobId, opts_.nowMs() + leaseMs);
-			deliverGuarded(job);
+			ran = true;
+			if (deliverGuarded(job))
+			{
+				releaseWaiting(subId);
+				continue;
+			}
 			// The jobs behind this one waited out its delivery, however long it
 			// took: renew them before their claim can lapse.
 			renewWaiting(subId, opts_.nowMs() + leaseMs);
+		}
+	}
+
+	// Hand every job waiting in this node's run for `subId` back to the queue,
+	// unleased, in order. The queue holds them behind the subscription's
+	// deferred job, so none is delivered ahead of it.
+	private void releaseWaiting(string subId) @safe
+	{
+		auto q = subId in subscriptionRuns_;
+		if (q is null)
+			return;
+		auto waiting = *q;
+		subscriptionRuns_.remove(subId);
+		const now = opts_.nowMs();
+		foreach (j; waiting)
+		{
+			localJobs_.remove(j.jobId);
+			deliveryQueue_.renew(j.jobId, now);
 		}
 	}
 
@@ -2187,23 +2215,18 @@ final class EventsRuntime
 	// throws unexpectedly (e.g. a custom store/queue raising). Without this a thrown
 	// job would stay leased and silently re-lease forever. On an unexpected throw the
 	// attempt count is advanced and the job is dead-lettered (acked) once the bound is
-	// reached, so a persistently-throwing job cannot loop invisibly.
-	private void deliverGuarded(Delivery job) @safe
+	// reached, so a persistently-throwing job cannot loop invisibly. Returns
+	// whether the job was deferred to a later retry rather than settled.
+	private bool deliverGuarded(Delivery job) @safe
 	{
-		bool settled;
 		// The highest attempt count deliverWithRetry persisted before it threw;
 		// counting on from the leased job's count would roll it back and let the
 		// job exceed webhookMaxAttempts across re-leases.
 		int persisted = job.attempt;
 		try
-		{
-			deliverWithRetry(job, persisted);
-			settled = true;
-		}
+			return deliverWithRetry(job, persisted);
 		catch (Exception e)
 			logEventsError("webhook delivery threw", e);
-		if (settled)
-			return;
 		const attempt = max(persisted, job.attempt) + 1;
 		if (attempt >= opts_.webhookMaxAttempts)
 		{
@@ -2217,10 +2240,11 @@ final class EventsRuntime
 				logEventsError("settling a dead-lettered delivery threw", e);
 				ackJob(job.jobId);
 			}
+			return false;
 		}
-		else
-			deliveryQueue_.touch(job.jobId, attempt,
-					opts_.nowMs() + opts_.deliveryLease.total!"msecs");
+		deliveryQueue_.touch(job.jobId, attempt,
+				opts_.nowMs() + opts_.deliveryLease.total!"msecs");
+		return true;
 	}
 
 	/// Run the periodic worker until `stopDeliveryWorker` is called: every
@@ -2296,8 +2320,10 @@ final class EventsRuntime
 	/// once its position is settled — success, a 410 (which ends the subscription)
 	/// or 413, or exhaustion — never on a mere transient failure (so it survives to
 	/// be re-leased). `persistedAttempt` tracks the attempt count last persisted,
-	/// for a caller that recovers from a throw part-way through.
-	private void deliverWithRetry(Delivery job, ref int persistedAttempt) @safe
+	/// for a caller that recovers from a throw part-way through. Returns whether
+	/// the job was deferred to a later retry (its endpoint not yet verified)
+	/// rather than settled.
+	private bool deliverWithRetry(Delivery job, ref int persistedAttempt) @safe
 	{
 		const subId = job.subscriptionId;
 		const occ = job.occ;
@@ -2306,17 +2332,17 @@ final class EventsRuntime
 		if (s0.isNull)
 		{
 			ackJob(job.jobId); // subscription gone; nothing to deliver
-			return;
+			return false;
 		}
 		if (dropIfLapsed(job, s0.get))
-			return;
+			return false;
 		if (!s0.get.active)
 		{
 			// Delivery is suspended: the job is dropped rather than re-leased on
 			// every drain, and the refresh that reactivates the subscription
 			// signals the missed position with a gap.
 			abandonUndelivered(job);
-			return;
+			return false;
 		}
 		const verification = ensureVerified(s0.get);
 		if (verification == Verification.inProgress)
@@ -2324,7 +2350,7 @@ final class EventsRuntime
 			// Another delivery is verifying this endpoint: retry once it has had
 			// time to finish, without counting an attempt against this job.
 			deliveryQueue_.touch(job.jobId, job.attempt, opts_.nowMs() + verifyBackoffBaseMs);
-			return;
+			return true;
 		}
 		if (verification == Verification.failed || verification == Verification.backingOff)
 		{
@@ -2336,11 +2362,13 @@ final class EventsRuntime
 			// attempt so a never-verifying endpoint's jobs are eventually dropped.
 			const attempt = job.attempt + 1;
 			if (attempt >= opts_.webhookMaxAttempts)
+			{
 				abandonUndelivered(job);
-			else
-				deliveryQueue_.touch(job.jobId, attempt,
-						opts_.nowMs() + backoffFor(attempt).total!"msecs");
-			return;
+				return false;
+			}
+			deliveryQueue_.touch(job.jobId, attempt,
+					opts_.nowMs() + backoffFor(attempt).total!"msecs");
+			return true;
 		}
 		// A body over the delivery-profile ceiling would be rejected with 413 by a
 		// conformant receiver, so it is abandoned up front: its position settles
@@ -2351,7 +2379,7 @@ final class EventsRuntime
 			settlePosition(subId, job.jobId, occ.cursor);
 			ackJob(job.jobId);
 			flushMissed(s0.get);
-			return;
+			return false;
 		}
 		int attempt = job.attempt;
 		for (;;)
@@ -2363,10 +2391,10 @@ final class EventsRuntime
 			if (sn.isNull)
 			{
 				ackJob(job.jobId);
-				return;
+				return false;
 			}
 			if (dropIfLapsed(job, sn.get))
-				return;
+				return false;
 			auto res = attemptDelivery(sn.get, job);
 			if (res.ok)
 			{
@@ -2374,21 +2402,21 @@ final class EventsRuntime
 				ackJob(job.jobId);
 				// The endpoint is taking deliveries again: send any gap it is owed.
 				flushMissed(sn.get);
-				return;
+				return false;
 			}
 			// 410 Gone: the receiver no longer wants this subscription, so it ends.
 			if (res.statusCode == 410)
 			{
 				ackJob(job.jobId);
 				removeWebhookState(sn.get);
-				return;
+				return false;
 			}
 			// 413 too large: retrying cannot succeed, so the event is skipped and
 			// the client is owed a gap. It is no evidence the endpoint is healthy.
 			if (res.statusCode == 413)
 			{
 				abandonUndelivered(job);
-				return;
+				return false;
 			}
 			// Each failed attempt is one sample for the suspension policy, so an
 			// endpoint that never answers reaches the threshold within the window.
@@ -2396,12 +2424,12 @@ final class EventsRuntime
 			if (!recordFailure(subId, cat))
 			{
 				abandonUndelivered(job);
-				return;
+				return false;
 			}
 			if (attempt >= opts_.webhookMaxAttempts)
 			{
 				abandonUndelivered(job);
-				return;
+				return false;
 			}
 			opts_.deliverySleep(backoffFor(attempt));
 			// Renew the lease after the inter-attempt sleep so a long retry loop never
@@ -3513,9 +3541,9 @@ unittest  // a delivery drain claims at most deliveryLeaseBatch jobs from the qu
 	auto rt = new EventsRuntime(null, o);
 	EventRegistration reg = {descriptor: EventType("n"), emitOnly: true};
 	rt.register(reg);
-	rt.subscribeWebhook(webhookSub("n", "https://proxy/hooks"), "user-1");
-	foreach (id; ["evt_1", "evt_2", "evt_3"])
-		rt.emit(EventOccurrence(id, "n", "t"));
+	foreach (url; ["https://proxy/a", "https://proxy/b", "https://proxy/c"])
+		rt.subscribeWebhook(webhookSub("n", url), "user-1");
+	rt.emit(EventOccurrence("evt_1", "n", "t"));
 	rt.drainDeliveries();
 	// Two were claimed by the drain; the third is still free for another node.
 	assert(queue.lease(1_000_000L, 1000, 0).length == 1);
@@ -8101,4 +8129,47 @@ unittest  // multi-node: a quiet pass does not advance the watermark past anothe
 	t.b.drainDeliveries();
 	t.a.tick();
 	assert(t.store.get(r.id).get.cursor.get == "c2");
+}
+
+unittest  // a deferred delivery is not overtaken by its subscription's later events
+{
+	import std.algorithm : map;
+	import std.array : array;
+
+	auto ft = new FakeWebhookTransport();
+	ft.throwEvents = 1;
+	long now = 1_000_000;
+	EventsOptions o;
+	o.nowMs = () @safe => now;
+	o.nowIso = () @safe => "t";
+	o.allowPrivateCallbackHosts = true;
+	o.webhookTransport = ft;
+	o.webhookRetryBase = 1.seconds;
+	o.webhookHttpTimeout = 1.seconds;
+	o.deliverySleep = (Duration d) @safe {};
+	void delegate() @safe[] deferred;
+	o.deliveryExecutor = (void delegate() @safe job) @safe { deferred ~= job; };
+	void runAll() @safe
+	{
+		for (size_t i = 0; i < deferred.length; i++)
+			deferred[i]();
+		deferred = null;
+	}
+
+	auto rt = new EventsRuntime(null, o);
+	EventRegistration reg = {descriptor: EventType("n"), emitOnly: true};
+	rt.register(reg);
+	rt.subscribeWebhook(webhookSub("n", "https://proxy/hooks"), "user-1");
+	rt.emit(EventOccurrence("evt_1", "n", "t"));
+	rt.emit(EventOccurrence("evt_2", "n", "t"));
+	runAll(); // evt_1's attempt throws, deferring it
+	rt.emit(EventOccurrence("evt_3", "n", "t"));
+	runAll();
+	assert(ft.eventPosts().length == 1);
+
+	now += rt.opts_.deliveryLease.total!"msecs" + 1;
+	rt.drainDeliveries();
+	runAll();
+	auto ids = ft.eventPosts().map!(p => parseJsonString(p.body)["eventId"].get!string).array;
+	assert(ids == ["evt_1", "evt_1", "evt_2", "evt_3"]);
 }
