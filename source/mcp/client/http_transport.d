@@ -1481,6 +1481,9 @@ final class HttpClientTransport : ClientTransport
 		// The previous line ended in CR at the end of a read, so a LF opening the
 		// next read completes that CRLF rather than ending an empty line.
 		bool pendingCr;
+		// How much of `acc` is already known to hold no line ending, so each read
+		// scans only its new bytes and a long line costs time linear in its length.
+		size_t scanned;
 		void tokenize()
 		{
 			for (;;)
@@ -1491,14 +1494,17 @@ final class HttpClientTransport : ClientTransport
 						acc = acc[1 .. $];
 					pendingCr = false;
 				}
-				const eol = acc.indexOfAny("\r\n");
-				if (eol < 0)
+				const found = acc[scanned .. $].indexOfAny("\r\n");
+				if (found < 0)
 				{
 					// `acc` holds one incomplete line; it may not outgrow a message.
 					if (acc.length > maxMessageBytes)
 						throw messageTooLarge(maxMessageBytes);
+					scanned = acc.length;
 					break;
 				}
+				const eol = scanned + found;
+				scanned = 0;
 				auto line = acc[0 .. eol];
 				size_t next = eol + 1;
 				if (acc[eol] == '\r')
@@ -5526,4 +5532,32 @@ unittest  // startLegacyFallback surfaces a refused legacy GET connection prompt
 	assert(msg.length);
 	assert(!msg.canFind("did not send an `endpoint` event"), msg);
 	assert(took < 5.seconds);
+}
+
+unittest  // readSseBody frames a large single-line event in time linear in its size
+{
+	import core.time : MonoTime, seconds;
+	import vibe.stream.memory : createMemoryStream;
+
+	enum size = 6 * 1024 * 1024;
+	auto body = new char[](size + "data: \n\n".length);
+	body[0 .. 6] = "data: ";
+	body[6 .. 6 + size] = 'x';
+	body[$ - 2 .. $] = "\n\n";
+	auto t = new HttpClientTransport("http://host:8080/mcp");
+	auto stream = () @trusted {
+		return createMemoryStream(cast(ubyte[])
+				body, false);
+	}();
+	SseCursor cursor;
+	size_t got;
+	const start = MonoTime.currTime;
+	() @trusted {
+		t.readSseBody(stream, false, cursor, () @safe => false, (string e, string d) @safe {
+			got = d.length;
+		});
+	}();
+	const took = MonoTime.currTime - start;
+	assert(got == size);
+	assert(took < 2.seconds);
 }
