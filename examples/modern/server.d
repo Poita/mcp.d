@@ -65,7 +65,7 @@ final class StatelessModernApi
 	/// (ttl=9.seconds, wire ttlMs=9000, scope=private). Legacy peers see no
 	/// cache fields.
 	@resource("demo://greeting", "greeting", "text/plain")
-	@cacheable(9.seconds, "private")
+	@cacheable(9.seconds, CacheScope.private_)
 	string greeting() @safe
 	{
 		return "hello from the modern protocol server";

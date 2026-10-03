@@ -23,7 +23,7 @@ opt in with `client.enableModern()`.
   `ttlMs` milliseconds).
   ```d
   @resource("config://app", "Application configuration", "application/json")
-  @cacheable(60.seconds, "private")
+  @cacheable(60.seconds, CacheScope.private_)
   string config() @safe { return `{"theme":"dark","retries":3}`; }
   ```
 - **Per-list hint** — `server.d` calls

@@ -74,7 +74,7 @@ final class ResourcesApi
 	/// (ttlMs/cacheScope) is emitted on the modern `resources/read` response so a
 	/// modern client can cache the contents.
 	@resource("config://app", "App config", "application/json")
-	@cacheable(60.seconds, "public")
+	@cacheable(60.seconds, CacheScope.public_)
 	string config() @safe
 	{
 		return `{"name":"resources-example","featureFlags":["resources","subscribe"]}`;

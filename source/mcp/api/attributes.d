@@ -2,6 +2,7 @@ module mcp.api.attributes;
 
 import vibe.data.json : Json;
 import core.time : Duration;
+import mcp.protocol.modern : CacheScope;
 
 @safe:
 
@@ -470,18 +471,18 @@ public import jsonschema : fieldDescription, minimum, maximum, title, schemaForm
 /// `resources/read` carries `ttlMs` / `cacheScope`. Has no effect on legacy
 /// protocol versions (the server only emits cache fields when negotiated to the modern protocol).
 ///
-/// `scope_` is `"public"` (the default) or `"private"`.
+/// `scope_` is `CacheScope.public_` (the default) or `CacheScope.private_`.
 ///
 /// Example:
 /// ---
 /// @resource("file:///data", "Data", "application/json")
-/// @cacheable(5.seconds, "private")
+/// @cacheable(5.seconds, CacheScope.private_)
 /// string data() @safe { ... }
 /// ---
 struct cacheable
 {
 	Duration ttl; /// how long the result may be cached
-	string scope_ = "public"; /// "public" (default) | "private"
+	CacheScope scope_ = CacheScope.public_; /// who may cache the result
 }
 
 unittest  // @priority accepts in-range values
@@ -511,4 +512,15 @@ unittest  // @priority rejects out-of-range values
 
 	assert(rejects(5.0));
 	assert(rejects(-1.0));
+}
+
+unittest  // @cacheable takes its scope as a CacheScope, defaulting to public
+{
+	import core.time : seconds;
+	import mcp.protocol.modern : CacheScope;
+
+	static assert(is(typeof(cacheable.init.scope_) == CacheScope));
+	static assert(cacheable.init.scope_ == CacheScope.public_);
+	static assert(!__traits(compiles, cacheable(1.seconds, "private")));
+	static assert(cacheable(1.seconds, CacheScope.private_).scope_ == CacheScope.private_);
 }
