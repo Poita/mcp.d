@@ -386,23 +386,6 @@ struct ClientSettings
 	Duration taskTimeout = Duration.zero;
 }
 
-/// Thrown by a request that received no response within
-/// `ClientSettings.requestTimeout` (restarted by progress when
-/// `resetTimeoutOnProgress` is set) or within `ClientSettings.maxTotalTimeout`.
-/// The client has already cancelled the request
-/// on the server.
-///
-/// JSON-RPC has no timeout code, so `code` is `ErrorCode.internalError`, the same
-/// code a server reports for its own internal errors. Tell a local timeout apart
-/// by catching this type rather than by inspecting `code`.
-class RequestTimeoutException : McpException
-{
-	this(string message) @safe
-	{
-		super(ErrorCode.internalError, message);
-	}
-}
-
 /// Thrown by a request that cannot be carried because the connection to the
 /// server is gone for good: the client was closed, or the stdio channel ended
 /// (the server exited or closed its stdout). Retrying on the same client cannot

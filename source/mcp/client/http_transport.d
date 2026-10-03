@@ -1851,7 +1851,7 @@ final class HttpClientTransport : ClientTransport
 				throw stream.error;
 			if (!stream.ended)
 			{
-				import mcp.client.client : RequestTimeoutException;
+				import mcp.protocol.errors : RequestTimeoutException;
 
 				stream.cancel();
 				const method = ("method" in message && message["method"].type == Json.Type.string) ? message["method"]
@@ -4434,7 +4434,7 @@ unittest  // a request that times out while its rejected bearer is being refresh
 {
 	import core.time : MonoTime, msecs;
 	import vibe.core.core : sleep;
-	import mcp.client.client : ClientSettings, McpClient, RequestTimeoutException;
+	import mcp.client.client : ClientSettings, McpClient;
 
 	int seen;
 	auto router = answeringRouter((Json req, HTTPServerResponse res) @safe {
@@ -4481,7 +4481,7 @@ unittest  // a timed-out connect() probe is cancelled by closing its stream, not
 {
 	import core.time : msecs;
 	import vibe.core.core : sleep;
-	import mcp.client.client : ClientSettings, McpClient, RequestTimeoutException;
+	import mcp.client.client : ClientSettings, McpClient;
 
 	string[] notifications;
 	auto router = answeringRouter((Json req, HTTPServerResponse res) @safe {
@@ -4574,7 +4574,7 @@ unittest  // an HTTP request whose SSE stream goes silent fails after requestTim
 {
 	import core.time : msecs, MonoTime;
 	import vibe.core.core : sleep;
-	import mcp.client.client : McpClient, ClientSettings, RequestTimeoutException;
+	import mcp.client.client : McpClient, ClientSettings;
 
 	bool release;
 	long cancelledId = -1;
@@ -5664,7 +5664,7 @@ unittest  // close() stops the server stream before the session DELETE, so it ne
 unittest  // openListen with no leading frame times out, cancels the stream and throws
 {
 	import core.time : msecs, MonoTime;
-	import mcp.client.client : RequestTimeoutException;
+	import mcp.protocol.errors : RequestTimeoutException;
 	import vibe.core.core : sleep;
 
 	bool release;

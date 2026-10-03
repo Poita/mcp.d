@@ -228,7 +228,7 @@ final class StdioClientTransport : ClientTransport
 				throw stream.error;
 			if (!stream.ended)
 			{
-				import mcp.client.client : RequestTimeoutException;
+				import mcp.protocol.errors : RequestTimeoutException;
 
 				stream.cancel();
 				throw new RequestTimeoutException(
@@ -1340,7 +1340,7 @@ version (unittest) private string inLoopCapturing(scope void delegate() @safe bo
 unittest  // stdio openListen with no leading frame times out, cancels the stream and throws
 {
 	import core.time : msecs;
-	import mcp.client.client : RequestTimeoutException;
+	import mcp.protocol.errors : RequestTimeoutException;
 
 	auto toClient = new TestLines;
 	string[] toServer;
@@ -1368,7 +1368,7 @@ unittest  // stdio openListen with no leading frame times out, cancels the strea
 unittest  // a stdio request with no reply fails after ClientSettings.requestTimeout and sends notifications/cancelled
 {
 	import core.time : msecs, seconds, MonoTime, Duration;
-	import mcp.client.client : ClientSettings, RequestTimeoutException;
+	import mcp.client.client : ClientSettings;
 
 	auto toClient = new TestLines;
 	string[] toServer;
@@ -1455,7 +1455,7 @@ unittest  // server pings do not hold a stdio request's deadline open
 {
 	import core.time : msecs, seconds, MonoTime, Duration;
 	import vibe.core.core : sleep;
-	import mcp.client.client : ClientSettings, RequestTimeoutException;
+	import mcp.client.client : ClientSettings;
 
 	auto toClient = new TestLines;
 	auto toServer = new TestLines;
@@ -1500,7 +1500,7 @@ unittest  // a server request pauses a stdio deadline and resumes it with the ti
 {
 	import core.time : msecs, seconds, MonoTime, Duration;
 	import vibe.core.core : sleep;
-	import mcp.client.client : ClientSettings, RequestTimeoutException;
+	import mcp.client.client : ClientSettings;
 	import mcp.protocol.types : ListRootsResult;
 
 	auto toClient = new TestLines;
@@ -1549,7 +1549,7 @@ unittest  // ClientSettings.maxTotalTimeout caps a stdio request that keeps repo
 {
 	import core.time : msecs, seconds, MonoTime, Duration;
 	import vibe.core.core : sleep;
-	import mcp.client.client : ClientSettings, RequestOptions, RequestTimeoutException;
+	import mcp.client.client : ClientSettings, RequestOptions;
 	import mcp.protocol.types : ProgressNotification;
 
 	auto toClient = new TestLines;
@@ -1602,7 +1602,7 @@ unittest  // maxTotalTimeout fails a stdio request while a server request on its
 {
 	import core.time : msecs, seconds, MonoTime, Duration;
 	import vibe.core.core : sleep;
-	import mcp.client.client : ClientSettings, RequestTimeoutException;
+	import mcp.client.client : ClientSettings;
 	import mcp.protocol.types : ListRootsResult;
 
 	auto toClient = new TestLines;
@@ -1650,7 +1650,7 @@ unittest  // a stdio request whose write the server never drains still times out
 {
 	import core.time : msecs, seconds, MonoTime, Duration;
 	import vibe.core.core : sleep;
-	import mcp.client.client : ClientSettings, RequestTimeoutException;
+	import mcp.client.client : ClientSettings;
 
 	auto toClient = new TestLines;
 	bool timedOut;
@@ -1680,7 +1680,7 @@ unittest  // a stdio request that times out before its line is written is never 
 {
 	import core.time : msecs, seconds;
 	import vibe.core.core : sleep;
-	import mcp.client.client : ClientSettings, RequestTimeoutException;
+	import mcp.client.client : ClientSettings;
 
 	auto toClient = new TestLines;
 	string[] written;

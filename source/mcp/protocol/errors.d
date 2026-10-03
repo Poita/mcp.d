@@ -64,6 +64,23 @@ class McpException : Exception
 	}
 }
 
+/// Thrown when a peer does not reply to a request within its timeout: a client
+/// request past `ClientSettings.requestTimeout` (restarted by progress when
+/// `resetTimeoutOnProgress` is set) or `ClientSettings.maxTotalTimeout`, which
+/// the client has already cancelled on the server, or a server->client request
+/// (elicitation, sampling, roots) the client left unanswered.
+///
+/// JSON-RPC has no timeout code, so `code` is `ErrorCode.internalError`, the same
+/// code a peer reports for its own internal errors. Tell a local timeout apart
+/// by catching this type rather than by inspecting `code`.
+class RequestTimeoutException : McpException
+{
+	this(string message, string file = __FILE__, size_t line = __LINE__) @safe
+	{
+		super(ErrorCode.internalError, message, Json.undefined, file, line);
+	}
+}
+
 /// Build the JSON-RPC error object `{code, message, data?}`.
 Json toErrorJson(const McpException e) @safe
 {

@@ -14,8 +14,7 @@ import mcp.protocol.versions;
 import mcp.protocol.modern;
 import mcp.protocol.mrtr;
 import mcp.protocol.events;
-import mcp.transport.coordinator : defaultServerRequestTimeout,
-	RequestTimeoutException, cancelledNotification;
+import mcp.transport.coordinator : defaultServerRequestTimeout, cancelledNotification;
 import mcp.transport.sse_context;
 import mcp.transport.session;
 import mcp.auth.resource_server;

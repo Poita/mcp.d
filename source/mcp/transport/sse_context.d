@@ -10,7 +10,7 @@ import vibe.http.server : HTTPServerResponse;
 import mcp.protocol.jsonrpc;
 import mcp.protocol.errors;
 import mcp.transport.coordinator : throwOrReturn, defaultServerRequestTimeout,
-	RequestTimeoutException, cancelledNotification;
+	cancelledNotification;
 import mcp.protocol.capabilities;
 import mcp.protocol.mrtr : withListenSubscriptionId;
 import mcp.protocol.versions : ProtocolVersion, latestLegacy, supportsProgressMessage;

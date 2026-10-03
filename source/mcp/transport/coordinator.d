@@ -14,15 +14,6 @@ import mcp.protocol.errors;
 /// because elicitation and sampling may wait on a human.
 enum Duration defaultServerRequestTimeout = 5.minutes;
 
-/// Thrown when a peer does not reply to a request within its timeout.
-class RequestTimeoutException : McpException
-{
-	this(string message, string file = __FILE__, size_t line = __LINE__) @safe
-	{
-		super(ErrorCode.internalError, message, Json.undefined, file, line);
-	}
-}
-
 /// The `notifications/cancelled` a requester sends for its request `id` once it
 /// stops waiting for the reply, so the peer can abandon the work.
 Json cancelledNotification(long id, string reason) @safe
@@ -233,6 +224,19 @@ unittest  // alloc hands out distinct, increasing ids
 	const c = coord.alloc();
 	assert(a != b && b != c && a != c);
 	assert(b == a + 1 && c == b + 1);
+}
+
+unittest  // an unanswered request times out with the public RequestTimeoutException
+{
+	import core.time : msecs;
+	import std.exception : collectException;
+	static import mcp;
+
+	auto coord = new DuplexCoordinator;
+	const id = coord.alloc();
+	coord.register(id);
+	auto e = collectException!(mcp.RequestTimeoutException)(coord.await(id, 10.msecs));
+	assert(e !is null);
 }
 
 unittest  // resolve before await: a result registered then resolved is returned by await

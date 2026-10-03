@@ -9,8 +9,7 @@ import vibe.data.json : Json, parseJsonString;
 
 import mcp.protocol.jsonrpc;
 import mcp.protocol.errors;
-import mcp.transport.coordinator : DuplexCoordinator, RequestTimeoutException,
-	cancelledNotification;
+import mcp.transport.coordinator : DuplexCoordinator, cancelledNotification;
 
 @safe:
 
