@@ -300,14 +300,6 @@ final class StdioClientTransport : ClientTransport
 		send(message);
 	}
 
-	/// false: replies are deferred — see `ClientTransport.repliesSynchronously`.
-	/// The read loop always runs as a vibe task (`DuplexChannel.start` -> `runTask`),
-	/// so the event loop that deferral needs is always available.
-	bool repliesSynchronously() @safe
-	{
-		return false;
-	}
-
 	/// Serialize a single message and write it as one newline-delimited line
 	/// through the channel's serialized writer. `Json.toString` never emits a raw
 	/// newline, so the line framing holds and only a valid MCP message is written
@@ -1051,19 +1043,6 @@ version (Posix) unittest  // close() is idempotent: a second call does not re-ru
 		transport.close();
 		assert(transport.closeProcessRuns() == 1, "second close() must be a no-op");
 	});
-}
-
-unittest  // a server->client reply is NOT written inline from the read-loop task
-{
-	// A reply written inline from the single read-loop task can deadlock a spawned
-	// subprocess (the child blocks writing stdout while we block writing the reply
-	// into its stdin). `McpClient.handleServerRequest` only defers the reply to its
-	// own task when the transport reports it does NOT reply synchronously, so the
-	// stdio transport must report false to keep the read loop draining.
-	auto transport = new StdioClientTransport(() @safe { return cast(string) null; },
-			(string) @safe {});
-	assert(!transport.repliesSynchronously(),
-			"stdio reply must be deferred (not inline) so the read loop keeps draining the child");
 }
 
 version (Posix) unittest  // partial fragment at EOF closes the channel cleanly, not via a spurious error write

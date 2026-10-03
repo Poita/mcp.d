@@ -103,18 +103,8 @@ final class EventSubscription
 		seen_ = null;
 	}
 
-	/// Whether `eventId` was already delivered on this subscription. A new id is
-	/// recorded (evicting the oldest once the window is full). An empty id is never
-	/// a duplicate — there is nothing to match on.
-	package bool alreadySeen(string eventId) @safe
-	{
-		if (isSeen(eventId))
-			return true;
-		markSeen(eventId);
-		return false;
-	}
-
-	/// Whether `eventId` is in the dedup window, without recording it.
+	/// Whether `eventId` is in the dedup window, without recording it. An empty
+	/// id is never a duplicate — there is nothing to match on.
 	package bool isSeen(string eventId) @safe
 	{
 		return eventId.length && (eventId in seen_) !is null;
@@ -213,32 +203,34 @@ unittest  // cancel is idempotent and runs the teardown exactly once
 	assert(n == 1);
 }
 
-unittest  // alreadySeen reports a repeated eventId and ignores empty ids
+unittest  // isSeen reports a marked eventId and ignores empty ids
 {
 	auto s = new EventSubscription();
 	s.dedupCapacity(8);
-	assert(!s.alreadySeen("e1"));
-	assert(s.alreadySeen("e1"));
-	assert(!s.alreadySeen(""));
-	assert(!s.alreadySeen(""));
+	assert(!s.isSeen("e1"));
+	s.markSeen("e1");
+	assert(s.isSeen("e1"));
+	s.markSeen("");
+	assert(!s.isSeen(""));
 }
 
 unittest  // the dedup window forgets the oldest id once it wraps
 {
 	auto s = new EventSubscription();
 	s.dedupCapacity(2);
-	assert(!s.alreadySeen("a"));
-	assert(!s.alreadySeen("b"));
-	assert(!s.alreadySeen("c")); // evicts "a"
-	assert(!s.alreadySeen("a")); // forgotten, so delivered again
-	assert(s.alreadySeen("c"));
+	s.markSeen("a");
+	s.markSeen("b");
+	s.markSeen("c"); // evicts "a"
+	assert(!s.isSeen("a")); // forgotten, so delivered again
+	assert(s.isSeen("b"));
+	assert(s.isSeen("c"));
 }
 
 unittest  // a zero dedup capacity disables deduplication
 {
 	auto s = new EventSubscription();
-	assert(!s.alreadySeen("e1"));
-	assert(!s.alreadySeen("e1"));
+	s.markSeen("e1");
+	assert(!s.isSeen("e1"));
 }
 
 unittest  // a terminated control ends the subscription without a cancel

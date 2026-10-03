@@ -4357,10 +4357,10 @@ final class McpClient : ClientProtocol
 	/// Answer a server->client request by dispatching to the matching handler and
 	/// sending the response. We are inside the transport's inbound-read callback of
 	/// an in-flight request, and the server withholds that request's final response
-	/// until it receives this reply, so *how* we send it depends on
-	/// `transport.repliesSynchronously` (see `ClientTransport` for the rationale):
-	/// true sends the reply inline, false defers it via `runTask` so the read loop
-	/// keeps draining and the two directions cannot wedge each other.
+	/// until it receives this reply, so the reply is sent from its own task: the
+	/// read loop keeps draining and the two directions cannot wedge each other
+	/// (stdio would block the read loop on the child's stdin pipe while the child
+	/// blocks on its stdout; HTTP's reply travels on a different request).
 	private void handleServerRequest(Message msg) @safe
 	{
 		import vibe.core.core : runTask;
@@ -4380,12 +4380,6 @@ final class McpClient : ClientProtocol
 			response = makeErrorResponse(msg.id, e);
 		catch (Exception e)
 			response = makeErrorResponse(msg.id, internalError(e.msg));
-
-		if (transport.repliesSynchronously())
-		{
-			transport.sendOneway(response);
-			return;
-		}
 
 		runTask((Json r) nothrow{
 			try
@@ -4455,12 +4449,14 @@ final class McpClient : ClientProtocol
 		}
 	}
 
-	/// Whether a response with JSON-RPC id `id` belongs to a request this client
-	/// has cancelled (and so should be ignored per basic/utilities/cancellation).
-	/// Exposed for tests; cheap membership check on the cancelled-id set.
-	package bool isResponseCancelled(long id) const @safe nothrow
+	version (unittest)
 	{
-		return (id in cancelledRequests_) !is null;
+		/// Whether a response with JSON-RPC id `id` belongs to a request this
+		/// client has cancelled.
+		package bool isResponseCancelled(long id) const @safe nothrow
+		{
+			return (id in cancelledRequests_) !is null;
+		}
 	}
 
 	/// `ClientProtocol.isCancelled`: the transport consults this through the
@@ -8869,11 +8865,6 @@ version (unittest)
 			aborted ~= expectId;
 		}
 
-		bool repliesSynchronously() @safe
-		{
-			return false;
-		}
-
 		void close() @safe
 		{
 		}
@@ -8913,11 +8904,6 @@ version (unittest)
 
 		void abort(long, McpException) @safe
 		{
-		}
-
-		bool repliesSynchronously() @safe
-		{
-			return true;
 		}
 
 		void startServerStream() @safe

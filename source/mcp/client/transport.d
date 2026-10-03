@@ -79,22 +79,6 @@ interface ClientTransport
 	/// response to a server->client request.
 	void sendOneway(Json message) @safe;
 
-	/// Whether a reply to a server->client request may be written *inline* from
-	/// the inbound-read callback rather than deferred to a background task. The
-	/// reply is sent from inside the read loop of an in-flight request, while that
-	/// loop must keep draining inbound bytes, so the answer turns on whether a
-	/// nested synchronous send can wedge the read loop:
-	///   - false (both concrete transports): defer the reply. stdio would block
-	///     the single read-loop task on the OS pipe buffer (the child may be
-	///     blocked writing stdout we have stopped draining while we block writing
-	///     its stdin); HTTP's reply travels on a different request that could
-	///     deadlock the connection. `McpClient` dispatches the reply via `runTask`,
-	///     which requires a running event loop — both transports already provide
-	///     one.
-	///   - true: send inline, with no event loop required. Reserved for a future
-	///     transport whose read loop neither blocks nor holds the awaited response.
-	bool repliesSynchronously() @safe;
-
 	/// Open the standalone server->client stream, if the transport has one
 	/// (HTTP GET SSE). A no-op on stdio.
 	void startServerStream() @safe;

@@ -1772,11 +1772,6 @@ version (unittest)
 		{
 		}
 
-		bool repliesSynchronously() @safe
-		{
-			return true;
-		}
-
 		void startServerStream() @safe
 		{
 		}
