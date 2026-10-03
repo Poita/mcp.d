@@ -1621,6 +1621,50 @@ unittest  // a stdio request that times out before its line is written is never 
 				"a request abandoned before it was written must not reach the server");
 }
 
+unittest  // a server request the server cancels signals its handler and gets no reply
+{
+	import core.time : msecs, seconds, MonoTime;
+	import vibe.core.core : sleep;
+	import mcp.protocol.types : ListRootsResult;
+
+	auto toClient = new TestLines;
+	string[] toServer;
+	bool sawCancel;
+	string reason;
+	const failure = inLoopCapturing(() @safe {
+		auto client = McpClient.stdio(() @safe => toClient.take(), (string l) @safe {
+			toServer ~= l;
+		});
+		// Stands in for a handler waiting on a user, giving up once cancelled.
+		client.onListRoots = () @safe {
+			auto token = client.serverRequestCancellation();
+			const start = MonoTime.currTime;
+			while (!token.isCancelled && MonoTime.currTime - start < 2.seconds)
+				sleep(10.msecs);
+			sawCancel = token.isCancelled;
+			reason = token.reason;
+			return ListRootsResult.init;
+		};
+		client.sendNotification("notifications/initialized"); // starts the read loop
+		toClient.put(makeRequest(Json(5), "roots/list", Json.emptyObject).toString());
+		sleep(100.msecs);
+		Json p = Json.emptyObject;
+		p["requestId"] = 5;
+		p["reason"] = "user went away";
+		toClient.put(makeNotification("notifications/cancelled", p).toString());
+		sleep(500.msecs);
+		toClient.closeEnd();
+	});
+	assert(failure.length == 0, failure);
+	assert(sawCancel, "the handler must see the server's cancellation");
+	assert(reason == "user went away");
+	foreach (l; toServer)
+	{
+		auto m = parseJsonString(l);
+		assert("id" !in m || m["id"] != Json(5), "a cancelled server request must not be answered");
+	}
+}
+
 unittest  // cancelling a call's CancellationToken fails it at once and sends notifications/cancelled
 {
 	import core.time : msecs, seconds, MonoTime, Duration;

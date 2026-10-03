@@ -651,6 +651,12 @@ final class McpClient : ClientProtocol
 	// that task's fiber, so `rpc` (reached through the paging / MRTR / cache
 	// helpers) binds every request the call issues to the caller's token.
 	private CancellationToken[void* ] callTokens_;
+	// The cancellation of each server->client request being answered: keyed by
+	// its JSON-RPC id rendered as JSON, so the server's `notifications/cancelled`
+	// reaches it, and by the fiber running its handler, for
+	// `serverRequestCancellation`.
+	private CancellationToken[string] serverRequests_;
+	private CancellationToken[void* ] serverRequestTokens_;
 	// Per-subscription push handlers, keyed by the `events/stream` request id (the
 	// subscriptionId stamped on every `notifications/events/*` frame). streamEvents
 	// registers; the stream's cleanup hook and a `terminated` frame deregister, so
@@ -758,7 +764,9 @@ final class McpClient : ClientProtocol
 	/// requests (2025-11-25+) set `mode == "url"` and carry `url` and
 	/// `elicitationId` instead of a schema — present the URL for the user to
 	/// complete out-of-band and return an action (no content). The SDK enforces
-	/// the advertised-mode capability check before invoking this.
+	/// the advertised-mode capability check before invoking this. A handler
+	/// waiting on the user can watch `serverRequestCancellation` to stop once
+	/// the server cancels the request.
 	ElicitResult delegate(ElicitParams params) @safe onElicitation;
 	/// Handler for `roots/list`; returns the typed `ListRootsResult`. Null =>
 	/// unsupported. (`roots/list` carries no meaningful params, so the handler
@@ -4222,6 +4230,18 @@ final class McpClient : ClientProtocol
 	/// outcome. Every other notification is forwarded unchanged.
 	private void dispatchNotification(string method, Json params) @safe
 	{
+		// The server gave up on a request it sent us: tell its handler, and the
+		// reply is withheld (basic/utilities/cancellation).
+		if (method == "notifications/cancelled"
+				&& params.type == Json.Type.object && "requestId" in params)
+		{
+			if (auto token = params["requestId"].toString() in serverRequests_)
+			{
+				const reason = "reason" in params && params["reason"].type == Json.Type.string
+					? params["reason"].get!string : null;
+				(*token).cancel(reason);
+			}
+		}
 		if (method == "notifications/elicitation/complete")
 		{
 			if (params.type != Json.Type.object || "elicitationId" !in params
@@ -4421,15 +4441,37 @@ final class McpClient : ClientProtocol
 		auto paused = msg.method == "ping" ? null : pauseDeadlines();
 		scope (exit)
 			resumeDeadlines(paused);
+		// The handler runs under a token the server's `notifications/cancelled`
+		// for this request cancels; requests the handler makes inherit it.
+		auto token = new CancellationToken;
+		const key = msg.id.toString();
+		const fiber = currentFiberKey();
+		serverRequests_[key] = token;
+		auto outer = serverRequestTokens_.get(fiber, null);
+		serverRequestTokens_[fiber] = token;
+		scope (exit)
+		{
+			if (auto t = key in serverRequests_)
+				if (*t is token)
+					serverRequests_.remove(key);
+			if (outer is null)
+				serverRequestTokens_.remove(fiber);
+			else
+				serverRequestTokens_[fiber] = outer;
+		}
 		try
 		{
-			Json result = dispatchServerMethod(msg.method, msg.params);
+			Json result = withCancellation(token,
+					() @safe => dispatchServerMethod(msg.method, msg.params));
 			response = makeResponse(msg.id, result);
 		}
 		catch (McpException e)
 			response = makeErrorResponse(msg.id, e);
 		catch (Exception e)
 			response = makeErrorResponse(msg.id, internalError(e.msg));
+		// The receiver of a cancellation does not answer the cancelled request.
+		if (token.isCancelled)
+			return;
 
 		runTask((Json r) nothrow{
 			try
@@ -4444,6 +4486,19 @@ final class McpClient : ClientProtocol
 					r["id"].toString(), e.msg);
 			}
 		}, response);
+	}
+
+	/// The cancellation of the server->client request (sampling, elicitation,
+	/// roots) whose handler is running on the calling task; null outside one.
+	/// It is cancelled when the server sends `notifications/cancelled` for the
+	/// request, after which the client sends no reply, so a handler waiting on a
+	/// user or a model can stop early. Requests the handler itself makes are
+	/// bound to it and fail with `requestCancelled` once it is cancelled.
+	CancellationToken serverRequestCancellation() @safe nothrow
+	{
+		if (auto t = currentFiberKey() in serverRequestTokens_)
+			return *t;
+		return null;
 	}
 
 	private Json dispatchServerMethod(string method, Json params) @safe
