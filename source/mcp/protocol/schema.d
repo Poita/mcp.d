@@ -130,7 +130,7 @@ unittest  // a SumType is written as the value it holds, at any depth
 
 	auto j = () @trusted {
 		return serializeWithPolicy!(JsonSerializer, EnumByNamePolicy)(S(U("a"), [
-				U(1), U("b")
+			U(1), U("b")
 		]));
 	}();
 	assert(j["u"] == Json("a"), j.toString);
