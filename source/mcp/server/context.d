@@ -405,8 +405,9 @@ interface RequestContext
 /// capabilities, not stateless, no input responses / request state, no auth). A
 /// focused context — most of them test fakes — subclasses this and overrides only
 /// the one or two members it exercises, instead of re-stubbing the whole 12-method
-/// surface. Channel-less production contexts (`NullContext`,
-/// `HttpNotifyContext`) override only the server->client reject message.
+/// surface. `NullContext` overrides nothing; the Streamable HTTP transport's
+/// `HttpScopedContext` adds its connection scope and overrides only `noChannel`,
+/// the server->client reject message.
 abstract class BaseRequestContext : RequestContext
 {
 	bool isCancelled() @safe
