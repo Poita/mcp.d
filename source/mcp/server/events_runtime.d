@@ -1352,6 +1352,17 @@ final class EventsRuntime
 	/// performed by the webhook delivery engine.)
 	SubscribeResult subscribeWebhook(SubscribeParams p, string principal) @safe
 	{
+		return subscribeWebhookAttempt(p, principal, 0);
+	}
+
+	// One attempt at `subscribeWebhook`. A refresh that loses a race with another
+	// writer, or a create that a concurrent subscribe beat to the store, starts
+	// over from the stored record; `attempt` bounds how often.
+	private SubscribeResult subscribeWebhookAttempt(SubscribeParams p, string principal, int attempt) @safe
+	{
+		enum maxAttempts = 64;
+		if (attempt >= maxAttempts)
+			throw internalError("webhook subscription is contended; the subscribe was not applied");
 		principal = resolvePrincipal(principal);
 		if (principal.length == 0)
 			throw forbidden("events/subscribe requires an authenticated principal");
@@ -1438,10 +1449,12 @@ final class EventsRuntime
 			if (!webhookStore_.get(id).isNull)
 			{
 				releaseLifecycle(p.name, p.arguments, principal);
-				return subscribeWebhook(p, principal);
+				return subscribeWebhookAttempt(p, principal, attempt + 1);
 			}
+			webhookStore_.put(sub);
 		}
-		webhookStore_.put(sub);
+		else if (!webhookStore_.compareAndSwap(sub, existing.get.revision))
+			return subscribeWebhookAttempt(p, principal, attempt + 1);
 		// The reference is recorded only once the subscription is stored: a
 		// reconcile pass during the write releases every held reference whose
 		// subscription the store lacks. A registration that adopted the stored
@@ -1602,16 +1615,19 @@ final class EventsRuntime
 		}
 		// The check can yield: apply the backfill's cursors to the current record
 		// rather than the pre-check copy, and stop if it was removed meanwhile.
-		auto fresh = webhookStore_.get(sub.id);
-		if (fresh.isNull)
+		WebhookSubscription committed;
+		const applied = modifyWebhook(sub.id, (ref WebhookSubscription cur) @safe {
+			cur.fetchCursor = er.cursor;
+			// With nothing to replay the reported position is already safe to
+			// persist; otherwise the watermark stays put until the replayed
+			// deliveries settle.
+			if (er.events.length == 0)
+				cur.cursor = er.cursor;
+			return true;
+		}, committed);
+		if (!applied)
 			return false;
-		sub = fresh.get;
-		sub.fetchCursor = er.cursor;
-		// With nothing to replay the reported position is already safe to persist;
-		// otherwise the watermark stays put until the replayed deliveries settle.
-		if (er.events.length == 0)
-			sub.cursor = er.cursor;
-		webhookStore_.put(sub);
+		sub = committed;
 		bool any;
 		foreach (occ; er.events)
 			any |= enqueueForWebhook(sub, reg, occ, regIsEmitOnly(reg));
@@ -1664,16 +1680,19 @@ final class EventsRuntime
 				// The check can yield, so the subscription may have been removed,
 				// refreshed, or advanced meanwhile: apply this pass's cursors to the
 				// current record, and drop the batch if another pass already fetched it.
-				auto fresh = webhookStore_.get(sub.id);
-				if (fresh.isNull || fresh.get.isExpired(opts_.nowMs())
-						|| !fresh.get.active || fresh.get.fetchCursor != sub.fetchCursor)
-					continue;
-				auto cur = fresh.get;
 				const gap = er.truncated && !er.cursor.isNull;
-				cur.fetchCursor = er.cursor;
-				if (!gap && er.events.length == 0 && (cur.id in outstanding_) is null)
-					cur.cursor = er.cursor;
-				webhookStore_.put(cur);
+				const fetchedFrom = sub.fetchCursor;
+				WebhookSubscription cur;
+				const applied = modifyWebhook(sub.id, (ref WebhookSubscription s) @safe {
+					if (s.isExpired(opts_.nowMs()) || !s.active || s.fetchCursor != fetchedFrom)
+						return false;
+					s.fetchCursor = er.cursor;
+					if (!gap && er.events.length == 0 && (s.id in outstanding_) is null)
+						s.cursor = er.cursor;
+					return true;
+				}, cur);
+				if (!applied)
+					continue;
 				foreach (occ; er.events)
 					any |= enqueueForWebhook(cur, reg, occ, false);
 				// The gap is queued behind the batch, so the watermark reaches its
@@ -2679,33 +2698,66 @@ final class EventsRuntime
 		removeWebhookState(sub);
 	}
 
+	/// Atomically apply `mutate` to the stored subscription `id`: read it, let
+	/// `mutate` change it, and write it back only if no other writer (another
+	/// fiber, or another node sharing the store) changed it in between,
+	/// re-reading and retrying on a lost race. `mutate` returns false to leave
+	/// the record as is. Returns whether a change was committed, and the
+	/// committed record in `committed`; false for an unknown subscription.
+	private bool modifyWebhook(string id,
+			scope bool delegate(ref WebhookSubscription) @safe mutate,
+			out WebhookSubscription committed) @safe
+	{
+		enum maxAttempts = 64;
+		foreach (_; 0 .. maxAttempts)
+		{
+			auto sn = webhookStore_.get(id);
+			if (sn.isNull)
+				return false;
+			auto sub = sn.get;
+			const expected = sub.revision;
+			if (!mutate(sub))
+				return false;
+			if (!webhookStore_.compareAndSwap(sub, expected))
+				continue;
+			sub.revision = expected + 1;
+			committed = sub;
+			return true;
+		}
+		throw internalError("webhook subscription is contended; the update was not applied");
+	}
+
+	/// `modifyWebhook` for a caller that does not need the committed record.
+	private bool modifyWebhook(string id, scope bool delegate(ref WebhookSubscription) @safe mutate) @safe
+	{
+		WebhookSubscription committed;
+		return modifyWebhook(id, mutate, committed);
+	}
+
 	private void markVerified(string subId) @safe
 	{
-		auto sn = webhookStore_.get(subId);
-		if (sn.isNull)
-			return;
-		auto sub = sn.get;
-		if (!sub.verified)
-		{
+		modifyWebhook(subId, (ref WebhookSubscription sub) @safe {
+			if (sub.verified)
+				return false;
 			sub.verified = true;
-			webhookStore_.put(sub);
-		}
+			return true;
+		});
 	}
 
 	private void recordSuccess(string subId, string jobId, Nullable!string cursor) @safe
 	{
-		auto sn = webhookStore_.get(subId);
-		if (sn.isNull)
-			return;
-		auto sub = sn.get;
 		const now = opts_.nowMs();
-		sub.lastDeliveryAtMs = now;
-		sub.lastErrorCat = -1;
-		sub.failedSinceMs = 0;
-		rollWindow(sub, now);
-		sub.windowAttempts++;
-		clearExpiredRotation(sub, now);
-		webhookStore_.put(sub);
+		const found = modifyWebhook(subId, (ref WebhookSubscription sub) @safe {
+			sub.lastDeliveryAtMs = now;
+			sub.lastErrorCat = -1;
+			sub.failedSinceMs = 0;
+			rollWindow(sub, now);
+			sub.windowAttempts++;
+			clearExpiredRotation(sub, now);
+			return true;
+		});
+		if (!found)
+			return;
 		settlePosition(subId, jobId, cursor);
 	}
 
@@ -2732,15 +2784,12 @@ final class EventsRuntime
 		}
 		else
 			candidate = cursor.get;
-		auto sn = webhookStore_.get(subId);
-		if (sn.isNull)
-			return;
-		auto sub = sn.get;
-		if (cursorAdvances(sub.cursor, candidate, tracked))
-		{
+		modifyWebhook(subId, (ref WebhookSubscription sub) @safe {
+			if (!cursorAdvances(sub.cursor, candidate, tracked))
+				return false;
 			sub.cursor = candidate;
-			webhookStore_.put(sub);
-		}
+			return true;
+		});
 	}
 
 	// Start tracking job `jobId` for `subId`: it counts against the pending bound
@@ -2916,24 +2965,23 @@ final class EventsRuntime
 	// window. Returns whether the subscription is still active afterwards.
 	private bool recordFailure(string subId, DeliveryErrorCategory cat) @safe
 	{
-		auto sn = webhookStore_.get(subId);
-		if (sn.isNull)
-			return false;
-		auto sub = sn.get;
 		const now = opts_.nowMs();
-		sub.lastErrorCat = cast(int) cat;
-		if (sub.failedSinceMs == 0)
-			sub.failedSinceMs = now;
-		rollWindow(sub, now);
-		sub.windowAttempts++;
-		sub.windowFailures++;
 		const policy = opts_.webhookSuspension;
-		if (policy.minAttempts > 0 && sub.windowAttempts >= policy.minAttempts
+		WebhookSubscription committed;
+		const found = modifyWebhook(subId, (ref WebhookSubscription sub) @safe {
+			sub.lastErrorCat = cast(int) cat;
+			if (sub.failedSinceMs == 0)
+				sub.failedSinceMs = now;
+			rollWindow(sub, now);
+			sub.windowAttempts++;
+			sub.windowFailures++;
+			if (policy.minAttempts > 0 && sub.windowAttempts >= policy.minAttempts
 				&& sub.windowFailures * 100L >= sub.windowAttempts * cast(
-					long) policy.failureRatePercent)
-			sub.active = false;
-		webhookStore_.put(sub);
-		return sub.active;
+				long) policy.failureRatePercent)
+				sub.active = false;
+			return true;
+		}, committed);
+		return found && committed.active;
 	}
 
 	// Start a fresh failure-rate sample window once the current one has elapsed
@@ -5040,6 +5088,11 @@ version (unittest)
 		void put(WebhookSubscription sub) @safe
 		{
 			inner.put(sub);
+		}
+
+		bool compareAndSwap(WebhookSubscription sub, ulong expectedRevision) @safe
+		{
+			return inner.compareAndSwap(sub, expectedRevision);
 		}
 
 		Nullable!WebhookSubscription get(string id) @safe
@@ -7259,6 +7312,101 @@ unittest  // subscribe and publish read only the subscriptions they concern, nev
 	assert(store.allCalls == 0);
 	auto delivered = ft.eventPosts();
 	assert(delivered.length == 1 && delivered[0].url == "https://proxy/a");
+}
+
+version (unittest)
+{
+	// A store that runs a concurrent writer once, just before the runtime's next
+	// write lands, as another node sharing the store would.
+	private final class RacingStore : ForwardingStore
+	{
+		void delegate() @safe beforeWrite;
+
+		private void race() @safe
+		{
+			if (beforeWrite is null)
+				return;
+			auto hook = beforeWrite;
+			beforeWrite = null;
+			hook();
+		}
+
+		override void put(WebhookSubscription sub) @safe
+		{
+			race();
+			inner.put(sub);
+		}
+
+		override bool compareAndSwap(WebhookSubscription sub, ulong expectedRevision) @safe
+		{
+			race();
+			return inner.compareAndSwap(sub, expectedRevision);
+		}
+	}
+
+	// A runtime over `store` whose webhook endpoints need no verification.
+	private EventsRuntime racingRuntime(WebhookSubscriptionStore store) @safe
+	{
+		EventsOptions o;
+		o.nowMs = () @safe => 1_000_000L;
+		o.nowIso = () @safe => "t";
+		o.allowPrivateCallbackHosts = true;
+		o.webhookTransport = new FakeWebhookTransport();
+		o.deliverySleep = (Duration d) @safe {};
+		o.deliveryExecutor = (void delegate() @safe job) @safe { job(); };
+		auto rt = new EventsRuntime(store, o);
+		EventRegistration reg = {descriptor: EventType("n"), emitOnly: true};
+		rt.register(reg);
+		return rt;
+	}
+}
+
+unittest  // a delivery-health update does not overwrite a concurrent writer's change
+{
+	auto store = new RacingStore();
+	auto rt = racingRuntime(store);
+	auto r = rt.subscribeWebhook(webhookSub("n", "https://proxy/hooks"), "user-1");
+	store.beforeWrite = () @safe {
+		auto s = store.inner.get(r.id).get;
+		s.cursor = "remote";
+		store.inner.put(s);
+	};
+	rt.recordFailure(r.id, DeliveryErrorCategory.http5xx);
+	auto stored = store.get(r.id).get;
+	assert(stored.cursor.get == "remote");
+	assert(stored.lastErrorCat == cast(int) DeliveryErrorCategory.http5xx);
+}
+
+unittest  // a watermark advance does not overwrite a concurrent writer's change
+{
+	auto store = new RacingStore();
+	auto rt = racingRuntime(store);
+	auto r = rt.subscribeWebhook(webhookSub("n", "https://proxy/hooks"), "user-1");
+	store.beforeWrite = () @safe {
+		auto s = store.inner.get(r.id).get;
+		s.verified = true;
+		s.lastDeliveryAtMs = 42;
+		store.inner.put(s);
+	};
+	rt.settlePosition(r.id, "untracked-job", nullable(seqCursor(7)));
+	auto stored = store.get(r.id).get;
+	assert(stored.cursor.get == seqCursor(7));
+	assert(stored.lastDeliveryAtMs == 42);
+}
+
+unittest  // a webhook refresh does not overwrite a concurrent writer's change
+{
+	auto store = new RacingStore();
+	auto rt = racingRuntime(store);
+	rt.subscribeWebhook(webhookSub("n", "https://proxy/hooks"), "user-1");
+	auto id = store.all()[0].id;
+	store.beforeWrite = () @safe {
+		auto s = store.inner.get(id).get;
+		s.cursor = seqCursor(9);
+		store.inner.put(s);
+	};
+	rt.subscribeWebhook(webhookSub("n", "https://proxy/hooks"), "user-1");
+	assert(store.get(id).get.cursor.get == seqCursor(9));
 }
 
 unittest  // a reconcile pass while a new webhook subscription is stored does not tear it down

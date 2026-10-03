@@ -291,6 +291,10 @@ struct WebhookSubscription
 	long windowStartMs; /// start of the current failure-rate sample window
 	int windowAttempts; /// delivery attempts in the window
 	int windowFailures; /// failed attempts in the window (drives suspension)
+	/// Advanced by the store on every write; the optimistic-concurrency token that
+	/// lets writers on different fibers or nodes detect a concurrent change
+	/// (`WebhookSubscriptionStore.compareAndSwap`) instead of overwriting it.
+	ulong revision;
 
 	/// Whether the subscription has lapsed at `nowMs` (always false for no-expiry).
 	bool isExpired(long nowMs) const @safe pure nothrow
@@ -332,6 +336,7 @@ struct WebhookSubscription
 			j["windowAttempts"] = windowAttempts;
 			j["windowFailures"] = windowFailures;
 		}
+		j["revision"] = revision;
 		return j;
 	}
 
@@ -361,6 +366,8 @@ struct WebhookSubscription
 		s.windowStartMs = j.getOr("windowStartMs", 0L);
 		s.windowAttempts = j.getOr("windowAttempts", 0);
 		s.windowFailures = j.getOr("windowFailures", 0);
+		if ("revision" in j && j["revision"].type == Json.Type.int_)
+			s.revision = j["revision"].get!ulong;
 		return s;
 	}
 }
@@ -376,8 +383,21 @@ interface WebhookSubscriptionStore
 	/// subscription lost on restart would silently stop delivering.
 	bool durable() @safe;
 
-	/// Insert or replace the subscription identified by `sub.id`.
+	/// Insert or replace the subscription identified by `sub.id` unconditionally.
+	/// A replaced record's revision is advanced (the stored revision becomes the
+	/// old one plus one), so a `compareAndSwap` based on the old record fails.
+	/// The runtime uses this to create a subscription; every read-modify-write of
+	/// an existing one goes through `compareAndSwap`.
 	void put(WebhookSubscription sub) @safe;
+
+	/// Replace the subscription identified by `sub.id` only if its stored
+	/// `revision` still equals `expectedRevision`, storing `sub` with
+	/// `revision = expectedRevision + 1`. Returns false, changing nothing, when
+	/// the subscription is unknown or another writer changed it first; the
+	/// runtime then re-reads and retries. A shared store implements this as one
+	/// atomic conditional write (e.g. a Redis WATCH/MULTI or a SQL
+	/// `UPDATE ... WHERE revision = ?`).
+	bool compareAndSwap(WebhookSubscription sub, ulong expectedRevision) @safe;
 
 	/// The subscription with `id`, or null if unknown.
 	Nullable!WebhookSubscription get(string id) @safe;
@@ -414,6 +434,7 @@ final class InMemoryWebhookSubscriptionStore : WebhookSubscriptionStore
 		string principal;
 		bool noExpiry;
 		long expiresAtMs;
+		ulong revision;
 	}
 
 	private Record[string] records_;
@@ -427,9 +448,26 @@ final class InMemoryWebhookSubscriptionStore : WebhookSubscriptionStore
 
 	void put(WebhookSubscription sub) @safe
 	{
+		if (auto p = sub.id in records_)
+			sub.revision = p.revision + 1;
+		store(sub);
+	}
+
+	bool compareAndSwap(WebhookSubscription sub, ulong expectedRevision) @safe
+	{
+		auto p = sub.id in records_;
+		if (p is null || p.revision != expectedRevision)
+			return false;
+		sub.revision = expectedRevision + 1;
+		store(sub);
+		return true;
+	}
+
+	private void store(WebhookSubscription sub) @safe
+	{
 		remove(sub.id);
 		records_[sub.id] = Record(sub.toJson().clone(), sub.name,
-				sub.principal, sub.noExpiry, sub.expiresAtMs);
+				sub.principal, sub.noExpiry, sub.expiresAtMs, sub.revision);
 		idsByName_[sub.name][sub.id] = true;
 		idsByPrincipal_[sub.principal][sub.id] = true;
 	}
@@ -659,6 +697,44 @@ final class InMemoryDeliveryQueue : DeliveryQueue
 	{
 		return (jobId in entries_) !is null;
 	}
+}
+
+unittest  // the in-memory subscription store's compareAndSwap applies only on the expected revision
+{
+	auto store = new InMemoryWebhookSubscriptionStore();
+	WebhookSubscription sub;
+	sub.id = "s";
+	sub.name = "n";
+	store.put(sub);
+	auto read = store.get("s").get;
+	read.verified = true;
+	assert(store.compareAndSwap(read, read.revision));
+	assert(store.get("s").get.verified);
+	assert(store.get("s").get.revision == read.revision + 1);
+	// A second writer holding the old revision loses.
+	read.cursor = "stale";
+	assert(!store.compareAndSwap(read, read.revision));
+	assert(store.get("s").get.cursor.isNull);
+}
+
+unittest  // the in-memory subscription store's compareAndSwap fails for an unknown subscription
+{
+	auto store = new InMemoryWebhookSubscriptionStore();
+	WebhookSubscription sub;
+	sub.id = "missing";
+	assert(!store.compareAndSwap(sub, 0));
+	assert(store.get("missing").isNull);
+}
+
+unittest  // an unconditional put advances the revision, so an older compareAndSwap fails
+{
+	auto store = new InMemoryWebhookSubscriptionStore();
+	WebhookSubscription sub;
+	sub.id = "s";
+	store.put(sub);
+	auto read = store.get("s").get;
+	store.put(read);
+	assert(!store.compareAndSwap(read, read.revision));
 }
 
 unittest  // the in-memory subscription store shares no Json with its callers

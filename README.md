@@ -291,7 +291,11 @@ poll leases, sweeps lapsed webhook subscriptions, and runs poll-driven webhook
 delivery for fetch-handler types. The in-memory default is single-node; injecting
 a shared, durable queue (Redis/SQS/DB) plus a `WebhookSubscriptionStore` makes webhook
 delivery node-agnostic (any node's worker delivers; a crashed node's leased job
-is re-leased) — mirroring the `TaskStore`/`TaskDispatcher` split.
+is re-leased) — mirroring the `TaskStore`/`TaskDispatcher` split. Like
+`TaskStore`, a shared `WebhookSubscriptionStore` implements `compareAndSwap` on the
+record's `revision` as one atomic conditional write: every update to a stored
+subscription (watermark, verification, delivery health, refresh) is a
+read-modify-write retried on a lost race, so nodes never overwrite each other.
 
 > **Guidance:** if your tools initiate elicitation/sampling/roots, or use the
 > 2025-era `resources/subscribe` push over HTTP, construct the server with
