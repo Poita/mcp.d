@@ -759,7 +759,7 @@ private final class SseWriter
 
 	/// How long a full queue waits for its client to read before the stream is
 	/// closed.
-	enum Duration queueStallTimeout = 2.seconds;
+	enum Duration queueStallTimeout = sseStallTimeout;
 
 	this(HTTPServerResponse res, size_t maxQueued) @safe
 	{
@@ -863,28 +863,6 @@ private final class SseWriter
 		closeRawConnection(res);
 		if (started && writer.running && writer != Task.getThis())
 			writer.interrupt();
-	}
-}
-
-/// Close the TCP connection under `res`, so a write blocked on a client that
-/// stopped reading fails at once. vibe.d exposes no public close for a server
-/// response, so its private raw-connection field is located by name; a test
-/// response has none, and then nothing happens.
-private void closeRawConnection(HTTPServerResponse res) @trusted nothrow
-{
-	foreach (i, ref field; res.tupleof)
-	{
-		static if (__traits(identifier, res.tupleof[i]) == "m_rawConnection")
-		{
-			try
-			{
-				if (field)
-					field.close();
-			}
-			catch (Exception)
-			{
-			}
-		}
 	}
 }
 
@@ -3085,6 +3063,71 @@ unittest  // modern: a client closing its TCP connection mid-request cancels the
 	assert(failure.length == 0, failure);
 	assert(started, "the tool handler never ran");
 	assert(cancelled, "a client disconnect must cancel a modern request");
+}
+
+unittest  // a POST stream whose client stops reading does not pin its handler
+{
+	import core.time : MonoTime, msecs;
+	import std.array : replicate;
+	import std.conv : to;
+	import vibe.core.core : runTask, runEventLoop, exitEventLoop, sleep;
+	import vibe.core.net : connectTCP;
+	import vibe.http.server : HTTPServerSettings, listenHTTP;
+	import mcp.protocol.types : Tool, CallToolResult;
+
+	auto server = McpServer.stateless("t", "1");
+	server.enableLogging();
+	bool started, finished;
+	Tool flood = {name: "flood"};
+	server.registerTool(flood, (Json args, RequestContext ctx) @safe {
+		started = true;
+		const big = Json("x".replicate(64 * 1024));
+		foreach (_; 0 .. 400)
+			ctx.log("info", big);
+		finished = true;
+		CallToolResult r;
+		return r;
+	});
+	auto router = new URLRouter;
+	mountMcp(router, server);
+	auto settings = new HTTPServerSettings;
+	settings.port = 0;
+	settings.bindAddresses = ["127.0.0.1"];
+
+	string failure;
+	Duration took;
+	runTask(() nothrow{
+		scope (exit)
+			exitEventLoop();
+		try
+		{
+			auto listener = listenHTTP(settings, router);
+			scope (exit)
+				listener.stopListening();
+			auto conn = connectTCP("127.0.0.1", listener.bindAddresses[0].port);
+			scope (exit)
+				conn.close();
+			const body_ = `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"flood",` ~ `"arguments":{},"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28",` ~ `"io.modelcontextprotocol/clientCapabilities":{},` ~ `"io.modelcontextprotocol/logLevel":"debug"}}}`;
+			conn.write(
+				"POST /mcp HTTP/1.1\r\nHost: 127.0.0.1\r\n" ~ "Content-Type: application/json\r\n"
+				~ "Accept: application/json, text/event-stream\r\n"
+				~ "MCP-Protocol-Version: 2026-07-28\r\nMcp-Method: tools/call\r\n"
+				~ "Mcp-Name: flood\r\nContent-Length: " ~ body_.length.to!string
+				~ "\r\n\r\n" ~ body_);
+			conn.flush();
+			const began = MonoTime.currTime;
+			while (!finished && MonoTime.currTime - began < 10.seconds)
+				sleep(20.msecs);
+			took = MonoTime.currTime - began;
+		}
+		catch (Exception e)
+			failure = e.msg;
+	});
+	runEventLoop();
+	assert(failure.length == 0, failure);
+	assert(started, "the tool handler never ran");
+	assert(finished, "a client that stops reading must not block its handler forever");
+	assert(took < 8.seconds, took.toString);
 }
 
 /// Validate the modern Streamable HTTP request headers against the JSON-RPC body.

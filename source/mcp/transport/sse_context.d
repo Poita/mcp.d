@@ -2422,6 +2422,32 @@ void applySseStreamHeaders(HTTPServerResponse res, bool modern) @safe
 		res.headers[k] = v;
 }
 
+/// How long an SSE write may wait on a client that has stopped reading before
+/// the client is deemed gone and its connection closed.
+package(mcp) enum Duration sseStallTimeout = 2.seconds;
+
+/// Close the TCP connection under `res`, so a write blocked on a client that
+/// stopped reading fails at once. vibe.d exposes no public close for a server
+/// response, so its private raw-connection field is located by name; a test
+/// response has none, and then nothing happens.
+package(mcp) void closeRawConnection(HTTPServerResponse res) @trusted nothrow
+{
+	foreach (i, ref field; res.tupleof)
+	{
+		static if (__traits(identifier, res.tupleof[i]) == "m_rawConnection")
+		{
+			try
+			{
+				if (field)
+					field.close();
+			}
+			catch (Exception)
+			{
+			}
+		}
+	}
+}
+
 /// Whether the client behind `res` still holds its connection open.
 /// `HTTPServerResponse.connected` keeps reporting a connection the peer has
 /// closed as connected (the close is only observed by a read), so the socket is
@@ -2718,13 +2744,34 @@ final class HttpStreamContext : RequestContext, ConnectionScoped
 	// failed write marks the stream disconnected and later frames are skipped
 	// rather than thrown into the handler. Frames are still recorded by the replay
 	// channel (if any) before reaching here, so a resuming GET receives them.
+	//
+	// A client that stops reading fills the socket and parks the write, which
+	// would pin the handler and its session. The frame is therefore written in
+	// slices under a watchdog: when no slice is accepted within `sseStallTimeout`
+	// the connection is closed, failing the write.
 	private void writeFrame(string frame) @safe
 	{
+		import std.algorithm : min;
+		import vibe.core.core : setTimer;
+
 		if (disconnected_)
 			return;
+		enum size_t slice = 16 * 1024;
+		auto watchdog = setTimer(sseStallTimeout, () nothrow @safe {
+			closeRawConnection(res);
+		});
+		scope (exit)
+			watchdog.stop();
 		try
 			() @trusted {
-			res.bodyWriter.write(cast(const(ubyte)[]) frame);
+			auto bytes = cast(const(ubyte)[]) frame;
+			while (bytes.length)
+			{
+				const n = min(slice, bytes.length);
+				res.bodyWriter.write(bytes[0 .. n]);
+				bytes = bytes[n .. $];
+				watchdog.rearm(sseStallTimeout);
+			}
 			res.bodyWriter.flush();
 		}();
 		catch (Exception)
