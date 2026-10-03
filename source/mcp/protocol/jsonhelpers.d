@@ -209,6 +209,69 @@ bool tryGet(N : Nullable!T, T)(Json j, string key, ref N val) @safe
 	return true;
 }
 
+/// Assign `j[key]` into the integral `val` when it is a JSON number with a whole
+/// value in `T`'s range: an integer, a bigInt, or a float such as `1024.0`
+/// (JSON draws no distinction between `1024` and `1024.0`). Leaves `val`
+/// untouched otherwise. Returns whether the assignment happened. Never throws.
+bool tryGetWhole(T)(Json j, string key, ref T val) @safe if (isIntegral!T)
+{
+	if (j.type != Json.Type.object)
+		return false;
+	auto p = key in j;
+	if (p is null)
+		return false;
+	if (p.type == Json.Type.int_ || p.type == Json.Type.bigInt)
+		return integralInRange(*p, val);
+	if (p.type != Json.Type.float_)
+		return false;
+	const d = p.get!double;
+	// `T.max + 1.0` is exact as a double even where `T.max` is not; the
+	// negated comparison also rejects NaN.
+	if (!(d >= cast(double) T.min && d < cast(double) T.max + 1.0))
+		return false;
+	const T n = cast(T) d;
+	if (n != d)
+		return false;
+	val = n;
+	return true;
+}
+
+/// `Nullable` overload of `tryGetWhole`.
+bool tryGetWhole(N : Nullable!T, T)(Json j, string key, ref N val) @safe
+{
+	T tmp;
+	if (!tryGetWhole(j, key, tmp))
+		return false;
+	val = tmp;
+	return true;
+}
+
+@safe unittest  // tryGetWhole accepts whole floats and rejects fractions, NaN and out-of-range values
+{
+	import std.bigint : BigInt;
+
+	Json j = Json.emptyObject;
+	long v;
+	j["n"] = 1024.0;
+	assert(tryGetWhole(j, "n", v) && v == 1024);
+	j["n"] = Json(BigInt(7));
+	assert(tryGetWhole(j, "n", v) && v == 7);
+	j["n"] = 1.5;
+	assert(!tryGetWhole(j, "n", v) && v == 7);
+	j["n"] = double.nan;
+	assert(!tryGetWhole(j, "n", v));
+	j["n"] = 0x1p63;
+	assert(!tryGetWhole(j, "n", v));
+	j["n"] = "3";
+	assert(!tryGetWhole(j, "n", v));
+	int i;
+	j["n"] = 3e9;
+	assert(!tryGetWhole(j, "n", i));
+	Nullable!long nl;
+	j["n"] = 5.0;
+	assert(tryGetWhole(j, "n", nl) && nl.get == 5);
+}
+
 @safe unittest  // getOr returns the value when the key is present and well-typed
 {
 	Json j = Json.emptyObject;

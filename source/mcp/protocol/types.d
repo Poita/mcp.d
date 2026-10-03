@@ -5,7 +5,7 @@ import vibe.data.json : Json, parseJsonString, deserializeJson, serializeToJson;
 import mcp.protocol.capabilities;
 import mcp.protocol.errors : ErrorCode, McpException, invalidParams, isValidElicitationUrl;
 import mcp.protocol.versions : ProtocolVersion, toWire;
-import mcp.protocol.jsonhelpers : getOr, tryGet, requireObject, tryNumber;
+import mcp.protocol.jsonhelpers : getOr, tryGet, tryGetWhole, requireObject, tryNumber;
 import mcp.protocol.tasks : Task, makeCreateTaskResult, isCreateTaskResult;
 import mcp.protocol.mrtr : InputRequest, emitInputRequired, parseInputRequired;
 import mcp.protocol.modern : CacheHint, parseCacheHint, withCache;
@@ -730,8 +730,7 @@ struct Content
 			c.mimeType = j.getOr("mimeType", "");
 			tryGet(j, "title", c.title);
 			tryGet(j, "description", c.description);
-			if ("size" in j && j["size"].type == Json.Type.int_)
-				c.size = j["size"].get!long;
+			tryGetWhole(j, "size", c.size);
 			c.parseMeta(j);
 			return Content(c);
 		case "resource":
@@ -2960,8 +2959,7 @@ struct Resource
 		tryGet(j, "mimeType", r.mimeType);
 		if ("annotations" in j && j["annotations"].type == Json.Type.object)
 			r.annotations = Annotations.fromJson(j["annotations"]);
-		if ("size" in j && j["size"].type == Json.Type.int_)
-			r.size = j["size"].get!long;
+		tryGetWhole(j, "size", r.size);
 		if ("icons" in j && j["icons"].type == Json.Type.array)
 			foreach (i; 0 .. j["icons"].length)
 				r.icons ~= Icon.fromJson(j["icons"][i]);
@@ -3352,10 +3350,26 @@ struct SkillResourceRef
 			r.uri = j["uri"].get!string;
 		if ("digest" in j && j["digest"].type == Json.Type.string)
 			r.digest = j["digest"].get!string;
-		if ("size" in j && j["size"].type == Json.Type.int_)
-			r.size = j["size"].get!long;
+		tryGetWhole(j, "size", r.size);
 		return r;
 	}
+}
+
+unittest  // size fields accept a whole-valued float or in-range bigInt
+{
+	import std.bigint : BigInt;
+	import vibe.data.json : parseJsonString;
+
+	auto link = Content.fromJson(parseJsonString(
+			`{"type":"resource_link","uri":"file:///a","name":"a","size":1024.0}`));
+	assert(link.size.get == 1024);
+	auto res = Resource.fromJson(parseJsonString(`{"uri":"file:///a","name":"a","size":2048.0}`));
+	assert(res.size.get == 2048);
+	Json ref_ = parseJsonString(`{"uri":"file:///a","digest":"sha256:00"}`);
+	ref_["size"] = Json(BigInt(4096));
+	assert(SkillResourceRef.fromJson(ref_).size == 4096);
+	ref_["size"] = 1.5;
+	assert(SkillResourceRef.fromJson(ref_).size == 0);
 }
 
 /// One skill entry, as carried by `skills/list` and `skills/get`. `name` and
