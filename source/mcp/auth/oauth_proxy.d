@@ -148,7 +148,8 @@ struct OAuthProxyConfig
 
 	/// The RFC 8707 canonical resource identifier of the MCP server, advertised
 	/// in the PRM document and forwarded to the upstream as the `resource`
-	/// parameter so issued tokens are audience-bound to this server.
+	/// parameter so issued tokens are audience-bound to this server. Required:
+	/// `OAuthProxy` refuses a config without it.
 	string resource;
 
 	/// In ISSUE-OWN-TOKEN (broker) mode, mints the MCP server's own token for the
@@ -1083,6 +1084,11 @@ final class OAuthProxy
 	in (consentStore !is null)
 	in (redirectRegistry !is null)
 	{
+		import std.exception : enforce;
+
+		enforce(cfg.resource.length > 0,
+				"OAuthProxy: resource (the canonical MCP server URL) must be set; "
+				~ "every token would otherwise fail the audience check.");
 		requireSecureUrl(cfg.upstreamAuthorizationEndpoint, cfg.upstreamSsrfPolicy);
 		requireSecureUrl(cfg.upstreamTokenEndpoint, cfg.upstreamSsrfPolicy);
 		requireSecureUrl(cfg.callbackUrl(), SsrfPolicy.allowLoopback);
@@ -1461,6 +1467,15 @@ version (unittest)
 		d.redirectUris = ["http://127.0.0.1:8765/callback"];
 		return d;
 	}
+}
+
+unittest  // OAuthProxy refuses a config with no resource, which would reject every request after login
+{
+	import std.exception : assertThrown;
+
+	auto cfg = sampleConfig();
+	cfg.resource = "";
+	assertThrown(new OAuthProxy(cfg));
 }
 
 unittest  // an upstream IdP on a private network is accepted only under a policy that permits it
@@ -2433,6 +2448,7 @@ unittest  // CONSTRUCTOR SECURITY: a plaintext (http) baseUrl over a non-loopbac
 	cfg.upstreamTokenEndpoint = "https://github.com/login/oauth/access_token";
 	cfg.upstreamClientId = "client-id";
 	cfg.baseUrl = "http://mcp.example.com"; // insecure non-loopback base URL
+	cfg.resource = cfg.baseUrl ~ "/mcp";
 	assertThrown(new OAuthProxy(cfg));
 }
 
@@ -2443,6 +2459,7 @@ unittest  // CONSTRUCTOR SECURITY: a loopback http baseUrl is accepted for local
 	cfg.upstreamTokenEndpoint = "https://github.com/login/oauth/access_token";
 	cfg.upstreamClientId = "client-id";
 	cfg.baseUrl = "http://127.0.0.1:8080"; // loopback dev config is allowed
+	cfg.resource = cfg.baseUrl ~ "/mcp";
 	auto proxy = new OAuthProxy(cfg); // must not throw
 	assert(proxy !is null);
 }
