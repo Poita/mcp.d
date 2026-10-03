@@ -22,7 +22,8 @@ struct BearerProvider
 	/// or `error="invalid_token"`). Returns whether a replacement token is
 	/// available: when true the request is retried once with a fresh `token()`,
 	/// otherwise the 401 is surfaced to the caller with its `WWW-Authenticate`
-	/// challenge. Optional; without it a 401 is surfaced to the caller.
+	/// challenge. A refresh that throws counts as returning false. Optional;
+	/// without it a 401 is surfaced to the caller.
 	bool delegate(string rejectedToken) @safe onRejected;
 }
 

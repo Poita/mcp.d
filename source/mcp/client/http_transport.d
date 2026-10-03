@@ -740,7 +740,7 @@ final class HttpClientTransport : ClientTransport
 				req.inHandler++;
 				scope (exit)
 					req.inHandler--;
-				if (!bearerProvider.onRejected(sentBearer))
+				if (!refreshBearer(sentBearer))
 					throw e;
 			}
 			return postAndAwait(message, expectId, req);
@@ -4460,6 +4460,41 @@ unittest  // a rejected bearer with no replacement surfaces the 401 without a re
 	assert(rejectedBearers(`Bearer error="invalid_token"`, attempts, false) == [
 		"tok"
 	]);
+	assert(attempts == 1);
+}
+
+unittest  // a bearer refresh that throws surfaces the 401 with its challenge
+{
+	import mcp.client.client : McpClient;
+
+	enum challenge = `Bearer error="invalid_token"`;
+	int attempts;
+	auto router = answeringRouter((Json req, HTTPServerResponse res) @safe {
+		++attempts;
+		res.statusCode = 401;
+		res.headers["WWW-Authenticate"] = challenge;
+		res.writeBody("", "text/plain");
+	});
+	Exception caught;
+	const failure = runAgainstFakeServer(router, (string url) @safe {
+		auto client = McpClient.http(url);
+		scope (exit)
+			client.close();
+		client.setBearerProvider(BearerProvider(() @safe => "tok", (string t) @safe {
+				throw new Exception("token endpoint unreachable");
+				return false;
+			}));
+		client.initialize("2025-11-25");
+		try
+			client.listTools();
+		catch (Exception e)
+			caught = e;
+	});
+	assert(failure.length == 0, "scenario failed: " ~ failure);
+	auto h = cast(HttpStatusException) caught;
+	assert(h !is null, "a failed refresh must surface the 401, got: " ~ (caught is null
+			? "nothing" : caught.msg));
+	assert(h.wwwAuthenticate == challenge);
 	assert(attempts == 1);
 }
 
