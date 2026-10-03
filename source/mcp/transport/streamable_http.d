@@ -35,7 +35,8 @@ struct StreamLimits
 	size_t maxLegacyStreams = 1_000;
 	/// Requests dispatched concurrently from one legacy HTTP+SSE stream; past it
 	/// a POST is answered 429. A client's reply to a server->client request is
-	/// never refused.
+	/// never refused. Notification POSTs draw on a separate pool of this many
+	/// slots and wait for one rather than being refused.
 	size_t maxLegacyInFlight = 16;
 	/// Standalone GET streams open at once on one session; past it a GET is
 	/// answered 429.
@@ -573,6 +574,8 @@ void mountLegacyHttpSse(URLRouter router, McpServer server,
 /// subscriptions, or in-flight cancellation registry.
 final class LegacySseChannel
 {
+	import vibe.core.sync : LocalManualEvent, createManualEvent;
+
 	private struct Listener
 	{
 		long id;
@@ -588,6 +591,10 @@ final class LegacySseChannel
 	private StreamLimits limits;
 	/// Requests currently dispatched per stream session token.
 	private size_t[string] inFlight;
+	/// Notification-only payloads currently dispatched per stream session token.
+	private size_t[string] notificationsInFlight;
+	/// Emitted whenever a notification dispatch slot frees.
+	private LocalManualEvent notificationSlotFreed;
 	/// Correlates server->client requests with the client's reply POSTs, keyed by
 	/// (sessionId, requestId). A handler that blocks in ctx.sample/ctx.elicit/
 	/// ctx.listRoots registers here; the client's reply POST resolves the waiter.
@@ -601,6 +608,7 @@ final class LegacySseChannel
 		this.endpointPath = endpointPath;
 		this.limits = limits;
 		this.coord = coord !is null ? coord : new StreamCoordinator;
+		notificationSlotFreed = createManualEvent();
 	}
 
 	/// Whether the channel holds as many open streams as `maxLegacyStreams`.
@@ -630,6 +638,44 @@ final class LegacySseChannel
 			else
 				(*n)--;
 		}
+	}
+
+	/// Claim a notification dispatch slot on the stream `sessionId`, waiting
+	/// while it already runs `maxLegacyInFlight` notification payloads. These
+	/// slots are separate from the request slots, so a stream saturated with
+	/// requests still takes its notifications. Returns false, without a slot,
+	/// once the stream closes. Pair a claimed slot with `releaseNotification`.
+	bool acquireNotification(string sessionId) @safe
+	{
+		import core.time : seconds;
+
+		while (true)
+		{
+			const ec = notificationSlotFreed.emitCount;
+			if (!isOpen(sessionId))
+				return false;
+			const n = notificationsInFlight.get(sessionId, 0);
+			if (limits.maxLegacyInFlight == 0 || n < limits.maxLegacyInFlight)
+			{
+				notificationsInFlight[sessionId] = n + 1;
+				return true;
+			}
+			// The timeout rechecks whether the stream has closed meanwhile.
+			notificationSlotFreed.wait(1.seconds, ec);
+		}
+	}
+
+	/// Release a slot claimed by `acquireNotification`.
+	void releaseNotification(string sessionId) @safe
+	{
+		if (auto n = sessionId in notificationsInFlight)
+		{
+			if (*n <= 1)
+				notificationsInFlight.remove(sessionId);
+			else
+				(*n)--;
+		}
+		notificationSlotFreed.emit();
 	}
 
 	/// Register an open GET SSE stream. A fresh per-stream session token and a
@@ -1037,6 +1083,18 @@ private bool carriesRequest(ref const ParsedInput input) @safe
 	return false;
 }
 
+/// Whether `input` holds nothing but `notifications/cancelled` messages, whose
+/// handling only flips cancellation tokens and never blocks.
+private bool onlyCancellations(ref const ParsedInput input) @safe
+{
+	if (input.messages.length == 0 || input.errors.length)
+		return false;
+	foreach (ref m; input.messages)
+		if (m.kind != MessageKind.notification || m.method != "notifications/cancelled")
+			return false;
+	return true;
+}
+
 /// Dispatch a parsed legacy POST against the stream `sessionId` and its
 /// connection state `conn`, delivering any response on the stream.
 private void handleLegacyInput(McpServer server, LegacySseChannel channel,
@@ -1138,9 +1196,12 @@ enum LegacyPostOutcome
 /// server->client request (elicitation, sampling, roots) the handler blocks on.
 /// A request is refused when its stream already runs as many requests as the
 /// channel's `StreamLimits.maxLegacyInFlight`; a client reply only wakes its
-/// waiter, so it is handled at once and never refused, and a payload without a
-/// request (a notification such as `notifications/cancelled`) runs without
-/// taking a slot, so it is never refused either.
+/// waiter, so it is handled at once and never refused. A payload without a
+/// request is never refused either: one holding only `notifications/cancelled`
+/// is handled at once, so a saturated stream can always be told to stop work,
+/// and any other notification payload waits for one of the stream's separate
+/// pool of `maxLegacyInFlight` notification slots, so a client cannot park an
+/// unbounded number of notification handlers.
 LegacyPostOutcome dispatchLegacyPost(McpServer server, LegacySseChannel channel,
 		string sessionId, string payload, TokenInfo token = TokenInfo.invalid()) @safe
 {
@@ -1153,20 +1214,29 @@ LegacyPostOutcome dispatchLegacyPost(McpServer server, LegacySseChannel channel,
 	ParsedInput input;
 	if (!parseLegacyPayload(channel, sessionId, payload, input))
 		return LegacyPostOutcome.accepted;
-	if (isLegacyReply(input))
+	if (isLegacyReply(input) || onlyCancellations(input))
 	{
 		handleLegacyInput(server, channel, sessionId, conn, input, token);
 		return LegacyPostOutcome.accepted;
 	}
-	const needsSlot = carriesRequest(input);
-	if (needsSlot && !channel.tryAcquireDispatch(sessionId))
-		return LegacyPostOutcome.tooManyRequests;
+	const isRequest = carriesRequest(input);
+	if (isRequest)
+	{
+		if (!channel.tryAcquireDispatch(sessionId))
+			return LegacyPostOutcome.tooManyRequests;
+	}
+	else if (!channel.acquireNotification(sessionId))
+		return LegacyPostOutcome.unknownStream;
 	runTask(() nothrow{
 		try
 		{
 			scope (exit)
-				if (needsSlot)
+			{
+				if (isRequest)
 					channel.releaseDispatch(sessionId);
+				else
+					channel.releaseNotification(sessionId);
+			}
 			handleLegacyInput(server, channel, sessionId, conn, input, token);
 		}
 		catch (Exception e)
@@ -6722,6 +6792,54 @@ unittest  // legacy notifications/cancelled is accepted while the stream's in-fl
 		yield();
 	}
 	assert(cancelled);
+}
+
+unittest  // legacy notification POSTs wait for a slot rather than each parking a task
+{
+	import vibe.core.core : runTask, yield;
+
+	auto server = McpServer.stateful("t", "1");
+	size_t running, peak, ran;
+	bool release;
+	server.setClientNotificationHandler((string method, Json params) @safe {
+		running++;
+		if (running > peak)
+			peak = running;
+		while (!release)
+			yield();
+		running--;
+		ran++;
+	});
+	StreamLimits limits;
+	limits.maxLegacyInFlight = 1;
+	auto ch = new LegacySseChannel("/message", limits);
+	const sid = ch.sessionIdFor(ch.addListener((string) @safe {}));
+	enum note = `{"jsonrpc":"2.0","method":"notifications/roots/list_changed"}`;
+
+	LegacyPostOutcome[] outcomes;
+	foreach (_; 0 .. 3)
+		runTask(() nothrow{
+			try
+				outcomes ~= dispatchLegacyPost(server, ch, sid, note);
+			catch (Exception)
+			{
+			}
+		});
+	foreach (_; 0 .. 64)
+		yield();
+	const peakWhileBlocked = peak;
+	release = true;
+	foreach (_; 0 .. 4096)
+	{
+		if (ran == 3)
+			break;
+		yield();
+	}
+	assert(peakWhileBlocked == 1, "notification dispatch must be bounded per stream");
+	assert(ran == 3, "every notification still runs");
+	assert(outcomes.length == 3);
+	foreach (o; outcomes)
+		assert(o == LegacyPostOutcome.accepted, "a notification must never be refused");
 }
 
 version (unittest) private HTTPServerResponse legacyRequest(URLRouter router,
