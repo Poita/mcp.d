@@ -358,13 +358,17 @@ interface RequestContext
 	/// `serializeToJson(state).toString()`), so this is the typed inverse: parse
 	/// the echoed string and deserialise it into `T`. Returns `T.init` when the
 	/// client echoed no state (`requestState` empty). The value is untrusted input
-	/// the client round-tripped, so a malformed payload throws.
+	/// the client round-tripped, so a payload that does not parse, nests too
+	/// deeply, or does not fit `T` throws an invalid-params (-32602) error.
 	T requestStateAs(T)() @safe
 	{
 		const raw = requestState();
 		if (raw.length == 0)
 			return T.init;
-		return deserializeJson!T(parseUntrustedJson(raw));
+		try
+			return deserializeJson!T(parseUntrustedJson(raw));
+		catch (Exception e)
+			throw invalidParams("malformed requestState");
 	}
 
 	/// Typed convenience over `log(string, Json, string)`: emit a
@@ -1523,12 +1527,47 @@ unittest  // requestStateAs!T returns T.init when requestState is empty
 unittest  // requestStateAs!T rejects a requestState nested past the depth cap
 {
 	import std.array : replicate;
-	import std.exception : assertThrown;
-	import vibe.data.json : JSONException;
 
 	auto probe = new StateProbe;
 	probe.state = "[".replicate(1000) ~ "]".replicate(1000);
-	assertThrown!JSONException(probe.requestStateAs!Json);
+	try
+	{
+		probe.requestStateAs!Json;
+		assert(false, "a too-deep requestState must be rejected");
+	}
+	catch (McpException e)
+		assert(e.code == ErrorCode.invalidParams);
+}
+
+unittest  // requestStateAs!T rejects unparseable requestState as invalid params
+{
+	auto probe = new StateProbe;
+	probe.state = "not json";
+	try
+	{
+		probe.requestStateAs!Json;
+		assert(false, "a malformed requestState must be rejected");
+	}
+	catch (McpException e)
+		assert(e.code == ErrorCode.invalidParams);
+}
+
+unittest  // requestStateAs!T rejects requestState of the wrong shape as invalid params
+{
+	static struct Cursor
+	{
+		int step;
+	}
+
+	auto probe = new StateProbe;
+	probe.state = `{"step":"three"}`;
+	try
+	{
+		probe.requestStateAs!Cursor;
+		assert(false, "a mistyped requestState must be rejected");
+	}
+	catch (McpException e)
+		assert(e.code == ErrorCode.invalidParams);
 }
 
 unittest  // typed log(LogLevel, string) emits the same frame as the string/Json form

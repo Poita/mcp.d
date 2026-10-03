@@ -101,7 +101,8 @@ private mixin template InputRequiredPart()
 	/// `requestState`. Serialises `state` to JSON and stores its string form.
 	/// ENCODING CONTRACT: the stored value is `serializeToJson(state).toString()`,
 	/// which `RequestContext.requestStateAs!T()` decodes via
-	/// `deserializeJson!T(parseJsonString(state))`. Constrained off `string` so it
+	/// `deserializeJson!T(parseUntrustedJson(state))`, failing a malformed echo
+	/// with invalid params (-32602). Constrained off `string` so it
 	/// does not collide with the verbatim-string overload above.
 	static typeof(this) inputRequired(T)(InputRequest[] requests, T state) @safe
 			if (!is(T : string))
