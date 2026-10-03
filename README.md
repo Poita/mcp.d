@@ -689,7 +689,6 @@ resource convention, and `import mcp;` brings in the helpers (`mcp.api.apps`):
 ```d
 auto server = new McpServer("weather", "1.0.0");
 registerModule!(my.module)(server);     // a @tool tagged @ui("ui://weather/dashboard", "model", "app")
-server.enableApps();              // declare the extension capability
 
 UiResourceOptions ui;
 ui.meta.csp.connectDomains = ["https://api.open-meteo.com"];
@@ -700,6 +699,9 @@ registerUiResource(server, "ui://weather/dashboard", "weather_dashboard",
 
 A `@tool` carries its UI link via `@ui(resourceUri, visibility…)` (folded into the
 tool's `_meta.ui`); the dynamic path uses `setUiToolMeta(tool, UiToolMeta(...))`.
+Registering a `@ui` tool or a UI resource advertises the extension; call
+`server.enableApps(mimeTypes)` only to declare content types other than
+`text/html;profile=mcp-app` (before or after registering).
 `clientSupportsApps(ctx)` reports whether the calling client opted into the
 extension. The runnable [Apps example](examples/apps/) verifies the whole surface
 over both transports.
@@ -737,7 +739,7 @@ string deploy(string gitRef, TaskContext tc) @safe
     return tc.detach("deploying " ~ gitRef);    // leave it working; the webhook below completes it
 }
 
-registerModule!deployments(server);   // the module declaring `deploy`; must follow enableTasks()
+registerModule!deployments(server);   // the module declaring `deploy`
 
 // The deploy system's callback — runs on any node, holds no fiber:
 void onDeployFinished(string taskId, bool ok) @safe
@@ -749,9 +751,10 @@ void onDeployFinished(string taskId, bool ok) @safe
 }
 ```
 
-Register task functions (`registerModule` / `registerHandlers`) only after
-`enableTasks()`: a task tool needs the runtime, so registering one before it
-throws.
+Registering a task tool enables the extension with default `TaskOptions` when
+`enableTasks()` has not been called; calling `enableTasks(opts)` afterwards
+replaces those options and keeps the registered task tools. A stateful server
+never speaks 2026-07-28, so registering a task tool on one throws.
 
 The three exits cover the lifecycle: `return` a value completes the task,
 `tc.requireInput(...)` suspends it for a client answer (delivered via `tasks/update`),
@@ -857,6 +860,13 @@ EventBatch!Email checkEmail(EmailArgs args, FetchContext ctx) @safe
 
 `ctx.cursor` is a `Nullable!string`: null means the client asked to start from
 now (`isBootstrap`), so read it with `.get` only after that check.
+
+Registering an `@event` (or a `registerEventType`) enables the extension with
+default options when `enableEvents()` has not been called. To pass a webhook
+store or `EventsOptions`, call `enableEvents(store, opts)` before registering any
+event type: afterwards it throws rather than discard the registered types. A
+stateful server never speaks 2026-07-28, so registering an event type on one
+throws.
 
 The dynamic `server.registerEventType(EventRegistration(...))` path (raw `Json`)
 remains for runtime-defined types.

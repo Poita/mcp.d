@@ -18,7 +18,7 @@ import mcp.server.task_runtime : TaskOptions;
 import mcp.server.event_context : EventContext, EventResult, Event, EventBatch, FetchContext;
 import mcp.server.events_runtime : EventRegistration, EventCheck;
 import mcp.api.attributes;
-import mcp.api.apps : UiToolMeta, setUiToolMeta;
+import mcp.api.apps : UiToolMeta, setUiToolMeta, ensureApps;
 import mcp.api.skills : Skill, isValidSkillPath, registerSkill;
 import mcp.api.binding : bindJson, bindString, defaultAs, schemaNode, schemaOf,
 	SchemaUse, setBound, wireName;
@@ -1044,6 +1044,8 @@ private void registerToolMethod(string memberName, alias overload, alias parent)
 		else
 			return toToolResult(__traits(getMember, parent, memberName)(argv.expand));
 	});
+	static if (hasUDA!(overload, ui))
+		ensureApps(server);
 }
 
 private void registerTaskMethod(string memberName, alias overload, alias parent)(
@@ -1103,6 +1105,8 @@ private void registerTaskMethod(string memberName, alias overload, alias parent)
 		else
 			return toToolResult(__traits(getMember, parent, memberName)(argv.expand)).toJson();
 	}, opts);
+	static if (hasUDA!(overload, ui))
+		ensureApps(server);
 }
 
 /// Register a typed `@event` pull/fetch type. The method must have the shape
@@ -1111,12 +1115,12 @@ private void registerTaskMethod(string memberName, alias overload, alias parent)
 /// handler (backing poll directly, stream/webhook via the runtime's loop) through
 /// `EventsRuntime.define!(A,P).onFetch`. `@eventPollInterval` sets the cadence.
 /// Push-only event types use the builder (`server.events.define!(A,P)(...)` +
-/// `publish`) directly rather than `@event`. Requires `enableEvents()` first.
+/// `publish`) directly rather than `@event`. Enables the Events extension with
+/// default options when it is not yet enabled.
 private void registerEventMethod(string memberName, alias overload, alias parent)(
 		McpServer server, event attr) @safe
 {
 	import std.traits : Parameters, ReturnType;
-	import mcp.protocol.errors : internalError;
 
 	static assert(Parameters!overload.length == 2,
 			"@event method '" ~ memberName ~ "' must take (Args, FetchContext)");
@@ -1127,10 +1131,8 @@ private void registerEventMethod(string memberName, alias overload, alias parent
 	{
 		alias A = Parameters!overload[0];
 
-		if (server.events is null)
-			throw internalError("@event requires enableEvents() before registerHandlers");
-
-		auto ev = server.events.define!(A, EP)(attr.name, attr.description, attr.title);
+		auto ev = server.ensureEvents("@event '" ~ attr.name ~ "'").define!(A,
+				EP)(attr.name, attr.description, attr.title);
 		ev.onFetch((A args, scope FetchContext ctx) @safe => __traits(getMember,
 				parent, memberName)(args, ctx));
 		static foreach (a; __traits(getAttributes, overload))
@@ -5685,4 +5687,64 @@ unittest  // a protected handler method is rejected at compile time
 {
 	auto s = new McpServer("t", "1");
 	static assert(!__traits(compiles, registerHandlers(s, new ProtectedHandlerApi)));
+}
+
+unittest  // registering a @taskTool enables the Tasks extension when it is not yet enabled
+{
+	auto s = new McpServer("t", "1");
+	registerHandlers(s, new TaskUdaApi);
+	assert(s.tasks() !is null);
+}
+
+unittest  // enableTasks with custom options after registering a @taskTool keeps the task tools
+{
+	import mcp.protocol.jsonrpc : Message, makeRequest;
+	import mcp.server.task_context : SyncTaskDispatcher;
+
+	auto s = new McpServer("t", "1");
+	registerHandlers(s, new TaskUdaApi);
+	s.enableTasks(TaskOptions(null, new SyncTaskDispatcher()));
+
+	Json p = Json.emptyObject;
+	p["name"] = "async_double";
+	p["arguments"] = Json(["n": Json(4)]);
+	p["_meta"] = modernMeta();
+	auto call = s.handle(Message(makeRequest(Json(1), "tools/call", p))).get;
+	const id = call["result"]["taskId"].get!string;
+	Json gp = Json(["taskId": Json(id)]);
+	gp["_meta"] = modernMeta();
+	auto got = s.handle(Message(makeRequest(Json(2), "tasks/get", gp))).get["result"];
+	assert(got["status"].get!string == "completed", got.toString);
+	assert(got["result"]["structuredContent"]["value"].get!int == 8);
+}
+
+unittest  // a @taskTool on a stateful server fails naming the tool and the reason
+{
+	import std.algorithm.searching : canFind;
+
+	auto s = McpServer.stateful("t", "1");
+	string msg;
+	try
+		registerHandlers(s, new TaskUdaApi);
+	catch (Exception e)
+		msg = e.msg;
+	assert(msg.canFind("async_double") && msg.canFind("stateful"), msg);
+}
+
+unittest  // registering an @event enables the Events extension when it is not yet enabled
+{
+	auto s = new McpServer("t", "1");
+	registerHandlers(s, new EventUdaApi);
+	assert(s.events() !is null);
+	assert(s.events().has("email.received"));
+}
+
+unittest  // enableEvents after an event type is registered throws rather than dropping it
+{
+	import std.exception : assertThrown;
+
+	auto s = new McpServer("t", "1");
+	registerHandlers(s, new EventUdaApi);
+	assertThrown(s.enableEvents());
+	assert(s.events().has("email.received"));
 }

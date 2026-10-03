@@ -1239,18 +1239,33 @@ final class McpServer : ServerCore
 		return taskRuntime_;
 	}
 
+	/// Enable the Tasks extension with default options unless it is already
+	/// enabled, for registering `what` (e.g. "task tool 'x'"). Throws, naming
+	/// `what`, on a `stateful` server, which never speaks the modern protocol.
+	private void ensureTasks(string what) @safe
+	{
+		if (taskRuntime_ !is null)
+			return;
+		if (mode_ == ServerMode.stateful)
+			throw new Exception(what ~ " needs the Tasks extension, which is modern-only,"
+					~ " and a stateful server never speaks 2026-07-28. Construct the server"
+					~ " with McpServer.stateless() instead.");
+		enableTasks();
+	}
+
 	/// Register a `@taskTool` tool: a tool whose `tools/call` returns a task handle
 	/// immediately and runs `executor` asynchronously via the dispatcher. The
 	/// executor is stored by `descriptor.name` so the dispatcher can re-invoke it
 	/// on each `tasks/update`. `opts` sets each task's TTL / poll cadence and
 	/// what a client without the Tasks extension gets (see `TaskToolOptions`).
-	/// Requires `enableTasks` to have been called first. Used by the UDA
+	/// Enables the Tasks extension with default options when it is not yet
+	/// enabled; a later `enableTasks(opts)` replaces those options and keeps the
+	/// registered task tools. Throws on a `stateful` server. Used by the UDA
 	/// reflection layer; callable directly for dynamic task tools.
 	void registerTaskTool(Tool descriptor, TaskExecutor executor,
 			TaskToolOptions opts = TaskToolOptions.init) @safe
 	{
-		if (taskRuntime_ is null)
-			throw internalError("registerTaskTool requires enableTasks() first");
+		ensureTasks("task tool '" ~ descriptor.name ~ "'");
 		const toolName = descriptor.name;
 		const create = opts.create;
 		// The tool is registered first so a name clash throws before the
@@ -1266,11 +1281,11 @@ final class McpServer : ServerCore
 	/// Register the executor that drives tasks created under `name`, without
 	/// listing a tool of that name. `startTask(name, …)` then creates and
 	/// dispatches such a task; `registerTaskTool` registers the executor and the
-	/// tool together. Requires `enableTasks` to have been called first.
+	/// tool together. Enables the Tasks extension with default options when it is
+	/// not yet enabled, and throws on a `stateful` server.
 	void registerTaskExecutor(string name, TaskExecutor executor) @safe
 	{
-		if (taskRuntime_ is null)
-			throw internalError("registerTaskExecutor requires enableTasks() first");
+		ensureTasks("task executor '" ~ name ~ "'");
 		taskExecutors_[name] = executor;
 	}
 
@@ -1419,7 +1434,9 @@ final class McpServer : ServerCore
 	/// lease, and webhook security. Returns the `EventsRuntime` so the author can
 	/// `emit()` events and the reflection layer can register `@event` types.
 	/// Throws on a `stateful` server, which never negotiates the modern protocol
-	/// the extension requires.
+	/// the extension requires. Registering an event type enables the extension
+	/// with default options, so call this first to choose them: once a type is
+	/// registered it throws rather than replace the runtime holding that type.
 	EventsRuntime enableEvents(WebhookSubscriptionStore store = null,
 			EventsOptions opts = EventsOptions.init) @safe
 	{
@@ -1428,7 +1445,13 @@ final class McpServer : ServerCore
 					~ " Events extension is modern-only and a stateful server never speaks"
 					~ " 2026-07-28. Construct the server with McpServer.stateless() instead.");
 		if (eventsRuntime_ !is null)
+		{
+			if (eventsRuntime_.list().events.length)
+				throw new Exception("enableEvents() must come before any event type is"
+						~ " registered: registering one enables the Events extension with"
+						~ " default options, and a new runtime would drop the registered types");
 			eventsRuntime_.stopDeliveryWorker();
+		}
 		eventsRuntime_ = new EventsRuntime(store, opts);
 		eventsRuntime_.exposeInternalErrors = exposeInternalErrors_;
 		eventsRuntime_.onListChanged(() @safe {
@@ -1454,13 +1477,27 @@ final class McpServer : ServerCore
 
 	/// Register an event type against the events runtime. `check` is the author's
 	/// "changes since cursor" function (null for an emit-only type whose poll is
-	/// served from the ring buffer). Requires `enableEvents` first. Used by the UDA
-	/// reflection layer; callable directly for dynamic event types.
+	/// served from the ring buffer). Enables the Events extension with default
+	/// options when it is not yet enabled, and throws on a `stateful` server. Used
+	/// by the UDA reflection layer; callable directly for dynamic event types.
 	void registerEventType(EventRegistration reg) @safe
 	{
-		if (eventsRuntime_ is null)
-			throw internalError("registerEventType requires enableEvents() first");
-		eventsRuntime_.register(reg);
+		ensureEvents("event type '" ~ reg.descriptor.name ~ "'").register(reg);
+	}
+
+	/// The events runtime, enabling the Events extension with default options
+	/// unless it is already enabled, for registering `what` (e.g. "event type
+	/// 'x'"). Throws, naming `what`, on a `stateful` server, which never speaks
+	/// the modern protocol.
+	package(mcp) EventsRuntime ensureEvents(string what) @safe
+	{
+		if (eventsRuntime_ !is null)
+			return eventsRuntime_;
+		if (mode_ == ServerMode.stateful)
+			throw new Exception(what ~ " needs the Events extension, which is modern-only,"
+					~ " and a stateful server never speaks 2026-07-28. Construct the server"
+					~ " with McpServer.stateless() instead.");
+		return enableEvents();
 	}
 
 	/// The events runtime created by `enableEvents`, or null if events are not
@@ -1482,6 +1519,13 @@ final class McpServer : ServerCore
 		if (extensions.type != Json.Type.object)
 			extensions = Json.emptyObject;
 		extensions[identifier] = settings;
+	}
+
+	/// Whether `enableExtension` (or an `enable*` call built on it) has
+	/// advertised the extension `identifier`.
+	bool extensionEnabled(string identifier) const @safe
+	{
+		return extensions.type == Json.Type.object && (identifier in extensions) !is null;
 	}
 
 	/// The SEP-2640 skills index, created on first `enableSkills` / `registerSkill`

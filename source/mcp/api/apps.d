@@ -222,6 +222,10 @@ void setUiToolMeta(ref Tool tool, UiToolMeta ui) @safe
 /// resources use. `mimeTypes` defaults to `[mcpAppMimeType]`. Call it as
 /// `server.enableApps()`, like `server.enableTasks()`; it is a free function
 /// only because `mcp.api` builds on `mcp.server`, not the other way round.
+///
+/// Registering a `@ui` tool or a UI resource enables the extension with the
+/// default `mimeTypes` when it is not yet enabled, so an explicit call is only
+/// needed to declare other content types; it may come before or after them.
 void enableApps(McpServer server, string[] mimeTypes = null) @safe
 {
 	Json arr = Json.emptyArray;
@@ -233,6 +237,14 @@ void enableApps(McpServer server, string[] mimeTypes = null) @safe
 	Json settings = Json.emptyObject;
 	settings["mimeTypes"] = arr;
 	server.enableExtension(appsExtensionKey, settings);
+}
+
+/// Enable the Apps extension with the default content types unless it is
+/// already enabled, keeping any settings an explicit `enableApps` declared.
+package(mcp) void ensureApps(McpServer server) @safe
+{
+	if (!server.extensionEnabled(appsExtensionKey))
+		server.enableApps();
 }
 
 /// Whether the client behind `ctx` advertised the MCP Apps extension (at
@@ -254,7 +266,8 @@ struct UiResourceOptions
 /// Register a `ui://` HTML resource an MCP App tool can render. The resource is
 /// served with the `text/html;profile=mcp-app` MIME type and, when `opts.meta`
 /// carries any field, a `_meta.ui` object on both the listing and the read
-/// contents. Throws if `uri` is not in the `ui://` scheme.
+/// contents. Enables the Apps extension (see `enableApps`) when it is not yet
+/// enabled. Throws if `uri` is not in the `ui://` scheme.
 void registerUiResource(McpServer server, string uri, string name, string html,
 		UiResourceOptions opts = UiResourceOptions.init) @safe
 {
@@ -286,6 +299,7 @@ void registerUiResource(McpServer server, string uri, string name, string html,
 			c.meta = wrapped;
 		return c;
 	});
+	ensureApps(server);
 }
 
 unittest  // UiToolMeta serializes to the spec's _meta.ui shape
@@ -630,4 +644,44 @@ unittest  // registerUiResource takes its description and _meta.ui through UiRes
 			Json.emptyObject))).get["result"]["resources"][0];
 	assert(res["description"].get!string == "A demo widget");
 	assert(res["_meta"]["ui"]["prefersBorder"].get!bool == true);
+}
+
+version (unittest) private Json advertisedExtensions(McpServer s) @safe
+{
+	import mcp.protocol.jsonrpc : Message, makeRequest;
+
+	Json params = Json.emptyObject;
+	params["protocolVersion"] = "2025-11-25";
+	auto caps = s.handle(Message(makeRequest(Json(1), "initialize", params)))
+		.get["result"]["capabilities"];
+	return "extensions" in caps ? caps["extensions"] : Json.emptyObject;
+}
+
+unittest  // registering a @ui tool enables the Apps extension when it is not yet enabled
+{
+	import mcp.api.reflection : registerHandlers;
+
+	auto s = new McpServer("t", "1");
+	registerHandlers(s, new UiToolApi);
+	auto ext = advertisedExtensions(s);
+	assert(appsExtensionKey in ext, ext.toString);
+	assert(ext[appsExtensionKey]["mimeTypes"][0].get!string == mcpAppMimeType);
+}
+
+unittest  // registering a UI resource enables the Apps extension when it is not yet enabled
+{
+	auto s = new McpServer("t", "1");
+	registerUiResource(s, "ui://demo/plain", "plain", "<p>x</p>");
+	assert(appsExtensionKey in advertisedExtensions(s));
+}
+
+unittest  // an explicit enableApps keeps its settings when a @ui tool registers afterwards
+{
+	import mcp.api.reflection : registerHandlers;
+
+	auto s = new McpServer("t", "1");
+	s.enableApps(["text/html;profile=custom"]);
+	registerHandlers(s, new UiToolApi);
+	auto ext = advertisedExtensions(s);
+	assert(ext[appsExtensionKey]["mimeTypes"][0].get!string == "text/html;profile=custom");
 }
