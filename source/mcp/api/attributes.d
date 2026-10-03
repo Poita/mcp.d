@@ -404,9 +404,9 @@ struct mcpHeader
 	string name; /// the header suffix, e.g. "Region" -> `Mcp-Param-Region`
 }
 
-/// UDA declaring a display icon for a `@tool`, `@resource`, or
-/// `@resourceTemplate`-annotated method (the MCP `Icons` mixin: `Tool.icons`,
-/// `Resource.icons`). Attach one or more `@icon` UDAs to the same method; each
+/// UDA declaring a display icon for a `@tool`, `@taskTool`, `@prompt`,
+/// `@resource`, or `@resourceTemplate`-annotated method (the MCP `Icons` mixin:
+/// `Tool.icons`, `Prompt.icons`, `Resource.icons`). Attach one or more `@icon` UDAs to the same method; each
 /// becomes an entry in the descriptor's `icons` array. `src` is required;
 /// `mimeType`, `sizes`, and `theme` are optional.
 ///
@@ -450,9 +450,9 @@ struct ui
 	}
 }
 
-/// UDA attaching a descriptor-level `_meta` object to a `@tool`, `@resource`,
-/// or `@resourceTemplate`-annotated method (the MCP `_meta` field on `Tool`,
-/// `Resource`, `ResourceTemplate`). The supplied JSON must be an object, or
+/// UDA attaching a descriptor-level `_meta` object to a `@tool`, `@taskTool`,
+/// `@prompt`, `@resource`, or `@resourceTemplate`-annotated method (the MCP
+/// `_meta` field on `Tool`, `Prompt`, `Resource`, `ResourceTemplate`). The supplied JSON must be an object, or
 /// registration is a compile error; it is emitted verbatim as the descriptor's
 /// `_meta`. On a tool that also carries `@ui`, it must not set the `ui` key,
 /// which `@ui` writes.
