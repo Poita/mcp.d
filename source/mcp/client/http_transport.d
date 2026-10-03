@@ -9,6 +9,7 @@ import vibe.http.client : HTTPClientRequest, HTTPClientResponse;
 import vibe.http.common : HTTPMethod;
 import vibe.stream.operations : readAllUTF8, readLine;
 import vibe.core.net : TCPConnection, connectTCP;
+import vibe.core.task : Task;
 import vibe.stream.tls : createTLSContext, createTLSStream, TLSContext, TLSContextKind;
 import vibe.stream.wrapper : ProxyStream, createProxyStream;
 import vibe.core.stream : Stream;
@@ -460,6 +461,10 @@ final class HttpClientTransport : ClientTransport
 	// ephemeral-port / TIME_WAIT pressure a burst of concurrent requests creates.
 	private uint maxInFlight;
 	private InFlightPermits inFlightSem;
+	// The tasks running an inbound request's handler. Their requests skip the
+	// in-flight cap: the request the server is serving them for holds a permit
+	// until they return, so with every permit held they could never get one.
+	private Task[] handlerTasks;
 
 	this(string url, uint maxInFlight = 0) @safe
 	{
@@ -675,10 +680,11 @@ final class HttpClientTransport : ClientTransport
 	/// release it. Returns null when no cap is configured (`maxInFlight == 0`), in
 	/// which case the POST proceeds unthrottled. The permits are created lazily on
 	/// first use because their event must be constructed on the event loop. An
-	/// `abort` of the waiting request interrupts the wait.
+	/// `abort` of the waiting request interrupts the wait. A request issued on a
+	/// task running a server->client request's handler takes no permit.
 	private InFlightPermits acquireInFlight() @safe
 	{
-		if (maxInFlight == 0)
+		if (maxInFlight == 0 || handlerTasks.canFind(Task.getThis()))
 			return null;
 		if (inFlightSem is null)
 			inFlightSem = new InFlightPermits(maxInFlight);
@@ -2304,7 +2310,15 @@ final class HttpClientTransport : ClientTransport
 	{
 		import vibe.core.core : runTask;
 
-		runTask((Message msg) nothrow{
+		runTask((Message msg, bool isRequest) nothrow{
+			import std.algorithm.mutation : remove;
+
+			auto self = Task.getThis();
+			if (isRequest)
+				handlerTasks ~= self;
+			scope (exit)
+				if (isRequest)
+					handlerTasks = handlerTasks.remove!(t => t == self);
 			try
 				dispatch(msg);
 			catch (Exception e)
@@ -2313,7 +2327,7 @@ final class HttpClientTransport : ClientTransport
 
 				logWarn("[mcp.client] inbound handler threw: %s", e.msg);
 			}
-		}, m);
+		}, m, m.kind == MessageKind.request);
 	}
 
 	/// Fail every still-outstanding legacy waiter with a typed error so each blocked
@@ -5495,6 +5509,70 @@ unittest  // a reply to a server->client request is sent while every in-flight p
 	});
 	assert(failure.length == 0, "scenario failed: " ~ failure);
 	assert(replied, "the ping reply must not wait for the request POST's permit");
+}
+
+unittest  // a request a server-request handler makes is not held up by the in-flight cap
+{
+	import core.time : msecs, MonoTime;
+	import mcp.client.client : McpClient, ClientSettings;
+	import mcp.protocol.types : ListRootsResult;
+	import vibe.core.core : sleep;
+
+	bool replied, nestedOk;
+	string nestedError;
+	auto r = new URLRouter;
+	r.post("/mcp", (HTTPServerRequest req, HTTPServerResponse res) @safe {
+		auto j = requestJson(req);
+		const method = ("method" in j) ? j["method"].get!string : "";
+		if (method == "initialize")
+			res.writeBody(initializeReply(j, "2025-11-25").toString(), "application/json");
+		else if ("id" !in j || method.length == 0)
+		{
+			if ("result" in j || "error" in j)
+				replied = true;
+			res.statusCode = 202;
+			res.writeBody("", "text/plain");
+		}
+		else if (method == "tools/list")
+		{
+			auto resp = parseJsonString(`{"jsonrpc":"2.0","result":{"tools":[]}}`);
+			resp["id"] = j["id"];
+			res.writeBody(resp.toString(), "application/json");
+		}
+		else
+		{
+			writeSse(res, `data: {"jsonrpc":"2.0","id":"s1","method":"roots/list"}` ~ "\n\n");
+			const until = MonoTime.currTime + 3.seconds;
+			while (!replied && MonoTime.currTime < until)
+				sleep(20.msecs);
+			auto resp = parseJsonString(`{"jsonrpc":"2.0","result":{"content":[]}}`);
+			resp["id"] = j["id"];
+			writeSse(res, "data: " ~ resp.toString() ~ "\n\n");
+		}
+	});
+	ClientSettings settings;
+	settings.maxInFlight = 1;
+	settings.requestTimeout = 1.seconds;
+	const failure = runAgainstFakeServer(r, (string url) @safe {
+		auto client = McpClient.http(url, settings);
+		scope (exit)
+			client.close();
+		client.onListRoots = () @safe {
+			try
+			{
+				client.listTools();
+				nestedOk = true;
+			}
+			catch (Exception e)
+				nestedError = e.msg;
+			return ListRootsResult.init;
+		};
+		client.initialize("2025-11-25");
+		client.callTool("slow", Json.emptyObject);
+	});
+	assert(failure.length == 0, "scenario failed: " ~ failure);
+	assert(nestedOk,
+			"the handler's request must not wait for the permit its caller holds: " ~ nestedError);
 }
 
 unittest  // cancelling a request parked on the in-flight cap wakes it at once

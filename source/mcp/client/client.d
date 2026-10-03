@@ -293,7 +293,9 @@ struct ClientSettings
 	/// socket / ephemeral-port use. A request POST holds its permit until its
 	/// response stream ends. Notifications and replies to server-initiated
 	/// requests (sampling / elicitation / roots) are short and never wait for a
-	/// permit, so a request awaiting such a reply cannot deadlock the cap.
+	/// permit, and neither do requests a handler for a server-initiated request
+	/// makes on its own task, so a request awaiting such a reply cannot deadlock
+	/// the cap. A task the handler spawns is not exempt.
 	uint maxInFlight = 0;
 
 	/// The largest message the client accepts from the server: an HTTP response
