@@ -3909,9 +3909,9 @@ final class McpServer : ServerCore
 ///   - `{;var}` / `{?var}` / `{&var}`: optional `name=value` pairs, only for the
 ///     variables the expression names, in any order.
 /// Values are percent-decoded per RFC 3986; a malformed escape does not match.
-/// Comma-separated variable lists are supported; prefix (`:n`) and explode (`*`)
-/// modifiers are accepted, with an exploded last variable of a `/` or `.`
-/// expression taking the remaining segments.
+/// Comma-separated variable lists are supported. A prefix modifier (`:n`) caps
+/// its variable's decoded value at `n` code points. An explode modifier (`*`) on
+/// the last variable of a `/` or `.` expression takes the remaining segments.
 bool matchUriTemplate(string tmpl, string uri, out string[string] params) @safe
 {
 	auto m = UriTemplateMatcher(tmpl, uri);
@@ -4019,7 +4019,7 @@ private enum uriTemplatePrefixOps = "#./;?&";
 /// the URI substring `s` it spans; see `matchUriTemplate` for the rules.
 private bool bindUriExpression(string expr, string s, ref string[string] params) @safe
 {
-	import std.algorithm : canFind;
+	import std.algorithm : countUntil;
 	import std.array : join, split;
 	import std.string : indexOf;
 
@@ -4030,12 +4030,26 @@ private bool bindUriExpression(string expr, string s, ref string[string] params)
 		expr = expr[1 .. $];
 	}
 	string[] names;
+	// Each variable's RFC 6570 prefix length (`{var:n}`), or 0 for none.
+	size_t[] maxLengths;
 	bool explodeLast;
 	foreach (spec; expr.split(','))
 	{
+		size_t maxLength;
 		const colon = spec.indexOf(':');
 		if (colon >= 0)
+		{
+			import std.conv : ConvException, to;
+
+			try
+				maxLength = spec[colon + 1 .. $].to!size_t;
+			catch (ConvException)
+				return false;
+			if (maxLength == 0)
+				return false;
 			spec = spec[0 .. colon];
+		}
+		maxLengths ~= maxLength;
 		explodeLast = spec.length && spec[$ - 1] == '*';
 		if (explodeLast)
 			spec = spec[0 .. $ - 1];
@@ -4045,6 +4059,15 @@ private bool bindUriExpression(string expr, string s, ref string[string] params)
 	}
 	if (names.length == 0)
 		return false;
+
+	// A prefix expansion emits at most `n` code points of the value, so a longer
+	// captured value cannot have come from this template.
+	bool withinPrefix(size_t i, string v) @safe
+	{
+		import std.range : walkLength;
+
+		return maxLengths[i] == 0 || v.walkLength <= maxLengths[i];
+	}
 
 	bool bindList(string[] parts, bool allowSlash) @safe
 	{
@@ -4067,6 +4090,8 @@ private bool bindUriExpression(string expr, string s, ref string[string] params)
 				return false;
 			// A fragment is never resolved as a path, so only it may carry dot segments.
 			if (op != '#' && hasDotSegment(v))
+				return false;
+			if (!withinPrefix(i, v))
 				return false;
 			params[names[i]] = v;
 		}
@@ -4102,10 +4127,13 @@ private bool bindUriExpression(string expr, string s, ref string[string] params)
 		{
 			const eq = pair.indexOf('=');
 			const name = eq < 0 ? pair : pair[0 .. eq];
-			if (!names.canFind(name))
+			const idx = names.countUntil(name);
+			if (idx < 0)
 				return false;
 			string v;
 			if (!decodeUriValue(eq < 0 ? "" : pair[eq + 1 .. $], true, v))
+				return false;
+			if (!withinPrefix(idx, v))
 				return false;
 			params[name] = v;
 		}
@@ -4188,6 +4216,31 @@ unittest  // segment and reserved expressions reject a '.' or '..' path segment
 	assert(!matchUriTemplate("res://x/{+path}", "res://x/a%2F..%2Fetc", params));
 	assert(matchUriTemplate("res://x/{+path}", "res://x/a/b.c/d", params));
 	assert(params["path"] == "a/b.c/d");
+}
+
+unittest  // a prefix modifier {var:n} rejects a value longer than n characters
+{
+	string[string] params;
+	assert(!matchUriTemplate("res://{id:3}", "res://abcdef", params));
+	assert(matchUriTemplate("res://{id:3}", "res://abc", params));
+	assert(params["id"] == "abc");
+}
+
+unittest  // a prefix modifier counts decoded code points, not encoded bytes
+{
+	string[string] params;
+	assert(matchUriTemplate("res://{id:2}", "res://%C3%A9%C3%A9", params));
+	assert(params["id"] == "\u00e9\u00e9");
+	assert(!matchUriTemplate("res://{id:2}", "res://%C3%A9%C3%A9%C3%A9", params));
+}
+
+unittest  // a prefix modifier applies to its own variable in a list and in a query
+{
+	string[string] params;
+	assert(!matchUriTemplate("res://{a:1,b}", "res://xy,z", params));
+	assert(matchUriTemplate("res://{a,b:1}", "res://xy,z", params));
+	assert(!matchUriTemplate("res://x{?q:2}", "res://x?q=abc", params));
+	assert(matchUriTemplate("res://x{?q:2}", "res://x?q=ab", params));
 }
 
 unittest  // a reserved expression spans a later occurrence of its trailing literal
