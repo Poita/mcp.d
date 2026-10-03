@@ -1593,16 +1593,12 @@ final class McpServer : ServerCore
 	/// active modern `subscriptions/listen` it is additionally written to stdout
 	/// (stamped with the listen subscriptionId), since that transport shares one
 	/// channel for all server->client traffic. A list-changed notification whose
-	/// `listChanged` capability the server does not advertise is not sent.
+	/// `listChanged` capability the server does not advertise is not sent, and a
+	/// `notifications/resources/updated` reaches a 2025-era stream only when its
+	/// session subscribed to the URI, exactly as `notifyResourceUpdated`.
 	size_t notify(string method, Json params = Json.undefined) @safe
 	{
-		if (!listChangedAdvertised(method))
-			return 0;
-		size_t delivered = writeStdioListen(method, params);
-		delivered += writeStdioPlain(method, params, resourceUriOf(method, params));
-		if (pushChannel !is null)
-			delivered += pushChannel.notify(method, params);
-		return delivered;
+		return notifyChange(method, params, resourceUriOf(method, params));
 	}
 
 	/// Write `method` to the stdio `subscriptions/listen` stream, if one is open
@@ -11182,14 +11178,12 @@ unittest  // notify delivers unsolicited notifications to GET-stream listeners
 
 	string[] received;
 	ch.addListener((string f) @safe { received ~= f; });
-	const n = s.notify("notifications/resources/updated", Json([
-		"uri": Json("test://x")
-	]));
+	const n = s.notify("notifications/example/changed", Json(["id": Json("x")]));
 	assert(n == 1);
 	assert(received.length == 1);
 	import std.algorithm : canFind;
 
-	assert(received[0].canFind("notifications/resources/updated"));
+	assert(received[0].canFind("notifications/example/changed"));
 }
 
 unittest  // notifyResourceUpdated emits resources/updated for a subscribed uri
@@ -11229,6 +11223,21 @@ unittest  // notifyResourceUpdated is a no-op for a uri nobody subscribed to
 
 	const n = s.notifyResourceUpdated("test://never");
 	assert(n == 0);
+	assert(received.length == 0);
+}
+
+unittest  // notify(resources/updated) honours the subscription gate like notifyResourceUpdated
+{
+	auto s = McpServer.stateful("t", "1");
+	s.enableResourceSubscriptions();
+	auto coord = new StreamCoordinator;
+	auto ch = ensurePushChannel(s, coord);
+	string[] received;
+	ch.addListener((string f) @safe { received ~= f; });
+
+	Json p = Json.emptyObject;
+	p["uri"] = "test://never";
+	assert(s.notify("notifications/resources/updated", p) == 0);
 	assert(received.length == 0);
 }
 
