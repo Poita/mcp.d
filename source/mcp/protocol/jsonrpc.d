@@ -181,14 +181,54 @@ private void validateEnvelope(Json j) @safe
 	}
 }
 
+/// The deepest array/object nesting accepted in JSON text from a peer.
+enum maxJsonNestingDepth = 128;
+
+/// Parse JSON text from an untrusted peer. The vibe.d parser recurses once per
+/// nested array or object, so the nesting depth is checked with a flat scan
+/// first: deeper input is rejected instead of overflowing the stack. Throws a
+/// -32700 `McpException` for over-deep or invalid JSON.
+Json parseJsonBounded(string text) @safe
+{
+	size_t depth;
+	bool inString;
+	for (size_t i = 0; i < text.length; i++)
+	{
+		const c = text[i];
+		if (inString)
+		{
+			if (c == '\\')
+				i++;
+			else if (c == '"')
+				inString = false;
+			continue;
+		}
+		if (c == '"')
+			inString = true;
+		else if (c == '[' || c == '{')
+		{
+			if (++depth > maxJsonNestingDepth)
+			{
+				import std.conv : to;
+
+				throw parseError(
+						"Invalid JSON: nesting deeper than "
+						~ maxJsonNestingDepth.to!string ~ " levels");
+			}
+		}
+		else if ((c == ']' || c == '}') && depth > 0)
+			depth--;
+	}
+	try
+		return parseJsonString(text);
+	catch (Exception e)
+		throw parseError("Invalid JSON: " ~ e.msg);
+}
+
 /// Parse and classify a single JSON-RPC message from text.
 Message parseMessage(string text) @safe
 {
-	Json j;
-	try
-		j = parseJsonString(text);
-	catch (Exception e)
-		throw parseError("Invalid JSON: " ~ e.msg);
+	Json j = parseJsonBounded(text);
 	validateEnvelope(j);
 	return Message(j);
 }
@@ -217,11 +257,7 @@ struct BatchResult
 /// an empty array.
 BatchResult parseBatchTolerant(string text) @safe
 {
-	Json arr;
-	try
-		arr = parseJsonString(text);
-	catch (Exception e)
-		throw parseError("Invalid JSON: " ~ e.msg);
+	Json arr = parseJsonBounded(text);
 	if (arr.type != Json.Type.array)
 		throw invalidRequest("Batch must be a JSON array");
 	if (arr.length == 0)
@@ -279,8 +315,8 @@ string takeBatchReplies(string raw, scope void delegate(Message) @safe onReply) 
 		return raw;
 	Json arr;
 	try
-		arr = parseJsonString(raw);
-	catch (Exception)
+		arr = parseJsonBounded(raw);
+	catch (McpException)
 		return raw;
 	if (arr.type != Json.Type.array)
 		return raw;
@@ -318,6 +354,57 @@ Json makeRequest(Json id, string method, Json params = Json.undefined) @safe
 	if (params.type != Json.Type.undefined)
 		j["params"] = params;
 	return j;
+}
+
+unittest  // parseMessage rejects nesting beyond the depth cap as a parse error
+{
+	import std.array : replicate;
+	import std.exception : collectException;
+
+	const text = `{"jsonrpc":"2.0","id":1,"method":"x","params":{"a":` ~ "[".replicate(
+			maxJsonNestingDepth) ~ "]".replicate(maxJsonNestingDepth) ~ "}}";
+	auto e = collectException!McpException(parseMessage(text));
+	assert(e !is null);
+	assert(e.code == ErrorCode.parseError);
+}
+
+unittest  // a batch of huge nesting depth is rejected rather than overflowing the stack
+{
+	import std.array : replicate;
+	import std.exception : collectException;
+
+	auto e = collectException!McpException(parseBatchTolerant("[".replicate(200_000)));
+	assert(e !is null);
+	assert(e.code == ErrorCode.parseError);
+	e = collectException!McpException(parseAny("[".replicate(200_000)));
+	assert(e !is null && e.code == ErrorCode.parseError);
+	assert(takeBatchReplies("[".replicate(200_000), (Message) {}) !is null);
+}
+
+unittest  // nesting at the depth cap parses
+{
+	import std.array : replicate;
+
+	const text = `{"jsonrpc":"2.0","id":1,"method":"x","params":{"a":` ~ "[".replicate(
+			maxJsonNestingDepth - 2) ~ "]".replicate(maxJsonNestingDepth - 2) ~ "}}";
+	assert(parseMessage(text).kind == MessageKind.request);
+}
+
+unittest  // brackets inside strings, including escaped quotes, do not count as nesting
+{
+	import std.array : replicate;
+
+	const s = `\"` ~ "[".replicate(500);
+	const j = parseJsonBounded(`{"s":"` ~ s ~ `"}`);
+	assert(j["s"].get!string == `"` ~ "[".replicate(500));
+}
+
+unittest  // parseJsonBounded reports invalid JSON as a parse error
+{
+	import std.exception : collectException;
+
+	auto e = collectException!McpException(parseJsonBounded("{nope"));
+	assert(e !is null && e.code == ErrorCode.parseError);
 }
 
 unittest  // parseMessage rejects a request with a fractional float id

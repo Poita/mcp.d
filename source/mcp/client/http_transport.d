@@ -1356,7 +1356,7 @@ final class HttpClientTransport : ClientTransport
 	{
 		Message msg;
 		try
-			msg = Message(parseJsonString(data));
+			msg = Message(parseJsonBounded(data));
 		catch (Exception)
 			return; // ignore non-JSON SSE comments/heartbeats
 
@@ -1711,7 +1711,7 @@ final class HttpClientTransport : ClientTransport
 						scope (exit)
 							slot.inHandler--;
 						try
-							dispatch(Message(parseJsonString(data)));
+							dispatch(Message(parseJsonBounded(data)));
 						catch (Exception)
 						{
 						}
@@ -1941,7 +1941,7 @@ final class HttpClientTransport : ClientTransport
 							|| isCancelled(), (string eventType, string data) @safe {
 						Message m;
 						try
-							m = Message(parseJsonString(data));
+							m = Message(parseJsonBounded(data));
 						catch (Exception)
 							return; // not a JSON-RPC message (keep-alive or comment)
 						if (endsStream(m))
@@ -2187,7 +2187,7 @@ final class HttpClientTransport : ClientTransport
 	{
 		Message m;
 		try
-			m = Message(parseJsonString(data));
+			m = Message(parseJsonBounded(data));
 		catch (Exception e)
 		{
 			import vibe.core.log : logDiagnostic;

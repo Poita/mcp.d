@@ -208,7 +208,7 @@ final class DuplexChannel
 		{
 			Json item;
 			try
-				item = parseJsonString(line);
+				item = parseJsonBounded(line);
 			catch (Exception)
 			{
 			}
