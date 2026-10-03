@@ -484,8 +484,21 @@ void mountOAuthRegister(URLRouter router, OAuthProxy proxy) @safe
 				"redirect_uris is required and must contain at least one usable URI"));
 			return;
 		}
+		Json registration;
+		try
+			registration = proxy.register(uris);
+		catch (InvalidRedirectUriException e)
+		{
+			// RFC 7591 §3.2.2: a redirect URI the server will not accept.
+			Json err = Json.emptyObject;
+			err["error"] = "invalid_redirect_uri";
+			err["error_description"] = e.msg;
+			res.statusCode = HTTPStatus.badRequest;
+			res.writeJsonBody(err);
+			return;
+		}
 		res.statusCode = HTTPStatus.created;
-		res.writeJsonBody(proxy.register(uris));
+		res.writeJsonBody(registration);
 	});
 }
 
@@ -2285,8 +2298,12 @@ unittest  // OPEN REDIRECT: /authorize 400s an http non-loopback redirect_uri ev
 	cfg.baseUrl = "https://mcp.example.com";
 	cfg.resource = "https://mcp.example.com/mcp";
 
-	auto proxy = new OAuthProxy(cfg);
-	proxy.register(["http://app.example.com/cb"]);
+	import mcp.auth.oauth_proxy : InMemoryConsentStore, InMemoryRedirectUriRegistry;
+
+	// Even if a registry held such a URI, /authorize rejects it.
+	auto reg = new InMemoryRedirectUriRegistry();
+	reg.register("h", ["http://app.example.com/cb"]);
+	auto proxy = new OAuthProxy(cfg, new InMemoryConsentStore(), reg);
 	auto router = new URLRouter;
 	mountOAuthProxy(router, proxy);
 
@@ -2641,6 +2658,36 @@ unittest  // /register rejects a malformed JSON body with 400 invalid_client_met
 	const body_ = () @trusted { return cast(string) sink.data; }();
 	assert(res.statusCode == 400);
 	assert(body_.canFind("invalid_client_metadata"));
+}
+
+unittest  // /register rejects a redirect_uri /authorize would never accept with 400 invalid_redirect_uri
+{
+	import std.algorithm : canFind;
+	import vibe.http.common : HTTPMethod;
+	import vibe.http.server : createTestHTTPServerRequest,
+		createTestHTTPServerResponse, TestHTTPResponseMode;
+	import vibe.inet.url : URL;
+	import vibe.stream.memory : createMemoryOutputStream, createMemoryStream;
+
+	auto proxy = mountSampleProxy();
+	auto router = new URLRouter;
+	mountOAuthRegister(router, proxy);
+
+	foreach (uri; ["com.example.app:/oauth/cb", "http://app.example.com/cb"])
+	{
+		auto formBody = () @trusted {
+			return cast(ubyte[])(`{"redirect_uris":["` ~ uri ~ `"]}`).dup;
+		}();
+		auto req = createTestHTTPServerRequest(URL("https://mcp.example.com/register"),
+				HTTPMethod.POST, createMemoryStream(formBody, false));
+		auto sink = createMemoryOutputStream();
+		auto res = createTestHTTPServerResponse(sink, null, TestHTTPResponseMode.bodyOnly);
+		router.handleRequest(req, res);
+
+		const body_ = () @trusted { return cast(string) sink.data; }();
+		assert(res.statusCode == 400, uri);
+		assert(body_.canFind("invalid_redirect_uri"), body_);
+	}
 }
 
 unittest  // /register rejects a body with no usable redirect_uris with 400

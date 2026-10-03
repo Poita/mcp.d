@@ -492,6 +492,30 @@ bool isAllowedRedirectScheme(string redirectUri) @safe
 	return false;
 }
 
+/// The form of `redirectUri` that registration and validation compare. For an
+/// `http` loopback IP-literal URI (`127.0.0.1`, `[::1]`) the port is removed,
+/// since a native client binds an ephemeral port per sign-in and RFC 8252 §7.3
+/// requires the authorization server to allow any port there; every other URI
+/// (including `localhost`) is compared as the exact string.
+string redirectUriMatchKey(string redirectUri) @safe
+{
+	import std.string : indexOfAny, lastIndexOf;
+
+	enum prefix = "http://";
+	if (!redirectUri.startsWith(prefix))
+		return redirectUri;
+	const rest = redirectUri[prefix.length .. $];
+	const host = hostOf(rest);
+	if (host != "127.0.0.1" && host != "[::1]")
+		return redirectUri;
+	const end = rest.indexOfAny("/?#\\");
+	const authorityEnd = end < 0 ? rest.length : end;
+	// The authority is `[userinfo@]host[:port]`; keep everything up to the host.
+	const at = rest[0 .. authorityEnd].lastIndexOf('@');
+	const hostEnd = (at < 0 ? 0 : at + 1) + host.length;
+	return prefix ~ rest[0 .. hostEnd] ~ rest[authorityEnd .. $];
+}
+
 /// The host of the authority that begins `authorityAndRest` (the text after
 /// `scheme://`). The authority ends at the first `/`, `?` or `#` (RFC 3986 §3.2),
 /// or `\`, which browsers treat as a path separator in http URLs, so an `@` in
@@ -769,7 +793,8 @@ class InvalidClientIdMetadataException : Exception
 ///   * `clientIdUrl` is https with a path component (`isValidClientIdMetadataUrl`);
 ///   * the document's `client_id` equals `clientIdUrl` exactly;
 ///   * the document carries the required fields (`client_id`, `client_name`, `redirect_uris`);
-///   * `redirectUri` is an exact-string member of the document's `redirect_uris`;
+///   * `redirectUri` is an exact-string member of the document's `redirect_uris`
+///     (ignoring a loopback IP literal's port, `redirectUriMatchKey`);
 ///   * `redirectUri` uses a scheme the proxy will relay a code to (RFC 8252).
 /// Pure (no HTTP): the SSRF-guarded fetch is performed by
 /// `OAuthProxy.fetchClientIdMetadata`; this carries the validation logic so it is
@@ -795,7 +820,8 @@ void validateClientIdMetadata(string clientIdUrl,
 	if (doc.redirectUris.length == 0)
 		throw new InvalidClientIdMetadataException(clientIdUrl,
 				"metadata document is missing the required redirect_uris field");
-	if (!doc.redirectUris.canFind(redirectUri))
+	const key = redirectUriMatchKey(redirectUri);
+	if (!doc.redirectUris.canFind!(u => redirectUriMatchKey(u) == key))
 		throw new InvalidClientIdMetadataException(clientIdUrl,
 				"redirect_uri is not listed in the metadata document");
 	if (!isAllowedRedirectScheme(redirectUri))
@@ -1160,6 +1186,12 @@ final class OAuthProxy
 	/// against them) and return the registration response. The fixed upstream
 	/// `client_id` is shared across clients, so the registry is keyed by a
 	/// server-issued registration handle rather than that shared id.
+	///
+	/// Throws `InvalidRedirectUriException` (registering nothing) when any URI
+	/// uses a scheme `/authorize` would refuse (`isAllowedRedirectScheme`), so a
+	/// client learns at registration rather than mid-sign-in. Registered URIs
+	/// are stored by `redirectUriMatchKey`, so a loopback IP-literal URI later
+	/// matches on any port.
 	Json register(const string[] requestedRedirectUris) @safe
 	{
 		import std.uuid : randomUUID;
@@ -1167,7 +1199,15 @@ final class OAuthProxy
 		const handle = () @trusted { return randomUUID().toString(); }();
 		const capped = requestedRedirectUris.length > maxRedirectUrisPerRegistration
 			? requestedRedirectUris[0 .. maxRedirectUrisPerRegistration] : requestedRedirectUris;
-		redirectRegistry.register(handle, capped);
+		string[] keys;
+		foreach (uri; capped)
+		{
+			if (!isAllowedRedirectScheme(uri))
+				throw new InvalidRedirectUriException(uri,
+						"scheme not allowed (https, or http for loopback only; no fragment)");
+			keys ~= redirectUriMatchKey(uri);
+		}
+		redirectRegistry.register(handle, keys);
 		return registrationResponseJson(cfg, capped);
 	}
 
@@ -1175,7 +1215,8 @@ final class OAuthProxy
 	/// code to. Fails closed by throwing `InvalidRedirectUriException` when the
 	/// `redirect_uri` is empty, uses a disallowed scheme (RFC 8252 §7.3), or is
 	/// not an exact match against any previously-registered `redirect_uri` (RFC
-	/// 6749 §3.1.2.2 / §10.6). Called by both `authorize` overloads before any
+	/// 6749 §3.1.2.2 / §10.6), ignoring only the port of a loopback IP literal
+	/// (RFC 8252 §7.3, `redirectUriMatchKey`). Called by both `authorize` overloads before any
 	/// proxy state is minted or the request is forwarded upstream.
 	void validateRedirectUri(string clientRedirectUri) @safe
 	{
@@ -1184,7 +1225,7 @@ final class OAuthProxy
 		if (!isAllowedRedirectScheme(clientRedirectUri))
 			throw new InvalidRedirectUriException(clientRedirectUri,
 					"scheme not allowed (https, or http for loopback only)");
-		if (!redirectRegistry.isRegistered(clientRedirectUri))
+		if (!redirectRegistry.isRegistered(redirectUriMatchKey(clientRedirectUri)))
 			throw new InvalidRedirectUriException(clientRedirectUri,
 					"redirect_uri is not registered for any client");
 	}
@@ -1354,7 +1395,7 @@ final class OAuthProxy
 		// A DCR client that got this far has consented and signed in, so its
 		// registration is retained ahead of never-used ones.
 		if (binding.clientId.length == 0)
-			redirectRegistry.markUsed(binding.clientRedirectUri);
+			redirectRegistry.markUsed(redirectUriMatchKey(binding.clientRedirectUri));
 	}
 
 	/// Record that `refreshToken` is being relayed to a client in an upstream
@@ -2386,10 +2427,59 @@ unittest  // SCHEME ALLOWLIST: a registered scheme is still scheme-checked (regi
 	import std.exception : assertThrown;
 
 	auto cfg = sampleConfig();
-	auto proxy = new OAuthProxy(cfg);
-	// Even if such a URI were registered, the scheme gate rejects it.
-	proxy.register(["http://app.example.com/cb"]);
+	// Even if a registry held such a URI, the scheme gate rejects it.
+	auto reg = new InMemoryRedirectUriRegistry();
+	reg.register("h", ["http://app.example.com/cb"]);
+	auto proxy = new OAuthProxy(cfg, new InMemoryConsentStore(), reg);
 	assertThrown!InvalidRedirectUriException(proxy.validateRedirectUri("http://app.example.com/cb"));
+}
+
+unittest  // REGISTER: a redirect_uri /authorize would never accept is refused at registration
+{
+	import std.exception : assertThrown;
+
+	auto proxy = new OAuthProxy(sampleConfig());
+	assertThrown!InvalidRedirectUriException(proxy.register([
+			"com.example.app:/oauth/cb"
+	]));
+	assertThrown!InvalidRedirectUriException(proxy.register([
+		"https://app.example.com/cb", "http://app.example.com/cb"
+	]));
+	assertThrown!InvalidRedirectUriException(proxy.register([
+			"https://app.example.com/cb#frag"
+	]));
+	// Nothing from a refused registration is retained.
+	assertThrown!InvalidRedirectUriException(
+			proxy.validateRedirectUri("https://app.example.com/cb"));
+}
+
+unittest  // LOOPBACK: a loopback IP-literal redirect_uri matches on any port (RFC 8252 §7.3)
+{
+	import std.exception : assertThrown;
+
+	auto proxy = new OAuthProxy(sampleConfig());
+	proxy.register(["http://127.0.0.1/callback", "http://[::1]:5000/callback"]);
+	proxy.validateRedirectUri("http://127.0.0.1:61234/callback");
+	proxy.validateRedirectUri("http://127.0.0.1/callback");
+	proxy.validateRedirectUri("http://[::1]:49152/callback");
+	// Path, query and host still match exactly.
+	assertThrown!InvalidRedirectUriException(
+			proxy.validateRedirectUri("http://127.0.0.1:61234/other"));
+	assertThrown!InvalidRedirectUriException(
+			proxy.validateRedirectUri("http://127.0.0.1:61234/callback?x=1"));
+	assertThrown!InvalidRedirectUriException(
+			proxy.validateRedirectUri("http://127.0.0.2:61234/callback"));
+}
+
+unittest  // LOOPBACK: a non-loopback redirect_uri still matches its port exactly
+{
+	import std.exception : assertThrown;
+
+	auto proxy = new OAuthProxy(sampleConfig());
+	proxy.register(["https://app.example.com/cb", "http://localhost:5000/cb"]);
+	assertThrown!InvalidRedirectUriException(
+			proxy.validateRedirectUri("https://app.example.com:8443/cb"));
+	assertThrown!InvalidRedirectUriException(proxy.validateRedirectUri("http://localhost:6000/cb"));
 }
 
 unittest  // REDIRECT REGISTRY: InMemoryRedirectUriRegistry exact-matches across registrations
