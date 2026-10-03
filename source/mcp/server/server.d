@@ -3896,15 +3896,15 @@ final class McpServer : ServerCore
 /// `params` with the captured variable values and returns true.
 ///
 /// Each expression is bound according to its operator:
-///   - `{var}` (simple): a non-empty value that contains no `/`, `?` or `#`,
-///     neither raw nor percent-encoded (simple expansion encodes them, so a
+///   - `{var}` (simple): a non-empty value that contains no `/`, `\`, `?` or
+///     `#`, neither raw nor percent-encoded (simple expansion encodes them, so a
 ///     value carrying one could only be a path-traversal attempt).
 ///   - `{+var}` (reserved): a non-empty value that may contain `/`.
 ///   - `{#var}`: an optional `#`-prefixed fragment, which may contain `/`.
 ///   - `{/var}` / `{.var}`: optional `/`- or `.`-prefixed segments, one per
 ///     variable, none containing `/`.
 /// Outside a fragment, a value with a `.` or `..` path segment (raw or
-/// percent-encoded) does not match, so a captured value never walks out of the
+/// percent-encoded, delimited by `/` or `\`) does not match, so a captured value never walks out of the
 /// path the template names.
 ///   - `{;var}` / `{?var}` / `{&var}`: optional `name=value` pairs, only for the
 ///     variables the expression names, in any order.
@@ -4141,30 +4141,33 @@ private bool bindUriExpression(string expr, string s, ref string[string] params)
 	}
 }
 
-/// Whether any `/`-separated segment of the decoded value `v` is `.` or `..`, so
-/// a reader that joins the value onto a path cannot be walked out of it.
+/// Whether any segment of the decoded value `v`, split on `/` or `\`, is `.` or
+/// `..`, so a reader that joins the value onto a path (including a Windows path,
+/// where `\` also separates) cannot be walked out of it.
 private bool hasDotSegment(string v) @safe
 {
 	import std.algorithm : any, splitter;
 
-	return v.splitter('/').any!(seg => seg == "." || seg == "..");
+	return v.splitter!(c => c == '/' || c == '\\')
+		.any!(seg => seg == "." || seg == "..");
 }
 
 /// Percent-decode a captured template value. Unless `allowSlash`, a value whose
-/// raw or decoded form contains `/` — or whose raw form contains `?` or `#` — is
-/// rejected. Returns false on a malformed escape.
+/// raw or decoded form contains a path separator (`/` or `\`) — or whose raw
+/// form contains `?` or `#` — is rejected. Returns false on a malformed escape.
 private bool decodeUriValue(string raw, bool allowSlash, out string value) @safe
 {
+	import std.algorithm : canFind;
 	import std.string : indexOf;
 	import std.uri : decodeComponent, URIException;
 
-	if (!allowSlash && (raw.indexOf('/') >= 0 || raw.indexOf('?') >= 0 || raw.indexOf('#') >= 0))
+	if (!allowSlash && (raw.canFind('/', '\\') || raw.indexOf('?') >= 0 || raw.indexOf('#') >= 0))
 		return false;
 	try
 		value = decodeComponent(raw);
 	catch (URIException)
 		return false;
-	return allowSlash || value.indexOf('/') < 0;
+	return allowSlash || !value.canFind('/', '\\');
 }
 
 unittest  // template matching captures a single parameter
@@ -4241,6 +4244,22 @@ unittest  // a prefix modifier applies to its own variable in a list and in a qu
 	assert(matchUriTemplate("res://{a,b:1}", "res://xy,z", params));
 	assert(!matchUriTemplate("res://x{?q:2}", "res://x?q=abc", params));
 	assert(matchUriTemplate("res://x{?q:2}", "res://x?q=ab", params));
+}
+
+unittest  // a simple {var} rejects a backslash separator, raw or percent-encoded
+{
+	string[string] params;
+	assert(!matchUriTemplate("res://x/{id}", "res://x/..%5C..%5Csecret", params));
+	assert(!matchUriTemplate("res://x/{id}", "res://x/a%5Cb", params));
+	assert(!matchUriTemplate("res://x/{id}", "res://x/a\\b", params));
+}
+
+unittest  // a reserved expression rejects a dot segment delimited by a backslash
+{
+	string[string] params;
+	assert(!matchUriTemplate("res://x/{+path}", "res://x/a/..\\..\\etc", params));
+	assert(!matchUriTemplate("res://x/{+path}", "res://x/a/..%5C..%5Cetc", params));
+	assert(!matchUriTemplate("res://x{/seg}", "res://x/..%5Cetc", params));
 }
 
 unittest  // a reserved expression spans a later occurrence of its trailing literal
