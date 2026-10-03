@@ -475,7 +475,8 @@ struct EventClientSettings
 	/// How long a managed push stream may go without any frame (event or
 	/// heartbeat) before it is declared dead and reopened with the last cursor.
 	/// Servers heartbeat at least every 30 s, so twice that is the default. Zero
-	/// disables reconnection.
+	/// disables reconnection: the subscription then ends, with an `error`
+	/// control, when its stream does.
 	Duration streamDeadAfter = 60.seconds;
 
 	/// How often a webhook subscription granted no expiry is still refreshed: the
@@ -3125,9 +3126,10 @@ final class McpClient : ClientProtocol
 	/// ending streams cannot drive a tight reconnect loop. While backing off, the
 	/// watchdog waits out the whole delay even if the stream ends. Any other
 	/// failure — the server refusing or failing the stream — ends the
-	/// subscription and is reported to `onControl` as an `error` control. Ends
-	/// when the subscription is cancelled or terminated, or when reconnection is
-	/// disabled. Seam-driven for tests.
+	/// subscription and is reported to `onControl` as an `error` control. With
+	/// reconnection disabled, the subscription instead ends with its stream,
+	/// reporting why it ended. Ends when the subscription is cancelled or
+	/// terminated. Seam-driven for tests.
 	package void runStreamWatchdog(EventSubscription sub) @safe
 	{
 		auto msp = sub in managedStreams_;
@@ -3139,7 +3141,16 @@ final class McpClient : ClientProtocol
 		{
 			const dead = eventSettings_.streamDeadAfter;
 			if (dead <= Duration.zero)
+			{
+				streamWatchSleep(ms, Duration.max, true);
+				if (!sub.active || closed_)
+					return;
+				if (!ms.stream.ended)
+					continue;
+				endManagedStream(sub, ms, ms.stream.error !is null ? ms.stream.error
+						: internalError("the server ended the event stream"));
 				return;
+			}
 			streamWatchSleep(ms, dead * (1L << (failures < 5 ? failures : 5)), failures == 0);
 			if (!sub.active || closed_)
 				return;
@@ -10709,12 +10720,51 @@ unittest  // reconnection is disabled by a zero streamDeadAfter
 	EventClientSettings es;
 	es.streamDeadAfter = Duration.zero;
 	c.eventSettings = es;
+	long now = 0;
+	c.onEventNowForTest = () @safe => now;
 	auto sub = c.subscribeStream(StreamParams("incident.created"), null);
 	c.onStreamWatchSleepForTest = (Duration d) @safe {
-		assert(false, "must not sleep");
+		now += 200_000;
+		t.streams[0].finish();
 	};
 	c.runStreamWatchdog(sub);
-	assert(t.listens.length == 1 && sub.active);
+	assert(t.listens.length == 1, "a stream must not be reopened with reconnection disabled");
+}
+
+unittest  // with reconnection disabled a stream the server ends cleanly ends the subscription
+{
+	auto t = new RecordingClientTransport();
+	auto c = new McpClient(t);
+	EventClientSettings es;
+	es.streamDeadAfter = Duration.zero;
+	c.eventSettings = es;
+	EventControl[] ctrls;
+	auto sub = c.subscribeStream(StreamParams("incident.created"), null, (EventControl ctrl) @safe {
+		ctrls ~= ctrl;
+	});
+	c.onStreamWatchSleepForTest = (Duration d) @safe { t.streams[0].finish(); };
+	c.runStreamWatchdog(sub);
+	assert(!sub.active, "the subscription must end with its stream");
+	assert(ctrls.length == 1 && ctrls[0].kind == EventControlKind.error);
+}
+
+unittest  // with reconnection disabled a stream the server fails reports its error
+{
+	auto t = new RecordingClientTransport();
+	auto c = new McpClient(t);
+	EventClientSettings es;
+	es.streamDeadAfter = Duration.zero;
+	c.eventSettings = es;
+	EventControl[] ctrls;
+	auto sub = c.subscribeStream(StreamParams("incident.created"), null, (EventControl ctrl) @safe {
+		ctrls ~= ctrl;
+	});
+	c.onStreamWatchSleepForTest = (Duration d) @safe {
+		t.streams[0].finish(new HttpStatusException(503, "unavailable"));
+	};
+	c.runStreamWatchdog(sub);
+	assert(!sub.active);
+	assert(ctrls.length == 1 && ctrls[0].error.get.message == "unavailable");
 }
 
 unittest  // cancelling a managed stream stops delivery
