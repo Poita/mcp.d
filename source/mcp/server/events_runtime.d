@@ -406,12 +406,10 @@ string isoFromMs(long ms) @safe
 /// leaves a trace.
 private void logEventsError(string what, Exception e) @safe nothrow
 {
-	try
-		() @trusted {
-		import std.stdio : stderr;
+	import vibe.core.log : logError;
 
-		stderr.writeln("[mcp.events] ", what, ": ", e.msg);
-	}();
+	try
+		logError("[mcp.events] %s: %s", what, e.msg);
 	catch (Exception)
 	{
 	}
@@ -3325,6 +3323,47 @@ version (unittest)
 		h.stream.started_ = true;
 		return h;
 	}
+
+	import vibe.core.log : LogLevel, Logger, LogLine;
+
+	// Records the text of every error-or-higher log line while registered.
+	private final class CaptureLogger : Logger
+	{
+		string[] lines;
+		this() @safe
+		{
+			minLevel = LogLevel.error;
+		}
+
+		override void log(ref LogLine line) @safe
+		{
+			lines ~= line.text;
+		}
+	}
+
+	// Run `fn` with a `CaptureLogger` registered and return the lines it logged.
+	private string[] captureLogs(scope void delegate() @safe fn) @safe
+	{
+		import vibe.core.log : deregisterLogger, registerLogger;
+
+		auto logger = new CaptureLogger;
+		auto shared_ = () @trusted { return cast(shared) logger; }();
+		() @trusted { registerLogger(shared_); }();
+		scope (exit)
+			() @trusted { deregisterLogger(shared_); }();
+		fn();
+		return () @trusted { return (cast() logger).lines; }();
+	}
+}
+
+unittest  // a contained events failure goes to the vibe.d log
+{
+	import std.algorithm : any, canFind;
+
+	auto lines = captureLogs(() @safe {
+		logEventsError("worker step", new Exception("store unavailable"));
+	});
+	assert(lines.any!(l => l.canFind("worker step") && l.canFind("store unavailable")));
 }
 
 unittest  // the delivery lease is clamped to twice the longest wait between renewals
