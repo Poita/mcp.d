@@ -1686,7 +1686,11 @@ final class EventsRuntime
 					if (s.isExpired(opts_.nowMs()) || !s.active || s.fetchCursor != fetchedFrom)
 						return false;
 					s.fetchCursor = er.cursor;
-					if (!gap && er.events.length == 0 && (s.id in outstanding_) is null)
+					// A quiet fetch advances the watermark only when no delivery is
+					// in flight for the subscription — on this node, or, over a
+					// shared queue, on any other.
+					if (!gap && er.events.length == 0 && (s.id in outstanding_) is null
+						&& !deliveryQueue_.hasPendingFor(s.id))
 						s.cursor = er.cursor;
 					return true;
 				}, cur);
@@ -8083,4 +8087,18 @@ unittest  // a dead-lettered delivery is logged and owed a gap
 	rt.emit(EventOccurrence("evt_2", "n", "t"));
 	assert(ft.acceptedGaps.length == 1);
 	assert(ft.acceptedGaps[0]["cursor"].get!string == seqCursor(1));
+}
+
+unittest  // multi-node: a quiet pass does not advance the watermark past another node's queued jobs
+{
+	auto t = twoNodes(1000);
+	auto r = t.a.subscribeWebhook(webhookSub("mail", "https://proxy/hooks"), "user-1");
+	t.produced = 2;
+	pollOnA(t);
+	t.b.pollWebhookSubscriptions(); // quiet for B: A already fetched up to c2
+	assert(t.ftB.eventPosts().length == 0);
+	assert(t.store.get(r.id).get.cursor.get == "c0");
+	t.b.drainDeliveries();
+	t.a.tick();
+	assert(t.store.get(r.id).get.cursor.get == "c2");
 }

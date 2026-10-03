@@ -605,6 +605,12 @@ interface DeliveryQueue
 	/// Whether `jobId` is still queued (leased or not). A node learns from this
 	/// that a job it enqueued was settled by another node's worker.
 	bool contains(string jobId) @safe;
+
+	/// Whether any job for `subscriptionId` is still queued (leased or not),
+	/// whichever node enqueued it. A node consults this before advancing a
+	/// subscription's watermark on a quiet poll, so it never moves past a
+	/// delivery another node still has in flight.
+	bool hasPendingFor(string subscriptionId) @safe;
 }
 
 /// In-memory `DeliveryQueue`. The default; jobs are lost on restart, which is the
@@ -697,6 +703,26 @@ final class InMemoryDeliveryQueue : DeliveryQueue
 	{
 		return (jobId in entries_) !is null;
 	}
+
+	bool hasPendingFor(string subscriptionId) @safe
+	{
+		foreach (ref e; entries_.byValue)
+			if (e.job.getOr("subscriptionId", "") == subscriptionId)
+				return true;
+		return false;
+	}
+}
+
+unittest  // the in-memory delivery queue reports whether a subscription has jobs queued
+{
+	auto q = new InMemoryDeliveryQueue();
+	assert(!q.hasPendingFor("s1"));
+	q.enqueue(Delivery("s1/e1", "s1", EventOccurrence("e1", "n", "t"), 0));
+	assert(q.hasPendingFor("s1") && !q.hasPendingFor("s2"));
+	q.lease(0, 1000, 0);
+	assert(q.hasPendingFor("s1")); // a leased job is still pending
+	q.ack("s1/e1");
+	assert(!q.hasPendingFor("s1"));
 }
 
 unittest  // the in-memory subscription store's compareAndSwap applies only on the expected revision
