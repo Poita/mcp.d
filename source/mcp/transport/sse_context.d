@@ -755,8 +755,25 @@ final class ServerPushChannel : PushChannel
 			}
 		listeners = listeners.remove!(l => l.id == id);
 		if (auto ord = id in streamOf)
-			if (*ord !in history && *ord !in openStreams)
-				nextSeq.remove(*ord);
+		{
+			// Nothing can resume or continue a stream with no replay history and
+			// no open POST, so its per-ordinal bookkeeping goes with its last
+			// listener.
+			const ordinal = *ord;
+			if (ordinal !in history && ordinal !in openStreams)
+			{
+				nextSeq.remove(ordinal);
+				bool shared_;
+				foreach (lid, o; streamOf)
+					if (o == ordinal && lid != id)
+					{
+						shared_ = true;
+						break;
+					}
+				if (!shared_)
+					streamOwner.remove(ordinal);
+			}
+		}
 		streamOf.remove(id);
 		live.remove(id);
 
@@ -1572,6 +1589,24 @@ unittest  // a listener receives framed events, with monotonic per-listener ids
 	assert(received[0] != received[1]);
 	ch.removeListener(id);
 	assert(ch.listenerCount == 0);
+}
+
+unittest  // removing a listener with no replay history forgets its stream's owner
+{
+	auto ch = new ServerPushChannel(new StreamCoordinator);
+	foreach (_; 0 .. 100)
+		ch.removeListener(ch.addListener((string) @safe {}, Json.init,
+				ListenFilter.init, "", null, "A"));
+	assert(ch.streamOwner.length == 0);
+}
+
+unittest  // removing a listener whose stream has replay history keeps it resumable
+{
+	auto ch = new ServerPushChannel(new StreamCoordinator);
+	const id = ch.addListener((string) @safe {}, Json.init, ListenFilter.init, "", null, "A");
+	ch.notify("notifications/message");
+	ch.removeListener(id);
+	assert(ch.streamOwner.length == 1);
 }
 
 unittest  // a GET carrying Last-Event-ID replays events emitted after that cursor
