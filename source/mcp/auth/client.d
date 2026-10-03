@@ -75,6 +75,10 @@ struct IssuerResolution
 /// Registration (RFC 7591), and the token endpoint (authorization-code + PKCE,
 /// client-credentials, refresh) with RFC 8707 resource indicators.
 ///
+/// Access tokens are presented as `Bearer`, so the access-token grants reject a
+/// response whose `token_type` is anything else (such as `DPoP`);
+/// `tokenExchange`, which may issue a non-access token (`N_A`), does not.
+///
 /// The interactive authorization-code redirect (opening a browser / running a
 /// loopback listener) is supplied by the host application via an
 /// `authorizeCallback`; everything else is handled here.
@@ -440,7 +444,7 @@ final class OAuthClient
 		auto form = buildAuthCodeTokenForm(code, redirectUri, codeVerifier,
 				client.clientId, resource, post ? client.clientSecret : "") ~ clientAssertionParams(
 				client.clientId, as_.issuer.length ? as_.issuer : as_.tokenEndpoint);
-		return TokenSet.fromJson(postForm(as_.tokenEndpoint, form, client));
+		return requireBearer(TokenSet.fromJson(postForm(as_.tokenEndpoint, form, client)));
 	}
 
 	/// Obtain a token via the client-credentials grant (service-to-service).
@@ -452,7 +456,7 @@ final class OAuthClient
 		auto form = buildClientCredentialsForm(client.clientId, scopeStr,
 				resource, post ? client.clientSecret : "") ~ clientAssertionParams(client.clientId,
 				as_.issuer.length ? as_.issuer : as_.tokenEndpoint);
-		return TokenSet.fromJson(postForm(as_.tokenEndpoint, form, client));
+		return requireBearer(TokenSet.fromJson(postForm(as_.tokenEndpoint, form, client)));
 	}
 
 	/// RFC 8693 token exchange: swap a subject token (e.g. an IdP id_token) for
@@ -476,7 +480,7 @@ final class OAuthClient
 		requireResource();
 		auto form = buildJwtBearerForm(assertion, scopeStr, resource, client.clientId)
 			~ clientAuthParams(client, as_.issuer.length ? as_.issuer : as_.tokenEndpoint);
-		return TokenSet.fromJson(postForm(as_.tokenEndpoint, form, client));
+		return requireBearer(TokenSet.fromJson(postForm(as_.tokenEndpoint, form, client)));
 	}
 
 	/// Refresh an access token.
@@ -487,7 +491,7 @@ final class OAuthClient
 		auto form = buildRefreshTokenForm(refreshToken, client.clientId,
 				resource, post ? client.clientSecret : "") ~ clientAssertionParams(client.clientId,
 				as_.issuer.length ? as_.issuer : as_.tokenEndpoint);
-		return TokenSet.fromJson(postForm(as_.tokenEndpoint, form, client));
+		return requireBearer(TokenSet.fromJson(postForm(as_.tokenEndpoint, form, client)));
 	}
 
 	/// Build the authorization-request URL the host should open (browser/loopback).
@@ -1951,6 +1955,39 @@ unittest  // a rejected refresh carries the OAuth error code for oauthErrorCode
 	auto e = collectException(c.refresh(as_, RegisteredClient("cid", ""), "dead-rt"));
 	assert(e !is null);
 	assert(oauthErrorCode(e) == "invalid_grant");
+}
+
+unittest  // OAuthClient refuses an access token whose token_type is not Bearer
+{
+	import std.exception : assertThrown;
+
+	auto srv = startLoopback((scope HTTPServerRequest req, scope HTTPServerResponse res) @safe {
+		res.writeBody(`{"access_token":"at","token_type":"DPoP"}`, "application/json");
+	});
+	scope (exit)
+		srv.stop();
+
+	auto c = new OAuthClient();
+	c.resource = "http://127.0.0.1:3000/mcp";
+	AuthorizationServerMetadata as_;
+	as_.issuer = "https://as.example.com";
+	as_.tokenEndpoint = srv.base ~ "/token";
+	assertThrown(c.refresh(as_, RegisteredClient("cid", ""), "rt"));
+	assertThrown(c.clientCredentials(as_, RegisteredClient("cid", "shh"), ""));
+}
+
+unittest  // token exchange accepts an N_A token_type for a non-access token
+{
+	auto srv = startLoopback((scope HTTPServerRequest req, scope HTTPServerResponse res) @safe {
+		res.writeBody(`{"access_token":"jag","token_type":"N_A"}`, "application/json");
+	});
+	scope (exit)
+		srv.stop();
+
+	auto c = new OAuthClient();
+	c.resource = "http://127.0.0.1:3000/mcp";
+	assert(c.tokenExchange(srv.base ~ "/token", "subj", "urn:t:id_token",
+			"urn:t:id-jag", "aud", RegisteredClient("cid", "")).accessToken == "jag");
 }
 
 unittest  // client_secret_post: token exchange carries the client secret

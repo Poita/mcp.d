@@ -1666,7 +1666,22 @@ private TokenSet parseTokenResponse(int status, string responseBody) @safe
 	if (status < 200 || status >= 300)
 		throw invalidRequest("token endpoint returned HTTP " ~ status.to!string ~ (
 				responseBody.length ? ": " ~ responseBody : ""), oauthErrorData(responseBody));
-	return TokenSet.fromJson(parseUntrustedJson(responseBody));
+	return requireBearer(TokenSet.fromJson(parseUntrustedJson(responseBody)));
+}
+
+/// Return `ts` when its `token_type` is `Bearer` (compared case-insensitively,
+/// RFC 6749 §5.1) or absent; otherwise throw. The SDK presents access tokens
+/// only as `Authorization: Bearer`, so a DPoP or other token type would be sent
+/// under the wrong scheme.
+package(mcp) TokenSet requireBearer(TokenSet ts) @safe
+{
+	import std.uni : sicmp;
+	import mcp.protocol.errors : invalidRequest;
+
+	if (ts.tokenType.length && sicmp(ts.tokenType, "Bearer") != 0)
+		throw invalidRequest("token endpoint issued token_type \""
+				~ ts.tokenType ~ "\"; only Bearer tokens are supported");
+	return ts;
 }
 
 /// The exception `data` for an OAuth error response body: `{"error": code}`
@@ -1912,6 +1927,19 @@ unittest  // parseTokenResponse carries the OAuth error code of a rejected token
 			`{"error":"invalid_grant"}`))) == "invalid_grant");
 	assert(oauthErrorCode(collectException(parseTokenResponse(502, "<html>"))) == "");
 	assert(oauthErrorCode(new Exception("network down")) == "");
+}
+
+unittest  // parseTokenResponse rejects a token_type other than Bearer
+{
+	import std.algorithm : canFind;
+	import std.exception : collectExceptionMsg;
+
+	const msg = collectExceptionMsg(parseTokenResponse(200,
+			`{"access_token":"AT","token_type":"DPoP"}`));
+	assert(msg.canFind("DPoP"), msg);
+	assert(parseTokenResponse(200,
+			`{"access_token":"AT","token_type":"bearer"}`).accessToken == "AT");
+	assert(parseTokenResponse(200, `{"access_token":"AT"}`).accessToken == "AT");
 }
 
 unittest  // parseTokenResponse decodes a 2xx body into a populated TokenSet
