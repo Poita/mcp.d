@@ -27,7 +27,7 @@ import mcp.auth.jwt_verifier : JwtVerifierConfig, jwtVerifier;
 import mcp.auth.oauth : TokenEndpointAuthMethod;
 import mcp.auth.oauth_proxy : IssueTokenHook, OAuthProxyConfig;
 import mcp.auth.reference_token : ReferenceTokenStore;
-import mcp.auth.resource_server : ResourceServerConfig;
+import mcp.auth.resource_server : ResourceServerConfig, TokenInfo, TokenValidator;
 
 @safe:
 
@@ -279,15 +279,16 @@ in (store !is null)
 
 /// GitHub OAuth app. Fills in GitHub's fixed authorize/token endpoints; the IdP
 /// has no DCR and issues opaque tokens, so the proxy fronts it. The author still
-/// supplies a `tokenVerifier` and a `baseUrl`/`resource` for the proxy surface.
-/// Defaults to passthrough; a server that calls GitHub's API with the issued
-/// token should chain `.brokered(...)` to switch to issue-own-token mode.
+/// supplies a `baseUrl`/`resource` for the proxy surface. Defaults to
+/// passthrough; a server that calls GitHub's API with the issued token should
+/// chain `.brokered(...)` to switch to issue-own-token mode.
 ///
 /// GitHub tokens carry no audience, so the preset sets
 /// `verifierBindsResource`: every token the `tokenVerifier` accepts is treated as
-/// issued for `resource`. The verifier must therefore confirm the token belongs
-/// to this OAuth app (`POST /applications/{client_id}/token`), not merely that
-/// it is a live GitHub token (`GET /user` accepts any user's token).
+/// issued for `resource`. The preset therefore installs `githubTokenVerifier`,
+/// which confirms the token belongs to this OAuth app. A replacement verifier
+/// must do the same, not merely check that it is a live GitHub token
+/// (`GET /user` accepts a token granted to any app).
 OAuthProxyConfig github(string clientId, string clientSecret, string[] scopes = [
 ]) @safe
 {
@@ -299,20 +300,20 @@ OAuthProxyConfig github(string clientId, string clientSecret, string[] scopes = 
 	cfg.tokenEndpointAuthMethod = TokenEndpointAuthMethod.clientSecretPost;
 	cfg.scopesSupported = scopes.dup;
 	cfg.verifierBindsResource = true;
+	cfg.tokenVerifier = githubTokenVerifier(clientId, clientSecret);
 	return cfg;
 }
 
 /// Google. Fills in Google's fixed authorize/token endpoints; Google has no DCR,
-/// so the proxy fronts it. The author supplies a `tokenVerifier` plus the proxy
-/// `baseUrl`/`resource`. Defaults to passthrough; a server that calls Google's
-/// API with the issued token should chain `.brokered(...)` to switch to
-/// issue-own-token mode.
+/// so the proxy fronts it. The author supplies the proxy `baseUrl`/`resource`.
+/// Defaults to passthrough; a server that calls Google's API with the issued
+/// token should chain `.brokered(...)` to switch to issue-own-token mode.
 ///
 /// Google access tokens are opaque to the resource server, so the preset sets
 /// `verifierBindsResource`: every token the `tokenVerifier` accepts is treated as
-/// issued for `resource`. The verifier must therefore confirm the token was
-/// issued to `clientId` (the `aud`/`azp` returned by Google's tokeninfo
-/// endpoint), not merely that it is a live Google token.
+/// issued for `resource`. The preset therefore installs `googleTokenVerifier`,
+/// which confirms the token was issued to `clientId`. A replacement verifier
+/// must do the same, not merely check that it is a live Google token.
 OAuthProxyConfig google(string clientId, string clientSecret, string[] scopes = [
 ]) @safe
 {
@@ -324,7 +325,200 @@ OAuthProxyConfig google(string clientId, string clientSecret, string[] scopes = 
 	cfg.tokenEndpointAuthMethod = TokenEndpointAuthMethod.clientSecretPost;
 	cfg.scopesSupported = scopes.dup;
 	cfg.verifierBindsResource = true;
+	cfg.tokenVerifier = googleTokenVerifier(clientId);
 	return cfg;
+}
+
+// ===========================================================================
+// Client-binding verifiers for the opaque-token presets
+// ===========================================================================
+
+/// An HTTP request issued by a provider token verifier.
+package struct ProviderHttpRequest
+{
+	string method;
+	string url;
+	/// The `Authorization` header value; empty sends none.
+	string authorization;
+	/// The JSON request body; empty sends none.
+	string body;
+}
+
+/// The status and body of a provider verifier's HTTP response.
+package struct ProviderHttpResponse
+{
+	int status;
+	string body;
+}
+
+/// Performs a provider verifier's HTTP request. The default is the
+/// SSRF-guarded HTTPS client; tests script it.
+package alias ProviderHttp = ProviderHttpResponse delegate(ProviderHttpRequest) @safe;
+
+/// Upper bound on a provider verifier response body.
+private enum size_t maxProviderResponseBytes = 64 * 1024;
+
+private ProviderHttpResponse providerHttp(ProviderHttpRequest r) @trusted
+{
+	import vibe.http.client : HTTPClientRequest, HTTPClientResponse;
+	import vibe.http.common : HTTPMethod;
+	import vibe.stream.operations : readAllUTF8;
+	import mcp.auth.oauth : secureRequestHTTP;
+	import mcp.protocol.ssrf : SsrfPolicy;
+
+	ProviderHttpResponse out_;
+	secureRequestHTTP(r.url, SsrfPolicy.allowLoopback, (scope HTTPClientRequest req) {
+		req.method = r.method == "POST" ? HTTPMethod.POST : HTTPMethod.GET;
+		req.headers["Accept"] = "application/json";
+		req.headers["User-Agent"] = "mcp-d";
+		if (r.authorization.length)
+			req.headers["Authorization"] = r.authorization;
+		if (r.body.length)
+		{
+			req.headers["Content-Type"] = "application/json";
+			req.writeBody(cast(const(ubyte)[]) r.body);
+		}
+	}, (scope HTTPClientResponse res) {
+		out_.status = res.statusCode;
+		if (out_.status / 100 == 2)
+			out_.body = res.bodyReader.readAllUTF8(false, maxProviderResponseBytes);
+		else
+			res.dropBody();
+	});
+	return out_;
+}
+
+/// Run `check` fail-closed, logging a failed provider call.
+private TokenInfo providerCheck(string provider, TokenInfo delegate() @safe check) @safe
+{
+	try
+		return check();
+	catch (Exception e)
+	{
+		import vibe.core.log : logWarn;
+
+		logWarn("%s token verification failed; rejecting the token: %s", provider, e.msg);
+		return TokenInfo.invalid();
+	}
+}
+
+/// A `TokenValidator` for GitHub OAuth-app tokens that accepts only tokens
+/// issued to the OAuth app `clientId`. Each call asks GitHub's check-token API
+/// (`POST https://api.github.com/applications/{client_id}/token`,
+/// authenticated with the app's `clientId:clientSecret`), which answers 404
+/// for a token granted to any other app, so a live token from another app
+/// cannot be replayed here. The subject is the GitHub login, the scopes are
+/// the token's granted scopes, and `claims` is GitHub's response minus the
+/// echoed token. The `github` preset installs this by default.
+///
+/// Every validation makes one HTTPS request to GitHub, which counts against
+/// the app's API rate limit.
+TokenValidator githubTokenVerifier(string clientId, string clientSecret) @safe
+{
+	return githubTokenVerifierWith(clientId, clientSecret,
+			(ProviderHttpRequest r) @safe => providerHttp(r));
+}
+
+/// `githubTokenVerifier` over an arbitrary HTTP call.
+package TokenValidator githubTokenVerifierWith(string clientId,
+		string clientSecret, ProviderHttp http) @safe
+{
+	import std.base64 : Base64;
+	import std.uri : encodeComponent;
+	import vibe.data.json : parseJsonString;
+
+	enforce(clientId.length > 0, "githubTokenVerifier: clientId must be set.");
+	const url = "https://api.github.com/applications/" ~ encodeComponent(clientId) ~ "/token";
+	const string authorization = "Basic " ~ Base64.encode(
+			cast(const(ubyte)[])(clientId ~ ":" ~ clientSecret)).idup;
+	return (string token) @safe {
+		if (token.length == 0)
+			return TokenInfo.invalid();
+		return providerCheck("GitHub", () @safe {
+			Json req = Json.emptyObject;
+			req["access_token"] = token;
+			const res = http(ProviderHttpRequest("POST", url, authorization, req.toString()));
+			if (res.status != 200)
+				return TokenInfo.invalid();
+			auto doc = parseJsonString(res.body);
+			if (doc.type != Json.Type.object || jsonString(doc["app"], "client_id") != clientId)
+				return TokenInfo.invalid();
+			TokenInfo ti;
+			ti.valid = true;
+			ti.subject = jsonString(doc["user"], "login");
+			auto scopes = doc["scopes"];
+			if (scopes.type == Json.Type.array)
+				foreach (s; ()@trusted { return scopes.get!(Json[]); }())
+					if (s.type == Json.Type.string)
+						ti.scopes ~= s.get!string;
+			doc.remove("token");
+			ti.claims = doc;
+			return ti;
+		});
+	};
+}
+
+/// A `TokenValidator` for Google OAuth access tokens that accepts only tokens
+/// issued to the OAuth client `clientId`. Each call asks Google's tokeninfo
+/// endpoint (`https://oauth2.googleapis.com/tokeninfo`) and requires its `aud`
+/// or `azp` to equal `clientId` and its `exp` to be in the future, so a live
+/// token granted to another client cannot be replayed here. The subject is the
+/// Google account id (`sub`), the scopes are the token's granted scopes, and
+/// `claims` is the tokeninfo response. The `google` preset installs this by
+/// default.
+///
+/// Every validation makes one HTTPS request to Google.
+TokenValidator googleTokenVerifier(string clientId) @safe
+{
+	return googleTokenVerifierWith(clientId, (ProviderHttpRequest r) @safe => providerHttp(r));
+}
+
+/// `googleTokenVerifier` over an arbitrary HTTP call.
+package TokenValidator googleTokenVerifierWith(string clientId, ProviderHttp http) @safe
+{
+	import std.array : split;
+	import std.conv : to;
+	import std.datetime.systime : Clock;
+	import std.uri : encodeComponent;
+	import vibe.data.json : parseJsonString;
+
+	enforce(clientId.length > 0, "googleTokenVerifier: clientId must be set.");
+	return (string token) @safe {
+		if (token.length == 0)
+			return TokenInfo.invalid();
+		return providerCheck("Google", () @safe {
+			const res = http(ProviderHttpRequest("GET",
+				"https://oauth2.googleapis.com/tokeninfo?access_token=" ~ encodeComponent(token)));
+			if (res.status != 200)
+				return TokenInfo.invalid();
+			auto doc = parseJsonString(res.body);
+			if (doc.type != Json.Type.object)
+				return TokenInfo.invalid();
+			if (jsonString(doc, "aud") != clientId && jsonString(doc, "azp") != clientId)
+				return TokenInfo.invalid();
+			const exp = jsonString(doc, "exp");
+			if (exp.length == 0 || exp.to!long <= Clock.currTime.toUnixTime)
+				return TokenInfo.invalid();
+			TokenInfo ti;
+			ti.valid = true;
+			ti.subject = jsonString(doc, "sub");
+			foreach (s; jsonString(doc, "scope").split(' '))
+				if (s.length)
+					ti.scopes ~= s;
+			ti.claims = doc;
+			return ti;
+		});
+	};
+}
+
+/// The string member `key` of `obj`, or empty when `obj` is not an object or
+/// the member is absent or not a string.
+private string jsonString(Json obj, string key) @safe
+{
+	if (obj.type != Json.Type.object)
+		return null;
+	auto v = obj[key];
+	return v.type == Json.Type.string ? v.get!string : null;
 }
 
 // ===========================================================================
@@ -742,4 +936,122 @@ unittest  // ENTRA: an app-only access token (roles) is accepted
 	TokenInfo info;
 	assert(authorize(entraPinnedConfig(),
 			"Bearer " ~ entraToken(`"roles":["Mcp.Invoke"]`), info) == AuthFailure.none);
+}
+
+unittest  // the GitHub and Google presets ship a client-binding token verifier by default
+{
+	assert(github("Iv1.client", "ghsecret").tokenVerifier !is null);
+	assert(google("client.apps.googleusercontent.com", "gsecret").tokenVerifier !is null);
+}
+
+version (unittest)
+{
+	/// A scripted provider endpoint recording the last request it answered.
+	private final class FakeProviderHttp
+	{
+		ProviderHttpRequest last;
+		int calls;
+		ProviderHttpResponse delegate(ProviderHttpRequest) @safe answer;
+
+		ProviderHttp call() @safe
+		{
+			return (ProviderHttpRequest req) @safe {
+				++calls;
+				last = req;
+				return answer(req);
+			};
+		}
+	}
+}
+
+unittest  // GITHUB: the verifier asks GitHub's check-token API, authenticated as this OAuth app
+{
+	import std.algorithm : canFind;
+
+	auto fake = new FakeProviderHttp;
+	fake.answer = (ProviderHttpRequest req) @safe => ProviderHttpResponse(200,
+			`{"token":"gho_valid","scopes":["read:user","repo"],"app":{"client_id":"Iv1.client"},`
+			~ `"user":{"login":"octocat","id":1}}`);
+	auto v = githubTokenVerifierWith("Iv1.client", "ghsecret", fake.call());
+
+	auto info = v("gho_valid");
+	assert(info.valid);
+	assert(info.subject == "octocat");
+	assert(info.scopes == ["read:user", "repo"]);
+	assert(fake.last.method == "POST");
+	assert(fake.last.url == "https://api.github.com/applications/Iv1.client/token");
+	assert(fake.last.authorization == "Basic SXYxLmNsaWVudDpnaHNlY3JldA==");
+	assert(fake.last.body.canFind(`"access_token":"gho_valid"`));
+	assert(info.claims["token"].type == Json.Type.undefined,
+			"the echoed token must not be exposed in the claims");
+}
+
+unittest  // GITHUB: a live token issued to another OAuth app is rejected
+{
+	auto fake = new FakeProviderHttp;
+	fake.answer = (ProviderHttpRequest req) @safe => ProviderHttpResponse(404,
+			`{"message":"Not Found"}`);
+	auto v = githubTokenVerifierWith("Iv1.client", "ghsecret", fake.call());
+	assert(!v("gho_other_app").valid);
+
+	fake.answer = (ProviderHttpRequest req) @safe => ProviderHttpResponse(200,
+			`{"app":{"client_id":"Iv1.other"},"user":{"login":"octocat"}}`);
+	assert(!v("gho_other_app").valid);
+}
+
+unittest  // GITHUB: a failed check-token call rejects the token without throwing
+{
+	auto fake = new FakeProviderHttp;
+	fake.answer = (ProviderHttpRequest req) @safe {
+		throw new Exception("network down");
+		return ProviderHttpResponse.init;
+	};
+	auto v = githubTokenVerifierWith("Iv1.client", "ghsecret", fake.call());
+	assert(!v("gho_valid").valid);
+	assert(!v("").valid);
+	assert(fake.calls == 1, "an empty token is rejected without a call");
+}
+
+unittest  // GOOGLE: the verifier accepts a token whose tokeninfo aud or azp is this client
+{
+	import std.algorithm : canFind;
+	import std.conv : to;
+	import std.datetime.systime : Clock;
+
+	const exp = (Clock.currTime.toUnixTime + 3600).to!string;
+	auto fake = new FakeProviderHttp;
+	fake.answer = (ProviderHttpRequest req) @safe => ProviderHttpResponse(200,
+			`{"aud":"client.apps.googleusercontent.com","azp":"client.apps.googleusercontent.com",`
+			~ `"sub":"1234","scope":"openid email","exp":"` ~ exp ~ `"}`);
+	auto v = googleTokenVerifierWith("client.apps.googleusercontent.com", fake.call());
+
+	auto info = v("ya29.valid");
+	assert(info.valid);
+	assert(info.subject == "1234");
+	assert(info.scopes == ["openid", "email"]);
+	assert(fake.last.method == "GET");
+	assert(fake.last.url.canFind("https://oauth2.googleapis.com/tokeninfo?access_token=ya29.valid"));
+}
+
+unittest  // GOOGLE: a live token issued to another client, or an expired one, is rejected
+{
+	import std.conv : to;
+	import std.datetime.systime : Clock;
+
+	const now = Clock.currTime.toUnixTime;
+	auto fake = new FakeProviderHttp;
+	fake.answer = (ProviderHttpRequest req) @safe => ProviderHttpResponse(200,
+			`{"aud":"other.apps.googleusercontent.com","azp":"other.apps.googleusercontent.com",`
+			~ `"sub":"1234","exp":"` ~ (now + 3600).to!string ~ `"}`);
+	auto v = googleTokenVerifierWith("client.apps.googleusercontent.com", fake.call());
+	assert(!v("ya29.other").valid);
+
+	fake.answer = (ProviderHttpRequest req) @safe => ProviderHttpResponse(200,
+			`{"aud":"client.apps.googleusercontent.com","sub":"1234","exp":"` ~ (now - 10)
+				.to!string ~ `"}`);
+	assert(!v("ya29.expired").valid);
+
+	fake.answer = (ProviderHttpRequest req) @safe => ProviderHttpResponse(400,
+			`{"error":"invalid_token"}`);
+	assert(!v("ya29.revoked").valid);
 }

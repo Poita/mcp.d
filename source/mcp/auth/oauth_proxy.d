@@ -143,9 +143,9 @@ struct OAuthProxyConfig
 	/// Google issue opaque tokens with no `aud`, which `authorize`'s RFC 8707
 	/// resource check would otherwise reject; their presets set this. With it
 	/// set, `tokenVerifier` carries the audience guarantee and MUST confirm the
-	/// token was issued to this proxy's `upstreamClientId` (e.g. GitHub's
-	/// `POST /applications/{client_id}/token`, or the `aud`/`azp` from Google's
-	/// tokeninfo endpoint), not merely that it is a live upstream token.
+	/// token was issued to this proxy's `upstreamClientId`, not merely that it
+	/// is a live upstream token; the presets install `githubTokenVerifier` and
+	/// `googleTokenVerifier`, which do.
 	bool verifierBindsResource;
 
 	/// The RFC 8707 canonical resource identifier of the MCP server, advertised
