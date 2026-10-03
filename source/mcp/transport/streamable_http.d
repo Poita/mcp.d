@@ -1912,7 +1912,7 @@ private void handleEventsStream(McpServer server, Message msg,
 	auto rt = server.events();
 	if (rt is null)
 	{
-		auto e = methodNotFound("events");
+		auto e = methodNotFound("events/stream");
 		res.statusCode = httpStatusForResponse(makeErrorResponse(msg.id, e), true);
 		res.writeBody(makeErrorResponse(msg.id, e).toString(), "application/json");
 		return;
@@ -5594,6 +5594,35 @@ unittest  // an events/stream POST without _meta client capabilities is refused 
 	assert(resp["error"]["code"].get!int == ErrorCode.invalidParams);
 	assert(resp["error"]["data"]["missingMeta"][0].get!string
 			== "io.modelcontextprotocol/clientCapabilities");
+}
+
+unittest  // an events/stream POST to a server without events is -32601 naming events/stream
+{
+	import vibe.data.json : parseJsonString;
+	import vibe.http.server : createTestHTTPServerResponse, TestHTTPResponseMode;
+	import vibe.http.router : URLRouter;
+	import vibe.stream.memory : createMemoryOutputStream;
+
+	auto server = McpServer.stateless("t", "1");
+	auto router = new URLRouter;
+	mountMcp(router, server);
+
+	auto sink = createMemoryOutputStream();
+	auto res = createTestHTTPServerResponse(sink, null, TestHTTPResponseMode.bodyOnly);
+	const body_ = `{"jsonrpc":"2.0","id":1,"method":"events/stream","params":{`
+		~ `"name":"n","_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28",`
+		~ `"io.modelcontextprotocol/clientInfo":{"name":"c","version":"1"},`
+		~ `"io.modelcontextprotocol/clientCapabilities":{}}}}`;
+	auto req = makeInitPostReq(body_, [
+		"Accept": "application/json, text/event-stream",
+		"MCP-Protocol-Version": "2026-07-28",
+		"Mcp-Method": "events/stream"
+	]);
+	router.handleRequest(req, res);
+	auto resp = parseJsonString(() @trusted { return cast(string) sink.data; }());
+	assert(resp["error"]["code"].get!int == ErrorCode.methodNotFound, resp.toString());
+	assert(resp["error"]["message"].get!string == "Method not found: events/stream",
+			resp.toString());
 }
 
 unittest  // an events/stream POST with a negative maxAgeMs answers InvalidParams

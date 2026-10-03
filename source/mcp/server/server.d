@@ -1812,7 +1812,7 @@ final class McpServer : ServerCore
 		}
 		if (eventsRuntime_ is null)
 		{
-			writeLine(makeErrorResponse(msg.id, methodNotFound("events")).toString());
+			writeLine(makeErrorResponse(msg.id, methodNotFound("events/stream")).toString());
 			return true;
 		}
 
@@ -2927,10 +2927,10 @@ final class McpServer : ServerCore
 	// a server that never enabled tasks does not expose these methods and MUST
 	// answer -32601 (method not found). SEP-2663 defines exactly tasks/get,
 	// tasks/update, and tasks/cancel — there is no tasks/list or tasks/result.
-	private void requireTasks(ProtocolVersion ver) @safe
+	private void requireTasks(ProtocolVersion ver, string method) @safe
 	{
 		if (!ver.isModern || !tasksEnabled_)
-			throw methodNotFound("tasks");
+			throw methodNotFound(method);
 	}
 
 	private string requireTaskId(Json params) @safe
@@ -2953,7 +2953,7 @@ final class McpServer : ServerCore
 
 	private Json doTasksGet(Json params, RequestContext ctx, ProtocolVersion ver) @safe
 	{
-		requireTasks(ver);
+		requireTasks(ver, "tasks/get");
 		requireTasksDeclared(params);
 		const id = requireTaskId(params);
 		taskRuntime_.requireAccess(id, requestPrincipal(ctx));
@@ -2962,7 +2962,7 @@ final class McpServer : ServerCore
 
 	private Json doTasksUpdate(Json params, RequestContext ctx, ProtocolVersion ver) @safe
 	{
-		requireTasks(ver);
+		requireTasks(ver, "tasks/update");
 		requireTasksDeclared(params);
 		const id = requireTaskId(params);
 		taskRuntime_.requireAccess(id, requestPrincipal(ctx));
@@ -2977,7 +2977,7 @@ final class McpServer : ServerCore
 
 	private Json doTasksCancel(Json params, RequestContext ctx, ProtocolVersion ver) @safe
 	{
-		requireTasks(ver);
+		requireTasks(ver, "tasks/cancel");
 		requireTasksDeclared(params);
 		const id = requireTaskId(params);
 		taskRuntime_.requireAccess(id, requestPrincipal(ctx));
@@ -2989,10 +2989,10 @@ final class McpServer : ServerCore
 	// extension is modern-only and opt-in via `enableEvents()`; a legacy session
 	// or a server that never enabled events answers -32601. `events/stream` (push)
 	// is long-lived and handled by the transports, not routed here.
-	private void requireEvents(ProtocolVersion ver) @safe
+	private void requireEvents(ProtocolVersion ver, string method) @safe
 	{
 		if (!ver.isModern || !eventsEnabled_)
-			throw methodNotFound("events");
+			throw methodNotFound(method);
 	}
 
 	// The authenticated principal behind a request (the validated token's
@@ -3009,13 +3009,13 @@ final class McpServer : ServerCore
 
 	private Json doEventsList(Json params, ProtocolVersion ver) @safe
 	{
-		requireEvents(ver);
+		requireEvents(ver, "events/list");
 		return eventsRuntime_.list().toJson();
 	}
 
 	private Json doEventsPoll(Json params, RequestContext ctx, ProtocolVersion ver) @safe
 	{
-		requireEvents(ver);
+		requireEvents(ver, "events/poll");
 		auto p = PollParams.fromJson(params);
 		if (p.name.length == 0)
 			throw invalidParams("events/poll requires a string 'name'");
@@ -3025,7 +3025,7 @@ final class McpServer : ServerCore
 
 	private Json doEventsSubscribe(Json params, RequestContext ctx, ProtocolVersion ver) @safe
 	{
-		requireEvents(ver);
+		requireEvents(ver, "events/subscribe");
 		auto p = SubscribeParams.fromJson(params);
 		if (p.name.length == 0)
 			throw invalidParams("events/subscribe requires a string 'name'");
@@ -3034,7 +3034,7 @@ final class McpServer : ServerCore
 
 	private Json doEventsUnsubscribe(Json params, RequestContext ctx, ProtocolVersion ver) @safe
 	{
-		requireEvents(ver);
+		requireEvents(ver, "events/unsubscribe");
 		auto p = UnsubscribeParams.fromJson(params);
 		if (p.name.length == 0)
 			throw invalidParams("events/unsubscribe requires a string 'name'");
@@ -7442,6 +7442,20 @@ unittest  // a stdio events/stream missing _meta clientCapabilities is -32602
 	assert(parseJsonString(frames[0])["error"]["code"].get!int == ErrorCode.invalidParams);
 }
 
+unittest  // a stdio events/stream on a server without events is -32601 naming events/stream
+{
+	import vibe.data.json : parseJsonString;
+
+	auto s = new McpServer("t", "1");
+	string[] frames;
+	assert(s.tryServeStdioEventsStream(modernReq(1, "events/stream",
+			Json(["name": Json("x")])), (string l) @safe { frames ~= l; }));
+	assert(frames.length == 1);
+	auto err = parseJsonString(frames[0])["error"];
+	assert(err["code"].get!int == ErrorCode.methodNotFound);
+	assert(err["message"].get!string == "Method not found: events/stream", err.toString());
+}
+
 unittest  // stdio subscriptions/listen is cancellable via notifications/cancelled
 {
 	import std.algorithm : canFind;
@@ -7667,6 +7681,8 @@ unittest  // tasks/* are -32601 when the server never enabled tasks
 		Json p = Json(["taskId": Json("x")]);
 		auto resp = s.handle(modernReq(1, m, p)).get;
 		assert(resp["error"]["code"].get!int == ErrorCode.methodNotFound, m);
+		assert(resp["error"]["message"].get!string == "Method not found: " ~ m,
+				resp["error"]["message"].get!string);
 	}
 }
 
@@ -7679,6 +7695,8 @@ unittest  // tasks/* are -32601 on a legacy session even when enabled (extension
 		Json p = Json(["taskId": Json("x")]);
 		auto resp = s.handle(req(1, m, p)).get;
 		assert(resp["error"]["code"].get!int == ErrorCode.methodNotFound, m);
+		assert(resp["error"]["message"].get!string == "Method not found: " ~ m,
+				resp["error"]["message"].get!string);
 	}
 }
 
@@ -7737,6 +7755,8 @@ unittest  // events/* are -32601 when the server never enabled events
 	{
 		auto resp = s.handle(modernReq(1, m, Json(["name": Json("x")]))).get;
 		assert(resp["error"]["code"].get!int == ErrorCode.methodNotFound, m);
+		assert(resp["error"]["message"].get!string == "Method not found: " ~ m,
+				resp["error"]["message"].get!string);
 	}
 }
 
@@ -7750,6 +7770,8 @@ unittest  // events/* are -32601 on a legacy session even when enabled (modern-o
 	{
 		auto resp = s.handle(req(1, m, Json(["name": Json("x")]))).get;
 		assert(resp["error"]["code"].get!int == ErrorCode.methodNotFound, m);
+		assert(resp["error"]["message"].get!string == "Method not found: " ~ m,
+				resp["error"]["message"].get!string);
 	}
 }
 
