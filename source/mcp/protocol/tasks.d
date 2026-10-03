@@ -3,7 +3,7 @@ module mcp.protocol.tasks;
 import std.typecons : Nullable, nullable;
 import vibe.data.json : Json;
 
-import mcp.protocol.jsonhelpers : getOr, tryGet, requireObject;
+import mcp.protocol.jsonhelpers : getOr, tryGet, tryGetWhole, requireObject;
 
 /// How a tool relates to the Tasks extension (SEP-2663 "task support"). The
 /// server decides whether a call creates a task; the client only declares the
@@ -130,11 +130,19 @@ struct Task
 		t.lastUpdatedAt = j.getOr("lastUpdatedAt", "");
 		// `ttlMs` is always present on the wire: a JSON null means unlimited
 		// (leave `ttlMs` null), a number sets the duration.
-		if ("ttlMs" in j && j["ttlMs"].type != Json.Type.null_)
-			tryGet(j, "ttlMs", t.ttlMs);
-		tryGet(j, "pollIntervalMs", t.pollIntervalMs);
+		readDurationMs(j, "ttlMs", t.ttlMs);
+		readDurationMs(j, "pollIntervalMs", t.pollIntervalMs);
 		return t;
 	}
+}
+
+/// Read the millisecond duration `j[key]` into `val` when it is a non-negative
+/// whole number (`60000` or `60000.0`); any other value leaves `val` null.
+private void readDurationMs(Json j, string key, ref Nullable!long val) @safe
+{
+	long ms;
+	if (tryGetWhole(j, key, ms) && ms >= 0)
+		val = ms;
 }
 
 /// Build the `CreateTaskResult` a server returns in lieu of the standard result
@@ -385,4 +393,26 @@ unittest  // Task.fromJson rejects a non-object value with -32602
 
 	auto ex = cast(McpException) collectException(Task.fromJson(Json(5)));
 	assert(ex !is null && ex.code == ErrorCode.invalidParams);
+}
+
+unittest  // Task.fromJson reads whole-number float ttlMs and pollIntervalMs
+{
+	auto t = Task.fromJson(Json([
+		"taskId": Json("x"),
+		"ttlMs": Json(60000.0),
+		"pollIntervalMs": Json(250.0)
+	]));
+	assert(!t.ttlMs.isNull && t.ttlMs.get == 60000);
+	assert(!t.pollIntervalMs.isNull && t.pollIntervalMs.get == 250);
+}
+
+unittest  // Task.fromJson ignores negative ttlMs and pollIntervalMs
+{
+	auto t = Task.fromJson(Json([
+		"taskId": Json("x"),
+		"ttlMs": Json(-1),
+		"pollIntervalMs": Json(-5)
+	]));
+	assert(t.ttlMs.isNull);
+	assert(t.pollIntervalMs.isNull);
 }
