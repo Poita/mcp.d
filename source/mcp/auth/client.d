@@ -1840,9 +1840,9 @@ unittest  // register() rejects a registration response without a client_id
 {
 	RegisteredClient rc;
 	Exception error;
-	registerAgainst(`{"client_secret":"s"}`, rc, error);
+	cast(void) registerAgainst(`{"client_secret":"s"}`, rc, error);
 	assert(error !is null);
-	registerAgainst(`{"client_id":""}`, rc, error);
+	cast(void) registerAgainst(`{"client_id":""}`, rc, error);
 	assert(error !is null);
 }
 
@@ -1864,12 +1864,14 @@ unittest  // register() refuses an assigned token_endpoint_auth_method the clien
 {
 	RegisteredClient rc;
 	Exception error;
-	registerAgainst(`{"client_id":"cid","token_endpoint_auth_method":"tls_client_auth"}`, rc, error);
+	cast(void) registerAgainst(
+			`{"client_id":"cid","token_endpoint_auth_method":"tls_client_auth"}`, rc, error);
 	assert(error !is null);
-	registerAgainst(`{"client_id":"cid","token_endpoint_auth_method":"client_secret_basic"}`,
-			rc, error);
+	cast(void) registerAgainst(
+			`{"client_id":"cid","token_endpoint_auth_method":"client_secret_basic"}`, rc, error);
 	assert(error !is null, "a secret-based method needs a client_secret");
-	registerAgainst(`{"client_id":"cid","token_endpoint_auth_method":"private_key_jwt"}`, rc, error);
+	cast(void) registerAgainst(
+			`{"client_id":"cid","token_endpoint_auth_method":"private_key_jwt"}`, rc, error);
 	assert(error !is null, "private_key_jwt needs a configured privateKeyPem");
 }
 

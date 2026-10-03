@@ -469,7 +469,7 @@ final class HttpClientTransport : ClientTransport
 	/// Throws when `url` is not a valid `http(s)://host[:port][/path]` endpoint.
 	this(string url, uint maxInFlight = 0) @safe
 	{
-		parseHttpEndpoint(url);
+		cast(void) parseHttpEndpoint(url);
 		this.url = url;
 		this.maxInFlight = maxInFlight;
 	}
