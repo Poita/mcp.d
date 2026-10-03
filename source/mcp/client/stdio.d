@@ -1553,6 +1553,74 @@ unittest  // maxTotalTimeout fails a stdio request while a server request on its
 			"a pending server request must not hold a request past maxTotalTimeout");
 }
 
+unittest  // a stdio request whose write the server never drains still times out
+{
+	import core.time : msecs, seconds, MonoTime, Duration;
+	import vibe.core.core : sleep;
+	import mcp.client.client : ClientSettings, RequestTimeoutException;
+
+	auto toClient = new TestLines;
+	bool timedOut;
+	Duration took;
+	const failure = inLoopCapturing(() @safe {
+		ClientSettings s;
+		s.requestTimeout = 300.msecs;
+		// A server that has stopped reading stdin: each write stalls for 2s.
+		auto client = McpClient.stdio(() @safe => toClient.take(), (string l) @safe {
+			sleep(2.seconds);
+		}, s);
+		const start = MonoTime.currTime;
+		try
+			client.callTool("big", Json.emptyObject);
+		catch (RequestTimeoutException)
+			timedOut = true;
+		took = MonoTime.currTime - start;
+		sleep(5.seconds);
+		toClient.closeEnd();
+	});
+	assert(failure.length == 0, failure);
+	assert(timedOut);
+	assert(took < 1200.msecs, "a stalled write must not hold a request past its timeout");
+}
+
+unittest  // a stdio request that times out before its line is written is never sent
+{
+	import core.time : msecs, seconds;
+	import vibe.core.core : sleep;
+	import mcp.client.client : ClientSettings, RequestTimeoutException;
+
+	auto toClient = new TestLines;
+	string[] written;
+	int timeouts;
+	const failure = inLoopCapturing(() @safe {
+		ClientSettings s;
+		s.requestTimeout = 300.msecs;
+		// The first line written stalls for 1s, holding the channel's writer.
+		auto client = McpClient.stdio(() @safe => toClient.take(), (string l) @safe {
+			if (written.length == 0)
+				sleep(1.seconds);
+			written ~= l;
+		}, s);
+		runTask(() nothrow{
+			try
+				client.callTool("first", Json.emptyObject);
+			catch (Exception)
+				timeouts++;
+		});
+		try
+			client.callTool("second", Json.emptyObject);
+		catch (RequestTimeoutException)
+			timeouts++;
+		sleep(2.seconds);
+		toClient.closeEnd();
+	});
+	assert(failure.length == 0, failure);
+	assert(timeouts == 2);
+	foreach (l; written)
+		assert(parseJsonString(l)["params"]["name"].opt!string != "second",
+				"a request abandoned before it was written must not reach the server");
+}
+
 unittest  // cancelling a call's CancellationToken fails it at once and sends notifications/cancelled
 {
 	import core.time : msecs, seconds, MonoTime, Duration;

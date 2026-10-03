@@ -54,6 +54,9 @@ final class DuplexChannel
 	private void delegate(string) @safe onInboundBatch;
 	private DuplexCoordinator coord;
 	private TaskMutex writeMutex;
+	// The lines `deliver` has handed to its writer tasks and not yet written,
+	// keyed by request id, so `abort` can withdraw one.
+	private PendingWrite[long] pendingWrites_;
 	private bool closed_;
 	private Task readTask_;
 	// Set by `stopReadLoop`: the read loop exits at its next iteration and a read
@@ -301,27 +304,55 @@ final class DuplexChannel
 	/// Send a request whose id was already chosen by the caller (the CLIENT path:
 	/// `McpClient` pre-allocates the id), and block the current task until the
 	/// correlated reply arrives. Returns its result, or throws `McpException` on an
-	/// error reply / timeout / channel close.
+	/// error reply / timeout / channel close, or what writing the line threw.
+	///
+	/// The line is written on a task of its own while the caller awaits the reply,
+	/// so a peer that stops reading parks only that writer: `abort` (a timeout or
+	/// cancellation) still releases the caller. Interrupting the write instead
+	/// would leave a partial line on the wire and break the framing of every
+	/// later message. A line still queued behind another writer when its request
+	/// is aborted is never written.
 	Json deliver(Json message, long expectId, Duration timeout = 60.seconds) @safe
 	{
 		if (closed_)
 			throw internalError("stdio channel closed");
 		coord.register(expectId);
+		auto write = new PendingWrite;
+		pendingWrites_[expectId] = write;
+		runTask((Json msg, long id, PendingWrite w) nothrow{
+			try
+				writeLine(msg.toString(), w);
+			catch (Exception e)
+			{
+				w.failure = e;
+				try
+					coord.resolve(Json(id), Json.undefined, toErrorJson(internalError(e.msg)));
+				catch (Exception)
+				{
+				}
+			}
+			if (auto p = id in pendingWrites_)
+				if (*p is w)
+					pendingWrites_.remove(id);
+		}, message, expectId, write);
 		try
-			send(message);
-		catch (Exception e)
+			return coord.await(expectId, timeout);
+		catch (McpException e)
 		{
-			coord.cancel(expectId);
+			if (write.failure !is null)
+				throw write.failure;
 			throw e;
 		}
-		return coord.await(expectId, timeout);
 	}
 
 	/// Wake the task blocked awaiting request `id` with `reason` as its error, as
-	/// if the peer had replied with it. A later reply for `id` is then ignored.
-	/// A no-op when `id` is not pending.
+	/// if the peer had replied with it, and withdraw its line if it is not yet
+	/// being written. A later reply for `id` is then ignored. A no-op when `id`
+	/// is not pending.
 	void abort(long id, McpException reason) @safe
 	{
+		if (auto w = id in pendingWrites_)
+			(*w).abandoned = true;
 		coord.resolve(Json(id), Json.undefined, toErrorJson(reason));
 	}
 
@@ -372,9 +403,18 @@ final class DuplexChannel
 	/// the text being one valid MCP message with no embedded newline.
 	void sendRaw(string text) @safe
 	{
+		writeLine(text, null);
+	}
+
+	/// Write `text` under the writer lock, unless `write` was abandoned while it
+	/// waited for the lock.
+	private void writeLine(string text, PendingWrite write) @safe
+	{
 		writeMutex.lock();
 		scope (exit)
 			writeMutex.unlock();
+		if (write !is null && write.abandoned)
+			return;
 		writeLineDg(text);
 	}
 
@@ -398,6 +438,15 @@ final class DuplexChannel
 		closed_ = true;
 		coord.failPending(internalError("stdio channel closed"));
 	}
+}
+
+/// A request line `DuplexChannel.deliver` handed to its writer task.
+private final class PendingWrite
+{
+	// Set by `abort`: a line not yet being written is dropped.
+	bool abandoned;
+	// What writing the line threw, rethrown to the awaiting caller.
+	Exception failure;
 }
 
 version (unittest)
