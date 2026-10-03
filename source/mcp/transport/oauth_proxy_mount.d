@@ -176,7 +176,7 @@ struct ProxyAuthState
 /// Build the minimal HTML consent screen presented when a dynamically-registered
 /// client (identified by its `clientRedirectUri`) has not yet been approved to be
 /// forwarded to the upstream authorization server. The MCP authorization spec
-/// (Â§Security Considerations > Confused Deputy Problem) requires a proxy using a
+/// (§Security Considerations > Confused Deputy Problem) requires a proxy using a
 /// static upstream `client_id` to obtain user consent for EACH dynamically
 /// registered client before forwarding it upstream. The screen offers a single
 /// approval action: a `<form method="POST">` targeting `consentPath` and carrying

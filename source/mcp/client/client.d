@@ -536,7 +536,7 @@ private struct CacheGeneration
 /// A Model Context Protocol client, transport-agnostic.
 ///
 /// Speaks pure JSON-RPC + protocol logic over a `ClientTransport` (Streamable
-/// HTTP via `McpClient.http`/`McpClient.spawn`, or stdio via `McpClient.stdio`).
+/// HTTP via `McpClient.http`, or stdio via `McpClient.spawn`/`McpClient.stdio`).
 /// Drives the lifecycle (`initialize` + `notifications/initialized`) and the
 /// server features (tools, resources, prompts, completion, logging,
 /// subscriptions) with auto-pagination. Server->client requests received on an
@@ -3517,7 +3517,7 @@ final class McpClient : ClientProtocol
 	/// Send a request and return its result (or throw `McpException`).
 	///
 	/// When the server answers with a `URLElicitationRequiredError`
-	/// (`-32042`, client/elicitation Â§"URL Elicitation Required Error",
+	/// (`-32042`, client/elicitation §"URL Elicitation Required Error",
 	/// 2025-11-25 / modern), its `data.elicitations[]` carries URL-mode
 	/// elicitations the server has begun out-of-band. Per SEP-1036 the client
 	/// MUST treat such an error as equivalent to an `elicitation/create` request,
