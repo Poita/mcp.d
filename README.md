@@ -693,12 +693,14 @@ resource convention, and `import mcp;` brings in the helpers (`mcp.api.apps`):
 auto server = new McpServer("weather", "1.0.0");
 registerModule!(my.module)(server);     // a @tool tagged @ui("ui://weather/dashboard", "model", "app")
 
-UiResourceOptions ui;
+UiResource ui = {uri: "ui://weather/dashboard", name: "weather_dashboard", html: dashboardHtml};
 ui.meta.csp.connectDomains = ["https://api.open-meteo.com"];
 ui.meta.prefersBorder = nullable(true);
-registerUiResource(server, "ui://weather/dashboard", "weather_dashboard",
-        dashboardHtml, ui);             // serve the ui:// HTML with text/html;profile=mcp-app
+registerUiResource(server, ui);         // serve the ui:// HTML with text/html;profile=mcp-app
 ```
+
+Set `UiResource.htmlProvider` instead of `html` to generate the document on each
+read.
 
 A `@tool` carries its UI link via `@ui(resourceUri, visibility…)` (folded into the
 tool's `_meta.ui`); the dynamic path uses `setUiToolMeta(tool, UiToolMeta(...))`.

@@ -70,11 +70,13 @@ void main(string[] args) @safe
 	registerModule!(apps_server)(server);
 
 	// Publish the ui:// resource the tool links to, with CSP + border hints.
-	UiResourceOptions ui;
-	ui.description = "Interactive weather dashboard";
+	UiResource ui = {
+		uri: "ui://weather/dashboard", name: "weather_dashboard", html: dashboardHtml,
+		description: "Interactive weather dashboard"
+	};
 	ui.meta.csp.connectDomains = ["https://api.open-meteo.com"];
 	ui.meta.prefersBorder = nullable(true);
-	registerUiResource(server, "ui://weather/dashboard", "weather_dashboard", dashboardHtml, ui);
+	registerUiResource(server, ui);
 
 	// stdio by default, or Streamable HTTP under `--http` on `--port`/`--host`.
 	runServerFromArgs(server, args, DefaultPort);

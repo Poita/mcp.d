@@ -569,14 +569,6 @@ package(mcp) Json resourceRef(string uri, string digest, size_t size) @safe
 	return r;
 }
 
-/// Convenience overload registering a skill from its parts (no supporting files
-/// or metadata). Equivalent to `registerSkill(server, Skill(path, description,
-/// instructions))`.
-void registerSkill(McpServer server, string path, string description, string instructions) @safe
-{
-	registerSkill(server, Skill(path, description, instructions));
-}
-
 /// A skill whose `SKILL.md` body is generated on each read, so no stable digest
 /// can be published for it: its entry carries `resources: "dynamic"` instead of
 /// a manifest. The frontmatter is fixed — synthesized from `path`'s final
@@ -942,8 +934,8 @@ unittest  // registerSkill serves SKILL.md and skills/list carries a conformant 
 	import mcp.protocol.jsonrpc : Message, makeRequest;
 
 	auto s = new McpServer("t", "1");
-	registerSkill(s, "git-workflow", "Follow Git conventions",
-			"# Git Workflow\n\n1. Branch from main.\n");
+	registerSkill(s, Skill("git-workflow", "Follow Git conventions",
+			"# Git Workflow\n\n1. Branch from main.\n"));
 
 	// The SKILL.md resource carries the markdown mime type and the rendered body.
 	Json rp = Json.emptyObject;
@@ -1100,8 +1092,8 @@ unittest  // skills/list paginates whole entries with cursor/nextCursor
 
 	auto s = new McpServer("t", "1");
 	s.setPageSize(1);
-	registerSkill(s, "alpha", "First", "a");
-	registerSkill(s, "beta", "Second", "b");
+	registerSkill(s, Skill("alpha", "First", "a"));
+	registerSkill(s, Skill("beta", "Second", "b"));
 
 	auto page1 = s.handle(Message(makeRequest(Json(1), "skills/list",
 			Json.emptyObject))).get["result"];
@@ -1405,7 +1397,7 @@ unittest  // registerDynamicSkill rejects an invalid path and a duplicate uri
 	};
 	assertThrown!Exception(registerDynamicSkill(s, bad));
 
-	registerSkill(s, "taken", "First", "a");
+	registerSkill(s, Skill("taken", "First", "a"));
 	DynamicSkill dup = {
 		path: "taken", description: "d", instructions: () @safe => "x"
 	};
@@ -1417,7 +1409,7 @@ unittest  // a prefixed skill path lists frontmatter.name as the final segment
 	import mcp.protocol.jsonrpc : Message, makeRequest;
 
 	auto s = new McpServer("t", "1");
-	registerSkill(s, "acme/billing/refunds", "Process refunds", "# Refunds\n");
+	registerSkill(s, Skill("acme/billing/refunds", "Process refunds", "# Refunds\n"));
 
 	Json rp = Json.emptyObject;
 	rp["uri"] = skillUri("acme/billing/refunds");
@@ -1500,7 +1492,7 @@ unittest  // registerSkill rejects an invalid skill path
 	import std.exception : assertThrown;
 
 	auto s = new McpServer("t", "1");
-	assertThrown!Exception(registerSkill(s, "Bad Name", "d", "body"));
+	assertThrown!Exception(registerSkill(s, Skill("Bad Name", "d", "body")));
 }
 
 unittest  // a duplicate supporting-file path is rejected and rolls back cleanly
@@ -1539,8 +1531,8 @@ unittest  // registering the same skill path twice is rejected, leaving one entr
 	import mcp.protocol.jsonrpc : Message, makeRequest;
 
 	auto s = new McpServer("t", "1");
-	registerSkill(s, "twice", "First", "a");
-	assertThrown!Exception(registerSkill(s, "twice", "Second", "b"));
+	registerSkill(s, Skill("twice", "First", "a"));
+	assertThrown!Exception(registerSkill(s, Skill("twice", "Second", "b")));
 
 	// The first registration is intact: still listed once, still served.
 	auto result = s.handle(Message(makeRequest(Json(1), "skills/list",
@@ -1567,8 +1559,8 @@ unittest  // multiple skills accumulate in the listing in SKILL.md URI order
 	import mcp.protocol.jsonrpc : Message, makeRequest;
 
 	auto s = new McpServer("t", "1");
-	registerSkill(s, "beta", "Second", "b");
-	registerSkill(s, "alpha", "First", "a");
+	registerSkill(s, Skill("beta", "Second", "b"));
+	registerSkill(s, Skill("alpha", "First", "a"));
 
 	auto result = s.handle(Message(makeRequest(Json(1), "skills/list",
 			Json.emptyObject))).get["result"];
@@ -1969,8 +1961,8 @@ unittest  // skillsList entries span a paginated listing a paginated listing to 
 {
 	auto s = new McpServer("t", "1");
 	s.setPageSize(1);
-	registerSkill(s, "alpha", "First", "a");
-	registerSkill(s, "beta", "Second", "b");
+	registerSkill(s, Skill("alpha", "First", "a"));
+	registerSkill(s, Skill("beta", "Second", "b"));
 	auto client = new McpClient(new ServerBackedTransport(s));
 
 	auto skills = client.skillsList().entries;
@@ -1997,7 +1989,7 @@ unittest  // skillsGet's entry is the same typed entry the listing carries
 unittest  // skillsList surfaces a dynamic entry as isDynamic with an empty manifest
 {
 	auto s = new McpServer("t", "1");
-	registerSkill(s, "static-one", "Static", "# S\n");
+	registerSkill(s, Skill("static-one", "Static", "# S\n"));
 	DynamicSkill dyn = {
 		path: "dynamic-one", description: "Dynamic", instructions: () @safe => "# D\n"
 	};
@@ -2250,4 +2242,10 @@ unittest  // a DynamicSkill with an empty description is rejected
 		path: "x", description: "", instructions: () @safe => "# Body\n"
 	};
 	assertThrown(registerDynamicSkill(s, dyn));
+}
+
+unittest  // a skill is registered only from a Skill value, not from loose parts
+{
+	auto s = new McpServer("t", "1");
+	static assert(!__traits(compiles, registerSkill(s, "x", "d", "body")));
 }

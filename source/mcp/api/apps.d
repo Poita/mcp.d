@@ -256,27 +256,39 @@ bool clientSupportsApps(RequestContext ctx) @safe
 	return ext.type == Json.Type.object && (appsExtensionKey in ext) !is null;
 }
 
-/// Optional settings for `registerUiResource`.
-struct UiResourceOptions
+/// A `ui://` HTML resource an MCP App tool renders (the tool links to it with
+/// `@ui` or `setUiToolMeta`). Register it with `registerUiResource`.
+struct UiResource
 {
+	string uri; /// the resource's `ui://` URI
+	string name; /// the resource name
+	/// The HTML document served on every read; leave empty when `htmlProvider`
+	/// supplies it.
+	string html;
+	/// Produces the HTML document on each read, for a UI that is generated
+	/// rather than fixed; set it or `html`, not both.
+	string delegate() @safe htmlProvider;
 	string description; /// the resource's description (empty = unset)
 	UiResourceMeta meta; /// the `_meta.ui` hints (CSP, border, domain, ...)
 }
 
-/// Register a `ui://` HTML resource an MCP App tool can render. The resource is
-/// served with the `text/html;profile=mcp-app` MIME type and, when `opts.meta`
-/// carries any field, a `_meta.ui` object on both the listing and the read
-/// contents. Enables the Apps extension (see `enableApps`) when it is not yet
-/// enabled. Throws if `uri` is not in the `ui://` scheme.
-void registerUiResource(McpServer server, string uri, string name, string html,
-		UiResourceOptions opts = UiResourceOptions.init) @safe
+/// Register `resource` on `server`. It is served with the
+/// `text/html;profile=mcp-app` MIME type and, when `resource.meta` carries any
+/// field, a `_meta.ui` object on both the listing and the read contents.
+/// Enables the Apps extension (see `enableApps`) when it is not yet enabled.
+/// Throws if `resource.uri` is not in the `ui://` scheme, or if both `html` and
+/// `htmlProvider` are set.
+void registerUiResource(McpServer server, UiResource resource) @safe
 {
 	import std.algorithm.searching : startsWith;
 
+	const uri = resource.uri;
 	if (!uri.startsWith("ui://"))
 		throw new Exception("a UI resource uri must start with \"ui://\", got: " ~ uri);
+	if (resource.html.length && resource.htmlProvider !is null)
+		throw new Exception("UI resource " ~ uri ~ " sets both html and htmlProvider; set only one");
 
-	const uiMeta = opts.meta.toJson();
+	const uiMeta = resource.meta.toJson();
 	Json wrapped = Json.undefined;
 	if (uiMeta.length)
 	{
@@ -286,15 +298,17 @@ void registerUiResource(McpServer server, string uri, string name, string html,
 
 	Resource descriptor;
 	descriptor.uri = uri;
-	descriptor.name = name;
+	descriptor.name = resource.name;
 	descriptor.mimeType = nullable(mcpAppMimeType);
-	if (opts.description.length)
-		descriptor.description = nullable(opts.description);
+	if (resource.description.length)
+		descriptor.description = nullable(resource.description);
 	if (wrapped.type == Json.Type.object)
 		descriptor.meta = wrapped;
 
+	const html = resource.html;
+	auto provider = resource.htmlProvider;
 	server.registerResource(descriptor, () @safe {
-		auto c = ResourceContents.makeText(uri, mcpAppMimeType, html);
+		auto c = ResourceContents.makeText(uri, mcpAppMimeType, provider is null ? html : provider());
 		if (wrapped.type == Json.Type.object)
 			c.meta = wrapped;
 		return c;
@@ -510,9 +524,11 @@ unittest  // registerUiResource serves HTML with the app mime type and _meta.ui
 	import mcp.protocol.jsonrpc : Message, makeRequest;
 
 	auto s = new McpServer("t", "1");
-	UiResourceOptions opts;
-	opts.meta.csp.connectDomains = ["https://api.example.com"];
-	registerUiResource(s, "ui://demo/widget", "widget", "<h1>hi</h1>", opts);
+	UiResource ui = {
+		uri: "ui://demo/widget", name: "widget", html: "<h1>hi</h1>"
+	};
+	ui.meta.csp.connectDomains = ["https://api.example.com"];
+	registerUiResource(s, ui);
 
 	Json rp = Json.emptyObject;
 	rp["uri"] = "ui://demo/widget";
@@ -530,9 +546,11 @@ unittest  // registerUiResource lists the resource with mime type and _meta.ui
 	import mcp.protocol.jsonrpc : Message, makeRequest;
 
 	auto s = new McpServer("t", "1");
-	UiResourceOptions opts;
-	opts.meta.prefersBorder = nullable(true);
-	registerUiResource(s, "ui://demo/widget", "widget", "<h1>hi</h1>", opts);
+	UiResource ui = {
+		uri: "ui://demo/widget", name: "widget", html: "<h1>hi</h1>"
+	};
+	ui.meta.prefersBorder = nullable(true);
+	registerUiResource(s, ui);
 
 	auto res = s.handle(Message(makeRequest(Json(1), "resources/list",
 			Json.emptyObject))).get["result"]["resources"][0];
@@ -546,7 +564,7 @@ unittest  // registerUiResource with no metadata emits a clean resource (no _met
 	import mcp.protocol.jsonrpc : Message, makeRequest;
 
 	auto s = new McpServer("t", "1");
-	registerUiResource(s, "ui://demo/plain", "plain", "<p>x</p>");
+	registerUiResource(s, UiResource("ui://demo/plain", "plain", "<p>x</p>"));
 
 	Json rp = Json.emptyObject;
 	rp["uri"] = "ui://demo/plain";
@@ -561,7 +579,7 @@ unittest  // registerUiResource rejects a uri that is not in the ui:// scheme
 	import std.exception : assertThrown;
 
 	auto s = new McpServer("t", "1");
-	assertThrown!Exception(registerUiResource(s, "https://demo/widget", "w", "<x/>"));
+	assertThrown!Exception(registerUiResource(s, UiResource("https://demo/widget", "w", "<x/>")));
 }
 
 unittest  // setUiToolMeta attaches the ui link under a tool's _meta.ui
@@ -630,15 +648,17 @@ unittest  // @ui UDA attaches _meta.ui to a reflected @tool
 	assert("_meta" !in plainTool);
 }
 
-unittest  // registerUiResource takes its description and _meta.ui through UiResourceOptions
+unittest  // registerUiResource takes its description and _meta.ui from the UiResource
 {
 	import mcp.protocol.jsonrpc : Message, makeRequest;
 
 	auto s = new McpServer("t", "1");
-	UiResourceOptions opts;
-	opts.description = "A demo widget";
-	opts.meta.prefersBorder = nullable(true);
-	registerUiResource(s, "ui://demo/widget", "widget", "<h1>hi</h1>", opts);
+	UiResource ui = {
+		uri: "ui://demo/widget", name: "widget", html: "<h1>hi</h1>"
+	};
+	ui.description = "A demo widget";
+	ui.meta.prefersBorder = nullable(true);
+	registerUiResource(s, ui);
 
 	auto res = s.handle(Message(makeRequest(Json(1), "resources/list",
 			Json.emptyObject))).get["result"]["resources"][0];
@@ -671,7 +691,7 @@ unittest  // registering a @ui tool enables the Apps extension when it is not ye
 unittest  // registering a UI resource enables the Apps extension when it is not yet enabled
 {
 	auto s = new McpServer("t", "1");
-	registerUiResource(s, "ui://demo/plain", "plain", "<p>x</p>");
+	registerUiResource(s, UiResource("ui://demo/plain", "plain", "<p>x</p>"));
 	assert(appsExtensionKey in advertisedExtensions(s));
 }
 
@@ -684,4 +704,53 @@ unittest  // an explicit enableApps keeps its settings when a @ui tool registers
 	registerHandlers(s, new UiToolApi);
 	auto ext = advertisedExtensions(s);
 	assert(ext[appsExtensionKey]["mimeTypes"][0].get!string == "text/html;profile=custom");
+}
+
+unittest  // registerUiResource takes a UiResource and serves its static html
+{
+	import mcp.protocol.jsonrpc : Message, makeRequest;
+
+	auto s = new McpServer("t", "1");
+	UiResource res = {
+		uri: "ui://demo/static", name: "static", html: "<p>fixed</p>", description: "A widget"
+	};
+	registerUiResource(s, res);
+	Json rp = Json.emptyObject;
+	rp["uri"] = "ui://demo/static";
+	auto contents = s.handle(Message(makeRequest(Json(1), "resources/read",
+			rp))).get["result"]["contents"][0];
+	assert(contents["text"].get!string == "<p>fixed</p>");
+}
+
+unittest  // a UiResource's htmlProvider produces the html on every read
+{
+	import mcp.protocol.jsonrpc : Message, makeRequest;
+
+	auto s = new McpServer("t", "1");
+	int reads;
+	UiResource res;
+	res.uri = "ui://demo/live";
+	res.name = "live";
+	res.htmlProvider = () @safe {
+		import std.conv : to;
+
+		return "<p>" ~ (++reads).to!string ~ "</p>";
+	};
+	registerUiResource(s, res);
+	Json rp = Json.emptyObject;
+	rp["uri"] = "ui://demo/live";
+	auto first = s.handle(Message(makeRequest(Json(1), "resources/read", rp))).get;
+	auto second = s.handle(Message(makeRequest(Json(2), "resources/read", rp))).get;
+	assert(first["result"]["contents"][0]["text"].get!string == "<p>1</p>");
+	assert(second["result"]["contents"][0]["text"].get!string == "<p>2</p>");
+}
+
+unittest  // a UiResource setting both html and htmlProvider is rejected
+{
+	import std.exception : assertThrown;
+
+	auto s = new McpServer("t", "1");
+	UiResource res = {uri: "ui://demo/both", name: "both", html: "<p>x</p>"};
+	res.htmlProvider = () @safe => "<p>y</p>";
+	assertThrown(registerUiResource(s, res));
 }
