@@ -570,13 +570,21 @@ private AddressClass classifyIpv6Literal(string inner) @safe pure nothrow @nogc
 	if (translated && b[8] == 0xFF && b[9] == 0xFF && b[10] == 0 && b[11] == 0)
 		return classifyIpv4Octets(b[12], b[13], b[14], b[15]);
 
+	// An IPv4 embedded in a 6to4 or NAT64 address is reached through a relay or
+	// gateway, not on this host, so an embedded 127.x is internal but never the
+	// literal-loopback dev allowance.
+	static AddressClass routed(AddressClass c) @safe pure nothrow @nogc
+	{
+		return c == AddressClass.loopback ? AddressClass.privateOrLinkLocal : c;
+	}
+
 	// 6to4 2002::/16 (RFC 3056) carries the relay-routed IPv4 in bytes 2..5.
 	if (b[0] == 0x20 && b[1] == 0x02)
-		return classifyIpv4Octets(b[2], b[3], b[4], b[5]);
+		return routed(classifyIpv4Octets(b[2], b[3], b[4], b[5]));
 
-	// NAT64 prefixes carry an embedded IPv4 in the low 32 bits that a NAT64
-	// gateway translates and routes, so classify that IPv4 the same as ::ffff:.
-	// Well-known 64:ff9b::/96 (RFC 6052): 00 64 ff 9b then bytes 4..11 zero.
+	// NAT64 prefixes carry an embedded IPv4 that a NAT64 gateway translates and
+	// routes. Well-known 64:ff9b::/96 (RFC 6052): 00 64 ff 9b then bytes 4..11
+	// zero, with the IPv4 in the low 32 bits.
 	if (b[0] == 0x00 && b[1] == 0x64 && b[2] == 0xFF && b[3] == 0x9B)
 	{
 		bool wellKnown = true;
@@ -587,10 +595,12 @@ private AddressClass classifyIpv6Literal(string inner) @safe pure nothrow @nogc
 				break;
 			}
 		if (wellKnown)
-			return classifyIpv4Octets(b[12], b[13], b[14], b[15]);
-		// Local-use 64:ff9b:1::/48 (RFC 8215): 00 64 ff 9b 00 01.
+			return routed(classifyIpv4Octets(b[12], b[13], b[14], b[15]));
+		// Local-use 64:ff9b:1::/48 (RFC 8215): 00 64 ff 9b 00 01. Its prefix
+		// length, and so where the IPv4 sits, is a local choice, so the whole
+		// block is internal.
 		if (b[4] == 0x00 && b[5] == 0x01)
-			return classifyIpv4Octets(b[12], b[13], b[14], b[15]);
+			return AddressClass.privateOrLinkLocal;
 	}
 
 	return AddressClass.public_;
@@ -1269,16 +1279,25 @@ unittest  // classifyIpv6Literal classes NAT64 well-known 64:ff9b::/96 embedded 
 {
 	// A NAT64 gateway translates these to the embedded low-32-bit IPv4 and routes it,
 	// reaching loopback / link-local-metadata / RFC1918 internal targets. The embedded
-	// IPv4 is classified exactly as the ::ffff: path does, so each matches the IPv4 class.
-	assert(classifyIpv6Literal("64:ff9b::7f00:1") == AddressClass.loopback); // 127.0.0.1
+	// IPv4 is classified as the ::ffff: path does, except that an embedded 127.x is
+	// reached through the gateway rather than on this host, so it is not loopback.
+	assert(classifyIpv6Literal("64:ff9b::7f00:1") == AddressClass.privateOrLinkLocal); // 127.0.0.1
 	assert(classifyIpv6Literal("64:ff9b::a9fe:a9fe") == AddressClass.privateOrLinkLocal); // 169.254.169.254
 	assert(classifyIpv6Literal("64:ff9b::a00:5") == AddressClass.privateOrLinkLocal); // 10.0.0.5
 }
 
-unittest  // classifyIpv6Literal classes NAT64 local-use 64:ff9b:1::/48 embedded internal IPv4 as internal
+unittest  // classifyIpv6Literal classes the whole NAT64 local-use 64:ff9b:1::/48 as private
 {
-	assert(classifyIpv6Literal("64:ff9b:1::7f00:1") == AddressClass.loopback); // 127.0.0.1
+	assert(classifyIpv6Literal("64:ff9b:1::7f00:1") == AddressClass.privateOrLinkLocal); // 127.0.0.1
 	assert(classifyIpv6Literal("64:ff9b:1::a9fe:a9fe") == AddressClass.privateOrLinkLocal); // 169.254.169.254
+	assert(classifyIpv6Literal("64:ff9b:1::808:808") == AddressClass.privateOrLinkLocal); // 8.8.8.8
+	assert(classifyIpv6Literal("64:ff9b:1:abcd::808:808") == AddressClass.privateOrLinkLocal);
+}
+
+unittest  // embedded 127.x in 6to4 and NAT64 is not the plain-http loopback dev allowance
+{
+	assert(!pinnedConnectAddress("[2002:7f00:1::]", false, SsrfPolicy.allowLoopback).ok);
+	assert(!pinnedConnectAddress("[64:ff9b::7f00:1]", false, SsrfPolicy.allowLoopback).ok);
 }
 
 unittest  // classifyIpv6Literal treats NAT64 with public embedded IPv4 like ::ffff: public embedded
@@ -1326,7 +1345,7 @@ unittest  // classifyIpv4Octets classes IETF protocol-assignment, benchmarking a
 
 unittest  // classifyIpv6Literal classifies the IPv4 embedded in a 6to4 2002::/16 address
 {
-	assert(classifyIpv6Literal("2002:7f00:1::1") == AddressClass.loopback); // 127.0.0.1
+	assert(classifyIpv6Literal("2002:7f00:1::1") == AddressClass.privateOrLinkLocal); // 127.0.0.1
 	assert(classifyIpv6Literal("2002:a9fe:a9fe::") == AddressClass.privateOrLinkLocal); // 169.254.169.254
 	assert(classifyIpv6Literal("2002:a00:5::1") == AddressClass.privateOrLinkLocal); // 10.0.0.5
 	assert(classifyIpv6Literal("2002:808:808::1") == AddressClass.public_); // 8.8.8.8
