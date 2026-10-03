@@ -3062,6 +3062,8 @@ final class McpClient : ClientProtocol
 		void delegate(EventControl) @safe onControl;
 		SubscriptionStream stream;
 		long lastFrameMs;
+		// When `stream` was opened, to tell a stream the server ends at once.
+		long openedMs;
 		// Emitted when `stream` ends, so the watchdog wakes at once rather than at
 		// its next scheduled check; `wakeCount` is its emit count when `stream`
 		// was opened.
@@ -3084,6 +3086,7 @@ final class McpClient : ClientProtocol
 	private void openManagedStream(EventSubscription sub, ManagedStream ms, Nullable!string cursor) @safe
 	{
 		ms.lastFrameMs = eventNowMs();
+		ms.openedMs = ms.lastFrameMs;
 		ms.wakeCount = ms.wake.emitCount;
 		auto sp = ms.params;
 		sp.cursor = cursor;
@@ -3109,10 +3112,14 @@ final class McpClient : ClientProtocol
 	/// that window closes it and reopens it from
 	/// the subscription's last cursor. A transient failure (connection loss, HTTP
 	/// 5xx/408/429, internal error) is retried, backing off exponentially across
-	/// consecutive failed reopens; any other failure — the server refusing or
-	/// failing the stream — ends the subscription and is reported to `onControl`
-	/// as an `error` control. Ends when the subscription is cancelled or
-	/// terminated, or when reconnection is disabled. Seam-driven for tests.
+	/// consecutive failed reopens; so is a stream that ends before its leading
+	/// frame or within `minStreamLifetime` of opening, so a server that keeps
+	/// ending streams cannot drive a tight reconnect loop. While backing off, the
+	/// watchdog waits out the whole delay even if the stream ends. Any other
+	/// failure — the server refusing or failing the stream — ends the
+	/// subscription and is reported to `onControl` as an `error` control. Ends
+	/// when the subscription is cancelled or terminated, or when reconnection is
+	/// disabled. Seam-driven for tests.
 	package void runStreamWatchdog(EventSubscription sub) @safe
 	{
 		auto msp = sub in managedStreams_;
@@ -3125,7 +3132,7 @@ final class McpClient : ClientProtocol
 			const dead = eventSettings_.streamDeadAfter;
 			if (dead <= Duration.zero)
 				return;
-			streamWatchSleep(ms, dead * (1L << (failures < 5 ? failures : 5)));
+			streamWatchSleep(ms, dead * (1L << (failures < 5 ? failures : 5)), failures == 0);
 			if (!sub.active || closed_)
 				return;
 			if (!ms.stream.ended && eventNowMs() - ms.lastFrameMs < dead.total!"msecs")
@@ -3135,11 +3142,14 @@ final class McpClient : ClientProtocol
 				endManagedStream(sub, ms, ms.stream.error);
 				return;
 			}
+			const shortLived = ms.stream.ended
+				&& eventNowMs() - ms.openedMs < minStreamLifetime.total!"msecs";
 			ms.stream.close();
 			try
 			{
 				openManagedStream(sub, ms, sub.cursor());
-				failures = 0;
+				// A stream that is already over came back without its leading frame.
+				failures = shortLived || ms.stream.ended ? failures + 1 : 0;
 			}
 			catch (McpException e)
 			{
@@ -3228,17 +3238,27 @@ final class McpClient : ClientProtocol
 		reportEventError(ms.onControl, e);
 	}
 
+	/// How long a managed push stream must stay open for its reopen to count
+	/// as successful.
+	private enum minStreamLifetime = 1.seconds;
+
 	/// Wait up to `d` between watchdog checks, returning early once `ms`'s
-	/// current stream ends. A test seam runs the loop synchronously.
-	private void streamWatchSleep(ManagedStream ms, Duration d) @safe
+	/// current stream ends when `wakeOnEnd` is set. A test seam runs the loop
+	/// synchronously.
+	private void streamWatchSleep(ManagedStream ms, Duration d, bool wakeOnEnd) @safe
 	{
+		import vibe.core.core : sleep;
+
 		version (unittest)
 			if (onStreamWatchSleepForTest !is null)
 			{
 				onStreamWatchSleepForTest(d);
 				return;
 			}
-		ms.wake.wait(d, ms.wakeCount);
+		if (wakeOnEnd)
+			ms.wake.wait(d, ms.wakeCount);
+		else
+			sleep(d);
 	}
 
 	/// Monotonic milliseconds for stream liveness. A test seam supplies the clock.
@@ -8896,6 +8916,9 @@ version (unittest)
 		SubscriptionStream[] streams; // every stream openListen returned, in order
 		// Failures thrown by the next openListen calls, consumed front first.
 		McpException[] listenFailures;
+		// When set, openListen returns a stream the server already ended cleanly,
+		// as one that closes before its leading frame.
+		bool listensEndAtOpen;
 
 		SubscriptionStream openListen(Json message) @safe
 		{
@@ -8908,6 +8931,8 @@ version (unittest)
 			}
 			auto cancelled = () @trusted { return new shared bool(false); }();
 			streams ~= new SubscriptionStream(cancelled);
+			if (listensEndAtOpen)
+				streams[$ - 1].finish();
 			return streams[$ - 1];
 		}
 
@@ -10496,6 +10521,49 @@ unittest  // transient reopen failures back off between attempts
 	assert(sleeps[1] > sleeps[0] && sleeps[2] > sleeps[1] && sleeps[3] > sleeps[2],
 			"consecutive failures must back off");
 	assert(sleeps[4] == sleeps[0], "a successful reopen must reset the backoff");
+}
+
+unittest  // reopens that end before their leading frame back off between attempts
+{
+	auto t = new RecordingClientTransport();
+	auto c = new McpClient(t);
+	long now = 0;
+	c.onEventNowForTest = () @safe => now;
+	auto sub = c.subscribeStream(StreamParams("incident.created"), null);
+	now = 10_000;
+	t.streams[0].finish();
+	t.listensEndAtOpen = true;
+	Duration[] sleeps;
+	c.onStreamWatchSleepForTest = (Duration d) @safe {
+		sleeps ~= d;
+		now += d.total!"msecs" + 1;
+		if (sleeps.length == 4)
+			sub.cancel();
+	};
+	c.runStreamWatchdog(sub);
+	assert(sleeps[2] > sleeps[1] && sleeps[3] > sleeps[2],
+			"a stream that ends before its leading frame must count as a failed reopen");
+}
+
+unittest  // streams the server keeps ending right after they open back off between reopens
+{
+	auto t = new RecordingClientTransport();
+	auto c = new McpClient(t);
+	long now = 0;
+	c.onEventNowForTest = () @safe => now;
+	auto sub = c.subscribeStream(StreamParams("incident.created"), null);
+	Duration[] sleeps;
+	c.onStreamWatchSleepForTest = (Duration d) @safe {
+		sleeps ~= d;
+		// The stream opened at `now` ends at once, so it lived no time at all.
+		t.streams[$ - 1].finish();
+		if (sleeps.length == 4)
+			sub.cancel();
+	};
+	c.runStreamWatchdog(sub);
+	assert(t.listens.length == 4);
+	assert(sleeps[1] > sleeps[0] && sleeps[2] > sleeps[1],
+			"a stream that ends as soon as it opens must count as a failed reopen");
 }
 
 unittest  // close() cancels every open subscriptions/listen stream
