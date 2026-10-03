@@ -883,19 +883,29 @@ version (unittest)
 	import vibe.core.core : runTask, runEventLoop, exitEventLoop, yield;
 }
 
-// Run `body` inside a vibe task + event loop, exiting the loop when it returns.
+// Run `body` inside a vibe task + event loop, exiting the loop when it returns,
+// and rethrow anything it threw so the calling test fails.
 version (unittest) private void inLoop(scope void delegate() @safe body) @trusted
 {
+	Exception failure;
 	runTask(() nothrow{
 		scope (exit)
 			exitEventLoop();
 		try
 			body();
-		catch (Exception)
-		{
-		}
+		catch (Exception e)
+			failure = e;
 	});
 	runEventLoop();
+	if (failure !is null)
+		throw failure;
+}
+
+unittest  // inLoop propagates an exception thrown by its body
+{
+	import std.exception : assertThrown;
+
+	assertThrown!Exception(inLoop(() @safe { throw new Exception("boom"); }));
 }
 
 unittest  // stdio openListen writes the subscriptions/listen request to the server (2026-07-28)
