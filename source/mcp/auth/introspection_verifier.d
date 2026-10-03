@@ -298,9 +298,14 @@ private string postIntrospect(IntrospectionConfig cfg, string token) @trusted
 /// Every `put` sweeps entries whose `expiresAt` is in the past, and when a new
 /// key would push `entries.length` past `maxEntries`, the entry with the earliest
 /// `expiresAt` is evicted. This keeps memory bounded under sustained load with
-/// many distinct short-lived tokens.
+/// many distinct short-lived tokens. Entries are also ordered by expiry, so a
+/// sweep visits only the expired entries and an eviction takes the first one:
+/// a `put` costs O(log n) plus the entries it removes.
 final class PositiveCache
 {
+	import std.container.rbtree : RedBlackTree;
+	import std.typecons : Tuple;
+
 	/// Default maximum number of live cache entries.
 	enum size_t defaultMaxEntries = 10_000;
 
@@ -310,14 +315,19 @@ final class PositiveCache
 		long expiresAt; // unix seconds
 	}
 
+	private alias Expiry = Tuple!(long, "at", string, "token");
+
 	private Duration ttl;
 	private size_t maxEntries;
 	private Entry[string] entries;
+	// One element per entry, ordered by (expiresAt, token).
+	private RedBlackTree!Expiry byExpiry;
 
 	this(Duration ttl, size_t maxEntries = defaultMaxEntries) @safe
 	{
 		this.ttl = ttl;
 		this.maxEntries = maxEntries;
+		this.byExpiry = new RedBlackTree!Expiry;
 	}
 
 	/// Number of live (not yet swept) entries.
@@ -333,7 +343,7 @@ final class PositiveCache
 		{
 			if (now < e.expiresAt)
 				return &e.info;
-			entries.remove(token);
+			remove(token, e.expiresAt);
 		}
 		return null;
 	}
@@ -352,42 +362,26 @@ final class PositiveCache
 		if (expiresAt <= now)
 			return; // token is already expired — nothing to cache
 		sweep(now);
-		if (maxEntries != 0 && (token in entries) is null)
+		if (auto old = token in entries)
+			remove(token, old.expiresAt);
+		else if (maxEntries != 0)
 			while (entries.length >= maxEntries)
-				evictOldest();
+				remove(byExpiry.front.token, byExpiry.front.at);
 		entries[token] = Entry(info, expiresAt);
+		byExpiry.insert(Expiry(expiresAt, token));
 	}
 
 	// Remove all entries whose expiresAt is not in the future.
 	private void sweep(long now) @safe
 	{
-		if (entries.length == 0)
-			return;
-		string[] expired;
-		foreach (k, ref e; entries)
-			if (now >= e.expiresAt)
-				expired ~= k;
-		foreach (k; expired)
-			entries.remove(k);
+		while (!byExpiry.empty && byExpiry.front.at <= now)
+			remove(byExpiry.front.token, byExpiry.front.at);
 	}
 
-	// Evict the entry with the earliest expiresAt (closest to expiry / most stale).
-	private void evictOldest() @safe
+	private void remove(string token, long expiresAt) @safe
 	{
-		string oldest;
-		long oldestExpiry = long.max;
-		bool found;
-		foreach (k, ref e; entries)
-		{
-			if (!found || e.expiresAt < oldestExpiry)
-			{
-				oldest = k;
-				oldestExpiry = e.expiresAt;
-				found = true;
-			}
-		}
-		if (found)
-			entries.remove(oldest);
+		byExpiry.removeKey(Expiry(expiresAt, token));
+		entries.remove(token);
 	}
 }
 
@@ -852,6 +846,49 @@ unittest  // PositiveCache sweeps expired entries on put, reclaiming space
 	assert(cache.get("a", 1031) is null);
 	assert(cache.get("b", 1031) is null);
 	assert(cache.get("c", 1031) !is null);
+}
+
+unittest  // PositiveCache drops expired entries from its length once a later put runs
+{
+	auto cache = new PositiveCache(30.seconds, 10);
+	TokenInfo ti;
+	ti.valid = true;
+	cache.put("a", ti, 1000);
+	cache.put("b", ti, 1000);
+	cache.put("c", ti, 1031);
+	assert(cache.length == 1);
+}
+
+unittest  // PositiveCache evicts the soonest-expiring entry when full
+{
+	auto cache = new PositiveCache(60.seconds, 2);
+	TokenInfo late, soon;
+	late.valid = soon.valid = true;
+	soon.claims = parseJsonString(`{"active":true,"exp":1010}`);
+	cache.put("late", late, 1000);
+	cache.put("soon", soon, 1000);
+	cache.put("new", late, 1001);
+	assert(cache.get("soon", 1001) is null);
+	assert(cache.get("late", 1001) !is null);
+	assert(cache.get("new", 1001) !is null);
+}
+
+unittest  // PositiveCache re-putting a token moves its expiry for eviction and sweeping
+{
+	auto cache = new PositiveCache(60.seconds, 2);
+	TokenInfo ti;
+	ti.valid = true;
+	cache.put("a", ti, 1000); // expires 1060
+	cache.put("b", ti, 1010); // expires 1070
+	cache.put("a", ti, 1020); // now expires 1080, so "b" expires first
+	assert(cache.length == 2);
+	cache.put("c", ti, 1030);
+	assert(cache.get("b", 1030) is null);
+	assert(cache.get("a", 1030) !is null);
+	cache.put("d", ti, 1075); // "c" (1090) and "a" (1080) are both still live
+	assert(cache.length == 2);
+	assert(cache.get("a", 1075) is null, "the cap evicts the soonest-expiring entry");
+	assert(cache.get("c", 1075) !is null);
 }
 
 unittest  // PositiveCache skips storing a token whose exp claim is already in the past
