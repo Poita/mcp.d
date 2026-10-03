@@ -883,13 +883,11 @@ struct PinnedConnect
 /// included); only a fail-closed classification (unresolvable / malformed)
 /// is rejected.
 ///
-/// The returned `pinnedIp` has any `:port` suffix stripped and bracketing
-/// preserved for IPv6 so the caller pins the connection to the vetted address.
+/// The returned `pinnedIp` is the bare numeric address `classifyHost` vetted
+/// (no port, IPv6 unbracketed) so the caller pins the connection to it.
 /// `@safe`.
 PinnedConnect pinnedConnectAddress(string host, bool tls, SsrfPolicy policy) @safe
 {
-	import std.string : indexOf;
-
 	PinnedConnect r;
 	string pinned;
 	const cls = classifyHost(host, pinned);
@@ -920,22 +918,7 @@ PinnedConnect pinnedConnectAddress(string host, bool tls, SsrfPolicy policy) @sa
 	// off — vibe's TLS layer wants the bare name).
 	r.sniHost = stripPortAndBrackets(host);
 
-	// Strip a port suffix from the pinned address (the caller keeps its own port).
-	string connHost = pinned;
-	if (connHost.length && connHost[0] == '[')
-	{
-		const close = connHost.indexOf(']');
-		if (close > 0)
-			connHost = connHost[1 .. close];
-	}
-	else if (connHost.length)
-	{
-		const c = connHost.indexOf(':');
-		// IPv4/host:port carries a single ':'; a bracketless IPv6 literal has many.
-		if (c >= 0 && connHost.indexOf(':', c + 1) < 0)
-			connHost = connHost[0 .. c];
-	}
-	r.pinnedIp = connHost;
+	r.pinnedIp = pinned;
 	r.ok = true;
 	return r;
 }
