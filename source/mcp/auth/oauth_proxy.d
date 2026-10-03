@@ -615,11 +615,21 @@ final class InMemoryRedirectUriRegistry : RedirectUriRegistry
 {
 	import core.time : MonoTime;
 
-	private string[][string] byHandle;
-	private string[] order;
-	private string[][string] handlesByUri;
-	private bool[string] usedHandles;
-	private MonoTime[string] registeredAt;
+	/// One registration, linked into the all-registrations list (oldest first)
+	/// and, while unused, the unused list (oldest first), so lookup, removal and
+	/// eviction are constant time.
+	private static final class Registration
+	{
+		string handle;
+		string[] uris;
+		MonoTime registeredAt;
+		bool used;
+		Registration prevAll, nextAll, prevUnused, nextUnused;
+	}
+
+	private Registration[string] byHandle;
+	private Registration allHead, allTail, unusedHead, unusedTail;
+	private bool[string][string] handlesByUri;
 	private const RedirectUriRegistryOptions opts;
 
 	this() @safe
@@ -636,17 +646,18 @@ final class InMemoryRedirectUriRegistry : RedirectUriRegistry
 	{
 		// Re-registering a handle replaces its URIs and gives it a fresh slot at the
 		// back of the eviction order.
-		if (registrationHandle in byHandle)
-			removeHandle(registrationHandle);
+		if (auto r = registrationHandle in byHandle)
+			removeRegistration(*r);
 		sweepExpired();
-		string[] uris;
-		foreach (u; redirectUris)
-			uris ~= u;
-		byHandle[registrationHandle] = uris;
-		order ~= registrationHandle;
-		registeredAt[registrationHandle] = now();
-		foreach (u; uris)
-			handlesByUri[u] ~= registrationHandle;
+		auto r = new Registration;
+		r.handle = registrationHandle;
+		r.uris = redirectUris.dup;
+		r.registeredAt = now();
+		byHandle[registrationHandle] = r;
+		linkAll(r);
+		linkUnused(r);
+		foreach (u; r.uris)
+			handlesByUri[u][registrationHandle] = true;
 		enforceCap();
 	}
 
@@ -657,18 +668,26 @@ final class InMemoryRedirectUriRegistry : RedirectUriRegistry
 		auto hs = redirectUri in handlesByUri;
 		if (hs is null)
 			return false;
-		foreach (h; *hs)
-			if (!isExpired(h))
+		foreach (h; (*hs).byKey)
+			if (!isExpired(byHandle[h]))
 				return true;
 		return false;
 	}
 
 	override void markUsed(string redirectUri) @safe
 	{
-		if (auto hs = redirectUri in handlesByUri)
-			foreach (h; *hs)
-				if (!isExpired(h))
-					usedHandles[h] = true;
+		auto hs = redirectUri in handlesByUri;
+		if (hs is null)
+			return;
+		foreach (h; (*hs).byKey)
+		{
+			auto r = byHandle[h];
+			if (!isExpired(r))
+			{
+				unlinkUnused(r);
+				r.used = true;
+			}
+		}
 	}
 
 	private MonoTime now() @safe
@@ -676,74 +695,92 @@ final class InMemoryRedirectUriRegistry : RedirectUriRegistry
 		return opts.clock !is null ? opts.clock() : MonoTime.currTime;
 	}
 
-	private bool isExpired(string handle) @safe
+	private bool isExpired(Registration r) @safe
 	{
-		if (handle in usedHandles)
-			return false;
-		auto at = handle in registeredAt;
-		return at is null || now() - *at >= opts.unusedTtl;
+		return !r.used && now() - r.registeredAt >= opts.unusedTtl;
 	}
 
-	// Drop expired unused registrations. `order` is oldest first, so the sweep
-	// stops at the first unused registration that is still live.
+	// Drop expired unused registrations. The unused list is oldest first, so the
+	// sweep stops at the first one that is still live.
 	private void sweepExpired() @safe
 	{
-		string[] expired;
-		foreach (h; order)
-		{
-			if (h in usedHandles)
-				continue;
-			if (!isExpired(h))
-				break;
-			expired ~= h;
-		}
-		foreach (h; expired)
-			removeHandle(h);
+		while (unusedHead !is null && isExpired(unusedHead))
+			removeRegistration(unusedHead);
 	}
 
-	private void removeHandle(string handle) @safe
+	private void removeRegistration(Registration r) @safe
 	{
-		import std.algorithm : countUntil, remove;
-
-		if (auto p = handle in byHandle)
+		foreach (u; r.uris)
 		{
-			foreach (u; *p)
+			if (auto hs = u in handlesByUri)
 			{
-				if (auto hs = u in handlesByUri)
-				{
-					const i = (*hs).countUntil(handle);
-					if (i >= 0)
-						*hs = (*hs).dup.remove(i);
-					if ((*hs).length == 0)
-						handlesByUri.remove(u);
-				}
+				(*hs).remove(r.handle);
+				if ((*hs).length == 0)
+					handlesByUri.remove(u);
 			}
-			byHandle.remove(handle);
 		}
-		usedHandles.remove(handle);
-		registeredAt.remove(handle);
-		const at = order.countUntil(handle);
-		if (at >= 0)
-			order = order.dup.remove(at);
+		byHandle.remove(r.handle);
+		unlinkAll(r);
+		unlinkUnused(r);
 	}
 
 	private void enforceCap() @safe
 	{
-		while (order.length > opts.maxRegistrations)
+		while (byHandle.length > opts.maxRegistrations)
 		{
-			// The newest registration is exempt, so a registry full of in-use
-			// clients still admits a new one (evicting the oldest).
-			string victim = order[0];
-			foreach (h; order[0 .. $ - 1])
-			{
-				if (h !in usedHandles)
-				{
-					victim = h;
-					break;
-				}
-			}
-			removeHandle(victim);
+			// Evict the oldest unused registration. The newest registration is
+			// exempt, so a registry full of in-use clients still admits a new one
+			// (evicting the oldest).
+			removeRegistration(unusedHead !is null && unusedHead !is allTail ? unusedHead : allHead);
 		}
+	}
+
+	private void linkAll(Registration r) @safe
+	{
+		r.prevAll = allTail;
+		if (allTail !is null)
+			allTail.nextAll = r;
+		else
+			allHead = r;
+		allTail = r;
+	}
+
+	private void unlinkAll(Registration r) @safe
+	{
+		if (r.prevAll !is null)
+			r.prevAll.nextAll = r.nextAll;
+		else
+			allHead = r.nextAll;
+		if (r.nextAll !is null)
+			r.nextAll.prevAll = r.prevAll;
+		else
+			allTail = r.prevAll;
+		r.prevAll = r.nextAll = null;
+	}
+
+	private void linkUnused(Registration r) @safe
+	{
+		r.prevUnused = unusedTail;
+		if (unusedTail !is null)
+			unusedTail.nextUnused = r;
+		else
+			unusedHead = r;
+		unusedTail = r;
+	}
+
+	private void unlinkUnused(Registration r) @safe
+	{
+		if (r.used)
+			return;
+		if (r.prevUnused !is null)
+			r.prevUnused.nextUnused = r.nextUnused;
+		else
+			unusedHead = r.nextUnused;
+		if (r.nextUnused !is null)
+			r.nextUnused.prevUnused = r.prevUnused;
+		else
+			unusedTail = r.prevUnused;
+		r.prevUnused = r.nextUnused = null;
 	}
 }
 
@@ -2878,6 +2915,35 @@ unittest  // REDIRECT REGISTRY: looking a registration up does not shield it fro
 		assert(reg.isRegistered(uri));
 	}
 	assert(reg.isRegistered("https://app.example/cb"));
+}
+
+unittest  // REDIRECT REGISTRY: a /register flood at the cap evicts in constant time per registration
+{
+	import core.time : seconds;
+	import std.conv : to;
+	import std.datetime.stopwatch : AutoStart, StopWatch;
+
+	// Every flood registration names the same URI, so one handle list and the
+	// eviction order both sit at the cap; a linear-cost eviction makes this
+	// quadratic and blows well past the bound.
+	auto reg = new InMemoryRedirectUriRegistry();
+	auto sw = StopWatch(AutoStart.yes);
+	foreach (i; 0 .. 60_000)
+		reg.register("flood-" ~ i.to!string, ["https://flood.example/cb"]);
+	assert(sw.peek < 5.seconds);
+	assert(reg.isRegistered("https://flood.example/cb"));
+}
+
+unittest  // REDIRECT REGISTRY: an evicted registration's URI stays registered via a newer one
+{
+	auto reg = new InMemoryRedirectUriRegistry(RedirectUriRegistryOptions(2));
+	reg.register("a", ["https://shared.example/cb", "https://a.example/cb"]);
+	reg.register("b", ["https://shared.example/cb"]);
+	reg.register("c", ["https://c.example/cb"]); // evicts a
+	assert(!reg.isRegistered("https://a.example/cb"));
+	assert(reg.isRegistered("https://shared.example/cb"));
+	reg.register("d", ["https://d.example/cb"]); // evicts b
+	assert(!reg.isRegistered("https://shared.example/cb"));
 }
 
 unittest  // REDIRECT REGISTRY: an unused registration expires after the unused TTL
