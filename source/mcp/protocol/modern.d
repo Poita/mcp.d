@@ -601,8 +601,8 @@ unittest  // parseCacheHint accepts a float ttlMs (ms) and defaults cacheScope t
 unittest  // parseCacheHint reads an unrecognized or non-string cacheScope as private
 {
 	foreach (scope_; [
-			Json("PRIVATE"), Json("shared"), Json(""), Json(1), Json(null)
-		])
+		Json("PRIVATE"), Json("shared"), Json(""), Json(1), Json(null)
+	])
 	{
 		Json r = Json.emptyObject;
 		r["ttlMs"] = 1000;

@@ -2137,7 +2137,7 @@ unittest  // notifyPrincipal with an empty principal reaches no stream
 	ch.addListener((string fr) @safe { anon1 = fr; }, Json("l-1"), f);
 	ch.addListener((string fr) @safe { anon2 = fr; }, Json("l-2"), f);
 	assert(ch.notifyPrincipal("", "notifications/tasks", Json([
-				"taskId": Json("t1")
+		"taskId": Json("t1")
 	])) == 0);
 	assert(anon1.length == 0 && anon2.length == 0);
 }
