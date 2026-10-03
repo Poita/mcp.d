@@ -87,6 +87,11 @@ final class TaskRuntime
 	// client ever learns.
 	private bool[string] silenced_;
 
+	/// Whether a task executor's unexpected (non-`McpException`) exception message
+	/// is recorded as the failed task's error, rather than a generic "Internal
+	/// error". Set by `McpServer.exposeInternalErrors`.
+	bool exposeInternalErrors;
+
 	this(TaskOptions opts) @safe
 	{
 		store_ = (opts.store is null) ? new InMemoryTaskStore() : opts.store;

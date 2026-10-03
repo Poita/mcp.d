@@ -317,15 +317,24 @@ private void drive(ref TaskContext tc, TaskExecutor executor) @safe
 	}
 	catch (Exception e)
 	{
+		import vibe.core.log : logError;
+
 		if (tc.outcome_.unwound)
 			return;
 		if (tc.cancelRequested())
 			settleCancelled();
 		else
+		{
+			// The task error is visible to clients via tasks/get and
+			// notifications/tasks, so an unexpected exception's message (which can
+			// carry paths, SQL or other internals) is logged and replaced with a
+			// generic one unless the server exposes internal errors.
+			logError("task %s: executor threw %s: %s", taskId, typeid(e).name, e.msg);
 			rt.fail(taskId, Json([
-			"code": Json(cast(int) ErrorCode.internalError),
-			"message": Json(e.msg)
-		]));
+				"code": Json(cast(int) ErrorCode.internalError),
+				"message": Json(rt.exposeInternalErrors ? e.msg : "Internal error")
+			]));
+		}
 	}
 }
 
@@ -503,10 +512,37 @@ unittest  // detach(statusMessage) records a working status message
 	assert(d["statusMessage"].get!string == "deploying");
 }
 
-unittest  // an executor that throws fails the task with a JSON-RPC error
+version (unittest)
 {
-	import mcp.server.task_store : InMemoryTaskStore;
+	import vibe.core.log : LogLevel, Logger, LogLine;
+
+	// Records the text of every error-or-higher log line.
+	private final class CaptureLogger : Logger
+	{
+		string[] lines;
+		this() @safe
+		{
+			minLevel = LogLevel.error;
+		}
+
+		override void log(ref LogLine line) @safe
+		{
+			lines ~= line.text;
+		}
+	}
+}
+
+unittest  // an executor that throws fails the task with a generic internal error
+{
+	import std.algorithm : any, canFind;
+	import vibe.core.log : deregisterLogger, registerLogger;
 	import mcp.server.task_runtime : TaskOptions;
+
+	auto logger = new CaptureLogger;
+	auto shared_ = () @trusted { return cast(shared) logger; }();
+	() @trusted { registerLogger(shared_); }();
+	scope (exit)
+		() @trusted { deregisterLogger(shared_); }();
 
 	auto rt = new TaskRuntime(TaskOptions.init);
 	auto t = rt.createFor("boom", Json.undefined);
@@ -515,7 +551,38 @@ unittest  // an executor that throws fails the task with a JSON-RPC error
 	});
 	auto d = rt.getDetailed(t.taskId);
 	assert(d["status"].get!string == "failed");
+	assert(d["error"]["code"].get!int == cast(int) ErrorCode.internalError);
+	assert(d["error"]["message"].get!string == "Internal error");
+	auto lines = () @trusted { return (cast() logger).lines; }();
+	assert(lines.any!(l => l.canFind("kaboom")));
+}
+
+unittest  // exposeInternalErrors records a throwing executor's own message
+{
+	import mcp.server.task_runtime : TaskOptions;
+
+	auto rt = new TaskRuntime(TaskOptions.init);
+	rt.exposeInternalErrors = true;
+	auto t = rt.createFor("boom", Json.undefined);
+	runTaskExecutor(rt, t.taskId, delegate Json(TaskContext tc) @safe {
+		throw new Exception("kaboom");
+	});
+	auto d = rt.getDetailed(t.taskId);
+	assert(d["status"].get!string == "failed");
 	assert(d["error"]["message"].get!string == "kaboom");
+}
+
+unittest  // an executor's McpException message is recorded verbatim
+{
+	import mcp.server.task_runtime : TaskOptions;
+	import mcp.protocol.errors : invalidParams;
+
+	auto rt = new TaskRuntime(TaskOptions.init);
+	auto t = rt.createFor("boom", Json.undefined);
+	runTaskExecutor(rt, t.taskId, delegate Json(TaskContext tc) @safe {
+		throw invalidParams("bad input");
+	});
+	assert(rt.getDetailed(t.taskId)["error"]["message"].get!string == "bad input");
 }
 
 unittest  // a cancel observed during the run marks the task cancelled, not completed

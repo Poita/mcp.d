@@ -717,6 +717,8 @@ final class McpServer : ServerCore
 		exposeInternalErrors_ = true;
 		if (eventsRuntime_ !is null)
 			eventsRuntime_.exposeInternalErrors = true;
+		if (taskRuntime_ !is null)
+			taskRuntime_.exposeInternalErrors = true;
 	}
 
 	/// The JSON-RPC error a non-`McpException` thrown while serving `method`
@@ -1208,6 +1210,7 @@ final class McpServer : ServerCore
 		if (taskRuntime_ !is null)
 			taskRuntime_.stopSweeper();
 		taskRuntime_ = new TaskRuntime(opts);
+		taskRuntime_.exposeInternalErrors = exposeInternalErrors_;
 		taskDispatcher_ = (opts.dispatcher is null) ? new InProcessTaskDispatcher()
 			: opts.dispatcher;
 		taskRuntime_.onStatusChange((Json detailed, string owner) @safe {
@@ -12090,6 +12093,18 @@ unittest  // McpServer.exposeInternalErrors reaches the events runtime in either
 	assert(before.enableEvents().exposeInternalErrors);
 	auto after = McpServer.stateless("t", "1");
 	auto rt = after.enableEvents();
+	assert(!rt.exposeInternalErrors);
+	after.exposeInternalErrors();
+	assert(rt.exposeInternalErrors);
+}
+
+unittest  // McpServer.exposeInternalErrors reaches the task runtime in either call order
+{
+	auto before = McpServer.stateless("t", "1");
+	before.exposeInternalErrors();
+	assert(before.enableTasks().exposeInternalErrors);
+	auto after = McpServer.stateless("t", "1");
+	auto rt = after.enableTasks();
 	assert(!rt.exposeInternalErrors);
 	after.exposeInternalErrors();
 	assert(rt.exposeInternalErrors);
