@@ -293,27 +293,32 @@ final class EventHandle(A, P)
 	// Deserialize subscription arguments leniently: arguments are partial filters,
 	// so a field absent from the request keeps its `A.init` default rather than
 	// erroring (vibe's whole-object deserialize requires every non-optional field).
-	// Each present field is assigned individually, through `EnumByNamePolicy` so any
+	// Each present field is read from its serialized name (the key the inputSchema
+	// advertises) and assigned individually, through `EnumByNamePolicy` so any
 	// enum field round-trips by its schema-declared member name.
 	private A argsOf(Json j) @safe
 	{
 		import std.traits : FieldNameTuple;
+		import mcp.api.binding : isBoundField, wireFieldName;
 
 		A result;
 		if (j.type == Json.Type.object)
 			static foreach (f; FieldNameTuple!A)
-				() @trusted {
-					if (auto p = f in j)
-						{
-						try
-							__traits(getMember, result, f) = deserializeWithPolicy!(JsonSerializer,
-									EnumByNamePolicy, typeof(__traits(getMember, result, f)))(*p);
-						catch (McpException e)
-							throw e;
-						catch (Exception e)
-							throw invalidParams("argument '" ~ f ~ "': " ~ e.msg);
-					}
-				}();
+				static if (isBoundField!(A, f))
+					() @trusted {
+						enum key = wireFieldName!(A, f);
+						if (auto p = key in j)
+							{
+							try
+								__traits(getMember, result, f) = deserializeWithPolicy!(
+										JsonSerializer, EnumByNamePolicy,
+										typeof(__traits(getMember, result, f)))(*p);
+							catch (McpException e)
+								throw e;
+							catch (Exception e)
+								throw invalidParams("argument '" ~ key ~ "': " ~ e.msg);
+						}
+					}();
 		return result;
 	}
 
@@ -869,7 +874,7 @@ final class EventsRuntime
 	/// `description` or `title` is left unset.
 	EventHandle!(A, P) define(A, P)(string name, string description = "", string title = "") @safe
 	{
-		import mcp.protocol.schema : jsonSchemaOf;
+		import mcp.api.binding : schemaOf, SchemaUse;
 
 		EventRegistration reg;
 		reg.descriptor.name = name;
@@ -877,13 +882,15 @@ final class EventsRuntime
 			reg.descriptor.description = description;
 		if (title.length)
 			reg.descriptor.title = title;
-		// Subscription arguments are filters: an absent field means "no filter" and
-		// deserializes to the field's default, so the advertised schema declares
-		// every field optional rather than the generator's non-Nullable => required.
-		reg.descriptor.inputSchema = jsonSchemaOf!A;
+		// Both schemas key each field by its serialized name (vibe's `@name`, or the
+		// field name without a trailing `_`), matching the arguments `argsOf` reads
+		// and the payloads `publish` writes. Subscription arguments are filters: an
+		// absent field means "no filter" and deserializes to the field's default, so
+		// the advertised schema declares every field optional.
+		reg.descriptor.inputSchema = schemaOf!(A, SchemaUse.input);
 		if (reg.descriptor.inputSchema.type == Json.Type.object)
 			reg.descriptor.inputSchema.remove("required");
-		reg.descriptor.payloadSchema = jsonSchemaOf!P;
+		reg.descriptor.payloadSchema = schemaOf!(P, SchemaUse.output);
 		reg.emitOnly = true;
 		register(reg);
 		return new EventHandle!(A, P)(this, name);
@@ -8229,4 +8236,45 @@ unittest  // an EventHandle setter keeps changes made through the raw register()
 	h.pollInterval(5.seconds);
 	assert(rt.types_["x"].descriptor.description == "set via register");
 	assert(rt.types_["x"].pollInterval.get == 5.seconds);
+}
+
+version (unittest)
+{
+	private struct WireArgs
+	{
+		string version_;
+	}
+
+	private struct WirePayload
+	{
+		import vibe.data.serialization : name;
+
+		int version_;
+		@name("kind") string type_;
+	}
+}
+
+unittest  // a typed event type's schemas use the fields' serialized names
+{
+	auto rt = testRuntime();
+	rt.define!(WireArgs, WirePayload)("wire");
+	auto payload = rt.types_["wire"].descriptor.payloadSchema["properties"];
+	assert("version" in payload && "kind" in payload);
+	assert("version_" !in payload && "type_" !in payload);
+	auto input = rt.types_["wire"].descriptor.inputSchema["properties"];
+	assert("version" in input && "version_" !in input);
+}
+
+unittest  // a typed event's arguments are read by their serialized names
+{
+	auto rt = testRuntime();
+	string seen;
+	auto h = rt.define!(WireArgs, WirePayload)("wire");
+	h.onFetch((WireArgs a, scope FetchContext ctx) @safe {
+		seen = a.version_;
+		return EventBatch!WirePayload.empty("c1");
+	});
+	rt.poll("wire", Json(["version": Json("v2")]), "", nullable("c0"),
+			Nullable!long.init, Nullable!long.init);
+	assert(seen == "v2");
 }
