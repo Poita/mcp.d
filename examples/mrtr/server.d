@@ -49,8 +49,6 @@ module mrtr_server;
 import std.typecons : nullable, Nullable;
 
 import mcp;
-import mcp.protocol.mrtr : InputRequest;
-import mcp.protocol.sampling : CreateMessageRequest, SamplingMessage;
 
 import examples_common : runServerFromArgs;
 

@@ -190,14 +190,23 @@ unittest
 	static assert(!visibleFromMcp!"readRequestState");
 }
 
-// The MRTR request/response shapes live in `mcp.protocol.mrtr` and are
-// transport plumbing, not top-level public surface: they stay out of
-// `import mcp;`.
+// The MRTR shapes the public result/response API names
+// (`CallToolResult.inputRequests`, `ToolResponse.inputRequired`,
+// `McpClient.withInputResponses`) and the reserved `_meta` key names are
+// reachable from `import mcp;`.
 unittest
 {
-	static assert(!visibleFromMcp!"InputRequest");
+	static assert(visibleFromMcp!"InputRequest");
+	static assert(visibleFromMcp!"InputKind");
+	static assert(visibleFromMcp!"InputResponse");
+	static assert(visibleFromMcp!"MetaKey");
+}
+
+// The wire-level `InputRequiredResult` envelope is transport plumbing: it
+// stays out of `import mcp;`.
+unittest
+{
 	static assert(!visibleFromMcp!"InputRequiredResult");
-	static assert(!visibleFromMcp!"InputResponse");
 }
 
 // Transport wiring is reachable behind the opt-in `mcp.transport` import.

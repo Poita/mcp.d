@@ -4,7 +4,8 @@
  * Importing `mcp` re-exports the curated, stable public API:
  *
  *   - the protocol types (`mcp.protocol.*`: versions, errors, JSON-RPC,
- *     capabilities, core types, sampling),
+ *     capabilities, core types, sampling, and the user-facing MRTR types
+ *     such as `InputRequest`),
  *   - the server / client entry points (`McpServer`, `McpClient`,
  *     `RequestContext`),
  *   - the declarative UDA / reflection layer (`@tool`, `@resource`,
@@ -82,9 +83,16 @@ public import mcp.api.skill_dir;
 // hint codec). They are referenced by members already on the lean public
 // surface — `McpServer.setListCacheHint(string, CacheHint)` and
 // `McpClient.discover()` returning `DiscoverResult` — so the whole module is
-// safe to re-export. The transport/wire plumbing lives in
-// `mcp.protocol.mrtr`, reachable via `import mcp.transport;`.
+// safe to re-export.
 public import mcp.protocol.modern;
+
+// --- User-facing MRTR (multi-round-trip request) types ---
+// Named by the public result/response API: `CallToolResult.inputRequests`,
+// `ToolResponse`/`PromptResponse.inputRequired` and
+// `McpClient.withInputResponses` take these, and `MetaKey` names the reserved
+// `_meta` keys. The rest of `mcp.protocol.mrtr` (header codecs, wire helpers)
+// is transport plumbing, reachable via `import mcp.transport;`.
+public import mcp.protocol.mrtr : InputKind, InputRequest, InputResponse, MetaKey;
 
 // --- Opt-in MRTR requestState security ---
 // Referenced by `McpServer.secureRequestState(RequestStateSecurity)`. The codec

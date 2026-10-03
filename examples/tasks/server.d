@@ -40,7 +40,6 @@ import core.time : msecs, seconds;
 import vibe.core.core : sleep;
 
 import mcp;
-import mcp.protocol.mrtr : InputRequest;
 import examples_common : runServerFromArgs;
 
 /// The fixed HTTP port for this example.
