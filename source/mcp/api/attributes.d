@@ -37,7 +37,10 @@ struct tool
 /// the server's task dispatcher, its return value becoming the task's final
 /// result. The method may take an injected `TaskContext` parameter (omitted from
 /// the input schema) to report progress, observe cancellation, or suspend for
-/// mid-execution input via `requireInput`. Requires `enableTasks()` on the server.
+/// mid-execution input via `requireInput`. Registering one enables the Tasks
+/// extension with default options (a later `enableTasks(opts)` replaces them and
+/// keeps the task tools); it throws on a `stateful` server, since the extension is
+/// modern-only.
 ///
 /// Behavioral-hint marker UDAs (`@readOnly`, `@destructive`, ...) and
 /// `@hintTitle` apply exactly as for `@tool`.
@@ -97,7 +100,10 @@ struct taskPollInterval
 /// shape `EventBatch!P fetch(A args, FetchContext ctx)`: `A` (the subscription
 /// arguments) derives the `inputSchema`, `P` (the payload) derives the
 /// `payloadSchema`, and the method becomes the type's fetch handler, backing poll
-/// directly and stream/webhook via the runtime's loop. Requires `enableEvents()`.
+/// directly and stream/webhook via the runtime's loop. Registering one enables the
+/// Events extension with default options, so to choose them call `enableEvents`
+/// first: it throws once an event type is registered. Registration throws on a
+/// `stateful` server, since the extension is modern-only.
 ///
 /// Push-only event types (no cursor-addressable upstream) use the builder instead
 /// — `auto ev = server.events.define!(A, P)("name"); ev.publish(payload);` — so the
