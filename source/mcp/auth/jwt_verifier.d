@@ -41,6 +41,8 @@ import mcp.protocol.ssrf : SsrfPolicy;
 /// Configuration for `jwtVerifier`. Provide either a `jwksUri` (the verifier
 /// fetches and caches the issuer's JWKS, selecting the key by `kid`) or one or
 /// more `staticPublicKeysPem` (PEM SubjectPublicKeyInfo blobs pinned directly).
+/// `jwtVerifier` refuses a config with neither. Each rejected token is logged at
+/// diagnostic level with the reason (never the token).
 struct JwtVerifierConfig
 {
 	/// The JWKS endpoint to fetch verification keys from (kid-selected). When
@@ -127,6 +129,7 @@ TokenValidator jwtVerifier(JwtVerifierConfig cfg) @safe
 
 	enforce(cfg.issuer.length || cfg.allowAnyIssuer,
 			"jwtVerifier: set JwtVerifierConfig.issuer (or allowAnyIssuer to skip the iss check)");
+	enforce(cfg.jwksUri.length || cfg.staticPublicKeysPem.length, "jwtVerifier: set JwtVerifierConfig.jwksUri or staticPublicKeysPem; with neither, no token can verify");
 	auto cache = new JwksCache(cfg.jwksUri, cfg.jwksCacheTtl, cfg.ssrfPolicy);
 	return (string token) @safe {
 		return verifyOrInvalid(() @safe => verifyToken(cfg, token, cache, currentUnixTime()));
@@ -165,6 +168,17 @@ package interface KeySource
 	string[] keysFor(string kid) @safe;
 }
 
+/// Reject a token, logging `reason` at diagnostic level so a misconfigured
+/// verifier (wrong audience, issuer or accepted `typ`) can be diagnosed. The
+/// token itself is never logged (it is a bearer credential).
+private TokenInfo reject(string reason) @safe
+{
+	import vibe.core.log : logDiagnostic;
+
+	logDiagnostic("jwtVerifier: token rejected: %s", reason);
+	return TokenInfo.invalid();
+}
+
 /// Verify `token` against `cfg` at wall-clock time `now` (unix seconds), drawing
 /// JWKS keys from `keys`. Separated from clock/HTTP so tests can drive it
 /// deterministically.
@@ -172,35 +186,35 @@ package TokenInfo verifyToken(JwtVerifierConfig cfg, string token, KeySource key
 {
 	auto parts = token.split('.');
 	if (parts.length != 3)
-		return TokenInfo.invalid();
+		return reject("not a three-part JWS");
 
 	const headerJson = decodeSegmentJson(parts[0]);
 	const payloadJson = decodeSegmentJson(parts[1]);
 	if (headerJson.type != Json.Type.object || payloadJson.type != Json.Type.object)
-		return TokenInfo.invalid();
+		return reject("header or payload is not a JSON object");
 
 	const alg = jsonStr(headerJson, "alg");
 	const kid = jsonStr(headerJson, "kid");
 	if (alg != "RS256" && alg != "ES256")
-		return TokenInfo.invalid();
+		return reject("unsupported alg");
 
 	// RFC 7515 4.1.11: a `crit` header lists extensions the recipient MUST
 	// understand. This verifier implements none, so any token carrying a
 	// `crit` member MUST be rejected rather than silently accepted.
 	if ("crit" in headerJson)
-		return TokenInfo.invalid();
+		return reject("crit header present");
 
 	// RFC 9068 4.1: reject a token whose `typ` is not an expected access-token
 	// type, so a token of another type (e.g. an OIDC `id_token`) signed with the
 	// same key cannot be replayed as an access token.
 	if (!typAccepted(cfg.acceptedTokenTypes, jsonStr(headerJson, "typ")))
-		return TokenInfo.invalid();
+		return reject("typ header is absent or not an accepted token type");
 
 	// Gather candidate keys: pinned PEM keys plus any JWKS keys for this kid.
 	string[] candidates = cfg.staticPublicKeysPem.dup;
 	candidates ~= keys.keysFor(kid);
 	if (candidates.length == 0)
-		return TokenInfo.invalid();
+		return reject("no verification key available");
 
 	const signingInput = parts[0] ~ "." ~ parts[1];
 	// A malformed signature segment is an ordinary bad token, not a verifier
@@ -209,7 +223,7 @@ package TokenInfo verifyToken(JwtVerifierConfig cfg, string token, KeySource key
 	try
 		sig = base64UrlDecode(parts[2]);
 	catch (Exception)
-		return TokenInfo.invalid();
+		return reject("malformed signature segment");
 
 	bool sigOk = false;
 	foreach (pem; candidates)
@@ -221,7 +235,7 @@ package TokenInfo verifyToken(JwtVerifierConfig cfg, string token, KeySource key
 		}
 	}
 	if (!sigOk)
-		return TokenInfo.invalid();
+		return reject("signature does not verify against any candidate key");
 
 	return validateClaims(cfg, payloadJson, now);
 }
@@ -252,12 +266,12 @@ package TokenInfo validateClaims(JwtVerifierConfig cfg, Json payload, long now) 
 	// non-numeric or non-finite `exp` is treated as invalid.
 	double e;
 	if (!numericDate(payload["exp"], e))
-		return TokenInfo.invalid();
+		return reject("exp claim is absent or not a NumericDate");
 	// RFC 7519 4.1.4: the token is expired once the current time is no longer
 	// before `exp`. With `clockSkew` the grace boundary is `now <= exp + skew`,
 	// so reject at the boundary (`>=`) rather than one second past it.
 	if (now >= e + skew)
-		return TokenInfo.invalid();
+		return reject("token is expired (exp)");
 	// `nbf` is optional, but when present it must be a NumericDate; any other
 	// value is rejected so a malformed claim cannot switch the not-before check
 	// off.
@@ -266,7 +280,7 @@ package TokenInfo validateClaims(JwtVerifierConfig cfg, Json payload, long now) 
 	{
 		double nbf;
 		if (!numericDate(nbfClaim, nbf) || now + skew < nbf)
-			return TokenInfo.invalid();
+			return reject("token is not yet valid or nbf is malformed");
 	}
 
 	// Claims only an OIDC id_token carries. An id_token is typed `JWT` like many
@@ -275,19 +289,19 @@ package TokenInfo validateClaims(JwtVerifierConfig cfg, Json payload, long now) 
 	// that client id.
 	foreach (idTokenClaim; ["nonce", "at_hash", "c_hash"])
 		if (payload[idTokenClaim].type != Json.Type.undefined)
-			return TokenInfo.invalid();
+			return reject("payload carries an OIDC id_token-only claim");
 
 	if (!cfg.allowAnyIssuer && (cfg.issuer.length == 0 || jsonStr(payload, "iss") != cfg.issuer))
-		return TokenInfo.invalid();
+		return reject("iss does not match the configured issuer");
 
 	auto auds = audiences(payload);
 	if (cfg.audience.length && !auds.canFind(cfg.audience))
-		return TokenInfo.invalid();
+		return reject("aud does not include the configured audience");
 
 	auto scopes = tokenScopes(payload);
 	foreach (req; cfg.requiredScopes)
 		if (!scopes.canFind(req))
-			return TokenInfo.invalid();
+			return reject("a required scope is missing");
 
 	TokenInfo ti;
 	ti.valid = true;
@@ -1017,10 +1031,94 @@ unittest  // jwtVerifier refuses a config that pins no issuer
 	assertThrown(jwtVerifier(cfg));
 }
 
+unittest  // jwtVerifier refuses a config with neither a jwksUri nor a pinned key
+{
+	import std.exception : assertThrown;
+
+	JwtVerifierConfig cfg;
+	cfg.issuer = "https://as.example.com";
+	assertThrown(jwtVerifier(cfg));
+}
+
+unittest  // a claim rejection is logged with its reason, never with the token
+{
+	import std.algorithm : any;
+	import vibe.core.log : deregisterLogger, LogLevel, Logger, LogLine, registerLogger;
+
+	static final class DiagLogger : Logger
+	{
+		string[] lines;
+		this() @safe
+		{
+			minLevel = LogLevel.diagnostic;
+		}
+
+		override void log(ref LogLine line) @safe
+		{
+			lines ~= line.text;
+		}
+	}
+
+	auto logger = new DiagLogger;
+	auto shared_ = () @trusted { return cast(shared) logger; }();
+	() @trusted { registerLogger(shared_); }();
+	scope (exit)
+		() @trusted { deregisterLogger(shared_); }();
+
+	JwtVerifierConfig cfg;
+	cfg.allowAnyIssuer = true;
+	cfg.audience = "https://other.example.com";
+	auto cache = new JwksCache("", cfg.jwksCacheTtl);
+	cache.load(`{"keys":[{"kty":"RSA","kid":"rsa-1","n":"` ~ testRsaN ~ `","e":"` ~ testRsaE
+			~ `"}]}`);
+	assert(!verifyToken(cfg, testRs256Jwt, cache, 1_700_001_000).valid);
+
+	auto lines = () @trusted { return (cast() logger).lines; }();
+	assert(lines.any!(l => l.canFind("aud")), "the audience rejection must be logged");
+	assert(!lines.any!(l => l.canFind(testRs256Jwt[0 .. 20])), "the token must never be logged");
+}
+
+unittest  // a `typ` rejection is logged with its reason
+{
+	import std.algorithm : any;
+	import vibe.core.log : deregisterLogger, LogLevel, Logger, LogLine, registerLogger;
+
+	static final class DiagLogger : Logger
+	{
+		string[] lines;
+		this() @safe
+		{
+			minLevel = LogLevel.diagnostic;
+		}
+
+		override void log(ref LogLine line) @safe
+		{
+			lines ~= line.text;
+		}
+	}
+
+	auto logger = new DiagLogger;
+	auto shared_ = () @trusted { return cast(shared) logger; }();
+	() @trusted { registerLogger(shared_); }();
+	scope (exit)
+		() @trusted { deregisterLogger(shared_); }();
+
+	JwtVerifierConfig cfg;
+	cfg.allowAnyIssuer = true;
+	cfg.acceptedTokenTypes = ["at+jwt"];
+	cfg.staticPublicKeysPem = [testEcPubPem];
+	auto tok = makeEs256(`{"sub":"u","exp":1700003600}`);
+	assert(!verifyToken(cfg, tok, new NoKeys, 1_700_001_000).valid);
+
+	auto lines = () @trusted { return (cast() logger).lines; }();
+	assert(lines.any!(l => l.canFind("typ")), "the typ rejection must be logged");
+}
+
 unittest  // allowAnyIssuer explicitly accepts a token from any issuer
 {
 	JwtVerifierConfig cfg;
 	cfg.allowAnyIssuer = true;
+	cfg.staticPublicKeysPem = [testEcPubPem];
 	auto payload = parseJsonString(`{"iss":"https://any.example","sub":"u","exp":1700003600}`);
 	assert(validateClaims(cfg, payload, 1_700_001_000).valid);
 	cast(void) jwtVerifier(cfg);

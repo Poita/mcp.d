@@ -547,6 +547,7 @@ unittest  // resourceServer omits authorizationServers when no issuer is pinned
 	JwtVerifierConfig vc;
 	vc.allowAnyIssuer = true;
 	vc.audience = "api://x";
+	vc.staticPublicKeysPem = [presetEcPubPem];
 	auto cfg = resourceServer(vc, mcpUrl);
 	assert(cfg.enabled);
 	assert(cfg.resource == mcpUrl);
