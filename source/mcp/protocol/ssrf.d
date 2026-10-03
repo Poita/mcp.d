@@ -611,6 +611,23 @@ private AddressClass classifyIpv6Literal(string inner) @safe pure nothrow @nogc
 	return AddressClass.public_;
 }
 
+/// Whether `name` is the loopback name `localhost`. Host names compare
+/// case-insensitively, and one trailing dot marks the same name fully qualified.
+private bool isLocalhostName(string name) @safe pure nothrow @nogc
+{
+	import std.ascii : toLower;
+
+	enum lh = "localhost";
+	if (name.length && name[$ - 1] == '.')
+		name = name[0 .. $ - 1];
+	if (name.length != lh.length)
+		return false;
+	foreach (i, c; name)
+		if (toLower(c) != lh[i])
+			return false;
+	return true;
+}
+
 /// Classify a resolved address given as its numeric string form (as produced by
 /// `std.socket.Address.toAddrString`). Empty/unparseable forms fail closed.
 /// `@safe pure nothrow @nogc`.
@@ -717,7 +734,7 @@ AddressClass classifyHost(string host, out string pinnedIp) @safe
 		}
 	}
 
-	if (bare == "localhost")
+	if (isLocalhostName(bare))
 	{
 		pinnedIp = "127.0.0.1";
 		return AddressClass.loopback;
@@ -824,7 +841,7 @@ AddressClass classifyHostLexical(string host) @safe pure nothrow @nogc
 			|| (bare.indexOf(':') >= 0 && bare.indexOf("::") >= 0))
 		return classifyIpv6Literal(bare);
 
-	if (bare == "localhost")
+	if (isLocalhostName(bare))
 		return AddressClass.loopback;
 
 	ubyte[4] oct;
@@ -1462,6 +1479,19 @@ unittest  // classifyHost classes loopback hosts without resolving
 	assert(classifyHost("127.0.0.1:8765", pin) == AddressClass.loopback);
 }
 
+unittest  // localhost matches case-insensitively and with one trailing root dot
+{
+	string pin;
+	foreach (h; ["LOCALHOST", "localhost.", "LocalHost.:8080"])
+	{
+		assert(classifyHost(h, pin) == AddressClass.loopback && pin == "127.0.0.1", h);
+		assert(classifyHostLexical(h) == AddressClass.loopback, h);
+		assert(pinnedConnectAddress(h, false, SsrfPolicy.allowLoopback).ok, h);
+	}
+	assert(classifyHostLexical("localhost..") == AddressClass.public_);
+	assert(classifyHostLexical("localhostx") == AddressClass.public_);
+}
+
 unittest  // classifyHost classes numeric-encoded loopback as loopback (SSRF encodings)
 {
 	string pin;
@@ -1642,7 +1672,6 @@ unittest  // allowLoopback still rejects loopback over https and private/link-lo
 	assert(!pinnedConnectAddress("127.0.0.1", true, SsrfPolicy.allowLoopback).ok);
 	assert(!pinnedConnectAddress("10.0.0.5", false, SsrfPolicy.allowLoopback).ok);
 	assert(!pinnedConnectAddress("169.254.169.254", true, SsrfPolicy.allowLoopback).ok);
-	assert(!pinnedConnectAddress("LOCALHOST", false, SsrfPolicy.allowLoopback).ok);
 	assert(pinnedConnectAddress("8.8.8.8", true, SsrfPolicy.allowLoopback).ok);
 }
 
@@ -1689,13 +1718,23 @@ unittest  // blockInternal rejects private/link-local hosts
 
 unittest  // blockInternal rejects a registered name that DNS-resolves to loopback (no literal-loopback allowance for resolved hosts)
 {
-	// "LOCALHOST" does not match the case-sensitive literal `localhost` fast path,
-	// so it goes through DNS resolution and resolves to 127.0.0.1/::1. A resolved
-	// loopback address must NOT receive the literal dev-loopback allowance.
+	// A resolved loopback address must NOT receive the literal dev-loopback
+	// allowance.
+	static Resolution loopbackResolve(string host) @safe nothrow
+	{
+		return Resolution(["127.0.0.1", "::1"], false);
+	}
+
+	auto saved = () @trusted { return hostResolver; }();
+	() @trusted { hostResolver = &loopbackResolve; }();
+	scope (exit)
+		() @trusted { hostResolver = saved; }();
+
 	string pin;
-	assert(classifyHost("LOCALHOST", pin) == AddressClass.privateOrLinkLocal);
-	assert(!pinnedConnectAddress("LOCALHOST", true, SsrfPolicy.blockInternal).ok);
-	assert(!pinnedConnectAddress("LOCALHOST", false, SsrfPolicy.blockInternal).ok);
+	assert(classifyHost("loop.example", pin) == AddressClass.privateOrLinkLocal);
+	assert(!pinnedConnectAddress("loop.example", true, SsrfPolicy.blockInternal).ok);
+	assert(!pinnedConnectAddress("loop.example", false, SsrfPolicy.blockInternal).ok);
+	assert(!pinnedConnectAddress("loop.example", false, SsrfPolicy.allowLoopback).ok);
 }
 
 unittest  // allowUserConfigured permits loopback and private targets (user-chosen endpoint)
