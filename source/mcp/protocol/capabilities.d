@@ -51,11 +51,12 @@ private Json projectExtensions(const Json extensions, ProtocolVersion v) @safe
 	Json kept = Json.emptyObject;
 	// `Json.opApply` is `@system` and non-`const`; we only read, so cast away
 	// `const` inside the trusted block to iterate the object (mirrors
-	// `diffMissingKeys`).
+	// `diffMissingKeys`). Each value is cloned so the projection never aliases
+	// the caller's (const) settings.
 	() @trusted {
 		foreach (string key, Json settings; cast() extensions)
 			if (v >= extensionMinVersion(key))
-				kept[key] = settings;
+				kept[key] = settings.clone();
 	}();
 	return kept.length > 0 ? kept : Json.undefined;
 }
@@ -305,7 +306,7 @@ struct ServerCapabilities
 		projected.resources = resources;
 		projected.prompts = prompts;
 		projected.logging = logging;
-		projected.experimental = experimental;
+		projected.experimental = experimental.clone();
 		if (v >= ProtocolVersion.v2025_03_26)
 			projected.completions = completions;
 		// Each extension carries its own version floor (see extensionMinVersion):
@@ -445,7 +446,7 @@ struct ClientCapabilities
 		projected.roots = roots;
 		projected.rootsListChanged = rootsListChanged;
 		projected.sampling = sampling || samplingTools || samplingContext;
-		projected.experimental = experimental;
+		projected.experimental = experimental.clone();
 		// elicitation applies from 2025-06-18. `toJson` treats a set
 		// `elicitationForm`/`elicitationUrl` as implying elicitation presence, so a
 		// client that set only a submode must still project a bare `elicitation`
@@ -600,11 +601,12 @@ struct ClientCapabilities
 			return Json(null);
 		Json missing = Json.emptyObject;
 		// `Json.opApply` is `@system` and non-`const`; we only read, so cast
-		// away `const` inside the trusted block to iterate the object.
+		// away `const` inside the trusted block to iterate the object. Each value
+		// is cloned so the result never aliases the (const) `required` map.
 		() @trusted {
 			foreach (string k, Json v; cast() required)
 				if (declared.type != Json.Type.object || k !in declared)
-					missing[k] = v;
+					missing[k] = v.clone();
 		}();
 		return missing;
 	}
@@ -1428,4 +1430,47 @@ unittest  // every capabilities fromJson rejects a non-object value with -32602
 			assert(ex !is null && ex.code == ErrorCode.invalidParams, T.stringof);
 		}
 	}
+}
+
+unittest  // mutating ServerCapabilities.forVersion output leaves the stored extensions intact
+{
+	ServerCapabilities caps;
+	caps.extensions = Json(["io.modelcontextprotocol/ui": Json(["a": Json(1)])]);
+	auto projected = caps.forVersion(ProtocolVersion.v2026_07_28);
+	projected.extensions["io.modelcontextprotocol/ui"]["a"] = 2;
+	assert(caps.extensions["io.modelcontextprotocol/ui"]["a"].get!int == 1);
+}
+
+unittest  // mutating ServerCapabilities.forVersion output leaves the stored experimental intact
+{
+	ServerCapabilities caps;
+	caps.experimental = Json(["feat": Json(["a": Json(1)])]);
+	auto projected = caps.forVersion(ProtocolVersion.v2026_07_28);
+	projected.experimental["feat"]["a"] = 2;
+	assert(caps.experimental["feat"]["a"].get!int == 1);
+}
+
+unittest  // mutating ClientCapabilities.forVersion output leaves the stored extensions intact
+{
+	ClientCapabilities caps;
+	caps.extensions = Json(["io.modelcontextprotocol/ui": Json(["a": Json(1)])]);
+	auto projected = caps.forVersion(ProtocolVersion.v2026_07_28);
+	projected.extensions["io.modelcontextprotocol/ui"]["a"] = 2;
+	assert(caps.extensions["io.modelcontextprotocol/ui"]["a"].get!int == 1);
+}
+
+unittest  // mutating missingFrom output leaves the required capabilities intact
+{
+	ClientCapabilities required;
+	required.extensions = Json([
+		"io.modelcontextprotocol/ui": Json(["a": Json(1)])
+	]);
+	required.experimental = Json(["feat": Json(["a": Json(1)])]);
+	auto missing = required.missingFrom(ClientCapabilities.init);
+	assert(!missing.isNull);
+	auto m = missing.get;
+	m.extensions["io.modelcontextprotocol/ui"]["a"] = 2;
+	m.experimental["feat"]["a"] = 2;
+	assert(required.extensions["io.modelcontextprotocol/ui"]["a"].get!int == 1);
+	assert(required.experimental["feat"]["a"].get!int == 1);
 }
