@@ -881,6 +881,7 @@ struct InputRequiredResult
 
 	static InputRequiredResult fromJson(Json j) @safe
 	{
+		requireObject(j, "InputRequiredResult");
 		InputRequiredResult r;
 		parseInputRequired(j, r.inputRequests, r.requestState);
 		return r;
@@ -1159,6 +1160,18 @@ unittest  // InputRequest.elicitation without a schema sends an empty object sch
 	assert(schema["type"].get!string == "object");
 	assert(schema["properties"].type == Json.Type.object);
 	assert(schema["properties"].length == 0);
+}
+
+unittest  // InputRequiredResult.fromJson rejects a non-object result with -32602
+{
+	import std.exception : collectException;
+	import mcp.protocol.errors : McpException, ErrorCode;
+
+	foreach (v; [Json(5), Json("x"), Json.emptyArray, Json(null)])
+	{
+		auto ex = cast(McpException) collectException(InputRequiredResult.fromJson(v));
+		assert(ex !is null && ex.code == ErrorCode.invalidParams);
+	}
 }
 
 unittest  // MRTR InputRequiredResult round-trips and input responses parse

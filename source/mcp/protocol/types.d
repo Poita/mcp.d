@@ -3335,6 +3335,7 @@ struct SkillResourceRef
 
 	static SkillResourceRef fromJson(Json j) @safe
 	{
+		requireObject(j, "SkillResourceRef");
 		SkillResourceRef r;
 		if ("uri" in j && j["uri"].type == Json.Type.string)
 			r.uri = j["uri"].get!string;
@@ -3391,6 +3392,7 @@ struct SkillEntry
 
 	static SkillEntry fromJson(Json j) @safe
 	{
+		requireObject(j, "SkillEntry");
 		SkillEntry e;
 		if ("uri" in j && j["uri"].type == Json.Type.string)
 			e.uri = j["uri"].get!string;
@@ -3508,6 +3510,36 @@ struct GetSkillResult
 	{
 		return SkillEntry.fromJson(skill);
 	}
+}
+
+unittest  // ListSkillsResult.entries rejects a non-object skill entry with -32602
+{
+	import std.exception : collectException;
+
+	auto r = ListSkillsResult.fromJson(Json(["skills": Json([Json("x")])]));
+	auto ex = cast(McpException) collectException(r.entries());
+	assert(ex !is null && ex.code == ErrorCode.invalidParams);
+}
+
+unittest  // SkillEntry.fromJson rejects a non-object manifest entry with -32602
+{
+	import std.exception : collectException;
+
+	auto j = Json([
+		"uri": Json("skill://a/SKILL.md"),
+		"resources": Json([Json(1)])
+	]);
+	auto ex = cast(McpException) collectException(SkillEntry.fromJson(j));
+	assert(ex !is null && ex.code == ErrorCode.invalidParams);
+}
+
+unittest  // GetSkillResult.entry rejects a result with no skill object with -32602
+{
+	import std.exception : collectException;
+
+	auto r = GetSkillResult.fromJson(Json.emptyObject);
+	auto ex = cast(McpException) collectException(r.entry());
+	assert(ex !is null && ex.code == ErrorCode.invalidParams);
 }
 
 /// Result of `resources/templates/list`.
