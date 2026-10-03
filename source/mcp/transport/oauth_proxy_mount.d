@@ -890,9 +890,18 @@ in (exchange !is null)
 		// endpoint MUST honour either: an authorization_code exchange (default, also
 		// when grant_type is omitted, for backward compatibility) and a
 		// refresh_token exchange (OAuth 2.1 §4.3), relaying the refresh token to the
-		// upstream token endpoint with the fixed upstream credentials.
+		// upstream token endpoint with the fixed upstream credentials. Any other
+		// grant is refused (RFC 6749 §5.2).
 		const grantType = formField(form, "grant_type");
 		const isRefresh = grantType == "refresh_token";
+		if (grantType.length && grantType != "authorization_code" && !isRefresh)
+		{
+			Json err = Json.emptyObject;
+			err["error"] = "unsupported_grant_type";
+			res.statusCode = HTTPStatus.badRequest;
+			res.writeJsonBody(err);
+			return;
+		}
 
 		// Broker mode issues non-refreshable opaque tokens and keeps the upstream
 		// token server-side. Honouring a refresh grant here would exchange and
@@ -3219,6 +3228,30 @@ unittest  // PASSTHROUGH: a relayed refresh token refreshes once and is replaced
 	assert(calls == 2);
 	assert(browserPost(router, "https://mcp.example.com/token",
 			"grant_type=refresh_token&refresh_token=rt2", "").status == 200);
+}
+
+unittest  // an unknown grant_type is refused with unsupported_grant_type (RFC 6749 §5.2)
+{
+	import std.algorithm : canFind;
+	import std.array : replace;
+
+	auto proxy = mountSampleProxy();
+	auto router = new URLRouter;
+	bool upstreamCalled;
+	mountOAuthToken(router, proxy, (string endpoint, string body_,
+			string authHeader, out string rb, out int status) @safe {
+		upstreamCalled = true;
+		rb = `{"access_token":"gho_upstream","token_type":"bearer"}`;
+		status = 200;
+	});
+
+	// A redeemable code under an unsupported grant must not be exchanged.
+	const form = redeemableCodeForm(proxy).replace("grant_type=authorization_code",
+			"grant_type=password");
+	const hit = browserPost(router, "https://mcp.example.com/token", form, "");
+	assert(hit.status == 400);
+	assert(hit.body_.canFind("unsupported_grant_type"));
+	assert(!upstreamCalled);
 }
 
 unittest  // BROKER MOUNT: a refresh_token grant is refused, never relaying the upstream token
