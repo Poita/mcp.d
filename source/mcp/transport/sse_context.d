@@ -174,7 +174,8 @@ final class StreamCoordinator
 	/// (or even reach) another session's waiter — closing the cross-session hijack
 	/// without a separate owner check. A waiter registered under the empty token
 	/// (stateless / shared mode) is matched only by a reply that likewise carries
-	/// the empty token.
+	/// the empty token. A request already settled keeps its first outcome until
+	/// its awaiter wakes to take it.
 	bool resolve(Json idJson, Json result, Json error, string responderToken = "") @safe
 	{
 		long id;
@@ -195,6 +196,8 @@ final class StreamCoordinator
 			return false;
 		if (auto w = WaiterKey(responderToken, id) in waiters)
 		{
+			if (w.done)
+				return true;
 			w.result = result;
 			w.error = error;
 			w.done = true;
@@ -210,7 +213,7 @@ final class StreamCoordinator
 	/// GET SSE listener a server->client request was delivered on disconnects
 	/// before the client could respond: rather than letting the awaiter block for
 	/// the full timeout, it is released promptly with an `McpException`. Unknown
-	/// keys are ignored.
+	/// keys are ignored, and a request the client already answered keeps its reply.
 	///
 	/// The waiter is left in the table: cleanup is the awaiter's responsibility via
 	/// `await`/`awaitLive`'s `scope (exit) waiters.remove(key)`. Callers MUST only
@@ -224,6 +227,8 @@ final class StreamCoordinator
 	{
 		if (auto w = WaiterKey(sessionToken, id) in waiters)
 		{
+			if (w.done)
+				return;
 			Json err = Json.emptyObject;
 			err["code"] = error.code;
 			err["message"] = error.msg;
@@ -343,15 +348,38 @@ unittest  // resolve rejects a fractional float id (not a valid JSON-RPC integer
 
 unittest  // failPending is idempotent and leaves the awaiter to clean the table up
 {
-	// Failing the same id twice must not throw: the second call simply re-marks an
-	// already-failed waiter. The waiter stays in the table (the awaiter removes it),
-	// so the fail-then-await path can still observe and report the error.
+	// Failing the same id twice must not throw: the second call leaves the
+	// already-failed waiter as it is. The waiter stays in the table (the awaiter
+	// removes it), so the fail-then-await path can still observe and report the error.
 	auto coord = new StreamCoordinator;
 	const id = coord.alloc();
 	coord.register(id);
 
 	coord.failPending(id, internalError("first"));
 	coord.failPending(id, internalError("second")); // idempotent: no throw, no crash
+}
+
+unittest  // failPending keeps a client reply that arrived before the awaiter woke
+{
+	auto coord = new StreamCoordinator;
+	const id = coord.alloc();
+	coord.register(id, "s");
+	coord.resolve(Json(id), Json(["ok": Json(true)]), Json.undefined, "s");
+	coord.failPending(id, internalError("client disconnected"), "s");
+	assert(coord.await(id, 60.seconds, "s")["ok"].get!bool);
+}
+
+unittest  // a second outcome for a settled request does not replace the first
+{
+	import std.exception : collectException;
+
+	auto coord = new StreamCoordinator;
+	const id = coord.alloc();
+	coord.register(id);
+	coord.failPending(id, internalError("client disconnected"));
+	coord.resolve(Json(id), Json(["ok": Json(true)]), Json.undefined);
+	auto e = collectException!McpException(coord.await(id));
+	assert(e !is null && e.msg == "client disconnected");
 }
 
 /// The mount's `ServerPushChannel` for `server`, created and attached to the
