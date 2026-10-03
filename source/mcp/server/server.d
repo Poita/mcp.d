@@ -1350,6 +1350,8 @@ final class McpServer : ServerCore
 		case "input_required":
 			throw tasksExtensionRequired(
 					"The tool needs client input, which requires the Tasks extension");
+		case "cancelled":
+			throw new McpException(ErrorCode.requestCancelled, "Request cancelled");
 		default:
 			throw internalError(
 					"task '" ~ seed.taskId ~ "' did not settle synchronously (" ~ status ~ ")");
@@ -8373,6 +8375,27 @@ unittest  // an inline task tool observes its request's cancellation through tc.
 	])));
 	assert(saw, "the executor must see the request's cancellation");
 	assert(resp.isNull, "no response is sent for a cancelled request");
+}
+
+unittest  // an inline task tool that ends cancelled answers with requestCancelled, not an internal error
+{
+	import std.algorithm : canFind;
+
+	auto s = new McpServer("t", "1");
+	auto rt = s.enableTasks(syncTasks());
+	Tool desc;
+	desc.name = "abort";
+	desc.inputSchema = Json(["type": Json("object")]);
+	string taskId;
+	s.registerTaskTool(desc, (TaskContext tc) @safe {
+		taskId = tc.taskId;
+		rt.cancel(tc.taskId);
+		return Json(["content": Json.emptyArray]);
+	});
+	auto resp = s.handle(modernReqNoTasks(1, "tools/call",
+			Json(["name": Json("abort"), "arguments": Json.emptyObject]))).get;
+	assert(resp["error"]["code"].get!int == cast(int) ErrorCode.requestCancelled);
+	assert(!resp["error"]["message"].get!string.canFind(taskId));
 }
 
 unittest  // an inline task tool cannot detach: the client gets -32021 naming the extension
