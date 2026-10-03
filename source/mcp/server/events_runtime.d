@@ -454,6 +454,22 @@ private struct LifeRef
 	string principal;
 	Json arguments;
 	string subscriptionId;
+	LifeSetup setup; /// the first subscriber's `onSubscribe` while it runs; null once it succeeded
+}
+
+/// The first subscriber's in-progress `onSubscribe` for a key. Concurrent
+/// subscribers of the key wait on it instead of sharing an upstream that may
+/// never be set up.
+private final class LifeSetup
+{
+	import vibe.core.sync : LocalManualEvent, createManualEvent;
+
+	LocalManualEvent done;
+
+	this() @safe nothrow
+	{
+		done = createManualEvent();
+	}
 }
 
 /// A per-`(principal, url)` negative cache entry for endpoint verification: an
@@ -3185,25 +3201,36 @@ final class EventsRuntime
 	// Acquire a lifecycle reference for `(principal, name, arguments)`. `onSubscribe`
 	// fires only on the 0->1 transition, so the author provisions the upstream
 	// source once however many poll/stream/webhook subscriptions share the key.
+	// on_subscribe may yield: a concurrent acquire of the key waits for it, takes
+	// a reference once it succeeded, and runs the hook itself if it failed.
 	private void acquireLifecycle(ref EventRegistration reg, string name,
 			Json arguments, string principal, string subId) @safe
 	{
 		const key = leaseKey(name, arguments, principal);
-		if (auto p = key in lifeRefs_)
+		for (auto p = key in lifeRefs_; p !is null; p = key in lifeRefs_)
 		{
-			p.refs++;
-			return;
+			if (p.setup is null)
+			{
+				p.refs++;
+				return;
+			}
+			auto pending = p.setup;
+			pending.done.wait(pending.done.emitCount);
 		}
-		lifeRefs_[key] = LifeRef(1, name, principal, arguments, subId);
-		// on_subscribe may yield, and a concurrent acquire of the key then holds a
-		// reference too; a failure drops only this call's reference.
+		auto setup = new LifeSetup;
+		lifeRefs_[key] = LifeRef(1, name, principal, arguments, subId, setup);
+		scope (exit)
+			setup.done.emit();
 		scope (failure)
 		{
 			if (auto p = key in lifeRefs_)
-				if (--p.refs == 0)
+				if (p.setup is setup)
 					lifeRefs_.remove(key);
 		}
 		fireLifecycle(reg.onSubscribe, arguments, principal, subId);
+		if (auto p = key in lifeRefs_)
+			if (p.setup is setup)
+				p.setup = null;
 	}
 
 	// Release a lifecycle reference; `onUnsubscribe` fires on the 1->0 transition.
@@ -4570,15 +4597,28 @@ unittest  // concurrent first polls for one key hold a single lease and lifecycl
 	reg.descriptor.name = "n";
 	reg.check = (EventContext ctx) @safe => EventResult.empty("c");
 	// A second poll running while the first one's on_subscribe yields.
+	import vibe.core.core : runTask, exitEventLoop, runEventLoop, yield;
+
 	reg.onSubscribe = (EventContext ctx, string id) @safe {
-		if (++subs == 1)
-			rt.poll("n", Json.emptyObject, "u", Nullable!string.init,
-					Nullable!long.init, Nullable!long.init);
+		subs++;
+		foreach (_; 0 .. 8)
+			yield();
 	};
 	reg.onUnsubscribe = (EventContext ctx, string id) @safe { unsubs++; };
 	rt.register(reg);
-	rt.poll("n", Json.emptyObject, "u", Nullable!string.init,
-			Nullable!long.init, Nullable!long.init);
+	int done;
+	foreach (_; 0 .. 2)
+		runTask(() nothrow @safe {
+			try
+				rt.poll("n", Json.emptyObject, "u", Nullable!string.init,
+					Nullable!long.init, Nullable!long.init);
+			catch (Exception)
+			{
+			}
+			if (++done == 2)
+				exitEventLoop();
+		});
+	runEventLoop();
 	assert(rt.pollLeaseCount_.get("u", 0) == 1);
 	now += 10 * 60 * 1000;
 	rt.sweepPollLeases();
@@ -4603,31 +4643,114 @@ unittest  // a throwing on_subscribe does not leave a push stream registered
 	assert(delivered == 0);
 }
 
-unittest  // a throwing first on_subscribe keeps the reference a concurrent subscriber took
+unittest  // a subscriber waiting on a failed first on_subscribe runs the hook itself
 {
+	import vibe.core.core : runTask, exitEventLoop, runEventLoop, yield;
+
 	auto rt = testRuntime();
 	EventRegistration reg = {descriptor: EventType("n"), emitOnly: true};
 	PushHandle second;
+	bool firstThrew, secondStarted;
 	int subs, unsubs;
 	reg.onSubscribe = (EventContext ctx, string id) @safe {
 		if (++subs == 1)
 		{
 			// A concurrent subscriber of the same key arrives while the first
 			// on_subscribe is still running, then the first one fails.
-			second = openLive(rt, "n", Json.emptyObject, "u", Json(2), (string m, Json p) @safe {
-			});
+			while (!secondStarted)
+				yield();
+			foreach (_; 0 .. 8)
+				yield();
 			throw new Exception("upstream unavailable");
 		}
 	};
 	reg.onUnsubscribe = (EventContext ctx, string id) @safe { unsubs++; };
 	rt.register(reg);
-	import std.exception : assertThrown;
 
-	assertThrown!Exception(openLive(rt, "n", Json.emptyObject, "u", Json(1),
-			(string m, Json p) @safe {}));
-	assert(second !is null);
+	int done;
+	runTask(() nothrow @safe {
+		try
+			cast(void) openLive(rt, "n", Json.emptyObject, "u", Json(1), (string m, Json p) @safe {
+			});
+		catch (Exception)
+			firstThrew = true;
+		if (++done == 2)
+			exitEventLoop();
+	});
+	runTask(() nothrow @safe {
+		try
+		{
+			while (subs == 0)
+				yield();
+			secondStarted = true;
+			second = openLive(rt, "n", Json.emptyObject, "u", Json(2), (string m, Json p) @safe {
+			});
+		}
+		catch (Exception)
+		{
+		}
+		if (++done == 2)
+			exitEventLoop();
+	});
+	runEventLoop();
+
+	assert(firstThrew);
+	assert(second !is null, "the waiting subscriber must still subscribe");
+	assert(subs == 2, "the upstream the first hook failed to set up must be set up again");
 	second.close();
-	assert(unsubs == 1, "the surviving subscriber's release must reach on_unsubscribe");
+	assert(unsubs == 1);
+}
+
+unittest  // a subscriber waiting on a successful first on_subscribe does not run it again
+{
+	import vibe.core.core : runTask, exitEventLoop, runEventLoop, yield;
+
+	auto rt = testRuntime();
+	EventRegistration reg = {descriptor: EventType("n"), emitOnly: true};
+	PushHandle first, second;
+	bool secondStarted, secondReturnedEarly;
+	int subs;
+	reg.onSubscribe = (EventContext ctx, string id) @safe {
+		subs++;
+		while (!secondStarted)
+			yield();
+		foreach (_; 0 .. 8)
+			yield();
+		secondReturnedEarly = second !is null;
+	};
+	rt.register(reg);
+
+	int done;
+	runTask(() nothrow @safe {
+		try
+			first = openLive(rt, "n", Json.emptyObject, "u", Json(1), (string m, Json p) @safe {
+			});
+		catch (Exception)
+		{
+		}
+		if (++done == 2)
+			exitEventLoop();
+	});
+	runTask(() nothrow @safe {
+		try
+		{
+			while (subs == 0)
+				yield();
+			secondStarted = true;
+			second = openLive(rt, "n", Json.emptyObject, "u", Json(2), (string m, Json p) @safe {
+			});
+		}
+		catch (Exception)
+		{
+		}
+		if (++done == 2)
+			exitEventLoop();
+	});
+	runEventLoop();
+
+	assert(first !is null && second !is null);
+	assert(subs == 1);
+	assert(!secondReturnedEarly, "a subscriber must not proceed before the upstream is set up");
 }
 
 unittest  // a throwing on_unsubscribe does not stop the sweep expiring the other leases
@@ -4661,9 +4784,9 @@ unittest  // two principals pushing with the same request id get distinct subscr
 	string[] ids;
 	reg.onSubscribe = (EventContext ctx, string id) @safe { ids ~= id; };
 	rt.register(reg);
-	openLive(rt, "n", Json.emptyObject, "alice", Json(1), (string m, Json p) @safe {
+	cast(void) openLive(rt, "n", Json.emptyObject, "alice", Json(1), (string m, Json p) @safe {
 	});
-	openLive(rt, "n", Json.emptyObject, "bob", Json(1), (string m, Json p) @safe {
+	cast(void) openLive(rt, "n", Json.emptyObject, "bob", Json(1), (string m, Json p) @safe {
 	});
 	assert(ids.length == 2);
 	assert(ids[0] != ids[1]);
@@ -5518,17 +5641,31 @@ unittest  // a runtime over a store holding webhook subscriptions fires on_subsc
 
 unittest  // concurrent first webhook subscribes for one key hold a single lifecycle reference
 {
+	import vibe.core.core : runTask, exitEventLoop, runEventLoop, yield;
+
 	auto rt = testRuntime();
 	int subs, unsubs;
 	EventRegistration reg = {descriptor: EventType("n"), emitOnly: true};
-	// A second subscribe running while the first one's on_subscribe yields.
+	// A second subscribe runs while the first one's on_subscribe yields.
 	reg.onSubscribe = (EventContext ctx, string id) @safe {
-		if (++subs == 1)
-			rt.subscribeWebhook(webhookSub("n", "https://proxy/hooks"), "user-1");
+		subs++;
+		foreach (_; 0 .. 8)
+			yield();
 	};
 	reg.onUnsubscribe = (EventContext ctx, string id) @safe { unsubs++; };
 	rt.register(reg);
-	rt.subscribeWebhook(webhookSub("n", "https://proxy/hooks"), "user-1");
+	int done;
+	foreach (_; 0 .. 2)
+		runTask(() nothrow @safe {
+			try
+				rt.subscribeWebhook(webhookSub("n", "https://proxy/hooks"), "user-1");
+			catch (Exception)
+			{
+			}
+			if (++done == 2)
+				exitEventLoop();
+		});
+	runEventLoop();
 	UnsubscribeParams u;
 	u.name = "n";
 	u.arguments = Json.emptyObject;
