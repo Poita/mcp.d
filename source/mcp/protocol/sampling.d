@@ -340,10 +340,13 @@ struct CreateMessageRequest
 ///   immediately followed by a `user` message that consists entirely of
 ///   `tool_result` blocks, with each `tool_use` `id` matched by a
 ///   `tool_result` `toolUseId`, before any other message.
+/// - Every `tool_result` `toolUseId` MUST match a `tool_use` `id` of the
+///   immediately preceding `assistant` message.
 ///
 /// On violation throws an `McpException` with the spec's `-32602` (Invalid
-/// params) code; the message distinguishes "Tool result missing in request"
-/// from "Tool results mixed with other content". A well-formed (or
+/// params) code; the message distinguishes "Tool result missing in request",
+/// "Tool result has no matching tool_use" and "Tool results mixed with other
+/// content". A well-formed (or
 /// tool-free) request returns normally.
 ///
 /// `params` is the raw `sampling/createMessage` params JSON — the same value
@@ -379,15 +382,21 @@ void validateSamplingMessages(Json params) @safe
 			.get!string : "";
 	}
 
+	// The tool_use ids of the previous message, which are the only ids a
+	// tool_result in the current message may answer.
+	bool[string] priorToolUseIds;
 	foreach (mi; 0 .. msgs.length)
 	{
 		auto msg = msgs[mi];
 		const role = (msg.type == Json.Type.object && "role" in msg
 				&& msg["role"].type == Json.Type.string) ? msg["role"].get!string : "";
 		auto blocks = blocksOf(msg);
+		auto answerable = priorToolUseIds;
+		priorToolUseIds = null;
 
 		// §Tool Result Messages: a user message containing any tool_result
-		// block must contain ONLY tool_result blocks.
+		// block must contain ONLY tool_result blocks, each answering a
+		// tool_use of the immediately preceding assistant message.
 		if (role == "user")
 		{
 			bool hasToolResult, hasOther;
@@ -400,6 +409,16 @@ void validateSamplingMessages(Json params) @safe
 			}
 			if (hasToolResult && hasOther)
 				throw invalidParams("Tool results mixed with other content");
+			foreach (b; blocks)
+			{
+				if (blockType(b) != "tool_result")
+					continue;
+				if (b.type != Json.Type.object || "toolUseId" !in b
+						|| b["toolUseId"].type != Json.Type.string)
+					throw invalidParams("Tool result block missing required string toolUseId");
+				if (b["toolUseId"].get!string !in answerable)
+					throw invalidParams("Tool result has no matching tool_use");
+			}
 		}
 
 		// §Tool Use and Result Balance: every assistant message with tool_use
@@ -424,6 +443,7 @@ void validateSamplingMessages(Json params) @safe
 			}
 			if (toolUseIds.length == 0)
 				continue;
+			priorToolUseIds = toolUseIds;
 
 			if (mi + 1 >= msgs.length)
 				throw invalidParams("Tool result missing in request");
@@ -1246,10 +1266,28 @@ unittest  // a tool_use followed by an assistant message (not user) is rejected
 	assert(threw);
 }
 
-unittest  // a lone user tool_result message (no other content) is allowed
+unittest  // a tool_result with no preceding assistant tool_use is rejected
 {
-	auto p = samplingParams(msg("user", toolResult("call_1")));
-	validateSamplingMessages(p); // single-block tool_result-only user msg is fine
+	import std.exception : collectException;
+
+	auto e = collectException!McpException(
+			validateSamplingMessages(samplingParams(msg("user", toolResult("call_1")))));
+	assert(e !is null && e.code == ErrorCode.invalidParams);
+	assert(e.msg == "Tool result has no matching tool_use");
+	e = collectException!McpException(validateSamplingMessages(samplingParams(textMsg("assistant",
+			"hi"), msg("user", toolResult("call_1")))));
+	assert(e !is null && e.msg == "Tool result has no matching tool_use");
+}
+
+unittest  // a tool_result whose toolUseId matches no tool_use of the prior message is rejected
+{
+	import std.exception : collectException;
+
+	auto p = samplingParams(msg("assistant", toolUse("call_1", "get_weather")),
+			msg("user", toolResult("call_1"), toolResult("call_9")));
+	auto e = collectException!McpException(validateSamplingMessages(p));
+	assert(e !is null && e.code == ErrorCode.invalidParams);
+	assert(e.msg == "Tool result has no matching tool_use");
 }
 
 unittest  // missing/empty messages is a no-op (nothing to validate)
