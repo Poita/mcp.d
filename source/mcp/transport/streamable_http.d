@@ -1221,9 +1221,9 @@ private final class LegacySseContext : RequestContext, ConnectionScoped
 		return inner.clientSupports(cap);
 	}
 
-	bool isStateless() @safe
+	bool usesInputRequired() @safe
 	{
-		return inner.isStateless();
+		return inner.usesInputRequired();
 	}
 
 	Json[string] inputResponses() @safe

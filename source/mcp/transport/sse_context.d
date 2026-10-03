@@ -2905,9 +2905,9 @@ final class HttpStreamContext : RequestContext, ConnectionScoped
 		return clientCaps.supports(cap);
 	}
 
-	// Per-request protocol state (statelessness, input responses) is supplied by
+	// Per-request protocol state (MRTR use, input responses) is supplied by
 	// the server's RequestScope wrapper, not the transport; default here.
-	bool isStateless() @safe
+	bool usesInputRequired() @safe
 	{
 		return false;
 	}

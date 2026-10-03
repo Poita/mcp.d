@@ -486,11 +486,13 @@ final class McpServer : ServerCore
 	}
 
 	/// Register a *dynamic* tool whose handler may ask the client for more input
-	/// on a stateless (MRTR) request. The handler branches on `ctx.isStateless`:
-	/// when stateless it reads `ctx.inputResponses` and returns either
-	/// `ToolResponse.complete` or `ToolResponse.inputRequired`; otherwise it may
-	/// call the blocking `ctx.elicit`/`ctx.sample`. A server that wants to serve
-	/// both protocol eras handles both branches here.
+	/// on an MRTR (2026-07-28) request. The handler branches on
+	/// `ctx.usesInputRequired`: when true it reads `ctx.inputResponses` and
+	/// returns either `ToolResponse.complete` or `ToolResponse.inputRequired`.
+	/// When false the request is 2025-era: on a `McpServer.stateful()` server the
+	/// handler may call the blocking `ctx.elicit`/`ctx.sample`, while on a
+	/// `McpServer.stateless()` server (the default) those throw and a 2025-era
+	/// client cannot be asked for input.
 	void registerTool(Tool descriptor, MrtrToolHandler handler) @safe
 	{
 		requireToolNameAvailable(descriptor.name);
@@ -8885,12 +8887,13 @@ version (unittest) private McpServer makeEscalatingServer(TaskSupport support) @
 	desc.inputSchema = Json(["type": Json("object")]);
 	s.registerTool(desc, (Json args, RequestContext ctx) @safe {
 		auto answers = ctx.inputResponses();
-		if (ctx.isStateless && "user_name" !in answers)
+		if (ctx.usesInputRequired && "user_name" !in answers)
 			return ToolResponse.inputRequired([
 			InputRequest.elicitation("user_name", "What is your name?")
 		], "round-1");
 		Json input = Json.emptyObject;
-		input["user_name"] = ctx.isStateless ? answers["user_name"]["content"]["name"] : Json("Bob");
+		input["user_name"] = ctx.usesInputRequired
+			? answers["user_name"]["content"]["name"] : Json("Bob");
 		return s.startTask("greet", input, ctx);
 	});
 	if (support != TaskSupport.none)
@@ -9852,7 +9855,7 @@ unittest  // a direct resource reader can receive the per-request RequestContext
 	auto s = new McpServer("t", "1");
 	Resource r = {uri: "s://ctx", name: "ctx"};
 	s.registerResource(r, (RequestContext ctx) @safe => ResourceContents.makeText("s://ctx",
-			"text/plain", ctx.isStateless ? "stateless" : "session"));
+			"text/plain", ctx.usesInputRequired ? "stateless" : "session"));
 	auto res = s.handle(modernReq(1, "resources/read", Json([
 		"uri": Json("s://ctx")
 	]))).get;
@@ -9866,7 +9869,7 @@ unittest  // a prompt handler returning a final result can receive the per-reque
 	s.registerPrompt(p, (Json args, RequestContext ctx) @safe {
 		GetPromptResult g;
 		g.messages = [
-			PromptMessage("user", Content.makeText(ctx.isStateless ? "stateless" : "session"))
+			PromptMessage("user", Content.makeText(ctx.usesInputRequired ? "stateless" : "session"))
 		];
 		return g;
 	});
@@ -10340,9 +10343,9 @@ unittest  // requests without a per-request version use the negotiated session v
 }
 
 // ---------------------------------------------------------------------------
-// MRTR (2026-07-28) tool handling: the handler branches on ctx.isStateless and either
-// returns ToolResponse.inputRequired(...) (stateless) or calls ctx.elicit()
-// (2025-era). No framework version-dispatch and no replay.
+// MRTR (2026-07-28) tool handling: the handler branches on ctx.usesInputRequired and either
+// returns ToolResponse.inputRequired(...) (MRTR) or calls ctx.elicit()
+// (2025-era, stateful server). No framework version-dispatch and no replay.
 // ---------------------------------------------------------------------------
 
 unittest  // ToolResponse.complete serializes to the tool result
@@ -10392,7 +10395,7 @@ version (unittest)
 	{
 		Tool book = {name: "book"};
 		s.registerTool(book, (Json args, RequestContext ctx) @safe {
-			if (ctx.isStateless)
+			if (ctx.usesInputRequired)
 			{
 				auto answers = ctx.inputResponses();
 				if ("date" !in answers)

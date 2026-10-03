@@ -165,12 +165,17 @@ interface RequestContext
 		return ClientCapabilities.init;
 	}
 
-	/// True when this request is on a stateless (MRTR) protocol — 2026-07-28
-	/// revision, where there is no server->client channel. On such requests a
-	/// tool handler must NOT call `elicit`/`sample` (they throw); instead it
-	/// returns `ToolResponse.inputRequired(...)` and reads the client's answers
-	/// from `inputResponses` on the retried request. False on 2025-era requests.
-	bool isStateless() @safe;
+	/// True when this request gathers client input through MRTR (the 2026-07-28
+	/// protocol): the handler returns `ToolResponse.inputRequired(...)` and reads
+	/// the client's answers from `inputResponses` on the retried request, and
+	/// `elicit`/`sample`/`listRoots` throw.
+	///
+	/// False on 2025-era requests, but false does not mean those blocking calls
+	/// are available: they need a server constructed with `McpServer.stateful()`
+	/// on a transport with a server->client channel. On a `McpServer.stateless()`
+	/// server (the default) a 2025-era request has no way to ask the client for
+	/// input, and `elicit`/`sample` throw there too.
+	bool usesInputRequired() @safe;
 
 	/// The input responses the client attached when resubmitting an MRTR
 	/// request, keyed by the `InputRequest.id` the server issued on the prior
@@ -196,7 +201,7 @@ interface RequestContext
 	/// instead — or if the client does not support sampling.
 	final Json sample(Json params) @safe
 	{
-		if (isStateless)
+		if (usesInputRequired)
 			throw internalError("sample() is unavailable on a stateless (MRTR) request;"
 					~ " return ToolResponse.inputRequired instead, or construct the server with"
 					~ " McpServer.stateful() for a blocking server->client round-trip");
@@ -247,7 +252,7 @@ interface RequestContext
 	/// `.action`; read collected values via `.content` or `.contentAs!T`).
 	final ElicitResult elicit(string message, Json requestedSchema) @safe
 	{
-		if (isStateless)
+		if (usesInputRequired)
 			throw internalError("elicit() is unavailable on a stateless (MRTR) request;"
 					~ " return ToolResponse.inputRequired instead, or construct the server with"
 					~ " McpServer.stateful() for a blocking server->client round-trip");
@@ -293,7 +298,7 @@ interface RequestContext
 	/// contain a valid URL).
 	final ElicitResult elicitUrl(string message, string url, string elicitationId) @safe
 	{
-		if (isStateless)
+		if (usesInputRequired)
 			throw internalError("elicitUrl() is unavailable on a stateless (MRTR) request;"
 					~ " return ToolResponse.inputRequired instead, or construct the server with"
 					~ " McpServer.stateful() for a blocking server->client round-trip");
@@ -324,7 +329,7 @@ interface RequestContext
 	/// channel on the stateless protocol; use `ToolResponse.inputRequired` instead.
 	final ListRootsResult listRoots() @safe
 	{
-		if (isStateless)
+		if (usesInputRequired)
 			throw internalError("listRoots() is unavailable on a stateless (MRTR) request;"
 					~ " return ToolResponse.inputRequired instead, or construct the server with"
 					~ " McpServer.stateful() for a blocking server->client round-trip");
@@ -454,7 +459,7 @@ abstract class BaseRequestContext : RequestContext
 		return false;
 	}
 
-	bool isStateless() @safe
+	bool usesInputRequired() @safe
 	{
 		return false;
 	}
@@ -618,7 +623,7 @@ final class StdioContext : RequestContext
 		return clientCaps.supports(cap);
 	}
 
-	bool isStateless() @safe
+	bool usesInputRequired() @safe
 	{
 		return false;
 	}
@@ -675,15 +680,15 @@ private McpException missingClientCapability(ClientCapability cap, string messag
 
 /// Wraps a transport-supplied `RequestContext` with the per-request protocol
 /// state the server determines only after parsing the message: whether the
-/// request is stateless (MRTR), and the input responses the client attached.
-/// The server installs this around the transport context before dispatching, so
-/// handlers observe correct `isStateless`/`inputResponses` and `elicit`/`sample`
-/// fail fast on stateless requests. Notifications and server->client requests
+/// request gathers input through MRTR, and the input responses the client
+/// attached. The server installs this around the transport context before
+/// dispatching, so handlers observe correct `usesInputRequired`/`inputResponses`
+/// and `elicit`/`sample` fail fast on MRTR requests. Notifications and server->client requests
 /// delegate to the wrapped context unchanged.
 final class RequestScope : RequestContext, ConnectionScoped
 {
 	private RequestContext inner;
-	private bool stateless;
+	private bool inputRequired;
 	private Json[string] responses;
 	private string requestState_;
 	private string minLevel;
@@ -692,7 +697,7 @@ final class RequestScope : RequestContext, ConnectionScoped
 	private ProtocolVersion effectiveVersion_;
 	private ClientCapabilities clientCaps_;
 
-	this(RequestContext inner, bool stateless, Json[string] responses, string minLevel = "info",
+	this(RequestContext inner, bool inputRequired, Json[string] responses, string minLevel = "info",
 			bool loggingRequested = true, CancellationToken cancellation = null,
 			string requestState = "",
 			ProtocolVersion effectiveVersion = latestLegacy,
@@ -700,7 +705,7 @@ final class RequestScope : RequestContext, ConnectionScoped
 	{
 		this.clientCaps_ = clientCaps;
 		this.inner = inner;
-		this.stateless = stateless;
+		this.inputRequired = inputRequired;
 		this.responses = responses;
 		this.requestState_ = requestState;
 		this.minLevel = minLevel;
@@ -813,14 +818,14 @@ final class RequestScope : RequestContext, ConnectionScoped
 	/// context, which also knows whether a server->client channel exists.
 	bool clientSupports(ClientCapability cap) @safe
 	{
-		if (stateless)
+		if (inputRequired)
 			return clientCaps_.supports(cap);
 		return inner.clientSupports(cap);
 	}
 
-	bool isStateless() @safe
+	bool usesInputRequired() @safe
 	{
-		return stateless;
+		return inputRequired;
 	}
 
 	Json[string] inputResponses() @safe
@@ -900,7 +905,7 @@ version (unittest) private final class ElicitProbe : BaseRequestContext
 	/// them individually to model form-only / url-only clients.
 	bool supportsForm = true;
 	bool supportsUrl = true;
-	bool stateless = false;
+	bool inputRequired = false;
 	/// MRTR round-2 answers a test can populate to exercise `inputResponseAs!T`.
 	Json[string] responses;
 
@@ -928,9 +933,9 @@ version (unittest) private final class ElicitProbe : BaseRequestContext
 		}
 	}
 
-	override bool isStateless() @safe
+	override bool usesInputRequired() @safe
 	{
-		return stateless;
+		return inputRequired;
 	}
 
 	override Json[string] inputResponses() @safe
@@ -1001,7 +1006,7 @@ unittest  // elicitUrl() is rejected on a stateless (MRTR) request
 	import mcp.protocol.errors : McpException;
 
 	auto probe = new ElicitProbe;
-	probe.stateless = true;
+	probe.inputRequired = true;
 	assertThrown!McpException(probe.elicitUrl("msg", "https://example.com", "elic-1"));
 }
 
@@ -1464,7 +1469,7 @@ version (unittest) private final class StateProbe : BaseRequestContext
 	string state;
 	Json[string] responses;
 
-	override bool isStateless() @safe
+	override bool usesInputRequired() @safe
 	{
 		return true;
 	}
@@ -1590,7 +1595,7 @@ unittest  // sample() on a stateless (MRTR) request throws an internalError (ser
 {
 	import mcp.protocol.errors : McpException, ErrorCode;
 
-	auto probe = new StateProbe; // isStateless() == true
+	auto probe = new StateProbe; // usesInputRequired() == true
 	bool threw;
 	try
 		probe.sample(Json.emptyObject);
@@ -1608,7 +1613,7 @@ unittest  // listRoots() on a stateless (MRTR) request throws an internalError (
 
 	// roots/list is a server->client round-trip like sample/elicit, so it has no
 	// channel on the stateless protocol and must fail fast (use MRTR instead).
-	auto probe = new StateProbe; // isStateless() == true
+	auto probe = new StateProbe; // usesInputRequired() == true
 	bool threw;
 	try
 		probe.listRoots();
@@ -1626,7 +1631,7 @@ unittest  // elicit() on a stateless (MRTR) request throws an internalError (ser
 	import std.algorithm.searching : canFind;
 
 	auto probe = new ElicitProbe;
-	probe.stateless = true;
+	probe.inputRequired = true;
 	bool threw;
 	try
 		probe.elicit("Pick one", Json.emptyObject);
@@ -1649,7 +1654,7 @@ unittest  // elicitUrl() on a stateless (MRTR) request throws an internalError (
 	import mcp.protocol.errors : McpException, ErrorCode;
 
 	auto probe = new ElicitProbe;
-	probe.stateless = true;
+	probe.inputRequired = true;
 	bool threw;
 	try
 		probe.elicitUrl("msg", "https://example.com", "elic-1");
