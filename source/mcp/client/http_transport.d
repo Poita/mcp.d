@@ -372,6 +372,12 @@ final class HttpClientTransport : ClientTransport
 	// after the reader has exited fails its waiter at once instead of polling for
 	// the full timeout, since no response can ever arrive on a dead stream.
 	private bool legacyStreamAlive;
+	// Set when the legacy GET-SSE reader task exits, together with the cause when
+	// it failed (a rejected GET's HTTP status, or a connect/read error), so
+	// `startLegacyFallback` stops waiting for an `endpoint` event that cannot come
+	// and reports why.
+	private bool legacyStreamEnded;
+	private McpException legacyStreamFailure;
 	// True while the standalone server->client SSE reader task is running. Makes
 	// `startServerStream()` idempotent: a second call while a reader is live is a
 	// no-op, so a second standalone stream is never spawned and the live socket
@@ -1953,6 +1959,8 @@ final class HttpClientTransport : ClientTransport
 		legacyMode = true;
 		legacyEndpoint = null;
 		legacyEndpointRejected = false;
+		legacyStreamEnded = false;
+		legacyStreamFailure = null;
 
 		// Create the completion event before spawning the reader so an `endpoint`
 		// event the reader discovers immediately cannot be missed.
@@ -1972,9 +1980,10 @@ final class HttpClientTransport : ClientTransport
 		// endpoint URI, woken by the reader's `notifyLegacy` rather than polling.
 		// Exit immediately when the reader sets `legacyEndpointRejected`: a
 		// cross-origin endpoint was received and rejected by the SSRF guard, so
-		// no valid endpoint will ever arrive on this stream.
+		// no valid endpoint will ever arrive on this stream. Exit too when the
+		// reader has ended, since a dead stream delivers no endpoint either.
 		const deadline = MonoTime.currTime + 10_000.msecs;
-		while (legacyEndpoint.length == 0 && !legacyEndpointRejected)
+		while (legacyEndpoint.length == 0 && !legacyEndpointRejected && !legacyStreamEnded)
 		{
 			const now = MonoTime.currTime;
 			if (now >= deadline)
@@ -1989,6 +1998,11 @@ final class HttpClientTransport : ClientTransport
 		if (legacyEndpoint.length == 0)
 		{
 			legacyMode = false;
+			if (legacyStreamFailure !is null)
+				throw legacyStreamFailure;
+			if (legacyStreamEnded)
+				throw internalError(
+						"legacy HTTP+SSE GET stream closed before sending an `endpoint` event");
 			throw internalError(
 					"legacy HTTP+SSE server did not send an `endpoint` event on the GET stream");
 		}
@@ -2062,7 +2076,11 @@ final class HttpClientTransport : ClientTransport
 
 		legacyStreamAlive = true;
 		scope (exit)
+		{
 			legacyStreamAlive = false;
+			legacyStreamEnded = true;
+			notifyLegacy(); // wake `startLegacyFallback`
+		}
 
 		auto slot = new ListenSocketSlot;
 		slot.owner = Task.getThis();
@@ -2096,7 +2114,12 @@ final class HttpClientTransport : ClientTransport
 
 				const head = readResponseHead(conn);
 				if (head.status != 200)
+				{
+					legacyStreamFailure = new HttpStatusException(head.status,
+							"legacy HTTP+SSE server rejected the GET stream with HTTP " ~ idStr(
+								head.status), head.wwwAuthenticate);
 					return;
+				}
 
 				SseCursor cursor;
 				readSseBody(conn, head.chunked, cursor, () @safe => closing,
@@ -2118,6 +2141,7 @@ final class HttpClientTransport : ClientTransport
 			}
 			catch (Exception e)
 			{
+				legacyStreamFailure = internalError("legacy HTTP+SSE stream failed: " ~ e.msg);
 				failOutstandingLegacyWaiters("legacy HTTP+SSE stream failed: " ~ e.msg);
 			}
 		}();
@@ -5444,4 +5468,62 @@ unittest  // HttpEndpoint.hostHeader omits only the scheme's default port
 	assert(parseHttpEndpoint("https://h:8443/x").hostHeader == "h:8443");
 	assert(parseHttpEndpoint("http://[::1]:9000/x").hostHeader == "[::1]:9000");
 	assert(parseHttpEndpoint("https://[::1]/x").hostHeader == "[::1]");
+}
+
+unittest  // startLegacyFallback surfaces a rejected legacy GET stream promptly with its HTTP status
+{
+	import core.time : MonoTime, seconds;
+
+	auto router = new URLRouter;
+	router.get("/mcp", (HTTPServerRequest req, HTTPServerResponse res) @safe {
+		res.headers["WWW-Authenticate"] = `Bearer realm="mcp"`;
+		res.statusCode = 401;
+		res.writeBody("unauthorized");
+	});
+
+	int status;
+	string challenge;
+	auto took = 0.seconds;
+	const failure = runAgainstFakeServer(router, (string url) @safe {
+		auto t = new HttpClientTransport(url);
+		const start = MonoTime.currTime;
+		try
+			t.startLegacyFallback();
+		catch (HttpStatusException e)
+		{
+			status = e.status;
+			challenge = e.wwwAuthenticate;
+		}
+		took = MonoTime.currTime - start;
+		t.close();
+	});
+	assert(failure.length == 0, failure);
+	assert(status == 401);
+	assert(challenge == `Bearer realm="mcp"`);
+	assert(took < 5.seconds);
+}
+
+unittest  // startLegacyFallback surfaces a refused legacy GET connection promptly
+{
+	import core.time : MonoTime, seconds;
+	import std.algorithm : canFind;
+
+	auto router = new URLRouter;
+	string msg;
+	auto took = 0.seconds;
+	const failure = runAgainstFakeServer(router, (string url) @safe {
+		// Nothing listens on loopback port 9, so the connect is refused.
+		auto t = new HttpClientTransport("http://127.0.0.1:9/mcp");
+		const start = MonoTime.currTime;
+		try
+			t.startLegacyFallback();
+		catch (McpException e)
+			msg = e.msg;
+		took = MonoTime.currTime - start;
+		t.close();
+	});
+	assert(failure.length == 0, failure);
+	assert(msg.length);
+	assert(!msg.canFind("did not send an `endpoint` event"), msg);
+	assert(took < 5.seconds);
 }
