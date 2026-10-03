@@ -1440,9 +1440,19 @@ final class EventsRuntime
 				releaseLifecycle(p.name, p.arguments, principal);
 				return subscribeWebhook(p, principal);
 			}
-			heldWebhookRefs_[id] = WebhookRef(p.name, p.arguments, principal);
 		}
 		webhookStore_.put(sub);
+		// The reference is recorded only once the subscription is stored: a
+		// reconcile pass during the write releases every held reference whose
+		// subscription the store lacks. A registration that adopted the stored
+		// subscription during the write already holds its reference.
+		if (isNew)
+		{
+			if ((id in heldWebhookRefs_) is null)
+				heldWebhookRefs_[id] = WebhookRef(p.name, p.arguments, principal);
+			else
+				releaseLifecycle(p.name, p.arguments, principal);
+		}
 		// A fresh subscription replays from its cursor (or bootstraps a fresh one);
 		// the backfill reports whether delivery starts later than that cursor.
 		const truncated = isNew ? backfillWebhook(sub, reg, p.maxAgeMs) : false;
@@ -7249,6 +7259,47 @@ unittest  // subscribe and publish read only the subscriptions they concern, nev
 	assert(store.allCalls == 0);
 	auto delivered = ft.eventPosts();
 	assert(delivered.length == 1 && delivered[0].url == "https://proxy/a");
+}
+
+unittest  // a reconcile pass while a new webhook subscription is stored does not tear it down
+{
+	static final class YieldingStore : ForwardingStore
+	{
+		void delegate() @safe duringPut;
+
+		override void put(WebhookSubscription sub) @safe
+		{
+			if (duringPut !is null)
+			{
+				auto hook = duringPut;
+				duringPut = null;
+				hook();
+			}
+			inner.put(sub);
+		}
+	}
+
+	auto store = new YieldingStore();
+	EventsOptions o;
+	o.nowMs = () @safe => 1_000_000L;
+	o.nowIso = () @safe => "t";
+	o.allowPrivateCallbackHosts = true;
+	o.webhookTransport = new FakeWebhookTransport();
+	o.deliverySleep = (Duration d) @safe {};
+	o.deliveryExecutor = (void delegate() @safe job) @safe { job(); };
+	auto rt = new EventsRuntime(store, o);
+	int subs, unsubs;
+	EventRegistration reg = {descriptor: EventType("n"), emitOnly: true};
+	reg.onSubscribe = (EventContext ctx, string id) @safe { subs++; };
+	reg.onUnsubscribe = (EventContext ctx, string id) @safe { unsubs++; };
+	rt.register(reg);
+	// The worker's reconcile pass runs while the store write is in flight, as a
+	// shared store's network round-trip would let it.
+	store.duringPut = () @safe { rt.reconcileDeliveries(); };
+	rt.subscribeWebhook(webhookSub("n", "https://proxy/hooks"), "user-1");
+	assert(subs == 1 && unsubs == 0);
+	rt.reconcileDeliveries();
+	assert(unsubs == 0);
 }
 
 unittest  // a job for a subscription that lapsed before delivery is acked without a POST
