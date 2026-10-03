@@ -882,9 +882,10 @@ ClientIdMetadataDocument parseClientIdMetadataDocument(string clientIdUrl, strin
 ///     keeps in a cookie. Binding consent to it means an approval recorded in one
 ///     browser (e.g. an attacker approving their own redirect_uri) never lets a
 ///     different browser skip the consent screen.
-///   * `client` — the per-client identity: the client-supplied `redirect_uri`
-///     for a DCR client (the `client_id` is shared), or the stable `client_id`
-///     URL for a SEP-991 CIMD client.
+///   * `client` — the per-client identity: the `redirectUriMatchKey` of the
+///     client-supplied `redirect_uri` for a DCR client (the `client_id` is
+///     shared; a loopback IP literal's port is not part of it), or the stable
+///     `client_id` URL for a SEP-991 CIMD client.
 ///
 /// Each approval also records the scopes the user saw and approved, so a later
 /// request for broader access re-prompts rather than riding on the earlier
@@ -1290,9 +1291,11 @@ final class OAuthProxy
 	/// Whether the browser identified by `consentSession` has already approved
 	/// `client` (a DCR client's `redirect_uri`, or a CIMD `client_id` URL) to be
 	/// forwarded to the upstream identity provider with every scope in `scopes`.
+	/// A client is identified by its `redirectUriMatchKey`, so an approval of a
+	/// loopback IP-literal redirect_uri holds for any port, as registration does.
 	bool hasConsent(string consentSession, string client, const(string)[] scopes) @safe
 	{
-		return consentStore.hasConsent(consentSession, client, scopes);
+		return consentStore.hasConsent(consentSession, redirectUriMatchKey(client), scopes);
 	}
 
 	/// The scopes of the space-delimited `scopeStr` this proxy forwards upstream
@@ -1310,10 +1313,10 @@ final class OAuthProxy
 	/// `authorize` calls from that browser for that client are then forwarded to
 	/// the upstream IdP for `scopes` (as `forwardedScopes` yields them). Other
 	/// browsers, and requests for scopes not yet approved, still see the consent
-	/// screen.
+	/// screen. The approval is recorded under `redirectUriMatchKey(client)`.
 	void grantConsent(string consentSession, string client, const(string)[] scopes) @safe
 	{
-		consentStore.grantConsent(consentSession, client, scopes);
+		consentStore.grantConsent(consentSession, redirectUriMatchKey(client), scopes);
 	}
 
 	/// Build the upstream authorization redirect for a proxied `/authorize`,
@@ -1333,7 +1336,7 @@ final class OAuthProxy
 			string codeChallenge, string scopeStr, string state) @safe
 	{
 		validateRedirectUri(clientRedirectUri);
-		if (!consentStore.hasConsent(consentSession, clientRedirectUri, forwardedScopes(scopeStr)))
+		if (!hasConsent(consentSession, clientRedirectUri, forwardedScopes(scopeStr)))
 			throw new ConsentRequiredException(clientRedirectUri);
 		return proxyAuthorizeUrl(cfg, codeChallenge, scopeStr, state);
 	}
@@ -1466,7 +1469,7 @@ final class OAuthProxy
 			throw new InvalidClientIdMetadataException(clientIdUrl,
 					"Client ID Metadata Documents are not enabled on this proxy");
 		validateClientIdMetadata(clientIdUrl, doc, clientRedirectUri);
-		if (!consentStore.hasConsent(consentSession, clientIdUrl, forwardedScopes(scopeStr)))
+		if (!hasConsent(consentSession, clientIdUrl, forwardedScopes(scopeStr)))
 			throw new ConsentRequiredException(clientIdUrl);
 		return proxyAuthorizeUrl(cfg, codeChallenge, scopeStr, state);
 	}
@@ -2338,6 +2341,32 @@ unittest  // CONFUSED DEPUTY: consent is per-client (one approval does not cover
 	assert(!proxy.hasConsent("browser-1", "http://localhost:6000/callback", null));
 	assertThrown!ConsentRequiredException(proxy.authorize("browser-1",
 			"http://localhost:6000/callback", "CH", "read:user", "S"));
+}
+
+unittest  // CONSENT: approval of a loopback IP-literal redirect_uri covers the same client on another port
+{
+	auto proxy = new OAuthProxy(sampleConfig());
+	proxy.register(["http://127.0.0.1:5000/callback"]);
+	proxy.grantConsent("browser-1", "http://127.0.0.1:5000/callback", [
+		"read:user"
+	]);
+	assert(proxy.hasConsent("browser-1", "http://127.0.0.1:61234/callback", [
+		"read:user"
+	]));
+	cast(void) proxy.authorize("browser-1", "http://127.0.0.1:61234/callback",
+			"CH", "read:user", "S");
+}
+
+unittest  // CONSENT: approval of a loopback redirect_uri does not cover a different path
+{
+	auto proxy = new OAuthProxy(sampleConfig());
+	proxy.register(["http://127.0.0.1:5000/callback"]);
+	proxy.grantConsent("browser-1", "http://127.0.0.1:5000/callback", [
+		"read:user"
+	]);
+	assert(!proxy.hasConsent("browser-1", "http://127.0.0.1:5000/other", [
+		"read:user"
+	]));
 }
 
 unittest  // CONFUSED DEPUTY: the exception names the client redirect_uri needing consent
