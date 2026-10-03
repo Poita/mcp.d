@@ -857,7 +857,12 @@ private final class SseWriter
 			}
 		}
 		catch (Exception)
+		{
 			dead = true;
+			// Wake writes waiting for room so they fail now rather than at their
+			// stall deadline.
+			drained.emit();
+		}
 	}
 
 	/// Write out what is queued, waiting at most `drain`, then stop the writer;
@@ -883,6 +888,7 @@ private final class SseWriter
 	{
 		dead = true;
 		queue = null;
+		drained.emit();
 		closeRawConnection(res);
 		if (started && writer.running && writer != Task.getThis())
 			writer.interrupt();
@@ -4124,6 +4130,54 @@ unittest  // a stalled SSE reader blocks neither notify nor other streams, and i
 			"a stalled reader must hold up notify only until its queue gives up on it");
 	assert(received == 40, "a healthy stream must receive every notification");
 	assert(remaining == 1, "a stream whose client stopped reading must be dropped");
+}
+
+version (unittest) private final class FailingSink : OutputStream
+{
+@safe:
+	size_t write(scope const(ubyte)[] bytes, IOMode) @trusted
+	{
+		import core.time : msecs;
+		import vibe.core.core : sleep;
+
+		sleep(100.msecs);
+		throw new Exception("connection reset");
+	}
+
+	void flush()
+	{
+	}
+
+	void finalize()
+	{
+	}
+}
+
+unittest  // a write waiting on a full SSE queue fails as soon as the writer dies
+{
+	import core.time : MonoTime;
+	import vibe.core.core : runTask, exitEventLoop, runEventLoop;
+	import vibe.http.server : createTestHTTPServerResponse, TestHTTPResponseMode;
+
+	auto writer = sseFrameWriter(createTestHTTPServerResponse(new FailingSink,
+			null, TestHTTPResponseMode.bodyOnly), 10);
+	Duration took;
+	bool failed;
+	runTask(() @safe nothrow{
+		const started = MonoTime.currTime;
+		try
+		{
+			writer("aaaaaaaa");
+			writer("bbbbbbbb");
+		}
+		catch (Exception)
+			failed = true;
+		took = MonoTime.currTime - started;
+		exitEventLoop();
+	});
+	runEventLoop();
+	assert(failed, "a write to a dead stream must throw");
+	assert(took < 1.seconds, "a waiting write must wake when the writer dies");
 }
 
 unittest  // several stalled SSE readers hold up a fan-out for one stall timeout, not one each
