@@ -26,8 +26,8 @@ import mcp.client.subscription : SubscriptionStream, ListenGate;
 /// status and no JSON-RPC response for the request. `status` is the HTTP status
 /// code. A 400/404/405 raised while `McpClient.connect` probes the server is the
 /// backward-compatibility trigger; a 404 on a request that carried an
-/// `Mcp-Session-Id` means the session expired (the transport drops the id so the
-/// next `initialize` starts a new session).
+/// `Mcp-Session-Id` means the session expired and raises the subclass
+/// `SessionExpiredException`.
 ///
 /// When the body carried a JSON-RPC error, `code`/`msg`/`data` are that error's;
 /// otherwise `code` is `internalError`. `wwwAuthenticate` is the response's
@@ -48,6 +48,20 @@ class HttpStatusException : McpException
 		super(code, message, data);
 		this.status = status;
 		this.wwwAuthenticate = wwwAuthenticate;
+	}
+}
+
+/// A request rejected because the server no longer knows the client's session:
+/// it answered a request carrying an `Mcp-Session-Id` with HTTP 404, or a
+/// request followed such an answer (basic/transports §Session Management).
+/// Every request fails this way until the client starts a new session with
+/// `initialize`, which also reopens a standalone server stream the expiry
+/// ended.
+class SessionExpiredException : HttpStatusException
+{
+	this(int status, string message) @safe
+	{
+		super(status, message);
 	}
 }
 
@@ -398,6 +412,9 @@ final class HttpClientTransport : ClientTransport
 	// no-op, so a second standalone stream is never spawned and the live socket
 	// slots are never orphaned.
 	private bool serverStreamAlive;
+	// Set when a session expiry ended the standalone stream `startServerStream`
+	// opened, so the `notifications/initialized` of the next session reopens it.
+	private bool reopenServerStream;
 	// Event-driven completion for the two legacy-path waits (`startLegacyFallback`
 	// endpoint discovery and `legacyRpc` response arrival), replacing fixed 50ms
 	// busy-poll loops. The background `runLegacyStream` reader emits it after
@@ -681,7 +698,7 @@ final class HttpClientTransport : ClientTransport
 			sessionId = null;
 		}
 		else if (sessionExpired)
-			throw new HttpStatusException(404,
+			throw new SessionExpiredException(404,
 					"MCP session expired (server rejected a prior request with HTTP 404/410)");
 		if (legacyMode)
 			return legacyRpc(message, expectId);
@@ -764,7 +781,15 @@ final class HttpClientTransport : ClientTransport
 
 	void sendOneway(Json message) @safe
 	{
-		post(message);
+		const status = post(message);
+		// A new session is ready once the server has its `initialized`.
+		if (reopenServerStream && status >= 200 && status < 300 && sessionId.length
+				&& message.type == Json.Type.object && "method" in message
+				&& message["method"] == Json("notifications/initialized"))
+		{
+			reopenServerStream = false;
+			startServerStream();
+		}
 	}
 
 	void abort(long expectId, McpException reason) @safe
@@ -886,7 +911,7 @@ final class HttpClientTransport : ClientTransport
 		{
 			sessionExpired = true;
 			sessionId = null;
-			throw new HttpStatusException(status,
+			throw new SessionExpiredException(status,
 					"MCP session expired (server answered HTTP 404 for the session)");
 		}
 		// Any other 400/404/405 without a recognised modern error is the signal
@@ -1758,6 +1783,10 @@ final class HttpClientTransport : ClientTransport
 					sessionExpired = true;
 					sessionId = null;
 				}
+				// The session this stream belonged to is gone (here or through a
+				// request's 404): reopen it for the next session.
+				if (status == 404 && sentSession.length && sessionId != sentSession)
+					reopenServerStream = true;
 				break;
 			}
 			if (status == 401 && !(sentBearer.length && isRejectedBearer(status,
@@ -4064,6 +4093,10 @@ version (unittest)
 		int minted;
 		string[] initializeSessionHeaders; // the Mcp-Session-Id each initialize carried
 		int sessionlessRequests; // non-initialize POSTs that carried no Mcp-Session-Id
+		// Whether GET serves the standalone stream, and the Mcp-Session-Id each
+		// accepted stream carried.
+		bool serveStream;
+		string[] streamSessions;
 
 		void expire() @safe
 		{
@@ -4103,9 +4136,83 @@ version (unittest)
 				res.statusCode = 202;
 				res.writeBody("", "text/plain");
 			});
+			// The standalone stream: refused for a dead session, otherwise held
+			// open briefly and then closed, so the client reconnects.
+			if (serveStream)
+				r.get("/mcp", (HTTPServerRequest req, HTTPServerResponse res) @safe {
+					import core.time : msecs;
+					import vibe.core.core : sleep;
+
+					const sid = req.headers.get("Mcp-Session-Id", "");
+					if (sid != live || live.length == 0)
+					{
+						res.statusCode = 404;
+						res.writeBody("", "text/plain");
+						return;
+					}
+					streamSessions ~= sid;
+					res.headers["Content-Type"] = "text/event-stream";
+					res.bodyWriter.write(": open\n\n");
+					res.bodyWriter.flush();
+					sleep(100.msecs);
+				});
 			return r;
 		}
 	}
+}
+
+unittest  // a request on an expired session fails with SessionExpiredException
+{
+	import mcp.client.client : McpClient;
+
+	auto srv = new SessionFakeServer;
+	int expired;
+	const failure = runAgainstFakeServer(srv.router(), (string url) @safe {
+		auto client = McpClient.http(url);
+		scope (exit)
+			client.close();
+		client.initialize("2025-11-25");
+		srv.expire();
+		foreach (_; 0 .. 2)
+		{
+			try
+				client.listTools();
+			catch (SessionExpiredException e)
+			{
+				assert(e.status == 404);
+				++expired;
+			}
+		}
+	});
+	assert(failure.length == 0, "scenario failed: " ~ failure);
+	assert(expired == 2, "both the 404 and the request after it must report the expired session");
+}
+
+unittest  // the server stream an expired session ended is reopened once the client re-initializes
+{
+	import core.time : msecs;
+	import vibe.core.core : sleep;
+	import mcp.client.client : McpClient;
+
+	auto srv = new SessionFakeServer;
+	srv.serveStream = true;
+	const failure = runAgainstFakeServer(srv.router(), (string url) @safe {
+		auto client = McpClient.http(url);
+		scope (exit)
+			client.close();
+		client.initialize("2025-11-25");
+		client.startServerStream();
+		sleep(50.msecs);
+		srv.expire();
+		// The stream closes and its reconnect is refused with a 404.
+		sleep(800.msecs);
+		client.initialize("2025-11-25");
+		sleep(300.msecs);
+	});
+	assert(failure.length == 0, "scenario failed: " ~ failure);
+	assert(srv.streamSessions.length >= 2 && srv.streamSessions[0] == "s1"
+			&& srv.streamSessions[$ - 1] == "s2",
+			"the server stream must be reopened for the new session");
 }
 
 unittest  // a mid-session 404 surfaces as a typed McpException and a fresh initialize starts a new session
