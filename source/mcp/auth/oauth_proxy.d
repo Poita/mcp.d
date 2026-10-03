@@ -31,7 +31,7 @@
 /// are unit-testable with a mocked upstream.
 module mcp.auth.oauth_proxy;
 
-import core.time : days, Duration, minutes;
+import core.time : days, Duration, hours, minutes, MonoTime, seconds;
 import std.string : endsWith, indexOf, startsWith;
 
 import vibe.data.json : Json;
@@ -1090,10 +1090,46 @@ struct RelayedCodeBinding
 	string clientId; /// the CIMD `client_id` URL; empty for a DCR client
 }
 
+/// A fetched Client ID Metadata Document and when its cache entry lapses.
+private struct CachedClientIdMetadata
+{
+	ClientIdMetadataDocument doc;
+	MonoTime expiresAt;
+}
+
+/// How long to cache a Client ID Metadata Document fetched with the
+/// `Cache-Control` header value `cacheControl`: its `max-age`, else
+/// `OAuthProxy.cimdCacheDefaultTtl`, clamped to `OAuthProxy.cimdCacheMinTtl` ..
+/// `OAuthProxy.cimdCacheMaxTtl`. `no-store`/`no-cache` select the minimum.
+package Duration cimdCacheTtl(string cacheControl) @safe
+{
+	import std.algorithm : clamp;
+	import std.array : split;
+	import std.conv : to;
+	import std.string : strip, toLower;
+
+	enum minS = OAuthProxy.cimdCacheMinTtl.total!"seconds";
+	enum maxS = OAuthProxy.cimdCacheMaxTtl.total!"seconds";
+	foreach (directive; cacheControl.toLower.split(','))
+	{
+		const d = directive.strip;
+		if (d == "no-store" || d == "no-cache")
+			return OAuthProxy.cimdCacheMinTtl;
+		if (d.startsWith("max-age="))
+		{
+			try
+				return d["max-age=".length .. $].to!long.clamp(minS, maxS).seconds;
+			catch (Exception)
+				return OAuthProxy.cimdCacheDefaultTtl;
+		}
+	}
+	return OAuthProxy.cimdCacheDefaultTtl;
+}
+
 /// Fetches and parses the OAuth Client ID Metadata Document (SEP-991) hosted at a
 /// URL-formatted `client_id`. The default fetcher is the SSRF-guarded HTTP fetch
-/// (`OAuthProxy.fetchClientIdMetadata`); inject a custom one (e.g. a caching
-/// fetcher honouring HTTP cache headers, or a test stub) via
+/// (`OAuthProxy.fetchClientIdMetadata`); inject a custom one (e.g. one backed by
+/// storage shared across processes, or a test stub) via
 /// `OAuthProxy.clientIdMetadataFetcher`.
 alias ClientIdMetadataFetcher = ClientIdMetadataDocument delegate(string clientIdUrl) @safe;
 
@@ -1114,6 +1150,27 @@ final class OAuthProxy
 	private ClientIdMetadataFetcher cimdFetcher;
 	private BoundedExpiringMap!RelayedCodeBinding relayedCodes = BoundedExpiringMap!RelayedCodeBinding(
 			relayedCodeTtl, maxRelayedCodes, null);
+
+	// Fetched Client ID Metadata Documents by client_id URL, so the /consent
+	// leg and repeated /authorize requests reuse one fetch.
+	private BoundedExpiringMap!CachedClientIdMetadata cimdCache = BoundedExpiringMap!CachedClientIdMetadata(
+			cimdCacheMaxTtl, maxCachedClientIdMetadata, null);
+
+	/// How long a fetched Client ID Metadata Document is reused when its
+	/// response carries no usable `Cache-Control: max-age`.
+	enum Duration cimdCacheDefaultTtl = 5.minutes;
+
+	/// The shortest a fetched document is cached, even under `no-store` or
+	/// `max-age=0`: the document host is attacker-chosen, so it must not be able
+	/// to make every request trigger a fresh fetch.
+	enum Duration cimdCacheMinTtl = 1.minutes;
+
+	/// The longest a fetched document is cached, whatever its `max-age`, so an
+	/// edited document is picked up within this window.
+	enum Duration cimdCacheMaxTtl = 1.hours;
+
+	/// Maximum number of cached Client ID Metadata Documents.
+	enum size_t maxCachedClientIdMetadata = 1_000;
 
 	/// How long a relayed authorization code stays redeemable at `/token`.
 	enum Duration relayedCodeTtl = 10.minutes;
@@ -1295,10 +1352,11 @@ final class OAuthProxy
 		return proxyAuthorizeUrl(cfg, codeChallenge, scopeStr, state);
 	}
 
-	/// Install a custom Client ID Metadata Document fetcher (e.g. a caching fetcher
-	/// honouring HTTP cache headers, or a test stub), replacing the default
-	/// SSRF-guarded HTTP fetch. The fail-fast enabled/URL checks in
-	/// `fetchClientIdMetadata` still run before the injected fetcher is consulted.
+	/// Install a custom Client ID Metadata Document fetcher (e.g. one backed by
+	/// storage shared across processes, or a test stub), replacing the default
+	/// SSRF-guarded HTTP fetch. The fail-fast enabled/URL checks and the
+	/// per-`client_id` cache in `fetchClientIdMetadata` still apply; a document
+	/// it returns is cached for `cimdCacheDefaultTtl`.
 	void clientIdMetadataFetcher(ClientIdMetadataFetcher fetcher) @safe
 	{
 		cimdFetcher = fetcher;
@@ -1314,12 +1372,13 @@ final class OAuthProxy
 	/// NOT yet validated against the request — pass it to
 	/// `authorizeWithClientIdMetadata`, which enforces the SEP-991 MUSTs. Throws
 	/// `InvalidClientIdMetadataException` on any fail-fast, fetch, or parse error.
+	///
+	/// A fetched document is cached per `client_id` for its `Cache-Control`
+	/// `max-age` bounded by `cimdCacheMinTtl` .. `cimdCacheMaxTtl` (default
+	/// `cimdCacheDefaultTtl`), so the `/consent` leg and repeated `/authorize`
+	/// requests for one client do not refetch an attacker-chosen URL.
 	ClientIdMetadataDocument fetchClientIdMetadata(string clientIdUrl) @safe
 	{
-		import vibe.http.client : HTTPClientRequest, HTTPClientResponse;
-		import vibe.http.common : HTTPMethod;
-		import vibe.stream.operations : readAllUTF8;
-
 		if (!cfg.clientIdMetadataDocumentSupported)
 			throw new InvalidClientIdMetadataException(clientIdUrl,
 					"Client ID Metadata Documents are not enabled on this proxy");
@@ -1327,10 +1386,35 @@ final class OAuthProxy
 			throw new InvalidClientIdMetadataException(clientIdUrl,
 					"client_id must be an https URL with a path component (SEP-991)");
 
+		const now = MonoTime.currTime;
+		if (auto hit = cimdCache.get(clientIdUrl, false))
+		{
+			if (now < hit.expiresAt)
+				return hit.doc;
+			cimdCache.remove(clientIdUrl);
+		}
+
+		ClientIdMetadataDocument doc;
+		Duration ttl = cimdCacheDefaultTtl;
 		if (cimdFetcher !is null)
-			return cimdFetcher(clientIdUrl);
+			doc = cimdFetcher(clientIdUrl);
+		else
+			doc = fetchClientIdMetadataOverHttp(clientIdUrl, ttl);
+		cimdCache.put(clientIdUrl, CachedClientIdMetadata(doc, now + ttl));
+		return doc;
+	}
+
+	// The SSRF-guarded fetch behind `fetchClientIdMetadata`; `ttl` receives the
+	// cache lifetime the response's Cache-Control allows.
+	private ClientIdMetadataDocument fetchClientIdMetadataOverHttp(string clientIdUrl,
+			out Duration ttl) @safe
+	{
+		import vibe.http.client : HTTPClientRequest, HTTPClientResponse;
+		import vibe.http.common : HTTPMethod;
+		import vibe.stream.operations : readAllUTF8;
 
 		string responseBody;
+		string cacheControl;
 		bool ok = false;
 		try
 		{
@@ -1343,6 +1427,7 @@ final class OAuthProxy
 					responseBody = () @trusted {
 						return res.bodyReader.readAllUTF8(false, maxClientIdMetadataBytes);
 					}();
+					cacheControl = res.headers.get("Cache-Control", "");
 					ok = true;
 				}
 				else
@@ -1355,6 +1440,7 @@ final class OAuthProxy
 		if (!ok)
 			throw new InvalidClientIdMetadataException(clientIdUrl,
 					"metadata document endpoint did not return a success status");
+		ttl = cimdCacheTtl(cacheControl);
 		return parseClientIdMetadataDocument(clientIdUrl, responseBody);
 	}
 
@@ -1806,6 +1892,37 @@ unittest  // CIMD FETCH: an injected fetcher is consulted instead of the network
 	auto got = proxy.fetchClientIdMetadata("https://app.example.com/oauth/client.json");
 	assert(called);
 	assert(got.clientId == doc.clientId);
+}
+
+unittest  // CIMD CACHE: a document fetched at /authorize is reused for the same client_id
+{
+	auto cfg = sampleConfig();
+	cfg.clientIdMetadataDocumentSupported = true;
+	auto proxy = new OAuthProxy(cfg);
+	int fetches;
+	proxy.clientIdMetadataFetcher = (string url) @safe {
+		++fetches;
+		return sampleCimdDoc();
+	};
+	foreach (i; 0 .. 3)
+		cast(void) proxy.fetchClientIdMetadata("https://app.example.com/oauth/client.json");
+	assert(fetches == 1);
+	cast(void) proxy.fetchClientIdMetadata("https://other.example.com/oauth/client.json");
+	assert(fetches == 2);
+}
+
+unittest  // CIMD CACHE: Cache-Control max-age sets the cache lifetime within fixed bounds
+{
+	import core.time : hours, minutes, seconds;
+
+	assert(cimdCacheTtl("") == OAuthProxy.cimdCacheDefaultTtl);
+	assert(cimdCacheTtl("public, max-age=600") == 600.seconds);
+	assert(cimdCacheTtl("Max-Age=120") == 120.seconds);
+	// An attacker-hosted document cannot opt out of caching or pin it for long.
+	assert(cimdCacheTtl("no-store") == OAuthProxy.cimdCacheMinTtl);
+	assert(cimdCacheTtl("max-age=0") == OAuthProxy.cimdCacheMinTtl);
+	assert(cimdCacheTtl("max-age=31536000") == OAuthProxy.cimdCacheMaxTtl);
+	assert(cimdCacheTtl("max-age=bogus") == OAuthProxy.cimdCacheDefaultTtl);
 }
 
 unittest  // CIMD FETCH: even with an injected fetcher, a malformed client_id URL fails fast
@@ -2440,13 +2557,13 @@ unittest  // REGISTER: a redirect_uri /authorize would never accept is refused a
 
 	auto proxy = new OAuthProxy(sampleConfig());
 	assertThrown!InvalidRedirectUriException(proxy.register([
-			"com.example.app:/oauth/cb"
+		"com.example.app:/oauth/cb"
 	]));
 	assertThrown!InvalidRedirectUriException(proxy.register([
 		"https://app.example.com/cb", "http://app.example.com/cb"
 	]));
 	assertThrown!InvalidRedirectUriException(proxy.register([
-			"https://app.example.com/cb#frag"
+		"https://app.example.com/cb#frag"
 	]));
 	// Nothing from a refused registration is retained.
 	assertThrown!InvalidRedirectUriException(
