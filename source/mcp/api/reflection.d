@@ -486,7 +486,7 @@ private void checkParamTypes(alias func)()
 						func) ~ "' has type " ~ P.stringof ~ ", but " ~ facetMismatch!(P,
 						ParamAttributes!(func, i))());
 			static foreach (d; ParamSchemaDefaults!(func, i))
-				static assert(isDefaultFor!(P, typeof(d.value)),
+				static assert(isDefaultFor!(P, d),
 						"the @schemaDefault value of type " ~ typeof(d.value)
 							.stringof ~ " on parameter '" ~ ids[i] ~ "' of '" ~ __traits(identifier,
 								func) ~ "' does not convert to its type " ~ P.stringof);
@@ -5153,6 +5153,41 @@ unittest  // a @schemaDefault whose value does not convert to the parameter type
 	auto s = new McpServer("t", "1");
 	static assert(!__traits(compiles, registerHandlers(s, new MismatchedDefaultApi)));
 	static assert(!__traits(compiles, registerHandlers(s, new FractionalIntDefaultApi)));
+}
+
+version (unittest) private final class OutOfRangeDefaultApi
+{
+	import jsonschema : schemaDefault;
+
+	@tool("f", "f")
+	string f(@schemaDefault(300) ubyte x)@safe
+	{
+		return "";
+	}
+}
+
+version (unittest) private final class NonMemberEnumDefaultApi
+{
+	import jsonschema : schemaDefault;
+
+	enum Mode : string
+	{
+		light = "L",
+		dark = "D",
+	}
+
+	@tool("f", "f")
+	string f(@schemaDefault("dark") Mode x)@safe
+	{
+		return "";
+	}
+}
+
+unittest  // a lossy or non-member @schemaDefault on a parameter is rejected at compile time
+{
+	auto s = new McpServer("t", "1");
+	assert(!__traits(compiles, registerHandlers(s, new OutOfRangeDefaultApi)));
+	assert(!__traits(compiles, registerHandlers(s, new NonMemberEnumDefaultApi)));
 }
 
 version (unittest) private final class TaskTtlOnToolApi

@@ -306,8 +306,7 @@ package(mcp) string unsupportedTypeReason(T, SchemaUse use, Ancestors...)()
 			static if (isBoundField!(T, field))
 			{
 				static foreach (d; getUDAs!(__traits(getMember, T, field), SchemaDefault))
-					static if (!isDefaultFor!(typeof(__traits(getMember, T,
-							field)), typeof(d.value)))
+					static if (!isDefaultFor!(typeof(__traits(getMember, T, field)), d))
 						return T.stringof ~ "." ~ field
 							~ ": its @schemaDefault value of type " ~ typeof(d.value)
 								.stringof ~ " does not convert to " ~ typeof(__traits(getMember,
@@ -395,30 +394,56 @@ package(mcp) string facetMismatch(T, udas...)()
 	}
 }
 
-/// Whether a `@schemaDefault` value of type `V` can be the default of a `P`: it
-/// converts to `P` (or, for a `Nullable`, to the type it wraps) without losing
-/// a fractional part to an integer.
-package(mcp) template isDefaultFor(P, V)
+/// Whether the `@schemaDefault` UDA `uda` can be the default of a `P` (or, for a
+/// `Nullable`, of the type it wraps) without changing its value: it converts
+/// implicitly, an integer is within the target integer type's range, and an
+/// enum default is a member of the enum type itself.
+package(mcp) template isDefaultFor(P, alias uda)
 {
 	static if (isInstanceOf!(Nullable, P))
 		alias Target = TemplateArgsOf!P[0];
 	else
 		alias Target = P;
-	enum isDefaultFor = is(typeof(cast(P) V.init)) && !(isFloatingPoint!V
-				&& !isFloatingPoint!Target);
+	alias V = typeof(uda.value);
+
+	static if (is(Target == enum))
+		enum isDefaultFor = is(V : Target) && isEnumMember!(Target, uda.value);
+	else static if (isIntegral!Target && isIntegral!V && !is(V == enum))
+		enum isDefaultFor = fitsIn!Target(uda.value);
+	else
+		enum isDefaultFor = is(V : Target);
+}
+
+private bool isEnumMember(E, alias value)()
+{
+	static foreach (m; EnumMembers!E)
+		if (value == m)
+			return true;
+	return false;
+}
+
+/// Whether the integer `value` is within the range of the integer type `T`.
+private bool fitsIn(T, V)(V value)
+{
+	static if (isSigned!V)
+		if (value < 0)
+			return isSigned!T && long(value) >= long(T.min);
+	return ulong(value) <= ulong(T.max);
 }
 
 /// The value of the `@schemaDefault` UDA `uda` as a `P`, rejected at compile
-/// time when it does not convert (see `isDefaultFor`).
+/// time when it cannot be one (see `isDefaultFor`).
 package(mcp) P defaultAs(P, alias uda)()
 {
 	alias V = typeof(uda.value);
-	static assert(isDefaultFor!(P, V),
+	static assert(isDefaultFor!(P, uda),
 			"a @schemaDefault value of type " ~ V.stringof ~ " does not convert to " ~ P.stringof);
-	static if (isDefaultFor!(P, V))
-		return cast(P) uda.value;
-	else
+	static if (!isDefaultFor!(P, uda))
 		return P.init;
+	else static if (isInstanceOf!(Nullable, P))
+		return P(cast(TemplateArgsOf!P[0]) uda.value);
+	else
+		return cast(P) uda.value;
 }
 
 /// The `HH:MM:SS` form vibe reads and writes a `TimeOfDay` in. `TimeOfDay` and
@@ -1134,10 +1159,68 @@ unittest  // a struct field whose @schemaDefault does not convert to its type is
 	}
 
 	static assert(unsupportedTypeReason!(S, SchemaUse.input)().length);
-	static assert(isDefaultFor!(Nullable!int, int));
-	static assert(isDefaultFor!(double, int));
-	static assert(!isDefaultFor!(int, double));
-	static assert(!isDefaultFor!(int, string));
+	static assert(isDefaultFor!(Nullable!int, schemaDefault(1)));
+	static assert(isDefaultFor!(double, schemaDefault(1)));
+	static assert(!isDefaultFor!(int, schemaDefault(1.0)));
+	static assert(!isDefaultFor!(int, schemaDefault("1")));
+}
+
+version (unittest) private enum Level
+{
+	low,
+	high,
+}
+
+unittest  // a struct field @schemaDefault out of range for its integer type is reported
+{
+	import jsonschema : schemaDefault;
+
+	static struct Byte
+	{
+		@schemaDefault(300) ubyte n;
+	}
+
+	static struct Unsigned
+	{
+		@schemaDefault(-1) uint n;
+	}
+
+	assert(unsupportedTypeReason!(Byte, SchemaUse.input)().length);
+	assert(unsupportedTypeReason!(Unsigned, SchemaUse.input)().length);
+}
+
+unittest  // a struct field @schemaDefault that is not a member of its enum type is reported
+{
+	import jsonschema : schemaDefault;
+
+	static struct StringEnum
+	{
+		@schemaDefault("dark") Shade shade;
+	}
+
+	static struct IntEnum
+	{
+		@schemaDefault(1) Level level;
+	}
+
+	assert(unsupportedTypeReason!(StringEnum, SchemaUse.input)().length);
+	assert(unsupportedTypeReason!(IntEnum, SchemaUse.input)().length);
+}
+
+unittest  // an in-range integer @schemaDefault narrows to a smaller integer field
+{
+	import jsonschema : schemaDefault;
+	import vibe.data.json : parseJsonString;
+
+	static struct S
+	{
+		@schemaDefault(200) ubyte n;
+		@schemaDefault(Level.high) Nullable!Level level;
+	}
+
+	static assert(unsupportedTypeReason!(S, SchemaUse.input)() is null);
+	auto s = bindJson!S(parseJsonString(`{}`));
+	assert(s.n == 200 && s.level.get == Level.high);
 }
 
 unittest  // an integer binds from a JSON number with no fractional part

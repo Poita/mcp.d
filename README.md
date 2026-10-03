@@ -656,7 +656,10 @@ A parameter, field, or return type with no JSON form — a class, pointer,
 delegate, `char`, `std.typecons.Tuple`, an associative array keyed by a
 non-string, or a `real` parameter (use `double`) — is rejected at compile time
 with a message naming the handler and parameter, as is a `@schemaDefault` whose
-value does not convert to the parameter's type.
+value is not exactly a value of the parameter's type: it must convert implicitly,
+an integer must be within the parameter's range (`@schemaDefault(300) ubyte` is
+rejected), and an enum parameter's default must be a member of that enum
+(`@schemaDefault(Mode.dark)`, not `"dark"` or `1`).
 
 Integer types map to `"integer"` (not `"number"`) deliberately — it is the more
 precise constraint; use `double` for a field that should accept fractional values.
