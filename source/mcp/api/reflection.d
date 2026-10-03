@@ -1186,6 +1186,30 @@ private Json omitEmptyPromptArgs(alias func)(Json args) @safe
 	return kept;
 }
 
+/// Whether the facet UDA type `A` takes effect on a prompt argument: a
+/// description, a display title, or a default. A prompt argument has no JSON
+/// Schema, so a validation facet would match nothing.
+private enum isPromptArgFacet(A) = is(A == fieldDescription) || is(A == title)
+	|| isInstanceOf!(SchemaDefault, A);
+
+/// Whether the facet UDA type `A` takes effect on a URI template variable; none
+/// does, since a resource template has no per-variable schema or description.
+private enum isTemplateVarFacet(A) = false;
+
+/// Reject a JSON Schema facet UDA on a parameter of `func`, a handler of the
+/// kind `kind` (e.g. "@prompt"), that `isApplied` says the handler ignores,
+/// rather than let it silently match nothing.
+private void checkParamFacets(alias func, string kind, alias isApplied, string hint)()
+{
+	alias ids = ParameterIdentifierTuple!func;
+	static foreach (i, P; BoundParameters!func)
+		static foreach (attr; ParamAttributes!(func, i))
+			static if (!is(attr) && isSchemaFacet!(typeof(attr)))
+				static assert(isApplied!(typeof(attr)), "@" ~ typeof(attr)
+						.stringof ~ " on parameter '" ~ ids[i] ~ "' of " ~ kind ~ " method '" ~ __traits(
+							identifier, func) ~ "' has no effect: " ~ hint);
+}
+
 private void registerPromptMethod(string memberName, alias overload, alias parent)(
 		McpServer server, prompt attr) @safe
 {
@@ -1197,6 +1221,9 @@ private void registerPromptMethod(string memberName, alias overload, alias paren
 	checkParamNames!overload();
 	checkParamTypes!overload();
 	validateParamUdas!overload();
+	checkParamFacets!(overload, "@prompt", isPromptArgFacet, "a prompt argument has no "
+			~ "JSON Schema, so only @fieldDescription, @title, and @schemaDefault apply; "
+			~ "validate the value in the handler")();
 
 	Prompt descriptor;
 	descriptor.name = attr.name;
@@ -1211,14 +1238,26 @@ private void registerPromptMethod(string memberName, alias overload, alias paren
 		static if (!is(P : RequestContext))
 		{
 			{
-				// Populate PromptArgument.description from the @describeParam UDA.
-				enum d = describeFor!(overload, names[i]);
 				// A prompt argument is required only when it is neither Nullable nor
 				// carries a declared default (D-level or @schemaDefault), matching
 				// the tool path.
-				descriptor.arguments ~= PromptArgument(names[i], d.length
-						? nullable(d) : Nullable!string.init, !isInstanceOf!(Nullable, P)
-						&& is(defs[i] == void) && !ParamSchemaDefaults!(overload, i).length);
+				PromptArgument arg;
+				arg.name = names[i];
+				arg.required = !isInstanceOf!(Nullable, P) && is(defs[i] == void)
+					&& !ParamSchemaDefaults!(overload, i).length;
+				// The parameter's @fieldDescription and @title describe the
+				// argument; the method's @describeParam takes precedence.
+				static foreach (a; ParamAttributes!(overload, i))
+				{
+					static if (is(typeof(a) == fieldDescription))
+						arg.description = a.value;
+					else static if (is(typeof(a) == title))
+						arg.title = a.value;
+				}
+				enum d = describeFor!(overload, names[i]);
+				static if (d.length)
+					arg.description = d;
+				descriptor.arguments ~= arg;
 			}
 		}
 	}
@@ -1386,6 +1425,9 @@ private void registerTemplateMethod(string memberName, alias overload,
 				~ "; a resource template may take only a RequestContext besides its variables");
 	checkParamNames!overload();
 	checkParamTypes!overload();
+	checkParamFacets!(overload, "@resourceTemplate", isTemplateVarFacet, "a URI template "
+			~ "variable has no schema or description; validate the value in the handler, "
+			~ "and give it a D default value rather than @schemaDefault")();
 	// Every bound parameter must name a template variable; any other name would
 	// silently receive an empty or default value on every read.
 	static foreach (i, P; BoundParameters!overload)
@@ -5136,7 +5178,7 @@ version (unittest) private final class EventPollOnToolApi
 version (unittest) private final class FittingUdasApi
 {
 	@prompt("p", "p") @icon("https://example.com/p.png") @describeParam("topic", "what")
-	string p(@minLength(1) string topic)@safe
+	string p(@fieldDescription("the topic") string topic)@safe
 	{
 		return topic;
 	}
@@ -5513,4 +5555,91 @@ unittest  // an empty string for a required non-string prompt argument is a miss
 	assert(resp["error"]["code"].get!int == ErrorCode.invalidParams);
 	assert(resp["error"]["message"].get!string.canFind("Missing required argument 'count'"),
 			resp.toString);
+}
+
+unittest  // @fieldDescription and @title on a prompt parameter fill its PromptArgument
+{
+	import mcp.protocol.jsonrpc : Message, makeRequest;
+
+	@safe final class DescribedPromptParamApi
+	{
+		@prompt("brief", "A brief")
+		string brief(@fieldDescription("the subject") @title("Subject") string topic)@safe
+		{
+			return topic;
+		}
+	}
+
+	auto s = new McpServer("t", "1");
+	registerHandlers(s, new DescribedPromptParamApi);
+	auto list = s.handle(Message(makeRequest(Json(1), "prompts/list", Json.emptyObject))).get;
+	auto arg = list["result"]["prompts"][0]["arguments"][0];
+	assert(arg["description"].get!string == "the subject", arg.toString);
+	assert(arg["title"].get!string == "Subject", arg.toString);
+}
+
+unittest  // @describeParam takes precedence over a prompt parameter's @fieldDescription
+{
+	import mcp.protocol.jsonrpc : Message, makeRequest;
+
+	@safe final class BothDescribedPromptApi
+	{
+		@prompt("brief", "A brief")
+		@describeParam("topic", "from the method")
+		string brief(@fieldDescription("from the parameter") string topic)@safe
+		{
+			return topic;
+		}
+	}
+
+	auto s = new McpServer("t", "1");
+	registerHandlers(s, new BothDescribedPromptApi);
+	auto list = s.handle(Message(makeRequest(Json(1), "prompts/list", Json.emptyObject))).get;
+	auto arg = list["result"]["prompts"][0]["arguments"][0];
+	assert(arg["description"].get!string == "from the method", arg.toString);
+}
+
+version (unittest) private final class PromptFacetApi
+{
+	@prompt("count", "Count")
+	string count(@minimum(1) int n)@safe
+	{
+		return "";
+	}
+}
+
+version (unittest) private final class TemplateFacetApi
+{
+	@resourceTemplate("t://{id}", "Item")
+	string item(@pattern("^[a-z]+$") string id)@safe
+	{
+		return id;
+	}
+}
+
+version (unittest) private final class TemplateDescriptionApi
+{
+	@resourceTemplate("t://{id}", "Item")
+	string item(@fieldDescription("the id") string id)@safe
+	{
+		return id;
+	}
+}
+
+unittest  // a validation facet on a prompt parameter is rejected at compile time
+{
+	auto s = new McpServer("t", "1");
+	static assert(!__traits(compiles, registerHandlers(s, new PromptFacetApi)));
+}
+
+unittest  // a validation facet on a resource-template parameter is rejected at compile time
+{
+	auto s = new McpServer("t", "1");
+	static assert(!__traits(compiles, registerHandlers(s, new TemplateFacetApi)));
+}
+
+unittest  // @fieldDescription on a resource-template parameter is rejected at compile time
+{
+	auto s = new McpServer("t", "1");
+	static assert(!__traits(compiles, registerHandlers(s, new TemplateDescriptionApi)));
 }

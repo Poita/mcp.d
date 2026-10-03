@@ -673,7 +673,10 @@ Field/parameter constraints are added with UDAs: `@minimum` / `@maximum`,
 on an `int`, `@minimum` on a `string`, `@minItems` on a scalar) is a compile
 error, as is a method-level UDA on a handler kind that does not read it (such as
 `@cacheable` on a `@tool`, `@readOnly` on a `@prompt`, or `@taskTtl` on a plain
-`@tool`). An argument a tool does not declare is ignored; mark the
+`@tool`). A prompt argument has no JSON Schema, so on a `@prompt` parameter only
+`@fieldDescription` and `@title` (its `description` and `title`) and
+`@schemaDefault` apply, and a URI template variable takes no constraint UDA at
+all; any other placement is a compile error. An argument a tool does not declare is ignored; mark the
 method `@strictArgs` to advertise `"additionalProperties": false` and reject one.
 
 ## MCP Apps (interactive UI)

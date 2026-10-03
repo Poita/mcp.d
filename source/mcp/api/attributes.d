@@ -461,7 +461,9 @@ struct meta
 /// collide with `std.format.format`. They attach to a handler parameter or a
 /// struct field; one attached to a handler method is a compile error (a tool's
 /// display title is `@tool`'s `title` argument, or `@hintTitle` for its
-/// annotations).
+/// annotations). A `@prompt` parameter takes only `@fieldDescription`, `@title`,
+/// and `@schemaDefault`, and a `@resourceTemplate` parameter none, since neither
+/// has a JSON Schema for the others to constrain.
 public import jsonschema : fieldDescription, minimum, maximum, title, schemaFormat = format,
 	minLength, maxLength, pattern, minItems, maxItems, SchemaDefault, schemaDefault;
 
