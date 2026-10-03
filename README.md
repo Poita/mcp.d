@@ -603,7 +603,9 @@ compile time, and arguments/results are marshalled for you. A handler may take a
 trailing `RequestContext` parameter to report progress, log, or call back to the
 client (sampling/elicitation). For tools whose schema is only known at runtime,
 drop to `server.registerTool(Tool, delegate)` / `registerResource` /
-`registerPrompt`, which receive the raw `Json`.
+`registerPrompt`, which receive the raw `Json`; `argsAs!T(arguments)` binds that
+`Json` into a typed struct with the same rules the UDA layer uses, throwing a
+`ToolError` (an `isError` result) for a malformed argument.
 
 A tool reports a failure the model should see by throwing `ToolError` (or
 returning `CallToolResult.error(msg)`): the client receives a result with

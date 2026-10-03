@@ -693,21 +693,26 @@ private P marshalArg(P, bool stringArgs = false)(Json args, string name) @safe
 /// signature for you, but the dynamic `registerTool`/`registerPrompt`
 /// overloads hand the handler the raw `Json arguments`. `argsAs` deserializes
 /// `arguments` through the same enum-by-name policy the UDA layer uses (so any `enum` leaf is read
-/// from its schema-declared member name, at any nesting depth) and maps a vibe
-/// conversion failure to `invalidParams` (-32602), matching how the reflection
-/// layer reports a malformed argument. A handler can then write
-/// `auto a = argsAs!MyArgs(arguments);` instead of hand-rolling
-/// `arguments["x"].get!int` with manual presence/type checks.
+/// from its schema-declared member name, at any nesting depth) and maps a
+/// conversion failure to a `ToolError`, so a dynamic tool reports a malformed
+/// argument as an `isError` result, exactly as a `@tool` method's does. A
+/// handler can then write `auto a = argsAs!MyArgs(arguments);` instead of
+/// hand-rolling `arguments["x"].get!int` with manual presence/type checks.
+///
+/// In a dynamic prompt handler, where a malformed argument is a JSON-RPC
+/// `invalidParams` (-32602) error, catch the `ToolError` and rethrow it as
+/// `invalidParams(e.msg)`.
 T argsAs(T)(Json arguments) @safe
 {
-	import mcp.protocol.errors : McpException, invalidParams;
+	import mcp.protocol.errors : McpException;
+	import mcp.server.responses : ToolError;
 
 	try
 		return bindJson!T(arguments);
 	catch (McpException e)
 		throw e;
 	catch (Exception e)
-		throw invalidParams("arguments: " ~ e.msg);
+		throw new ToolError("arguments: " ~ e.msg);
 }
 
 /// The JSON Schema describing a tool's structured output, derived from its
@@ -2652,26 +2657,45 @@ unittest  // argsAs deserializes a typed struct through the enum-by-name policy
 	assert(a.c == Color.green);
 }
 
-unittest  // argsAs maps a conversion failure to invalidParams (-32602)
+unittest  // argsAs maps a conversion failure to a ToolError
 {
-	import mcp.protocol.errors : McpException, ErrorCode;
+	import mcp.server.responses : ToolError;
 
 	struct Args
 	{
 		int n;
 	}
 
-	// `n` is a string, not an int -> vibe conversion fails -> invalidParams.
+	// `n` is a string, not an int -> vibe conversion fails -> ToolError.
 	Json j = Json(["n": Json("not-a-number")]);
 	bool threw;
 	try
 		cast(void) argsAs!Args(j);
-	catch (McpException e)
-	{
+	catch (ToolError e)
 		threw = true;
-		assert(e.code == ErrorCode.invalidParams);
+	assert(threw, "argsAs must surface a conversion failure as a ToolError");
+}
+
+unittest  // a dynamic tool's malformed arguments read via argsAs yield an isError result
+{
+	import std.algorithm.searching : canFind;
+
+	static struct Args
+	{
+		int n;
 	}
-	assert(threw, "argsAs must surface a conversion failure as invalidParams");
+
+	auto s = new McpServer("t", "1");
+	Tool t;
+	t.name = "dyn";
+	t.inputSchema = parseJsonString(`{"type":"object"}`);
+	s.registerTool(t, (Json arguments, RequestContext ctx) @safe {
+		cast(void) argsAs!Args(arguments);
+		return CallToolResult.text("ok");
+	});
+	auto r = callToolArgs(s, "dyn", `{"n":"not-a-number"}`);
+	assert(r["isError"].get!bool, r.toString);
+	assert(r["content"][0]["text"].get!string.canFind("arguments"), r.toString);
 }
 
 unittest  // MRTR UDA tool: returning ToolResponse.complete produces a normal result
