@@ -35,7 +35,7 @@ private __gshared bool _ranStdio;
 ///     `ctx.isCancelled` does not stall the read loop. Notifications the handler
 ///     emits (`notifications/message`, `notifications/progress`) and the request's
 ///     reply are written through `channel.send` (serialized against other
-///     writers);
+///     writers). While `opts.maxInFlight` handlers run, no further line is read;
 ///   - a *notification* (e.g. `notifications/cancelled`, `notifications/initialized`)
 ///     is handled inline; an inbound `notifications/cancelled` flips the matching
 ///     in-flight request's `CancellationToken` concurrently with its running
@@ -69,7 +69,7 @@ void serveStdio(McpServer server, string delegate() @safe readLine,
 
 	DuplexChannel channel;
 
-	// Count of dispatched-but-not-yet-finished request handler tasks. Cooperative
+	// Count of dispatched-but-not-yet-finished handler tasks. Cooperative
 	// vibe tasks on one thread never preempt each other between yield points, so a
 	// plain counter (incremented when a handler starts, decremented when it ends)
 	// needs no atomics. After the read loop ends at EOF we drain this to
@@ -157,6 +157,10 @@ void serveStdio(McpServer server, string delegate() @safe readLine,
 			// The channel already runs this on its own task, started immediately, so
 			// initialized / cancelled take effect before the next line is read while
 			// an observer that blocks (e.g. re-listing roots) does not stall the loop.
+			// It counts toward `maxInFlight` like a request handler.
+			inflight.start();
+			scope (exit)
+				inflight.finish();
 			server.handle(m);
 			break;
 		case MessageKind.response:
@@ -199,7 +203,16 @@ void serveStdio(McpServer server, string delegate() @safe readLine,
 		}, raw);
 	}
 
-	channel = new DuplexChannel(readLine, writeLine, &onInbound, &onInboundBatch);
+	// Backpressure: no further line is read while `maxInFlight` handlers run, so
+	// a peer cannot spawn handler tasks without bound.
+	string boundedReadLine() @safe
+	{
+		if (opts.maxInFlight != 0)
+			inflight.awaitBelow(opts.maxInFlight);
+		return readLine();
+	}
+
+	channel = new DuplexChannel(&boundedReadLine, writeLine, &onInbound, &onInboundBatch);
 	channel.onError = opts.onError;
 	// Change notifications for a 2025-era client ride the same serialized writer.
 	server.attachStdioSink(&sink);
@@ -225,11 +238,11 @@ private final class InflightCount
 	import vibe.core.sync : LocalManualEvent, createManualEvent;
 
 	private size_t count;
-	private LocalManualEvent idle;
+	private LocalManualEvent finished;
 
 	this() @safe
 	{
-		idle = createManualEvent();
+		finished = createManualEvent();
 	}
 
 	void start() @safe nothrow
@@ -239,8 +252,18 @@ private final class InflightCount
 
 	void finish() @safe nothrow
 	{
-		if (--count == 0)
-			idle.emit();
+		--count;
+		finished.emit();
+	}
+
+	/// Wait until fewer than `max` handlers are running.
+	void awaitBelow(size_t max) @safe
+	{
+		while (count >= max)
+		{
+			const ec = finished.emitCount;
+			() @trusted { finished.wait(ec); }();
+		}
 	}
 
 	/// Wait until no handler is running or `timeout` elapses.
@@ -254,8 +277,8 @@ private final class InflightCount
 			const now = MonoTime.currTime;
 			if (now >= deadline)
 				break;
-			const ec = idle.emitCount;
-			() @trusted { idle.wait(deadline - now, ec); }();
+			const ec = finished.emitCount;
+			() @trusted { finished.wait(deadline - now, ec); }();
 		}
 	}
 }
@@ -322,6 +345,13 @@ struct StdioOptions
 	/// How long the transport waits, once stdin reaches end-of-input, for request
 	/// handlers still running to finish and write their replies before it returns.
 	Duration drainTimeout = 5.seconds;
+
+	/// The most inbound requests, batches and notifications handled at once
+	/// (`0`: unbounded). While this many handlers run, no further stdin line is
+	/// read, so a client cannot spawn handler tasks without bound. A reply to a
+	/// server->client request is a line too, so a handler awaiting one while the
+	/// cap is reached waits until `serverRequestTimeout` fails it.
+	size_t maxInFlight = 64;
 
 	/// How long a server->client request (elicitation, sampling, roots) waits for
 	/// the client's reply before it fails with `RequestTimeoutException` and is
@@ -3048,4 +3078,62 @@ unittest  // END-TO-END: a server tool's ctx.sample round-trips to the client's 
 
 	assert(toolText == "got:sampled",
 			"server ctx.sample must round-trip to the client's onSampling over stdio");
+}
+
+unittest  // serveStdio stops reading while maxInFlight requests run, then resumes
+{
+	auto s = new McpServer("inflight-cap", "1.0");
+	bool release;
+	size_t running, peak;
+	Tool slow = {name: "slow"};
+	s.registerTool(slow, (Json args, RequestContext ctx) @safe {
+		running++;
+		if (running > peak)
+			peak = running;
+		while (!release)
+			yield();
+		running--;
+		return CallToolResult.init;
+	});
+
+	auto link = new ServerLink;
+	StdioOptions opts;
+	opts.maxInFlight = 2;
+	foreach (i; 0 .. 5)
+		link.feed(`{"jsonrpc":"2.0","id":` ~ cast(char)(
+				'1' + i) ~ `,"method":"tools/call","params":{"name":"slow"}}`);
+	size_t readWhileBlocked, peakWhileBlocked;
+	() @trusted {
+		runTask(() nothrow{
+			try
+				serveStdio(s, &link.readLine, &link.writeLine, opts);
+			catch (Exception)
+			{
+			}
+		});
+		runTask(() nothrow{
+			scope (exit)
+				exitEventLoop();
+			try
+			{
+				foreach (_; 0 .. 64)
+					yield();
+				readWhileBlocked = link.inPos;
+				peakWhileBlocked = peak;
+				release = true;
+				foreach (_; 0 .. 256)
+					yield();
+				link.closeInput();
+				foreach (_; 0 .. 64)
+					yield();
+			}
+			catch (Exception)
+			{
+			}
+		});
+		runEventLoop();
+	}();
+	assert(peakWhileBlocked == 2, "no more than maxInFlight handlers run at once");
+	assert(readWhileBlocked == 2, "reading stops while maxInFlight handlers run");
+	assert(link.outbound.length == 5, "every request is answered once slots free");
 }
