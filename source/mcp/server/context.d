@@ -5,7 +5,8 @@ import vibe.data.json : Json, deserializeJson, parseJsonString;
 
 import mcp.protocol.errors;
 import mcp.protocol.sampling : CreateMessageRequest, CreateMessageResult;
-import mcp.protocol.types : ListRootsResult, ElicitResult, ElicitAction, LogLevel, shouldLog;
+import mcp.protocol.types : ListRootsResult, ElicitResult, ElicitAction,
+	LogLevel, logLevelRank, shouldLog;
 import mcp.protocol.capabilities : ClientCapabilities, ClientCapability;
 import mcp.protocol.schema : elicitationSchemaOf, isFlatElicitationStruct;
 import mcp.auth.resource_server : TokenInfo;
@@ -121,7 +122,9 @@ interface RequestContext
 	void reportProgress(double progress,
 			Nullable!double total = Nullable!double.init, string message = null) @safe;
 
-	/// Emit a `notifications/message` (logging) at the given level. `data` may be
+	/// Emit a `notifications/message` (logging) at the given level. `level` must
+	/// be one of the RFC 5424 names the spec defines (`debug` ... `emergency`);
+	/// prefer the `LogLevel` overloads, which cannot misspell it. `data` may be
 	/// any JSON value (commonly a string or object); `logger` is optional.
 	void log(string level, Json data, string logger = null) @safe;
 
@@ -773,8 +776,16 @@ final class RequestScope : RequestContext, ConnectionScoped
 	/// `_meta["io.modelcontextprotocol/logLevel"]`; the server signals that by
 	/// constructing this scope with `loggingRequested = false`, in which case
 	/// every log is dropped regardless of severity.
+	///
+	/// Throws an `internalError` for a `level` outside the RFC 5424 set (e.g.
+	/// `"warn"` or `"Info"`): it cannot be ordered against the client's minimum
+	/// and is not a valid wire level.
 	void log(string level, Json data, string logger = null) @safe
 	{
+		if (logLevelRank(level) < 0)
+			throw internalError("log(): unknown level \"" ~ level ~ "\"; use one of debug,"
+					~ " info, notice, warning, error, critical, alert, emergency, or the"
+					~ " LogLevel overload");
 		if (!loggingRequested)
 			return;
 		if (!shouldLog(level, minLevel))
@@ -1196,6 +1207,25 @@ unittest  // RequestScope with the default "info" minimum drops only debug
 	scope_.log("warning", Json("w"));
 
 	assert(probe.emittedLevels == ["info", "warning"]);
+}
+
+unittest  // RequestScope rejects a log level outside the RFC 5424 set as an internalError
+{
+	Json[string] empty;
+	auto probe = new LogProbe;
+	auto scope_ = new RequestScope(probe, false, empty, "error");
+
+	assertInternalError(scope_.log("warn", Json("w")));
+	assertInternalError(scope_.log("Info", Json("i")));
+	assert(probe.emittedLevels.length == 0);
+}
+
+unittest  // RequestScope rejects an unknown log level even when logging was not requested
+{
+	Json[string] empty;
+	auto scope_ = new RequestScope(new LogProbe, true, empty, "info", false);
+
+	assertInternalError(scope_.log("verbose", Json("v")));
 }
 
 unittest  // RequestScope exposes the shared cancellation token via isCancelled
