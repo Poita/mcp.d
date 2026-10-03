@@ -208,6 +208,22 @@ struct EventOccurrence
 	}
 }
 
+/// Read a request's optional `cursor` into `val`. Absent or null leaves `val`
+/// null (bootstrap: start from now). Any value other than a string throws
+/// -32602 InvalidParams, so a malformed cursor is refused rather than silently
+/// treated as a bootstrap that skips the client's backlog.
+private void readCursor(Json j, ref Nullable!string val) @safe
+{
+	import mcp.protocol.errors : invalidParams;
+
+	auto v = "cursor" in j;
+	if (v is null || v.type == Json.Type.null_ || v.type == Json.Type.undefined)
+		return;
+	if (v.type != Json.Type.string)
+		throw invalidParams("'cursor' must be a string or null");
+	val = v.get!string;
+}
+
 /// Read the optional non-negative integer field `key` of a request's params into
 /// `val`. Absent or null leaves `val` null. A whole-number float (`60000.0`) is
 /// accepted, and an integer beyond `long.max` clamps to `long.max`. Any other
@@ -287,8 +303,7 @@ struct PollParams
 		p.name = j.getOr("name", "");
 		if ("arguments" in j && j["arguments"].type == Json.Type.object)
 			p.arguments = j["arguments"];
-		if ("cursor" in j && j["cursor"].type == Json.Type.string)
-			p.cursor = j["cursor"].get!string;
+		readCursor(j, p.cursor);
 		readNonNegative(j, "maxAgeMs", p.maxAgeMs);
 		readNonNegative(j, "maxEvents", p.maxEvents);
 		return p;
@@ -363,8 +378,7 @@ struct StreamParams
 		p.name = j.getOr("name", "");
 		if ("arguments" in j && j["arguments"].type == Json.Type.object)
 			p.arguments = j["arguments"];
-		if ("cursor" in j && j["cursor"].type == Json.Type.string)
-			p.cursor = j["cursor"].get!string;
+		readCursor(j, p.cursor);
 		readNonNegative(j, "maxAgeMs", p.maxAgeMs);
 		return p;
 	}
@@ -435,8 +449,7 @@ struct SubscribeParams
 			p.arguments = j["arguments"];
 		if ("delivery" in j && j["delivery"].type == Json.Type.object)
 			p.delivery = WebhookDelivery.fromJson(j["delivery"]);
-		if ("cursor" in j && j["cursor"].type == Json.Type.string)
-			p.cursor = j["cursor"].get!string;
+		readCursor(j, p.cursor);
 		readNonNegative(j, "maxAgeMs", p.maxAgeMs);
 		if ("ttlMs" in j)
 		{
@@ -1492,4 +1505,38 @@ unittest  // every events fromJson rejects a non-object value with -32602
 			assert(ex !is null && ex.code == ErrorCode.invalidParams, T.stringof);
 		}
 	}
+}
+
+unittest  // events/poll rejects a cursor that is neither a string nor null
+{
+	import std.exception : collectException;
+	import vibe.data.json : parseJsonString;
+	import mcp.protocol.errors : McpException, ErrorCode;
+
+	auto e = collectException!McpException(
+			PollParams.fromJson(parseJsonString(`{"name":"n","cursor":123}`)));
+	assert(e !is null && e.code == ErrorCode.invalidParams);
+	assert(PollParams.fromJson(parseJsonString(`{"name":"n","cursor":null}`)).cursor.isNull);
+}
+
+unittest  // events/stream rejects a cursor that is neither a string nor null
+{
+	import std.exception : collectException;
+	import vibe.data.json : parseJsonString;
+	import mcp.protocol.errors : McpException, ErrorCode;
+
+	auto e = collectException!McpException(
+			StreamParams.fromJson(parseJsonString(`{"name":"n","cursor":{"seq":1}}`)));
+	assert(e !is null && e.code == ErrorCode.invalidParams);
+}
+
+unittest  // events/subscribe rejects a cursor that is neither a string nor null
+{
+	import std.exception : collectException;
+	import vibe.data.json : parseJsonString;
+	import mcp.protocol.errors : McpException, ErrorCode;
+
+	auto e = collectException!McpException(
+			SubscribeParams.fromJson(parseJsonString(`{"name":"n","cursor":true}`)));
+	assert(e !is null && e.code == ErrorCode.invalidParams);
 }
