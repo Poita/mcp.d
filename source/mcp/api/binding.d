@@ -656,12 +656,88 @@ package(mcp) T bindString(T)(string raw, string path = "")
 }
 
 /// Bind a scalar, enum, or vibe-custom-serialized value through vibe with enums
-/// read by member name.
+/// read by member name. A value of the wrong JSON type, an enum name that is
+/// not a member, and an integer outside `T`'s range are reported in JSON terms.
+/// An integer also binds from a JSON number with no fractional part (`2.0`),
+/// which JSON Schema's `integer` admits and some clients send.
 private T bindLeaf(T)(Json v, string path)
 {
 	import mcp.protocol.schema : EnumByNamePolicy;
+	import std.conv : to;
 	import vibe.data.json : JsonSerializer;
 	import vibe.data.serialization : deserializeWithPolicy;
+
+	static if (is(T == enum))
+	{
+		if (v.type != Json.Type.string)
+			throw new BindException(located(path, "expected a string, got " ~ jsonTypeName(v)));
+		static foreach (m; __traits(allMembers, T))
+			if (v.get!string == m)
+				return __traits(getMember, T, m);
+		string names;
+		static foreach (i, m; __traits(allMembers, T))
+			names ~= (i ? ", " : "") ~ `"` ~ m ~ `"`;
+		throw new BindException(located(path, "expected one of " ~ names ~ ", got " ~ v.toString));
+	}
+	else static if (is(T == bool))
+	{
+		if (v.type != Json.Type.bool_)
+			throw new BindException(located(path, "expected a boolean, got " ~ jsonTypeName(v)));
+	}
+	else static if (isSomeString!T)
+	{
+		if (v.type != Json.Type.string)
+			throw new BindException(located(path, "expected a string, got " ~ jsonTypeName(v)));
+	}
+	else static if (isFloatingPoint!T)
+	{
+		if (v.type != Json.Type.int_ && v.type != Json.Type.bigInt && v.type != Json.Type.float_)
+			throw new BindException(located(path, "expected a number, got " ~ jsonTypeName(v)));
+	}
+	else static if (isIntegral!T)
+	{
+		import std.math : isFinite, trunc;
+
+		enum outOfRange = "expected an integer from " ~ T.min.to!string
+			~ " to " ~ T.max.to!string ~ ", got ";
+		if (v.type == Json.Type.float_)
+		{
+			const d = v.get!double;
+			if (!isFinite(d) || d != trunc(d))
+				throw new BindException(located(path,
+						"expected an integer, got a number with a fractional part"));
+			// The bounds are powers of two, exact as doubles, so a whole `d`
+			// strictly inside them converts to `T` without overflow.
+			enum double limit = 2.0 ^^ (T.sizeof * 8 - (isSigned!T ? 1 : 0));
+			if (d >= limit || d < (isSigned!T ? -limit : 0))
+				throw new BindException(located(path, outOfRange ~ v.toString));
+			return cast(T) d;
+		}
+		if (v.type == Json.Type.int_)
+		{
+			const n = v.get!long;
+			static if (T.sizeof < 8)
+			{
+				if (n < T.min || n > T.max)
+					throw new BindException(located(path, outOfRange ~ v.toString));
+			}
+			else static if (isUnsigned!T)
+			{
+				if (n < 0)
+					throw new BindException(located(path, outOfRange ~ v.toString));
+			}
+			return cast(T) n;
+		}
+		if (v.type != Json.Type.bigInt)
+			throw new BindException(located(path, "expected an integer, got " ~ jsonTypeName(v)));
+		{
+			import std.bigint : BigInt;
+
+			const b = v.get!BigInt;
+			if (b < T.min || b > T.max)
+				throw new BindException(located(path, outOfRange ~ v.toString));
+		}
+	}
 
 	try
 		return () @trusted {
@@ -669,6 +745,29 @@ private T bindLeaf(T)(Json v, string path)
 	}();
 	catch (Exception e)
 		throw new BindException(located(path, e.msg));
+}
+
+/// How a JSON value's type reads in an error message: "a string", "an array".
+private string jsonTypeName(const Json v)
+{
+	final switch (v.type)
+	{
+	case Json.Type.undefined:
+	case Json.Type.null_:
+		return "null";
+	case Json.Type.bool_:
+		return "a boolean";
+	case Json.Type.int_:
+	case Json.Type.bigInt:
+	case Json.Type.float_:
+		return "a number";
+	case Json.Type.string:
+		return "a string";
+	case Json.Type.array:
+		return "an array";
+	case Json.Type.object:
+		return "an object";
+	}
 }
 
 private string located(string path, string msg) pure nothrow
@@ -1004,4 +1103,49 @@ unittest  // a struct field whose @schemaDefault does not convert to its type is
 	static assert(isDefaultFor!(double, int));
 	static assert(!isDefaultFor!(int, double));
 	static assert(!isDefaultFor!(int, string));
+}
+
+unittest  // an integer binds from a JSON number with no fractional part
+{
+	assert(bindJson!int(Json(2.0)) == 2);
+	assert(bindJson!long(Json(-7.0)) == -7);
+	assert(bindJson!ubyte(Json(255.0)) == 255);
+}
+
+unittest  // an integer rejects a fractional or out-of-range JSON number, in JSON terms
+{
+	import std.exception : collectException;
+
+	auto frac = collectException!BindException(bindJson!int(Json(2.5)));
+	assert(frac !is null
+			&& frac.msg == "expected an integer, got a number with a fractional part", frac.msg);
+	auto big = collectException!BindException(bindJson!ubyte(Json(256.0)));
+	assert(big !is null && big.msg == "expected an integer from 0 to 255, got 256", big.msg);
+	auto over = collectException!BindException(bindJson!ubyte(Json(256)));
+	assert(over !is null && over.msg == "expected an integer from 0 to 255, got 256", over.msg);
+}
+
+unittest  // a scalar of the wrong JSON type is reported in JSON terms
+{
+	import std.exception : collectException;
+	import vibe.data.json : parseJsonString;
+
+	auto e1 = collectException!BindException(bindJson!string(parseJsonString(`[1]`)));
+	assert(e1 !is null && e1.msg == "expected a string, got an array", e1.msg);
+	auto e2 = collectException!BindException(bindJson!int(Json("3")));
+	assert(e2 !is null && e2.msg == "expected an integer, got a string", e2.msg);
+	auto e3 = collectException!BindException(bindJson!bool(Json(1)));
+	assert(e3 !is null && e3.msg == "expected a boolean, got a number", e3.msg);
+	auto e4 = collectException!BindException(bindJson!double(Json.emptyObject));
+	assert(e4 !is null && e4.msg == "expected a number, got an object", e4.msg);
+	auto e5 = collectException!BindException(bindJson!Shade(Json(1)));
+	assert(e5 !is null && e5.msg == "expected a string, got a number", e5.msg);
+}
+
+unittest  // an enum names its members when the value is not one of them
+{
+	import std.exception : collectException;
+
+	auto e = collectException!BindException(bindJson!Shade(Json("D")));
+	assert(e !is null && e.msg == `expected one of "light", "dark", got "D"`, e.msg);
 }

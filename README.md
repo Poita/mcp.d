@@ -632,7 +632,7 @@ is predictable when porting a hand-built server):
 | D type | JSON Schema |
 | --- | --- |
 | `bool` | `{"type": "boolean"}` |
-| `int` / `long` / `short` / `byte` (and `uint`/`ulong`/… ) | `{"type": "integer"}`; `byte`/`ubyte`/`short`/`ushort`/`uint` also get their type's `minimum` and `maximum`, and `ulong` gets `"minimum": 0` |
+| `int` / `long` / `short` / `byte` (and `uint`/`ulong`/… ) | `{"type": "integer"}`; `byte`/`ubyte`/`short`/`ushort`/`uint` also get their type's `minimum` and `maximum`, and `ulong` gets `"minimum": 0`; an argument also binds from a whole JSON number such as `2.0` |
 | `float` / `double` | `{"type": "number"}`; in an output schema `{"type": ["number", "null"]}`, since vibe writes a NaN (an unset value's `.init`) as `null` |
 | `string` | `{"type": "string"}` |
 | `enum` | `{"type": "string", "enum": [members…]}` |
