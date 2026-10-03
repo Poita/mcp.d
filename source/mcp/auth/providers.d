@@ -51,7 +51,8 @@ struct JwtPresetOptions
 	/// published as the RFC 9728 `resource`. Required.
 	string resource;
 	/// The JWT audience tokens must carry. Defaults to `resource` when empty,
-	/// for IdPs that honor the RFC 8707 resource indicator.
+	/// for IdPs that honor the RFC 8707 resource indicator; the Entra ID presets
+	/// require it.
 	string audience;
 	/// Scopes required on every token, also advertised as `scopes_supported`.
 	string[] scopes;
@@ -114,9 +115,16 @@ ResourceServerConfig resourceServer(JwtVerifierConfig vc, string resource) @safe
 /// `https://login.microsoftonline.com/{tenant}/v2.0` and the matching JWKS
 /// (`/discovery/v2.0/keys`).
 ///
-/// `opts.audience` is the application (client) id of the API's own app
-/// registration, which Entra stamps as `aud` in every v2.0 access token for
-/// that API. Register the MCP server as its own API application rather than
+/// `opts.audience` is required: it is the application (client) id GUID of the
+/// API's own app registration, which Entra stamps as `aud` in every v2.0 access
+/// token for that API (never the MCP server URL, so it cannot default to
+/// `opts.resource`). The preset pins the v2.0 issuer, so the API's app
+/// registration manifest must set `"accessTokenAcceptedVersion": 2`
+/// (`requestedAccessTokenVersion` in the Microsoft Graph application object);
+/// with the default `null`/`1`, Entra issues v1.0 tokens whose `iss` is
+/// `https://sts.windows.net/{tenant}/` and every token is rejected.
+///
+/// Register the MCP server as its own API application rather than
 /// reusing the registration a client signs users in with: an OIDC `id_token`
 /// is issued for the signing-in client's id, so a shared registration makes
 /// id_tokens carry the API's audience. As a second line of defence the preset
@@ -131,12 +139,13 @@ ResourceServerConfig resourceServer(JwtVerifierConfig vc, string resource) @safe
 ResourceServerConfig entraId(string tenant, JwtPresetOptions opts) @safe
 {
 	requireConcreteEntraTenant(tenant, "entraId");
+	requireEntraAudience(opts, "entraId");
 	const issuer = "https://login.microsoftonline.com/" ~ tenant ~ "/v2.0";
 	const jwks = "https://login.microsoftonline.com/" ~ tenant ~ "/discovery/v2.0/keys";
 	JwtVerifierConfig vc;
 	vc.issuer = issuer;
 	vc.jwksUri = jwks;
-	vc.audience = opts.audience.length ? opts.audience : opts.resource;
+	vc.audience = opts.audience;
 	vc.requiredScopes = opts.scopes.dup;
 	return entraResourceServer(vc, opts.resource);
 }
@@ -181,6 +190,7 @@ ResourceServerConfig entraIdTenants(string[] tenants, JwtPresetOptions opts) @sa
 	import mcp.auth.resource_server : TokenInfo, TokenValidator;
 
 	enforce(tenants.length > 0, "entraIdTenants: list at least one allowed tenant.");
+	requireEntraAudience(opts, "entraIdTenants");
 	TokenValidator[] validators;
 	string[] issuers;
 	foreach (tenant; tenants)
@@ -207,6 +217,14 @@ ResourceServerConfig entraIdTenants(string[] tenants, JwtPresetOptions opts) @sa
 	cfg.scopesSupported = opts.scopes.dup;
 	cfg.requiredScopes = opts.scopes.dup;
 	return cfg;
+}
+
+private void requireEntraAudience(JwtPresetOptions opts, string fn) @safe
+{
+	enforce(opts.audience.length > 0,
+			fn ~ ": set JwtPresetOptions.audience to the API app registration's "
+			~ "application (client) id. Entra v2.0 access tokens carry that GUID as aud, "
+			~ "not the MCP server URL, so defaulting to resource would reject every token.");
 }
 
 private void requireConcreteEntraTenant(string tenant, string fn) @safe
@@ -617,6 +635,17 @@ unittest  // Google fills in its fixed authorize/token endpoints + credentials
 	assert(cfg.scopesSupported == ["openid", "email"]);
 }
 
+unittest  // entraId and entraIdTenants require an explicit audience instead of defaulting to the MCP URL
+{
+	import std.algorithm : canFind;
+	import std.exception : collectExceptionMsg;
+
+	const one = collectExceptionMsg(entraId("tenant-a", JwtPresetOptions(mcpUrl)));
+	assert(one.canFind("audience"), one);
+	const many = collectExceptionMsg(entraIdTenants(["tenant-a"], JwtPresetOptions(mcpUrl)));
+	assert(many.canFind("audience"), many);
+}
+
 unittest  // entraId rejects pseudo-tenant "common" at call time to prevent silent failures
 {
 	import std.exception : assertThrown;
@@ -667,7 +696,7 @@ unittest  // entraIdTenants rejects an empty allowlist and pseudo-tenants
 	import std.exception : assertThrown;
 
 	assertThrown(entraIdTenants([], JwtPresetOptions(mcpUrl)));
-	assertThrown(entraIdTenants(["tenant-a", "common"], JwtPresetOptions(mcpUrl)));
+	assertThrown(entraIdTenants(["tenant-a", "common"], JwtPresetOptions(mcpUrl, "api://my-app")));
 }
 
 unittest  // entraId rejects an empty tenant string at call time
