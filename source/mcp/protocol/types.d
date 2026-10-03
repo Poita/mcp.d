@@ -5040,8 +5040,9 @@ struct GetPromptResult
 	/// Return a copy with each message's content projected for the negotiated
 	/// protocol version (see `PromptMessage.forVersion` / `Content.forVersion`),
 	/// so newer content kinds and post-2024-11-05 content `_meta` /
-	/// `Annotations.lastModified` do not leak to an older peer. Mirrors
-	/// `CallToolResult.forVersion`.
+	/// `Annotations.lastModified` do not leak to an older peer. The MRTR
+	/// `inputRequests`/`requestState` survive only on the modern protocol.
+	/// Mirrors `CallToolResult.forVersion`.
 	GetPromptResult forVersion(ProtocolVersion v) const @safe
 	{
 		GetPromptResult r;
@@ -5049,8 +5050,36 @@ struct GetPromptResult
 		r.meta = meta;
 		foreach (m; messages)
 			r.messages ~= m.forVersion(v);
+		// `inputRequests`/`requestState` form the modern-only MRTR
+		// `InputRequiredResult` shape; a legacy `GetPromptResult` schema has no
+		// such fields, so drop them when projecting below 2026-07-28.
+		if (v >= ProtocolVersion.v2026_07_28)
+		{
+			r.inputRequests = inputRequests.dup;
+			r.requestState = requestState;
+		}
 		return r;
 	}
+}
+
+unittest  // GetPromptResult.forVersion keeps MRTR fields on the modern protocol
+{
+	GetPromptResult r;
+	r.inputRequests = [InputRequest("q1", "elicitation", Json.emptyObject)];
+	r.requestState = "s1";
+	auto modern = r.forVersion(ProtocolVersion.v2026_07_28);
+	assert(modern.isInputRequired);
+	assert(modern.inputRequests.length == 1);
+	assert(modern.requestState == "s1");
+}
+
+unittest  // GetPromptResult.forVersion drops MRTR fields below the modern protocol
+{
+	GetPromptResult r;
+	r.inputRequests = [InputRequest("q1", "elicitation", Json.emptyObject)];
+	r.requestState = "s1";
+	auto legacy = r.forVersion(ProtocolVersion.v2025_11_25);
+	assert(!legacy.isInputRequired);
 }
 
 unittest  // Content.forVersion downgrades audio to a text placeholder pre-2025-03-26

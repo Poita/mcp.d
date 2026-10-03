@@ -228,9 +228,14 @@ struct PromptResponse
 
 	mixin InputRequiredPart;
 
-	/// The handler is done; `r` is the final prompt result.
+	/// The handler is done; `r` is the final prompt result. A `GetPromptResult`
+	/// carrying MRTR `inputRequests`/`requestState` is classified as
+	/// `inputRequired`, so it gets the same capability filtering and version
+	/// gating as one built through that factory.
 	static PromptResponse complete(GetPromptResult r) @safe
 	{
+		if (r.isInputRequired)
+			return PromptResponse.inputRequired(r.inputRequests, r.requestState);
 		PromptResponse p;
 		p.result_ = r;
 		return p;
@@ -260,6 +265,17 @@ struct PromptResponse
 		}
 		return PromptResponse.complete(result_.forVersion(v));
 	}
+}
+
+unittest  // PromptResponse.complete classifies a GetPromptResult carrying MRTR fields as input-required
+{
+	GetPromptResult r;
+	r.inputRequests = [InputRequest("q1", "elicitation", Json.emptyObject)];
+	r.requestState = "s1";
+	auto pr = PromptResponse.complete(r);
+	assert(pr.needsInput);
+	assert(pr.inputRequests.length == 1);
+	assert(pr.requestState == "s1");
 }
 
 unittest  // PromptResponse.forVersion rejects an input-required result on a non-MRTR session
