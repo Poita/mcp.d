@@ -435,8 +435,10 @@ struct ui
 
 /// UDA attaching a descriptor-level `_meta` object to a `@tool`, `@resource`,
 /// or `@resourceTemplate`-annotated method (the MCP `_meta` field on `Tool`,
-/// `Resource`, `ResourceTemplate`). The supplied JSON must be an object; it is
-/// emitted verbatim as the descriptor's `_meta`.
+/// `Resource`, `ResourceTemplate`). The supplied JSON must be an object, or
+/// registration is a compile error; it is emitted verbatim as the descriptor's
+/// `_meta`. On a tool that also carries `@ui`, it must not set the `ui` key,
+/// which `@ui` writes.
 ///
 /// Example:
 /// ---
@@ -447,7 +449,7 @@ struct ui
 /// ---
 struct meta
 {
-	Json value; /// the `_meta` object (must be a JSON object to be emitted)
+	Json value; /// the `_meta` object
 }
 
 /// The JSON Schema constraint UDAs (`@fieldDescription`, `@minimum`, `@maximum`,

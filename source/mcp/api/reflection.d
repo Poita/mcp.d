@@ -819,7 +819,8 @@ private Icon[] collectIcons(alias overload)() @safe
 }
 
 /// Collect a `@meta` UDA's object into a descriptor `_meta` Json (undefined when
-/// absent or when the supplied value is not an object).
+/// absent). A `@meta` value that is not a JSON object, or one setting the `ui`
+/// key a `@ui` UDA on the same method writes, is rejected at compile time.
 private Json collectMeta(alias overload)() @safe
 {
 	Json m = Json.undefined;
@@ -827,8 +828,13 @@ private Json collectMeta(alias overload)() @safe
 	{
 		static if (is(typeof(a) == meta))
 		{
-			if (a.value.type == Json.Type.object)
-				m = a.value;
+			static assert(a.value.type == Json.Type.object, "@meta on '" ~ __traits(identifier,
+					overload) ~ "' must be a JSON object, as `_meta` is");
+			static assert(!hasUDA!(overload, ui) || ("ui" in a.value) is null,
+					"@meta on '" ~ __traits(identifier,
+						overload)
+					~ "' sets the \"ui\" key, which its @ui UDA writes; drop one of them");
+			m = a.value;
 		}
 	}
 	return m;
@@ -5780,4 +5786,57 @@ unittest  // a Json parameter left out is still a missing required argument
 	registerHandlers(s, new NullJsonParamApi);
 	auto r = callToolArgs(s, "kind", `{}`);
 	assert(r["isError"].get!bool, r.toString);
+}
+
+version (unittest) private final class NonObjectMetaApi
+{
+	@tool("m", "Tool with a non-object @meta")
+	@meta(parseJsonString(`["not", "an", "object"]`))
+	string m() @safe
+	{
+		return "";
+	}
+}
+
+version (unittest) private final class UiMetaClashApi
+{
+	@tool("m", "Tool whose @meta sets the ui key @ui owns")
+	@meta(parseJsonString(`{"ui":{"resourceUri":"ui://a/b"}}`))
+	@ui("ui://demo/widget")
+	string m() @safe
+	{
+		return "";
+	}
+}
+
+version (unittest) private final class UiMetaMergeApi
+{
+	@tool("m", "Tool combining @meta and @ui")
+	@meta(parseJsonString(`{"category":"art"}`))
+	@ui("ui://demo/widget")
+	string m() @safe
+	{
+		return "";
+	}
+}
+
+unittest  // a @meta whose value is not a JSON object is rejected at compile time
+{
+	auto s = new McpServer("t", "1");
+	static assert(!__traits(compiles, registerHandlers(s, new NonObjectMetaApi)));
+}
+
+unittest  // a @meta setting the "ui" key alongside @ui is rejected at compile time
+{
+	auto s = new McpServer("t", "1");
+	static assert(!__traits(compiles, registerHandlers(s, new UiMetaClashApi)));
+}
+
+unittest  // @meta and @ui merge into one _meta object
+{
+	auto s = new McpServer("t", "1");
+	registerHandlers(s, new UiMetaMergeApi);
+	auto t = s.handle(MakeListMessage()).get["result"]["tools"][0];
+	assert(t["_meta"]["category"].get!string == "art", t.toString);
+	assert(t["_meta"]["ui"]["resourceUri"].get!string == "ui://demo/widget", t.toString);
 }
