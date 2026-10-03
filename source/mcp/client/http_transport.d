@@ -511,16 +511,9 @@ final class HttpClientTransport : ClientTransport
 	}
 
 	/// Bound each one-way POST (a notification, a reply to a server->client
-	/// request, or a legacy HTTP+SSE request) by `timeout`, so an unresponsive
-	/// server cannot hold the sending task indefinitely.
-	/// Zero removes the bound.
-	void setSendTimeout(Duration timeout) @safe
-	{
-		sendTimeout = timeout;
-	}
-
-	/// Bound each one-way POST by the client's request timeout; with no request
-	/// deadline (`Duration.zero`) the default send bound applies.
+	/// request, or a legacy HTTP+SSE request) by the client's request timeout, so
+	/// an unresponsive server cannot hold the sending task indefinitely; with no
+	/// request deadline (`Duration.zero`) the default send bound applies.
 	void setRequestTimeout(Duration timeout) @safe
 	{
 		sendTimeout = timeout > Duration.zero ? timeout : defaultSendTimeout;
@@ -4832,7 +4825,7 @@ unittest  // a legacy HTTP+SSE request whose POST is rejected fails at once with
 			"a rejected legacy POST must fail its waiter with the status");
 }
 
-unittest  // a one-way POST to an unresponsive server gives up after the send timeout
+unittest  // a one-way POST to an unresponsive server gives up after the request timeout
 {
 	import core.time : msecs, MonoTime;
 	import vibe.core.core : sleep;
@@ -4849,7 +4842,7 @@ unittest  // a one-way POST to an unresponsive server gives up after the send ti
 	Duration took;
 	const failure = runAgainstFakeServer(router, (string url) @safe {
 		auto t = new HttpClientTransport(url);
-		t.setSendTimeout(200.msecs);
+		t.setRequestTimeout(200.msecs);
 		const start = MonoTime.currTime;
 		try
 			t.sendOneway(makeNotification("notifications/initialized", Json.emptyObject));
@@ -4861,7 +4854,7 @@ unittest  // a one-way POST to an unresponsive server gives up after the send ti
 		t.close();
 	});
 	assert(failure.length == 0, "scenario failed: " ~ failure);
-	assert(took < 2.seconds, "a hung one-way POST must be bounded by the send timeout");
+	assert(took < 2.seconds, "a hung one-way POST must be bounded by the request timeout");
 }
 
 unittest  // aborting a legacy HTTP+SSE request interrupts its pending POST
