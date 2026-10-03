@@ -603,6 +603,11 @@ private AddressClass classifyIpv6Literal(string inner) @safe pure nothrow @nogc
 			return AddressClass.privateOrLinkLocal;
 	}
 
+	// Teredo 2001::/32 (RFC 4380) tunnels to an obfuscated IPv4 client address
+	// via a relay; it is never a direct public destination, so fail closed.
+	if (b[0] == 0x20 && b[1] == 0x01 && b[2] == 0 && b[3] == 0)
+		return AddressClass.privateOrLinkLocal;
+
 	return AddressClass.public_;
 }
 
@@ -1341,6 +1346,14 @@ unittest  // classifyIpv4Octets classes IETF protocol-assignment, benchmarking a
 	assert(classifyIpv4Octets(198, 17, 255, 255) == AddressClass.public_);
 	assert(classifyIpv4Octets(198, 20, 0, 1) == AddressClass.public_);
 	assert(classifyIpv4Octets(203, 0, 114, 1) == AddressClass.public_);
+}
+
+unittest  // classifyIpv6Literal classes Teredo 2001::/32 as private/link-local
+{
+	assert(classifyIpv6Literal(
+			"2001:0:4136:e378:8000:63bf:80ff:fffe") == AddressClass.privateOrLinkLocal);
+	assert(classifyIpv6Literal("2001::1") == AddressClass.privateOrLinkLocal);
+	assert(classifyIpv6Literal("2001:4860:4860::8888") == AddressClass.public_);
 }
 
 unittest  // classifyIpv6Literal classifies the IPv4 embedded in a 6to4 2002::/16 address
