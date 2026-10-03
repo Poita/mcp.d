@@ -422,9 +422,13 @@ struct SessionLimits
 	/// The most sessions one authenticated principal keeps at once (`0`:
 	/// unbounded). Past it, that principal's least-recently-active idle session
 	/// is evicted, so one principal cannot push out everyone else's sessions.
-	/// Unauthenticated sessions share no principal and are bounded only by
-	/// `maxSessions`.
-	size_t maxPerPrincipal = 0;
+	size_t maxPerPrincipal = 100;
+	/// The most unauthenticated sessions created from one remote address kept at
+	/// once (`0`: unbounded). Past it, that address's least-recently-active idle
+	/// anonymous session is evicted, so one anonymous caller cannot push out
+	/// everyone else's sessions. Behind a reverse proxy every anonymous caller
+	/// shares the proxy's address; raise this, or set it to `0`, there.
+	size_t maxAnonymousPerAddress = 100;
 }
 
 /// Thrown by `SessionManager.create` when a session cap is reached and every
@@ -468,6 +472,7 @@ final class SessionManager
 	// so a never-DELETE client cannot grow the table without bound.
 	private BoundedExpiringMap!Session sessions;
 	private size_t maxPerPrincipal;
+	private size_t maxAnonymousPerAddress;
 
 	/// A session's state together with the authenticated principal (token
 	/// subject, "" when unauthenticated) that created it.
@@ -475,6 +480,10 @@ final class SessionManager
 	{
 		ConnectionState state;
 		string principal;
+		/// The key its creator's session cap counts it under: the principal when
+		/// authenticated, else a key derived from the remote address ("" when
+		/// neither is known).
+		string bucket;
 		/// Standalone GET streams currently open on the session.
 		size_t streams;
 	}
@@ -490,6 +499,7 @@ final class SessionManager
 	{
 		sessions = BoundedExpiringMap!Session(limits.idleTtl, limits.maxSessions, null);
 		maxPerPrincipal = limits.maxPerPrincipal;
+		maxAnonymousPerAddress = limits.maxAnonymousPerAddress;
 		sessions.onEvict = &evicted;
 		sessions.busy = (ref Session s) @safe => s.state.inFlight.length > 0 || s.streams > 0;
 	}
@@ -516,11 +526,12 @@ final class SessionManager
 	///
 	/// Before minting the new session the idle TTL sweep runs lazily and, if a
 	/// cap would be exceeded, the least-recently-active idle session is evicted:
-	/// one of `principal`'s own sessions for the per-principal cap, any session
-	/// for the global cap. So a client that connects, initializes, and walks away
-	/// without DELETE cannot grow the table without bound. A session running a
-	/// request or holding an open GET stream is never evicted; when only such
-	/// sessions remain, no session is minted.
+	/// one of `principal`'s own sessions for the per-principal cap (or, when
+	/// unauthenticated, one of `address`'s anonymous sessions for the per-address
+	/// cap), any session for the global cap. So a client that connects,
+	/// initializes, and walks away without DELETE cannot grow the table without
+	/// bound. A session running a request or holding an open GET stream is never
+	/// evicted; when only such sessions remain, no session is minted.
 	///
 	/// Throws: `SessionCapacityException` when a cap is reached and every
 	/// candidate session is busy. `McpException` (`internalError`) when the host
@@ -530,24 +541,30 @@ final class SessionManager
 	/// returning an id. vibe.d converts an escaping `McpException` to an HTTP 500;
 	/// `handlePost` additionally maps it to a JSON-RPC error response so the wire
 	/// shape matches every other error path.
-	string create(string principal = "") @safe
+	string create(string principal = "", string address = "") @safe
 	{
-		if (maxPerPrincipal != 0 && principal.length)
+		// Distinct prefixes keep a principal named like an address out of that
+		// address's anonymous bucket.
+		const bucket = principal.length ? "\x1ep\x1e" ~ principal
+			: address.length ? "\x1ea\x1e" ~ address : "";
+		const cap = principal.length ? maxPerPrincipal : maxAnonymousPerAddress;
+		if (cap != 0 && bucket.length)
 		{
 			bool mine(ref Session s) @safe
 			{
-				return s.principal == principal;
+				return s.bucket == bucket;
 			}
 
-			while (sessions.count(&mine) >= maxPerPrincipal)
+			while (sessions.count(&mine) >= cap)
 				if (!sessions.evictOldest(&mine))
-					throw new SessionCapacityException(
-							"too many active sessions for this principal");
+					throw new SessionCapacityException(principal.length
+							? "too many active sessions for this principal"
+							: "too many active sessions for this address");
 		}
 		const id = generateSessionId();
 		// put() runs the lazy idle sweep and cap eviction before inserting, so an
 		// abandoned session is reclaimed the next time any client initializes.
-		if (!sessions.put(id, Session(new ConnectionState, principal)))
+		if (!sessions.put(id, Session(new ConnectionState, principal, bucket)))
 			throw new SessionCapacityException("too many active sessions");
 		return id;
 	}
@@ -1112,4 +1129,38 @@ unittest  // past the per-principal cap with every session busy, create fails
 	assertThrown!SessionCapacityException(mgr.create("alice"));
 	assert(mgr.isActive(a));
 	mgr.create("bob");
+}
+
+unittest  // the per-principal cap bounds an authenticated principal by default
+{
+	auto mgr = new SessionManager(SessionLimits(Duration.zero, 0));
+	const first = mgr.create("alice");
+	foreach (_; 0 .. 200)
+		mgr.create("alice");
+	assert(!mgr.isActive(first), "a principal's sessions are bounded without configuration");
+	assert(mgr.activeCount < 200);
+}
+
+unittest  // past the per-address cap, an anonymous caller evicts only its own address's sessions
+{
+	import core.thread : Thread;
+	import core.time : msecs;
+
+	SessionLimits limits;
+	limits.idleTtl = Duration.zero;
+	limits.maxAnonymousPerAddress = 2;
+	auto mgr = new SessionManager(limits);
+	const other = mgr.create("", "10.0.0.2");
+	const alice = mgr.create("alice", "10.0.0.1");
+	Thread.sleep(2.msecs);
+	const a1 = mgr.create("", "10.0.0.1");
+	Thread.sleep(2.msecs);
+	const a2 = mgr.create("", "10.0.0.1");
+	Thread.sleep(2.msecs);
+	const a3 = mgr.create("", "10.0.0.1");
+	assert(!mgr.isActive(a1), "the address's oldest anonymous session makes room");
+	assert(mgr.isActive(a2) && mgr.isActive(a3));
+	assert(mgr.isActive(other), "another address's sessions are untouched");
+	assert(mgr.isActive(alice), "an authenticated session is not in the anonymous bucket");
+	assert(mgr.ownedBy(a3, ""), "an anonymous session is still owned by the empty principal");
 }

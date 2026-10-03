@@ -1619,6 +1619,18 @@ private string principalOf(TokenInfo token) @safe
 	return token.valid ? token.subject : "";
 }
 
+/// The remote IP address a request came from, or "" when it did not arrive over
+/// IP (a test request, a Unix socket).
+private string remoteAddressOf(HTTPServerRequest req) @safe nothrow
+{
+	import std.socket : AddressFamily;
+
+	const family = req.clientAddress.family;
+	if (family != AddressFamily.INET && family != AddressFamily.INET6)
+		return "";
+	return req.clientAddress.toAddressString();
+}
+
 private void handleGet(McpServer server, ServerPushChannel push,
 		SessionManager sessions, StreamGate getStreams,
 		StreamableHttpOptions opts, string principal, HTTPServerRequest req, HTTPServerResponse res) @safe
@@ -2541,7 +2553,7 @@ private void handlePost(McpServer server, ServerPushChannel push,
 		if (sessions !is null && msg.method == "initialize")
 		{
 			try
-				mintedSessionId = sessions.create(principalOf(token));
+				mintedSessionId = sessions.create(principalOf(token), remoteAddressOf(req));
 			catch (SessionCapacityException e)
 			{
 				res.statusCode = HTTPStatus.serviceUnavailable;
