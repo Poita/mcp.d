@@ -618,7 +618,7 @@ useful in development. An `McpException` becomes a JSON-RPC error.
 
 ```d
 @tool("weather", "Current weather for a city")
-string weather(string city)
+string weather(string city) @safe
 {
     if (city !in forecasts)
         throw new ToolError("unknown city: " ~ city);
