@@ -2479,27 +2479,78 @@ final class McpServer : ServerCore
 		return kept;
 	}
 
+	/// The client capability an MRTR input request needs: url-mode elicitation
+	/// needs `elicitation.url`, tool-enabled sampling needs `sampling.tools`.
+	private static ClientCapabilities requiredFor(ref const InputRequest reqst) @safe
+	{
+		ClientCapabilities need;
+		const k = reqst.kind;
+		if (k.isNull)
+			return need;
+		final switch (k.get)
+		{
+		case InputKind.elicitation:
+			const isUrl = reqst.params.type == Json.Type.object
+				&& "mode" in reqst.params && reqst.params["mode"].type == Json.Type.string
+				&& reqst.params["mode"].get!string == "url";
+			if (isUrl)
+				need.elicitationUrl = true;
+			else
+				need.elicitation = true;
+			break;
+		case InputKind.sampling:
+			const usesTools = reqst.params.type == Json.Type.object
+				&& ("tools" in reqst.params || "toolChoice" in reqst.params);
+			if (usesTools)
+				need.samplingTools = true;
+			else
+				need.sampling = true;
+			break;
+		case InputKind.roots:
+			need.roots = true;
+			break;
+		}
+		return need;
+	}
+
 	/// MRTR: never ask the client for an input kind it did not declare. Drop any
-	/// unsupported `inputRequests` against the `declared` capability set; if that
-	/// leaves no requests AND no `requestState`, the result violates the spec
-	/// ("at least one of inputRequests/requestState"), so surface it as an
-	/// internal error rather than emitting an unfulfillable round trip. Shared by
-	/// `doCallTool` (`what` = "tools/call") and `doGetPrompt` ("prompts/get");
-	/// both response types expose `needsInput`/`inputRequests`/`requestState`/
-	/// `withInputRequests`, so the helper is type-safe across them. Callers gate
-	/// on `ver.usesMRTR && response.needsInput` before calling.
+	/// unsupported `inputRequests` against the `declared` capability set. When
+	/// that drops every request, the client can never complete the round trip
+	/// (even with a `requestState`, it would only be asked again for nothing), so
+	/// reject the request with `-32021` naming the capabilities the dropped
+	/// requests need. Shared by `doCallTool` (`what` = "tools/call") and
+	/// `doGetPrompt` ("prompts/get"); both response types expose
+	/// `needsInput`/`inputRequests`/`requestState`/`withInputRequests`. Callers
+	/// gate on `ver.usesMRTR && response.needsInput` before calling.
 	private static T filterInputRequests(T)(T response,
 			ref const ClientCapabilities declared, string what) @safe
 	{
+		import std.algorithm.searching : canFind;
+		import std.array : join;
+
 		auto kept = supportedInputRequests(response.inputRequests, declared);
-		if (kept.length != response.inputRequests.length)
+		if (kept.length == response.inputRequests.length)
+			return response;
+		if (kept.length == 0)
 		{
-			if (kept.length == 0 && response.requestState.length == 0)
-				throw internalError(
-						what ~ " handler returned only input requests the client cannot satisfy");
-			response = response.withInputRequests(kept);
+			ClientCapabilities need;
+			string[] kinds;
+			foreach (ref r; response.inputRequests)
+			{
+				const n = requiredFor(r);
+				need.roots |= n.roots;
+				need.sampling |= n.sampling;
+				need.samplingTools |= n.samplingTools;
+				need.elicitation |= n.elicitation;
+				need.elicitationUrl |= n.elicitationUrl;
+				if (!kinds.canFind(r.type))
+					kinds ~= r.type;
+			}
+			throw missingRequiredClientCapability(need,
+					what ~ " needs input the client did not declare support for: " ~ kinds.join(
+						", "));
 		}
-		return response;
+		return response.withInputRequests(kept);
 	}
 
 	/// Configure the modern `CacheableResult` freshness hint (`ttlMs`/`cacheScope`)
@@ -3725,9 +3776,8 @@ final class McpServer : ServerCore
 			// MRTR: an InputRequiredResult MUST NOT ask the client for an
 			// input kind it never declared. Drop any unsupported inputRequests
 			// against the same `declared` set used for capability gating above. If
-			// that leaves no requests AND no requestState, the result violates the
-			// spec ("at least one of inputRequests/requestState"), so surface it as
-			// an internal error rather than emitting an unfulfillable round trip.
+			// that drops every request, the round trip can never complete, so the
+			// call fails with -32021 naming the missing capabilities.
 			// MRTR exists only on the modern (stateless) protocol — `usesMRTR` —
 			// where `declared` is the request's own _meta.clientCapabilities; a
 			// legacy InputRequiredResult is left untouched.
@@ -7340,13 +7390,35 @@ version (unittest)
 		return Message(makeRequest(Json(id), method, params));
 	}
 
+	// A modern request (as `modernReq`) whose client also declares elicitation,
+	// so MRTR elicitation input requests reach it.
+	private Message modernReqElicit(long id, string method, Json params = Json.emptyObject) @safe
+	{
+		Json meta = Json.emptyObject;
+		meta[MetaKey.protocolVersion] = "2026-07-28";
+		meta[MetaKey.clientInfo] = Json([
+			"name": Json("c"),
+			"version": Json("1")
+		]);
+		Json ext = Json.emptyObject;
+		ext[tasksExtensionKey] = Json.emptyObject;
+		meta[MetaKey.clientCapabilities] = Json([
+			"extensions": ext,
+			"elicitation": Json.emptyObject
+		]);
+		params["_meta"] = meta;
+		return Message(makeRequest(Json(id), method, params));
+	}
+
 	/// A modern request whose client capabilities do NOT declare the Tasks
-	/// extension (an ordinary client).
+	/// extension (an ordinary client that supports form elicitation).
 	private Message modernReqNoTasks(long id, string method, Json params = Json.emptyObject) @safe
 	{
 		Json meta = Json.emptyObject;
 		meta[MetaKey.protocolVersion] = "2026-07-28";
-		meta[MetaKey.clientCapabilities] = Json.emptyObject;
+		meta[MetaKey.clientCapabilities] = Json([
+			"elicitation": Json.emptyObject
+		]);
 		params["_meta"] = meta;
 		return Message(makeRequest(Json(id), method, params));
 	}
@@ -8481,10 +8553,8 @@ unittest  // startTask lets an MRTR tool gather input and then escalate to a tas
 	s.setToolTaskSupport("escalate", TaskSupport.required);
 
 	// Round 1: an InputRequiredResult, no taskId.
-	auto r1 = s.handle(modernReq(1, "tools/call", Json([
-		"name": Json("escalate"),
-		"arguments": Json.emptyObject
-	]))).get["result"];
+	auto r1 = s.handle(modernReqElicit(1, "tools/call",
+			Json(["name": Json("escalate"), "arguments": Json.emptyObject]))).get["result"];
 	assert(r1["resultType"].get!string == "input_required");
 	assert("taskId" !in r1);
 	// Round 2: the answer echoed back escalates to a task carrying no requestState.
@@ -8499,7 +8569,7 @@ unittest  // startTask lets an MRTR tool gather input and then escalate to a tas
 			])
 		])
 	]);
-	auto r2 = s.handle(modernReq(2, "tools/call", p2)).get["result"];
+	auto r2 = s.handle(modernReqElicit(2, "tools/call", p2)).get["result"];
 	assert(r2["resultType"].get!string == "task");
 	assert("requestState" !in r2);
 	const id = r2["taskId"].get!string;
@@ -9442,11 +9512,11 @@ unittest  // modern: a raw CallToolResult's inputRequests are filtered against t
 		return r;
 	});
 	// modernReq declares no elicitation capability, so the only request is
-	// unfulfillable and the result violates the at-least-one rule.
+	// unfulfillable and the call fails naming the missing capability.
 	Json p = Json(["name": Json("raw"), "arguments": Json.emptyObject]);
 	auto resp = s.handle(modernReq(1, "tools/call", p)).get;
 	assert("error" in resp);
-	assert(resp["error"]["code"].get!int == ErrorCode.internalError);
+	assert(resp["error"]["code"].get!int == ErrorCode.missingRequiredClientCapability);
 }
 
 unittest  // modern: a raw CallToolResult carrying a task handle bypasses output-schema validation
@@ -10306,8 +10376,8 @@ unittest  // a modern InputRequiredResult drops an elicitation request the clien
 	// The handler asks for elicitation, but this modern request's
 	// _meta.clientCapabilities omits elicitation. The server MUST NOT
 	// emit an inputRequest whose kind the client never declared. With no other
-	// request and no requestState, the result is a server-side error rather than
-	// an InputRequiredResult that the client could never fulfil.
+	// request left, the result is a -32021 error rather than an
+	// InputRequiredResult that the client could never fulfil.
 	auto s = new McpServer("t", "1");
 	Tool ask = {name: "ask"};
 	s.registerTool(ask, (Json args, RequestContext ctx) @safe {
@@ -10377,6 +10447,50 @@ unittest  // a mixed InputRequiredResult drops only the unsupported kinds
 			"the supported elicitation request must survive");
 	assert("r1" !in resp["result"]["inputRequests"],
 			"the unsupported roots request must be dropped");
+}
+
+unittest  // dropping every inputRequest with requestState set yields -32021, not an empty round trip
+{
+	auto s = new McpServer("t", "1");
+	Tool ask = {name: "ask"};
+	s.registerTool(ask, (Json args, RequestContext ctx) @safe {
+		return ToolResponse.inputRequired([InputRequest.roots("r1")], "state-1");
+	});
+	Json p = Json(["name": Json("ask")]);
+	auto resp = s.handle(modernReq(73, "tools/call", p)).get;
+	assert("error" in resp, "an all-dropped InputRequiredResult must not reach the client");
+	assert(resp["error"]["code"].get!int == cast(int) ErrorCode.missingRequiredClientCapability);
+	assert("roots" in resp["error"]["data"]["requiredCapabilities"]);
+}
+
+unittest  // dropping every inputRequest without requestState yields -32021 naming the kinds
+{
+	auto s = new McpServer("t", "1");
+	Tool ask = {name: "ask"};
+	s.registerTool(ask, (Json args, RequestContext ctx) @safe {
+		return ToolResponse.inputRequired([
+			InputRequest.elicitation("q1", "Your name?")
+		]);
+	});
+	Json p = Json(["name": Json("ask")]);
+	auto resp = s.handle(modernReq(74, "tools/call", p)).get;
+	assert(resp["error"]["code"].get!int == cast(int) ErrorCode.missingRequiredClientCapability);
+	assert("elicitation" in resp["error"]["data"]["requiredCapabilities"]);
+	import std.algorithm.searching : canFind;
+
+	assert(resp["error"]["message"].get!string.canFind("elicitation"));
+}
+
+unittest  // prompts/get: dropping every inputRequest with requestState set yields -32021
+{
+	auto s = new McpServer("t", "1");
+	Prompt descriptor = {name: "p"};
+	s.registerPrompt(descriptor, (Json args, RequestContext ctx) @safe {
+		return PromptResponse.inputRequired([InputRequest.roots("r1")], "state-1");
+	});
+	Json p = Json(["name": Json("p")]);
+	auto resp = s.handle(modernReq(75, "prompts/get", p)).get;
+	assert(resp["error"]["code"].get!int == cast(int) ErrorCode.missingRequiredClientCapability);
 }
 
 unittest  // elicit() is rejected on a modern (2026-07-28) request
