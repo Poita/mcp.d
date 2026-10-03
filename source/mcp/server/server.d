@@ -757,12 +757,18 @@ final class McpServer : ServerCore
 	/// identity (stdio / in-process, empty subject).
 	///
 	/// Throws when `sec.ttl` is under one second: blobs carry a whole-second
-	/// expiry, so a shorter ttl would expire every state as it is issued.
+	/// expiry, so a shorter ttl would expire every state as it is issued. Also
+	/// throws on a `stateful` server: MRTR `requestState` exists only on
+	/// 2026-07-28, which a stateful server never speaks.
 	void secureRequestState(RequestStateSecurity sec) @safe
 	{
 		import core.time : seconds;
 		import vibe.core.log : logWarn;
 
+		if (mode_ == ServerMode.stateful)
+			throw new Exception("secureRequestState() is not available on a stateful server:"
+					~ " MRTR requestState exists only on 2026-07-28, which a stateful server"
+					~ " never speaks. Construct the server with McpServer.stateless() instead.");
 		if (sec.ttl < 1.seconds)
 			throw new Exception("secureRequestState: ttl must be at least one second");
 		if (sec.key.length == 0)
@@ -10539,6 +10545,23 @@ unittest  // secureRequestState rejects a ttl under one second
 	assertThrown(new McpServer("t", "1").secureRequestState(sec));
 	sec.ttl = 1.seconds;
 	assertNotThrown(new McpServer("t", "1").secureRequestState(sec));
+}
+
+unittest  // secureRequestState throws on a stateful server, which never issues MRTR requestState
+{
+	import std.algorithm.searching : canFind;
+
+	RequestStateSecurity sec;
+	sec.key = new ubyte[32];
+	bool threw;
+	try
+		McpServer.stateful("t", "1").secureRequestState(sec);
+	catch (Exception e)
+	{
+		threw = true;
+		assert(e.msg.canFind("McpServer.stateless()"), e.msg);
+	}
+	assert(threw, "secureRequestState must throw on a stateful server");
 }
 
 version (unittest) private McpServer secureStatebookServer() @safe

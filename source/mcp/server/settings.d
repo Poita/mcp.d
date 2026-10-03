@@ -94,6 +94,7 @@ struct ServerSettings
 
 	/// When set, protect the MRTR `requestState` with the secure codec (calls
 	/// `secureRequestState`). Null (the default) passes it through as plaintext.
+	/// Stateless mode only: `newServer` throws when it is set on a `stateful` mode.
 	Nullable!RequestStateSecurity requestStateSecurity;
 
 	/// Advertise the MCP Apps extension capability (calls `enableApps` from
@@ -111,7 +112,7 @@ struct ServerSettings
 	/// apply the capability/validation flags via the matching `enable*`/`disable*`
 	/// methods. Tools, resources, and prompts are registered on the returned server
 	/// before serving. Throws when `resourceSubscriptions` or `requireInitialized`
-	/// is set on a `stateless` mode.
+	/// is set on a `stateless` mode, or `requestStateSecurity` on a `stateful` one.
 	McpServer newServer() @safe
 	{
 		import mcp.api.apps : enableApps;
@@ -274,6 +275,23 @@ version (unittest)
 				"the stateless rejection must name McpServer.stateful()");
 	}
 	assert(threw, "newServer() must throw for resourceSubscriptions on a stateless server");
+}
+
+@safe unittest
+{
+	// requestStateSecurity on a STATEFUL server makes newServer() throw, exactly
+	// as a direct secureRequestState() call would.
+	import std.exception : assertThrown;
+	import std.typecons : nullable;
+	import mcp.server.request_state : RequestStateSecurity;
+
+	ServerSettings s;
+	s.serverInfo = Implementation("settings-srv", "1.0");
+	s.mode = ServerMode.stateful;
+	RequestStateSecurity sec;
+	sec.key = new ubyte[32];
+	s.requestStateSecurity = nullable(sec);
+	assertThrown(s.newServer());
 }
 
 @safe unittest
