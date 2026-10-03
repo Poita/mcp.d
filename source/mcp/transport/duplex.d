@@ -283,21 +283,8 @@ final class DuplexChannel
 			try
 				onInbound(msg);
 			catch (Exception e)
-				logHandlerError(e);
+				reportError("inbound handler: " ~ e.msg);
 		}, m);
-	}
-
-	private static void logHandlerError(Exception e) @safe nothrow
-	{
-		import std.stdio : stderr;
-
-		() @trusted nothrow{
-			try
-				stderr.writeln("[mcp.transport.duplex] inbound handler: ", e.message);
-			catch (Exception)
-			{
-			}
-		}();
 	}
 
 	/// Send a request whose id was already chosen by the caller (the CLIENT path:
@@ -1276,6 +1263,34 @@ unittest  // a failed read ends the loop and is reported rather than passed off 
 	ch.runReadLoop();
 	assert(ch.closed);
 	assert(reported.length == 1 && reported[0].canFind("input/output error"));
+}
+
+unittest  // an inbound handler's exception is reported through onError
+{
+	import std.algorithm : canFind;
+
+	auto inbound = new LineLink;
+	string[] reported;
+	runTask(() nothrow{
+		scope (exit)
+			exitEventLoop();
+		try
+		{
+			auto ch = new DuplexChannel(() @safe { return inbound.take(); }, (string) @safe {
+			}, (Message) @safe { throw new Exception("handler exploded"); });
+			ch.onError = (string msg) @safe nothrow{ reported ~= msg; };
+			ch.start();
+			inbound.put(`{"jsonrpc":"2.0","method":"notifications/x"}`);
+			inbound.closeEnd();
+			foreach (_; 0 .. 8)
+				yield();
+		}
+		catch (Exception)
+		{
+		}
+	});
+	runEventLoop();
+	assert(reported.length == 1 && reported[0].canFind("handler exploded"));
 }
 
 unittest  // reaching end-of-input reports nothing
