@@ -84,8 +84,21 @@ struct IntrospectionConfig
 /// share the validator across worker threads; running the router with
 /// `HTTPServerOption.distribute` or worker threads is unsupported (see the
 /// concurrency contract in `mcp.transport.session`).
+///
+/// Throws when `cfg` names no introspection endpoint or client id, or an
+/// `authMethod` other than `clientSecretBasic`/`clientSecretPost`: RFC 7662
+/// requires the resource server to authenticate, and no other method is
+/// implemented here.
 TokenValidator introspectionVerifier(IntrospectionConfig cfg) @safe
 {
+	import std.exception : enforce;
+
+	enforce(cfg.introspectionEndpoint.length > 0,
+			"introspectionVerifier: introspectionEndpoint must be set.");
+	enforce(cfg.clientId.length > 0, "introspectionVerifier: clientId must be set.");
+	enforce(cfg.authMethod == TokenEndpointAuthMethod.clientSecretBasic
+			|| cfg.authMethod == TokenEndpointAuthMethod.clientSecretPost,
+			"introspectionVerifier: authMethod must be clientSecretBasic or clientSecretPost.");
 	return introspectionValidator(cfg, new HttpIntrospector(cfg));
 }
 
@@ -705,10 +718,40 @@ unittest  // introspectionVerifier yields a usable TokenValidator
 {
 	IntrospectionConfig cfg;
 	cfg.introspectionEndpoint = "https://as.example.com/introspect";
+	cfg.clientId = "rs";
+	cfg.clientSecret = "rs-secret";
 	TokenValidator v = introspectionVerifier(cfg);
 	assert(v !is null);
 	// An empty token is rejected before any network call.
 	assert(!v("").valid);
+}
+
+unittest  // introspectionVerifier refuses an auth method that sends no client credentials
+{
+	import std.exception : assertThrown;
+
+	IntrospectionConfig cfg;
+	cfg.introspectionEndpoint = "https://as.example.com/introspect";
+	cfg.clientId = "rs";
+	cfg.clientSecret = "rs-secret";
+	cfg.authMethod = TokenEndpointAuthMethod.none;
+	assertThrown(introspectionVerifier(cfg));
+	cfg.authMethod = TokenEndpointAuthMethod.privateKeyJwt;
+	assertThrown(introspectionVerifier(cfg));
+	cfg.authMethod = TokenEndpointAuthMethod.clientSecretPost;
+	assert(introspectionVerifier(cfg) !is null);
+}
+
+unittest  // introspectionVerifier requires an endpoint and a client id
+{
+	import std.exception : assertThrown;
+
+	IntrospectionConfig cfg;
+	cfg.introspectionEndpoint = "https://as.example.com/introspect";
+	assertThrown(introspectionVerifier(cfg));
+	cfg.introspectionEndpoint = "";
+	cfg.clientId = "rs";
+	assertThrown(introspectionVerifier(cfg));
 }
 
 unittest  // HttpIntrospector refuses an insecure (plaintext http) introspection endpoint
