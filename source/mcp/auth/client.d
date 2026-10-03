@@ -376,9 +376,16 @@ final class OAuthClient
 	}
 
 	/// Register a client dynamically (RFC 7591) at the AS registration endpoint.
+	/// The AS may assign a different `token_endpoint_auth_method` than requested
+	/// (RFC 7591 §3.2.1); this client then uses it as its `authMethod`. Throws
+	/// when the response carries no `client_id`, or assigns a method this client
+	/// cannot perform (unknown, secret-based without a `client_secret`, or
+	/// `private_key_jwt` without a `privateKeyPem`).
 	RegisteredClient register(AuthorizationServerMetadata as_, string clientName,
 			string scopeStr = "") @safe
 	{
+		import std.traits : EnumMembers;
+
 		if (as_.registrationEndpoint.length == 0)
 			throw internalError("Authorization server does not support Dynamic Client Registration");
 		ClientRegistration reg;
@@ -387,7 +394,43 @@ final class OAuthClient
 		reg.scope_ = scopeStr;
 		reg.tokenEndpointAuthMethod = cast(string) authMethod;
 		auto resp = postJson(as_.registrationEndpoint, reg.toJson());
-		return RegisteredClient.fromJson(resp);
+		auto rc = RegisteredClient.fromJson(resp);
+		if (rc.clientId.length == 0)
+			throw internalError("Dynamic client registration response carries no client_id");
+		const assigned = resp["token_endpoint_auth_method"];
+		if (assigned.type != Json.Type.string || assigned.get!string.length == 0)
+			return rc;
+		TokenEndpointAuthMethod method;
+		bool known;
+		static foreach (m; EnumMembers!TokenEndpointAuthMethod)
+			if (assigned.get!string == m)
+				{
+				method = m;
+				known = true;
+			}
+		if (!known)
+			throw internalError("Dynamic client registration assigned unsupported "
+					~ "token_endpoint_auth_method " ~ assigned.get!string);
+		final switch (method)
+		{
+		case TokenEndpointAuthMethod.none:
+			break;
+		case TokenEndpointAuthMethod.clientSecretBasic:
+		case TokenEndpointAuthMethod.clientSecretPost:
+			if (rc.clientSecret.length == 0)
+				throw internalError(
+						"Dynamic client registration assigned " ~ cast(
+						string) method ~ " but returned no client_secret");
+			break;
+		case TokenEndpointAuthMethod.privateKeyJwt:
+			if (privateKeyPem.length == 0)
+				throw internalError(
+						"Dynamic client registration assigned private_key_jwt "
+						~ "but OAuthClient.privateKeyPem is not set");
+			break;
+		}
+		authMethod = method;
+		return rc;
 	}
 
 	/// Select the client-registration approach for an authorization server,
@@ -1773,6 +1816,61 @@ unittest  // register() POSTs an RFC 7591 request and parses the returned creden
 
 	AuthorizationServerMetadata none;
 	assertThrown(c.register(none, "x"));
+}
+
+version (unittest) private OAuthClient registerAgainst(string response,
+		out RegisteredClient rc, out Exception error) @safe
+{
+	import std.exception : collectException;
+
+	auto srv = startLoopback((scope HTTPServerRequest req, scope HTTPServerResponse res) @safe {
+		res.writeBody(response, "application/json");
+	});
+	scope (exit)
+		srv.stop();
+	auto c = new OAuthClient();
+	c.resource = srv.base ~ "/mcp";
+	AuthorizationServerMetadata as_;
+	as_.registrationEndpoint = srv.base ~ "/register";
+	error = collectException(rc = c.register(as_, "dlang-mcp"));
+	return c;
+}
+
+unittest  // register() rejects a registration response without a client_id
+{
+	RegisteredClient rc;
+	Exception error;
+	registerAgainst(`{"client_secret":"s"}`, rc, error);
+	assert(error !is null);
+	registerAgainst(`{"client_id":""}`, rc, error);
+	assert(error !is null);
+}
+
+unittest  // register() adopts the token_endpoint_auth_method the AS assigned
+{
+	RegisteredClient rc;
+	Exception error;
+	auto c = registerAgainst(`{"client_id":"cid","client_secret":"s",`
+			~ `"token_endpoint_auth_method":"client_secret_post"}`, rc, error);
+	assert(error is null);
+	assert(c.authMethod == TokenEndpointAuthMethod.clientSecretPost);
+
+	c = registerAgainst(`{"client_id":"cid"}`, rc, error);
+	assert(error is null);
+	assert(c.authMethod == TokenEndpointAuthMethod.none);
+}
+
+unittest  // register() refuses an assigned token_endpoint_auth_method the client cannot use
+{
+	RegisteredClient rc;
+	Exception error;
+	registerAgainst(`{"client_id":"cid","token_endpoint_auth_method":"tls_client_auth"}`, rc, error);
+	assert(error !is null);
+	registerAgainst(`{"client_id":"cid","token_endpoint_auth_method":"client_secret_basic"}`,
+			rc, error);
+	assert(error !is null, "a secret-based method needs a client_secret");
+	registerAgainst(`{"client_id":"cid","token_endpoint_auth_method":"private_key_jwt"}`, rc, error);
+	assert(error !is null, "private_key_jwt needs a configured privateKeyPem");
 }
 
 unittest  // token grants POST their forms and parse the token response (loopback)
