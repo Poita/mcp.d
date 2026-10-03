@@ -2422,6 +2422,39 @@ void applySseStreamHeaders(HTTPServerResponse res, bool modern) @safe
 		res.headers[k] = v;
 }
 
+/// Whether the client behind `res` still holds its connection open.
+/// `HTTPServerResponse.connected` keeps reporting a connection the peer has
+/// closed as connected (the close is only observed by a read), so the socket is
+/// polled with a non-blocking read instead: bytes it picks up stay buffered on
+/// the connection for the next reader, and an end-of-stream means the client
+/// is gone. A response without a TCP connection (a test response) reports
+/// `res.connected`.
+package(mcp) bool clientConnected(HTTPServerResponse res) @trusted nothrow
+{
+	import vibe.core.net : TCPConnection, WaitForDataStatus;
+
+	foreach (i, ref field; res.tupleof)
+	{
+		static if (__traits(identifier, res.tupleof[i]) == "m_rawConnection")
+		{
+			if (!field)
+				return false;
+			try
+			{
+				auto tcp = field.extract!TCPConnection;
+				return tcp.connected
+					&& tcp.waitForDataEx(Duration.zero) != WaitForDataStatus.noMoreData;
+			}
+			catch (Exception)
+				return false;
+		}
+	}
+	try
+		return res.connected;
+	catch (Exception)
+		return false;
+}
+
 /// A `RequestContext` backed by an HTTP response that is (lazily) upgraded to a
 /// Server-Sent Events stream the first time the handler emits server->client
 /// traffic. Progress/logging become SSE notification events; sampling/
@@ -2520,7 +2553,7 @@ final class HttpStreamContext : RequestContext, ConnectionScoped
 		this.connState_ = connState;
 		this.serverStateless_ = serverStateless;
 		this.acceptsEventStream_ = acceptsEventStream;
-		this.connAlive_ = () @safe => res.connected;
+		this.connAlive_ = () @safe => clientConnected(res);
 		this.writeMtx_ = new TaskMutex;
 	}
 

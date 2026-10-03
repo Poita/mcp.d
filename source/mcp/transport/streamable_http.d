@@ -2689,7 +2689,7 @@ private void handlePost(McpServer server, ServerPushChannel push,
 		// cancellation: emit no response, exactly as `notifications/cancelled` would
 		// suppress it. Released versions (2025-*) keep their behaviour: a dropped
 		// connection still completes the write, which is a harmless no-op there.
-		if (suppressOnDisconnect(isModernReq, res.connected))
+		if (suppressOnDisconnect(isModernReq, clientConnected(res)))
 		{
 			// 2026-07-28 is stateless-only, so it never mints a session; the rollback
 			// is a no-op there. Kept for symmetry: a suppressed initialize must not
@@ -3015,6 +3015,76 @@ unittest  // released versions never suppress on disconnect (modern-only MUST)
 {
 	assert(!suppressOnDisconnect(false, false));
 	assert(!suppressOnDisconnect(false, true));
+}
+
+unittest  // modern: a client closing its TCP connection mid-request cancels the request
+{
+	import core.time : MonoTime, msecs;
+	import std.conv : to;
+	import vibe.core.core : runTask, runEventLoop, exitEventLoop, sleep;
+	import vibe.core.net : connectTCP;
+	import vibe.http.server : HTTPServerSettings, listenHTTP;
+	import mcp.protocol.types : Tool, CallToolResult;
+
+	auto server = McpServer.stateless("t", "1");
+	bool started, finished, cancelled;
+	Tool wait = {name: "wait"};
+	server.registerTool(wait, (Json args, RequestContext ctx) @safe {
+		started = true;
+		const deadline = MonoTime.currTime + 5.seconds;
+		while (!ctx.isCancelled && MonoTime.currTime < deadline)
+			sleep(10.msecs);
+		cancelled = ctx.isCancelled;
+		finished = true;
+		CallToolResult r;
+		return r;
+	});
+	auto router = new URLRouter;
+	mountMcp(router, server);
+	auto settings = new HTTPServerSettings;
+	settings.port = 0;
+	settings.bindAddresses = ["127.0.0.1"];
+
+	string failure;
+	runTask(() nothrow{
+		scope (exit)
+			exitEventLoop();
+		try
+		{
+			auto listener = listenHTTP(settings, router);
+			scope (exit)
+				listener.stopListening();
+			auto conn = connectTCP("127.0.0.1", listener.bindAddresses[0].port);
+			const body_ = `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"wait",`
+				~ `"arguments":{},"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28",`
+				~ `"io.modelcontextprotocol/clientCapabilities":{}}}}`;
+			conn.write(
+				"POST /mcp HTTP/1.1\r\nHost: 127.0.0.1\r\n" ~ "Content-Type: application/json\r\n"
+				~ "Accept: application/json, text/event-stream\r\n"
+				~ "MCP-Protocol-Version: 2026-07-28\r\nMcp-Method: tools/call\r\n"
+				~ "Mcp-Name: wait\r\nContent-Length: " ~ body_.length.to!string ~ "\r\n\r\n" ~ body_);
+			conn.flush();
+			const startBy = MonoTime.currTime + 2.seconds;
+			while (!started && MonoTime.currTime < startBy)
+				sleep(10.msecs);
+			if (!started)
+			{
+				ubyte[512] buf;
+				const n = conn.read(buf[], IOMode.once);
+				failure = () @trusted { return cast(string) buf[0 .. n].idup; }();
+			}
+			conn.close();
+			const finishBy = MonoTime.currTime + 6.seconds;
+			while (!finished && MonoTime.currTime < finishBy)
+				sleep(10.msecs);
+		}
+		catch (Exception e)
+			failure = e.msg;
+	});
+	runEventLoop();
+	assert(failure.length == 0, failure);
+	assert(started, "the tool handler never ran");
+	assert(cancelled, "a client disconnect must cancel a modern request");
 }
 
 /// Validate the modern Streamable HTTP request headers against the JSON-RPC body.
