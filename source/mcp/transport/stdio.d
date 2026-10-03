@@ -2048,7 +2048,7 @@ unittest  // stdio: a client reply inside a batch wakes the handler awaiting it
 	Tool ask = {name: "ask"};
 	s.registerTool(ask, (Json args, RequestContext ctx) @safe {
 		auto reply = ctx.elicit("What is your name?", Json([
-				"type": Json("object")
+			"type": Json("object")
 		]));
 		CallToolResult r;
 		r.content = [
