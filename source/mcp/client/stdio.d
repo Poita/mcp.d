@@ -592,6 +592,9 @@ version (Posix) StdioClientTransport spawnStdioTransport(string[] args,
 		}
 		if (acc.length && acc[$ - 1] == '\r')
 			acc = acc[0 .. $ - 1];
+		// A blank line is "" rather than null, which the read loop takes as EOF.
+		if (!acc.length)
+			return "";
 		return () @trusted { return cast(string) acc.idup; }();
 	}
 
@@ -863,7 +866,8 @@ version (Windows) private void pumpChildStdout(HANDLE h, Channel!string chan, si
 			}
 			if (acc.length && acc[$ - 1] == '\r')
 				acc = acc[0 .. $ - 1];
-			chan.put(cast(string) acc.idup);
+			// A blank line is "" rather than null, which the read loop takes as EOF.
+			chan.put(acc.length ? cast(string) acc.idup : "");
 			acc = null;
 		}
 	}
@@ -1116,6 +1120,29 @@ version (Posix) unittest  // spawned transport round-trips a request/response ov
 		assert(result["ok"].get!bool == true);
 		transport.closeProcess(5.seconds, 5.seconds);
 	});
+}
+
+version (Posix) unittest  // a blank line from the server is skipped, not taken as end-of-input
+{
+	import core.time : seconds;
+
+	bool ok;
+	string err;
+	inLoop(() @safe {
+		// The child stays alive after replying so the reply is not racing its exit.
+		auto transport = spawnStdioTransport([
+			"sh", "-c",
+			`read line; printf '\n\r\n{"jsonrpc":"2.0","id":1,"result":{"ok":true}}\n'; cat >/dev/null`
+		]);
+		scope (exit)
+			transport.closeProcess(5.seconds, 5.seconds);
+		Json req = parseJsonString(`{"jsonrpc":"2.0","id":1,"method":"ping"}`);
+		try
+			ok = transport.deliver(req, 1)["ok"].get!bool;
+		catch (Exception e)
+			err = e.msg;
+	});
+	assert(ok, "the reply after blank lines must arrive, got: " ~ err);
 }
 
 version (Posix) unittest  // an over-long newline-less stream ends the read loop instead of growing unbounded

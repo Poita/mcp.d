@@ -1280,6 +1280,9 @@ private struct StdinLineReader
 			}
 			if (acc.length && acc[$ - 1] == '\r')
 				acc = acc[0 .. $ - 1];
+			// A blank line is "" rather than null, which the read loop takes as EOF.
+			if (!acc.length)
+				return "";
 			return () @trusted { return cast(string) acc.idup; }();
 		}
 	}
@@ -1509,6 +1512,12 @@ unittest  // StdinLineReader returns a final unterminated line at EOF
 {
 	auto lines = drainLineReader(64, [cast(ubyte[]) "first\nlast\r".dup]);
 	assert(lines == ["first", "last"], "a final line without a newline must still be processed");
+}
+
+unittest  // StdinLineReader returns a blank line as an empty, non-null string
+{
+	auto lines = drainLineReader(64, [cast(ubyte[]) "a\n\n\r\nb\n".dup]);
+	assert(lines == ["a", "b"], "blank lines must not be reported as end-of-input");
 }
 
 unittest  // StdinLineReader reports an over-long line with its top-level id
