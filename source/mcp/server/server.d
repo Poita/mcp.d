@@ -325,12 +325,12 @@ final class McpServer : ServerCore
 	// application a public surface to react to client notifications. Mirrors
 	// the client's `onNotification` hook. Set via
 	// `setClientNotificationHandler`.
-	private void delegate(string method, Json params) @safe onClientNotification_;
+	private void delegate(string method, Json params, RequestContext ctx) @safe onClientNotification_;
 	// Convenience observer for `notifications/roots/list_changed`: when the
 	// client signals its root list changed, the application can re-call
 	// `ctx.listRoots()` to refresh. Invoked in addition to
 	// `onClientNotification_`. Set via `setRootsListChangedHandler`.
-	private void delegate() @safe onRootsListChanged_;
+	private void delegate(RequestContext ctx) @safe onRootsListChanged_;
 
 	this(string name, string version_, Nullable!string instructions = Nullable!string.init) @safe
 	{
@@ -1120,13 +1120,17 @@ final class McpServer : ServerCore
 	/// not affect the JSON-RPC wire output for any protocol version: an exception
 	/// the observer throws is logged and otherwise ignored.
 	///
-	/// The observer itself receives no `RequestContext`: inbound notifications are
-	/// dispatched without one. To issue the `ctx.listRoots()` refresh, capture a
-	/// server->client-capable `RequestContext` from a prior request handler (e.g. a
-	/// `tools/call`) and call it from this observer; on stdio that captured context
-	/// (a `StdioContext` bound to the duplex channel) round-trips the `roots/list`
-	/// request to the client from any task.
-	void setClientNotificationHandler(void delegate(string method, Json params) @safe handler) @safe
+	/// `ctx` is the context the notification arrived on and identifies its
+	/// sender: `connectionTokenOf(ctx)` is the connection / session it came from
+	/// (the `Mcp-Session-Id` on stateful Streamable HTTP, the legacy HTTP+SSE
+	/// session, "" on stdio's single connection) and `ctx.auth()` is the
+	/// request's validated bearer token where the transport enforces auth. On a
+	/// transport with a server->client channel for the notification (stdio,
+	/// legacy HTTP+SSE) a stateful server can call `ctx.listRoots()` on it
+	/// directly; a Streamable HTTP notification POST carries no such channel, so
+	/// refresh through a context captured from a request on the same session.
+	void setClientNotificationHandler(void delegate(string method, Json params,
+			RequestContext ctx) @safe handler) @safe
 	{
 		onClientNotification_ = handler;
 	}
@@ -1134,8 +1138,10 @@ final class McpServer : ServerCore
 	/// Convenience observer fired specifically on
 	/// `notifications/roots/list_changed`. Invoked in addition to any handler
 	/// registered via `setClientNotificationHandler`. Set to react to client
-	/// root-list changes without inspecting the method string yourself.
-	void setRootsListChangedHandler(void delegate() @safe handler) @safe
+	/// root-list changes without inspecting the method string yourself. `ctx`
+	/// identifies the client whose roots changed, as for
+	/// `setClientNotificationHandler`.
+	void setRootsListChangedHandler(void delegate(RequestContext ctx) @safe handler) @safe
 	{
 		onRootsListChanged_ = handler;
 	}
@@ -2785,10 +2791,10 @@ final class McpServer : ServerCore
 			break;
 		case "notifications/roots/list_changed":
 			if (onRootsListChanged_ !is null)
-				runObserver(msg.method, () @safe { onRootsListChanged_(); });
+				runObserver(msg.method, () @safe { onRootsListChanged_(ctx); });
 			if (onClientNotification_ !is null)
 				runObserver(msg.method, () @safe {
-					onClientNotification_(msg.method, msg.params);
+					onClientNotification_(msg.method, msg.params, ctx);
 				});
 			break;
 		default:
@@ -2796,7 +2802,7 @@ final class McpServer : ServerCore
 			// observer (if any) and otherwise ignored, per JSON-RPC.
 			if (onClientNotification_ !is null)
 				runObserver(msg.method, () @safe {
-					onClientNotification_(msg.method, msg.params);
+					onClientNotification_(msg.method, msg.params, ctx);
 				});
 			break;
 		}
@@ -5922,7 +5928,9 @@ unittest  // notifications/roots/list_changed fires the dedicated server hook
 {
 	auto s = new McpServer("t", "1");
 	bool sawRootsChanged;
-	s.setRootsListChangedHandler(() @safe { sawRootsChanged = true; });
+	s.setRootsListChangedHandler((RequestContext ctx) @safe {
+		sawRootsChanged = true;
+	});
 
 	auto out_ = s.handle(Message(makeNotification("notifications/roots/list_changed")));
 	assert(out_.isNull, "a notification produces no response");
@@ -5933,7 +5941,7 @@ unittest  // notifications/roots/list_changed also reaches the generic client-no
 {
 	auto s = new McpServer("t", "1");
 	string seenMethod;
-	s.setClientNotificationHandler((string method, Json params) @safe {
+	s.setClientNotificationHandler((string method, Json params, RequestContext ctx) @safe {
 		seenMethod = method;
 	});
 
@@ -5945,7 +5953,7 @@ unittest  // unrecognised client notifications are surfaced to the generic obser
 {
 	auto s = new McpServer("t", "1");
 	string seenMethod;
-	s.setClientNotificationHandler((string method, Json params) @safe {
+	s.setClientNotificationHandler((string method, Json params, RequestContext ctx) @safe {
 		seenMethod = method;
 	});
 
@@ -5954,11 +5962,30 @@ unittest  // unrecognised client notifications are surfaced to the generic obser
 	assert(seenMethod == "notifications/something/unknown");
 }
 
+unittest  // client-notification observers see which connection a notification came from
+{
+	auto s = new McpServer("t", "1");
+	string[] rootsFrom, notesFrom;
+	s.setRootsListChangedHandler((RequestContext ctx) @safe {
+		rootsFrom ~= connectionTokenOf(ctx);
+	});
+	s.setClientNotificationHandler((string method, Json params, RequestContext ctx) @safe {
+		notesFrom ~= connectionTokenOf(ctx);
+	});
+
+	s.handle(Message(makeNotification("notifications/roots/list_changed")), new ConnCtx("conn-A"));
+	s.handle(Message(makeNotification("notifications/roots/list_changed")), new ConnCtx("conn-B"));
+	assert(rootsFrom == ["conn-A", "conn-B"]);
+	assert(notesFrom == ["conn-A", "conn-B"]);
+}
+
 unittest  // a throwing client-notification observer does not escape handle()
 {
 	auto s = new McpServer("t", "1");
-	s.setRootsListChangedHandler(() @safe { throw new Exception("roots boom"); });
-	s.setClientNotificationHandler((string method, Json params) @safe {
+	s.setRootsListChangedHandler((RequestContext ctx) @safe {
+		throw new Exception("roots boom");
+	});
+	s.setClientNotificationHandler((string method, Json params, RequestContext ctx) @safe {
 		throw new Exception("observer boom");
 	});
 
@@ -5978,7 +6005,9 @@ unittest  // a throwing client-notification observer does not drop a batch's rep
 	params["capabilities"] = Json.emptyObject;
 	params["clientInfo"] = Json(["name": Json("c"), "version": Json("1")]);
 	s.handle(req(1, "initialize", params));
-	s.setRootsListChangedHandler(() @safe { throw new Exception("roots boom"); });
+	s.setRootsListChangedHandler((RequestContext ctx) @safe {
+		throw new Exception("roots boom");
+	});
 
 	auto outText = s.handleRaw(`[{"jsonrpc":"2.0","id":1,"method":"ping"},
 		{"jsonrpc":"2.0","method":"notifications/roots/list_changed"}]`);
@@ -5994,7 +6023,7 @@ unittest  // server-consumed notifications do NOT reach the generic client obser
 	// server itself and must not be forwarded to the application observer.
 	auto s = new McpServer("t", "1");
 	bool observed;
-	s.setClientNotificationHandler((string method, Json params) @safe {
+	s.setClientNotificationHandler((string method, Json params, RequestContext ctx) @safe {
 		observed = true;
 	});
 

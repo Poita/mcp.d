@@ -59,6 +59,7 @@ void serveStdio(McpServer server, string delegate() @safe readLine,
 	import vibe.data.json : Json;
 	import mcp.protocol.jsonrpc : Message, MessageKind;
 	import mcp.server.connection : ConnectionState;
+	import mcp.server.context : StdioContext;
 
 	// stdio is single-connection (one implicit peer per process), so this
 	// transport owns exactly one `ConnectionState`, which the server core threads
@@ -161,7 +162,10 @@ void serveStdio(McpServer server, string delegate() @safe readLine,
 			inflight.start();
 			scope (exit)
 				inflight.finish();
-			server.handle(m);
+			// Dispatched with the channel-bound context so an observer can issue
+			// server->client requests (e.g. `ctx.listRoots()`) directly.
+			server.handle(m, new StdioContext(&sink, &serverRequest, server.clientCapabilities,
+					Json.undefined, server.negotiatedVersion, server.mode == ServerMode.stateless));
 			break;
 		case MessageKind.response:
 		case MessageKind.errorResponse:
@@ -2188,6 +2192,42 @@ unittest  // stdio: a tool calling ctx.elicit is answered over the same stdio ch
 		}
 	}
 	assert(sawResult, "tools/call reply with the elicited value was never produced");
+}
+
+unittest  // stdio: a roots/list_changed observer can re-list roots on its own context
+{
+	import mcp.server.context : RequestContext;
+
+	auto s = McpServer.stateful("stdio-peer", "1.0");
+	string[] roots;
+	s.setRootsListChangedHandler((RequestContext ctx) @safe {
+		foreach (r; ctx.listRoots().roots)
+			roots ~= r.uri;
+	});
+
+	withServer(s, (ServerLink link) @safe {
+		link.feed(`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{"roots":{"listChanged":true}},"clientInfo":{"name":"t","version":"1"}}}`);
+		link.feed(`{"jsonrpc":"2.0","method":"notifications/initialized"}`);
+		link.feed(`{"jsonrpc":"2.0","method":"notifications/roots/list_changed"}`);
+		foreach (_; 0 .. 12)
+			yield();
+		long listId = -1;
+		foreach (o; link.outbound)
+		{
+			auto j = parseJsonString(o);
+			if ("method" in j && j["method"].get!string == "roots/list" && "id" in j)
+				listId = j["id"].get!long;
+		}
+		assert(listId >= 0, "the observer never sent roots/list");
+		link.feed(`{"jsonrpc":"2.0","id":` ~ () @trusted {
+			import std.conv : to;
+
+			return listId.to!string;
+		}() ~ `,"result":{"roots":[{"uri":"file:///work"}]}}`);
+		foreach (_; 0 .. 12)
+			yield();
+	});
+	assert(roots == ["file:///work"]);
 }
 
 unittest  // stdio: a client reply inside a batch wakes the handler awaiting it

@@ -2193,11 +2193,20 @@ private final class HttpScopedContext : BaseRequestContext, ConnectionScoped
 	// it is the per-request modern state, so dispatch resolves the modern effective
 	// version and serves the modern-only listen RPC.
 	private ConnectionState connState_;
+	// The POST's validated bearer token, so a notification observer can tell
+	// which principal sent it.
+	private TokenInfo auth_;
 
-	this(string token, ConnectionState connState = null) @safe
+	this(string token, ConnectionState connState = null, TokenInfo auth = TokenInfo.invalid()) @safe
 	{
 		this.token_ = token;
 		this.connState_ = connState;
+		this.auth_ = auth;
+	}
+
+	override TokenInfo auth() @safe
+	{
+		return auth_;
 	}
 
 	string connectionToken() @safe
@@ -2645,7 +2654,7 @@ private void handlePost(McpServer server, ServerPushChannel push,
 			&& msg.params.type == Json.Type.object
 			&& "requestId" in msg.params ? statelessInFlight.cancelScopeFor(
 					principalOf(token), msg.params["requestId"]) : cancelScope;
-		server.handle(msg, new HttpScopedContext(noteScope, noteState));
+		server.handle(msg, new HttpScopedContext(noteScope, noteState, token));
 		res.statusCode = HTTPStatus.accepted;
 		res.writeBody("", "text/plain");
 		return;
@@ -3034,6 +3043,52 @@ unittest  // with auth on, every member of a 2025-03-26 batch sees the caller's 
 	auto arr = parseJsonString(reply);
 	assert(arr[0]["result"]["content"][0]["text"].get!string == "alice",
 			"a batch member must run under the request's authenticated principal: " ~ reply);
+}
+
+unittest  // a notification observer sees the POST's session and authenticated principal
+{
+	import vibe.http.server : createTestHTTPServerResponse, TestHTTPResponseMode;
+	import vibe.stream.memory : createMemoryOutputStream;
+	import mcp.server.context : connectionTokenOf;
+
+	StreamableHttpOptions opts;
+	opts.auth.allowAnyAudience = true;
+	opts.auth.authorizationServers = ["https://auth.example.com"];
+	opts.auth.validator = (string t) @safe {
+		TokenInfo info;
+		info.valid = t == "tok-alice";
+		info.subject = "alice";
+		return info;
+	};
+	auto server = McpServer.stateful("t", "1");
+	string seenSession, seenSubject;
+	server.setRootsListChangedHandler((RequestContext ctx) @safe {
+		seenSession = connectionTokenOf(ctx);
+		seenSubject = ctx.auth().subject;
+	});
+	auto router = new URLRouter;
+	mountMcp(router, server, opts);
+
+	HTTPServerResponse send(string body_, string sid) @safe
+	{
+		string[string] h = [
+			"Accept": "application/json, text/event-stream",
+			"Authorization": "Bearer tok-alice",
+			"MCP-Protocol-Version": "2025-11-25"
+		];
+		if (sid.length)
+			h[SessionHeader] = sid;
+		auto res = createTestHTTPServerResponse(createMemoryOutputStream(),
+				null, TestHTTPResponseMode.bodyOnly);
+		router.handleRequest(makeInitPostReq(body_, h), res);
+		return res;
+	}
+
+	const sid = send(initializeBody(), "").headers[SessionHeader];
+	auto res = send(`{"jsonrpc":"2.0","method":"notifications/roots/list_changed"}`, sid);
+	assert(res.statusCode == HTTPStatus.accepted);
+	assert(seenSession == sid);
+	assert(seenSubject == "alice");
 }
 
 unittest  // a client reply inside a 2025-03-26 batch resolves the waiting server->client request
@@ -6888,7 +6943,7 @@ unittest  // legacy notification POSTs wait for a slot rather than each parking 
 	auto server = McpServer.stateful("t", "1");
 	size_t running, peak, ran;
 	bool release;
-	server.setClientNotificationHandler((string method, Json params) @safe {
+	server.setClientNotificationHandler((string method, Json params, RequestContext ctx) @safe {
 		running++;
 		if (running > peak)
 			peak = running;
