@@ -3037,9 +3037,32 @@ final class EventsRuntime
 	private EventResult runCheck(ref EventRegistration reg, EventContext ctx) @safe
 	{
 		auto er = reg.check(ctx);
-		foreach (ref occ; er.events)
+		foreach (i, ref occ; er.events)
+		{
+			if (occ.eventId.length == 0)
+				occ.eventId = derivedEventId(reg.descriptor.name, ctx.cursor, i, occ);
 			stamp(occ);
+		}
 		return er;
+	}
+
+	// The id of a check-returned event its author left without one, derived from
+	// what places it in the check's output — its own position when it carries
+	// one, else the position fetched from and its index in the batch — plus its
+	// timestamp and payload. A re-fetch of the same batch (a client replaying
+	// after a crash, a webhook re-poll) yields the same id, so it dedups.
+	private static string derivedEventId(string name, Nullable!string from,
+			size_t index, ref EventOccurrence occ) @safe
+	{
+		import std.conv : to;
+
+		string key = name ~ "\0";
+		if (!occ.cursor.isNull)
+			key ~= "at\0" ~ occ.cursor.get;
+		else
+			key ~= (from.isNull ? "boot\0" : "from\0" ~ from.get) ~ "\0" ~ index.to!string;
+		key ~= "\0" ~ occ.timestamp ~ "\0" ~ canonicalJsonString(occ.data);
+		return "evt_" ~ sha256Hex(key)[0 .. 32];
 	}
 
 	private void touchPollLease(ref EventRegistration reg, string name,
@@ -8006,4 +8029,29 @@ unittest  // a raw check's id-less events each reach a webhook subscriber
 	assert(ft.eventPosts().length == 3);
 	rt.pollWebhookSubscriptions();
 	assert(ft.eventPosts().length == 6);
+}
+
+unittest  // an onFetch event with no eventId gets the same id each time it is replayed
+{
+	auto rt = testRuntime();
+	auto ev = rt.define!(DemoArgs, DemoPayload)("incident.created");
+	ev.onFetch((DemoArgs args, scope FetchContext ctx) @safe {
+		return EventBatch!DemoPayload.of([
+			Event!DemoPayload(DemoPayload("INC-1", "P1"), "c1"),
+			Event!DemoPayload(DemoPayload("INC-2", "P1")),
+			Event!DemoPayload(DemoPayload("INC-2", "P1"))
+		], "c2");
+	});
+	PollResult fetch() @safe
+	{
+		return rt.poll("incident.created", Json.emptyObject, "",
+				nullable("c0"), Nullable!long.init, Nullable!long.init);
+	}
+
+	auto first = fetch();
+	auto replay = fetch();
+	foreach (i; 0 .. 3)
+		assert(first.events[i].eventId == replay.events[i].eventId);
+	assert(first.events[0].eventId != first.events[1].eventId);
+	assert(first.events[1].eventId != first.events[2].eventId);
 }

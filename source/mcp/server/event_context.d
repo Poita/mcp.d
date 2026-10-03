@@ -61,7 +61,8 @@ struct EventResult
 
 /// One typed event in a fetch batch: the strongly-typed `payload`, plus an
 /// optional `cursor` (this event's position — falls back to the batch cursor),
-/// `eventId` (for dedup; auto-generated when empty), and `timestamp` (ISO-8601;
+/// `eventId` (for dedup; when empty, derived from the event's position and payload,
+/// so a re-fetch of the same batch yields the same id), and `timestamp` (ISO-8601;
 /// stamped to now when empty).
 struct Event(P)
 {
