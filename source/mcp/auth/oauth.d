@@ -826,8 +826,11 @@ unittest  // an explicit applicationType wins over the redirect-URI inference
 // Client ID Metadata Documents (SEP-991)
 // ===========================================================================
 
-/// Validate an OAuth Client ID Metadata Document `client_id` URL (SEP-991):
-/// it MUST use the `https` scheme and contain a non-empty path component.
+/// Validate an OAuth Client ID Metadata Document `client_id` URL (SEP-991 /
+/// draft-ietf-oauth-client-id-metadata-document §3): it MUST use the `https`
+/// scheme, name a host, and contain a non-empty path component, and it MUST NOT
+/// contain a fragment, a username or password, or a `.`/`..` path segment
+/// (including their percent-encoded forms). A query component is tolerated.
 bool isValidClientIdMetadataUrl(string clientId) @safe pure nothrow @nogc
 {
 	import std.string : indexOf;
@@ -836,12 +839,56 @@ bool isValidClientIdMetadataUrl(string clientId) @safe pure nothrow @nogc
 	if (clientId.length < 8 || clientId[0 .. 8] != "https://")
 		return false;
 	auto rest = clientId[8 .. $];
-	// A path component must exist after the host: a '/' that is followed by at
-	// least one more character (a bare trailing '/' is not a path component).
-	const slash = rest.indexOf('/');
-	if (slash < 0)
+	if (rest.indexOf('#') >= 0)
 		return false;
-	return slash + 1 < rest.length;
+
+	// The authority runs up to the first '/' or '?'; a path must follow it.
+	size_t authorityEnd = 0;
+	while (authorityEnd < rest.length && rest[authorityEnd] != '/' && rest[authorityEnd] != '?')
+		++authorityEnd;
+	if (authorityEnd == 0 || authorityEnd == rest.length || rest[authorityEnd] != '/')
+		return false;
+	if (rest[0 .. authorityEnd].indexOf('@') >= 0)
+		return false;
+
+	auto path = rest[authorityEnd .. $];
+	const query = path.indexOf('?');
+	if (query >= 0)
+		path = path[0 .. query];
+	// A bare trailing '/' is not a path component.
+	if (path.length < 2)
+		return false;
+
+	size_t segStart = 1;
+	foreach (i; 1 .. path.length + 1)
+	{
+		if (i < path.length && path[i] != '/')
+			continue;
+		if (isDotSegment(path[segStart .. i]))
+			return false;
+		segStart = i + 1;
+	}
+	return true;
+}
+
+/// Whether a path segment is `.` or `..`, with any dot possibly written as the
+/// percent-encoding `%2e` / `%2E` (RFC 3986 §2.3 equivalence).
+private bool isDotSegment(string seg) @safe pure nothrow @nogc
+{
+	size_t dots;
+	size_t i;
+	while (i < seg.length)
+	{
+		if (seg[i] == '.')
+			++i;
+		else if (i + 2 < seg.length && seg[i] == '%' && seg[i + 1] == '2'
+				&& (seg[i + 2] == 'e' || seg[i + 2] == 'E'))
+			i += 3;
+		else
+			return false;
+		++dots;
+	}
+	return dots == 1 || dots == 2;
 }
 
 /// Parse `url` with vibe's parser (the one the connector uses) into its
@@ -1169,6 +1216,35 @@ unittest  // CIMD client_id must use https
 {
 	assert(!isValidClientIdMetadataUrl("http://app.example.com/oauth/client.json"));
 	assert(!isValidClientIdMetadataUrl("app.example.com/oauth/client.json"));
+}
+
+unittest  // CIMD client_id must not carry a fragment
+{
+	assert(!isValidClientIdMetadataUrl("https://app.example.com/client.json#frag"));
+	assert(!isValidClientIdMetadataUrl("https://app.example.com/client.json#"));
+}
+
+unittest  // CIMD client_id must not carry a username or password
+{
+	assert(!isValidClientIdMetadataUrl("https://user@app.example.com/client.json"));
+	assert(!isValidClientIdMetadataUrl("https://user:pw@app.example.com/client.json"));
+}
+
+unittest  // CIMD client_id must not contain dot path segments
+{
+	assert(!isValidClientIdMetadataUrl("https://app.example.com/./client.json"));
+	assert(!isValidClientIdMetadataUrl("https://app.example.com/a/../client.json"));
+	assert(!isValidClientIdMetadataUrl("https://app.example.com/a/.."));
+	assert(!isValidClientIdMetadataUrl("https://app.example.com/a/%2e%2E/client.json"));
+	// A segment merely containing dots is an ordinary name.
+	assert(isValidClientIdMetadataUrl("https://app.example.com/.well-known/client..json"));
+}
+
+unittest  // CIMD client_id must name a host and a path before any query
+{
+	assert(!isValidClientIdMetadataUrl("https:///client.json"));
+	assert(!isValidClientIdMetadataUrl("https://app.example.com?x=/client.json"));
+	assert(isValidClientIdMetadataUrl("https://app.example.com:8443/client.json?v=1"));
 }
 
 /// An OAuth Client ID Metadata Document (SEP-991) a client hosts at its
