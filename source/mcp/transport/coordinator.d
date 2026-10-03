@@ -148,7 +148,8 @@ final class DuplexCoordinator
 
 	/// Deliver a peer response / errorResponse. Returns true if `idJson` matched a
 	/// pending outbound request (waking its awaiting task), false otherwise (an id
-	/// we are not awaiting — e.g. a stray response — is ignored).
+	/// we are not awaiting — e.g. a stray response — is ignored). A request
+	/// already settled keeps its first outcome until its task wakes to take it.
 	///
 	/// Accepts both `int_` and whole-number `float_` ids: some peers (JavaScript,
 	/// Python `json.dumps`) serialise integer ids as floats (e.g. `1.0`), which
@@ -169,6 +170,8 @@ final class DuplexCoordinator
 			return false;
 		if (auto w = id in waiters)
 		{
+			if (w.done)
+				return true;
 			w.result = result;
 			w.error = error;
 			w.done = true;
@@ -180,7 +183,8 @@ final class DuplexCoordinator
 
 	/// Fail every still-pending request with `error` and wake its awaiting task.
 	/// Called by the read loop at end-of-input so a caller blocked in `await`
-	/// is released with an exception instead of hanging until its timeout. Marks
+	/// is released with an exception instead of hanging until its timeout. A
+	/// request whose reply was read before end-of-input keeps that reply. Marks
 	/// the coordinator closed so any request registered AFTER this point is failed
 	/// fast (see `register`) rather than left to time out.
 	void failPending(McpException error) @safe
@@ -193,6 +197,8 @@ final class DuplexCoordinator
 		{
 			if (auto w = id in waiters)
 			{
+				if (w.done)
+					continue;
 				Json err = Json.emptyObject;
 				err["code"] = error.code;
 				err["message"] = error.msg;
@@ -332,6 +338,30 @@ unittest  // failPending wakes an awaiting task with an error instead of hanging
 	});
 	runEventLoop();
 	assert(threw);
+}
+
+unittest  // failPending keeps a reply that arrived before the awaiting task woke
+{
+	auto coord = new DuplexCoordinator;
+	coord.register(4);
+	coord.resolve(Json(4L), Json(["ok": Json(true)]), Json.undefined);
+	coord.failPending(internalError("channel closed"));
+	assert(coord.await(4)["ok"].get!bool);
+}
+
+unittest  // a second outcome for a settled request does not replace the first
+{
+	import std.exception : collectException;
+
+	auto coord = new DuplexCoordinator;
+	coord.register(5);
+	Json err = Json.emptyObject;
+	err["code"] = ErrorCode.requestCancelled;
+	err["message"] = "aborted";
+	coord.resolve(Json(5L), Json.undefined, err);
+	coord.resolve(Json(5L), Json(["ok": Json(true)]), Json.undefined);
+	auto e = collectException!McpException(coord.await(5));
+	assert(e !is null && e.code == ErrorCode.requestCancelled);
 }
 
 unittest  // a request registered AFTER failPending fails fast instead of blocking until timeout
