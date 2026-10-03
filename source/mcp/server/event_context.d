@@ -175,7 +175,9 @@ final class EventContext
 			Nullable!long maxEvents = Nullable!long.init) @safe
 	{
 		cursor_ = cursor;
-		arguments_ = (arguments.type == Json.Type.object) ? arguments : Json.emptyObject;
+		// A private copy, so a hook that mutates its arguments cannot reach the
+		// stored subscription they came from.
+		arguments_ = (arguments.type == Json.Type.object) ? arguments.clone() : Json.emptyObject;
 		principal_ = principal;
 		maxAgeMs_ = maxAgeMs;
 		maxEvents_ = maxEvents;
@@ -220,6 +222,16 @@ final class EventContext
 	{
 		return maxEvents_;
 	}
+}
+
+unittest  // an EventContext keeps its own copy of the subscription arguments
+{
+	auto args = Json(["channel": Json("general")]);
+	auto ctx = new EventContext(Nullable!string.init, args, "u");
+	args["channel"] = "mutated";
+	assert(ctx.arguments["channel"].get!string == "general");
+	ctx.arguments["channel"] = "changed by a hook";
+	assert(args["channel"].get!string == "mutated");
 }
 
 unittest  // EventResult.of carries events + cursor and clears flags by default

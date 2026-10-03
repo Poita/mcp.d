@@ -402,8 +402,8 @@ interface WebhookSubscriptionStore
 
 /// In-memory `WebhookSubscriptionStore` backed by an associative array, indexed
 /// by event type name and by principal. The default store; records are
-/// serialized to JSON and re-parsed on read so a returned record never aliases
-/// stored state. Lost on restart — which is the deliberate trade for short-TTL
+/// deep-copied to JSON on write and back on read, so neither a stored nor a
+/// returned record shares `Json` with its caller. Lost on restart — which is the deliberate trade for short-TTL
 /// soft state (clients re-subscribe on refresh).
 final class InMemoryWebhookSubscriptionStore : WebhookSubscriptionStore
 {
@@ -428,8 +428,8 @@ final class InMemoryWebhookSubscriptionStore : WebhookSubscriptionStore
 	void put(WebhookSubscription sub) @safe
 	{
 		remove(sub.id);
-		records_[sub.id] = Record(sub.toJson(), sub.name, sub.principal,
-				sub.noExpiry, sub.expiresAtMs);
+		records_[sub.id] = Record(sub.toJson().clone(), sub.name,
+				sub.principal, sub.noExpiry, sub.expiresAtMs);
 		idsByName_[sub.name][sub.id] = true;
 		idsByPrincipal_[sub.principal][sub.id] = true;
 	}
@@ -437,7 +437,7 @@ final class InMemoryWebhookSubscriptionStore : WebhookSubscriptionStore
 	Nullable!WebhookSubscription get(string id) @safe
 	{
 		if (auto p = id in records_)
-			return nullable(WebhookSubscription.fromJson(p.json));
+			return nullable(WebhookSubscription.fromJson(p.json.clone()));
 		return Nullable!WebhookSubscription.init;
 	}
 
@@ -455,7 +455,7 @@ final class InMemoryWebhookSubscriptionStore : WebhookSubscriptionStore
 	{
 		WebhookSubscription[] result;
 		foreach (_, r; records_)
-			result ~= WebhookSubscription.fromJson(r.json);
+			result ~= WebhookSubscription.fromJson(r.json.clone());
 		return result;
 	}
 
@@ -464,7 +464,7 @@ final class InMemoryWebhookSubscriptionStore : WebhookSubscriptionStore
 		WebhookSubscription[] result;
 		if (auto ids = name in idsByName_)
 			foreach (id, _; *ids)
-				result ~= WebhookSubscription.fromJson(records_[id].json);
+				result ~= WebhookSubscription.fromJson(records_[id].json.clone());
 		return result;
 	}
 
@@ -571,8 +571,8 @@ interface DeliveryQueue
 
 /// In-memory `DeliveryQueue`. The default; jobs are lost on restart, which is the
 /// deliberate trade for short-TTL soft state (clients re-subscribe and replay
-/// from their cursor). Records are serialized/re-parsed so a leased job never
-/// aliases stored state.
+/// from their cursor). Jobs are deep-copied on enqueue and on lease, so neither
+/// a queued nor a leased job shares `Json` with its caller.
 final class InMemoryDeliveryQueue : DeliveryQueue
 {
 	private struct Entry
@@ -600,7 +600,7 @@ final class InMemoryDeliveryQueue : DeliveryQueue
 		if ((job.jobId in entries_) !is null)
 			return false;
 		const seq = nextSeq_++;
-		entries_[job.jobId] = Entry(job.toJson(), 0, seq);
+		entries_[job.jobId] = Entry(job.toJson().clone(), 0, seq);
 		order_ ~= Slot(job.jobId, seq);
 		return true;
 	}
@@ -614,7 +614,7 @@ final class InMemoryDeliveryQueue : DeliveryQueue
 			if (e is null || e.seq != slot.seq || e.leasedUntilMs > nowMs)
 				continue;
 			e.leasedUntilMs = nowMs + leaseMs;
-			result ~= Delivery.fromJson(e.job);
+			result ~= Delivery.fromJson(e.job.clone());
 			if (maxJobs > 0 && result.length >= maxJobs)
 				break;
 		}
@@ -659,6 +659,37 @@ final class InMemoryDeliveryQueue : DeliveryQueue
 	{
 		return (jobId in entries_) !is null;
 	}
+}
+
+unittest  // the in-memory subscription store shares no Json with its callers
+{
+	auto store = new InMemoryWebhookSubscriptionStore();
+	WebhookSubscription sub;
+	sub.id = "s";
+	sub.name = "n";
+	sub.arguments = Json(["channel": Json("general")]);
+	store.put(sub);
+	sub.arguments["channel"] = "mutated";
+	auto got = store.get("s").get;
+	assert(got.arguments["channel"].get!string == "general");
+	got.arguments["channel"] = "mutated";
+	assert(store.get("s").get.arguments["channel"].get!string == "general");
+	store.byName("n")[0].arguments["channel"] = "mutated";
+	store.all()[0].arguments["channel"] = "mutated";
+	assert(store.get("s").get.arguments["channel"].get!string == "general");
+}
+
+unittest  // the in-memory delivery queue shares no Json with its callers
+{
+	auto q = new InMemoryDeliveryQueue();
+	auto occ = EventOccurrence("a", "n", "t");
+	occ.data = Json(["k": Json("v")]);
+	q.enqueue(Delivery("j", "s", occ, 0));
+	occ.data["k"] = "mutated";
+	auto leased = q.lease(0, 1000, 0);
+	assert(leased[0].occ.data["k"].get!string == "v");
+	leased[0].occ.data["k"] = "mutated";
+	assert(q.lease(2000, 1000, 0)[0].occ.data["k"].get!string == "v");
 }
 
 unittest  // the in-memory delivery queue reports a job queued until it is acked

@@ -108,9 +108,9 @@ struct TaskRecord
 		if ("meta" in j)
 			r.meta = Task.fromJson(j["meta"]);
 		if ("result" in j && j["result"].type != Json.Type.undefined)
-			r.result = nullable(j["result"]);
+			r.result = nullable(cloneJson(j["result"]));
 		if ("error" in j && j["error"].type != Json.Type.undefined)
-			r.error = nullable(j["error"]);
+			r.error = nullable(cloneJson(j["error"]));
 		r.inputRequests = ("inputRequests" in j && j["inputRequests"].type == Json.Type.object)
 			? cloneJson(j["inputRequests"]) : Json.emptyObject;
 		if ("inputResponses" in j && j["inputResponses"].type == Json.Type.object)
@@ -243,6 +243,19 @@ string defaultTaskIdGenerator() @safe
 	import mcp.auth.csprng : cryptoRandomBytes;
 
 	return format("%(%02x%)", cryptoRandomBytes(16));
+}
+
+unittest  // TaskRecord.fromJson shares no Json with its source
+{
+	auto j = Json([
+		"result": Json(["structuredContent": Json(["ok": Json(true)])]),
+		"error": Json(["code": Json(-32603), "message": Json("m")])
+	]);
+	auto r = TaskRecord.fromJson(j);
+	j["result"]["structuredContent"]["ok"] = false;
+	j["error"]["message"] = "mutated";
+	assert(r.result.get["structuredContent"]["ok"].get!bool);
+	assert(r.error.get["message"].get!string == "m");
 }
 
 unittest  // TaskRecord round-trips all execution state through JSON
