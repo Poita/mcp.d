@@ -684,7 +684,7 @@ resource convention, and `import mcp;` brings in the helpers (`mcp.api.apps`):
 ```d
 auto server = new McpServer("weather", "1.0.0");
 registerModule!(my.module)(server);     // a @tool tagged @ui("ui://weather/dashboard", "model", "app")
-enableApps(server);               // declare the extension capability
+server.enableApps();              // declare the extension capability
 
 UiResourceOptions ui;
 ui.meta.csp.connectDomains = ["https://api.open-meteo.com"];

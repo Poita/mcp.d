@@ -26,7 +26,7 @@ the same assertions over either transport.
   `text/html;profile=mcp-app` MIME type (`mcpAppMimeType`) and a `_meta.ui`
   built from `UiResourceOptions.meta` (a `UiResourceMeta`): a CSP `connectDomains` allowlist and the
   `prefersBorder` hint.
-- **`enableApps(server)`** declares the extension capability, surfaced to modern
+- **`server.enableApps()`** declares the extension capability, surfaced to modern
   clients in the `extensions` map.
 - **`registerModule!(apps_server)(server)`** registers every module-level
   `@tool` in one call; `runServerFromArgs` picks the transport.

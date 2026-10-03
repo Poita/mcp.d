@@ -148,7 +148,7 @@ struct ServerSettings
 		if (!requestStateSecurity.isNull)
 			server.secureRequestState(requestStateSecurity.get);
 		if (apps)
-			enableApps(server);
+			server.enableApps();
 		// Last: a stateless-mode resourceSubscriptions opt-in throws here, exactly
 		// as a direct enableResourceSubscriptions() call would.
 		if (resourceSubscriptions)

@@ -69,7 +69,7 @@ void main(string[] args) @safe
 	registerModule!(apps_server)(server);
 
 	// Declare MCP Apps support (visible to modern clients via the extensions map).
-	enableApps(server);
+	server.enableApps();
 
 	// Publish the ui:// resource the tool links to, with CSP + border hints.
 	UiResourceOptions ui;

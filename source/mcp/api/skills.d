@@ -296,6 +296,9 @@ private Json frontmatterJson(string name, string description, string[string] met
 /// `registerSkill`, and called for you by `registerSkill` and the `@skill` UDA.
 /// Declare it (directly or via a `registerSkill`) before `initialize` /
 /// `server/discover` so the extension appears in the negotiated capabilities.
+/// Call it as `server.enableSkills()`, like `server.enableTasks()`; it is a free
+/// function only because `mcp.api` builds on `mcp.server`, not the other way
+/// round.
 void enableSkills(McpServer server) @safe
 {
 	auto index = server.ensureSkillIndex();
@@ -459,7 +462,7 @@ package(mcp) void registerSkillResources(McpServer server, string path,
 	addSkillEntry(server, entry);
 	// Advertised only once the skill is fully registered, so a throw above
 	// leaves the server unchanged.
-	enableSkills(server);
+	server.enableSkills();
 }
 
 /// One `{uri, digest, size}` element of a skill entry's `resources` manifest:
@@ -553,7 +556,7 @@ void registerDynamicSkill(McpServer server, DynamicSkill skill) @safe
 	entry["frontmatter"] = frontmatterJson(name, description, metadata);
 	entry["resources"] = "dynamic";
 	addSkillEntry(server, entry);
-	enableSkills(server);
+	server.enableSkills();
 }
 
 /// Whether the client behind `ctx` advertised the skills extension (at
@@ -806,7 +809,7 @@ unittest  // enableSkills advertises the extension (with directoryRead) and noth
 	import mcp.protocol.mrtr : MetaKey;
 
 	auto s = new McpServer("t", "1");
-	enableSkills(s);
+	s.enableSkills();
 
 	Json params = Json.emptyObject;
 	Json m = Json.emptyObject;
@@ -1017,7 +1020,7 @@ unittest  // skills/list on a server with the extension but no skills is empty
 	import mcp.protocol.jsonrpc : Message, makeRequest;
 
 	auto s = new McpServer("t", "1");
-	enableSkills(s);
+	s.enableSkills();
 	auto result = s.handle(Message(makeRequest(Json(1), "skills/list",
 			Json.emptyObject))).get["result"];
 	assert(result["skills"].type == Json.Type.array);
@@ -1184,7 +1187,7 @@ unittest  // declaring the skills extension also declares the resources capabili
 	// requires a server that supports resources to declare the capability — even
 	// before the first skill (and so the first resource) is registered.
 	auto s = new McpServer("t", "1");
-	enableSkills(s);
+	s.enableSkills();
 
 	Json params = Json.emptyObject;
 	Json m = Json.emptyObject;

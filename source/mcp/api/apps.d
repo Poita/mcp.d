@@ -219,7 +219,9 @@ void setUiToolMeta(ref Tool tool, UiToolMeta ui) @safe
 /// Advertise MCP Apps support in the server's extension capabilities. The
 /// extension is carried in the `extensions` negotiation map (emitted to clients
 /// from 2025-11-25 onward), declaring the content types this server's UI
-/// resources use. `mimeTypes` defaults to `[mcpAppMimeType]`.
+/// resources use. `mimeTypes` defaults to `[mcpAppMimeType]`. Call it as
+/// `server.enableApps()`, like `server.enableTasks()`; it is a free function
+/// only because `mcp.api` builds on `mcp.server`, not the other way round.
 void enableApps(McpServer server, string[] mimeTypes = null) @safe
 {
 	Json arr = Json.emptyArray;
@@ -436,7 +438,7 @@ unittest  // enableApps surfaces the extension with its mimeTypes (2026-07-28)
 	import mcp.protocol.mrtr : MetaKey;
 
 	auto s = new McpServer("t", "1");
-	enableApps(s);
+	s.enableApps();
 
 	Json params = Json.emptyObject;
 	Json meta = Json.emptyObject;
