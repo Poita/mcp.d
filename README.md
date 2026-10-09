@@ -142,9 +142,20 @@ or in `dub.json`:
 }
 ```
 
-For reproducible builds, replace `~main` with a full commit hash; `dub.selections.json`
-otherwise records the branch, not the commit. A local checkout works too:
-`dependency "mcp-d" path="../mcp.d"`.
+**dub caches a `~main` checkout and does not refresh it.** The first build clones
+`main` into `~/.dub/packages/mcp-d/~main`, and later builds (and `dub upgrade`)
+keep using that copy, so newer commits on `main` never arrive on their own;
+`dub.selections.json` records only the branch name, not the commit. Two ways to
+control which `main` you build against:
+
+- **Pin a commit (recommended).** Replace `~main` with a full commit hash, e.g.
+  `version="711d9fc447140f2d95992a6e57276d2a88c81a7c"`. Builds are reproducible,
+  and moving to a newer `main` is an explicit edit of that hash.
+- **Track `main`.** Keep `~main` and, when you want the latest commit, drop the
+  cached copy with `dub remove mcp-d` (it removes every cached mcp-d version);
+  the next `dub build` / `dub upgrade` clones `main` afresh.
+
+A local checkout works too: `dependency "mcp-d" path="../mcp.d"`.
 
 To use the latest tagged release instead, run `dub add mcp-d` and read the README
 at that release's tag, since its API may differ from `main`.
