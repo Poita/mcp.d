@@ -318,8 +318,23 @@ final class DuplexChannel
 		if (closed_)
 			throw internalError("stdio channel closed");
 		coord.register(expectId);
+		auto write = startWrite(message, expectId);
+		try
+			return coord.await(expectId, timeout);
+		catch (McpException e)
+		{
+			if (write.failure !is null)
+				throw write.failure;
+			throw e;
+		}
+	}
+
+	/// Write request `id`'s line on a writer task of its own. A write that
+	/// fails resolves `id` with the failure.
+	private PendingWrite startWrite(Json message, long id) @safe
+	{
 		auto write = new PendingWrite;
-		pendingWrites_[expectId] = write;
+		pendingWrites_[id] = write;
 		runTask((Json msg, long id, PendingWrite w) nothrow{
 			try
 				writeLine(msg.toString(), w);
@@ -335,15 +350,8 @@ final class DuplexChannel
 			if (auto p = id in pendingWrites_)
 				if (*p is w)
 					pendingWrites_.remove(id);
-		}, message, expectId, write);
-		try
-			return coord.await(expectId, timeout);
-		catch (McpException e)
-		{
-			if (write.failure !is null)
-				throw write.failure;
-			throw e;
-		}
+		}, message, id, write);
+		return write;
 	}
 
 	/// Wake the task blocked awaiting request `id` with `reason` as its error, as
@@ -360,31 +368,31 @@ final class DuplexChannel
 	/// Originate a server->client request (the SERVER path: sampling / elicitation
 	/// / roots / ping), allocating a fresh id, and block until the peer replies.
 	/// Returns its result, or throws `McpException` on an error reply / channel
-	/// close, or `RequestTimeoutException` after `timeout`, once the request has
-	/// been cancelled toward the peer with `notifications/cancelled`.
+	/// close, what writing the line threw, or `RequestTimeoutException` after
+	/// `timeout`. As in `deliver`, the line is written on a task of its own, so
+	/// the timeout also bounds a write the peer does not drain: a line not yet
+	/// being written then is withdrawn, and one that was is followed by a posted
+	/// `notifications/cancelled`.
 	Json request(string method, Json params, Duration timeout) @safe
 	{
 		if (closed_)
 			throw internalError("stdio channel closed");
 		const id = coord.alloc();
 		coord.register(id);
-		Json req = makeRequest(Json(id), method, params);
-		try
-			send(req);
-		catch (Exception e)
-		{
-			coord.cancel(id);
-			throw e;
-		}
+		auto write = startWrite(makeRequest(Json(id), method, params), id);
 		try
 			return coord.await(id, timeout);
 		catch (RequestTimeoutException e)
 		{
-			try
-				send(cancelledNotification(id, "request timed out"));
-			catch (Exception)
-			{
-			}
+			write.abandoned = true;
+			if (write.started)
+				post(cancelledNotification(id, "request timed out"));
+			throw e;
+		}
+		catch (McpException e)
+		{
+			if (write.failure !is null)
+				throw write.failure;
 			throw e;
 		}
 	}
@@ -439,8 +447,12 @@ final class DuplexChannel
 		writeMutex.lock();
 		scope (exit)
 			writeMutex.unlock();
-		if (write !is null && write.abandoned)
-			return;
+		if (write !is null)
+		{
+			if (write.abandoned)
+				return;
+			write.started = true;
+		}
 		++writing_;
 		scope (exit)
 			--writing_;
@@ -474,6 +486,8 @@ private final class PendingWrite
 {
 	// Set by `abort`: a line not yet being written is dropped.
 	bool abandoned;
+	// Set once the line's write begins.
+	bool started;
 	// What writing the line threw, rethrown to the awaiting caller.
 	Exception failure;
 }
@@ -1426,4 +1440,39 @@ unittest  // a timed-out server->client request is followed by notifications/can
 	const note = parseJsonString(sent[1]);
 	assert(note["method"].get!string == "notifications/cancelled");
 	assert(note["params"]["requestId"] == req["id"]);
+}
+
+unittest  // request() times out on schedule while its line is stalled on a peer that stopped reading
+{
+	import core.time : msecs, MonoTime;
+	import vibe.core.core : sleep;
+
+	auto toClient = new LineLink;
+	bool timedOut;
+	Duration took;
+	runTask(() nothrow{
+		scope (exit)
+			exitEventLoop();
+		try
+		{
+			auto channel = new DuplexChannel(() @safe { return toClient.take(); }, (string) @safe {
+				sleep(2.seconds);
+			}, (Message) @safe {});
+			channel.start();
+			const start = MonoTime.currTime;
+			try
+				channel.request("elicitation/create", Json.emptyObject, 100.msecs);
+			catch (RequestTimeoutException)
+				timedOut = true;
+			took = MonoTime.currTime - start;
+			sleep(2500.msecs);
+			toClient.closeEnd();
+		}
+		catch (Exception)
+		{
+		}
+	});
+	runEventLoop();
+	assert(timedOut);
+	assert(took < 1.seconds, "a stalled write must not hold request() past its timeout");
 }
