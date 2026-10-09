@@ -17,8 +17,8 @@ import vibe.data.json : Json;
 import mcp.server.server : McpServer;
 import mcp.protocol.types : SkillEntry;
 import mcp.api.skills : SkillFile, registerSkillResources, addSkillEntry,
-	skillName, skillFileUri, isValidSkillPath,
-	isValidSkillName, skillDigest,
+	skillName, skillFileUri, isValidSkillPath, isValidSkillName,
+	skillDigest, skillFieldProblem,
 	verifyResourceDigest, resourceRef, maxSkillResources, maxSkillTotalBytes;
 
 @safe:
@@ -68,7 +68,8 @@ struct SkillDirOptions
 /// published as its own flat entry whose `resources` cover exactly its subtree.
 ///
 /// Throws if `dir` is not a directory, has no `SKILL.md`, the frontmatter lacks
-/// a string `name`, the directory's own name does not match the frontmatter
+/// a string `name` or has a `description` / `compatibility` outside the Agent
+/// Skills limits (see `skillFieldProblem`), the directory's own name does not match the frontmatter
 /// `name`, the resolved skill path is invalid or its final segment does not
 /// match the frontmatter `name`, a symlink is encountered, the file count /
 /// total size exceeds the configured caps, or (`publishNested`) a nested
@@ -104,6 +105,8 @@ string registerSkillDir(McpServer server, string dir, SkillDirOptions options = 
 	if (!("description" in frontmatter && frontmatter["description"].type == Json.Type.string))
 		throw new Exception(
 				"registerSkillDir: SKILL.md frontmatter must define a string 'description'");
+	if (const problem = frontmatterFieldProblem(frontmatter))
+		throw new Exception("registerSkillDir: SKILL.md frontmatter: " ~ problem);
 	const fmName = frontmatter["name"].get!string;
 	// The Agent Skills spec requires the name to match the skill's directory.
 	const dirName = directoryName(dir);
@@ -163,6 +166,21 @@ private string frontmatterNameProblem(const Json frontmatter) @safe
 	return null;
 }
 
+/// Why the string `description` and optional `compatibility` of `frontmatter`
+/// fall outside the Agent Skills limits (see `skillFieldProblem`), or `null`
+/// when they are within them. A `compatibility` must be a string.
+private string frontmatterFieldProblem(const Json frontmatter) @safe
+{
+	string compatibility;
+	if (auto c = "compatibility" in frontmatter)
+	{
+		if (c.type != Json.Type.string)
+			return "'compatibility' must be a string";
+		compatibility = c.get!string;
+	}
+	return skillFieldProblem(frontmatter["description"].get!string, compatibility);
+}
+
 /// The name of the directory `dir` refers to, with `.`/`..` segments and
 /// trailing separators resolved against the working directory.
 private string directoryName(string dir) @safe
@@ -201,6 +219,9 @@ private Json[] buildNestedEntries(McpServer server, string path, RawFile[] raws)
 		if (!("description" in fm && fm["description"].type == Json.Type.string))
 			throw new Exception("registerSkillDir: nested SKILL.md frontmatter must "
 					~ "define a string 'description': " ~ r.path);
+		if (const problem = frontmatterFieldProblem(fm))
+			throw new Exception(
+					"registerSkillDir: nested SKILL.md frontmatter: " ~ problem ~ ": " ~ r.path);
 		if (!isValidSkillName(basename))
 			throw new Exception("registerSkillDir: nested skill directory name '"
 					~ basename ~ "' is not a valid skill name (" ~ r.path ~ ")");
@@ -1334,6 +1355,46 @@ unittest  // registerSkillDir requires a string description in the frontmatter
 
 	auto s = new McpServer("t", "1");
 	assertThrown!Exception(registerSkillDir(s, root));
+}
+
+unittest  // registerSkillDir holds the frontmatter description and compatibility to the skill limits
+{
+	import std.algorithm.searching : canFind;
+	import std.array : replicate;
+	import std.exception : collectException;
+
+	const cases = [
+		["description: \"\"", "must not be empty"],
+		["description: " ~ "a".replicate(1025), "at most 1024"],
+		["description: d\ncompatibility: " ~ "c".replicate(501), "at most 500"],
+		["description: d\ncompatibility: 5", "'compatibility' must be a string"],
+	];
+	foreach (c; cases)
+	{
+		const root = tmpRoot("limits", "x");
+		writeRawSkill(root, "---\nname: x\n" ~ c[0] ~ "\n---\n\n# Body\n");
+		scope (exit)
+			removeTree(root);
+
+		auto e = collectException(registerSkillDir(new McpServer("t", "1"), root));
+		assert(e !is null && e.msg.canFind(c[1]), e is null ? c[1] : e.msg);
+	}
+}
+
+unittest  // a nested skill's frontmatter description is held to the skill limits
+{
+	import std.algorithm.searching : canFind;
+	import std.exception : collectException;
+
+	const root = tmpRoot("nest-limits", "outer");
+	writeNestedFixture(root);
+	scope (exit)
+		removeTree(root);
+	writeFile(root ~ "/references/sub-skill/SKILL.md",
+			"---\nname: sub-skill\ndescription: \"\"\n---\n\n# Sub\n");
+
+	auto e = collectException(registerSkillDir(new McpServer("t", "1"), root));
+	assert(e !is null && e.msg.canFind("must not be empty"), e is null ? "" : e.msg);
 }
 
 unittest  // a synthesized SKILL.md keeps a YAML-ambiguous name a string
