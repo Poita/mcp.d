@@ -65,7 +65,8 @@ just build      # dub build
 just test       # dub test
 just fmt        # dub run dfmt -- --inplace source/ conformance/ examples/ bench/ deploy/ci-smoke/
 just lint       # ./scripts/dscanner-lint.sh + ./scripts/check-readme-versions.sh
-just examples   # ./scripts/run-examples.sh (build + e2e-run every example)
+just examples   # ./scripts/run-examples.sh (build + e2e-run every example; ~15 min)
+just example tools   # ./scripts/run-examples.sh tools (one example; a minute or two)
 just docs       # ./scripts/gen-docs.sh (API docs into docs/)
 just conformance-build    # build the conformance server and client
 just conformance-server   # server conformance suite, both protocol revisions
@@ -94,7 +95,10 @@ change must pass all of them:
    (non-blocking upload).
 6. **examples** — `./scripts/run-examples.sh` builds every example and runs each
    client as a self-verifying end-to-end test on Ubuntu; **examples-windows**
-   runs the stdio examples end to end on `windows-latest`.
+   runs the stdio examples end to end on `windows-latest`. The full run takes
+   roughly 15 minutes locally, since every example compiles its own server and
+   client against the SDK; while iterating, run just the examples you touched
+   with `just example <name>` (or `./scripts/run-examples.sh <name>...`).
 
 Separate workflows run the official conformance suites
 (`.github/workflows/conformance.yml`), build the reference deploy Dockerfile

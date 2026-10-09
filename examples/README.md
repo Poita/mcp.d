@@ -3,7 +3,8 @@
 Each subdirectory is its own dub package with a `server` and a `client`
 configuration; the client is a self-verifying end-to-end test of the server.
 `scripts/run-examples.sh` (or `just examples`) builds and runs every pair over
-stdio and Streamable HTTP.
+stdio and Streamable HTTP, which takes roughly 15 minutes; `just example <name>`
+runs a single one.
 
 Start from [`hello/`](hello/) when copying an example into your own project: it
 depends only on `mcp-d` and uses nothing outside the public `mcp` /

@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Build and e2e-run every example under examples/ over EVERY transport it
-# supports. Each example's client is a self-verifying e2e test (it asserts the
+# Build and e2e-run every example under examples/ (or only the examples named
+# as arguments, e.g. `scripts/run-examples.sh tools hello`) over EVERY transport
+# it supports. Run it from the repository root. Each example's client is a self-verifying e2e test (it asserts the
 # server's behaviour and exits non-zero on any mismatch).
 #
 #   - HTTP (every example): start the server with `--http --port <P>` (auth is
@@ -44,7 +45,20 @@ port_for() {
   esac
 }
 
-for d in examples/*/; do
+if [ "$#" -gt 0 ]; then
+  dirs=()
+  for n in "$@"; do
+    if [ ! -f "examples/${n}/dub.json" ]; then
+      echo "no such example: ${n}" >&2
+      exit 2
+    fi
+    dirs+=("examples/${n}/")
+  done
+else
+  dirs=(examples/*/)
+fi
+
+for d in "${dirs[@]}"; do
   n=$(basename "$d")
   [ -f "${d}dub.json" ] || continue
   # Skip shared library packages (e.g. examples/common) — they are helper

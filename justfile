@@ -35,9 +35,14 @@ lint:
     ./scripts/dscanner-lint.sh
     ./scripts/check-readme-versions.sh
 
-# Build every example and run its self-verifying client over stdio and HTTP.
+# Every example compiles its own server and client, so a full run takes ~15 min.
+# Build every example and run its self-verifying client over stdio and HTTP (~15 min).
 examples:
     ./scripts/run-examples.sh
+
+# Build and run one example over stdio and HTTP, e.g. `just example tools`.
+example name:
+    ./scripts/run-examples.sh {{name}}
 
 # Generate the API documentation into docs/ (adrdox if installed, else ddox).
 docs:
