@@ -431,6 +431,15 @@ struct SessionLimits
 	size_t maxAnonymousPerAddress = 100;
 }
 
+/// The key a caller's per-client caps count it under: the authenticated
+/// `principal` when there is one, else its remote `address` ("" when neither is
+/// known). Distinct prefixes keep a principal named like an address out of that
+/// address's anonymous bucket.
+package string callerBucket(string principal, string address) @safe pure nothrow
+{
+	return principal.length ? "\x1ep\x1e" ~ principal : address.length ? "\x1ea\x1e" ~ address : "";
+}
+
 /// Thrown by `SessionManager.create` when a session cap is reached and every
 /// session that could make room is busy. The transport answers 503.
 class SessionCapacityException : Exception
@@ -543,10 +552,7 @@ final class SessionManager
 	/// shape matches every other error path.
 	string create(string principal = "", string address = "") @safe
 	{
-		// Distinct prefixes keep a principal named like an address out of that
-		// address's anonymous bucket.
-		const bucket = principal.length ? "\x1ep\x1e" ~ principal
-			: address.length ? "\x1ea\x1e" ~ address : "";
+		const bucket = callerBucket(principal, address);
 		const cap = principal.length ? maxPerPrincipal : maxAnonymousPerAddress;
 		if (cap != 0 && bucket.length)
 		{

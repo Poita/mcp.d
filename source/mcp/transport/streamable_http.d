@@ -32,6 +32,14 @@ struct StreamLimits
 {
 	/// Open legacy HTTP+SSE GET streams at once; past it a GET is answered 503.
 	size_t maxLegacyStreams = 1_000;
+	/// Legacy HTTP+SSE GET streams one authenticated principal holds open at
+	/// once; past it that principal's GET is answered 429.
+	size_t maxLegacyStreamsPerPrincipal = 100;
+	/// Legacy HTTP+SSE GET streams unauthenticated callers from one remote
+	/// address hold open at once; past it that address's GET is answered 429.
+	/// Behind a reverse proxy every caller shares the proxy's address; raise
+	/// this, or set it to `0`, there.
+	size_t maxLegacyStreamsPerAddress = 100;
 	/// Requests dispatched concurrently from one legacy HTTP+SSE stream; past it
 	/// a POST is answered 429. A client's reply to a server->client request is
 	/// never refused. Notification POSTs draw on a separate pool of this many
@@ -47,18 +55,26 @@ struct StreamLimits
 	size_t maxGetStreams = 1_000;
 	/// Standalone GET streams one authenticated principal holds open at once
 	/// across all its sessions; past it that principal's GET is answered 429, so
-	/// one client cannot take every `maxGetStreams` slot. Unauthenticated callers
-	/// share no principal and are bounded only by `maxGetStreams`.
+	/// one client cannot take every `maxGetStreams` slot.
 	size_t maxGetStreamsPerPrincipal = 100;
+	/// Standalone GET streams unauthenticated callers from one remote address
+	/// hold open at once; past it that address's GET is answered 429. Behind a
+	/// reverse proxy every caller shares the proxy's address; raise this, or set
+	/// it to `0`, there.
+	size_t maxGetStreamsPerAddress = 100;
 	/// `subscriptions/listen` and `events/stream` response streams open at once
 	/// across the mount; past it such a request is answered 503.
 	size_t maxPushStreams = 1_000;
 	/// `subscriptions/listen` and `events/stream` response streams one
 	/// authenticated principal holds open at once; past it that principal's
 	/// request is answered 429, so one client cannot take every `maxPushStreams`
-	/// slot. Unauthenticated callers share no principal and are bounded only by
-	/// `maxPushStreams`.
+	/// slot.
 	size_t maxPushStreamsPerPrincipal = 100;
+	/// `subscriptions/listen` and `events/stream` response streams
+	/// unauthenticated callers from one remote address hold open at once; past it
+	/// that address's request is answered 429. Behind a reverse proxy every
+	/// caller shares the proxy's address; raise this, or set it to `0`, there.
+	size_t maxPushStreamsPerAddress = 100;
 	/// Bytes queued for one long-lived SSE stream whose client is not reading.
 	/// Past it, delivery waits briefly (`SseWriter.queueStallTimeout`) for the
 	/// client to catch up, then closes and drops the stream, so a stalled client
@@ -66,13 +82,15 @@ struct StreamLimits
 	size_t maxQueuedStreamBytes = defaultMaxQueuedStreamBytes;
 }
 
-/// Counts a mount's open streams of one kind against a mount-wide cap and, for
-/// authenticated callers, a per-principal cap (`0`: unbounded).
+/// Counts a mount's open streams of one kind against a mount-wide cap and a
+/// per-client cap: per principal for authenticated callers, per remote address
+/// for unauthenticated ones (`0`: unbounded).
 private final class StreamGate
 {
 	private size_t open;
 	private size_t max;
 	private size_t maxPerPrincipal;
+	private size_t maxPerAddress;
 	private size_t[string] openBy;
 
 	/// Why `tryAcquire` refused a slot.
@@ -80,41 +98,74 @@ private final class StreamGate
 	{
 		none, /// the slot was claimed
 		mount, /// the mount-wide cap is reached
-		principal /// the caller's per-principal cap is reached
+		caller /// the caller's per-principal or per-address cap is reached
 	}
 
-	this(size_t max, size_t maxPerPrincipal = 0) @safe
+	this(size_t max, size_t maxPerPrincipal, size_t maxPerAddress) @safe
 	{
 		this.max = max;
 		this.maxPerPrincipal = maxPerPrincipal;
+		this.maxPerAddress = maxPerAddress;
 	}
 
-	/// Claim a stream slot for `principal` ("" when unauthenticated). Pair a
-	/// claimed slot (`Refusal.none`) with `release(principal)`.
-	Refusal tryAcquire(string principal = "") @safe
+	/// Claim a stream slot for the caller `principal` ("" when unauthenticated)
+	/// connecting from `address` ("" when unknown). Pair a claimed slot
+	/// (`Refusal.none`) with `release(principal, address)`.
+	Refusal tryAcquire(string principal, string address) @safe
 	{
 		if (max != 0 && open >= max)
 			return Refusal.mount;
-		if (principal.length && maxPerPrincipal != 0 && openBy.get(principal, 0) >= maxPerPrincipal)
-			return Refusal.principal;
+		const key = callerBucket(principal, address);
+		const cap = principal.length ? maxPerPrincipal : maxPerAddress;
+		if (key.length && cap != 0 && openBy.get(key, 0) >= cap)
+			return Refusal.caller;
 		open++;
-		if (principal.length)
-			openBy[principal] = openBy.get(principal, 0) + 1;
+		if (key.length)
+			openBy[key] = openBy.get(key, 0) + 1;
 		return Refusal.none;
 	}
 
-	void release(string principal = "") @safe
+	void release(string principal, string address) @safe
 	{
 		if (open > 0)
 			open--;
-		if (auto n = principal in openBy)
+		const key = callerBucket(principal, address);
+		if (auto n = key in openBy)
 		{
 			if (*n <= 1)
-				openBy.remove(principal);
+				openBy.remove(key);
 			else
 				(*n)--;
 		}
 	}
+}
+
+unittest  // an anonymous caller past its per-address stream cap is refused
+{
+	auto gate = new StreamGate(10, 5, 1);
+	assert(gate.tryAcquire("", "10.0.0.1") == StreamGate.Refusal.none);
+	assert(gate.tryAcquire("", "10.0.0.1") == StreamGate.Refusal.caller);
+	assert(gate.tryAcquire("", "10.0.0.2") == StreamGate.Refusal.none,
+			"another address still gets a slot");
+	gate.release("", "10.0.0.1");
+	assert(gate.tryAcquire("", "10.0.0.1") == StreamGate.Refusal.none);
+}
+
+unittest  // a principal's streams do not count against its address's anonymous cap
+{
+	auto gate = new StreamGate(10, 2, 1);
+	assert(gate.tryAcquire("alice", "10.0.0.1") == StreamGate.Refusal.none);
+	assert(gate.tryAcquire("alice", "10.0.0.1") == StreamGate.Refusal.none);
+	assert(gate.tryAcquire("alice", "10.0.0.1") == StreamGate.Refusal.caller);
+	assert(gate.tryAcquire("", "10.0.0.1") == StreamGate.Refusal.none);
+}
+
+unittest  // a caller with neither principal nor address is bounded only by the mount cap
+{
+	auto gate = new StreamGate(2, 1, 1);
+	assert(gate.tryAcquire("", "") == StreamGate.Refusal.none);
+	assert(gate.tryAcquire("", "") == StreamGate.Refusal.none);
+	assert(gate.tryAcquire("", "") == StreamGate.Refusal.mount);
 }
 
 /// Configuration for the Streamable HTTP server transport.
@@ -315,8 +366,8 @@ unittest  // a disabled (no-validator) config is never rejected, even with no AS
 ///     server->client SSE stream wired to the server-push channel
 ///     (`McpServer.notify`): 400 without `Mcp-Session-Id`, 404 for an unknown
 ///     session, 406 when Accept excludes `text/event-stream`, 429 past
-///     `StreamLimits.maxGetStreamsPerSession` or `maxGetStreamsPerPrincipal`,
-///     503 past `maxGetStreams`. A stateless
+///     `StreamLimits.maxGetStreamsPerSession`, `maxGetStreamsPerPrincipal` or
+///     `maxGetStreamsPerAddress`, 503 past `maxGetStreams`. A stateless
 ///     server keeps no session to push on, so GET is always 405 (`Allow: POST`).
 ///   - DELETE: on a stateful server, terminates the session named by
 ///     `Mcp-Session-Id` (204; 400 without the header, 404 for an unknown
@@ -345,9 +396,10 @@ void mountMcp(URLRouter router, McpServer server,
 		: null;
 	auto statelessInFlight = sessions is null ? new StatelessInFlight : null;
 	auto pushStreams = new StreamGate(opts.streamLimits.maxPushStreams,
-			opts.streamLimits.maxPushStreamsPerPrincipal);
+			opts.streamLimits.maxPushStreamsPerPrincipal,
+			opts.streamLimits.maxPushStreamsPerAddress);
 	auto getStreams = new StreamGate(opts.streamLimits.maxGetStreams,
-			opts.streamLimits.maxGetStreamsPerPrincipal);
+			opts.streamLimits.maxGetStreamsPerPrincipal, opts.streamLimits.maxGetStreamsPerAddress);
 
 	// This mount owns a single fallback `ConnectionState`, which the server core
 	// threads through dispatch and reads back for the notify/push path. It is the
@@ -496,6 +548,9 @@ void mountLegacyHttpSse(URLRouter router, McpServer server,
 	fresh.requestTimeout = opts.serverRequestTimeout;
 	auto push = ensurePushChannel(server, fresh, opts.replayHistory);
 	auto channel = new LegacySseChannel(opts.legacyMessagePath, opts.streamLimits, push.coordinator);
+	auto streams = new StreamGate(opts.streamLimits.maxLegacyStreams,
+			opts.streamLimits.maxLegacyStreamsPerPrincipal,
+			opts.streamLimits.maxLegacyStreamsPerAddress);
 	mountCorsPreflight(router, opts.legacySsePath, "GET", opts);
 	mountCorsPreflight(router, opts.legacyMessagePath, "POST", opts);
 
@@ -505,14 +560,16 @@ void mountLegacyHttpSse(URLRouter router, McpServer server,
 		TokenInfo token;
 		if (!guardAuth(req, res, opts, token))
 			return;
-		if (channel.full)
+		const principal = principalOf(token);
+		const address = remoteAddressOf(req);
+		if (const why = streams.tryAcquire(principal, address))
 		{
-			res.statusCode = HTTPStatus.serviceUnavailable;
-			res.headers["Retry-After"] = "30";
-			res.writeBody("Too many open streams", "text/plain");
+			refuseTooManyStreams(res, why);
 			return;
 		}
-		handleLegacyGet(server, channel, push, principalOf(token),
+		scope (exit)
+			streams.release(principal, address);
+		handleLegacyGet(server, channel, push, principal,
 			opts.streamLimits.maxQueuedStreamBytes, res);
 	});
 
@@ -608,12 +665,6 @@ final class LegacySseChannel
 		this.limits = limits;
 		this.coord = coord !is null ? coord : new StreamCoordinator;
 		notificationSlotFreed = createManualEvent();
-	}
-
-	/// Whether the channel holds as many open streams as `maxLegacyStreams`.
-	bool full() const @safe
-	{
-		return limits.maxLegacyStreams != 0 && listeners.length >= limits.maxLegacyStreams;
 	}
 
 	/// Claim a dispatch slot on the stream `sessionId`, returning false when it
@@ -1729,6 +1780,17 @@ private string remoteAddressOf(HTTPServerRequest req) @safe nothrow
 	return req.clientAddress.toAddressString();
 }
 
+/// Answer a GET refused a stream slot: 503 when the mount-wide cap is reached,
+/// 429 when the caller's per-principal or per-address cap is.
+private void refuseTooManyStreams(HTTPServerResponse res, StreamGate.Refusal why) @safe
+{
+	const mine = why == StreamGate.Refusal.caller;
+	res.statusCode = mine ? HTTPStatus.tooManyRequests : HTTPStatus.serviceUnavailable;
+	res.headers["Retry-After"] = "30";
+	res.writeBody(mine
+			? "Too many open streams for this client" : "Too many open streams", "text/plain");
+}
+
 private void handleGet(McpServer server, ServerPushChannel push,
 		SessionManager sessions, StreamGate getStreams,
 		StreamableHttpOptions opts, string principal, HTTPServerRequest req, HTTPServerResponse res) @safe
@@ -1788,6 +1850,7 @@ private void handleGet(McpServer server, ServerPushChannel push,
 	// `notifications/resources/updated` delivery on this stream gates on THIS
 	// session's `resources/subscribe` set rather than the shared fallback state.
 	ConnectionState getConn;
+	const address = remoteAddressOf(req);
 	// The owning session's `Mcp-Session-Id`, used to scope Last-Event-ID resume to
 	// this session so one client cannot replay another session's buffered stream
 	// history by presenting its event id (cross-session disclosure).
@@ -1812,14 +1875,9 @@ private void handleGet(McpServer server, ServerPushChannel push,
 			res.writeBody("Too many open streams on this session", "text/plain");
 			return;
 		}
-		if (const why = getStreams.tryAcquire(principal))
+		if (const why = getStreams.tryAcquire(principal, address))
 		{
-			const mine = why == StreamGate.Refusal.principal;
-			res.statusCode = mine ? HTTPStatus.tooManyRequests : HTTPStatus.serviceUnavailable;
-			res.headers["Retry-After"] = "30";
-			res.writeBody(mine
-					? "Too many open streams for this principal" : "Too many open streams",
-					"text/plain");
+			refuseTooManyStreams(res, why);
 			return;
 		}
 		getConn = sessions.stateFor(sid);
@@ -1830,7 +1888,7 @@ private void handleGet(McpServer server, ServerPushChannel push,
 		if (sessions !is null)
 		{
 			sessions.streamClosed(ownerToken);
-			getStreams.release(principal);
+			getStreams.release(principal, address);
 		}
 
 	// Open a long-lived SSE stream wired to the server-push channel, so the
@@ -2447,14 +2505,15 @@ private bool readPostBody(HTTPServerRequest req, HTTPServerResponse res,
 
 /// Answer a `subscriptions/listen` or `events/stream` request refused a stream
 /// slot: 503 when the mount already holds `StreamLimits.maxPushStreams` such
-/// streams, 429 when the caller holds `StreamLimits.maxPushStreamsPerPrincipal`.
+/// streams, 429 when the caller holds `StreamLimits.maxPushStreamsPerPrincipal`
+/// (authenticated) or `maxPushStreamsPerAddress` (unauthenticated).
 private void refuseTooManyPushStreams(HTTPServerResponse res, Json id, StreamGate.Refusal why) @safe
 {
-	const mine = why == StreamGate.Refusal.principal;
+	const mine = why == StreamGate.Refusal.caller;
 	res.statusCode = mine ? HTTPStatus.tooManyRequests : HTTPStatus.serviceUnavailable;
 	res.headers["Retry-After"] = "30";
 	res.writeBody(makeErrorResponse(id, internalError(mine
-			? "too many open notification streams for this principal"
+			? "too many open notification streams for this client"
 			: "too many open notification streams")).toString(), "application/json");
 }
 
@@ -2780,13 +2839,14 @@ private void handlePost(McpServer server, ServerPushChannel push,
 				return;
 			}
 			const principal = principalOf(token);
-			if (const why = pushStreams.tryAcquire(principal))
+			const address = remoteAddressOf(req);
+			if (const why = pushStreams.tryAcquire(principal, address))
 			{
 				refuseTooManyPushStreams(res, msg.id, why);
 				return;
 			}
 			scope (exit)
-				pushStreams.release(principal);
+				pushStreams.release(principal, address);
 			handleListenStream(server, push, msg, res,
 					req.headers.get(HttpHeader.protocolVersion, ""), connToken,
 					principal, maxQueued);
@@ -2809,13 +2869,14 @@ private void handlePost(McpServer server, ServerPushChannel push,
 				return;
 			}
 			const principal = principalOf(token);
-			if (const why = pushStreams.tryAcquire(principal))
+			const address = remoteAddressOf(req);
+			if (const why = pushStreams.tryAcquire(principal, address))
 			{
 				refuseTooManyPushStreams(res, msg.id, why);
 				return;
 			}
 			scope (exit)
-				pushStreams.release(principal);
+				pushStreams.release(principal, address);
 			handleEventsStream(server, msg, res, principal, maxQueued);
 			return;
 		}
@@ -5847,6 +5908,77 @@ unittest  // one principal past its push-stream cap is refused with 429 while ot
 	assert(other.contentType == "text/event-stream", "another principal still gets a stream");
 }
 
+unittest  // one anonymous address past its push-stream cap is refused with 429 while others still connect
+{
+	import core.time : msecs;
+	import vibe.core.core : runTask, sleep, exitEventLoop, runEventLoop;
+	import vibe.core.net : resolveHost;
+	import vibe.http.server : createTestHTTPServerResponse, TestHTTPResponseMode;
+	import vibe.stream.memory : createMemoryOutputStream;
+
+	auto server = McpServer.stateless("t", "1");
+	server.enableToolsListChanged();
+	auto router = new URLRouter;
+	StreamableHttpOptions opts;
+	opts.streamLimits.maxPushStreamsPerAddress = 1;
+	mountMcp(router, server, opts);
+
+	Json meta = Json.emptyObject;
+	meta[MetaKey.protocolVersion] = "2026-07-28";
+	meta[MetaKey.clientCapabilities] = Json.emptyObject;
+	Json params = Json.emptyObject;
+	params["notifications"] = Json(["toolsListChanged": Json(true)]);
+	params["_meta"] = meta;
+	const body_ = makeRequest(Json(1), "subscriptions/listen", params).toString();
+
+	void listen(string from, HTTPServerResponse res) @safe
+	{
+		auto req = makeInitPostReq(body_, [
+			"Accept": "application/json, text/event-stream",
+			"MCP-Protocol-Version": "2026-07-28",
+			HttpHeader.method: "subscriptions/listen",
+		]);
+		req.clientAddress = resolveHost(from);
+		router.handleRequest(req, res);
+	}
+
+	HTTPServerResponse response() @safe
+	{
+		return createTestHTTPServerResponse(createMemoryOutputStream(), null,
+				TestHTTPResponseMode.bodyOnly);
+	}
+
+	auto first = response(), second = response(), other = response();
+	runTask(() @safe nothrow{
+		try
+			listen("10.0.0.1", first);
+		catch (Exception)
+		{
+		}
+	});
+	runTask(() @safe nothrow{
+		try
+			listen("10.0.0.2", other);
+		catch (Exception)
+		{
+		}
+	});
+	runTask(() @safe nothrow{
+		try
+		{
+			sleep(100.msecs);
+			listen("10.0.0.1", second);
+		}
+		catch (Exception)
+		{
+		}
+		exitEventLoop();
+	});
+	runEventLoop();
+	assert(second.statusCode == HTTPStatus.tooManyRequests);
+	assert(other.contentType == "text/event-stream", "another address still gets a stream");
+}
+
 unittest  // a stateful server answers a body-signalled 2026-07-28 subscriptions/listen with 400
 {
 	import vibe.data.json : parseJsonString;
@@ -7194,6 +7326,69 @@ unittest  // a legacy GET past the stream cap is refused with 503
 	});
 	runEventLoop();
 	assert(second == HTTPStatus.serviceUnavailable);
+}
+
+unittest  // one anonymous address past its legacy stream cap is refused with 429
+{
+	import core.time : msecs;
+	import vibe.core.core : runTask, sleep, exitEventLoop, runEventLoop;
+	import vibe.core.net : resolveHost;
+	import vibe.http.server : createTestHTTPServerRequest,
+		createTestHTTPServerResponse, TestHTTPResponseMode;
+	import vibe.inet.url : URL;
+	import vibe.stream.memory : createMemoryOutputStream, createMemoryStream;
+
+	auto server = McpServer.stateful("t", "1");
+	auto router = new URLRouter;
+	StreamableHttpOptions opts;
+	opts.streamLimits.maxLegacyStreamsPerAddress = 1;
+	mountLegacyHttpSse(router, server, opts);
+
+	HTTPServerResponse open(string from, HTTPServerResponse res) @safe
+	{
+		auto req = createTestHTTPServerRequest(URL("http://127.0.0.1/sse"),
+				HTTPMethod.GET, createMemoryStream(null, false));
+		req.headers["Host"] = "127.0.0.1";
+		req.clientAddress = resolveHost(from);
+		router.handleRequest(req, res);
+		return res;
+	}
+
+	HTTPServerResponse response() @safe
+	{
+		return createTestHTTPServerResponse(createMemoryOutputStream(), null,
+				TestHTTPResponseMode.bodyOnly);
+	}
+
+	auto first = response(), second = response(), other = response();
+	runTask(() @safe nothrow{
+		try
+			open("10.0.0.1", first);
+		catch (Exception)
+		{
+		}
+	});
+	runTask(() @safe nothrow{
+		try
+			open("10.0.0.2", other);
+		catch (Exception)
+		{
+		}
+	});
+	runTask(() @safe nothrow{
+		try
+		{
+			sleep(100.msecs);
+			open("10.0.0.1", second);
+		}
+		catch (Exception)
+		{
+		}
+		exitEventLoop();
+	});
+	runEventLoop();
+	assert(second.statusCode == HTTPStatus.tooManyRequests);
+	assert(other.contentType == "text/event-stream", "another address still gets a stream");
 }
 
 unittest  // closing a legacy GET stream fails the server->client request awaiting it
