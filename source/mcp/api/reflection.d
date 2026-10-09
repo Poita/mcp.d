@@ -182,6 +182,13 @@ private void registerOverload(string memberName, alias overload, alias parent)(
 		checkMethodFacets!(memberName, overload)();
 		checkUdaPlacement!(memberName, overload)();
 	}
+	else
+	{
+		static foreach (attr; __traits(getAttributes, overload))
+			static assert(!isMethodUda!attr, "@" ~ udaName!attr ~ " on '" ~ memberName
+					~ "' has no effect: the method has no handler UDA (@tool, @taskTool, "
+					~ "@prompt, @resource, @resourceTemplate, @event, @skill, or @skillDir)");
+	}
 	static foreach (attr; __traits(getAttributes, overload))
 	{
 		static if (is(attr))
@@ -383,6 +390,32 @@ private void checkMethodFacets(string memberName, alias f)()
 					~ "' is a JSON Schema facet, which applies to a parameter "
 					~ "or struct field, not a method; attach it to the parameter (for a "
 					~ "display title use @tool's title argument or @hintTitle)");
+}
+
+/// Whether the attribute `attr` is a method-level MCP UDA, applied or bare,
+/// which only a handler method reads.
+private template isMethodUda(alias attr)
+{
+	static if (is(attr))
+		enum isMethodUda = isMethodUdaType!attr;
+	else
+		enum isMethodUda = isMethodUdaType!(typeof(attr));
+}
+
+private enum isMethodUdaType(A) = is(A == readOnly) || is(A == destructive)
+	|| is(A == idempotent) || is(A == openWorld) || is(A == strictArgs)
+	|| is(A == hintTitle) || is(A == mcpHeader) || is(A == ui) || is(A == taskTtl)
+	|| is(A == taskPollInterval) || is(A == describeParam) || is(A == audience)
+	|| is(A == priority) || is(A == lastModified) || is(A == cacheable)
+	|| is(A == icon) || is(A == meta) || is(A == eventPollInterval);
+
+/// The name of the attribute `attr`'s UDA type.
+private template udaName(alias attr)
+{
+	static if (is(attr))
+		enum udaName = attr.stringof;
+	else
+		enum udaName = typeof(attr).stringof;
 }
 
 /// Reject a method-level MCP UDA on `f` that none of its handler kinds reads,
@@ -5453,6 +5486,42 @@ unittest  // @taskTtl on a plain @tool is rejected at compile time
 {
 	auto s = new McpServer("t", "1");
 	static assert(!__traits(compiles, registerHandlers(s, new TaskTtlOnToolApi)));
+}
+
+version (unittest) private final class MethodUdaWithoutHandlerApi(udas...)
+{
+	@tool("t", "t")
+	string t() @safe
+	{
+		return "";
+	}
+
+	@(udas) string helper() @safe
+	{
+		return "";
+	}
+}
+
+unittest  // a method-level MCP UDA on a method with no handler UDA is rejected at compile time
+{
+	import core.time : seconds;
+
+	auto s = new McpServer("t", "1");
+	static assert(__traits(compiles, registerHandlers(s, new MethodUdaWithoutHandlerApi!())));
+	static assert(!__traits(compiles, registerHandlers(s,
+			new MethodUdaWithoutHandlerApi!readOnly)));
+	static assert(!__traits(compiles, registerHandlers(s,
+			new MethodUdaWithoutHandlerApi!strictArgs)));
+	static assert(!__traits(compiles, registerHandlers(s,
+			new MethodUdaWithoutHandlerApi!(describeParam("x", "y")))));
+	static assert(!__traits(compiles, registerHandlers(s,
+			new MethodUdaWithoutHandlerApi!(cacheable(1.seconds)))));
+	static assert(!__traits(compiles, registerHandlers(s,
+			new MethodUdaWithoutHandlerApi!(hintTitle("h")))));
+	static assert(!__traits(compiles, registerHandlers(s,
+			new MethodUdaWithoutHandlerApi!(priority(0.5)))));
+	static assert(!__traits(compiles, registerHandlers(s,
+			new MethodUdaWithoutHandlerApi!(taskTtl(1.seconds)))));
 }
 
 unittest  // @cacheable on a @tool is rejected at compile time
