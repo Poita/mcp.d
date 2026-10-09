@@ -11565,12 +11565,12 @@ unittest  // a listen stream receives only the notification types its filter req
 			"subscriptions/listen", params)), &sink));
 
 	s.notify("notifications/message", Json([
-			"level": Json("info"),
-			"data": Json("x")
+		"level": Json("info"),
+		"data": Json("x")
 	]));
 	s.notify("notifications/progress", Json([
-			"progressToken": Json(1),
-			"progress": Json(1)
+		"progressToken": Json(1),
+		"progress": Json(1)
 	]));
 	s.notify("notifications/events/list_changed");
 	assert(!frames.canFind!(fr => fr.canFind("notifications/message")));

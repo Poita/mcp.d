@@ -75,21 +75,35 @@ private mixin template InputRequiredPart()
 	private InputRequiredResult required_;
 
 	/// The handler needs input; the client must gather it and resubmit with the
-	/// matching `inputResponses`.
+	/// matching `inputResponses`. Throws when `requests` is empty (the client
+	/// would have nothing to answer; pass a `requestState` to resume without new
+	/// input) or when two requests share an `id` (ids key the wire map, so one
+	/// would silently replace the other).
 	static typeof(this) inputRequired(InputRequest[] requests) @safe
 	{
-		typeof(this) r;
-		r.needsInput_ = true;
-		r.required_.inputRequests = requests;
-		return r;
+		return inputRequired(requests, "");
 	}
 
 	/// As `inputRequired`, but also attaches an opaque `requestState`
 	/// (SEP-2322): a modern server encodes whatever context it needs
 	/// to resume the call into this blob, which the client echoes verbatim on
 	/// the retry and the handler reads back via `RequestContext.requestState`.
+	/// Throws on duplicate request ids, and when both `requests` and
+	/// `requestState` are empty.
 	static typeof(this) inputRequired(InputRequest[] requests, string requestState) @safe
 	{
+		if (requests.length == 0 && requestState.length == 0)
+			throw new Exception("inputRequired needs at least one InputRequest or a"
+					~ " requestState: an empty input_required result gives the client"
+					~ " nothing to answer and nothing to resume from");
+		bool[string] ids;
+		foreach (ref q; requests)
+		{
+			if (q.id in ids)
+				throw new Exception("inputRequired was given two InputRequests with id '"
+						~ q.id ~ "': each request needs a distinct id");
+			ids[q.id] = true;
+		}
 		typeof(this) r;
 		r.needsInput_ = true;
 		r.required_.inputRequests = requests;
@@ -344,4 +358,25 @@ unittest  // ToolResponse.complete(T) emits a fieldwise struct as the object its
 	auto r = ToolResponse.complete(Point(1, 2)).toJson();
 	assert(r["structuredContent"]["x"].get!int == 1);
 	assert(r["structuredContent"]["y"].get!int == 2);
+}
+
+unittest  // inputRequired rejects an empty request list with no requestState
+{
+	import std.exception : assertThrown, assertNotThrown;
+
+	assertThrown!Exception(ToolResponse.inputRequired([]));
+	assertThrown!Exception(PromptResponse.inputRequired([], ""));
+	assertNotThrown(ToolResponse.inputRequired([], "resume-token"));
+}
+
+unittest  // inputRequired rejects two input requests sharing an id
+{
+	import std.exception : assertThrown;
+
+	auto reqs = [
+		InputRequest("q", "roots", Json.emptyObject),
+		InputRequest("q", "roots", Json.emptyObject)
+	];
+	assertThrown!Exception(ToolResponse.inputRequired(reqs));
+	assertThrown!Exception(PromptResponse.inputRequired(reqs, "s"));
 }
