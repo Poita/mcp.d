@@ -603,6 +603,17 @@ private AddressClass classifyIpv6Literal(string inner) @safe pure nothrow @nogc
 			return AddressClass.privateOrLinkLocal;
 	}
 
+	// Documentation 2001:db8::/32 (RFC 3849): never a real destination.
+	if (b[0] == 0x20 && b[1] == 0x01 && b[2] == 0x0D && b[3] == 0xB8)
+		return AddressClass.privateOrLinkLocal;
+	// Benchmarking 2001:2::/48 (RFC 5180): lab-only, not globally routed.
+	if (b[0] == 0x20 && b[1] == 0x01 && b[2] == 0 && b[3] == 0x02 && b[4] == 0 && b[5] == 0)
+		return AddressClass.privateOrLinkLocal;
+	// Discard-only 100::/64 (RFC 6666): blackholed by design.
+	if (b[0] == 0x01 && b[1] == 0 && b[2] == 0 && b[3] == 0 && b[4] == 0
+			&& b[5] == 0 && b[6] == 0 && b[7] == 0)
+		return AddressClass.privateOrLinkLocal;
+
 	// Teredo 2001::/32 (RFC 4380) tunnels to an obfuscated IPv4 client address
 	// via a relay; it is never a direct public destination, so fail closed.
 	if (b[0] == 0x20 && b[1] == 0x01 && b[2] == 0 && b[3] == 0)
@@ -1112,7 +1123,7 @@ private void fetchPinned(string url, SsrfPolicy policy,
 		// Unparseable -> fail closed.
 	}
 	if (host.length == 0)
-		throw invalidRequest("Refusing to fetch URL with no parseable host: " ~ url);
+		throw invalidRequest("Refusing to fetch URL with no parseable host: " ~ redactUrl(url));
 
 	// Scheme gate: https to any host, plus (allowLoopback only) http to an
 	// explicit loopback host for dev. allowUserConfigured leaves the scheme to
@@ -1123,7 +1134,7 @@ private void fetchPinned(string url, SsrfPolicy policy,
 
 	if (policy == SsrfPolicy.blockInternal && !isHttps)
 		throw invalidRequest(
-				"Refusing to fetch insecure URL (must be https to a public host): " ~ url);
+				"Refusing to fetch insecure URL (must be https to a public host): " ~ redactUrl(url));
 	if (policy == SsrfPolicy.allowLoopback)
 	{
 		// The lexical class (no DNS) decides the scheme; the resolved-address
@@ -1132,13 +1143,13 @@ private void fetchPinned(string url, SsrfPolicy policy,
 		if (!(isHttps || (isHttp && loopback)))
 			throw invalidRequest(
 					"Refusing to fetch insecure URL (must be https, or http to an explicit "
-					~ "loopback host; private/link-local addresses are rejected): " ~ url);
+					~ "loopback host; private/link-local addresses are rejected): " ~ redactUrl(url));
 	}
 
 	const pin = pinnedConnectAddress(host, tls, policy);
 	if (!pin.ok)
 		throw invalidRequest("Refusing to fetch URL whose host resolves to a "
-				~ "private/link-local address (or could not be resolved): " ~ url);
+				~ "private/link-local address (or could not be resolved): " ~ redactUrl(url));
 
 	// Build the pinned URL: same scheme/path/port/userinfo, host replaced by the
 	// vetted numeric address so the connector cannot re-resolve to a different
@@ -1180,6 +1191,31 @@ private void fetchPinned(string url, SsrfPolicy policy,
 		if (responder !is null)
 			responder(res);
 	});
+}
+
+/// `url` fit for an error message or log line: userinfo is dropped and any
+/// query or fragment is replaced by `?[redacted]`, since either may carry
+/// credentials, codes or tokens.
+string redactUrl(string url) @safe pure
+{
+	import std.string : indexOf, indexOfAny, lastIndexOf;
+
+	string prefix, rest = url;
+	const schemeEnd = url.indexOf("://");
+	if (schemeEnd >= 0)
+	{
+		const afterScheme = schemeEnd + 3;
+		auto authorityEnd = url[afterScheme .. $].indexOfAny("/?#");
+		const authority = authorityEnd < 0 ? url[afterScheme .. $]
+			: url[afterScheme .. afterScheme + authorityEnd];
+		const at = authority.lastIndexOf('@');
+		prefix = url[0 .. afterScheme] ~ (at < 0 ? authority : authority[at + 1 .. $]);
+		rest = url[afterScheme + authority.length .. $];
+	}
+	const tail = rest.indexOfAny("?#");
+	if (tail < 0)
+		return prefix ~ rest;
+	return prefix ~ rest[0 .. tail] ~ "?[redacted]";
 }
 
 /// Build the RFC 7230 §5.4 Host header value from a bare host string (as
@@ -1348,6 +1384,41 @@ unittest  // classifyIpv4Octets classes IETF protocol-assignment, benchmarking a
 	assert(classifyIpv4Octets(203, 0, 114, 1) == AddressClass.public_);
 }
 
+unittest  // classifyIpv6Literal classes documentation, discard-only and benchmarking ranges as non-routable
+{
+	assert(classifyIpv6Literal("2001:db8::1") == AddressClass.privateOrLinkLocal);
+	assert(classifyIpv6Literal("2001:db8:ffff::1") == AddressClass.privateOrLinkLocal);
+	assert(classifyIpv6Literal("100::1") == AddressClass.privateOrLinkLocal);
+	assert(classifyIpv6Literal("100::ffff:ffff:ffff:ffff") == AddressClass.privateOrLinkLocal);
+	assert(classifyIpv6Literal("2001:2::1") == AddressClass.privateOrLinkLocal);
+	assert(classifyIpv6Literal("2001:2:0:ffff::1") == AddressClass.privateOrLinkLocal);
+	// Neighbours outside those prefixes stay public.
+	assert(classifyIpv6Literal("100:0:0:1::1") == AddressClass.public_);
+	assert(classifyIpv6Literal("2001:2:1::1") == AddressClass.public_);
+	assert(classifyIpv6Literal("2001:db9::1") == AddressClass.public_);
+}
+
+unittest  // redactUrl drops userinfo and hides the query and fragment
+{
+	assert(redactUrl("https://user:pw@as.example.com/jwks?key=s3cret#f")
+			== "https://as.example.com/jwks?[redacted]");
+	assert(redactUrl("https://as.example.com?tenant=x") == "https://as.example.com?[redacted]");
+	assert(redactUrl("https://as.example.com/jwks") == "https://as.example.com/jwks");
+	assert(redactUrl("https://as.example.com/a@b") == "https://as.example.com/a@b");
+	assert(redactUrl("no scheme?x") == "no scheme?[redacted]");
+}
+
+unittest  // a refused fetch names the URL without its credentials or query
+{
+	import std.algorithm : canFind;
+	import std.exception : collectExceptionMsg;
+
+	const msg = collectExceptionMsg(secureRequestHTTP("http://user:pw@as.example.com/t?code=abc",
+			SsrfPolicy.blockInternal, null, null));
+	assert(msg.canFind("as.example.com/t"), msg);
+	assert(!msg.canFind("pw") && !msg.canFind("code=abc"), msg);
+}
+
 unittest  // classifyIpv6Literal classes Teredo 2001::/32 as private/link-local
 {
 	assert(classifyIpv6Literal(
@@ -1400,7 +1471,7 @@ unittest  // classifyIpv6Literal classes ff00::/8 multicast as private/link-loca
 
 unittest  // classifyIpv6Literal keeps a public global-unicast control public
 {
-	assert(classifyIpv6Literal("2001:db8::1") == AddressClass.public_);
+	assert(classifyIpv6Literal("2606:4700:4700::1111") == AddressClass.public_);
 }
 
 unittest  // an IPv6 literal's embedded IPv4 tail with a leading-zero octet fails closed
@@ -1418,7 +1489,7 @@ unittest  // an embedded IPv4 tail after hextets parses into the low 32 bits
 	assert(classifyIpv6Literal("::ffff:8.8.8.8") == AddressClass.public_);
 	assert(classifyIpv6Literal("::ffff:127.0.0.1") == AddressClass.loopback);
 	assert(classifyIpv6Literal("64:ff9b::10.0.0.1") == AddressClass.privateOrLinkLocal);
-	assert(classifyIpv6Literal("2001:db8:1:2:3:4:8.8.8.8") == AddressClass.public_);
+	assert(classifyIpv6Literal("2606:4700:1:2:3:4:8.8.8.8") == AddressClass.public_);
 	assert(classifyHost("[::FFFF:8.8.8.8]", pin) == AddressClass.public_);
 	assert(pin == "::ffff:808:808", pin);
 }

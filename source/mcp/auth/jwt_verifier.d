@@ -35,7 +35,7 @@ static if (!is(typeof(EVP_DigestVerify)))
 
 import mcp.auth.resource_server : TokenInfo, TokenValidator, TokenVerifierUnavailableException;
 import mcp.protocol.jsonrpc : parseUntrustedJson;
-import mcp.protocol.ssrf : SsrfPolicy;
+import mcp.protocol.ssrf : SsrfPolicy, redactUrl;
 
 @safe:
 
@@ -788,7 +788,7 @@ package final class JwksCache : KeySource
 			import vibe.core.log : logWarn;
 
 			logWarn("JWKS from %s has not been refreshed within %s; dropping the cached keys",
-					uri, maxStaleness);
+					redactUrl(uri), maxStaleness);
 			keysByKid = null;
 			allKeys = null;
 			loaded = false;
@@ -854,7 +854,7 @@ package final class JwksCache : KeySource
 			{
 				import vibe.core.log : logWarn;
 
-				logWarn("JWKS background refresh from %s failed: %s", uri, e.msg);
+				logWarn("JWKS background refresh from %s failed: %s", redactUrl(uri), e.msg);
 			}
 		};
 		if (spawn !is null)
@@ -890,7 +890,8 @@ package final class JwksCache : KeySource
 		{
 			import vibe.core.log : logWarn;
 
-			logWarn("JWKS from %s could not be parsed; keeping the cached keys: %s", uri, e.msg);
+			logWarn("JWKS from %s could not be parsed; keeping the cached keys: %s",
+					redactUrl(uri), e.msg);
 		}
 	}
 
@@ -923,7 +924,7 @@ package final class JwksCache : KeySource
 
 			logWarn(
 					"JWKS from %s holds no usable signature-verification key; keeping the cached keys",
-					uri);
+					redactUrl(uri));
 			return;
 		}
 		// Swap atomically into the cache fields only after all parsing succeeds.
@@ -959,12 +960,12 @@ private string fetchJwks(string uri, SsrfPolicy policy) @trusted
 			if (res.statusCode / 100 == 2)
 				body_ = res.bodyReader.readAllUTF8(false, maxJwksBytes);
 			else
-				logWarn("JWKS fetch from %s returned HTTP %d", uri, res.statusCode);
+				logWarn("JWKS fetch from %s returned HTTP %d", redactUrl(uri), res.statusCode);
 		});
 	}
 	catch (Exception e)
 	{
-		logWarn("JWKS fetch from %s failed: %s", uri, e.msg);
+		logWarn("JWKS fetch from %s failed: %s", redactUrl(uri), e.msg);
 		return null;
 	}
 	return body_;

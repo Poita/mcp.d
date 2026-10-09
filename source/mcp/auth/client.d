@@ -1088,8 +1088,8 @@ unittest  // resolveIssuerFrom downgrades to the origin only when the PRM docume
 unittest  // the origin fallback ends the authority at a query or fragment
 {
 	foreach (endpoint; [
-			"https://mcp.example.com?tenant=x", "https://mcp.example.com#frag"
-		])
+		"https://mcp.example.com?tenant=x", "https://mcp.example.com#frag"
+	])
 	{
 		const r = OAuthClient.resolveIssuerFrom(() @safe {
 			throw new PrmAbsentException("no PRM");
