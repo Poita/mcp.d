@@ -679,7 +679,7 @@ compile time, and arguments/results are marshalled for you. A handler may take a
 trailing `RequestContext` parameter to report progress, log, or call back to the
 client (sampling/elicitation). Registration is all or nothing: when one handler
 fails to register (a name already taken, a missing `@skillDir` directory), the
-handlers that call registered before it are removed again before the exception
+handlers that same call already registered are removed again before the exception
 propagates. For tools whose schema is only known at runtime,
 drop to `server.registerTool(Tool, delegate)` / `registerResource` /
 `registerPrompt`, which receive the raw `Json`; `argsAs!T(arguments)` binds that
