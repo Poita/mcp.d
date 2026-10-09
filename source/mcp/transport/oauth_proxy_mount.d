@@ -80,14 +80,18 @@ private string enc(string s) @safe
 /// proxy 302s to once the upstream callback fires. The client supplied the
 /// `redirect_uri` at `/authorize`; the proxy relays the upstream authorization
 /// `code` to it so the client can redeem it (with its own PKCE `code_verifier`)
-/// at the proxy `/token` endpoint.
-string buildClientCallbackRedirect(string clientRedirectUri, string code, string clientState) @safe
+/// at the proxy `/token` endpoint. A non-empty `issuer` (the proxy's own) is
+/// appended as the RFC 9207 `iss` parameter.
+string buildClientCallbackRedirect(string clientRedirectUri, string code,
+		string clientState, string issuer) @safe
 {
 	auto url = clientRedirectUri;
 	url ~= (clientRedirectUri.indexOf('?') < 0) ? "?" : "&";
 	url ~= "code=" ~ enc(code);
 	if (clientState.length)
 		url ~= "&state=" ~ enc(clientState);
+	if (issuer.length)
+		url ~= "&iss=" ~ enc(issuer);
 	return url;
 }
 
@@ -96,9 +100,10 @@ string buildClientCallbackRedirect(string clientRedirectUri, string code, string
 /// `redirect_uri`, producing the Location the proxy 302s to when the upstream
 /// authorization server redirects back with an `error` instead of a `code`.
 /// `error` is mandatory; `errorDescription` and `errorUri` are appended only
-/// when non-empty. Symmetric to `buildClientCallbackRedirect`.
+/// when non-empty, and a non-empty `issuer` as the RFC 9207 `iss` parameter.
+/// Symmetric to `buildClientCallbackRedirect`.
 string buildClientCallbackError(string clientRedirectUri, string error,
-		string errorDescription, string errorUri, string clientState) @safe
+		string errorDescription, string errorUri, string clientState, string issuer) @safe
 {
 	auto url = clientRedirectUri;
 	url ~= (clientRedirectUri.indexOf('?') < 0) ? "?" : "&";
@@ -109,6 +114,8 @@ string buildClientCallbackError(string clientRedirectUri, string error,
 		url ~= "&error_uri=" ~ enc(errorUri);
 	if (clientState.length)
 		url ~= "&state=" ~ enc(clientState);
+	if (issuer.length)
+		url ~= "&iss=" ~ enc(issuer);
 	return url;
 }
 
@@ -587,6 +594,12 @@ void mountOAuthProxy(URLRouter router, OAuthProxy proxy,
 	mountOAuthToken(router, proxy);
 }
 
+/// The proxy's issuer identifier, as its AS metadata publishes it.
+private string proxyIssuer(OAuthProxy proxy) @safe
+{
+	return proxy.metadataJson()["issuer"].get!string;
+}
+
 /// Mount the RFC 8414 Authorization Server Metadata well-known document. The
 /// proxy advertises ITSELF as the AS, so it lives at the proxy's own well-known
 /// path, derived from the issuer (`OAuthProxyConfig.baseUrl`) as RFC 8414 §3.1
@@ -726,6 +739,7 @@ void mountOAuthAuthorize(URLRouter router, OAuthProxy proxy,
 {
 	auto cfg = proxy.config();
 	const authorizePath = pathOf(cfg.authorizeEndpoint());
+	const issuer = proxyIssuer(proxy);
 	const consentPath = pathOf(cfg.consentEndpoint());
 	const secureCookie = cfg.baseUrl.startsWith("https://");
 
@@ -796,7 +810,7 @@ void mountOAuthAuthorize(URLRouter router, OAuthProxy proxy,
 		void redirectError(string error, string description) @safe
 		{
 			res.redirect(buildClientCallbackError(clientRedirect, error,
-				description, "", clientState), HTTPStatus.found);
+				description, "", clientState, issuer), HTTPStatus.found);
 		}
 
 		// The proxy supports only the authorization-code grant (RFC 6749 §4.1.1).
@@ -1031,6 +1045,8 @@ void mountOAuthCallback(URLRouter router, OAuthProxy proxy, ProxyStateStore stor
 	import mcp.auth.oauth : constantTimeEquals;
 
 	const callbackPath = pathOf(proxy.config().callbackUrl());
+	const issuer = proxyIssuer(proxy);
+	const upstreamIssuer = proxy.config().upstreamIssuer;
 	const secureCookie = proxy.config().baseUrl.startsWith("https://");
 	router.get(callbackPath, (HTTPServerRequest req, HTTPServerResponse res) @safe {
 		const code = req.query.get("code", "");
@@ -1064,6 +1080,17 @@ void mountOAuthCallback(URLRouter router, OAuthProxy proxy, ProxyStateStore stor
 			res.writeBody("Unknown or expired authorization state", "text/plain");
 			return;
 		}
+		// RFC 9207: a response naming an issuer other than the configured upstream
+		// one came from a different authorization server (a mix-up attack), so its
+		// code is never relayed.
+		const responseIssuer = req.query.get("iss", "");
+		if (upstreamIssuer.length && responseIssuer.length && responseIssuer != upstreamIssuer)
+		{
+			res.redirect(buildClientCallbackError(st.clientRedirectUri, "server_error",
+				"the authorization response came from an unexpected issuer",
+				"", st.clientState, issuer), HTTPStatus.found);
+			return;
+		}
 		// Relay an upstream authorization failure (RFC 6749 §4.1.2.1) to the client
 		// rather than forwarding an empty code. Branch when the upstream sent an
 		// `error`, or defensively when no `code` was returned at all.
@@ -1072,13 +1099,14 @@ void mountOAuthCallback(URLRouter router, OAuthProxy proxy, ProxyStateStore stor
 			const error = upstreamError.length ? upstreamError : "access_denied";
 			const location = buildClientCallbackError(st.clientRedirectUri, error,
 				req.query.get("error_description",
-				""), req.query.get("error_uri", ""), st.clientState);
+				""), req.query.get("error_uri", ""), st.clientState, issuer);
 			res.redirect(location, HTTPStatus.found);
 			return;
 		}
 		proxy.recordRelayedCode(code, RelayedCodeBinding(st.codeChallenge,
 			st.clientRedirectUri, st.clientId));
-		const location = buildClientCallbackRedirect(st.clientRedirectUri, code, st.clientState);
+		const location = buildClientCallbackRedirect(st.clientRedirectUri,
+			code, st.clientState, issuer);
 		res.redirect(location, HTTPStatus.found);
 	});
 }
@@ -1497,17 +1525,18 @@ unittest  // the relay redirect appends code (and state) to the client redirect_
 	import std.algorithm : canFind;
 
 	const url = buildClientCallbackRedirect("http://localhost:5000/callback",
-			"UPSTREAM-CODE", "cs-1");
+			"UPSTREAM-CODE", "cs-1", "https://mcp.example.com");
 	assert(url.startsWith("http://localhost:5000/callback?"));
 	assert(url.canFind("code=UPSTREAM-CODE"));
 	assert(url.canFind("state=cs-1"));
+	assert(url.canFind("iss=https%3A%2F%2Fmcp.example.com"));
 }
 
 unittest  // the relay redirect uses & when the client redirect_uri already has a query
 {
 	import std.algorithm : canFind;
 
-	const url = buildClientCallbackRedirect("http://localhost/cb?x=1", "C", "");
+	const url = buildClientCallbackRedirect("http://localhost/cb?x=1", "C", "", "");
 	assert(url.canFind("?x=1&code=C"));
 	// no state appended when the client supplied none
 	assert(!url.canFind("state="));
@@ -1517,13 +1546,14 @@ unittest  // the error relay appends error (+ description/uri/state) to the clie
 {
 	import std.algorithm : canFind;
 
-	const url = buildClientCallbackError("http://localhost:5000/cb",
-			"access_denied", "the user said no", "https://err.example", "cs-1");
+	const url = buildClientCallbackError("http://localhost:5000/cb", "access_denied",
+			"the user said no", "https://err.example", "cs-1", "https://mcp.example.com");
 	assert(url.startsWith("http://localhost:5000/cb?"));
 	assert(url.canFind("error=access_denied"));
 	assert(url.canFind("error_description=the%20user%20said%20no"));
 	assert(url.canFind("error_uri=https"));
 	assert(url.canFind("state=cs-1"));
+	assert(url.canFind("iss=https%3A%2F%2Fmcp.example.com"));
 	// No code is relayed on an error.
 	assert(!url.canFind("code="));
 }
@@ -1532,11 +1562,12 @@ unittest  // the error relay omits absent optional params and uses & with an exi
 {
 	import std.algorithm : canFind;
 
-	const url = buildClientCallbackError("http://localhost/cb?x=1", "server_error", "", "", "");
+	const url = buildClientCallbackError("http://localhost/cb?x=1", "server_error", "", "", "", "");
 	assert(url.canFind("?x=1&error=server_error"));
 	assert(!url.canFind("error_description="));
 	assert(!url.canFind("error_uri="));
 	assert(!url.canFind("state="));
+	assert(!url.canFind("iss="));
 }
 
 unittest  // redirectUrisFrom pulls the array out of a DCR request body
@@ -4014,6 +4045,68 @@ unittest  // CALLBACK BINDING: the consenting browser's callback relays the code
 	assert(cb.status == 302);
 	assert(cb.location.startsWith("http://localhost:5000/cb?"));
 	assert(cb.location.canFind("code=C1"));
+}
+
+version (unittest)
+{
+	/// Start a consented authorization for `http://localhost:5000/cb` and drive
+	/// the upstream callback with `callbackQuery` (appended after its `state`).
+	private BrowserHit completeCallback(OAuthProxyConfig cfg, string callbackQuery) @safe
+	{
+		auto proxy = new OAuthProxy(cfg);
+		proxy.register(["http://localhost:5000/cb"]);
+		auto router = new URLRouter;
+		mountOAuthProxy(router, proxy);
+		const page = browserGet(router,
+				"https://mcp.example.com/authorize?client_id=Iv1.upstream"
+				~ "&response_type=code&code_challenge_method=S256&code_challenge=CH"
+				~ "&redirect_uri=http%3A%2F%2Flocalhost%3A5000%2Fcb&state=cs", "");
+		const approved = browserPost(router, "https://mcp.example.com/consent",
+				consentForm(page.body_), page.setCookie);
+		return browserGet(router, "https://mcp.example.com/auth/callback?state=" ~ upstreamStateOf(
+				approved.location) ~ callbackQuery, page.setCookie);
+	}
+}
+
+unittest  // RFC 9207: a relayed code carries the proxy's iss
+{
+	const cb = completeCallback(consentMountConfig(), "&code=C1");
+	assert(cb.status == 302);
+	assert(cb.location.canFind("code=C1"));
+	assert(cb.location.canFind("iss=https%3A%2F%2Fmcp.example.com"));
+}
+
+unittest  // RFC 9207: a relayed upstream error carries the proxy's iss
+{
+	const cb = completeCallback(consentMountConfig(), "&error=access_denied");
+	assert(cb.status == 302);
+	assert(cb.location.canFind("error=access_denied"));
+	assert(cb.location.canFind("iss=https%3A%2F%2Fmcp.example.com"));
+}
+
+unittest  // RFC 9207: a callback whose iss is not the configured upstream issuer relays no code
+{
+	auto cfg = consentMountConfig();
+	cfg.upstreamIssuer = "https://github.com";
+	const bad = completeCallback(cfg, "&code=C1&iss=https%3A%2F%2Fevil.example");
+	assert(!bad.location.canFind("code=C1"));
+	assert(bad.status == 302 && bad.location.canFind("error="));
+	const good = completeCallback(cfg, "&code=C1&iss=https%3A%2F%2Fgithub.com");
+	assert(good.location.canFind("code=C1"));
+	const absent = completeCallback(cfg, "&code=C1");
+	assert(absent.location.canFind("code=C1"));
+}
+
+unittest  // RFC 9207: an /authorize error redirected to the client carries the proxy's iss
+{
+	const res = authorizeDcr("&response_type=token&code_challenge=CH&code_challenge_method=S256");
+	assert(res.location.canFind("iss=https%3A%2F%2Fmcp.example.com"));
+}
+
+unittest  // RFC 9207: the AS metadata advertises authorization_response_iss_parameter_supported
+{
+	auto proxy = new OAuthProxy(consentMountConfig());
+	assert(proxy.metadataJson()["authorization_response_iss_parameter_supported"].get!bool);
 }
 
 unittest  // CALLBACK BINDING: a pending authorization awaiting consent cannot be completed

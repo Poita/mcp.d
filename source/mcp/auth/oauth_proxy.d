@@ -91,6 +91,11 @@ struct OAuthProxyConfig
 	/// with the IdP. Handed to every MCP client at DCR time.
 	string upstreamClientId;
 
+	/// The upstream IdP's issuer identifier. When set, an upstream authorization
+	/// response carrying an RFC 9207 `iss` parameter is relayed only when `iss`
+	/// equals it, defending against mix-up attacks; empty skips the check.
+	string upstreamIssuer;
+
 	/// The fixed upstream `client_secret`. May be empty for public PKCE clients.
 	string upstreamClientSecret;
 
@@ -290,8 +295,9 @@ AuthorizationServerMetadata authorizationServerMetadata(const OAuthProxyConfig c
 /// `/.well-known/oauth-authorization-server`. Emits the proxy endpoints,
 /// `response_types_supported` (RFC 8414 §2 REQUIRED when
 /// `authorization_endpoint` is present), `code_challenge_methods_supported`,
-/// `grant_types_supported`, `token_endpoint_auth_methods_supported`, and
-/// (when non-empty) `scopes_supported`.
+/// `grant_types_supported`, `token_endpoint_auth_methods_supported`,
+/// (when non-empty) `scopes_supported`, and the RFC 9207
+/// `authorization_response_iss_parameter_supported` flag.
 Json authorizationServerMetadataJson(const OAuthProxyConfig cfg) @safe
 {
 	auto m = authorizationServerMetadata(cfg);
@@ -308,6 +314,9 @@ Json authorizationServerMetadataJson(const OAuthProxyConfig cfg) @safe
 		j["scopes_supported"] = strArray(m.scopesSupported);
 	if (m.clientIdMetadataDocumentSupported)
 		j["client_id_metadata_document_supported"] = true;
+	// The HTTP mount adds the RFC 9207 `iss` parameter to every authorization
+	// response it relays to a client.
+	j["authorization_response_iss_parameter_supported"] = true;
 	return j;
 }
 
