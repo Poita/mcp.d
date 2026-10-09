@@ -13,8 +13,8 @@ body:
     id: protocol-version
     attributes:
       label: Protocol version
-      description: Which version the gap applies to (e.g. 2025-11-25, 2025-06-18, draft).
-      placeholder: "2025-11-25"
+      description: Which version the gap applies to (e.g. 2026-07-28, 2025-11-25, 2025-06-18).
+      placeholder: "2026-07-28"
     validations:
       required: true
   - type: input
@@ -22,7 +22,7 @@ body:
     attributes:
       label: Spec reference
       description: Link to the authoritative schema/section (schema.ts line, or modelcontextprotocol.io page).
-      placeholder: "https://github.com/modelcontextprotocol/modelcontextprotocol/blob/main/schema/2025-11-25/schema.ts#L..."
+      placeholder: "https://github.com/modelcontextprotocol/modelcontextprotocol/blob/main/schema/2026-07-28/schema.ts#L..."
     validations:
       required: true
   - type: textarea
@@ -42,12 +42,12 @@ body:
     validations:
       required: true
   - type: checkboxes
-    id: draft-only
+    id: version-scope
     attributes:
-      label: Draft-only consideration
-      description: Draft-only requirements must NOT change released-version wire output.
+      label: Version scope
+      description: A fix for one protocol revision must NOT change another revision's wire output.
       options:
-        - label: This gap (and any fix) applies only when the negotiated version is `draft`.
+        - label: This gap applies to the modern protocol (2026-07-28).
           required: false
-        - label: This gap applies to a released version (2025-11-25 / 2025-06-18).
+        - label: This gap applies to a legacy version (2025-11-25 or earlier).
           required: false

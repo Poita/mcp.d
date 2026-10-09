@@ -30,8 +30,8 @@ body:
     id: protocol-version
     attributes:
       label: MCP protocol version
-      description: The negotiated protocol version (e.g. 2025-11-25, 2025-06-18, draft).
-      placeholder: "2025-11-25"
+      description: The negotiated protocol version (e.g. 2026-07-28, 2025-11-25, 2025-06-18).
+      placeholder: "2026-07-28"
     validations:
       required: false
   - type: textarea
@@ -41,7 +41,7 @@ body:
       description: SDK version/commit, D compiler and version (DMD/LDC), and OS.
       placeholder: |
         - mcp.d: commit abc1234
-        - Compiler: LDC 1.40 (DMD frontend 2.110)
+        - Compiler: LDC 1.41 (DMD frontend 2.111)
         - OS: macOS 15 / Ubuntu 24.04
     validations:
       required: false
