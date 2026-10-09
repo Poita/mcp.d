@@ -1495,7 +1495,7 @@ final class ServerPushChannel : PushChannel
 	}
 
 	/// Frame `msg` as the next event of the POST-initiated stream `ordinal`,
-	/// record it for replay, and forward it to a GET listener that has resumed the
+	/// record it for replay while the stream is open (see `openStream`), and forward it to a GET listener that has resumed the
 	/// stream. Returns the frame and whether it was forwarded; the caller writes an
 	/// unforwarded frame to the POST response, since a resumed stream replaces the
 	/// POST one. The frame is recorded before either write, so an event produced
@@ -1509,7 +1509,9 @@ final class ServerPushChannel : PushChannel
 			const seq = nextSeq.get(ordinal, 0);
 			nextSeq[ordinal] = seq + 1;
 			const frame = formatSseEvent(ordinal.to!string ~ "-" ~ seq.to!string, msg);
-			if (ordinal !in lostStreams)
+			// Only a running request's stream is resumable: one whose session
+			// closed, or whose history was lost, keeps nothing for replay.
+			if (ordinal in openStreams && ordinal !in lostStreams)
 			{
 				streamOwner[ordinal] = owner;
 				recordHistory(ordinal, seq, frame);
@@ -1801,12 +1803,28 @@ unittest  // closeSession discards the session's replay history but keeps others
 	auto ch = new ServerPushChannel(coord);
 	const a = coord.allocStream();
 	const b = coord.allocStream();
+	ch.openStream(a, "A");
+	ch.openStream(b, "B");
 	ch.publishStreamEvent(a, "A", Json("a"));
 	ch.publishStreamEvent(b, "B", Json("b"));
 	assert(ch.retainedHistoryStreams == 2);
 	ch.closeSession("A");
 	assert(ch.retainedHistoryStreams == 1);
 	assert(ch.retainedHistoryBytes > 0);
+}
+
+unittest  // events a handler publishes after its session closed are not retained
+{
+	auto coord = new StreamCoordinator;
+	auto ch = new ServerPushChannel(coord);
+	const a = coord.allocStream();
+	ch.openStream(a, "A");
+	ch.publishStreamEvent(a, "A", Json("before"));
+	ch.closeSession("A");
+	assert(ch.retainedHistoryStreams == 0);
+	ch.publishStreamEvent(a, "A", Json("after"));
+	assert(ch.retainedHistoryStreams == 0, "a closed session's stream must not regain history");
+	assert(ch.retainedHistoryBytes == 0);
 }
 
 unittest  // past the stream cap the earliest-disconnected stream's history goes first
@@ -1847,8 +1865,10 @@ unittest  // replay history is bounded by total bytes, not only by frame count
 	foreach (_; 0 .. 32)
 	{
 		const ordinal = coord.allocStream();
+		ch.openStream(ordinal, "S");
 		foreach (__; 0 .. 16)
 			ch.publishStreamEvent(ordinal, "S", big);
+		ch.closeStream(ordinal);
 	}
 	assert(ch.retainedHistoryBytes <= ReplayHistoryOptions.init.maxBytes);
 	assert(ch.retainedHistoryBytes > 0);
