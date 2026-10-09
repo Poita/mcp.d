@@ -632,7 +632,41 @@ package(mcp) T bindJson(T)(Json v, string path = "")
 	{
 		// A member the JSON value is natively written as wins over an earlier one
 		// that would merely convert it (an integer binds to `int`, not `double`);
-		// failing that, the first member that accepts the value does.
+		// failing that, the first member that accepts the value does. Among
+		// members reading a JSON object, the one whose fields hold the most of
+		// its keys wins, ties going to the one with the fewest fields of its own
+		// the object lacks, so a struct that would drop keys loses to one that
+		// holds them all.
+		if (v.type == Json.Type.object)
+		{
+			T best;
+			bool found;
+			size_t bestKept, bestAdded;
+			static foreach (V; TemplateArgsOf!T)
+			{
+				if (isNativeJsonType!V(v.type))
+				{
+					try
+					{
+						auto bound = bindJson!V(v, path);
+						size_t kept, added;
+						objectFit!V(v, kept, added);
+						if (!found || kept > bestKept || (kept == bestKept && added < bestAdded))
+						{
+							setBound(best, T(bound));
+							found = true;
+							bestKept = kept;
+							bestAdded = added;
+						}
+					}
+					catch (BindException)
+					{
+					}
+				}
+			}
+			if (found)
+				return best;
+		}
 		static foreach (V; TemplateArgsOf!T)
 		{
 			if (isNativeJsonType!V(v.type))
@@ -736,6 +770,28 @@ private bool isNativeJsonType(V)(Json.Type t) pure nothrow
 		return t == Json.Type.object;
 	else
 		return false;
+}
+
+/// How well the JSON object `obj` fits `V`: `kept` is how many of its keys `V`
+/// reads, `added` how many of `V`'s fields it lacks. A type that is not a
+/// struct (an associative array) reads every key and adds none.
+private void objectFit(V)(Json obj, out size_t kept, out size_t added)
+{
+	static if (isInstanceOf!(Nullable, V))
+		objectFit!(TemplateArgsOf!V[0])(obj, kept, added);
+	else static if (isFieldwiseStruct!V)
+	{
+		static foreach (field; FieldNameTuple!V)
+			static if (isBoundField!(V, field))
+				{
+				if (wireFieldName!(V, field) in obj)
+					kept++;
+				else
+					added++;
+			}
+	}
+	else
+		kept = obj.length;
 }
 
 /// Assign a freshly bound `value` into `dst`, a default-initialized slot being
@@ -1610,4 +1666,45 @@ unittest  // a flat elicitation form may carry private and @ignore'd helper fiel
 	}
 
 	static assert(isFlatElicitationStruct!Form);
+}
+
+unittest  // bindJson binds an object to the SumType struct member that holds every key
+{
+	import std.sumtype : SumType, has, match;
+	import vibe.data.json : parseJsonString;
+
+	static struct A
+	{
+		int x;
+	}
+
+	static struct B
+	{
+		int x;
+		int y;
+	}
+
+	auto u = bindJson!(SumType!(A, B))(parseJsonString(`{"x":1,"y":2}`));
+	assert(u.has!B);
+	assert(u.match!((B b) => b.y, (A a) => -1) == 2);
+}
+
+unittest  // bindJson prefers the SumType struct member with no fields beyond the object's
+{
+	import std.sumtype : SumType, has;
+	import vibe.data.json : parseJsonString;
+	import vibe.data.serialization : optional;
+
+	static struct B
+	{
+		int x;
+		@optional int y;
+	}
+
+	static struct A
+	{
+		int x;
+	}
+
+	assert(bindJson!(SumType!(B, A))(parseJsonString(`{"x":1}`)).has!A);
 }
