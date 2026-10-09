@@ -17,7 +17,7 @@
  *   - the requestedSchema is DERIVED ENTIRELY from the flat struct `TripDetails`:
  *     the rich facets (integer bounds, field titles, the enum/boolean defaults)
  *     live as field UDAs (`@minimum`/`@maximum`/`@title`/`@schemaDefault`) that
- *     `jsonSchemaOf!TripDetails` emits, so the typed
+ *     `elicitationSchemaOf!TripDetails` emits, so the typed
  *     `ctx.elicit!TripDetails(message)` sends the whole SEP-1034/1330 restricted
  *     schema with NO hand-built Json;
  *   - `ctx.elicit!T` returns a typed `ElicitResult`; on `accept` the collected
@@ -68,7 +68,7 @@ void main(string[] args) @safe
 	runServerFromArgs(server, args, defaultPort);
 }
 
-/// Cabin class — a D `enum`, so jsonSchemaOf derives the three enum members
+/// Cabin class — a D `enum`, so elicitationSchemaOf derives the three enum members
 /// (["economy","premium","business"]) into the requestedSchema automatically.
 enum Cabin
 {

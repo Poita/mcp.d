@@ -522,6 +522,95 @@ private JsonNode anyOfNode(JsonNode[] members...) pure
 	return s;
 }
 
+/// True when `F` is a scalar permitted as an elicitation form field: a
+/// bool/integer/floating/string/enum, a `Nullable` of one, or a flat array of a
+/// primitive enum (a multi-select). No nested objects or arrays of objects.
+template isElicitScalar(F)
+{
+	static if (isInstanceOf!(Nullable, F))
+		enum isElicitScalar = isElicitScalar!(typeof(F.init.get()));
+	else static if (isArray!F && !isSomeString!F)
+		enum isElicitScalar = is(typeof(F.init[0]) == enum);
+	else
+		enum isElicitScalar = is(F == bool) || isIntegral!F
+			|| isFloatingPoint!F || isSomeString!F || is(F == enum);
+}
+
+/// True when `T` is a struct whose every bound field (public and not
+/// `@ignore`d) is an `isElicitScalar`, i.e. a valid type to derive an
+/// elicitation form `requestedSchema` from (via `elicitationSchemaOf!T`). Used by
+/// `RequestContext.elicit!T` and `elicitationRequest!T` to reject nested/array
+/// structs at compile time.
+template isFlatElicitationStruct(T)
+{
+	static if (is(T == struct))
+		enum isFlatElicitationStruct = () {
+			bool flat = true;
+			static foreach (field; FieldNameTuple!T)
+				static if (isBoundField!(T, field))
+					flat = flat && isElicitScalar!(typeof(__traits(getMember, T, field)));
+			return flat;
+		}();
+	else
+		enum isFlatElicitationStruct = false;
+}
+
+/// Build a form-`elicitation` `InputRequest` whose `requestedSchema` is derived
+/// from the flat struct `T` via `elicitationSchemaOf!T` (same compile-time
+/// flat-struct restriction as `RequestContext.elicit!T`).
+auto elicitationRequest(T)(string id, string message)
+{
+	import mcp.protocol.mrtr : InputRequest;
+
+	static assert(isFlatElicitationStruct!T, "elicitationRequest!T requires a flat struct of scalar fields (string/number/integer/boolean/enum); " ~ T
+			.stringof ~ " has a nested or non-scalar field");
+	return InputRequest.elicitation(id, message, elicitationSchemaOf!T);
+}
+
+/// The elicitation form `requestedSchema` for the flat struct `T`: its
+/// `jsonSchemaOf` input schema, so the form's keys and `required` set are the
+/// ones `ElicitResult.contentAs!T` reads. Elicitation properties must be
+/// primitive schemas, so a `Nullable` field renders as its bare primitive (no
+/// `null` type or enum member) and is optional by being absent from `required`.
+Json elicitationSchemaOf(T)()
+{
+	static assert(isFlatElicitationStruct!T, "elicitationSchemaOf!T requires a flat struct of scalar fields (string/number/integer/boolean/enum); " ~ T
+			.stringof ~ " has a nested or non-scalar field");
+	auto s = jsonSchemaOf!(T, SchemaUse.input)();
+	if (auto props = "properties" in s)
+	{
+		string[] keys;
+		foreach (kv; props.byKeyValue)
+			keys ~= kv.key;
+		foreach (key; keys)
+			(*props)[key] = withoutNull((*props)[key]);
+	}
+	return s;
+}
+
+/// `prop` with JSON `null` removed from its `type` and `enum`.
+private Json withoutNull(Json prop)
+{
+	if (auto t = "type" in prop)
+		if (t.type == Json.Type.array)
+		{
+			Json[] kept;
+			foreach (i; 0 .. t.length)
+				if ((*t)[i] != Json("null"))
+					kept ~= (*t)[i];
+			*t = kept.length == 1 ? kept[0] : Json(kept);
+		}
+	if (auto e = "enum" in prop)
+	{
+		Json[] kept;
+		foreach (i; 0 .. e.length)
+			if ((*e)[i].type != Json.Type.null_)
+				kept ~= (*e)[i];
+		*e = Json(kept);
+	}
+	return prop;
+}
+
 /// Bind the JSON value `v` to `T`. `path` is the location of `v` relative to the
 /// top-level value (empty at the top) and prefixes error messages. Throws
 /// `BindException` for a shape or value that does not fit `T`.
@@ -1412,4 +1501,113 @@ unittest  // jsonSchemaOf inlines a shared nested struct rather than emitting $r
 	assert("$defs" !in s);
 	assert(s["properties"]["first"]["type"].get!string == "object");
 	assert(s["properties"]["second"]["properties"]["a"]["type"].get!string == "integer");
+}
+
+@safe unittest  // elicitationRequest!T derives requestedSchema from a flat struct
+{
+	import vibe.data.json : Json;
+
+	static struct Details
+	{
+		int travelers;
+		bool insurance;
+	}
+
+	auto ir = elicitationRequest!Details("e2", "Details?");
+	assert(ir.type == "elicitation");
+	assert(ir.params["message"].get!string == "Details?");
+	assert(ir.params["requestedSchema"] == elicitationSchemaOf!Details);
+}
+
+@safe unittest  // elicitationRequest!T renders a Nullable field as a bare primitive, optional via required
+{
+	import std.typecons : Nullable;
+
+	static struct Contact
+	{
+		string name;
+		Nullable!int age;
+	}
+
+	const schema = elicitationRequest!Contact("e3", "Contact?").params["requestedSchema"];
+	const age = schema["properties"]["age"];
+	assert(age["type"].get!string == "integer");
+	assert("anyOf" !in age);
+	assert(schema["required"].length == 1 && schema["required"][0].get!string == "name");
+	assert(elicitationSchemaOf!Contact == schema);
+}
+
+@safe unittest  // elicitationRequest!T rejects a non-flat struct at compile time
+{
+	static struct Inner
+	{
+		int x;
+	}
+
+	static struct Nested
+	{
+		Inner inner;
+	}
+
+	static assert(!__traits(compiles, elicitationRequest!Nested("e", "m")));
+}
+
+unittest  // isFlatElicitationStruct accepts a flat scalar struct, rejects nesting
+{
+	struct Flat
+	{
+		string s;
+		int n;
+		Nullable!bool b;
+	}
+
+	struct Nested
+	{
+		Flat inner;
+	}
+
+	static assert(isFlatElicitationStruct!Flat);
+	static assert(!isFlatElicitationStruct!Nested);
+}
+
+unittest  // elicitationSchemaOf keys and requires fields as ElicitResult.contentAs reads them
+{
+	import mcp.protocol.types : ElicitResult;
+	import std.algorithm : canFind;
+	import std.array : array;
+	import vibe.data.json : parseJsonString;
+	import vibe.data.serialization : optional;
+
+	static struct Form
+	{
+		string version_;
+		@optional string note;
+		int seats = 2;
+	}
+
+	auto s = elicitationSchemaOf!Form;
+	assert("version" in s["properties"] && "version_" !in s["properties"], s.toString);
+	auto req = s["required"][].array;
+	assert(req == [Json("version")], s.toString);
+	auto f = ElicitResult.accept(parseJsonString(`{"version":"1.2"}`)).contentAs!Form;
+	assert(f.version_ == "1.2" && f.seats == 2, f.version_);
+}
+
+unittest  // a flat elicitation form may carry private and @ignore'd helper fields
+{
+	import vibe.data.serialization : ignore;
+
+	static struct Inner
+	{
+		int x;
+	}
+
+	static struct Form
+	{
+		string name;
+		@ignore Inner cache;
+		private int[] scratch;
+	}
+
+	static assert(isFlatElicitationStruct!Form);
 }

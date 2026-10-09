@@ -44,7 +44,7 @@ Json, on both sides of the wire:
   `required` set and the `cabin` enum members come from reflection, while the
   rich facets (field titles, the `travelers` integer bounds, the `cabin` enum
   default, the `insurance` boolean default) are declared as field UDAs
-  (`@title`/`@minimum`/`@maximum`/`@schemaDefault`) that `jsonSchemaOf`
+  (`@title`/`@minimum`/`@maximum`/`@schemaDefault`) that `elicitationSchemaOf`
   emits — so the server builds **no schema Json by hand** (SEP-1034/1330);
 - `ctx.elicit!T` returns a typed `ElicitResult`; the handler branches on
   `.action` and, on `accept`, decodes the collected values with

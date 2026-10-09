@@ -46,7 +46,7 @@ MRTR `Json`** — it uses the typed builders and decoders throughout:
 
 - **`elicitationRequest!MeetingDate(id, message)`** — derives the
   elicitation `requestedSchema` from the flat `MeetingDate` struct via
-  `jsonSchemaOf!T` (no hand-built schema `Json`).
+  `elicitationSchemaOf!T` (no hand-built schema `Json`).
 - **`InputRequest.sampling(id, CreateMessageRequest)`** — builds the sampling
   request from a typed `CreateMessageRequest` (typed `SamplingMessage` +
   `Content.makeText`), not a hand-built params object.

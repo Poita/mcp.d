@@ -82,7 +82,7 @@ unittest
 	static assert(visibleFromMcp!"RequestContext");
 }
 
-// The schema layer's `elicitationRequest!T` builder is the user-facing entry
+// The binding layer's `elicitationRequest!T` builder is the user-facing entry
 // point for deriving an elicitation request from a flat struct, so it stays
 // reachable from `import mcp;`.
 unittest

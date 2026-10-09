@@ -710,7 +710,7 @@ struct InputRequest
 	/// JSON Schema (`requestedSchema`). Form mode requires a `requestedSchema`, so
 	/// without one the request carries an empty object schema (a plain
 	/// confirmation). For a `requestedSchema` derived from a flat
-	/// struct `T`, use `mcp.protocol.schema.elicitationRequest!T` (where
+	/// struct `T`, use `mcp.api.binding.elicitationRequest!T` (where
 	/// reflection-driven schema generation lives, so this module stays free of any
 	/// schema/reflection dependency).
 	static InputRequest elicitation(string id, string message, Json requestedSchema = Json

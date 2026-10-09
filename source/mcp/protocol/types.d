@@ -3908,20 +3908,20 @@ struct ElicitResult
 	/// into a typed struct `T`. Pairs with `RequestContext.elicit!T`, whose
 	/// `requestedSchema` is derived from the same `T`. Only meaningful for an
 	/// `accept`; on a `decline`/`cancel` (no content) this returns `T.init`, so
-	/// callers should branch on `action` first. Enum fields are read by member
-	/// name. The content comes from the peer, so a value that does not fit `T`
-	/// throws `McpException(invalidParams)`.
+	/// callers should branch on `action` first. Fields are read by the rules
+	/// `elicitationSchemaOf!T` advertises: keyed by wire name, enums by member
+	/// name, and an omitted optional field keeps its default. The content comes
+	/// from the peer, so a value that does not fit `T` throws
+	/// `McpException(invalidParams)`.
 	T contentAs(T)() const @safe
 	{
-		import mcp.protocol.schema : EnumByNamePolicy;
+		import mcp.api.binding : bindJson;
 		import mcp.protocol.errors : invalidParams;
-		import vibe.data.json : JsonSerializer;
-		import vibe.data.serialization : deserializeWithPolicy;
 
 		if (content.type != Json.Type.object)
 			return T.init;
 		try
-			return deserializeWithPolicy!(JsonSerializer, EnumByNamePolicy, T)(content);
+			return bindJson!T(content);
 		catch (McpException e)
 			throw e;
 		catch (Exception e)

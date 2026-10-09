@@ -1,8 +1,5 @@
 module mcp.protocol.schema;
 
-import std.traits : isInstanceOf, isArray, isSomeString, isIntegral, isFloatingPoint;
-import std.typecons : Nullable;
-
 import vibe.data.json : Json;
 
 import jsonschema : Validator;
@@ -206,119 +203,6 @@ unittest  // a SumType of structs prefers the member with no keys beyond the inp
 	assert(u.has!A);
 }
 
-/// True when `F` is a scalar permitted as an elicitation form field: a
-/// bool/integer/floating/string/enum, a `Nullable` of one, or a flat array of a
-/// primitive enum (a multi-select). No nested objects or arrays of objects.
-template isElicitScalar(F)
-{
-	static if (isInstanceOf!(Nullable, F))
-		enum isElicitScalar = isElicitScalar!(typeof(F.init.get()));
-	else static if (isArray!F && !isSomeString!F) // a multi-select array of enum members (a flat array of a primitive
-		// enum), e.g. `Color[]`, is a permitted form field (array items enum).
-		enum isElicitScalar = is(typeof(F.init[0]) == enum);
-	else
-		enum isElicitScalar = is(F == bool) || isIntegral!F
-			|| isFloatingPoint!F || isSomeString!F || is(F == enum);
-}
-
-/// True when `T` is a flat struct whose every field is an `isElicitScalar`, i.e. a
-/// valid type to derive an elicitation form `requestedSchema` from (via
-/// `elicitationSchemaOf!T`). Used by `RequestContext.elicit!T` and `elicitationRequest!T`
-/// to reject nested/array structs at compile time.
-template isFlatElicitationStruct(T)
-{
-	import std.meta : allSatisfy;
-
-	static if (is(T == struct))
-		enum isFlatElicitationStruct = allSatisfy!(isElicitScalar, typeof(T.tupleof));
-	else
-		enum isFlatElicitationStruct = false;
-}
-
-/// Build a form-`elicitation` `InputRequest` whose `requestedSchema` is derived
-/// from the flat struct `T` via `elicitationSchemaOf!T` (same compile-time flat-struct
-/// restriction as `RequestContext.elicit!T`). This convenience lives beside
-/// `jsonSchemaOf` because deriving a schema from a D type is reflection work; the
-/// `InputRequest.elicitation(string, string, Json)` overload in `mcp.protocol.mrtr`
-/// takes a ready-made schema and so stays free of any schema/reflection dependency.
-auto elicitationRequest(T)(string id, string message) @safe
-{
-	import mcp.protocol.mrtr : InputRequest;
-
-	static assert(isFlatElicitationStruct!T, "elicitationRequest!T requires a flat struct of scalar fields (string/number/integer/boolean/enum); " ~ T
-			.stringof ~ " has a nested or non-scalar field");
-	return InputRequest.elicitation(id, message, elicitationSchemaOf!T);
-}
-
-/// The elicitation form `requestedSchema` for the flat struct `T`. Elicitation
-/// properties must be primitive schemas, so a `Nullable` field renders as its
-/// bare primitive (no `anyOf` null branch) and is optional by being absent
-/// from `required`.
-Json elicitationSchemaOf(T)()
-{
-	import jsonschema : generate = jsonSchemaOf, GeneratorSettings;
-	import jsonschema.vibejson : nodeToVibeJson;
-
-	static assert(isFlatElicitationStruct!T, "elicitationSchemaOf!T requires a flat struct of scalar fields (string/number/integer/boolean/enum); " ~ T
-			.stringof ~ " has a nested or non-scalar field");
-	enum settings = () {
-		GeneratorSettings s;
-		s.inlineSubschemas = true;
-		s.nullableOmitsNull = true;
-		return s;
-	}();
-	return nodeToVibeJson(generate!(T, settings)());
-}
-
-@safe unittest  // elicitationRequest!T derives requestedSchema from a flat struct
-{
-	import vibe.data.json : Json;
-
-	static struct Details
-	{
-		int travelers;
-		bool insurance;
-	}
-
-	auto ir = elicitationRequest!Details("e2", "Details?");
-	assert(ir.type == "elicitation");
-	assert(ir.params["message"].get!string == "Details?");
-	assert(ir.params["requestedSchema"] == elicitationSchemaOf!Details);
-}
-
-@safe unittest  // elicitationRequest!T renders a Nullable field as a bare primitive, optional via required
-{
-	import std.typecons : Nullable;
-
-	static struct Contact
-	{
-		string name;
-		Nullable!int age;
-	}
-
-	const schema = elicitationRequest!Contact("e3", "Contact?").params["requestedSchema"];
-	const age = schema["properties"]["age"];
-	assert(age["type"].get!string == "integer");
-	assert("anyOf" !in age);
-	assert(schema["required"].length == 1 && schema["required"][0].get!string == "name");
-	assert(elicitationSchemaOf!Contact == schema);
-}
-
-@safe unittest  // elicitationRequest!T rejects a non-flat struct at compile time
-{
-	static struct Inner
-	{
-		int x;
-	}
-
-	static struct Nested
-	{
-		Inner inner;
-	}
-
-	static assert(!__traits(compiles, elicitationRequest!Nested("e", "m")));
-}
-
 /// Compile a vibe `Json` schema document into a reusable `Validator`, or `null`
 /// when `schema` is not a JSON object (and so imposes no constraint). Throws a
 /// `jsonschema.SchemaException` when the schema is a malformed object or declares
@@ -448,22 +332,4 @@ unittest  // a precompiled validator validates repeatedly with independent resul
 	assert(validationError(v, Json(["n": Json(1)])) == "");
 	assert(validationError(v, Json(["n": Json("bad")])).length > 0);
 	assert(validationError(v, Json(["n": Json(2)])) == "");
-}
-
-unittest  // isFlatElicitationStruct accepts a flat scalar struct, rejects nesting
-{
-	struct Flat
-	{
-		string s;
-		int n;
-		Nullable!bool b;
-	}
-
-	struct Nested
-	{
-		Flat inner;
-	}
-
-	static assert(isFlatElicitationStruct!Flat);
-	static assert(!isFlatElicitationStruct!Nested);
 }

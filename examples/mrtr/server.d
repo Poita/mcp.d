@@ -86,7 +86,7 @@ void main(string[] args) @safe
 }
 
 /// A flat struct describing the date elicitation form. `elicitationRequest!T`
-/// derives its `requestedSchema` from this via `jsonSchemaOf!T`, and the client's
+/// derives its `requestedSchema` from this via `elicitationSchemaOf!T`, and the client's
 /// answer decodes back into it through `ElicitResult.contentAs!MeetingDate`.
 struct MeetingDate
 {
@@ -138,7 +138,7 @@ final class MrtrApi
 		if (!ctx.isResubmit() || !ctx.hasInputResponse(dateId) || !ctx.hasInputResponse(agendaId))
 		{
 			// Typed elicitation builder: the `requestedSchema` is derived from the
-			// flat `MeetingDate` struct via jsonSchemaOf!T.
+			// flat `MeetingDate` struct via elicitationSchemaOf!T.
 			auto dateReq = elicitationRequest!MeetingDate(dateId, "On what date should we meet?");
 
 			// Typed sampling builder: build a CreateMessageRequest from a typed
