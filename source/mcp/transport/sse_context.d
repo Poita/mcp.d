@@ -2724,7 +2724,8 @@ final class HttpStreamContext : RequestContext, ConnectionScoped
 	// MUST be that session id when sessions are enabled -- a per-request UUID
 	// would never match the cancellation's own context and would break
 	// cancellation entirely. When sessions are disabled the transport supplies a
-	// per-principal scope instead (see `mountMcp`).
+	// fresh per-POST scope (`StatelessInFlight.scopeFor`), and a later
+	// `notifications/cancelled` is routed to it by `StatelessInFlight.cancelScopeFor`.
 	private string token_;
 	// The per-session (stateful) / per-request (stateless) ConnectionState this
 	// request is bound to. The transport resolves it — looked up by
@@ -2817,10 +2818,12 @@ final class HttpStreamContext : RequestContext, ConnectionScoped
 	}
 
 	/// The per-connection cancellation scope for this request, as supplied by
-	/// the transport: the `Mcp-Session-Id` when stateful sessions are enabled, or a
-	/// per-principal scope on a stateless mount, so a request and its later
-	/// `notifications/cancelled` -- which arrive on SEPARATE POSTs -- resolve to
-	/// the SAME `RequestScope` cancellation key.
+	/// the transport. With stateful sessions it is the `Mcp-Session-Id`, so a
+	/// request and its later `notifications/cancelled` -- which arrive on SEPARATE
+	/// POSTs -- resolve to the SAME `RequestScope` cancellation key. On a stateless
+	/// mount it is a fresh scope for this POST; the transport dispatches an
+	/// authenticated principal's `notifications/cancelled` under the scope of the
+	/// request it names.
 	string connectionToken() @safe
 	{
 		return token_;
