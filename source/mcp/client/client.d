@@ -306,7 +306,7 @@ struct ClientSettings
 	/// supplies `readLine`.
 	size_t maxMessageBytes = defaultMaxMessageBytes;
 
-	/// HTTP transport only: how https/wss servers are validated. The default
+	/// HTTP transport only: how https servers are validated. The default
 	/// requires a certificate chaining to a CA in the system store and matching
 	/// the endpoint host name. Set `tls.caFile` to trust a private CA or a local
 	/// server's self-signed certificate; `tls.insecureSkipVerify` disables

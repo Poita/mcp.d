@@ -445,7 +445,7 @@ final class HttpClientTransport : ClientTransport
 	// Configurable via `setMaxMessageBytes`.
 	private size_t maxMessageBytes = defaultMaxMessageBytes;
 
-	// How https/wss servers are validated, and the client TLS context built from
+	// How https servers are validated, and the client TLS context built from
 	// it on first use and shared by every connection.
 	private TlsTrust tlsTrust;
 	private TLSContext tlsContext_;
@@ -558,7 +558,7 @@ final class HttpClientTransport : ClientTransport
 		maxMessageBytes = limit;
 	}
 
-	/// Validate https/wss servers under `trust` (trusted CAs, or no verification
+	/// Validate https servers under `trust` (trusted CAs, or no verification
 	/// for development). Applies to connections opened afterwards.
 	void setTlsTrust(TlsTrust trust) @safe
 	{
@@ -566,7 +566,7 @@ final class HttpClientTransport : ClientTransport
 		tlsContext_ = null;
 	}
 
-	/// The client TLS context for this transport's https/wss connections: it
+	/// The client TLS context for this transport's https connections: it
 	/// requires a server certificate chaining to a trusted CA and matching the
 	/// endpoint host name, unless `tlsTrust` disables verification.
 	private TLSContext tlsContext() @trusted
@@ -1106,7 +1106,7 @@ final class HttpClientTransport : ClientTransport
 				slot.attach(sock);
 				if (closing)
 					return;
-				// Wrap in TLS for https/wss; plaintext is returned unwrapped.
+				// Wrap in TLS for https; plaintext is returned unwrapped.
 				auto conn = openClientStream(sock, ep.tls ? tlsContext() : null, ep.host);
 				scope (exit)
 					conn.release();
@@ -1366,7 +1366,7 @@ final class HttpClientTransport : ClientTransport
 				slot.attach(sock);
 				if (closing)
 					return;
-				// Wrap in TLS for https/wss; plaintext is returned unwrapped.
+				// Wrap in TLS for https; plaintext is returned unwrapped.
 				auto conn = openClientStream(sock, ep.tls ? tlsContext() : null, ep.host);
 				scope (exit)
 					conn.release();
@@ -1809,7 +1809,7 @@ final class HttpClientTransport : ClientTransport
 					slot.attach(sock);
 					if (closing)
 						return;
-					// Wrap in TLS for https/wss; plaintext is returned unwrapped.
+					// Wrap in TLS for https; plaintext is returned unwrapped.
 					auto conn = openClientStream(sock, ep.tls ? tlsContext() : null, ep.host);
 					scope (exit)
 						conn.release();
@@ -2035,7 +2035,7 @@ final class HttpClientTransport : ClientTransport
 					// A cancel() that raced ahead of attach must still tear the socket down.
 					if (isCancelled())
 						return;
-					// Wrap in TLS for https/wss; plaintext is returned unwrapped.
+					// Wrap in TLS for https; plaintext is returned unwrapped.
 					auto conn = openClientStream(sock, ep.tls ? tlsContext() : null, ep.host);
 					scope (exit)
 						conn.release();
@@ -2278,7 +2278,7 @@ final class HttpClientTransport : ClientTransport
 				slot.attach(sock);
 				if (closing)
 					return;
-				// Wrap in TLS for https/wss; plaintext is returned unwrapped.
+				// Wrap in TLS for https; plaintext is returned unwrapped.
 				auto conn = openClientStream(sock, ep.tls ? tlsContext() : null, ep.host);
 				scope (exit)
 					conn.release();
@@ -2441,7 +2441,7 @@ final class HttpClientTransport : ClientTransport
 
 /// The parsed components of an MCP endpoint URL, shared by every raw-TCP request
 /// path so host/port/scheme parsing lives in exactly one place. `tls` is true for
-/// an `https://`/`wss://` scheme; `port` defaults to the scheme's well-known port
+/// an `https://` scheme; `port` defaults to the scheme's well-known port
 /// (443 when `tls`, else 80) when the URL omits it, so a TLS URL can never be
 /// silently treated as plaintext on port 80.
 private struct HttpEndpoint
@@ -2464,26 +2464,24 @@ private struct HttpEndpoint
 }
 
 /// Parse `scheme://host[:port][/path][?query]` into its components, defaulting
-/// the port to 443 for a TLS scheme (https/wss) and 80 otherwise. The path keeps
-/// any query; an absent path becomes "/" and a fragment is dropped, as it never
-/// reaches the request target. Tolerates a missing scheme (treated as non-TLS).
-/// Throws on an empty host, userinfo (`user@host`), or a port that is not a
-/// number in 1-65535. See `HttpEndpoint`.
+/// the port to 443 for https and 80 for http. The path keeps any query; an
+/// absent path becomes "/" and a fragment is dropped, as it never reaches the
+/// request target. Throws on a scheme other than http or https (a missing or
+/// mistyped one must not silently fall back to plaintext), an empty host,
+/// userinfo (`user@host`), or a port that is not a number in 1-65535. See
+/// `HttpEndpoint`.
 private HttpEndpoint parseHttpEndpoint(string url) @safe
 {
 	import std.string : indexOf, indexOfAny, toLower;
 	import std.conv : to;
 
 	HttpEndpoint ep;
-	auto rest = url;
-	string scheme;
-	const sep = rest.indexOf("://");
-	if (sep >= 0)
-	{
-		scheme = rest[0 .. sep].toLower;
-		rest = rest[sep + 3 .. $];
-	}
-	ep.tls = scheme == "https" || scheme == "wss";
+	const sep = url.indexOf("://");
+	const scheme = sep < 0 ? "" : url[0 .. sep].toLower;
+	if (scheme != "http" && scheme != "https")
+		throw new Exception("MCP endpoint URL must use http or https: " ~ url);
+	auto rest = url[sep + 3 .. $];
+	ep.tls = scheme == "https";
 
 	const hash = rest.indexOf('#');
 	if (hash >= 0)
@@ -2615,7 +2613,7 @@ private final class ClientStream : ProxyStream
 }
 
 /// Open a client byte stream over `conn`, wrapped in a TLS tunnel when `ctx`
-/// is set (https/wss) and returned unwrapped otherwise, so every raw-TCP
+/// is set (https) and returned unwrapped otherwise, so every raw-TCP
 /// request path shares one TLS-handling site. `host` is the TLS peer name the
 /// server certificate is validated against under `ctx`. `conn` must outlive
 /// the returned stream.
@@ -2881,7 +2879,7 @@ unittest  // httpStatusError keeps the code and message of a null-id JSON-RPC er
 
 unittest  // parseHttpEndpoint defaults the port per scheme (443 for TLS)
 {
-	// https/wss default to 443; http and a bare host to 80. An explicit port wins.
+	// https defaults to 443 and http to 80. An explicit port wins.
 	auto h = parseHttpEndpoint("http://host/mcp");
 	assert(!h.tls && h.port == 80 && h.host == "host" && h.path == "/mcp");
 
@@ -2891,11 +2889,20 @@ unittest  // parseHttpEndpoint defaults the port per scheme (443 for TLS)
 	auto sp = parseHttpEndpoint("https://host:8443/x");
 	assert(sp.tls && sp.port == 8443);
 
-	auto ws = parseHttpEndpoint("wss://host");
-	assert(ws.tls && ws.port == 443 && ws.path == "/");
+	auto upper = parseHttpEndpoint("HTTPS://host");
+	assert(upper.tls && upper.port == 443 && upper.path == "/");
+}
 
-	auto bare = parseHttpEndpoint("host:9000/p");
-	assert(!bare.tls && bare.port == 9000 && bare.host == "host" && bare.path == "/p");
+unittest  // parseHttpEndpoint rejects a URL whose scheme is not http or https
+{
+	import std.exception : assertThrown;
+
+	assertThrown(parseHttpEndpoint("htps://host/mcp"));
+	assertThrown(parseHttpEndpoint("host/mcp"));
+	assertThrown(parseHttpEndpoint("host:9000/p"));
+	assertThrown(parseHttpEndpoint("wss://host/mcp"));
+	assertThrown(parseHttpEndpoint("ftp://host/mcp"));
+	assertThrown(new HttpClientTransport("htps://host/mcp"));
 }
 
 unittest  // parseHttpEndpoint rejects an invalid port and userinfo
@@ -2963,12 +2970,10 @@ unittest  // an https URL constructs (TLS supported)
 	// The streaming HTTP client transport wires real TLS through every raw-TCP
 	// path (openClientStream wraps the connection in a vibe TLS tunnel with
 	// SNI = host and trusted-chain + host-name verification, port 443 by default). An
-	// https/wss URL constructs successfully and the TLS handshake happens on
-	// first connect.
+	// https URL constructs successfully and the TLS handshake happens on first
+	// connect.
 	auto https = new HttpClientTransport("https://example.com/mcp");
 	assert(https !is null);
-	auto wss = new HttpClientTransport("wss://example.com/mcp");
-	assert(wss !is null);
 
 	// A plaintext http URL still constructs fine (the common case is unaffected).
 	auto ok = new HttpClientTransport("http://127.0.0.1:8080/mcp");
