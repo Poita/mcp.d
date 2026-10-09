@@ -56,6 +56,17 @@ struct TokenInfo
 		return audience.any!(a => canonicalResourceUri(a) == want);
 	}
 
+	/// A deep copy sharing no `claims`, `scopes` or `audience` storage with
+	/// this one, so a holder mutating either cannot affect the other.
+	TokenInfo dup() @safe
+	{
+		TokenInfo c = this;
+		c.claims = claims.clone();
+		c.scopes = scopes.dup;
+		c.audience = audience.dup;
+		return c;
+	}
+
 	/// A convenience constructor for a rejected token.
 	static TokenInfo invalid() @safe
 	{

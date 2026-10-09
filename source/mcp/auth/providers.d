@@ -27,6 +27,7 @@ import mcp.auth.jwt_verifier : JwtVerifierConfig, jwtVerifier;
 import mcp.auth.oauth : TokenEndpointAuthMethod;
 import mcp.auth.oauth_proxy : IssueTokenHook, OAuthProxyConfig;
 import mcp.auth.reference_token : ReferenceTokenStore;
+import mcp.auth.token_cache : TokenCache, TokenCacheOptions;
 import mcp.auth.resource_server : ResourceServerConfig, TokenInfo, TokenValidator,
 	TokenVerifierUnavailableException, isSsrfRefusal, isUnavailableStatus, parseRetryAfter;
 
@@ -475,17 +476,20 @@ private TokenInfo providerCheck(string provider, TokenInfo delegate() @safe chec
 /// the token's granted scopes, and `claims` is GitHub's response minus the
 /// echoed token. The `github` preset installs this by default.
 ///
-/// Every validation makes one HTTPS request to GitHub, which counts against
-/// the app's API rate limit.
-TokenValidator githubTokenVerifier(string clientId, string clientSecret) @safe
+/// Each check is one HTTPS request to GitHub, counted against the app's API
+/// rate limit, so results are cached per `cache` (by default a valid token for
+/// 60 seconds, a rejected one for 10) and concurrent checks of one token share
+/// a request. A token revoked at GitHub keeps verifying until its entry expires.
+TokenValidator githubTokenVerifier(string clientId, string clientSecret,
+		TokenCacheOptions cache = TokenCacheOptions.init) @safe
 {
 	return githubTokenVerifierWith(clientId, clientSecret,
-			(ProviderHttpRequest r) @safe => providerHttp(r));
+			(ProviderHttpRequest r) @safe => providerHttp(r), cache);
 }
 
 /// `githubTokenVerifier` over an arbitrary HTTP call.
-package TokenValidator githubTokenVerifierWith(string clientId,
-		string clientSecret, ProviderHttp http) @safe
+package TokenValidator githubTokenVerifierWith(string clientId, string clientSecret,
+		ProviderHttp http, TokenCacheOptions cacheOpts = TokenCacheOptions.init) @safe
 {
 	import std.base64 : Base64;
 	import std.uri : encodeComponent;
@@ -495,31 +499,32 @@ package TokenValidator githubTokenVerifierWith(string clientId,
 	const url = "https://api.github.com/applications/" ~ encodeComponent(clientId) ~ "/token";
 	const string authorization = "Basic " ~ Base64.encode(
 			cast(const(ubyte)[])(clientId ~ ":" ~ clientSecret)).idup;
+	auto cache = new TokenCache(cacheOpts);
 	return (string token) @safe {
 		if (token.length == 0)
 			return TokenInfo.invalid();
-		return providerCheck("GitHub", () @safe {
-			Json req = Json.emptyObject;
-			req["access_token"] = token;
-			const res = callProvider("GitHub", http,
+		return cache.lookup(token, () @safe => providerCheck("GitHub", () @safe {
+				Json req = Json.emptyObject;
+				req["access_token"] = token;
+				const res = callProvider("GitHub", http,
 				ProviderHttpRequest("POST", url, authorization, req.toString()));
-			if (res.status != 200)
-				return TokenInfo.invalid();
-			auto doc = parseUntrustedJson(res.body);
-			if (doc.type != Json.Type.object || jsonString(doc["app"], "client_id") != clientId)
-				return TokenInfo.invalid();
-			TokenInfo ti;
-			ti.valid = true;
-			ti.subject = jsonString(doc["user"], "login");
-			auto scopes = doc["scopes"];
-			if (scopes.type == Json.Type.array)
-				foreach (s; ()@trusted { return scopes.get!(Json[]); }())
-					if (s.type == Json.Type.string)
-						ti.scopes ~= s.get!string;
-			doc.remove("token");
-			ti.claims = doc;
-			return ti;
-		});
+				if (res.status != 200)
+					return TokenInfo.invalid();
+				auto doc = parseUntrustedJson(res.body);
+				if (doc.type != Json.Type.object || jsonString(doc["app"], "client_id") != clientId)
+					return TokenInfo.invalid();
+				TokenInfo ti;
+				ti.valid = true;
+				ti.subject = jsonString(doc["user"], "login");
+				auto scopes = doc["scopes"];
+				if (scopes.type == Json.Type.array)
+					foreach (s; ()@trusted { return scopes.get!(Json[]); }())
+						if (s.type == Json.Type.string)
+							ti.scopes ~= s.get!string;
+				doc.remove("token");
+				ti.claims = doc;
+				return ti;
+			}));
 	};
 }
 
@@ -533,14 +538,19 @@ package TokenValidator githubTokenVerifierWith(string clientId,
 /// `claims` is the tokeninfo response. The `google` preset installs this by
 /// default.
 ///
-/// Every validation makes one HTTPS request to Google.
-TokenValidator googleTokenVerifier(string clientId) @safe
+/// Each check is one HTTPS request to Google, so results are cached per `cache`
+/// (by default a valid token for 60 seconds, never past its `exp`, and a
+/// rejected one for 10) and concurrent checks of one token share a request. A
+/// token revoked at Google keeps verifying until its entry expires.
+TokenValidator googleTokenVerifier(string clientId, TokenCacheOptions cache = TokenCacheOptions()) @safe
 {
-	return googleTokenVerifierWith(clientId, (ProviderHttpRequest r) @safe => providerHttp(r));
+	return googleTokenVerifierWith(clientId, (ProviderHttpRequest r) @safe => providerHttp(r),
+			cache);
 }
 
 /// `googleTokenVerifier` over an arbitrary HTTP call.
-package TokenValidator googleTokenVerifierWith(string clientId, ProviderHttp http) @safe
+package TokenValidator googleTokenVerifierWith(string clientId,
+		ProviderHttp http, TokenCacheOptions cacheOpts = TokenCacheOptions.init) @safe
 {
 	import std.array : split;
 	import std.conv : to;
@@ -549,33 +559,34 @@ package TokenValidator googleTokenVerifierWith(string clientId, ProviderHttp htt
 	import mcp.protocol.jsonrpc : parseUntrustedJson;
 
 	enforce(clientId.length > 0, "googleTokenVerifier: clientId must be set.");
+	auto cache = new TokenCache(cacheOpts);
 	return (string token) @safe {
 		if (token.length == 0)
 			return TokenInfo.invalid();
-		return providerCheck("Google", () @safe {
-			const res = callProvider("Google", http, ProviderHttpRequest("POST",
+		return cache.lookup(token, () @safe => providerCheck("Google", () @safe {
+				const res = callProvider("Google", http, ProviderHttpRequest("POST",
 				"https://oauth2.googleapis.com/tokeninfo",
 				null, "access_token=" ~ encodeComponent(token),
 				"application/x-www-form-urlencoded"));
-			if (res.status != 200)
-				return TokenInfo.invalid();
-			auto doc = parseUntrustedJson(res.body);
-			if (doc.type != Json.Type.object)
-				return TokenInfo.invalid();
-			if (jsonString(doc, "aud") != clientId && jsonString(doc, "azp") != clientId)
-				return TokenInfo.invalid();
-			const exp = jsonString(doc, "exp");
-			if (exp.length == 0 || exp.to!long <= Clock.currTime.toUnixTime)
-				return TokenInfo.invalid();
-			TokenInfo ti;
-			ti.valid = true;
-			ti.subject = jsonString(doc, "sub");
-			foreach (s; jsonString(doc, "scope").split(' '))
-				if (s.length)
-					ti.scopes ~= s;
-			ti.claims = doc;
-			return ti;
-		});
+				if (res.status != 200)
+					return TokenInfo.invalid();
+				auto doc = parseUntrustedJson(res.body);
+				if (doc.type != Json.Type.object)
+					return TokenInfo.invalid();
+				if (jsonString(doc, "aud") != clientId && jsonString(doc, "azp") != clientId)
+					return TokenInfo.invalid();
+				const exp = jsonString(doc, "exp");
+				if (exp.length == 0 || exp.to!long <= Clock.currTime.toUnixTime)
+					return TokenInfo.invalid();
+				TokenInfo ti;
+				ti.valid = true;
+				ti.subject = jsonString(doc, "sub");
+				foreach (s; jsonString(doc, "scope").split(' '))
+					if (s.length)
+						ti.scopes ~= s;
+				ti.claims = doc;
+				return ti;
+			}));
 	};
 }
 
@@ -1118,6 +1129,61 @@ unittest  // GITHUB: an unreachable check-token API reports the verifier unavail
 	assert(!info.valid && info.unavailable);
 	assert(!v("").valid);
 	assert(fake.calls == 1, "an empty token is rejected without a call");
+}
+
+unittest  // GITHUB: a valid result is cached, so a repeated token costs one check-token call
+{
+	auto fake = new FakeProviderHttp;
+	fake.answer = (ProviderHttpRequest req) @safe => ProviderHttpResponse(200,
+			`{"app":{"client_id":"Iv1.client"},"user":{"login":"octocat"}}`);
+	auto v = githubTokenVerifierWith("Iv1.client", "ghsecret", fake.call());
+	foreach (i; 0 .. 3)
+		assert(v("gho_valid").subject == "octocat");
+	assert(fake.calls == 1);
+}
+
+unittest  // GITHUB: a rejection is cached briefly; an outage is not cached
+{
+	auto fake = new FakeProviderHttp;
+	fake.answer = (ProviderHttpRequest req) @safe => ProviderHttpResponse(404);
+	auto v = githubTokenVerifierWith("Iv1.client", "ghsecret", fake.call());
+	assert(!v("gho_other").valid);
+	assert(!v("gho_other").valid);
+	assert(fake.calls == 1);
+
+	fake.answer = (ProviderHttpRequest req) @safe => ProviderHttpResponse(503);
+	assert(v("gho_new").unavailable);
+	assert(v("gho_new").unavailable);
+	assert(fake.calls == 3);
+}
+
+unittest  // GITHUB: caching can be switched off
+{
+	import core.time : Duration;
+
+	auto fake = new FakeProviderHttp;
+	fake.answer = (ProviderHttpRequest req) @safe => ProviderHttpResponse(200,
+			`{"app":{"client_id":"Iv1.client"},"user":{"login":"octocat"}}`);
+	auto v = githubTokenVerifierWith("Iv1.client", "ghsecret", fake.call(),
+			TokenCacheOptions(Duration.zero, Duration.zero));
+	v("gho_valid");
+	v("gho_valid");
+	assert(fake.calls == 2);
+}
+
+unittest  // GOOGLE: a valid result is cached, so a repeated token costs one tokeninfo call
+{
+	import std.conv : to;
+	import std.datetime.systime : Clock;
+
+	const exp = (Clock.currTime.toUnixTime + 3600).to!string;
+	auto fake = new FakeProviderHttp;
+	fake.answer = (ProviderHttpRequest req) @safe => ProviderHttpResponse(200,
+			`{"aud":"client.apps.googleusercontent.com","sub":"1234","exp":"` ~ exp ~ `"}`);
+	auto v = googleTokenVerifierWith("client.apps.googleusercontent.com", fake.call());
+	assert(v("ya29.valid").valid);
+	assert(v("ya29.valid").valid);
+	assert(fake.calls == 1);
 }
 
 unittest  // GITHUB: a 5xx or 429 answer reports the verifier unavailable; a 404 rejects the token

@@ -10,8 +10,9 @@
 /// yields an invalid result, an unreachable endpoint or a 429/5xx answer yields
 /// `TokenInfo.temporarilyUnavailable`, and `active:true` yields a valid
 /// `TokenInfo` with `scope`, `sub`, and `aud` mapped across, after enforcing the
-/// configured audience and required scopes. Positive results may be briefly
-/// cached.
+/// configured audience and required scopes. Concurrent introspections of one
+/// token are coalesced, rejections are briefly cached, and positive results may
+/// be cached on request.
 module mcp.auth.introspection_verifier;
 
 import core.time : Duration, seconds;
@@ -20,10 +21,11 @@ import std.algorithm : canFind;
 
 import vibe.data.json : Json, parseJsonString;
 
-import mcp.auth.jwt_verifier : audiences, currentUnixTime, includesAudience, jsonStr, splitScopes;
+import mcp.auth.jwt_verifier : audiences, includesAudience, jsonStr, splitScopes;
 import mcp.auth.oauth : TokenEndpointAuthMethod, basicAuthHeader, secureRequestHTTP;
 import mcp.auth.resource_server : TokenInfo, TokenValidator,
 	TokenVerifierUnavailableException, isSsrfRefusal, isUnavailableStatus, parseRetryAfter;
+import mcp.auth.token_cache : TokenCache, TokenCacheOptions;
 import mcp.protocol.jsonrpc : parseUntrustedJson;
 import mcp.protocol.ssrf : SsrfPolicy;
 
@@ -58,13 +60,16 @@ struct IntrospectionConfig
 	/// `ResourceServerConfig.requiredScopes` instead.
 	string[] requiredScopes;
 
-	/// Optional TTL for caching positive (`active:true`) introspection results,
-	/// keyed by the raw token. Zero (the default) disables caching. Caching trades
-	/// revocation latency for performance: a token revoked at the AS, or one whose
-	/// own `exp` is sooner than the TTL, may be served as valid from cache until
-	/// the entry expires. Entry expiry is clamped to the token's `exp` (RFC 7662)
-	/// when present, so the staleness window never outlives the token itself.
-	Duration cacheTtl = Duration.zero;
+	/// How introspection results are reused. Concurrent introspections of the
+	/// same token always share one request. Rejections are cached for
+	/// `cache.negativeTtl` (10 seconds by default). Positive (`active:true`)
+	/// results are not cached by default (`cache.ttl` is zero): revocation that
+	/// takes effect at once is the usual reason to introspect rather than verify
+	/// a JWT locally, and a positive cache would serve a revoked token as valid
+	/// until its entry expires. Set `cache.ttl` to trade that latency for fewer
+	/// requests; an entry's expiry is clamped to the token's `exp` (RFC 7662), so
+	/// it never outlives the token itself.
+	TokenCacheOptions cache = TokenCacheOptions(Duration.zero);
 
 	/// The SSRF policy applied to the introspection request. The default
 	/// requires `https` to a public host (plain `http` only to loopback); an AS
@@ -81,12 +86,12 @@ struct IntrospectionConfig
 /// (`valid == false` on `active:false`, HTTP failure, or parse error). Plug it
 /// into `ResourceServerConfig.validator`.
 ///
-/// Concurrency: the returned validator and its internal `PositiveCache` hold
-/// unsynchronized mutable state (the cached positive results). Like the rest of
-/// the SDK they are bound to vibe.d's default single-threaded event loop. Do not
-/// share the validator across worker threads; running the router with
-/// `HTTPServerOption.distribute` or worker threads is unsupported (see the
-/// concurrency contract in `mcp.transport.session`).
+/// Concurrency: the returned validator and its internal `TokenCache` hold
+/// unsynchronized mutable state (the cached results and in-flight lookups).
+/// Like the rest of the SDK they are bound to vibe.d's default single-threaded
+/// event loop. Do not share the validator across worker threads; running the
+/// router with `HTTPServerOption.distribute` or worker threads is unsupported
+/// (see the concurrency contract in `mcp.transport.session`).
 ///
 /// Throws when `cfg` names no introspection endpoint or client id, or an
 /// `authMethod` other than `clientSecretBasic`/`clientSecretPost`: RFC 7662
@@ -110,48 +115,38 @@ TokenValidator introspectionVerifier(IntrospectionConfig cfg) @safe
 /// rejects the token.
 package TokenValidator introspectionValidator(IntrospectionConfig cfg, Introspector introspector) @safe
 {
-	auto cache = cfg.cacheTtl > Duration.zero ? new PositiveCache(cfg.cacheTtl) : null;
+	auto cache = new TokenCache(cfg.cache);
 	return (string token) @safe {
 		if (token.length == 0)
 			return TokenInfo.invalid();
-		if (cache !is null)
-			if (auto hit = cache.get(token, currentUnixTime()))
-				return detached(*hit);
-		TokenInfo ti;
-		try
-		{
-			const doc = introspector.introspect(token);
-			ti = introspectionResult(cfg, doc);
-		}
-		catch (TokenVerifierUnavailableException e)
-		{
-			import vibe.core.log : logWarn;
-
-			logWarn("Token introspection at %s is unavailable: %s",
-					cfg.introspectionEndpoint, e.msg);
-			return TokenInfo.temporarilyUnavailable(e.retryAfter);
-		}
-		catch (Exception e)
-		{
-			import vibe.core.log : logWarn;
-
-			logWarn("Token introspection at %s failed; rejecting the token: %s",
-					cfg.introspectionEndpoint, e.msg);
-			return TokenInfo.invalid();
-		}
-		if (ti.valid && cache !is null)
-			cache.put(token, detached(ti), currentUnixTime());
-		return ti;
+		return cache.lookup(token, () @safe => introspectOnce(cfg, introspector, token));
 	};
 }
 
-/// A deep copy of `ti`, so a request handler mutating its `claims`, `scopes`,
-/// or `audience` cannot alter a cached entry shared with later requests.
-private TokenInfo detached(TokenInfo ti) @safe
+/// Introspect `token` once and map the answer, logging a failed call.
+private TokenInfo introspectOnce(IntrospectionConfig cfg, Introspector introspector, string token) @safe
 {
-	ti.claims = ti.claims.clone();
-	ti.scopes = ti.scopes.dup;
-	ti.audience = ti.audience.dup;
+	TokenInfo ti;
+	try
+	{
+		const doc = introspector.introspect(token);
+		ti = introspectionResult(cfg, doc);
+	}
+	catch (TokenVerifierUnavailableException e)
+	{
+		import vibe.core.log : logWarn;
+
+		logWarn("Token introspection at %s is unavailable: %s", cfg.introspectionEndpoint, e.msg);
+		return TokenInfo.temporarilyUnavailable(e.retryAfter);
+	}
+	catch (Exception e)
+	{
+		import vibe.core.log : logWarn;
+
+		logWarn("Token introspection at %s failed; rejecting the token: %s",
+				cfg.introspectionEndpoint, e.msg);
+		return TokenInfo.invalid();
+	}
 	return ti;
 }
 
@@ -309,107 +304,6 @@ private string postIntrospect(IntrospectionConfig cfg, string token) @trusted
 	return responseBody;
 }
 
-// ===========================================================================
-// Positive-result cache
-// ===========================================================================
-
-/// A short-TTL cache of positive (`active:true`) introspection results, keyed by
-/// the raw token. Negative results are never cached.
-///
-/// The keyed lookup is not constant-time, but a hit requires the attacker to
-/// already present a token that introspected as active, so it is not a guessing
-/// oracle; opaque bearer tokens are assumed to be high-entropy secrets.
-///
-/// Every `put` sweeps entries whose `expiresAt` is in the past, and when a new
-/// key would push `entries.length` past `maxEntries`, the entry with the earliest
-/// `expiresAt` is evicted. This keeps memory bounded under sustained load with
-/// many distinct short-lived tokens. Entries are also ordered by expiry, so a
-/// sweep visits only the expired entries and an eviction takes the first one:
-/// a `put` costs O(log n) plus the entries it removes.
-final class PositiveCache
-{
-	import std.container.rbtree : RedBlackTree;
-	import std.typecons : Tuple;
-
-	/// Default maximum number of live cache entries.
-	enum size_t defaultMaxEntries = 10_000;
-
-	private struct Entry
-	{
-		TokenInfo info;
-		long expiresAt; // unix seconds
-	}
-
-	private alias Expiry = Tuple!(long, "at", string, "token");
-
-	private Duration ttl;
-	private size_t maxEntries;
-	private Entry[string] entries;
-	// One element per entry, ordered by (expiresAt, token).
-	private RedBlackTree!Expiry byExpiry;
-
-	this(Duration ttl, size_t maxEntries = defaultMaxEntries) @safe
-	{
-		this.ttl = ttl;
-		this.maxEntries = maxEntries;
-		this.byExpiry = new RedBlackTree!Expiry;
-	}
-
-	/// Number of live (not yet swept) entries.
-	size_t length() @safe
-	{
-		return entries.length;
-	}
-
-	/// Return the cached `TokenInfo` for `token` if present and unexpired.
-	TokenInfo* get(string token, long now) @safe
-	{
-		if (auto e = token in entries)
-		{
-			if (now < e.expiresAt)
-				return &e.info;
-			remove(token, e.expiresAt);
-		}
-		return null;
-	}
-
-	/// Cache a positive result for `token`. The entry expiry is the TTL, clamped
-	/// down to the token's own `exp` (RFC 7662) when present, so a cached result
-	/// never outlives the token it represents. Expired entries are swept on every
-	/// call; when the cap would be exceeded by a new key, the soonest-expiring
-	/// entry is evicted first.
-	void put(string token, TokenInfo info, long now) @safe
-	{
-		long expiresAt = now + cast(long) ttl.total!"seconds";
-		const exp = introspectionExp(info.claims);
-		if (exp > 0 && exp < expiresAt)
-			expiresAt = exp;
-		if (expiresAt <= now)
-			return; // token is already expired — nothing to cache
-		sweep(now);
-		if (auto old = token in entries)
-			remove(token, old.expiresAt);
-		else if (maxEntries != 0)
-			while (entries.length >= maxEntries)
-				remove(byExpiry.front.token, byExpiry.front.at);
-		entries[token] = Entry(info, expiresAt);
-		byExpiry.insert(Expiry(expiresAt, token));
-	}
-
-	// Remove all entries whose expiresAt is not in the future.
-	private void sweep(long now) @safe
-	{
-		while (!byExpiry.empty && byExpiry.front.at <= now)
-			remove(byExpiry.front.token, byExpiry.front.at);
-	}
-
-	private void remove(string token, long expiresAt) @safe
-	{
-		byExpiry.removeKey(Expiry(expiresAt, token));
-		entries.remove(token);
-	}
-}
-
 // Maximum bytes accepted from an introspection endpoint response body.
 // RFC 7662 responses are tiny JSON objects; this cap prevents a hostile or
 // misconfigured endpoint from exhausting heap memory by streaming an
@@ -419,21 +313,6 @@ package enum size_t maxIntrospectionBodyBytes = 256 * 1024;
 // ===========================================================================
 // Small helpers
 // ===========================================================================
-
-/// Extract the `exp` claim (token expiry, unix seconds) from an introspection
-/// response (RFC 7662 2.2 / RFC 7519 4.1.1). Returns 0 when absent or not a
-/// number, signalling "no known expiry".
-long introspectionExp(Json doc) @safe
-{
-	if (doc.type != Json.Type.object)
-		return 0;
-	auto e = doc["exp"];
-	if (e.type == Json.Type.int_)
-		return e.get!long;
-	if (e.type == Json.Type.float_)
-		return cast(long) e.get!double;
-	return 0;
-}
 
 /// Extract granted scopes from an introspection response: `scope` is a
 /// space-delimited string (RFC 7662 2.2).
@@ -649,68 +528,6 @@ unittest  // an empty token is rejected without introspecting
 	assert(!stub.wasCalled);
 }
 
-unittest  // PositiveCache returns a hit before expiry and a miss after
-{
-	auto cache = new PositiveCache(30.seconds);
-	TokenInfo ti;
-	ti.valid = true;
-	ti.subject = "cached-user";
-	cache.put("tok", ti, 1000);
-
-	auto hit = cache.get("tok", 1010);
-	assert(hit !is null);
-	assert(hit.subject == "cached-user");
-
-	assert(cache.get("tok", 1040) is null); // expired (1000 + 30 == 1030)
-	assert(cache.get("other", 1010) is null); // never stored
-}
-
-unittest  // PositiveCache clamps entry expiry to the token's exp claim
-{
-	auto cache = new PositiveCache(30.seconds);
-	TokenInfo ti;
-	ti.valid = true;
-	// exp at 1005 is sooner than now(1000) + ttl(30) == 1030, so it must win.
-	ti.claims = parseJsonString(`{"active":true,"exp":1005}`);
-	cache.put("tok", ti, 1000);
-
-	assert(cache.get("tok", 1004) !is null); // still valid before exp
-	assert(cache.get("tok", 1005) is null); // expired at exp, not at 1030
-}
-
-unittest  // PositiveCache keeps the TTL when exp is later than now + ttl
-{
-	auto cache = new PositiveCache(30.seconds);
-	TokenInfo ti;
-	ti.valid = true;
-	ti.claims = parseJsonString(`{"active":true,"exp":9999}`);
-	cache.put("tok", ti, 1000);
-
-	assert(cache.get("tok", 1029) !is null); // within TTL window
-	assert(cache.get("tok", 1030) is null); // TTL (1030) bounds it, not exp
-}
-
-unittest  // PositiveCache falls back to the TTL when no exp is present
-{
-	auto cache = new PositiveCache(30.seconds);
-	TokenInfo ti;
-	ti.valid = true;
-	ti.claims = parseJsonString(`{"active":true}`);
-	cache.put("tok", ti, 1000);
-
-	assert(cache.get("tok", 1029) !is null);
-	assert(cache.get("tok", 1030) is null);
-}
-
-unittest  // introspectionExp parses integer and floating exp, 0 otherwise
-{
-	assert(introspectionExp(parseJsonString(`{"exp":1700}`)) == 1700);
-	assert(introspectionExp(parseJsonString(`{"exp":1700.9}`)) == 1700);
-	assert(introspectionExp(parseJsonString(`{"active":true}`)) == 0);
-	assert(introspectionExp(parseJsonString(`{"exp":"soon"}`)) == 0);
-	assert(introspectionExp(parseJsonString(`"not-an-object"`)) == 0);
-}
-
 unittest  // postIntrospect body read is capped at maxIntrospectionBodyBytes
 {
 	// Verify that readAllUTF8 throws when given more data than the cap allows.
@@ -840,97 +657,6 @@ unittest  // HttpIntrospector refuses an internal/link-local introspection endpo
 	assertThrown(introspector.introspect("some-token"));
 }
 
-unittest  // PositiveCache does not grow beyond the configured maxEntries cap
-{
-	// A cache with cap of 3 — inserting 5 distinct tokens must not keep all 5.
-	auto cache = new PositiveCache(60.seconds, 3);
-	TokenInfo ti;
-	ti.valid = true;
-	foreach (i; 0 .. 5)
-	{
-		import std.conv : to;
-
-		cache.put("tok-" ~ i.to!string, ti, 1000);
-	}
-	// The map must be capped; all 5 entries must NOT all be present.
-	assert(cache.length <= 3);
-}
-
-unittest  // PositiveCache sweeps expired entries on put, reclaiming space
-{
-	// All entries inserted at t=1000 with ttl=30s expire at t=1030.
-	// After advancing past expiry, a new put must sweep the stale entries.
-	auto cache = new PositiveCache(30.seconds, 10);
-	TokenInfo ti;
-	ti.valid = true;
-	cache.put("a", ti, 1000);
-	cache.put("b", ti, 1000);
-	// Advance past expiry and insert a new entry.
-	cache.put("c", ti, 1031);
-	// "a" and "b" should have been swept; only "c" should remain.
-	assert(cache.get("a", 1031) is null);
-	assert(cache.get("b", 1031) is null);
-	assert(cache.get("c", 1031) !is null);
-}
-
-unittest  // PositiveCache drops expired entries from its length once a later put runs
-{
-	auto cache = new PositiveCache(30.seconds, 10);
-	TokenInfo ti;
-	ti.valid = true;
-	cache.put("a", ti, 1000);
-	cache.put("b", ti, 1000);
-	cache.put("c", ti, 1031);
-	assert(cache.length == 1);
-}
-
-unittest  // PositiveCache evicts the soonest-expiring entry when full
-{
-	auto cache = new PositiveCache(60.seconds, 2);
-	TokenInfo late, soon;
-	late.valid = soon.valid = true;
-	soon.claims = parseJsonString(`{"active":true,"exp":1010}`);
-	cache.put("late", late, 1000);
-	cache.put("soon", soon, 1000);
-	cache.put("new", late, 1001);
-	assert(cache.get("soon", 1001) is null);
-	assert(cache.get("late", 1001) !is null);
-	assert(cache.get("new", 1001) !is null);
-}
-
-unittest  // PositiveCache re-putting a token moves its expiry for eviction and sweeping
-{
-	auto cache = new PositiveCache(60.seconds, 2);
-	TokenInfo ti;
-	ti.valid = true;
-	cache.put("a", ti, 1000); // expires 1060
-	cache.put("b", ti, 1010); // expires 1070
-	cache.put("a", ti, 1020); // now expires 1080, so "b" expires first
-	assert(cache.length == 2);
-	cache.put("c", ti, 1030);
-	assert(cache.get("b", 1030) is null);
-	assert(cache.get("a", 1030) !is null);
-	cache.put("d", ti, 1075); // "c" (1090) and "a" (1080) are both still live
-	assert(cache.length == 2);
-	assert(cache.get("a", 1075) is null, "the cap evicts the soonest-expiring entry");
-	assert(cache.get("c", 1075) !is null);
-}
-
-unittest  // PositiveCache skips storing a token whose exp claim is already in the past
-{
-	// TTL = 30s, now = 1000, but exp = 500 (500 s in the past).
-	// The clamping sets expiresAt = 500, which is already expired relative to now.
-	// put must not store the entry; the cache must remain empty.
-	auto cache = new PositiveCache(30.seconds);
-	TokenInfo ti;
-	ti.valid = true;
-	ti.claims = parseJsonString(`{"active":true,"exp":500}`);
-	cache.put("tok", ti, 1000);
-	// The entry must not be stored — length stays 0 and a get returns null.
-	assert(cache.length == 0);
-	assert(cache.get("tok", 1000) is null);
-}
-
 version (unittest)
 {
 	import vibe.core.log : LogLevel, Logger, LogLine;
@@ -981,7 +707,7 @@ unittest  // a failed introspection call is logged rather than silently rejected
 unittest  // a caller mutating a cached result's claims, scopes, or audience leaves the cache intact
 {
 	IntrospectionConfig cfg;
-	cfg.cacheTtl = 60.seconds;
+	cfg.cache.ttl = 60.seconds;
 	auto stub = new StubIntrospector(`{"active":true,"sub":"u1","scope":"mcp:read","aud":"https://mcp.example.com/mcp","role":"user"}`);
 	auto v = stubVerifier(cfg, stub);
 
@@ -998,6 +724,27 @@ unittest  // a caller mutating a cached result's claims, scopes, or audience lea
 	assert(third.claims["role"].get!string == "user");
 	assert(third.scopes == ["mcp:read"]);
 	assert(third.audience == ["https://mcp.example.com/mcp"]);
+}
+
+unittest  // positive introspection results are not cached by default, so a revocation takes effect at once
+{
+	IntrospectionConfig cfg;
+	auto stub = new StubIntrospector(`{"active":true,"sub":"u1"}`);
+	auto v = stubVerifier(cfg, stub);
+	assert(v("tok").valid);
+	stub.response = `{"active":false}`;
+	assert(!v("tok").valid);
+}
+
+unittest  // an inactive token is briefly negatively cached
+{
+	IntrospectionConfig cfg;
+	auto stub = new StubIntrospector(`{"active":false}`);
+	auto v = stubVerifier(cfg, stub);
+	assert(!v("tok").valid);
+	stub.wasCalled = false;
+	assert(!v("tok").valid);
+	assert(!stub.wasCalled, "a repeated dead token must not cost another introspection");
 }
 
 unittest  // an unavailable introspection endpoint yields a temporarily-unavailable TokenInfo
