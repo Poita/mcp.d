@@ -590,6 +590,12 @@ interface RedirectUriRegistry
 	/// A pure lookup: it does not change how the registration is retained.
 	bool isRegistered(string redirectUri) @safe;
 
+	/// Record that an authorization for a client holding `redirectUri` is in
+	/// progress (the proxy minted pending state for it at `/authorize`). A
+	/// registry should retain such registrations for the life of that
+	/// authorization rather than evict them ahead of idle ones.
+	void markPending(string redirectUri) @safe;
+
 	/// Record that a client holding `redirectUri` completed a sign-in (the
 	/// proxy relayed it an authorization code, which happens only after user
 	/// consent). A registry may retain such registrations ahead of ones that
@@ -600,7 +606,7 @@ interface RedirectUriRegistry
 /// Bounds for an `InMemoryRedirectUriRegistry`.
 struct RedirectUriRegistryOptions
 {
-	import core.time : MonoTime, hours;
+	import core.time : MonoTime, hours, minutes;
 
 	/// Maximum number of live registrations (one per `/register` call). When
 	/// exceeded on `register`, one registration is evicted as a whole.
@@ -610,6 +616,11 @@ struct RedirectUriRegistryOptions
 	/// A registration marked used (see `RedirectUriRegistry.markUsed`) does not
 	/// expire.
 	Duration unusedTtl = 1.hours;
+
+	/// How long `markPending` shields an unused registration from expiry and
+	/// from eviction ahead of idle registrations; it matches the life of a
+	/// pending authorization in the HTTP mount.
+	Duration pendingTtl = 10.minutes;
 
 	/// Injectable monotonic clock (tests drive expiry with it). Null uses
 	/// `MonoTime.currTime`.
@@ -627,11 +638,13 @@ struct RedirectUriRegistryOptions
 /// which the proxy does only when it relays an authorization code (after the
 /// user consented and signed in upstream). Merely presenting a redirect URI at
 /// `/authorize` does not, so an anonymous client cannot make its registration
-/// sticky. Unused registrations expire after `unusedTtl`, and eviction prefers
-/// the oldest unused registration, falling back to the oldest registration only
-/// when every older one is in use. A flood of anonymous registrations therefore
-/// displaces other never-used registrations before a client that is actually
-/// signing users in.
+/// sticky; it marks the registration pending instead, which shields it for
+/// `pendingTtl` (after which it counts as freshly registered). Unused
+/// registrations expire after `unusedTtl`, and eviction prefers the oldest
+/// unused registration that has no authorization pending, falling back to the
+/// oldest registration only when there is none. A flood of anonymous
+/// registrations therefore displaces other idle registrations before a client
+/// whose user is mid-sign-in or that is actually signing users in.
 ///
 /// NOTE: even bounded, the unbounded-default in-memory backing is unsuitable for
 /// an internet-exposed multi-process proxy: state is per-process and lost on
@@ -641,20 +654,58 @@ final class InMemoryRedirectUriRegistry : RedirectUriRegistry
 {
 	import core.time : MonoTime;
 
+	private enum Status
+	{
+		unused,
+		pending,
+		used,
+	}
+
 	/// One registration, linked into the all-registrations list (oldest first)
-	/// and, while unused, the unused list (oldest first), so lookup, removal and
-	/// eviction are constant time.
+	/// and, unless used, into the unused or the pending list (oldest first), so
+	/// lookup, removal and eviction are constant time.
 	private static final class Registration
 	{
 		string handle;
 		string[] uris;
 		MonoTime registeredAt;
-		bool used;
-		Registration prevAll, nextAll, prevUnused, nextUnused;
+		MonoTime pendingUntil;
+		Status status;
+		Registration prevAll, nextAll, prev, next;
+	}
+
+	private static struct List
+	{
+		Registration head, tail;
+
+		void append(Registration r) @safe
+		{
+			r.prev = tail;
+			r.next = null;
+			if (tail !is null)
+				tail.next = r;
+			else
+				head = r;
+			tail = r;
+		}
+
+		void unlink(Registration r) @safe
+		{
+			if (r.prev !is null)
+				r.prev.next = r.next;
+			else
+				head = r.next;
+			if (r.next !is null)
+				r.next.prev = r.prev;
+			else
+				tail = r.prev;
+			r.prev = r.next = null;
+		}
 	}
 
 	private Registration[string] byHandle;
-	private Registration allHead, allTail, unusedHead, unusedTail;
+	private Registration allHead, allTail;
+	private List unused, pending;
 	private bool[string][string] handlesByUri;
 	private const RedirectUriRegistryOptions opts;
 
@@ -674,23 +725,24 @@ final class InMemoryRedirectUriRegistry : RedirectUriRegistry
 		// back of the eviction order.
 		if (auto r = registrationHandle in byHandle)
 			removeRegistration(*r);
-		sweepExpired();
+		sweep();
 		auto r = new Registration;
 		r.handle = registrationHandle;
 		r.uris = redirectUris.dup;
 		r.registeredAt = now();
 		byHandle[registrationHandle] = r;
 		linkAll(r);
-		linkUnused(r);
+		unused.append(r);
 		foreach (u; r.uris)
 			handlesByUri[u][registrationHandle] = true;
 		enforceCap();
 	}
 
-	/// Whether `redirectUri` belongs to a live registration: one marked used, or
-	/// an unused one younger than `unusedTtl`.
+	/// Whether `redirectUri` belongs to a live registration: one marked used or
+	/// pending, or an unused one younger than `unusedTtl`.
 	override bool isRegistered(string redirectUri) @safe
 	{
+		sweepPending();
 		auto hs = redirectUri in handlesByUri;
 		if (hs is null)
 			return false;
@@ -700,8 +752,27 @@ final class InMemoryRedirectUriRegistry : RedirectUriRegistry
 		return false;
 	}
 
+	override void markPending(string redirectUri) @safe
+	{
+		sweepPending();
+		auto hs = redirectUri in handlesByUri;
+		if (hs is null)
+			return;
+		foreach (h; (*hs).byKey)
+		{
+			auto r = byHandle[h];
+			if (r.status == Status.used || isExpired(r))
+				continue;
+			detach(r);
+			r.status = Status.pending;
+			r.pendingUntil = now() + opts.pendingTtl;
+			pending.append(r);
+		}
+	}
+
 	override void markUsed(string redirectUri) @safe
 	{
+		sweepPending();
 		auto hs = redirectUri in handlesByUri;
 		if (hs is null)
 			return;
@@ -710,8 +781,8 @@ final class InMemoryRedirectUriRegistry : RedirectUriRegistry
 			auto r = byHandle[h];
 			if (!isExpired(r))
 			{
-				unlinkUnused(r);
-				r.used = true;
+				detach(r);
+				r.status = Status.used;
 			}
 		}
 	}
@@ -723,15 +794,32 @@ final class InMemoryRedirectUriRegistry : RedirectUriRegistry
 
 	private bool isExpired(Registration r) @safe
 	{
-		return !r.used && now() - r.registeredAt >= opts.unusedTtl;
+		return r.status == Status.unused && now() - r.registeredAt >= opts.unusedTtl;
 	}
 
-	// Drop expired unused registrations. The unused list is oldest first, so the
-	// sweep stops at the first one that is still live.
-	private void sweepExpired() @safe
+	private void sweep() @safe
 	{
-		while (unusedHead !is null && isExpired(unusedHead))
-			removeRegistration(unusedHead);
+		sweepPending();
+		// The unused list is oldest first, so the sweep stops at the first
+		// registration that is still live.
+		while (unused.head !is null && isExpired(unused.head))
+			removeRegistration(unused.head);
+	}
+
+	// Return registrations whose pending authorization has lapsed to the unused
+	// list, as if registered when it lapsed. The pending list is ordered by
+	// `pendingUntil`, so this stops at the first one still pending.
+	private void sweepPending() @safe
+	{
+		const t = now();
+		while (pending.head !is null && pending.head.pendingUntil <= t)
+		{
+			auto r = pending.head;
+			pending.unlink(r);
+			r.status = Status.unused;
+			r.registeredAt = r.pendingUntil;
+			unused.append(r);
+		}
 	}
 
 	private void removeRegistration(Registration r) @safe
@@ -747,17 +835,34 @@ final class InMemoryRedirectUriRegistry : RedirectUriRegistry
 		}
 		byHandle.remove(r.handle);
 		unlinkAll(r);
-		unlinkUnused(r);
+		detach(r);
+	}
+
+	// Unlink `r` from the unused or pending list it is on.
+	private void detach(Registration r) @safe
+	{
+		final switch (r.status)
+		{
+		case Status.unused:
+			unused.unlink(r);
+			break;
+		case Status.pending:
+			pending.unlink(r);
+			break;
+		case Status.used:
+			break;
+		}
 	}
 
 	private void enforceCap() @safe
 	{
 		while (byHandle.length > opts.maxRegistrations)
 		{
-			// Evict the oldest unused registration. The newest registration is
-			// exempt, so a registry full of in-use clients still admits a new one
-			// (evicting the oldest).
-			removeRegistration(unusedHead !is null && unusedHead !is allTail ? unusedHead : allHead);
+			// Evict the oldest idle registration. The newest registration is
+			// exempt, so a registry full of in-use or pending clients still admits
+			// a new one (evicting the oldest).
+			removeRegistration(unused.head !is null && unused.head !is allTail ? unused.head
+					: allHead);
 		}
 	}
 
@@ -782,31 +887,6 @@ final class InMemoryRedirectUriRegistry : RedirectUriRegistry
 		else
 			allTail = r.prevAll;
 		r.prevAll = r.nextAll = null;
-	}
-
-	private void linkUnused(Registration r) @safe
-	{
-		r.prevUnused = unusedTail;
-		if (unusedTail !is null)
-			unusedTail.nextUnused = r;
-		else
-			unusedHead = r;
-		unusedTail = r;
-	}
-
-	private void unlinkUnused(Registration r) @safe
-	{
-		if (r.used)
-			return;
-		if (r.prevUnused !is null)
-			r.prevUnused.nextUnused = r.nextUnused;
-		else
-			unusedHead = r.nextUnused;
-		if (r.nextUnused !is null)
-			r.nextUnused.prevUnused = r.prevUnused;
-		else
-			unusedTail = r.prevUnused;
-		r.prevUnused = r.nextUnused = null;
 	}
 }
 
@@ -1457,10 +1537,15 @@ final class OAuthProxy
 	/// forward (`forwardedScopes`), so a request for broader access than was
 	/// approved re-prompts. The integrator presents a consent screen, records
 	/// approval, then retries.
+	///
+	/// Once `clientRedirectUri` validates, its registration is marked pending
+	/// (`RedirectUriRegistry.markPending`), so a `/register` flood does not evict
+	/// it while the user is signing in.
 	string authorize(string consentSession, string clientRedirectUri,
 			string codeChallenge, string scopeStr, string state) @safe
 	{
 		validateRedirectUri(clientRedirectUri);
+		redirectRegistry.markPending(redirectUriMatchKey(clientRedirectUri));
 		if (!hasConsent(consentSession, clientRedirectUri, forwardedScopes(scopeStr)))
 			throw new ConsentRequiredException(clientRedirectUri);
 		return proxyAuthorizeUrl(cfg, codeChallenge, scopeStr, state);
@@ -1477,6 +1562,7 @@ final class OAuthProxy
 			string codeChallenge, string scopeStr, string state) @safe
 	{
 		validateRedirectUri(clientRedirectUri);
+		redirectRegistry.markPending(redirectUriMatchKey(clientRedirectUri));
 		return proxyAuthorizeUrl(cfg, codeChallenge, scopeStr, state);
 	}
 
@@ -2984,6 +3070,50 @@ unittest  // REDIRECT REGISTRY: InMemoryRedirectUriRegistry exact-matches across
 	assert(reg.isRegistered("https://a/cb"));
 	assert(reg.isRegistered("https://b/cb"));
 	assert(!reg.isRegistered("https://c/cb"));
+}
+
+unittest  // REDIRECT REGISTRY: a registration with a pending authorization is evicted after idle ones
+{
+	auto reg = new InMemoryRedirectUriRegistry(RedirectUriRegistryOptions(2));
+	reg.register("h1", ["https://a/cb"]);
+	reg.register("h2", ["https://b/cb"]);
+	reg.markPending("https://a/cb");
+	reg.register("h3", ["https://c/cb"]);
+	assert(reg.isRegistered("https://a/cb"));
+	assert(!reg.isRegistered("https://b/cb"));
+	assert(reg.isRegistered("https://c/cb"));
+}
+
+unittest  // REDIRECT REGISTRY: a pending authorization keeps an unused registration past its unused TTL
+{
+	import core.time : minutes;
+
+	auto t = MonoTime.currTime;
+	RedirectUriRegistryOptions opts;
+	opts.clock = () @safe => t;
+	auto reg = new InMemoryRedirectUriRegistry(opts);
+	reg.register("h1", ["https://a/cb"]);
+	t += opts.unusedTtl - 1.minutes;
+	reg.markPending("https://a/cb");
+	t += 2.minutes;
+	assert(reg.isRegistered("https://a/cb"));
+	t += opts.pendingTtl + opts.unusedTtl;
+	assert(!reg.isRegistered("https://a/cb"));
+}
+
+unittest  // REDIRECT REGISTRY: an authorization in progress keeps its registration through a /register flood
+{
+	auto reg = new InMemoryRedirectUriRegistry(RedirectUriRegistryOptions(2));
+	auto proxy = new OAuthProxy(sampleConfig(), new InMemoryConsentStore(), reg);
+	proxy.register(["https://a.example/cb"]);
+	try
+		cast(void) proxy.authorize("browser-1", "https://a.example/cb", "CH", "read:user", "S");
+	catch (ConsentRequiredException)
+	{
+	}
+	proxy.register(["https://b.example/cb"]);
+	proxy.register(["https://c.example/cb"]);
+	proxy.validateRedirectUri("https://a.example/cb");
 }
 
 unittest  // REDIRECT REGISTRY: the registry caps live registrations, evicting the oldest as a unit
