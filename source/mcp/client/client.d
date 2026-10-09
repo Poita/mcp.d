@@ -329,6 +329,12 @@ struct ClientSettings
 	/// pre-cache behavior; a positive value caches even unhinted responses for
 	/// this long. A server-supplied hint always takes precedence over this.
 	///
+	/// A result cached only under this fallback is stored `private`, under this
+	/// client's `cachePartition`: without a server hint the client cannot know
+	/// the result is identity-independent, so a shared `cache` never serves it
+	/// to another partition. Only an explicit server `cacheScope: public` hint
+	/// makes a result shared.
+	///
 	/// This governs only which responses are cached. The tool schemas used for
 	/// `x-mcp-header` mirroring and output-schema validation are kept from every
 	/// `listTools` independently of the cache, until `tools/list_changed`.
@@ -1673,7 +1679,8 @@ final class McpClient : ClientProtocol
 	/// calling `fetch`; `bypass` skips the cache entirely (no read, no write);
 	/// `refresh` always fetches and re-stores. On a miss/refresh the result is
 	/// stored with an absolute expiry of `now + ttl` (the server hint, or
-	/// `defaultCacheTtl` when absent); a non-positive `ttl` stores nothing.
+	/// `defaultCacheTtl` when absent); a non-positive `ttl` stores nothing. An
+	/// unhinted result is stored `private`: only a server hint makes it `public`.
 	///
 	/// A `public` result lives under the shared empty partition (every client hits
 	/// the same key); a `private` result lives under this client's `cachePartition`
@@ -1715,7 +1722,7 @@ final class McpClient : ClientProtocol
 		const ttl = result.cache.isNull ? defaultCacheTtl_ : result.cache.get.ttl;
 		if (ttl > Duration.zero)
 		{
-			const scope_ = result.cache.isNull ? CacheScope.public_ : result.cache.get.cacheScope;
+			const scope_ = result.cache.isNull ? CacheScope.private_ : result.cache.get.cacheScope;
 			const storeKey = scopedKey(logical, scope_);
 			cacheStore_.put(storeKey, CacheEntry(result.toJson(), now_() + ttl, scope_));
 			// If the scope flipped since a prior fetch, drop the now-stale entry
@@ -8922,6 +8929,40 @@ unittest  // a bearer switch on one server's client keeps the principal's entrie
 	assert(bCalls == 1, "server B's entry must survive a re-authentication against server A");
 	a.listTools();
 	assert(aCalls == 2, "server A's own private entry must be evicted");
+}
+
+unittest  // an unhinted result cached under defaultCacheTtl stays in its own partition
+{
+	import core.time : seconds;
+
+	auto store = new InMemoryCacheStore();
+	int aCalls, bCalls;
+	McpClient unhinted(string partition, int* calls) @safe
+	{
+		ClientSettings s;
+		s.cache = store;
+		s.cachePartition = partition;
+		s.defaultCacheTtl = 60.seconds;
+		auto c = McpClient.http("http://localhost", s);
+		c.onRpcForTest = (string m, Json p) @safe {
+			Json r = Json.emptyObject;
+			if (m == "tools/list")
+			{
+				(*calls)++;
+				r["tools"] = Json.emptyArray;
+			}
+			return r;
+		};
+		return c;
+	}
+
+	auto a = unhinted("alice", &aCalls);
+	auto b = unhinted("bob", &bCalls);
+	a.listTools();
+	b.listTools();
+	a.listTools();
+	assert(aCalls == 1 && bCalls == 1,
+			"a fallback-TTL entry must not be served to another partition");
 }
 
 unittest  // a public result in a shared store is hit by every partition (one fetch total)
