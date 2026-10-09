@@ -35,7 +35,8 @@ private __gshared bool _ranStdio;
 ///     `ctx.isCancelled` does not stall the read loop. Notifications the handler
 ///     emits (`notifications/message`, `notifications/progress`) and the request's
 ///     reply are written through `channel.send` (serialized against other
-///     writers). While `opts.maxInFlight` handlers run, no further line is read;
+///     writers). At most `opts.maxInFlight` requests and batches run at once;
+///     further ones wait for a slot, and the read loop keeps reading meanwhile;
 ///   - a *notification* (e.g. `notifications/cancelled`, `notifications/initialized`)
 ///     is handled inline; an inbound `notifications/cancelled` flips the matching
 ///     in-flight request's `CancellationToken` concurrently with its running
@@ -119,6 +120,111 @@ void serveStdio(McpServer server, string delegate() @safe readLine,
 		});
 	}
 
+	// Admission control: at most `maxInFlight` requests and batches are handled
+	// at once. The read loop never waits for a slot, so replies to server->client
+	// requests, cancellations and end-of-input are always seen; a request or batch
+	// arriving while every slot is busy waits in `backlog` (in arrival order, up
+	// to `maxInFlight` entries) and is run by the next slot to free up. One
+	// arriving while the backlog is full is refused with an error.
+	size_t running;
+	Admitted[] backlog;
+
+	void runAdmitted(Admitted item) @safe nothrow
+	{
+		if (item.batch is null)
+		{
+			replyToRequest(server, &sink, &serverRequest, item.request, channel);
+			return;
+		}
+		try
+		{
+			auto reply = server.handleRaw(item.batch, &sink, &serverRequest);
+			if (reply.length)
+				channel.sendRaw(reply);
+		}
+		catch (Exception e)
+			channel.reportError("batch: " ~ e.msg);
+	}
+
+	// Answer every request in `item` with an error: the server is saturated.
+	void refuse(Admitted item) @safe nothrow
+	{
+		import mcp.protocol.errors : internalError;
+		import mcp.protocol.jsonrpc : makeErrorResponse, parseAny;
+		import std.conv : to;
+
+		try
+		{
+			auto err = internalError("server busy: " ~ opts.maxInFlight.to!string
+					~ " requests are in flight and " ~ backlog.length.to!string ~ " are queued");
+			if (item.batch is null)
+			{
+				channel.send(makeErrorResponse(item.request.id, err));
+				return;
+			}
+			Json[] replies;
+			foreach (msg; parseAny(item.batch).messages)
+				if (msg.kind == MessageKind.request)
+					replies ~= makeErrorResponse(msg.id, err);
+			if (replies.length)
+				channel.send(Json(replies));
+		}
+		catch (Exception e)
+			channel.reportError("refusing a request: " ~ e.msg);
+	}
+
+	// Whether `item` may run now. Otherwise it is queued or refused.
+	bool admit(Admitted item) @safe
+	{
+		inflight.start();
+		if (opts.maxInFlight == 0 || running < opts.maxInFlight)
+		{
+			++running;
+			return true;
+		}
+		if (backlog.length < opts.maxInFlight)
+		{
+			backlog ~= item;
+			return false;
+		}
+		inflight.finish();
+		refuse(item);
+		return false;
+	}
+
+	// Run `first`, then whatever the backlog holds, on the current task. The
+	// caller holds one slot (see `admit`), released on return.
+	void runSlot(Admitted first) @safe nothrow
+	{
+		scope (exit)
+			--running;
+		for (auto item = first;;)
+		{
+			runAdmitted(item);
+			inflight.finish();
+			if (backlog.length == 0)
+				break;
+			item = backlog[0];
+			backlog = backlog[1 .. $];
+		}
+	}
+
+	// Drop the queued request a `notifications/cancelled` names: it has not
+	// started, so it is never run and, per the cancellation rules, gets no reply.
+	void withdrawQueued(Json params) @safe
+	{
+		if (params.type != Json.Type.object || "requestId" !in params)
+			return;
+		const id = params["requestId"];
+		foreach (i, item; backlog)
+			if (item.batch is null && item.request.id == id)
+			{
+				backlog = backlog[0 .. i] ~ backlog[i + 1 .. $];
+				inflight.finish();
+				return;
+			}
+	}
+
 	void onInbound(Message m) @safe
 	{
 		final switch (m.kind)
@@ -147,18 +253,18 @@ void serveStdio(McpServer server, string delegate() @safe readLine,
 			// The channel already runs this on its own task, so a blocking or
 			// long-running handler (server->client request, cancellation poll loop)
 			// does not stall the read loop. The handler's notifications + reply ride
-			// `channel.send`. Track it as in-flight so EOF cannot abandon a handler
-			// that has computed its reply but not yet written it.
-			inflight.start();
-			scope (exit)
-				inflight.finish();
-			replyToRequest(server, &sink, &serverRequest, m, channel);
+			// `channel.send`.
+			if (admit(Admitted(m)))
+				runSlot(Admitted(m));
 			break;
 		case MessageKind.notification:
 			// The channel already runs this on its own task, started immediately, so
 			// initialized / cancelled take effect before the next line is read while
 			// an observer that blocks (e.g. re-listing roots) does not stall the loop.
-			// It counts toward `maxInFlight` like a request handler.
+			// Notifications bypass `maxInFlight`: a cancellation must reach a running
+			// handler, and one for a request still waiting for a slot withdraws it.
+			if (m.method == "notifications/cancelled")
+				withdrawQueued(m.params);
 			inflight.start();
 			scope (exit)
 				inflight.finish();
@@ -192,31 +298,13 @@ void serveStdio(McpServer server, string delegate() @safe readLine,
 			raw = takeBatchReplies(raw, &channel.resolveReply);
 		if (raw is null)
 			return;
-		inflight.start();
-		runTask((string text) nothrow{
-			try
-			{
-				auto reply = server.handleRaw(text, &sink, &serverRequest);
-				if (reply.length)
-					channel.sendRaw(reply);
-			}
-			catch (Exception e)
-				channel.reportError("batch: " ~ e.msg);
-			finally
-				inflight.finish();
-		}, raw);
+		Admitted batch;
+		batch.batch = raw;
+		if (admit(batch))
+			runTask((Admitted first) nothrow{ runSlot(first); }, batch);
 	}
 
-	// Backpressure: no further line is read while `maxInFlight` handlers run, so
-	// a peer cannot spawn handler tasks without bound.
-	string boundedReadLine() @safe
-	{
-		if (opts.maxInFlight != 0)
-			inflight.awaitBelow(opts.maxInFlight);
-		return readLine();
-	}
-
-	channel = new DuplexChannel(&boundedReadLine, writeLine, &onInbound, &onInboundBatch);
+	channel = new DuplexChannel(readLine, writeLine, &onInbound, &onInboundBatch);
 	channel.onError = opts.onError;
 	// Change notifications for a 2025-era client ride the same serialized writer.
 	server.attachStdioSink(&sink);
@@ -232,6 +320,14 @@ void serveStdio(McpServer server, string delegate() @safe readLine,
 	// until every dispatched handler task has finished, bounded by
 	// `opts.drainTimeout` so a stuck handler cannot hold the process open forever.
 	inflight.awaitIdle(opts.drainTimeout);
+}
+
+/// An inbound request, or a batch line (`batch` non-null), admitted for handling
+/// under `StdioOptions.maxInFlight`.
+private struct Admitted
+{
+	Message request;
+	string batch;
 }
 
 /// Count of running request handler tasks, signalling each time it returns to
@@ -258,16 +354,6 @@ private final class InflightCount
 	{
 		--count;
 		finished.emit();
-	}
-
-	/// Wait until fewer than `max` handlers are running.
-	void awaitBelow(size_t max) @safe
-	{
-		while (count >= max)
-		{
-			const ec = finished.emitCount;
-			() @trusted { finished.wait(ec); }();
-		}
 	}
 
 	/// Wait until no handler is running or `timeout` elapses.
@@ -350,11 +436,14 @@ struct StdioOptions
 	/// handlers still running to finish and write their replies before it returns.
 	Duration drainTimeout = 5.seconds;
 
-	/// The most inbound requests, batches and notifications handled at once
-	/// (`0`: unbounded). While this many handlers run, no further stdin line is
-	/// read, so a client cannot spawn handler tasks without bound. A reply to a
-	/// server->client request is a line too, so a handler awaiting one while the
-	/// cap is reached waits until `serverRequestTimeout` fails it.
+	/// The most inbound requests and batches handled at once (`0`: unbounded),
+	/// so a client cannot spawn handler tasks without bound. Up to this many more
+	/// wait, in arrival order, for a running one to finish; a request arriving
+	/// while that queue is full is answered with a -32603 "server busy" error.
+	/// stdin is always read, so replies to server->client requests,
+	/// `notifications/cancelled` (which also withdraws a queued request) and
+	/// end-of-input are seen however many handlers run. Notifications are not
+	/// counted.
 	size_t maxInFlight = 64;
 
 	/// How long a server->client request (elicitation, sampling, roots) waits for
@@ -1992,12 +2081,12 @@ version (unittest) private final class ServerLink
 // asserts. `serveStdio` runs as its own task; `drive` as another; the loop exits
 // when `drive` returns and the server task is told to stop (closeInput).
 version (unittest) private void withServer(McpServer server,
-		scope void delegate(ServerLink) @safe drive) @trusted
+		scope void delegate(ServerLink) @safe drive, StdioOptions opts = StdioOptions.init) @trusted
 {
 	auto link = new ServerLink;
 	runTask(() nothrow{
 		try
-			serveStdio(server, &link.readLine, &link.writeLine);
+			serveStdio(server, &link.readLine, &link.writeLine, opts);
 		catch (Exception)
 		{
 		}
@@ -3240,7 +3329,7 @@ unittest  // END-TO-END: a server tool's ctx.sample round-trips to the client's 
 			"server ctx.sample must round-trip to the client's onSampling over stdio");
 }
 
-unittest  // serveStdio stops reading while maxInFlight requests run, then resumes
+unittest  // serveStdio runs at most maxInFlight requests, queues as many more and refuses the rest
 {
 	auto s = new McpServer("inflight-cap", "1.0");
 	bool release;
@@ -3263,6 +3352,7 @@ unittest  // serveStdio stops reading while maxInFlight requests run, then resum
 		link.feed(`{"jsonrpc":"2.0","id":` ~ cast(char)(
 				'1' + i) ~ `,"method":"tools/call","params":{"name":"slow"}}`);
 	size_t readWhileBlocked, peakWhileBlocked;
+	string[] repliedWhileBlocked;
 	() @trusted {
 		runTask(() nothrow{
 			try
@@ -3280,6 +3370,7 @@ unittest  // serveStdio stops reading while maxInFlight requests run, then resum
 					yield();
 				readWhileBlocked = link.inPos;
 				peakWhileBlocked = peak;
+				repliedWhileBlocked = link.outbound.dup;
 				release = true;
 				foreach (_; 0 .. 256)
 					yield();
@@ -3294,6 +3385,122 @@ unittest  // serveStdio stops reading while maxInFlight requests run, then resum
 		runEventLoop();
 	}();
 	assert(peakWhileBlocked == 2, "no more than maxInFlight handlers run at once");
-	assert(readWhileBlocked == 2, "reading stops while maxInFlight handlers run");
-	assert(link.outbound.length == 5, "every request is answered once slots free");
+	assert(readWhileBlocked == 5, "reading continues while maxInFlight handlers run");
+	assert(repliedWhileBlocked.length == 1, "only the request beyond the queue is answered early");
+	auto refused = parseJsonString(repliedWhileBlocked[0]);
+	assert(refused["id"] == Json(5) && refused["error"]["code"].get!int == -32603);
+	assert(link.outbound.length == 5, "every queued request is answered once slots free");
+}
+
+unittest  // notifications/cancelled withdraws a request still waiting for an in-flight slot
+{
+	auto s = new McpServer("inflight-withdraw", "1.0");
+	bool release;
+	Tool slow = {name: "slow"};
+	s.registerTool(slow, (Json args, RequestContext ctx) @safe {
+		while (!release)
+			yield();
+		return CallToolResult.init;
+	});
+
+	StdioOptions opts;
+	opts.maxInFlight = 1;
+	string[] outputs;
+	withServer(s, (ServerLink link) @safe {
+		link.feed(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"slow"}}`);
+		link.feed(`{"jsonrpc":"2.0","id":2,"method":"ping"}`);
+		link.feed(`{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":2}}`);
+		foreach (_; 0 .. 32)
+			yield();
+		release = true;
+		foreach (_; 0 .. 32)
+			yield();
+		outputs = link.outbound.dup;
+	}, opts);
+	assert(outputs.length == 1, "the withdrawn request must not be answered");
+	assert(parseJsonString(outputs[0])["id"] == Json(1));
+}
+
+unittest  // a handler awaiting a client reply while maxInFlight handlers run still receives it
+{
+	import mcp.protocol.types : ElicitAction;
+
+	auto s = McpServer.stateful("stdio-cap-elicit", "1.0");
+	Tool ask = {name: "ask"};
+	s.registerTool(ask, (Json args, RequestContext ctx) @safe {
+		auto reply = ctx.elicit("Name?", Json(["type": Json("object")]));
+		CallToolResult r;
+		r.content = [
+			Content.makeText(reply.action == ElicitAction.accept
+				? reply.content["name"].get!string : "(declined)")
+		];
+		return r;
+	});
+
+	StdioOptions opts;
+	opts.maxInFlight = 1;
+	opts.serverRequestTimeout = 3.seconds;
+	string[] outputs;
+	withServer(s, (ServerLink link) @safe {
+		link.feed(`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{"elicitation":{}},"clientInfo":{"name":"t","version":"1"}}}`);
+		link.feed(`{"jsonrpc":"2.0","method":"notifications/initialized"}`);
+		link.feed(`{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"ask"}}`);
+		foreach (_; 0 .. 16)
+			yield();
+		long elicitId = -1;
+		foreach (o; link.outbound)
+		{
+			auto j = parseJsonString(o);
+			if ("method" in j && j["method"].get!string == "elicitation/create")
+				elicitId = j["id"].get!long;
+		}
+		assert(elicitId >= 0, "the handler never sent elicitation/create");
+		link.feed(`{"jsonrpc":"2.0","id":` ~ Json(elicitId)
+			.toString() ~ `,"result":{"action":"accept","content":{"name":"Ada"}}}`);
+		foreach (_; 0 .. 16)
+			yield();
+		outputs = link.outbound.dup;
+	}, opts);
+
+	bool answered;
+	foreach (o; outputs)
+	{
+		auto j = parseJsonString(o);
+		if ("id" in j && j["id"] == Json(2) && "result" in j)
+			answered = j["result"]["content"][0]["text"].get!string == "Ada";
+	}
+	assert(answered, "the elicitation reply must be read while the in-flight cap is reached");
+}
+
+unittest  // notifications/cancelled reaches a running handler while maxInFlight handlers run
+{
+	auto s = new McpServer("stdio-cap-cancel", "1.0");
+	auto entered = createManualEvent();
+	bool observedCancel;
+	Tool slow = {name: "slow"};
+	s.registerTool(slow, (Json args, RequestContext ctx) @safe {
+		entered.emit();
+		foreach (i; 0 .. 1000)
+		{
+			if (ctx.isCancelled)
+			{
+				observedCancel = true;
+				break;
+			}
+			yield();
+		}
+		return CallToolResult.init;
+	});
+
+	StdioOptions opts;
+	opts.maxInFlight = 1;
+	withServer(s, (ServerLink link) @safe {
+		link.feed(`{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"slow"}}`);
+		auto ec = entered.emitCount;
+		() @trusted { entered.wait(ec); }();
+		link.feed(`{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":2}}`);
+		foreach (_; 0 .. 16)
+			yield();
+	}, opts);
+	assert(observedCancel, "a cancellation must be read while the in-flight cap is reached");
 }
