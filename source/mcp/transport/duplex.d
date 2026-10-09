@@ -456,7 +456,10 @@ final class DuplexChannel
 		++writing_;
 		scope (exit)
 			--writing_;
-		writeLineDg(text);
+		try
+			writeLineDg(text);
+		catch (Exception e)
+			throw new ChannelWriteException("writing to the peer failed: " ~ e.msg);
 	}
 
 	/// Whether the channel has closed: the read loop ended (EOF or read error) or
@@ -478,6 +481,16 @@ final class DuplexChannel
 			return;
 		closed_ = true;
 		coord.failPending(internalError("stdio channel closed"));
+	}
+}
+
+/// Thrown by a `DuplexChannel` send when writing the line fails. The byte stream
+/// is broken (typically the peer closed its end), so the peer is gone.
+class ChannelWriteException : McpException
+{
+	this(string message) @safe pure nothrow
+	{
+		super(ErrorCode.internalError, message);
 	}
 }
 

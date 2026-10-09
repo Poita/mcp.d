@@ -8,7 +8,7 @@ import mcp.protocol.jsonrpc;
 import mcp.protocol.errors;
 import mcp.client.transport : BearerProvider, ClientTransport, ClientProtocol, InboundOrigin;
 import mcp.client.subscription : SubscriptionStream, ListenGate;
-import mcp.transport.duplex : DuplexChannel, defaultMaxLineBytes;
+import mcp.transport.duplex : ChannelWriteException, DuplexChannel, defaultMaxLineBytes;
 import mcp.protocol.mrtr : MetaKey;
 
 @safe:
@@ -279,19 +279,25 @@ final class StdioClientTransport : ClientTransport
 	}
 
 	/// `e`, or a `TransportClosedException` carrying its message when the channel
-	/// has closed, so the client can tell a dead server from a failed request.
+	/// has closed or a write to the server failed, so the client can tell a dead
+	/// server from a failed request.
 	private McpException closedOr(McpException e) @safe nothrow
 	{
 		import mcp.client.client : TransportClosedException;
 
-		bool closed;
+		const writeFailed = cast(ChannelWriteException) e !is null;
+		bool closed = writeFailed;
 		try
-			closed = channel !is null && channel.closed;
+			closed = closed || (channel !is null && channel.closed);
 		catch (Exception)
 		{
 		}
 		if (!closed || cast(TransportClosedException) e || e.code != ErrorCode.internalError)
 			return e;
+		// A failed write can precede the read loop seeing end-of-input, so the
+		// child's exit status is collected here too.
+		if (writeFailed && childExitStatus_.isNull && !closed_)
+			noteChildEndOfInput();
 		if (!childExitStatus_.isNull)
 			return new TransportClosedException(
 					e.msg ~ " (the server process exited with status " ~ statusText(
@@ -2058,4 +2064,29 @@ version (Posix) unittest  // closeProcess() with a write parked on a child that 
 	assert(timely);
 	assert(status == -SIGTERM);
 	assert(writeEnded, "the parked write must fail once the child is gone");
+}
+
+unittest  // a stdio write that fails because the server stopped reading surfaces as TransportClosedException
+{
+	import mcp.client.client : TransportClosedException;
+
+	auto toClient = new TestLines;
+	bool requestClosed, notifyClosed;
+	const failure = inLoopCapturing(() @safe {
+		auto client = McpClient.stdio(() @safe => toClient.take(), (string) @safe {
+			throw new Exception("Broken pipe");
+		});
+		try
+			client.ping();
+		catch (TransportClosedException)
+			requestClosed = true;
+		try
+			client.sendNotification("notifications/x");
+		catch (TransportClosedException)
+			notifyClosed = true;
+		toClient.closeEnd();
+	});
+	assert(failure.length == 0, failure);
+	assert(requestClosed, "a failed request write must raise TransportClosedException");
+	assert(notifyClosed, "a failed notification write must raise TransportClosedException");
 }
