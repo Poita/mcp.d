@@ -155,6 +155,14 @@ final class DuplexChannel
 		return true;
 	}
 
+	/// Whether `stopReadLoop` is ending the read loop. A `readLine` that keeps
+	/// consuming input without completing a line (a peer flooding an over-long
+	/// one) checks it to give up and return null.
+	bool stopping() const @safe nothrow
+	{
+		return stopping_;
+	}
+
 	/// Run the read loop inline on the current task (does not spawn a task).
 	/// `runStdio`/`serveStdio` call this so the server's main task IS the read
 	/// loop and the function blocks until stdin reaches EOF.

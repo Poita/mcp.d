@@ -9,6 +9,7 @@ import mcp.protocol.errors;
 import mcp.client.transport : BearerProvider, ClientTransport, ClientProtocol, InboundOrigin;
 import mcp.client.subscription : SubscriptionStream, ListenGate;
 import mcp.transport.duplex : ChannelWriteException, DuplexChannel, defaultMaxLineBytes;
+import mcp.transport.lines : FrameHead, frameHeadScanBytes, scanFrameHead;
 import mcp.protocol.mrtr : MetaKey;
 
 @safe:
@@ -362,6 +363,39 @@ final class StdioClientTransport : ClientTransport
 		}
 	}
 
+	/// A line from the server longer than `maxLineBytes` was dropped, `head`
+	/// being what its first bytes reveal. Report it, and fail the request it
+	/// answers or refuse the request it carries when its id is among those bytes.
+	private void noteOversized(FrameHead head, size_t maxLineBytes) @safe nothrow
+	{
+		import std.conv : to;
+
+		if (channel is null)
+			return;
+		string msg = "the server's message exceeds the ";
+		string id;
+		try
+		{
+			msg ~= maxLineBytes.to!string ~ "-byte line limit";
+			if (head.id.type != Json.Type.null_)
+				id = head.id.toString();
+		}
+		catch (Exception)
+		{
+		}
+		channel.reportError(msg ~ (id.length ? " (id " ~ id ~ ")" : "") ~ "; it was dropped");
+		try
+		{
+			if (head.hasMethod && id.length)
+				channel.post(makeErrorResponse(head.id, invalidRequest(msg)));
+			else if (head.id.type == Json.Type.int_)
+				channel.abort(head.id.get!long, internalError(msg));
+		}
+		catch (Exception)
+		{
+		}
+	}
+
 	void abort(long expectId, McpException reason) @safe
 	{
 		if (channel !is null)
@@ -559,7 +593,7 @@ final class StdioClientTransport : ClientTransport
 		() @trusted {
 			if (c.reader !is null)
 			{
-				string discard;
+				PumpedLine discard;
 				while (c.reader.isRunning)
 				{
 					while (c.lines.tryConsumeOne(discard, Duration.zero))
@@ -609,18 +643,21 @@ version (Posix) StdioClientTransport spawnStdioTransport(string[] args,
 	// End-of-input returns null (ending the duplex read loop) once `empty` reports
 	// the child closed its stdout, after a final unterminated line, which is still
 	// a complete message, so only a genuine read failure surfaces as an
-	// exception. If a single line exceeds `maxLineBytes` the child is producing an
-	// unbounded, newline-less stream — return null to end the duplex read loop
-	// rather than grow the accumulator without limit.
+	// exception. A line longer than `maxLineBytes` is reported (`noteOversized`)
+	// as soon as it passes the bound, and its remaining bytes are skipped up to
+	// the next newline rather than accumulated without limit.
 	string readLine() @safe
 	{
 		ubyte[1] one;
 		ubyte[] acc;
+		bool dropping;
 		for (;;)
 		{
+			if (transport.channel !is null && transport.channel.stopping)
+				return null;
 			if (()@trusted { return pipes.stdout.empty; }())
 			{
-				if (acc.length)
+				if (acc.length || dropping)
 					break;
 				transport.noteChildEndOfInput();
 				return null;
@@ -628,10 +665,19 @@ version (Posix) StdioClientTransport spawnStdioTransport(string[] args,
 			() @trusted { pipes.stdout.read(one[], IOMode.once); }();
 			if (one[0] == '\n')
 				break;
+			if (dropping)
+				continue;
 			acc ~= one[0];
 			if (acc.length > maxLineBytes)
-				return null; // over-long, newline-less frame -> end the read loop
+			{
+				transport.noteOversized(scanFrameHead(acc[0 .. $ < frameHeadScanBytes
+						? $ : frameHeadScanBytes]), maxLineBytes);
+				acc = null;
+				dropping = true;
+			}
 		}
+		if (dropping)
+			return "";
 		if (acc.length && acc[$ - 1] == '\r')
 			acc = acc[0 .. $ - 1];
 		// A blank line is "" rather than null, which the read loop takes as EOF.
@@ -674,7 +720,15 @@ version (Windows) private struct WinChild
 	// closeWinChild drains the channel and joins the thread so no GC-touching
 	// daemon thread survives into druntime shutdown, which faults on Windows.
 	Thread reader;
-	Channel!string lines;
+	Channel!PumpedLine lines;
+}
+
+/// What the Windows stdout reader thread hands the read loop: a complete line,
+/// or the first bytes of an over-long one it dropped.
+version (Windows) private struct PumpedLine
+{
+	string text;
+	bool oversized;
 }
 
 /// The thread writing the Windows child's stdin. Each line is handed to it
@@ -829,7 +883,7 @@ version (Windows) StdioClientTransport spawnStdioTransport(string[] args,
 
 	// Daemon reader: blocking ReadFile on the duplicated stdout handle, lines pushed
 	// to `lines`.
-	auto lines = createChannel!string();
+	auto lines = createChannel!PumpedLine();
 	auto chan = lines;
 	child.lines = lines;
 	() @trusted {
@@ -841,11 +895,19 @@ version (Windows) StdioClientTransport spawnStdioTransport(string[] args,
 
 	string readLine() @safe
 	{
-		string line;
-		const got = () @trusted { return lines.tryConsumeOne(line); }();
-		if (!got) // channel closed (EOF / over-long) -> end the loop
-			transport.noteChildEndOfInput();
-		return got ? line : null;
+		for (;;)
+		{
+			PumpedLine got;
+			if (!()@trusted { return lines.tryConsumeOne(got); }())
+			{
+				// The channel closed: the child's stdout reached end-of-input.
+				transport.noteChildEndOfInput();
+				return null;
+			}
+			if (!got.oversized)
+				return got.text;
+			transport.noteOversized(scanFrameHead(cast(const(ubyte)[]) got.text), maxLineBytes);
+		}
 	}
 
 	void writeLine(string s) @safe
@@ -860,10 +922,13 @@ version (Windows) StdioClientTransport spawnStdioTransport(string[] args,
 
 /// Reader-thread body (Windows client): blocking reads on the child's stdout,
 /// assembling newline-delimited lines with a trailing '\r' stripped. Each complete
-/// line is pushed to `chan`. An over-long newline-less run (> `maxLineBytes`) or
-/// EOF closes the channel, which surfaces to the duplex read loop as end-of-input;
-/// a final unterminated line is still a complete message and is pushed first.
-version (Windows) private void pumpChildStdout(HANDLE h, Channel!string chan, size_t maxLineBytes) @system
+/// line is pushed to `chan`. A line longer than `maxLineBytes` is dropped: its
+/// first bytes are pushed marked `oversized` as soon as it passes the bound, and
+/// the rest is skipped up to the next newline. EOF closes the channel, which
+/// surfaces to the duplex read loop as end-of-input; a final unterminated line is
+/// still a complete message and is pushed first.
+version (Windows) private void pumpChildStdout(HANDLE h,
+		Channel!PumpedLine chan, size_t maxLineBytes) @system
 {
 	import core.sys.windows.windef : DWORD;
 	import core.sys.windows.winbase : ReadFile, CloseHandle;
@@ -872,6 +937,7 @@ version (Windows) private void pumpChildStdout(HANDLE h, Channel!string chan, si
 		CloseHandle(h);
 	ubyte[32 * 1024] buf;
 	ubyte[] acc;
+	bool dropping;
 	for (;;)
 	{
 		DWORD n;
@@ -880,8 +946,8 @@ version (Windows) private void pumpChildStdout(HANDLE h, Channel!string chan, si
 		{
 			if (acc.length && acc[$ - 1] == '\r')
 				acc = acc[0 .. $ - 1];
-			if (acc.length)
-				chan.put(cast(string) acc.idup);
+			if (acc.length && !dropping)
+				chan.put(PumpedLine(cast(string) acc.idup));
 			break;
 		}
 		auto got = buf[0 .. n];
@@ -895,27 +961,30 @@ version (Windows) private void pumpChildStdout(HANDLE h, Channel!string chan, si
 					nl = j;
 					break;
 				}
-			if (nl == size_t.max)
+			const end = nl == size_t.max ? got.length : nl;
+			if (!dropping)
 			{
-				acc ~= got[i .. $];
+				acc ~= got[i .. end];
 				if (acc.length > maxLineBytes)
 				{
-					chan.close(); // over-long, newline-less frame -> end the loop
-					return;
+					const head = acc.length < frameHeadScanBytes ? acc.length : frameHeadScanBytes;
+					chan.put(PumpedLine(cast(string) acc[0 .. head].idup, true));
+					acc = null;
+					dropping = true;
 				}
-				break; // need more data
 			}
-			acc ~= got[i .. nl];
+			if (nl == size_t.max)
+				break; // need more data
 			i = nl + 1;
-			if (acc.length > maxLineBytes)
+			if (dropping)
 			{
-				chan.close();
-				return;
+				dropping = false;
+				continue;
 			}
 			if (acc.length && acc[$ - 1] == '\r')
 				acc = acc[0 .. $ - 1];
 			// A blank line is "" rather than null, which the read loop takes as EOF.
-			chan.put(acc.length ? cast(string) acc.idup : "");
+			chan.put(PumpedLine(acc.length ? cast(string) acc.idup : ""));
 			acc = null;
 		}
 	}
@@ -1203,36 +1272,33 @@ version (Posix) unittest  // a blank line from the server is skipped, not taken 
 	assert(ok, "the reply after blank lines must arrive, got: " ~ err);
 }
 
-version (Posix) unittest  // an over-long newline-less stream ends the read loop instead of growing unbounded
+version (Posix) unittest  // an over-long newline-less stream is reported and skipped, not accumulated
 {
 	import core.time : seconds, msecs;
 	import std.datetime.stopwatch : StopWatch, AutoStart;
 	import std.algorithm.searching : canFind;
+	import vibe.core.core : sleep;
 
+	string[] reported;
+	bool closedPromptly;
 	inLoop(() @safe {
 		// The child floods stdout with newline-less bytes. With a small
-		// maxLineBytes the reader must hit the bound and return null (EOF to the
-		// duplex loop), so the in-flight deliver fails via failPending ("channel
-		// closed") promptly — NOT by accumulating without limit.
+		// maxLineBytes the reader reports the line once it passes the bound and
+		// then skips its bytes rather than accumulating them without limit.
 		auto transport = spawnStdioTransport([
 			"sh", "-c", "yes A | tr -d \"\\n\""
 		], 4096);
-
-		string msg;
+		transport.chan().onError = (string m) @safe nothrow{ reported ~= m; };
 		auto sw = StopWatch(AutoStart.yes);
-		try
-		{
-			Json req = parseJsonString(`{"jsonrpc":"2.0","id":1,"method":"ping"}`);
-			transport.deliver(req, 1);
-		}
-		catch (McpException e)
-			msg = e.msg;
-		// The bound must have closed the channel (failPending), not timed out.
-		assert(msg.canFind("closed"),
-			"over-long newline-less stream must end the read loop via channel close, got: " ~ msg);
-		assert(sw.peek < 30.seconds, "the over-long-line bound must trip promptly");
+		while (reported.length == 0 && sw.peek < 30.seconds)
+			sleep(10.msecs);
+		sw.reset();
 		transport.closeProcess(200.msecs, 200.msecs);
+		closedPromptly = sw.peek < 10.seconds;
 	});
+	assert(reported.length == 1 && reported[0].canFind("4096-byte line limit"),
+			"the over-long line must be reported once, naming the limit");
+	assert(closedPromptly, "close() must stop a read loop skipping a flood");
 }
 
 version (Posix) unittest  // McpClient.spawn bounds the server's stdout lines by ClientSettings.maxMessageBytes
@@ -1258,7 +1324,35 @@ version (Posix) unittest  // McpClient.spawn bounds the server's stdout lines by
 			msg = e.msg;
 		client.close();
 	});
-	assert(msg.canFind("closed"), "an over-long line must close the channel, got: " ~ msg);
+	assert(msg.canFind("4096-byte line limit"),
+			"an over-long reply must fail its request naming the limit, got: " ~ msg);
+}
+
+version (Posix) unittest  // an over-long server line is skipped and the connection keeps working
+{
+	import core.time : msecs;
+	import std.algorithm.searching : canFind;
+
+	string firstMsg;
+	string[] reported;
+	Json second;
+	inLoop(() @safe {
+		auto transport = spawnStdioTransport([
+			"sh", "-c",
+			`read line; printf '{"jsonrpc":"2.0","id":1,"result":{"pad":"%0200d"}}\n' 0; ` ~ `read line; printf '{"jsonrpc":"2.0","id":2,"result":{"ok":true}}\n'; cat >/dev/null`
+		], 64);
+		transport.chan().onError = (string m) @safe nothrow{ reported ~= m; };
+		try
+			transport.deliver(parseJsonString(`{"jsonrpc":"2.0","id":1,"method":"ping"}`), 1);
+		catch (McpException e)
+			firstMsg = e.msg;
+		second = transport.deliver(parseJsonString(`{"jsonrpc":"2.0","id":2,"method":"ping"}`), 2);
+		transport.closeProcess(200.msecs, 200.msecs);
+	});
+	assert(firstMsg.canFind("64-byte line limit"), firstMsg);
+	assert(second["ok"].get!bool, "the line after an over-long one must still be read");
+	assert(reported.length == 1 && reported[0].canFind("64-byte line limit"),
+			"the dropped line must be reported through onError");
 }
 
 version (Posix) unittest  // close() releases the child's stdout pipe and process handle after the read loop stops

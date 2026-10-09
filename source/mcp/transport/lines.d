@@ -4,6 +4,10 @@ import vibe.data.json : Json;
 
 @safe:
 
+/// How many leading bytes of a dropped over-long line are scanned for its
+/// `FrameHead`.
+package(mcp) enum size_t frameHeadScanBytes = 4096;
+
 /// Newline-delimited line assembly over a byte source, shared by both ends of the
 /// stdio transport (the server reading its stdin, the client reading a spawned
 /// server's stdout).
@@ -19,7 +23,6 @@ package(mcp) struct LineReader
 	private ubyte[] storage; // fixed chunk-sized backing buffer that every read fills
 	private ubyte[] buf; // the filled prefix of `storage` from the latest read
 	private size_t bufPos; // index of the next unconsumed byte in `buf`
-	private enum size_t idScanBytes = 4096;
 	private bool oversized_; // an over-long line was dropped since the last takeOversized
 	private FrameHead oversizedHead_; // what the dropped line's first bytes reveal
 
@@ -119,7 +122,7 @@ package(mcp) struct LineReader
 					acc ~= rest;
 					if (acc.length > maxLineBytes)
 					{
-						markOversized(acc[0 .. $ < idScanBytes ? $ : idScanBytes]);
+						markOversized(acc[0 .. $ < frameHeadScanBytes ? $ : frameHeadScanBytes]);
 						acc = null;
 						dropping = true;
 					}
@@ -139,7 +142,7 @@ package(mcp) struct LineReader
 			if (dropping || acc.length > maxLineBytes)
 			{
 				if (!dropping)
-					markOversized(acc[0 .. $ < idScanBytes ? $ : idScanBytes]);
+					markOversized(acc[0 .. $ < frameHeadScanBytes ? $ : frameHeadScanBytes]);
 				return "";
 			}
 			if (acc.length && acc[$ - 1] == '\r')
