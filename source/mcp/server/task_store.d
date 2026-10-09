@@ -114,10 +114,8 @@ struct TaskRecord
 		r.inputRequests = ("inputRequests" in j && j["inputRequests"].type == Json.Type.object)
 			? cloneJson(j["inputRequests"]) : Json.emptyObject;
 		if ("inputResponses" in j && j["inputResponses"].type == Json.Type.object)
-			() @trusted {
-			foreach (string k, v; j["inputResponses"])
+			foreach (k, v; j["inputResponses"].byKeyValue)
 				r.inputResponses[k] = cloneJson(v);
-		}();
 		r.cancelRequested = ("cancelRequested" in j)
 			&& j["cancelRequested"].type == Json.Type.bool_ && j["cancelRequested"].get!bool;
 		r.detached = ("detached" in j) && j["detached"].type == Json.Type.bool_
@@ -130,10 +128,8 @@ struct TaskRecord
 			r.owner = j["owner"].get!string;
 		r.executorInput = ("executorInput" in j) ? cloneJson(j["executorInput"]) : Json.undefined;
 		if ("checkpoints" in j && j["checkpoints"].type == Json.Type.object)
-			() @trusted {
-			foreach (string k, v; j["checkpoints"])
+			foreach (k, v; j["checkpoints"].byKeyValue)
 				r.checkpoints[k] = cloneJson(v);
-		}();
 		return r;
 	}
 }

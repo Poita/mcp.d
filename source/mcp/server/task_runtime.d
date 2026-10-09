@@ -609,7 +609,7 @@ final class TaskRuntime
 		if (inputResponses.type != Json.Type.object || inputResponses.length == 0)
 			throw invalidParams("tasks/update 'inputResponses' must be a non-empty object");
 		bool resumed;
-		modify(id, (ref TaskRecord r) @trusted {
+		modify(id, (ref TaskRecord r) @safe {
 			resumed = false;
 			if (isTerminal(r.meta.status))
 			{
@@ -621,7 +621,7 @@ final class TaskRuntime
 			// Only answers to the current requests are kept, so a client cannot
 			// grow the stored record with keys no executor will read.
 			string[] unrequested;
-			foreach (string k, v; inputResponses)
+			foreach (k, v; inputResponses.byKeyValue)
 				if (r.inputRequests.type != Json.Type.object || k !in r.inputRequests)
 					unrequested ~= k;
 			if (unrequested.length)
@@ -634,11 +634,11 @@ final class TaskRuntime
 				throw new McpException(ErrorCode.invalidParams,
 					"Task has not requested input for: " ~ unrequested.join(", "), data);
 			}
-			foreach (string k, v; inputResponses)
+			foreach (k, v; inputResponses.byKeyValue)
 				r.inputResponses[k] = v;
 			if (r.toolName.length == 0 || r.meta.status != TaskStatus.inputRequired)
 				return Change.state;
-			foreach (string k, v; r.inputRequests)
+			foreach (k, v; r.inputRequests.byKeyValue)
 				if (k !in r.inputResponses)
 					return Change.state;
 			transition(r, TaskStatus.working);

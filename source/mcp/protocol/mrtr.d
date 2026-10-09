@@ -500,23 +500,21 @@ ParamHeader[] paramHeaders(Json inputSchema) @safe
 			return;
 		if ("properties" in node && node["properties"].type == Json.Type.object)
 		{
-			() @trusted {
-				foreach (string name, Json prop; node["properties"])
+			foreach (name, prop; node["properties"].byKeyValue)
+			{
+				if (prop.type != Json.Type.object)
+					continue;
+				auto childPath = path ~ name;
+				if ("x-mcp-header" in prop && prop["x-mcp-header"].type == Json.Type.string)
 				{
-					if (prop.type != Json.Type.object)
-						continue;
-					auto childPath = path ~ name;
-					if ("x-mcp-header" in prop && prop["x-mcp-header"].type == Json.Type.string)
-					{
-						const hv = prop["x-mcp-header"].get!string;
-						const ptype = ("type" in prop && prop["type"].type == Json.Type.string) ? prop["type"]
-							.get!string : "";
-						if (validateHeaderName(hv) is null && isPrimitiveHeaderType(ptype))
-							result ~= ParamHeader(childPath, HttpHeader.paramPrefix ~ hv, hv);
-					}
-					walk(prop, childPath);
+					const hv = prop["x-mcp-header"].get!string;
+					const ptype = ("type" in prop && prop["type"].type == Json.Type.string) ? prop["type"]
+						.get!string : "";
+					if (validateHeaderName(hv) is null && isPrimitiveHeaderType(ptype))
+						result ~= ParamHeader(childPath, HttpHeader.paramPrefix ~ hv, hv);
 				}
-			}();
+				walk(prop, childPath);
+			}
 		}
 	}
 
@@ -552,25 +550,21 @@ string validateInputSchemaHeaders(Json inputSchema) @safe
 		{
 			if ("x-mcp-header" in node)
 				return true;
-			() @trusted {
-				foreach (string _, Json v; node)
-					if (containsAnnotation(v))
-					{
-						found = true;
-						break;
-					}
-			}();
+			foreach (_, v; node.byKeyValue)
+				if (containsAnnotation(v))
+				{
+					found = true;
+					break;
+				}
 		}
 		else if (node.type == Json.Type.array)
 		{
-			() @trusted {
-				foreach (Json elem; node)
-					if (containsAnnotation(elem))
-					{
-						found = true;
-						break;
-					}
-			}();
+			foreach (elem; node.byValue)
+				if (containsAnnotation(elem))
+				{
+					found = true;
+					break;
+				}
 		}
 		return found;
 	}
@@ -591,69 +585,64 @@ string validateInputSchemaHeaders(Json inputSchema) @safe
 			return;
 		if ("properties" in node && node["properties"].type == Json.Type.object)
 		{
-			() @trusted {
-				foreach (string name, Json prop; node["properties"])
+			foreach (name, prop; node["properties"].byKeyValue)
+			{
+				if (err !is null)
+					break;
+				if (prop.type != Json.Type.object)
+					continue;
+				if ("x-mcp-header" in prop)
 				{
-					if (err !is null)
-						return;
-					if (prop.type != Json.Type.object)
-						continue;
-					if ("x-mcp-header" in prop)
+					if (prop["x-mcp-header"].type != Json.Type.string)
 					{
-						if (prop["x-mcp-header"].type != Json.Type.string)
-						{
-							err = "x-mcp-header value on '" ~ name ~ "' MUST be a string";
-							return;
-						}
-						const hv = prop["x-mcp-header"].get!string;
-						auto nameErr = validateHeaderName(hv);
-						if (nameErr !is null)
-						{
-							err = nameErr;
-							return;
-						}
-						const ptype = ("type" in prop && prop["type"].type == Json.Type.string) ? prop["type"]
-							.get!string : "";
-						if (!isPrimitiveHeaderType(ptype))
-						{
-							err = "x-mcp-header '" ~ hv ~ "' on '" ~ name
-								~ "' may only be applied to primitive types"
-								~ " (integer/string/boolean); type '" ~ ptype ~ "' is not permitted";
-							return;
-						}
-						const lc = asciiLowerName(hv);
-						if (lc in seen)
-						{
-							err = "x-mcp-header value '" ~ hv
-								~ "' is not case-insensitively unique within the inputSchema";
-							return;
-						}
-						seen[lc] = true;
+						err = "x-mcp-header value on '" ~ name ~ "' MUST be a string";
+						break;
 					}
-					walk(prop, true);
+					const hv = prop["x-mcp-header"].get!string;
+					auto nameErr = validateHeaderName(hv);
+					if (nameErr !is null)
+					{
+						err = nameErr;
+						break;
+					}
+					const ptype = ("type" in prop && prop["type"].type == Json.Type.string) ? prop["type"]
+						.get!string : "";
+					if (!isPrimitiveHeaderType(ptype))
+					{
+						err = "x-mcp-header '" ~ hv ~ "' on '" ~ name
+							~ "' may only be applied to primitive types"
+							~ " (integer/string/boolean); type '" ~ ptype ~ "' is not permitted";
+						break;
+					}
+					const lc = asciiLowerName(hv);
+					if (lc in seen)
+					{
+						err = "x-mcp-header value '" ~ hv
+							~ "' is not case-insensitively unique within the inputSchema";
+						break;
+					}
+					seen[lc] = true;
 				}
-			}();
+				walk(prop, true);
+			}
 		}
 		// Only a chain of `properties` keys reaches an annotated property
 		// statically; an annotation under any other keyword (array, composition,
 		// conditional, reference, map-shaped keywords such as
 		// `additionalProperties`/`patternProperties`, or an unknown extension)
 		// invalidates the whole tool definition.
-		() @trusted {
-			foreach (string key, Json v; node)
+		foreach (key, v; node.byKeyValue)
+		{
+			if (key == "properties" || valueKeys.canFind(key) || (isProperty && key == "x-mcp-header"))
+				continue;
+			if (key == "x-mcp-header" || containsAnnotation(v))
 			{
-				if (key == "properties" || valueKeys.canFind(key) || (isProperty
-						&& key == "x-mcp-header"))
-					continue;
-				if (key == "x-mcp-header" || containsAnnotation(v))
-				{
-					err = "x-mcp-header MUST only be applied to statically reachable properties"
-						~ " (a chain of `properties` keys); an annotation under `"
-						~ key ~ "` is invalid";
-					return;
-				}
+				err = "x-mcp-header MUST only be applied to statically reachable properties"
+					~ " (a chain of `properties` keys); an annotation under `" ~ key
+					~ "` is invalid";
+				break;
 			}
-		}();
+		}
 	}
 
 	walk(inputSchema, false);
@@ -956,10 +945,8 @@ InputRequest[] inputRequestsFromJson(Json j) @safe
 	if (j.type == Json.Type.object)
 	{
 		// `Json.opApply` is `@system`; iterating a plain object is safe here.
-		() @trusted {
-			foreach (string key, Json value; j)
-				requests ~= InputRequest.fromJson(key, value);
-		}();
+		foreach (key, value; j.byKeyValue)
+			requests ~= InputRequest.fromJson(key, value);
 	}
 	return requests;
 }
@@ -998,10 +985,8 @@ Json[string] readInputResponses(Json params) @safe
 	if (map.type != Json.Type.object)
 		return out_;
 	// `Json.opApply` is `@system`; iterating a plain object is safe here.
-	() @trusted {
-		foreach (string key, Json value; map)
-			out_[key] = value;
-	}();
+	foreach (key, value; map.byKeyValue)
+		out_[key] = value;
 	return out_;
 }
 

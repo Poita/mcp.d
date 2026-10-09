@@ -3438,10 +3438,8 @@ private string[] objectKeys(Json j) @safe
 	string[] keys;
 	if (j.type != Json.Type.object)
 		return keys;
-	() @trusted {
-		foreach (string k, Json v; cast() j)
-			keys ~= k;
-	}();
+	foreach (k, v; j.byKeyValue)
+		keys ~= k;
 	return keys;
 }
 
@@ -3496,10 +3494,8 @@ private void writeCanonical(R)(ref R sink, Json j) @safe
 		break;
 	case Json.Type.object:
 		string[] keys;
-		() @trusted {
-			foreach (string k, Json v; cast() j)
-				keys ~= k;
-		}();
+		foreach (k, v; j.byKeyValue)
+			keys ~= k;
 		keys.sort();
 		sink.put('{');
 		foreach (i, k; keys)

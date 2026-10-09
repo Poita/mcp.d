@@ -969,7 +969,7 @@ struct FetchOptions
 /// The system CA bundle: the file `SSL_CERT_FILE` names, else OpenSSL's
 /// compiled-in default, else the first well-known platform bundle that exists.
 /// Empty when none is found. Resolved once per thread.
-private string systemCaBundle() @trusted
+private string systemCaBundle() @safe
 {
 	import deimos.openssl.x509 : X509_get_default_cert_file, X509_get_default_cert_file_env;
 	import std.file : exists, isFile;
@@ -982,11 +982,15 @@ private string systemCaBundle() @trusted
 		return bundle;
 	resolved = true;
 
+	const envVar = () @trusted {
+		return fromStringz(X509_get_default_cert_file_env()).idup;
+	}();
+	const defaultFile = () @trusted {
+		return fromStringz(X509_get_default_cert_file()).idup;
+	}();
 	string[] candidates = [
-		environment.get(fromStringz(X509_get_default_cert_file_env()).idup, ""),
-		fromStringz(X509_get_default_cert_file()).idup,
-		"/etc/ssl/cert.pem", "/etc/ssl/certs/ca-certificates.crt",
-		"/etc/pki/tls/certs/ca-bundle.crt",
+		environment.get(envVar, ""), defaultFile, "/etc/ssl/cert.pem",
+		"/etc/ssl/certs/ca-certificates.crt", "/etc/pki/tls/certs/ca-bundle.crt",
 		"/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem",
 		"/etc/ssl/ca-bundle.pem", "/usr/local/etc/openssl/cert.pem",
 		"/usr/local/share/certs/ca-root-nss.crt",

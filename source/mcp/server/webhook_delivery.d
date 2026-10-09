@@ -152,7 +152,7 @@ enum size_t maxWebhookResponseBytes = 64 * 1024;
 
 /// Read at most `cap` bytes of `stream` as raw bytes (no UTF-8 validation),
 /// setting `truncated` when more remained unread.
-string readBoundedBody(S)(S stream, size_t cap, out bool truncated) @trusted
+string readBoundedBody(S)(S stream, size_t cap, out bool truncated) @safe
 {
 	import std.algorithm : min;
 
@@ -169,7 +169,8 @@ string readBoundedBody(S)(S stream, size_t cap, out bool truncated) @trusted
 		stream.read(chunk[0 .. n]);
 		buf ~= chunk[0 .. n];
 	}
-	return cast(string) buf;
+	// `buf` is a local nothing else references, so it can be viewed as immutable.
+	return () @trusted { return cast(string) buf; }();
 }
 
 /// Map a non-2xx HTTP status to its delivery-error category. Only a 5xx is a

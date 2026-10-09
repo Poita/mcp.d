@@ -49,15 +49,11 @@ private Json projectExtensions(const Json extensions, ProtocolVersion v) @safe
 	if (extensions.type != Json.Type.object)
 		return Json.undefined;
 	Json kept = Json.emptyObject;
-	// `Json.opApply` is `@system` and non-`const`; we only read, so cast away
-	// `const` inside the trusted block to iterate the object (mirrors
-	// `diffMissingKeys`). Each value is cloned so the projection never aliases
-	// the caller's (const) settings.
-	() @trusted {
-		foreach (string key, Json settings; cast() extensions)
-			if (v >= extensionMinVersion(key))
-				kept[key] = settings.clone();
-	}();
+	// Each value is cloned so the projection never aliases the caller's
+	// (const) settings.
+	foreach (key, settings; extensions.byKeyValue)
+		if (v >= extensionMinVersion(key))
+			kept[key] = settings.clone();
 	return kept.length > 0 ? kept : Json.undefined;
 }
 
@@ -600,14 +596,11 @@ struct ClientCapabilities
 		if (required.type != Json.Type.object)
 			return Json(null);
 		Json missing = Json.emptyObject;
-		// `Json.opApply` is `@system` and non-`const`; we only read, so cast
-		// away `const` inside the trusted block to iterate the object. Each value
-		// is cloned so the result never aliases the (const) `required` map.
-		() @trusted {
-			foreach (string k, Json v; cast() required)
-				if (declared.type != Json.Type.object || k !in declared)
-					missing[k] = v.clone();
-		}();
+		// Each value is cloned so the result never aliases the (const)
+		// `required` map.
+		foreach (k, v; required.byKeyValue)
+			if (declared.type != Json.Type.object || k !in declared)
+				missing[k] = v.clone();
 		return missing;
 	}
 
