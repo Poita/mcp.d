@@ -622,6 +622,7 @@ final class EventsRuntime
 	private Delivery[][string] subscriptionRuns_; // subscription id -> leased jobs awaiting this node's run
 	private bool[string] runningSubscriptions_; // subscription ids with a delivery run in progress
 	private bool[string] localJobs_; // job ids waiting in or being delivered by a run on this node
+	private bool drainKicked_; // a drain is scheduled on the delivery executor and has not started
 	private int[string] pendingCount_; // subscription id -> tracked, unsettled deliveries on this node
 	private TrackedJob[string] trackedJobs_; // job id -> its subscription and position, while this node tracks it
 	private bool[string] enqueuing_; // job ids tracked whose enqueue call has not yet returned
@@ -1550,7 +1551,7 @@ final class EventsRuntime
 		if (reactivated)
 		{
 			flushMissed(sub);
-			opts_.deliveryExecutor(() @safe { drainDeliveries(); });
+			kickDrain();
 		}
 
 		SubscribeResult r;
@@ -1714,7 +1715,7 @@ final class EventsRuntime
 		foreach (occ; er.events)
 			any |= enqueueForWebhook(sub, reg, occ, regIsEmitOnly(reg));
 		if (any)
-			opts_.deliveryExecutor(() @safe { drainDeliveries(); });
+			kickDrain();
 		return er.truncated;
 	}
 
@@ -1756,7 +1757,7 @@ final class EventsRuntime
 				}
 			}
 		if (any)
-			opts_.deliveryExecutor(() @safe { drainDeliveries(); });
+			kickDrain();
 	}
 
 	// Fetch one batch for `sub` from its fetch position and enqueue it. `more` is
@@ -2228,7 +2229,20 @@ final class EventsRuntime
 		// Kick a drain on this node so the just-enqueued jobs deliver promptly
 		// (workers on other nodes also lease from a shared queue independently).
 		if (any)
-			opts_.deliveryExecutor(() @safe { drainDeliveries(); });
+			kickDrain();
+	}
+
+	// Schedule a drain on the delivery executor unless one is already scheduled
+	// and no drain has started since: work queued meanwhile is leased by that
+	// drain, so a burst of emits costs one task rather than one each.
+	private void kickDrain() @safe
+	{
+		if (drainKicked_)
+			return;
+		drainKicked_ = true;
+		scope (failure)
+			drainKicked_ = false;
+		opts_.deliveryExecutor(() @safe { drainDeliveries(); });
 	}
 
 	/// Process one pass of the delivery queue: lease the ready jobs (claiming them
@@ -2236,6 +2250,7 @@ final class EventsRuntime
 	/// and by `startDeliveryWorker`. Safe to run on any node against a shared queue.
 	void drainDeliveries() @safe
 	{
+		drainKicked_ = false;
 		const leaseMs = opts_.deliveryLease.total!"msecs";
 		const batch = opts_.deliveryLeaseBatch;
 		auto jobs = deliveryQueue_.lease(opts_.nowMs(), leaseMs, batch);
@@ -2298,7 +2313,7 @@ final class EventsRuntime
 				if (backlogged_ || ran)
 				{
 					backlogged_ = false;
-					opts_.deliveryExecutor(() @safe { drainDeliveries(); });
+					kickDrain();
 				}
 				return;
 			}
@@ -2649,7 +2664,7 @@ final class EventsRuntime
 		const cursor = *p;
 		missed_.remove(sub.id);
 		if (enqueueGap(sub, cursor))
-			opts_.deliveryExecutor(() @safe { drainDeliveries(); });
+			kickDrain();
 	}
 
 	// Queue a `gap` job telling `sub`'s client to resume from `cursor` (or, when
@@ -7759,6 +7774,30 @@ unittest  // a no-replay check's truncation is reported to a webhook subscriber 
 	auto gaps = controlPostsOf(ft, "gap");
 	assert(gaps.length == before + 1);
 	assert(parseJsonString(gaps[$ - 1].body)["cursor"].type == Json.Type.null_);
+}
+
+unittest  // emits arriving before a drain runs share one drain kick
+{
+	auto ft = new FakeWebhookTransport();
+	EventsOptions o;
+	o.nowMs = () @safe => 1_000_000L;
+	o.nowIso = () @safe => "t";
+	o.allowPrivateCallbackHosts = true;
+	o.webhookTransport = ft;
+	o.deliverySleep = (Duration d) @safe {};
+	void delegate() @safe[] deferred;
+	o.deliveryExecutor = (void delegate() @safe job) @safe { deferred ~= job; };
+	auto rt = new EventsRuntime(null, o);
+	EventRegistration reg = {descriptor: EventType("n"), emitOnly: true};
+	rt.register(reg);
+	rt.subscribeWebhook(webhookSub("n", "https://proxy/hooks"), "user-1");
+	deferred = null;
+	foreach (id; ["evt_1", "evt_2", "evt_3"])
+		rt.emit(EventOccurrence(id, "n", "t"));
+	assert(deferred.length == 1);
+	for (size_t i = 0; i < deferred.length; i++)
+		deferred[i]();
+	assert(ft.eventPosts().length == 3);
 }
 
 unittest  // endpoint verification and well-known caches are evicted once stale

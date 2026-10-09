@@ -638,14 +638,27 @@ final class InMemoryDeliveryQueue : DeliveryQueue
 		ulong seq;
 	}
 
+	// One subscription's jobs in enqueue order. A slot whose job was acked (or
+	// re-enqueued under a newer seq) is dead and skipped; dead slots ahead of
+	// the first live one are dropped, and the rest compacted away once they
+	// outnumber the live ones.
+	private struct SubQueue
+	{
+		Slot[] slots;
+		size_t head;
+	}
+
 	private Entry[string] entries_;
 	private ulong nextSeq_;
-	// Enqueue order. A slot whose job was acked (or re-enqueued under a newer
-	// seq) is dead and skipped; dead slots are compacted away once they
-	// outnumber the live ones, so a lease walks jobs in order without sorting.
-	private Slot[] order_;
+	private SubQueue[string] subs_;
 	// Queued jobs per subscription, so `hasPendingFor` needs no scan.
 	private size_t[string] pendingBySub_;
+	// A lease finds nothing ready until `nowMs` reaches `nextReadyMs_`, unless
+	// `mayBeReady_` says a job was queued, acked, or left ready since the last
+	// lease looked: an idle worker's lease then costs nothing.
+	private bool mayBeReady_;
+	private long nextReadyMs_ = long.max;
+	version (unittest) private size_t scanned_; // queue slots a lease has visited
 
 	bool enqueue(Delivery job) @safe
 	{
@@ -653,47 +666,106 @@ final class InMemoryDeliveryQueue : DeliveryQueue
 			return false;
 		const seq = nextSeq_++;
 		entries_[job.jobId] = Entry(job.toJson().clone(), 0, seq, job.subscriptionId);
-		order_ ~= Slot(job.jobId, seq);
+		subs_.require(job.subscriptionId).slots ~= Slot(job.jobId, seq);
 		pendingBySub_[job.subscriptionId]++;
+		mayBeReady_ = true;
 		return true;
 	}
 
 	Delivery[] lease(long nowMs, long leaseMs, size_t maxJobs) @safe
 	{
+		import std.algorithm : min, sort;
+
+		if (!mayBeReady_ && nowMs < nextReadyMs_)
+			return null;
+		// Each subscription offers its ready prefix: the jobs ahead of its first
+		// one still leased, which holds back everything behind it. The oldest
+		// offers across subscriptions are taken.
+		Slot[] offers;
+		long nextReady = long.max;
+		bool left;
+		foreach (subId, ref q; subs_)
+		{
+			size_t taken;
+			foreach (slot; q.slots[q.head .. $])
+			{
+				version (unittest)
+					scanned_++;
+				auto e = slot.jobId in entries_;
+				if (e is null || e.seq != slot.seq)
+					continue;
+				if (e.leasedUntilMs > nowMs)
+				{
+					nextReady = min(nextReady, e.leasedUntilMs);
+					break;
+				}
+				if (maxJobs > 0 && taken >= maxJobs)
+				{
+					left = true;
+					break;
+				}
+				offers ~= slot;
+				taken++;
+			}
+		}
+		offers.sort!((a, b) => a.seq < b.seq);
+		if (maxJobs > 0 && offers.length > maxJobs)
+		{
+			offers = offers[0 .. maxJobs];
+			left = true;
+		}
 		Delivery[] result;
-		bool[string] heldBack; // subscriptions with an earlier job still leased
-		foreach (slot; order_)
+		result.reserve(offers.length);
+		foreach (slot; offers)
 		{
 			auto e = slot.jobId in entries_;
-			if (e is null || e.seq != slot.seq)
-				continue;
-			const subId = e.subscriptionId;
-			if (e.leasedUntilMs > nowMs)
-			{
-				heldBack[subId] = true;
-				continue;
-			}
-			if ((subId in heldBack) !is null)
-				continue;
 			e.leasedUntilMs = nowMs + leaseMs;
 			result ~= Delivery.fromJson(e.job.clone());
-			if (maxJobs > 0 && result.length >= maxJobs)
-				break;
 		}
+		if (result.length)
+			nextReady = min(nextReady, nowMs + leaseMs);
+		mayBeReady_ = left;
+		nextReadyMs_ = nextReady;
 		return result;
 	}
 
-	private void compact() @safe
+	// Drop `subId`'s dead slots ahead of its first live one, compact the rest
+	// once dead slots outnumber live ones, and forget a subscription with none.
+	private void trim(string subId) @safe
 	{
-		if (order_.length < 2 * entries_.length + 16)
+		auto q = subId in subs_;
+		if (q is null)
 			return;
-		Slot[] live;
-		live.reserve(entries_.length);
-		foreach (slot; order_)
-			if (auto e = slot.jobId in entries_)
-				if (e.seq == slot.seq)
-					live ~= slot;
-		order_ = live;
+		const live = pendingBySub_.get(subId, 0);
+		if (live == 0)
+		{
+			subs_.remove(subId);
+			return;
+		}
+		while (q.head < q.slots.length && !isLive(q.slots[q.head]))
+			q.head++;
+		if (q.slots.length - q.head < 2 * live + 16)
+			return;
+		Slot[] kept;
+		kept.reserve(live);
+		foreach (slot; q.slots[q.head .. $])
+			if (isLive(slot))
+				kept ~= slot;
+		q.slots = kept;
+		q.head = 0;
+	}
+
+	private bool isLive(Slot slot) @safe
+	{
+		auto e = slot.jobId in entries_;
+		return e !is null && e.seq == slot.seq;
+	}
+
+	// A claim moved to `leasedUntilMs` may make its job ready sooner.
+	private void noteLease(long leasedUntilMs) @safe
+	{
+		if (leasedUntilMs < nextReadyMs_)
+			nextReadyMs_ = leasedUntilMs;
 	}
 
 	void touch(string jobId, int attempt, long leasedUntilMs) @safe
@@ -702,13 +774,17 @@ final class InMemoryDeliveryQueue : DeliveryQueue
 		{
 			e.job["attempt"] = attempt;
 			e.leasedUntilMs = leasedUntilMs;
+			noteLease(leasedUntilMs);
 		}
 	}
 
 	void renew(string jobId, long leasedUntilMs) @safe
 	{
 		if (auto e = jobId in entries_)
+		{
 			e.leasedUntilMs = leasedUntilMs;
+			noteLease(leasedUntilMs);
+		}
 	}
 
 	void ack(string jobId) @safe
@@ -721,7 +797,8 @@ final class InMemoryDeliveryQueue : DeliveryQueue
 		if (auto n = subId in pendingBySub_)
 			if (--*n == 0)
 				pendingBySub_.remove(subId);
-		compact();
+		trim(subId);
+		mayBeReady_ = true;
 	}
 
 	bool contains(string jobId) @safe
@@ -733,6 +810,38 @@ final class InMemoryDeliveryQueue : DeliveryQueue
 	{
 		return (subscriptionId in pendingBySub_) !is null;
 	}
+}
+
+unittest  // a lease with nothing ready does not walk the queued jobs
+{
+	import std.conv : to;
+
+	auto q = new InMemoryDeliveryQueue();
+	foreach (i; 0 .. 1000)
+		q.enqueue(Delivery("s1/e" ~ i.to!string, "s1", EventOccurrence("e", "n", "t"), 0));
+	assert(q.lease(0, 1000, 1).length == 1);
+	q.scanned_ = 0;
+	assert(q.lease(10, 1000, 1).length == 0);
+	assert(q.scanned_ <= 1);
+}
+
+unittest  // a lease hands out jobs oldest first across subscriptions, holding back behind a leased one
+{
+	auto q = new InMemoryDeliveryQueue();
+	q.enqueue(Delivery("a/1", "a", EventOccurrence("1", "n", "t"), 0));
+	q.enqueue(Delivery("b/1", "b", EventOccurrence("1", "n", "t"), 0));
+	q.enqueue(Delivery("a/2", "a", EventOccurrence("2", "n", "t"), 0));
+	q.enqueue(Delivery("b/2", "b", EventOccurrence("2", "n", "t"), 0));
+	auto first = q.lease(0, 1000, 3);
+	assert(first.length == 3);
+	assert(first[0].jobId == "a/1" && first[1].jobId == "b/1" && first[2].jobId == "a/2");
+	q.ack("b/1");
+	auto second = q.lease(10, 1000, 0);
+	assert(second.length == 1 && second[0].jobId == "b/2");
+	assert(q.lease(20, 1000, 0).length == 0);
+	q.renew("a/1", 50); // a/1's claim lapses before a/2's
+	auto third = q.lease(60, 1000, 0);
+	assert(third.length == 1 && third[0].jobId == "a/1");
 }
 
 unittest  // the in-memory delivery queue reports whether a subscription has jobs queued
