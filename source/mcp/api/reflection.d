@@ -29,9 +29,11 @@ import mcp.protocol.jsonhelpers : isFieldwiseStruct;
 
 @safe:
 
-/// Register every `@tool` / `@prompt` / `@resource` / `@resourceTemplate`
-/// annotated method of `obj` on `server`, deriving JSON schemas and argument
-/// marshalling from the method signatures (FastMCP-style ergonomics).
+/// Register every handler-annotated method of `obj` on `server` (`@tool`,
+/// `@taskTool`, `@prompt`, `@resource`, `@resourceTemplate`, `@event`, `@skill`,
+/// and `@skillDir`), deriving JSON schemas and argument marshalling from the
+/// method signatures (FastMCP-style ergonomics). Registering a `@taskTool`,
+/// `@event`, `@skill`, `@skillDir`, or `@ui` tool enables its extension.
 ///
 /// `obj` is a class instance, an interface, or a pointer to a struct: the
 /// registered handlers call its methods for the server's lifetime, so a struct
@@ -90,8 +92,8 @@ private struct Rollback
 	}
 }
 
-/// Register every `@tool` / `@prompt` / `@resource` / `@resourceTemplate`
-/// annotated **free function** in module `mod` on `server`, mirroring
+/// Register every handler-annotated **free function** in module `mod` on
+/// `server` (the same handler UDAs as `registerHandlers`), mirroring
 /// `registerHandlers` but targeting module-scope symbols rather than the
 /// methods of an instance (FastMCP-style module decoration).
 ///
@@ -827,12 +829,14 @@ private P marshalArg(P, bool stringArgs = false)(Json args, string name) @safe
 /// The UDA-driven registration overloads marshal each argument from the method
 /// signature for you, but the dynamic `registerTool`/`registerPrompt`
 /// overloads hand the handler the raw `Json arguments`. `argsAs` deserializes
-/// `arguments` through the same enum-by-name policy the UDA layer uses (so any `enum` leaf is read
-/// from its schema-declared member name, at any nesting depth) and maps a
+/// `arguments` by the same binding rules the UDA layer uses (so any `enum` leaf
+/// is read from its schema-declared member name, at any nesting depth) and maps a
 /// conversion failure to a `ToolError`, so a dynamic tool reports a malformed
 /// argument as an `isError` result, exactly as a `@tool` method's does. A
 /// handler can then write `auto a = argsAs!MyArgs(arguments);` instead of
 /// hand-rolling `arguments["x"].get!int` with manual presence/type checks.
+/// Advertise the matching `inputSchema` with `jsonSchemaOf!MyArgs`, which follows
+/// the same field naming and optionality rules.
 ///
 /// In a dynamic prompt handler, where a malformed argument is a JSON-RPC
 /// `invalidParams` (-32602) error, catch the `ToolError` and rethrow it as
