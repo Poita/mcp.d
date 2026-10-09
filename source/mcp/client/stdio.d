@@ -607,7 +607,8 @@ version (Posix) StdioClientTransport spawnStdioTransport(string[] args,
 	// '\n' (stripping a trailing '\r'). (The byte source is already buffered by
 	// vibe's PipeInputStream, so single-byte reads here do not hit the OS per byte.)
 	// End-of-input returns null (ending the duplex read loop) once `empty` reports
-	// the child closed its stdout, so only a genuine read failure surfaces as an
+	// the child closed its stdout, after a final unterminated line, which is still
+	// a complete message, so only a genuine read failure surfaces as an
 	// exception. If a single line exceeds `maxLineBytes` the child is producing an
 	// unbounded, newline-less stream — return null to end the duplex read loop
 	// rather than grow the accumulator without limit.
@@ -619,6 +620,8 @@ version (Posix) StdioClientTransport spawnStdioTransport(string[] args,
 		{
 			if (()@trusted { return pipes.stdout.empty; }())
 			{
+				if (acc.length)
+					break;
 				transport.noteChildEndOfInput();
 				return null;
 			}
@@ -859,7 +862,7 @@ version (Windows) StdioClientTransport spawnStdioTransport(string[] args,
 /// assembling newline-delimited lines with a trailing '\r' stripped. Each complete
 /// line is pushed to `chan`. An over-long newline-less run (> `maxLineBytes`) or
 /// EOF closes the channel, which surfaces to the duplex read loop as end-of-input;
-/// a partial fragment at EOF is dropped rather than forwarded as a malformed line.
+/// a final unterminated line is still a complete message and is pushed first.
 version (Windows) private void pumpChildStdout(HANDLE h, Channel!string chan, size_t maxLineBytes) @system
 {
 	import core.sys.windows.windef : DWORD;
@@ -874,7 +877,13 @@ version (Windows) private void pumpChildStdout(HANDLE h, Channel!string chan, si
 		DWORD n;
 		const ok = ReadFile(h, cast(void*) buf.ptr, cast(DWORD) buf.length, &n, null) != 0;
 		if (!ok || n == 0)
-			break; // EOF/error -> drop any partial fragment
+		{
+			if (acc.length && acc[$ - 1] == '\r')
+				acc = acc[0 .. $ - 1];
+			if (acc.length)
+				chan.put(cast(string) acc.idup);
+			break;
+		}
 		auto got = buf[0 .. n];
 		size_t i;
 		while (i < got.length)
@@ -1325,33 +1334,22 @@ version (Posix) unittest  // a request to a server that exits on its own fails w
 	assert(msg.canFind("exited with status 3"), "the exit status must be reported, got: " ~ msg);
 }
 
-version (Posix) unittest  // partial fragment at EOF closes the channel cleanly, not via a spurious error write
+version (Posix) unittest  // a final reply the server leaves unterminated at EOF is still delivered
 {
-	import core.time : seconds, msecs;
-	import std.algorithm.searching : canFind;
+	import core.time : msecs;
 
-	// A child that writes a partial JSON fragment (no terminating newline) then exits
-	// leaves those bytes buffered in the pipe. spawnStdioTransport's readLine must
-	// return null on EOF regardless of accumulated bytes — the fragment is
-	// unrecoverable and returning it as a non-null string would route it through
-	// handleLine, causing a spurious null-id error-response write to the
-	// already-exited subprocess's stdin (broken pipe).
+	// The child answers the request without a trailing newline and exits; the
+	// last line is complete at end-of-input, as it is for the stdio server.
+	Json result;
 	inLoop(() @safe {
 		auto transport = spawnStdioTransport([
-			"sh", "-c", `printf '{"jsonrpc":"2.0","id":1'`
+			"sh", "-c",
+			`read line; printf '{"jsonrpc":"2.0","id":1,"result":{"ok":true}}'`
 		]);
-		string msg;
-		try
-		{
-			Json req = parseJsonString(`{"jsonrpc":"2.0","id":1,"method":"ping"}`);
-			transport.deliver(req, 1);
-		}
-		catch (McpException e)
-			msg = e.msg;
-		assert(msg.canFind("closed"),
-			"partial EOF fragment must close the channel cleanly, got: " ~ msg);
+		result = transport.deliver(parseJsonString(`{"jsonrpc":"2.0","id":1,"method":"ping"}`), 1);
 		transport.closeProcess(200.msecs, 200.msecs);
 	});
+	assert(result["ok"].get!bool, "an unterminated final line must not be dropped");
 }
 
 // An in-memory server->client line queue so a test can play the server side of
