@@ -60,6 +60,8 @@ final class WebhookReceiver
 	}
 
 	private Reg[string] regs_;
+	// Secrets of subscriptions being created (see `expectSecret`), with counts.
+	private size_t[string] expected_;
 	// Dedup keyed per subscription (subId \0 webhook-id), value is the delivery's
 	// webhook-timestamp (seconds). The same eventId fans out to multiple
 	// subscriptions as deliveries sharing a webhook-id, so the key must include
@@ -106,6 +108,25 @@ final class WebhookReceiver
 		regs_.remove(subscriptionId);
 	}
 
+	/// Expect a subscription signed with `secret` whose id is not known yet: a
+	/// server may send its verification challenge before the subscribe call
+	/// that creates the subscription returns its id. While expected, a challenge
+	/// for an unregistered id that verifies under `secret` is answered; anything
+	/// else for that id still waits for `register`. Calls nest: each needs a
+	/// matching `unexpectSecret`.
+	void expectSecret(string secret) @safe
+	{
+		expected_[secret]++;
+	}
+
+	/// Withdraw one `expectSecret` for `secret`.
+	void unexpectSecret(string secret) @safe
+	{
+		if (auto n = secret in expected_)
+			if (--*n == 0)
+				expected_.remove(secret);
+	}
+
 	/// Verify and route one delivery. Returns the HTTP status (and body) the
 	/// endpoint should reply with: `200` once the event is durably accepted (or a
 	/// verification challenge is echoed), `400` on a signature/parse failure, and
@@ -118,7 +139,7 @@ final class WebhookReceiver
 		const subId = headerGet(headers, "x-mcp-subscription-id");
 		auto reg = subId in regs_;
 		if (reg is null)
-			return ReceiverResponse(503, ""); // not yet routable; the server retries
+			return answerExpectedChallenge(body, headers);
 
 		auto wh = Webhook(reg.secret);
 		auto vr = verifyTimestamp ? wh.tryVerify(body,
@@ -156,6 +177,36 @@ final class WebhookReceiver
 			return resp;
 		}
 		return route(body, *reg);
+	}
+
+	// Answer a verification challenge for a subscription id not registered yet
+	// when it verifies under an expected secret; anything else is not routable
+	// yet, and the server retries it.
+	private ReceiverResponse answerExpectedChallenge(string body, string[string] headers) @safe
+	{
+		foreach (secret, _; expected_)
+		{
+			bool ok;
+			try
+			{
+				auto wh = Webhook(secret);
+				ok = (verifyTimestamp ? wh.tryVerify(body,
+						headers) : wh.tryVerifyIgnoringTimestamp(body, headers)).ok;
+			}
+			catch (Exception)
+				continue;
+			if (!ok)
+				continue;
+			Json j;
+			try
+				j = parseUntrustedJson(body);
+			catch (Exception)
+				break;
+			if (isControlEnvelope(j) && j["type"].get!string == "verification")
+				return ReceiverResponse(200, Json(["challenge": j["challenge"]]).toString());
+			break;
+		}
+		return ReceiverResponse(503, "");
 	}
 
 	// Parse a verified delivery and hand it to the subscription's callbacks.
@@ -305,6 +356,42 @@ unittest  // an unknown subscription id yields a retryable 503
 	auto rx = new WebhookReceiver();
 	auto resp = rx.processDelivery(`{}`, ["X-MCP-Subscription-Id": "unknown"]);
 	assert(resp.status == 503);
+}
+
+unittest  // a challenge for a subscription still being created is answered under an expected secret
+{
+	auto rx = new WebhookReceiver();
+	rx.verifyTimestamp = false;
+	const challenge = verificationEnvelope("nonce-early").toString();
+	DeliverySigning signing = {
+		secret: testSecret, messageId: "msg_verif", timestamp: 1700, subscriptionId: "sub_new"
+	};
+	auto headers = signDeliveryHeaders(signing, challenge);
+	assert(rx.processDelivery(challenge, headers).status == 503);
+	rx.expectSecret(testSecret);
+	auto resp = rx.processDelivery(challenge, headers);
+	assert(resp.status == 200);
+	assert(parseJsonString(resp.body)["challenge"].get!string == "nonce-early");
+	// Only the handshake is answered: an event still waits for the registration.
+	const event = EventOccurrence("evt_1", "n", "t").toJson().toString();
+	DeliverySigning evSigning = {
+		secret: testSecret, messageId: "evt_1", timestamp: 1700, subscriptionId: "sub_new"
+	};
+	assert(rx.processDelivery(event, signDeliveryHeaders(evSigning, event)).status == 503);
+	rx.unexpectSecret(testSecret);
+	assert(rx.processDelivery(challenge, headers).status == 503);
+}
+
+unittest  // a challenge signed under a secret nobody expects is not answered
+{
+	auto rx = new WebhookReceiver();
+	rx.verifyTimestamp = false;
+	rx.expectSecret("whsec_BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBA=");
+	const challenge = verificationEnvelope("nonce").toString();
+	DeliverySigning signing = {
+		secret: testSecret, messageId: "msg_verif", timestamp: 1700, subscriptionId: "sub_new"
+	};
+	assert(rx.processDelivery(challenge, signDeliveryHeaders(signing, challenge)).status == 503);
 }
 
 unittest  // a tampered body fails signature verification with 400

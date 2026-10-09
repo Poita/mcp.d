@@ -3302,7 +3302,15 @@ final class McpClient : ClientProtocol
 		auto sub = new EventSubscription();
 		sub.setMode(DeliveryMode.webhook);
 		sub.dedupCapacity(eventSettings_.dedupWindow);
-		auto res = subscribeWebhookEvents(p);
+		// The server may challenge the endpoint before this call returns the id
+		// the receiver routes by; expecting the secret lets that challenge pass.
+		rx.expectSecret(p.delivery.secret);
+		SubscribeResult res;
+		{
+			scope (exit)
+				rx.unexpectSecret(p.delivery.secret);
+			res = subscribeWebhookEvents(p);
+		}
 		const id = res.id;
 		sub.advanceCursor(res.cursor);
 		// Bind deliveries to the subscription's watermark, dedup, and terminal
