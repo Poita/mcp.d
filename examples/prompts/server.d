@@ -25,7 +25,7 @@ import mcp.server.server : McpServer;
 import mcp.api.reflection : registerHandlers;
 import mcp.api.attributes : prompt, describeParam;
 import mcp.protocol.types : GetPromptResult, PromptMessage, Content,
-	CompleteResult, CompletionReference;
+	CompleteRequest, CompleteResult, CompletionReference;
 
 import examples_common : runServerFromArgs;
 
@@ -133,7 +133,7 @@ private McpServer buildServer() @safe
 	// matching the partial value with the built-in `CompleteResult.prefixMatch`
 	// helper. Any other (prompt, argument) pair falls through to an empty result.
 	server.setArgumentCompleter(CompletionReference.forPrompt("code_review"), "language",
-			(string prefix) @safe => CompleteResult.prefixMatch(knownLanguages, prefix).values);
+			(CompleteRequest r) @safe => CompleteResult.prefixMatch(knownLanguages, r.argumentValue));
 
 	return server;
 }

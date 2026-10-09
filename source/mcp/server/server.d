@@ -239,7 +239,7 @@ final class McpServer : ServerCore
 	/// can register one completer per (reference, argument) instead of hand-routing
 	/// inside a single global delegate. Consulted by `doComplete` when no global
 	/// `typedCompletionHandler` is set or it returned no values.
-	private string[]delegate(string prefix) @safe[string] argumentCompleters;
+	private CompleteResult delegate(CompleteRequest request) @safe[string] argumentCompleters;
 	private bool loggingEnabled;
 	private bool resourceSubscriptionsEnabled;
 	private bool tasksEnabled_;
@@ -1084,15 +1084,16 @@ final class McpServer : ServerCore
 
 	/// Register a completer for a single `(reference, argumentName)` pair, so a
 	/// consumer need not hand-route every completable argument inside one global
-	/// `setCompletionRequestHandler` delegate. The delegate receives the partial
-	/// value typed so far and returns the candidate completions; the server wraps
-	/// them in a `CompleteResult` (use `CompleteResult.prefixMatch` for the common
-	/// prefix-matching case). Declaring any completer advertises the `completions`
-	/// capability. `completion/complete` dispatch tries the global handler first
-	/// (when set) and, when it returns no values, falls back to a matching
-	/// per-argument completer, then to an empty `CompleteResult`.
+	/// `setCompletionRequestHandler` delegate. The delegate receives the parsed
+	/// `CompleteRequest` (the partial value in `argumentValue`, previously
+	/// resolved arguments in `context`) and returns the `CompleteResult` (use
+	/// `CompleteResult.prefixMatch` for the common prefix-matching case).
+	/// Declaring any completer advertises the `completions` capability.
+	/// `completion/complete` dispatch tries the global handler first (when set)
+	/// and, when it returns no values, falls back to a matching per-argument
+	/// completer, then to an empty `CompleteResult`.
 	void setArgumentCompleter(CompletionReference reference, string argumentName,
-			string[]delegate(string prefix) @safe completer) @safe
+			CompleteResult delegate(CompleteRequest request) @safe completer) @safe
 	{
 		argumentCompleters[argumentCompleterKey(reference, argumentName)] = completer;
 	}
@@ -3669,13 +3670,7 @@ final class McpServer : ServerCore
 		}
 		const key = argumentCompleterKey(request.reference, request.argumentName);
 		if (auto completer = key in argumentCompleters)
-		{
-			CompleteResult result;
-			auto values = (*completer)(request.argumentValue);
-			result.values = values;
-			result.total = values.length;
-			return result.toJson();
-		}
+			return (*completer)(request).toJson();
 		// A registered (reference, argument) surface exists but this request
 		// matched none of them: an empty completion is the spec-compliant answer.
 		return CompleteResult.init.toJson();
@@ -6732,7 +6727,7 @@ unittest  // a per-argument completer is dispatched on its (reference, argument)
 	registerCompletablePrompt(s, "code_review");
 	immutable langs = ["c", "cpp", "d", "go", "java", "javascript"];
 	s.setArgumentCompleter(CompletionReference.forPrompt("code_review"), "language",
-			(string prefix) @safe => CompleteResult.prefixMatch(langs, prefix).values);
+			(CompleteRequest r) @safe => CompleteResult.prefixMatch(langs, r.argumentValue));
 
 	Json p = Json.emptyObject;
 	p["ref"] = CompletionReference.forPrompt("code_review").toJson();
@@ -6758,7 +6753,7 @@ unittest  // an empty global completion result falls back to a per-argument comp
 		return result;
 	});
 	s.setArgumentCompleter(CompletionReference.forPrompt("code_review"),
-			"language", (string prefix) @safe => ["d"]);
+			"language", (CompleteRequest r) @safe => CompleteResult(["d"]));
 
 	Json p = Json.emptyObject;
 	p["ref"] = CompletionReference.forPrompt("code_review").toJson();
@@ -6782,7 +6777,7 @@ unittest  // a per-argument completer surface answers a non-matching request wit
 	auto s = new McpServer("t", "1");
 	registerCompletablePrompt(s, "code_review");
 	s.setArgumentCompleter(CompletionReference.forPrompt("code_review"),
-			"language", (string prefix) @safe => ["d"]);
+			"language", (CompleteRequest r) @safe => CompleteResult(["d"]));
 
 	// Different argument name on the same prompt: no completer, empty result (not -32601).
 	Json p = Json.emptyObject;
@@ -6800,7 +6795,7 @@ unittest  // registering a per-argument completer advertises the completions cap
 {
 	auto s = new McpServer("t", "1");
 	s.setArgumentCompleter(CompletionReference.forPrompt("p"), "a",
-			(string prefix) @safe => cast(string[]) null);
+			(CompleteRequest r) @safe => CompleteResult.init);
 	auto caps = s.capabilities();
 	assert(caps.completions);
 }
@@ -12901,4 +12896,28 @@ unittest  // completion/complete for an unregistered resource or template is -32
 unittest  // the attached push channel is internal: its raw delivery bypasses the server's gates
 {
 	static assert(__traits(getVisibility, McpServer.serverPushChannel) == "package");
+}
+
+unittest  // a per-argument completer sees context.arguments and returns its own CompleteResult
+{
+	auto s = new McpServer("t", "1");
+	registerCompletablePrompt(s, "deploy");
+	string seenEnv;
+	s.setArgumentCompleter(CompletionReference.forPrompt("deploy"), "service",
+			(CompleteRequest r) @safe {
+		seenEnv = r.context.get("env", "");
+		auto res = CompleteResult.prefixMatch(["api", "auth"], r.argumentValue);
+		res.hasMore = true;
+		res.total = 40;
+		return res;
+	});
+	Json p = Json.emptyObject;
+	p["ref"] = CompletionReference.forPrompt("deploy").toJson();
+	p["argument"] = Json(["name": Json("service"), "value": Json("a")]);
+	p["context"] = Json(["arguments": Json(["env": Json("prod")])]);
+	auto resp = s.handle(req(1, "completion/complete", p)).get;
+	assert(seenEnv == "prod");
+	assert(resp["result"]["completion"]["values"].length == 2);
+	assert(resp["result"]["completion"]["total"].get!long == 40);
+	assert(resp["result"]["completion"]["hasMore"].get!bool);
 }
