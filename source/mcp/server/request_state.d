@@ -281,12 +281,13 @@ package(mcp) final class RequestStateCodec
 // ===========================================================================
 
 /// The identity an MRTR `requestState` blob is bound to: the request's
-/// authenticated subject (empty on stdio / in-process, where binding is a
-/// no-op). Shared by the incoming/outgoing seams so both sides bind to the same
+/// authenticated subject (empty without a valid token, e.g. on stdio /
+/// in-process, where binding is a no-op). Shared by the incoming/outgoing seams so both sides bind to the same
 /// identity.
 package string requestStateSubject(RequestContext ctx) @safe
 {
-	return ctx.auth().subject;
+	const token = ctx.auth();
+	return token.valid ? token.subject : "";
 }
 
 /// The target an MRTR `requestState` blob binds to under the
@@ -719,4 +720,22 @@ unittest  // authSubjectAndTool rejects a requestState minted for another method
 		.get!string;
 	assert(verifyIncomingRequestState(codec, wire, "tools/call", params, ctx).isNull);
 	assert(verifyIncomingRequestState(codec, wire, "prompts/get", params, ctx).get == `{"step":1}`);
+}
+
+unittest  // requestStateSubject ignores the subject of a token that is not valid
+{
+	import mcp.auth.resource_server : TokenInfo;
+	import mcp.server.context : BaseRequestContext;
+
+	static final class InvalidAliceCtx : BaseRequestContext
+	{
+		override TokenInfo auth() @safe
+		{
+			TokenInfo t;
+			t.subject = "alice";
+			return t;
+		}
+	}
+
+	assert(requestStateSubject(new InvalidAliceCtx) == "");
 }
