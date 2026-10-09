@@ -7,6 +7,7 @@
  */
 module app;
 
+import std.array : split;
 import std.conv : to;
 import std.process : environment;
 
@@ -27,5 +28,8 @@ void main(string[] args) @safe
 	StreamableHttpOptions opts;
 	opts.port = environment.get("PORT", "8080").to!ushort;
 	opts.bindAddresses = ["0.0.0.0"];
+	// The public hostname(s), comma-separated; without them the DNS-rebinding
+	// guard answers every non-localhost Host with 403.
+	opts.allowedHosts = environment.get("ALLOWED_HOSTS", "").split(",");
 	runStreamableHttp(server, opts);
 }

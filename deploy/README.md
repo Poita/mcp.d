@@ -91,6 +91,33 @@ For the container to be reachable on a PaaS, the server must:
    restricts `Host`. Keep `validateOrigin` on: it is the browser-facing half of
    the DNS-rebinding guard and works the same behind a proxy.)
 
+Put together, a deployable `main` reads both settings from the environment (the
+`fly.toml` below sets `PORT` and `ALLOWED_HOSTS`) and then serves:
+
+```d
+import std.array : split;
+import std.conv : to;
+import std.process : environment;
+
+import mcp;
+import mcp.transport.streamable_http : runStreamableHttp, StreamableHttpOptions;
+
+void main()
+{
+    auto server = new McpServer("my-server", "1.0.0");
+    // ... register tools, resources, and prompts ...
+
+    StreamableHttpOptions o;
+    o.port = environment.get("PORT", "8080").to!ushort;
+    o.bindAddresses = ["0.0.0.0"];
+    o.allowedHosts = environment.get("ALLOWED_HOSTS", "").split(",");
+    runStreamableHttp(server, o);
+}
+```
+
+[`ci-smoke/source/app.d`](ci-smoke/source/app.d) is the same server as a complete
+dub package; CI builds it with the reference `Dockerfile`.
+
 ## fly.io
 
 A minimal `fly.toml`. The key choice is **keeping a machine running**: if your
