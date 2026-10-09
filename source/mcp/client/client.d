@@ -1458,21 +1458,21 @@ final class McpClient : ClientProtocol
 			endCacheFetch("tools/list", "");
 		const epoch = identityEpoch_;
 		auto acc = cachedFetch!ListToolsResult(CacheKey("tools/list", ""), opts.cacheMode, () @safe {
-			auto a = drainList!ListToolsResult("tools/list", Json.emptyObject,
+			return drainList!ListToolsResult("tools/list", Json.emptyObject,
 				(ref ListToolsResult x, ref ListToolsResult r) @safe {
 				x.tools ~= r.tools;
 			}, opts);
-			// On a modern session over HTTP (the x-mcp-header feature), the client MUST
-			// exclude from tools/list any tool whose inputSchema carries an invalid
-			// `x-mcp-header` annotation (2026-07-28 server/tools #x-mcp-header). Validate each
-			// tool's schema and drop offenders before the result is cached, keeping
-			// siblings. A modern stdio session MAY ignore x-mcp-header; it applies the
-			// same exclusion so a server's tool set does not depend on the transport.
-			// Legacy sessions predate the annotation and are left unfiltered.
-			if (useModern)
-				a.tools = excludeInvalidHeaderTools(a.tools);
-			return a;
 		});
+		// On a modern session over HTTP (the x-mcp-header feature), the client MUST
+		// exclude from tools/list any tool whose inputSchema carries an invalid
+		// `x-mcp-header` annotation (2026-07-28 server/tools #x-mcp-header). Each
+		// tool's schema is validated and offenders dropped, keeping siblings, whether
+		// the list came from the server or from a (possibly shared or pre-seeded)
+		// cache. A modern stdio session MAY ignore x-mcp-header; it applies the same
+		// exclusion so a server's tool set does not depend on the transport. Legacy
+		// sessions predate the annotation and are left unfiltered.
+		if (useModern)
+			acc.tools = excludeInvalidHeaderTools(acc.tools);
 		if (cacheGeneration("tools/list", "") == generation && identityEpoch_ == epoch)
 		{
 			listedTools_ = null;
@@ -6079,6 +6079,41 @@ unittest  // listTools excludes a tool whose x-mcp-header value is empty (2026-0
 	auto names = res.tools.map!(t => t.name).array;
 	assert(!names.canFind("bad"), "tool with empty x-mcp-header must be excluded");
 	assert(names.canFind("good"), "sibling valid tool must remain");
+}
+
+unittest  // listTools excludes an invalid x-mcp-header tool served from a pre-seeded cache
+{
+	import std.algorithm : canFind, map;
+	import std.array : array;
+	import std.datetime : SysTime, DateTime;
+
+	auto c = McpClient.http("http://localhost");
+	c.enableModern();
+	ListToolsResult lr;
+	lr.tools = [
+		headerTool("bad", [
+			"region": Json(["type": Json("string"), "x-mcp-header": Json("")])
+		]),
+		headerTool("good", [
+			"region": Json([
+				"type": Json("string"),
+				"x-mcp-header": Json("Region")
+			])
+		])
+	];
+	auto store = new InMemoryCacheStore();
+	store.put(CacheKey("tools/list", "", "", "http://localhost"),
+			CacheEntry(lr.toJson(), SysTime(DateTime(2999, 1, 1))));
+	c.setCache(store);
+	int calls;
+	c.onRpcForTest = (string method, Json params) @safe {
+		calls++;
+		return Json.emptyObject;
+	};
+	auto names = c.listTools().tools.map!(t => t.name).array;
+	assert(calls == 0, "the pre-seeded entry must be served from the cache");
+	assert(!names.canFind("bad"), "a cached tool with an invalid x-mcp-header must be excluded");
+	assert(names.canFind("good"));
 }
 
 unittest  // listTools excludes a tool whose x-mcp-header value contains CR/LF
