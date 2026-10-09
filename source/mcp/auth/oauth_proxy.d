@@ -1128,13 +1128,19 @@ struct RelayedCodeBinding
 	string clientId; /// the CIMD `client_id` URL; empty for a DCR client
 }
 
-/// A fetched Client ID Metadata Document, or the reason its fetch failed, and
-/// when the cache entry lapses.
+/// A fetched Client ID Metadata Document and when it is next due a refetch.
 private struct CachedClientIdMetadata
 {
 	ClientIdMetadataDocument doc;
+	MonoTime freshUntil;
+}
+
+/// Why a Client ID Metadata Document fetch failed, and until when that failure
+/// is reported without fetching again.
+private struct FailedClientIdMetadata
+{
+	string reason;
 	MonoTime expiresAt;
-	string failure; /// non-empty when the fetch failed
 }
 
 /// The Client ID Metadata Document fetches made to one host in the current
@@ -1201,13 +1207,23 @@ final class OAuthProxy
 	private ConsentStore consentStore;
 	private RedirectUriRegistry redirectRegistry;
 	private ClientIdMetadataFetcher cimdFetcher;
+	private MonoTime delegate() @safe cimdClock;
 	private BoundedExpiringMap!RelayedCodeBinding relayedCodes = BoundedExpiringMap!RelayedCodeBinding(
 			relayedCodeTtl, maxRelayedCodes, null);
 
-	// Fetched Client ID Metadata Documents by client_id URL, so the /consent
-	// leg and repeated /authorize requests reuse one fetch.
+	// Validated Client ID Metadata Documents by client_id URL, so the /consent
+	// leg and repeated /authorize requests reuse one fetch. Kept apart from
+	// `cimdFailures` so failed fetches can never evict a working client's entry.
 	private BoundedExpiringMap!CachedClientIdMetadata cimdCache = BoundedExpiringMap!CachedClientIdMetadata(
-			cimdCacheMaxTtl, maxCachedClientIdMetadata, null);
+			cimdCacheMaxTtl + cimdStaleTtl, maxCachedClientIdMetadata, null);
+
+	// Recently failed fetches by client_id URL.
+	private BoundedExpiringMap!FailedClientIdMetadata cimdFailures = BoundedExpiringMap!FailedClientIdMetadata(
+			cimdCacheMinTtl, maxCachedClientIdMetadata, null);
+
+	/// How much longer than `cimdCacheMaxTtl` after its last successful fetch a
+	/// cached document keeps being served while refetching it fails.
+	enum Duration cimdStaleTtl = 1.hours;
 
 	/// How long a fetched Client ID Metadata Document is reused when its
 	/// response carries no usable `Cache-Control: max-age`.
@@ -1379,6 +1395,9 @@ final class OAuthProxy
 	void grantConsent(string consentSession, string client, const(string)[] scopes) @safe
 	{
 		consentStore.grantConsent(consentSession, redirectUriMatchKey(client), scopes);
+		// A CIMD client a user approved keeps its cached document ahead of ones
+		// only ever fetched by anonymous requests.
+		cimdCache.markUsed(client);
 	}
 
 	/// Build the upstream authorization redirect for a proxied `/authorize`,
@@ -1427,6 +1446,24 @@ final class OAuthProxy
 		cimdFetcher = fetcher;
 	}
 
+	/// Drive the Client ID Metadata Document cache and fetch budget from
+	/// `clock` instead of `MonoTime.currTime` (tests), discarding what they hold.
+	package(mcp) void setCimdClock(MonoTime delegate() @safe clock) @safe
+	{
+		cimdClock = clock;
+		cimdCache = BoundedExpiringMap!CachedClientIdMetadata(cimdCacheMaxTtl + cimdStaleTtl,
+				maxCachedClientIdMetadata, clock);
+		cimdFailures = BoundedExpiringMap!FailedClientIdMetadata(cimdCacheMinTtl,
+				maxCachedClientIdMetadata, clock);
+		cimdFetchesByHost = BoundedExpiringMap!HostFetchWindow(cimdCacheMinTtl,
+				maxCachedClientIdMetadata, clock);
+	}
+
+	private MonoTime cimdNow() @safe
+	{
+		return cimdClock !is null ? cimdClock() : MonoTime.currTime;
+	}
+
 	/// Fetch and parse the OAuth Client ID Metadata Document (SEP-991) hosted at a
 	/// URL-formatted `client_id`. Fails fast (no network) when CIMD is not enabled
 	/// on this proxy or `clientIdUrl` is not a valid https-with-path URL, then
@@ -1442,10 +1479,17 @@ final class OAuthProxy
 	/// `max-age` bounded by `cimdCacheMinTtl` .. `cimdCacheMaxTtl` (default
 	/// `cimdCacheDefaultTtl`), and a failed fetch for `cimdCacheMinTtl`, so the
 	/// `/consent` leg and repeated `/authorize` requests for one client do not
-	/// refetch an attacker-chosen URL. Fetches to one host are further limited to
-	/// `maxClientIdMetadataFetchesPerHost` per `cimdCacheMinTtl`, so distinct
-	/// `client_id` paths on one host cannot each trigger a fetch; past the limit
-	/// an uncached `client_id` on that host fails without a fetch.
+	/// refetch an attacker-chosen URL. Fetches of a `client_id` with no cached
+	/// document are further limited to `maxClientIdMetadataFetchesPerHost` per
+	/// host per `cimdCacheMinTtl`, so distinct `client_id` paths on one host
+	/// cannot each trigger a fetch; past the limit such a `client_id` fails
+	/// without a fetch. A cached document is refetched once stale regardless of
+	/// that budget, and when the refetch fails the cached copy keeps being served
+	/// (retrying every `cimdCacheMinTtl`) until `cimdCacheMaxTtl + cimdStaleTtl`
+	/// after its last successful fetch, so neither a
+	/// flood of requests for other paths nor an outage of the host locks out a
+	/// client already in use. Failed fetches are cached apart from documents and
+	/// cannot evict them.
 	ClientIdMetadataDocument fetchClientIdMetadata(string clientIdUrl) @safe
 	{
 		if (!cfg.clientIdMetadataDocumentSupported)
@@ -1455,19 +1499,20 @@ final class OAuthProxy
 			throw new InvalidClientIdMetadataException(clientIdUrl,
 					"client_id must be an https URL with a path component (SEP-991)");
 
-		const now = MonoTime.currTime;
-		if (auto hit = cimdCache.get(clientIdUrl, false))
+		const now = cimdNow();
+		auto known = cimdCache.get(clientIdUrl, false);
+		if (known !is null && now < known.freshUntil)
+			return known.doc;
+		if (known is null)
 		{
-			if (now < hit.expiresAt)
-			{
-				if (hit.failure.length)
-					throw new InvalidClientIdMetadataException(clientIdUrl, hit.failure);
-				return hit.doc;
-			}
-			cimdCache.remove(clientIdUrl);
+			if (auto failed = cimdFailures.get(clientIdUrl, false))
+				if (now < failed.expiresAt)
+					throw new InvalidClientIdMetadataException(clientIdUrl, failed.reason);
+			// Only a URL with no validated document draws on its host's budget, so
+			// requests for other paths on a host cannot block a known client's refetch.
+			chargeClientIdMetadataFetch(clientIdUrl, now);
 		}
 
-		chargeClientIdMetadataFetch(clientIdUrl, now);
 		ClientIdMetadataDocument doc;
 		Duration ttl = cimdCacheDefaultTtl;
 		try
@@ -1479,10 +1524,15 @@ final class OAuthProxy
 		}
 		catch (InvalidClientIdMetadataException e)
 		{
-			cimdCache.put(clientIdUrl, CachedClientIdMetadata(ClientIdMetadataDocument.init,
-					now + cimdCacheMinTtl, e.msg));
+			if (known !is null)
+			{
+				known.freshUntil = now + cimdCacheMinTtl;
+				return known.doc;
+			}
+			cimdFailures.put(clientIdUrl, FailedClientIdMetadata(e.msg, now + cimdCacheMinTtl));
 			throw e;
 		}
+		cimdFailures.remove(clientIdUrl);
 		cimdCache.put(clientIdUrl, CachedClientIdMetadata(doc, now + ttl));
 		return doc;
 	}
@@ -2082,6 +2132,89 @@ unittest  // CIMD FETCH: the per-host fetch budget is case-insensitive in the ho
 		cast(void) proxy.fetchClientIdMetadata("https://victim.example/" ~ cast(char)('a' + i));
 	assertThrown!InvalidClientIdMetadataException(
 			proxy.fetchClientIdMetadata("https://VICTIM.example/other"));
+}
+
+unittest  // CIMD FETCH: a host's spent fetch budget does not lock out a client whose document is already cached
+{
+	import core.time : minutes;
+	import std.conv : to;
+	import std.exception : assertThrown;
+
+	auto cfg = sampleConfig();
+	cfg.clientIdMetadataDocumentSupported = true;
+	auto proxy = new OAuthProxy(cfg);
+	auto t = MonoTime.currTime;
+	proxy.setCimdClock(() @safe => t);
+	const legit = "https://app.example.com/oauth/client.json";
+	int legitFetches;
+	proxy.clientIdMetadataFetcher = (string url) @safe {
+		if (url != legit)
+			throw new InvalidClientIdMetadataException(url, "not found");
+		++legitFetches;
+		return sampleCimdDoc();
+	};
+	cast(void) proxy.fetchClientIdMetadata(legit);
+	t += OAuthProxy.cimdCacheDefaultTtl + 1.minutes;
+	// Unauthenticated requests for other paths on the same host spend its budget.
+	foreach (i; 0 .. OAuthProxy.maxClientIdMetadataFetchesPerHost * 2)
+		assertThrown!InvalidClientIdMetadataException(
+				proxy.fetchClientIdMetadata("https://app.example.com/x" ~ i.to!string));
+	assert(proxy.fetchClientIdMetadata(legit).clientId == legit);
+	assert(legitFetches == 2);
+}
+
+unittest  // CIMD CACHE: a failed refetch of a validated document keeps serving the cached copy
+{
+	import core.time : minutes;
+
+	auto cfg = sampleConfig();
+	cfg.clientIdMetadataDocumentSupported = true;
+	auto proxy = new OAuthProxy(cfg);
+	auto t = MonoTime.currTime;
+	proxy.setCimdClock(() @safe => t);
+	bool up = true;
+	int fetches;
+	proxy.clientIdMetadataFetcher = (string url) @safe {
+		++fetches;
+		if (!up)
+			throw new InvalidClientIdMetadataException(url, "unreachable");
+		return sampleCimdDoc();
+	};
+	const url = "https://app.example.com/oauth/client.json";
+	cast(void) proxy.fetchClientIdMetadata(url);
+	up = false;
+	t += OAuthProxy.cimdCacheDefaultTtl + 1.minutes;
+	assert(proxy.fetchClientIdMetadata(url).clientId == url);
+	assert(fetches == 2);
+	// The failed refetch backs off rather than retrying on every request.
+	assert(proxy.fetchClientIdMetadata(url).clientId == url);
+	assert(fetches == 2);
+}
+
+unittest  // CIMD CACHE: a flood of failed fetches cannot evict a validated document
+{
+	import std.conv : to;
+	import std.exception : assertThrown;
+
+	auto cfg = sampleConfig();
+	cfg.clientIdMetadataDocumentSupported = true;
+	auto proxy = new OAuthProxy(cfg);
+	const legit = "https://app.example.com/oauth/client.json";
+	int legitFetches;
+	proxy.clientIdMetadataFetcher = (string url) @safe {
+		if (url != legit)
+			throw new InvalidClientIdMetadataException(url, "not found");
+		++legitFetches;
+		return sampleCimdDoc();
+	};
+	cast(void) proxy.fetchClientIdMetadata(legit);
+	foreach (h; 0 .. OAuthProxy.maxCachedClientIdMetadata
+			/ OAuthProxy.maxClientIdMetadataFetchesPerHost + 2)
+		foreach (i; 0 .. OAuthProxy.maxClientIdMetadataFetchesPerHost)
+			assertThrown!InvalidClientIdMetadataException(proxy.fetchClientIdMetadata(
+					"https://h" ~ h.to!string ~ ".example/" ~ i.to!string));
+	cast(void) proxy.fetchClientIdMetadata(legit);
+	assert(legitFetches == 1);
 }
 
 unittest  // CIMD CACHE: Cache-Control max-age sets the cache lifetime within fixed bounds
