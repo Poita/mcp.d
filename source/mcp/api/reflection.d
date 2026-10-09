@@ -15,7 +15,8 @@ import mcp.server.responses : ToolResponse;
 import mcp.server.context;
 import mcp.server.task_context : TaskContext;
 import mcp.server.task_runtime : TaskOptions;
-import mcp.server.event_context : EventContext, EventResult, Event, EventBatch, FetchContext;
+import mcp.server.event_context : EventContext, EventResult, Event, EventBatch,
+	FetchContext, SubContext;
 import mcp.server.events_runtime : EventRegistration, EventCheck;
 import mcp.api.attributes;
 import mcp.api.apps : UiToolMeta, setUiToolMeta, ensureApps;
@@ -1097,6 +1098,11 @@ private Tool toolDescriptor(alias overload, A)(A attr) @safe
 	return descriptor;
 }
 
+/// Whether `P` is a context only event handlers and hooks receive; any other
+/// handler would otherwise read it as a client-supplied argument.
+private enum isEventHandlerContext(P) = is(P == EventContext)
+	|| is(P == FetchContext) || is(P == SubContext);
+
 private void registerToolMethod(string memberName, alias overload, alias parent)(
 		McpServer server, tool attr) @safe
 {
@@ -1106,8 +1112,8 @@ private void registerToolMethod(string memberName, alias overload, alias parent)
 	{
 		static assert(!is(P == TaskContext), "@tool method '" ~ memberName
 				~ "' must not take a TaskContext; declare it with @taskTool to run as a task.");
-		static assert(!is(P == EventContext), "@tool method '" ~ memberName
-				~ "' must not take an EventContext; only event handlers receive one.");
+		static assert(!isEventHandlerContext!P, "@tool method '" ~ memberName
+				~ "' must not take a " ~ P.stringof ~ "; only event handlers receive one.");
 	}
 
 	auto descriptor = toolDescriptor!overload(attr);
@@ -1155,8 +1161,8 @@ private void registerTaskMethod(string memberName, alias overload, alias parent)
 		static assert(!is(P : RequestContext),
 				"@taskTool method '" ~ memberName ~ "' must not take a RequestContext "
 				~ "(the request has already returned); take a TaskContext instead.");
-		static assert(!is(P == EventContext), "@taskTool method '" ~ memberName
-				~ "' must not take an EventContext; only event handlers receive one.");
+		static assert(!isEventHandlerContext!P, "@taskTool method '" ~ memberName
+				~ "' must not take a " ~ P.stringof ~ "; only event handlers receive one.");
 	}
 	static assert(!is(ReturnType!overload == ToolResponse),
 			"@taskTool method '" ~ memberName ~ "' must return a value (or void), not ToolResponse");
@@ -1323,8 +1329,7 @@ private void registerPromptMethod(string memberName, alias overload, alias paren
 		McpServer server, prompt attr) @safe
 {
 	static foreach (P; BoundParameters!overload)
-		static assert(!is(P == TaskContext) && !is(P == EventContext)
-				&& !is(P == FetchContext),
+		static assert(!is(P == TaskContext) && !isEventHandlerContext!P,
 				"@prompt method '" ~ memberName ~ "' must not take a " ~ P.stringof
 				~ "; a prompt may take only a RequestContext besides its arguments");
 	checkParamNames!overload();
@@ -1529,7 +1534,7 @@ private void registerTemplateMethod(string memberName, alias overload,
 		descriptor.title = nullable(attr.title);
 
 	static foreach (P; BoundParameters!overload)
-		static assert(!is(P == TaskContext) && !is(P == EventContext) && !is(P == FetchContext),
+		static assert(!is(P == TaskContext) && !isEventHandlerContext!P,
 				"@resourceTemplate method '" ~ memberName ~ "' must not take a " ~ P.stringof
 				~ "; a resource template may take only a RequestContext besides its variables");
 	checkParamNames!overload();
@@ -4262,6 +4267,54 @@ unittest  // a @taskTool method taking an EventContext is rejected at compile ti
 {
 	auto s = new McpServer("t", "1");
 	static assert(!__traits(compiles, registerHandlers(s, new EventCtxTaskApi)));
+}
+
+version (unittest) private final class EventCtxParamsApi(C)
+{
+	@tool("t", "A plain tool that wrongly takes an event context")
+	string t(string msg, C c) @safe
+	{
+		return msg;
+	}
+}
+
+version (unittest) private final class EventCtxTaskParamsApi(C)
+{
+	@taskTool("t", "A task that wrongly takes an event context")
+	string t(string msg, C c) @safe
+	{
+		return msg;
+	}
+}
+
+version (unittest) private final class EventCtxPromptApi(C)
+{
+	@prompt("p", "A prompt that wrongly takes an event context")
+	string p(string msg, C c) @safe
+	{
+		return msg;
+	}
+}
+
+version (unittest) private final class EventCtxTemplateApi(C)
+{
+	@resourceTemplate("test://{id}", "r")
+	string r(string id, C c) @safe
+	{
+		return id;
+	}
+}
+
+unittest  // a handler taking a FetchContext or SubContext is rejected at compile time
+{
+	auto s = new McpServer("t", "1");
+	static foreach (C; AliasSeq!(FetchContext, SubContext))
+	{
+		static assert(!__traits(compiles, registerHandlers(s, new EventCtxParamsApi!C)));
+		static assert(!__traits(compiles, registerHandlers(s, new EventCtxTaskParamsApi!C)));
+		static assert(!__traits(compiles, registerHandlers(s, new EventCtxPromptApi!C)));
+		static assert(!__traits(compiles, registerHandlers(s, new EventCtxTemplateApi!C)));
+	}
 }
 
 unittest  // a Nullable return is wrapped under `result` in an object output schema
