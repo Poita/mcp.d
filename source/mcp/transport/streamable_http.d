@@ -864,7 +864,7 @@ private final class SseWriter
 	private bool closing;
 	private bool started;
 	private Task writer;
-	/// When the writer began its in-progress socket write (`MonoTime.init`
+	/// When the in-progress socket write last made progress (`MonoTime.init`
 	/// while it is not writing).
 	private MonoTime writingSince;
 	private LocalManualEvent wake;
@@ -885,8 +885,8 @@ private final class SseWriter
 	}
 
 	/// Queue `frame` for writing. When `maxQueued` bytes are already waiting, the
-	/// writer gets until `queueStallTimeout` after it began its current socket
-	/// write to make room, since a burst queued without yielding outruns even a
+	/// writer gets until `queueStallTimeout` after the socket last accepted a
+	/// slice to make room, since a burst queued without yielding outruns even a
 	/// healthy client; a client still not reading by then is deemed gone. The
 	/// deadline is anchored to the stalled write rather than to this call, so
 	/// streams that stalled together give up together and a fan-out across them
@@ -942,14 +942,26 @@ private final class SseWriter
 				auto batch = queue;
 				queue = null;
 				writingSince = MonoTime.currTime;
+				// Slices let a client that keeps reading re-arm the stall deadline and
+				// free queue room as each one is accepted, however large the frame.
+				enum size_t slice = 16 * 1024;
 				() @trusted {
 					foreach (frame; batch)
-						res.bodyWriter.write(cast(const(ubyte)[]) frame);
+					{
+						auto bytes = cast(const(ubyte)[]) frame;
+						while (bytes.length)
+						{
+							const n = bytes.length < slice ? bytes.length : slice;
+							res.bodyWriter.write(bytes[0 .. n]);
+							bytes = bytes[n .. $];
+							queued -= n;
+							writingSince = MonoTime.currTime;
+							drained.emit();
+						}
+					}
 					res.bodyWriter.flush();
 				}();
 				writingSince = MonoTime.init;
-				foreach (frame; batch)
-					queued -= frame.length;
 				drained.emit();
 			}
 		}
@@ -4332,6 +4344,59 @@ version (unittest) private final class StallingSink : OutputStream
 	void finalize()
 	{
 	}
+}
+
+version (unittest) private final class SlowSink : OutputStream
+{
+@safe:
+	size_t received;
+
+	size_t write(scope const(ubyte)[] bytes, IOMode) @trusted
+	{
+		import core.time : msecs;
+		import vibe.core.core : sleep;
+
+		sleep((20 * (bytes.length / 16_384 + 1)).msecs);
+		received += bytes.length;
+		return bytes.length;
+	}
+
+	void flush()
+	{
+	}
+
+	void finalize()
+	{
+	}
+}
+
+unittest  // a client steadily reading a frame larger than the stall timeout's worth is kept
+{
+	import std.array : replicate;
+	import vibe.core.core : runTask, exitEventLoop, runEventLoop;
+	import vibe.http.server : createTestHTTPServerResponse, TestHTTPResponseMode;
+
+	auto sink = new SlowSink;
+	auto writer = sseFrameWriter(createTestHTTPServerResponse(sink, null,
+			TestHTTPResponseMode.bodyOnly));
+	const big = "x".replicate(2 * 1024 * 1024);
+	bool heartbeatQueued;
+	runTask(() @safe nothrow{
+		try
+		{
+			writer(big);
+			writer(": heartbeat\n\n");
+			heartbeatQueued = true;
+			writer.close(10.seconds);
+		}
+		catch (Exception)
+		{
+		}
+		exitEventLoop();
+	});
+	runEventLoop();
+	assert(heartbeatQueued, "a client making steady progress must not be deemed stalled");
+	assert(sink.received >= big.length);
 }
 
 unittest  // a stalled SSE reader blocks neither notify nor other streams, and is dropped
