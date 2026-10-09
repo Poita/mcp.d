@@ -518,7 +518,7 @@ package Jwk[] parseJwks(string jwksJson) @safe
 	auto keys = root["keys"];
 	if (keys.type != Json.Type.array)
 		return result;
-	foreach (k; ()@trusted { return keys.get!(Json[]); }())
+	foreach (k; keys.get!(Json[]))
 	{
 		if (k.type != Json.Type.object)
 			continue;
@@ -988,7 +988,7 @@ package ubyte[] base64UrlDecode(string seg) @safe
 {
 	import std.base64 : Base64URLNoPadding;
 
-	return () @trusted { return Base64URLNoPadding.decode(seg); }();
+	return Base64URLNoPadding.decode(seg);
 }
 
 private Json decodeSegmentJson(string seg) @safe
@@ -996,7 +996,7 @@ private Json decodeSegmentJson(string seg) @safe
 	try
 	{
 		auto bytes = base64UrlDecode(seg);
-		auto s = () @trusted { return (cast(char[]) bytes).idup; }();
+		auto s = (cast(char[]) bytes).idup;
 		return parseUntrustedJson(s);
 	}
 	catch (Exception)
@@ -1020,7 +1020,7 @@ private string[] jsonStrArray(Json j, string key) @safe
 	if (v.type != Json.Type.array)
 		return null;
 	string[] result;
-	foreach (e; ()@trusted { return v.get!(Json[]); }())
+	foreach (e; v.get!(Json[]))
 		if (e.type == Json.Type.string)
 			result ~= e.get!string;
 	return result;
@@ -1035,7 +1035,7 @@ package string[] audiences(Json payload) @safe
 	if (a.type == Json.Type.string)
 		result ~= a.get!string;
 	else if (a.type == Json.Type.array)
-		foreach (e; ()@trusted { return a.get!(Json[]); }())
+		foreach (e; a.get!(Json[]))
 			if (e.type == Json.Type.string)
 				result ~= e.get!string;
 	return result;
@@ -1107,7 +1107,7 @@ string[] tokenScopes(Json payload) @safe
 	if (scp.type == Json.Type.array)
 	{
 		string[] result;
-		foreach (e; ()@trusted { return scp.get!(Json[]); }())
+		foreach (e; scp.get!(Json[]))
 			if (e.type == Json.Type.string)
 				result ~= e.get!string;
 		return result;
@@ -1255,7 +1255,7 @@ unittest  // a claim rejection is logged with its reason, never with the token
 			~ `"}]}`);
 	assert(!verifyToken(cfg, testRs256Jwt, cache, 1_700_001_000).valid);
 
-	auto lines = () @trusted { return (cast() logger).lines; }();
+	auto lines = (cast() logger).lines;
 	assert(lines.any!(l => l.canFind("aud")), "the audience rejection must be logged");
 	assert(!lines.any!(l => l.canFind(testRs256Jwt[0 .. 20])), "the token must never be logged");
 }
@@ -1292,7 +1292,7 @@ unittest  // a `typ` rejection is logged with its reason
 	auto tok = makeEs256(`{"sub":"u","exp":1700003600}`);
 	assert(!verifyToken(cfg, tok, new NoKeys, 1_700_001_000).valid);
 
-	auto lines = () @trusted { return (cast() logger).lines; }();
+	auto lines = (cast() logger).lines;
 	assert(lines.any!(l => l.canFind("typ")), "the typ rejection must be logged");
 }
 
@@ -1834,7 +1834,7 @@ version (Posix) unittest  // a JWKS on a non-loopback internal address loads onl
 			settings.bindAddresses = ["0.0.0.0"];
 			auto listener = listenHTTP(settings, router);
 			scope (exit)
-				() @trusted { listener.stopListening(); }();
+				listener.stopListening();
 			// 0.0.0.0 is an internal, non-loopback address that still reaches
 			// this host's listener on POSIX (Windows refuses to connect to it).
 			const uri = "http://0.0.0.0:" ~ listener.bindAddresses[0].port.to!string ~ "/jwks";
@@ -1903,7 +1903,7 @@ unittest  // rawEcdsaToDer round-trips via pre-allocated buffer (no OpenSSL allo
 	assert(rawSig.length == 64);
 	// rawEcdsaToDer uses i2d_ECDSA_SIG with a D-GC buffer rather than an
 	// OpenSSL-allocated buffer, so no CRYPTO_free call is needed.
-	auto der = () @trusted { return rawEcdsaToDer(rawSig); }();
+	auto der = rawEcdsaToDer(rawSig);
 	assert(der.length > 0 && der[0] == 0x30);
 }
 
@@ -1957,7 +1957,7 @@ unittest  // fetchJwks discards non-2xx bodies so a 503 does not mark the cache 
 			settings.bindAddresses = ["127.0.0.1"];
 			auto listener = listenHTTP(settings, router);
 			scope (exit)
-				() @trusted { listener.stopListening(); }();
+				listener.stopListening();
 
 			const port = listener.bindAddresses[0].port;
 			const uri = "http://127.0.0.1:" ~ port.to!string ~ "/jwks";
@@ -2018,7 +2018,7 @@ unittest  // fetchJwks refuses a JWKS response larger than maxJwksBytes
 			settings.bindAddresses = ["127.0.0.1"];
 			auto listener = listenHTTP(settings, router);
 			scope (exit)
-				() @trusted { listener.stopListening(); }();
+				listener.stopListening();
 			const uri = "http://127.0.0.1:" ~ listener.bindAddresses[0].port.to!string ~ "/jwks";
 			keys = new JwksCache(uri, 300.seconds).keysFor("rsa-1").length;
 		}

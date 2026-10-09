@@ -220,10 +220,8 @@ package(mcp) JsonNode schemaNode(T, SchemaUse use, Ancestors...)()
 							import vibe.data.json : JsonSerializer;
 							import vibe.data.serialization : serializeWithPolicy;
 
-							const d = () @trusted {
-								return serializeWithPolicy!(JsonSerializer, EnumByNamePolicy)(
-										__traits(getMember, T.init, field));
-							}();
+							const d = serializeWithPolicy!(JsonSerializer, EnumByNamePolicy)(
+									__traits(getMember, T.init, field));
 							if (d.type != Json.Type.null_ && d.type != Json.Type.undefined)
 								prop.set("default", vibeJsonToNode(d));
 						}
@@ -944,9 +942,7 @@ private T bindLeaf(T)(Json v, string path)
 	}
 
 	try
-		return () @trusted {
 		return deserializeWithPolicy!(JsonSerializer, EnumByNamePolicy, T)(v);
-	}();
 	catch (Exception e)
 		throw new BindException(located(path, e.msg));
 }

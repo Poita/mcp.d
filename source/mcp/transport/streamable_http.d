@@ -949,22 +949,20 @@ private final class SseWriter
 				// Slices let a client that keeps reading re-arm the stall deadline and
 				// free queue room as each one is accepted, however large the frame.
 				enum size_t slice = 16 * 1024;
-				() @trusted {
-					foreach (frame; batch)
+				foreach (frame; batch)
+				{
+					auto bytes = cast(const(ubyte)[]) frame;
+					while (bytes.length)
 					{
-						auto bytes = cast(const(ubyte)[]) frame;
-						while (bytes.length)
-						{
-							const n = bytes.length < slice ? bytes.length : slice;
-							res.bodyWriter.write(bytes[0 .. n]);
-							bytes = bytes[n .. $];
-							queued -= n;
-							writingSince = MonoTime.currTime;
-							drained.emit();
-						}
+						const n = bytes.length < slice ? bytes.length : slice;
+						res.bodyWriter.write(bytes[0 .. n]);
+						bytes = bytes[n .. $];
+						queued -= n;
+						writingSince = MonoTime.currTime;
+						drained.emit();
 					}
-					res.bodyWriter.flush();
-				}();
+				}
+				res.bodyWriter.flush();
 				writingSince = MonoTime.init;
 				drained.emit();
 			}
@@ -2243,7 +2241,7 @@ private void handleEventsStream(McpServer server, Message msg,
 			else
 			{
 				const ec = terminatedEvt.emitCount;
-				() @trusted { terminatedEvt.wait(sleepMs.msecs, ec); }();
+				terminatedEvt.wait(sleepMs.msecs, ec);
 			}
 		}
 		catch (Exception)
@@ -3142,7 +3140,7 @@ unittest  // with auth on, every member of a 2025-03-26 batch sees the caller's 
 				"Accept": "application/json, text/event-stream",
 				"Authorization": "Bearer tok-alice"
 	]), res);
-	const reply = () @trusted { return cast(string) sink.data.idup; }();
+	const reply = cast(string) sink.data.idup;
 	assert(res.statusCode == HTTPStatus.ok, reply);
 	auto arr = parseJsonString(reply);
 	assert(arr[0]["result"]["content"][0]["text"].get!string == "alice",
@@ -3217,7 +3215,7 @@ unittest  // a client reply inside a 2025-03-26 batch resolves the waiting serve
 	router.handleRequest(makeInitPostReq(`[{"jsonrpc":"2.0","id":` ~ id.to!string
 			~ `,"result":{"answer":42}},{"jsonrpc":"2.0","id":"p","method":"ping"}]`,
 			["Accept": "application/json, text/event-stream"]), res);
-	const reply = () @trusted { return cast(string) sink.data.idup; }();
+	const reply = cast(string) sink.data.idup;
 	assert(res.statusCode == HTTPStatus.ok, reply);
 	auto arr = parseJsonString(reply);
 	assert(arr.length == 1 && arr[0]["id"].get!string == "p", reply);
@@ -3386,7 +3384,7 @@ unittest  // modern: a client closing its TCP connection mid-request cancels the
 			{
 				ubyte[512] buf;
 				const n = conn.read(buf[], IOMode.once);
-				failure = () @trusted { return cast(string) buf[0 .. n].idup; }();
+				failure = cast(string) buf[0 .. n].idup;
 			}
 			conn.close();
 			const finishBy = MonoTime.currTime + 6.seconds;
@@ -4158,9 +4156,7 @@ unittest  // legacy POST route: missing sessionId is 400, unknown sessionId is 4
 
 	int post(string url) @safe
 	{
-		auto buf = () @trusted {
-			return cast(ubyte[]) initializeBody("2024-11-05").dup;
-		}();
+		auto buf = cast(ubyte[]) initializeBody("2024-11-05").dup;
 		auto req = createTestHTTPServerRequest(URL(url), HTTPMethod.POST,
 				createMemoryStream(buf, false));
 		req.headers["Host"] = "127.0.0.1";
@@ -5259,7 +5255,7 @@ version (unittest) private HTTPServerRequest makeInitPostReq(string body_,
 	import vibe.inet.url : URL;
 	import vibe.stream.memory : createMemoryStream;
 
-	auto buf = () @trusted { return cast(ubyte[]) body_.dup; }();
+	auto buf = cast(ubyte[]) body_.dup;
 	auto req = createTestHTTPServerRequest(URL("http://127.0.0.1/mcp"),
 			HTTPMethod.POST, createMemoryStream(buf, false));
 	req.headers["Host"] = "127.0.0.1";
@@ -5329,7 +5325,7 @@ version (unittest) private string streamedToolCall(string initVersion, string[st
 	router.handleRequest(makeInitPostReq(`{"jsonrpc":"2.0","id":2,"method":"tools/call",`
 			~ `"params":{"name":"progress","arguments":{},"_meta":{"progressToken":"p"}}}`,
 			callHeaders), res);
-	return () @trusted { return cast(string) sink.data.idup; }();
+	return cast(string) sink.data.idup;
 }
 
 unittest  // a 2025-03-26 session's streamed POST carries no priming event
@@ -5401,7 +5397,7 @@ unittest  // the standalone GET stream writes its first bytes as soon as it open
 		try
 		{
 			sleep(500.msecs);
-			early = () @trusted { return cast(string) sink.data.idup; }();
+			early = cast(string) sink.data.idup;
 			router.handleRequest(getReq(HTTPMethod.DELETE),
 				createTestHTTPServerResponse(createMemoryOutputStream(),
 				null, TestHTTPResponseMode.bodyOnly));
@@ -5523,7 +5519,7 @@ unittest  // a POST accepting only text/event-stream gets its non-streamed reply
 			`{"jsonrpc":"2.0","id":7,"method":"ping"}`, "text/event-stream"), res);
 	assert(res.statusCode == HTTPStatus.ok);
 	assert(res.headers.get("Content-Type", "").canFind("text/event-stream"));
-	const body_ = () @trusted { return cast(string) sink.data.idup; }();
+	const body_ = cast(string) sink.data.idup;
 	assert(body_.canFind("data: ") && body_.canFind(`"id":7`), body_);
 }
 
@@ -5560,7 +5556,7 @@ version (unittest) private HTTPServerResponse callElicitingTool(bool catchRefusa
 	router.handleRequest(sessionReq(HTTPMethod.POST, sid,
 			`{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"ask","arguments":{}}}`,
 			"application/json"), res);
-	responseBody = () @trusted { return cast(string) sink.data.idup; }();
+	responseBody = cast(string) sink.data.idup;
 	return res;
 }
 
@@ -5665,8 +5661,8 @@ unittest  // two mounts of one stateful server keep each session's events on its
 		exitEventLoop();
 	});
 	runEventLoop();
-	const a = () @trusted { return cast(string) sinkA.data.idup; }();
-	const b = () @trusted { return cast(string) sinkB.data.idup; }();
+	const a = cast(string) sinkA.data.idup;
+	const b = cast(string) sinkB.data.idup;
 	assert(b.canFind("notifications/progress") && b.canFind("\"id\":2"),
 			"session B's POST stream must carry its own events: " ~ b);
 	assert(!a.canFind("notifications/progress") && !a.canFind("\"id\":2"),
@@ -6101,7 +6097,7 @@ unittest  // a stateful server answers a body-signalled 2026-07-28 subscriptions
 	router.handleRequest(req, res);
 
 	assert(res.statusCode == HTTPStatus.badRequest);
-	auto resp = parseJsonString(() @trusted { return cast(string) sink.data.idup; }());
+	auto resp = parseJsonString(cast(string) sink.data.idup);
 	assert(resp["error"]["code"].get!int == ErrorCode.unsupportedProtocolVersion);
 }
 
@@ -6165,7 +6161,7 @@ version (unittest) private HTTPServerResponse postToMount(string body_,
 	auto sink = createMemoryOutputStream();
 	auto res = createTestHTTPServerResponse(sink, null, TestHTTPResponseMode.bodyOnly);
 	router.handleRequest(makeInitPostReq(body_, headers), res);
-	responseBody = () @trusted { return cast(string) sink.data.idup; }();
+	responseBody = cast(string) sink.data.idup;
 	return res;
 }
 
@@ -6257,7 +6253,7 @@ unittest  // a POST body that fails to read for a reason other than size is a 40
 	auto res = createTestHTTPServerResponse(sink, null, TestHTTPResponseMode.bodyOnly);
 	router.handleRequest(req, res);
 	assert(res.statusCode == HTTPStatus.badRequest);
-	const reply = () @trusted { return cast(string) sink.data.idup; }();
+	const reply = cast(string) sink.data.idup;
 	assert(parseJsonString(reply)["error"]["code"].get!int == ErrorCode.invalidRequest);
 }
 
@@ -6279,7 +6275,7 @@ unittest  // a POST body read failure answers a fixed message, not the stream's 
 	auto sink = createMemoryOutputStream();
 	auto res = createTestHTTPServerResponse(sink, null, TestHTTPResponseMode.bodyOnly);
 	router.handleRequest(req, res);
-	const reply = () @trusted { return cast(string) sink.data.idup; }();
+	const reply = cast(string) sink.data.idup;
 	const message = parseJsonString(reply)["error"]["message"].get!string;
 	assert(!message.canFind("connection reset by peer"), message);
 }
@@ -6295,7 +6291,7 @@ unittest  // a chunked POST body that grows past maxRequestBytes is a 413
 	opts.maxRequestBytes = 16;
 	auto router = new URLRouter;
 	mountMcp(router, new McpServer("t", "1"), opts);
-	auto buf = () @trusted { return cast(ubyte[]) initializeBody().dup; }();
+	auto buf = cast(ubyte[]) initializeBody().dup;
 	auto req = createTestHTTPServerRequest(URL("http://127.0.0.1/mcp"),
 			HTTPMethod.POST, createMemoryStream(buf, false));
 	req.headers["Host"] = "127.0.0.1";
@@ -7277,7 +7273,7 @@ version (unittest) private HTTPServerResponse legacyRequest(URLRouter router,
 	import vibe.inet.url : URL;
 	import vibe.stream.memory : createMemoryStream;
 
-	auto buf = () @trusted { return cast(ubyte[]) body_.dup; }();
+	auto buf = cast(ubyte[]) body_.dup;
 	auto req = createTestHTTPServerRequest(URL("http://127.0.0.1" ~ path),
 			method, createMemoryStream(buf, false));
 	req.headers["Host"] = "127.0.0.1";
@@ -7530,7 +7526,7 @@ version (unittest) private HTTPServerResponse corsRequest(URLRouter router,
 	import vibe.inet.url : URL;
 	import vibe.stream.memory : createMemoryStream, createMemoryOutputStream;
 
-	auto buf = () @trusted { return cast(ubyte[]) body_.dup; }();
+	auto buf = cast(ubyte[]) body_.dup;
 	auto req = createTestHTTPServerRequest(URL("http://127.0.0.1" ~ path),
 			method, createMemoryStream(buf, false));
 	req.headers["Host"] = "127.0.0.1";

@@ -305,7 +305,8 @@ final class EventHandle(A, P)
 		if (j.type == Json.Type.object)
 			static foreach (f; FieldNameTuple!A)
 				static if (isBoundField!(A, f))
-					() @trusted {
+					{
+					{
 						enum key = wireFieldName!(A, f);
 						if (auto p = key in j)
 							{
@@ -318,7 +319,8 @@ final class EventHandle(A, P)
 							catch (Exception e)
 								throw invalidParams("argument '" ~ key ~ "': " ~ e.msg);
 						}
-					}();
+					}
+				}
 		return result;
 	}
 
@@ -327,16 +329,12 @@ final class EventHandle(A, P)
 	// name, matching the derived payloadSchema and the @tool/@taskTool marshalling.
 	private static Json serializePayload(P payload) @safe
 	{
-		return () @trusted {
-			return serializeWithPolicy!(JsonSerializer, EnumByNamePolicy)(payload);
-		}();
+		return serializeWithPolicy!(JsonSerializer, EnumByNamePolicy)(payload);
 	}
 
 	private static P deserializePayload(Json data) @safe
 	{
-		return () @trusted {
-			return deserializeWithPolicy!(JsonSerializer, EnumByNamePolicy, P)(data);
-		}();
+		return deserializeWithPolicy!(JsonSerializer, EnumByNamePolicy, P)(data);
 	}
 }
 
@@ -3656,7 +3654,7 @@ version (unittest)
 		scope (exit)
 			() @trusted { deregisterLogger(shared_); }();
 		fn();
-		return () @trusted { return (cast() logger).lines; }();
+		return (cast() logger).lines;
 	}
 }
 

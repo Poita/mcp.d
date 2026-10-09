@@ -88,7 +88,7 @@ unittest
 		{
 			auto listener = listenHTTP(settings, router);
 			scope (exit)
-				() @trusted { listener.stopListening(); }();
+				listener.stopListening();
 			const port = listener.bindAddresses[0].port;
 			// Point the client at the LEGACY SSE endpoint. A POST to /sse has no
 			// route (only GET), so the server answers 404 -> the client's modern
@@ -150,7 +150,7 @@ unittest
 		{
 			auto listener = listenHTTP(settings, router);
 			scope (exit)
-				() @trusted { listener.stopListening(); }();
+				listener.stopListening();
 			const port = listener.bindAddresses[0].port;
 			auto url = "http://127.0.0.1:" ~ port.to!string ~ "/mcp";
 
@@ -222,7 +222,7 @@ unittest
 		{
 			auto listener = listenHTTP(settings, router);
 			scope (exit)
-				() @trusted { listener.stopListening(); }();
+				listener.stopListening();
 			const port = listener.bindAddresses[0].port;
 			auto url = "http://127.0.0.1:" ~ port.to!string ~ "/mcp";
 
@@ -302,7 +302,7 @@ unittest
 		{
 			auto listener = listenHTTP(settings, router);
 			scope (exit)
-				() @trusted { listener.stopListening(); }();
+				listener.stopListening();
 			const port = listener.bindAddresses[0].port;
 			auto url = "http://127.0.0.1:" ~ port.to!string ~ "/mcp";
 
@@ -367,7 +367,7 @@ unittest
 
 	auto router = new URLRouter;
 	router.post("/mcp", (HTTPServerRequest req, HTTPServerResponse res) @safe {
-		const payload = () @trusted { return req.bodyReader.readAllUTF8(); }();
+		const payload = req.bodyReader.readAllUTF8();
 		auto j = parseJsonString(payload);
 		const method = ("method" in j) ? j["method"].get!string : "";
 
@@ -387,10 +387,8 @@ unittest
 			// response — the trigger for the client's Last-Event-ID resume.
 			droppedId = j["id"].get!long;
 			res.contentType = "text/event-stream";
-			() @trusted {
-				res.bodyWriter.write(cast(const(ubyte)[]) "retry: 50\r\nid: evt-1\r\n\r\n");
-				res.bodyWriter.flush();
-			}();
+			res.bodyWriter.write(cast(const(ubyte)[]) "retry: 50\r\nid: evt-1\r\n\r\n");
+			res.bodyWriter.flush();
 			return; // handler returns -> stream closes (EOF) with no response
 		}
 		// notifications/initialized and any other oneway: just acknowledge.
@@ -411,10 +409,8 @@ unittest
 		resp["id"] = Json(droppedId);
 		res.contentType = "text/event-stream";
 		const frame = "id: evt-2\r\ndata: " ~ resp.toString() ~ "\r\n\r\n";
-		() @trusted {
-			res.bodyWriter.write(cast(const(ubyte)[]) frame);
-			res.bodyWriter.flush();
-		}();
+		res.bodyWriter.write(cast(const(ubyte)[]) frame);
+		res.bodyWriter.flush();
 	});
 
 	auto settings = new HTTPServerSettings;
@@ -426,7 +422,7 @@ unittest
 		{
 			auto listener = listenHTTP(settings, router);
 			scope (exit)
-				() @trusted { listener.stopListening(); }();
+				listener.stopListening();
 			const port = listener.bindAddresses[0].port;
 			auto url = "http://127.0.0.1:" ~ port.to!string ~ "/mcp";
 
@@ -500,7 +496,7 @@ unittest
 		{
 			auto listener = listenHTTP(settings, router);
 			scope (exit)
-				() @trusted { listener.stopListening(); }();
+				listener.stopListening();
 			const port = listener.bindAddresses[0].port;
 			auto url = "http://127.0.0.1:" ~ port.to!string ~ "/mcp";
 
@@ -579,7 +575,7 @@ unittest
 		{
 			auto listener = listenHTTP(settings, router);
 			scope (exit)
-				() @trusted { listener.stopListening(); }();
+				listener.stopListening();
 			const port = listener.bindAddresses[0].port;
 			auto url = "http://127.0.0.1:" ~ port.to!string ~ "/mcp";
 
@@ -656,7 +652,7 @@ unittest
 		{
 			auto listener = listenHTTP(settings, router);
 			scope (exit)
-				() @trusted { listener.stopListening(); }();
+				listener.stopListening();
 			const port = listener.bindAddresses[0].port;
 			auto url = "http://127.0.0.1:" ~ port.to!string ~ "/mcp";
 
@@ -748,7 +744,7 @@ unittest
 		{
 			auto listener = listenHTTP(settings, router);
 			scope (exit)
-				() @trusted { listener.stopListening(); }();
+				listener.stopListening();
 			const port = listener.bindAddresses[0].port;
 			auto client = McpClient.http("http://127.0.0.1:" ~ port.to!string ~ "/mcp");
 			scope (exit)

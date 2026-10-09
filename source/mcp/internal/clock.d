@@ -9,5 +9,5 @@ string systemNowIso() @safe
 {
 	import std.datetime.systime : Clock;
 
-	return () @trusted { return Clock.currTime().toUTC().toISOExtString(); }();
+	return Clock.currTime().toUTC().toISOExtString();
 }

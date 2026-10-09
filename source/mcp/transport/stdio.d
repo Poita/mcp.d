@@ -369,7 +369,7 @@ private final class InflightCount
 			if (now >= deadline)
 				break;
 			const ec = finished.emitCount;
-			() @trusted { finished.wait(deadline - now, ec); }();
+			finished.wait(deadline - now, ec);
 		}
 	}
 }
@@ -541,9 +541,9 @@ void runStdio(McpServer server, StdioOptions opts = StdioOptions.init)
 
 	void writeLine(string s) @safe
 	{
-		() @trusted { writeMtx.lock(); }();
+		writeMtx.lock();
 		scope (exit)
-			() @trusted { writeMtx.unlock(); }();
+			writeMtx.unlock();
 		auto bytes = cast(const(ubyte)[])(s ~ "\n");
 		// Write the whole frame (IOMode.all loops internally until done). Inspect
 		// the result symmetrically with readLine: a status that is neither ok nor
@@ -641,9 +641,9 @@ version (Posix)
 			return fstat(fd, &st) == 0 && S_ISSOCK(st.st_mode);
 		}();
 		if (e.isSocket_)
-			e.sock_ = () @trusted { return eventDriver.sockets.adoptStream(fd); }();
+			e.sock_ = eventDriver.sockets.adoptStream(fd);
 		else
-			e.pipe_ = () @trusted { return eventDriver.pipes.adopt(fd); }();
+			e.pipe_ = eventDriver.pipes.adopt(fd);
 		return e;
 	}
 
@@ -653,8 +653,8 @@ version (Posix)
 		import eventcore.core : eventDriver;
 
 		if (isSocket_)
-			return () @trusted { return eventDriver.sockets.isValid(sock_); }();
-		return () @trusted { return eventDriver.pipes.isValid(pipe_); }();
+			return eventDriver.sockets.isValid(sock_);
+		return eventDriver.pipes.isValid(pipe_);
 	}
 
 	/// Release the adopted handle (closes the dup'd fd eventcore owns).
@@ -663,9 +663,9 @@ version (Posix)
 		import eventcore.core : eventDriver;
 
 		if (isSocket_)
-			() @trusted { eventDriver.sockets.releaseRef(sock_); }();
+			eventDriver.sockets.releaseRef(sock_);
 		else
-			() @trusted { eventDriver.pipes.releaseRef(pipe_); }();
+			eventDriver.pipes.releaseRef(pipe_);
 	}
 
 	/// Read whatever is currently available into `buf` (`IOMode.once`), blocking
@@ -678,18 +678,14 @@ version (Posix)
 
 		if (isSocket_)
 		{
-			auto res = () @trusted {
-				return asyncAwaitUninterruptible!(IOCallback, (cb) {
-					eventDriver.sockets.read(sock_, buf, IOMode.once, cb);
-				});
-			}();
+			auto res = asyncAwaitUninterruptible!(IOCallback, (cb) {
+				eventDriver.sockets.read(sock_, buf, IOMode.once, cb);
+			});
 			return IoResult(res[1], res[2]);
 		}
-		auto res = () @trusted {
-			return asyncAwaitUninterruptible!(PipeIOCallback, (cb) {
-				eventDriver.pipes.read(pipe_, buf, IOMode.once, cb);
-			});
-		}();
+		auto res = asyncAwaitUninterruptible!(PipeIOCallback, (cb) {
+			eventDriver.pipes.read(pipe_, buf, IOMode.once, cb);
+		});
 		return IoResult(res[1], res[2]);
 	}
 
@@ -702,18 +698,14 @@ version (Posix)
 
 		if (isSocket_)
 		{
-			auto res = () @trusted {
-				return asyncAwaitUninterruptible!(IOCallback, (cb) {
-					eventDriver.sockets.write(sock_, bytes, IOMode.all, cb);
-				});
-			}();
+			auto res = asyncAwaitUninterruptible!(IOCallback, (cb) {
+				eventDriver.sockets.write(sock_, bytes, IOMode.all, cb);
+			});
 			return IoResult(res[1], res[2]);
 		}
-		auto res = () @trusted {
-			return asyncAwaitUninterruptible!(PipeIOCallback, (cb) {
-				eventDriver.pipes.write(pipe_, bytes, IOMode.all, cb);
-			});
-		}();
+		auto res = asyncAwaitUninterruptible!(PipeIOCallback, (cb) {
+			eventDriver.pipes.write(pipe_, bytes, IOMode.all, cb);
+		});
 		return IoResult(res[1], res[2]);
 	}
 }
@@ -956,12 +948,12 @@ version (Posix) private struct FdDiversion
 		import core.sys.posix.unistd : dup, dup2, close;
 
 		FdDiversion d;
-		const saved = () @trusted { return dup(fd); }();
+		const saved = dup(fd);
 		if (saved == -1)
 			return d;
-		if (()@trusted { return dup2(to, fd); }() == -1)
+		if (dup2(to, fd) == -1)
 		{
-			() @trusted { close(saved); }();
+			close(saved);
 			return d;
 		}
 		d.fd = fd;
@@ -976,7 +968,8 @@ version (Posix) private struct FdDiversion
 
 		if (saved == -1)
 			return;
-		() @trusted { dup2(saved, fd); close(saved); }();
+		dup2(saved, fd);
+		close(saved);
 		saved = -1;
 	}
 }
@@ -1075,16 +1068,14 @@ version (Posix)
 		import core.sys.posix.unistd : dup, close;
 		import core.sys.posix.fcntl : fcntl, F_GETFL;
 
-		const in2 = () @trusted { return dup(0); }();
-		const out2 = () @trusted { return dup(1); }();
+		const in2 = dup(0);
+		const out2 = dup(1);
 		if (in2 == -1 || out2 == -1)
 		{
-			() @trusted {
-				if (in2 != -1)
-					close(in2);
-				if (out2 != -1)
-					close(out2);
-			}();
+			if (in2 != -1)
+				close(in2);
+			if (out2 != -1)
+				close(out2);
 			throw new Exception("runStdio: dup(stdin/stdout) failed");
 		}
 
@@ -1112,17 +1103,17 @@ version (Posix)
 			if (a.inFD.valid())
 				a.inFD.releaseRef();
 			else
-				() @trusted { close(in2); }();
+				close(in2);
 			if (a.outFD.valid())
 				a.outFD.releaseRef();
 			else
-				() @trusted { close(out2); }();
+				close(out2);
 			throw new Exception("runStdio: failed to adopt stdin/stdout dups");
 		}
 
 		// The transport now writes through its own dup of stdout; everything else
 		// that writes to fd 1 goes to stderr so it cannot corrupt the stream.
-		() @trusted { import core.stdc.stdio : fflush, stdout;
+		() { import core.stdc.stdio : fflush, stdout;
 
 		fflush(stdout); }();
 		a.stdoutDiversion = FdDiversion.divert(1, 2);
@@ -1137,9 +1128,11 @@ version (Posix)
 	{
 		import core.sys.posix.fcntl : fcntl, F_SETFL;
 
-		() @trusted { import core.stdc.stdio : fflush, stdout;
+		{
+			import core.stdc.stdio : fflush, stdout;
 
-		fflush(stdout); }();
+			fflush(stdout);
+		}
 		stdoutDiversion.restore();
 		() @trusted {
 			if (inFlags != -1)
@@ -1346,22 +1339,24 @@ version (Posix) unittest  // runStdio's adopt/releaseRef cycle leaves the origin
 	import core.sys.posix.fcntl : fcntl, F_GETFL, F_SETFL, O_NONBLOCK;
 
 	int[2] fds;
-	assert(() @trusted { return pipe(fds); }() == 0, "pipe() failed");
+	assert(pipe(fds) == 0, "pipe() failed");
 	const readEnd = fds[0];
 	const writeEnd = fds[1];
 	scope (exit)
-		() @trusted { close(readEnd); close(writeEnd); }();
+	{
+		close(readEnd);
+		close(writeEnd);
+	}
 
 	const preFlags = () @trusted { return fcntl(readEnd, F_GETFL); }();
 	assert(preFlags != -1, "pre-adopt fcntl(F_GETFL) failed");
 	const preNonBlock = (preFlags & O_NONBLOCK) != 0;
 
 	// dup-then-adopt, exactly as runStdio does for fd 0/1.
-	const dupFd = () @trusted { return dup(readEnd); }();
+	const dupFd = dup(readEnd);
 	assert(dupFd != -1, "dup() failed");
-	auto handle = () @trusted { return eventDriver.pipes.adopt(dupFd); }();
-	assert(() @trusted { return eventDriver.pipes.isValid(handle); }(),
-			"adopt() of the dup should yield a valid handle");
+	auto handle = eventDriver.pipes.adopt(dupFd);
+	assert(eventDriver.pipes.isValid(handle), "adopt() of the dup should yield a valid handle");
 	// Restore the saved flags on the original fd FIRST (clearing the O_NONBLOCK that
 	// adopt set on the shared open file description), THEN release the adopted dup.
 	() @trusted {
@@ -1384,17 +1379,17 @@ version (Posix) unittest  // FdDiversion sends writes on the diverted fd elsewhe
 	import core.sys.posix.unistd : close, dup, pipe, read, write;
 
 	int[2] protocol, diag;
-	assert(() @trusted { return pipe(protocol) == 0 && pipe(diag) == 0; }());
+	assert(pipe(protocol) == 0 && pipe(diag) == 0);
 	// `fd` models fd 1: a descriptor that initially writes to the protocol pipe.
-	const fd = () @trusted { return dup(protocol[1]); }();
+	const fd = dup(protocol[1]);
 	scope (exit)
-		() @trusted {
+	{
 		close(fd);
 		close(protocol[0]);
 		close(protocol[1]);
 		close(diag[0]);
 		close(diag[1]);
-	}();
+	}
 
 	string readSome(int from) @trusted
 	{
@@ -1529,11 +1524,13 @@ version (Posix) unittest  // StdioEnd.adopt routes a socket fd through the socke
 	import core.sys.posix.unistd : dup, pipe, close;
 
 	int[2] sp;
-	assert(() @trusted { return socketpair(AF_UNIX, SOCK_STREAM, 0, sp); }() == 0,
-			"socketpair() failed");
+	assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sp) == 0, "socketpair() failed");
 	scope (exit)
-		() @trusted { close(sp[0]); close(sp[1]); }();
-	const sdup = () @trusted { return dup(sp[0]); }();
+	{
+		close(sp[0]);
+		close(sp[1]);
+	}
+	const sdup = dup(sp[0]);
 	auto sockEnd = StdioEnd.adopt(sdup);
 	scope (exit)
 		sockEnd.releaseRef();
@@ -1541,10 +1538,13 @@ version (Posix) unittest  // StdioEnd.adopt routes a socket fd through the socke
 	assert(sockEnd.isSocket_, "a socketpair fd must be detected and adopted as a socket");
 
 	int[2] pp;
-	assert(() @trusted { return pipe(pp); }() == 0, "pipe() failed");
+	assert(pipe(pp) == 0, "pipe() failed");
 	scope (exit)
-		() @trusted { close(pp[0]); close(pp[1]); }();
-	const pdup = () @trusted { return dup(pp[0]); }();
+	{
+		close(pp[0]);
+		close(pp[1]);
+	}
+	const pdup = dup(pp[0]);
 	auto pipeEnd = StdioEnd.adopt(pdup);
 	scope (exit)
 		pipeEnd.releaseRef();
@@ -1643,7 +1643,7 @@ version (unittest) private final class ServerLink
 		while (inPos >= inbound.length && !inClosed)
 		{
 			auto ec = inEvt.emitCount;
-			() @trusted { inEvt.wait(ec); }();
+			inEvt.wait(ec);
 		}
 		if (inPos >= inbound.length)
 			return null; // EOF
@@ -1887,7 +1887,7 @@ unittest  // stdio: a roots/list_changed observer can re-list roots on its own c
 				listId = j["id"].get!long;
 		}
 		assert(listId >= 0, "the observer never sent roots/list");
-		link.feed(`{"jsonrpc":"2.0","id":` ~ () @trusted {
+		link.feed(`{"jsonrpc":"2.0","id":` ~ () {
 			import std.conv : to;
 
 			return listId.to!string;
@@ -1987,7 +1987,7 @@ unittest  // stdio: notifications/cancelled mid-handler is observed via the in-f
 		link.feed(`{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"slow"}}`);
 		// Wait until the handler is actually running, then cancel it.
 		auto ec = entered.emitCount;
-		() @trusted { entered.wait(ec); }();
+		entered.wait(ec);
 		link.feed(`{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":2}}`);
 		foreach (_; 0 .. 16)
 			yield();
@@ -2035,30 +2035,28 @@ unittest  // a request reply that fails to write is reported through StdioOption
 		throw new Exception("stdout gone");
 	}
 
-	() @trusted {
-		runTask(() nothrow{
-			scope (exit)
-				exitEventLoop();
-			try
-				serveStdio(s, &link.readLine, &failingWrite, opts);
-			catch (Exception)
-			{
-			}
-		});
-		runTask(() nothrow{
-			try
-			{
-				link.feed(`{"jsonrpc":"2.0","id":1,"method":"ping"}`);
-				foreach (_; 0 .. 8)
-					yield();
-				link.closeInput();
-			}
-			catch (Exception)
-			{
-			}
-		});
-		runEventLoop();
-	}();
+	runTask(() nothrow{
+		scope (exit)
+			exitEventLoop();
+		try
+			serveStdio(s, &link.readLine, &failingWrite, opts);
+		catch (Exception)
+		{
+		}
+	});
+	runTask(() nothrow{
+		try
+		{
+			link.feed(`{"jsonrpc":"2.0","id":1,"method":"ping"}`);
+			foreach (_; 0 .. 8)
+				yield();
+			link.closeInput();
+		}
+		catch (Exception)
+		{
+		}
+	});
+	runEventLoop();
 	assert(errors.canFind!(e => e.canFind("stdout gone")),
 			"a failed reply write must be reported, not swallowed");
 }
@@ -2075,7 +2073,7 @@ unittest  // a handler still running when stdin EOFs is drained: its reply is no
 	s.registerTool(slow, (Json args, RequestContext ctx) @safe {
 		entered.emit();
 		auto ec = release.emitCount;
-		() @trusted { release.wait(ec); }();
+		release.wait(ec);
 		CallToolResult r;
 		r.content = [Content.makeText("late")];
 		return r;
@@ -2083,39 +2081,36 @@ unittest  // a handler still running when stdin EOFs is drained: its reply is no
 
 	auto link = new ServerLink;
 	string[] outputs;
-	() @trusted {
-		runTask(() nothrow{
-			scope (exit)
-				exitEventLoop();
-			try
-				serveStdio(s, &link.readLine, &link.writeLine);
-			catch (Exception)
-			{
-			}
-		});
-		runTask(() nothrow{
-			try
-			{
-				link.feed(
-					`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"slow"}}`);
-				// Wait until the handler is actually running, then EOF stdin while it
-				// is still blocked (reply not yet computed or written).
-				auto ec = entered.emitCount;
-				entered.wait(ec);
-				link.closeInput();
-				foreach (_; 0 .. 4)
-					yield();
-				// Now let the handler finish: its reply must still flush during the
-				// post-EOF drain rather than being abandoned.
-				release.emit();
-			}
-			catch (Exception)
-			{
-			}
-		});
-		runEventLoop();
-		outputs = link.outbound.dup;
-	}();
+	runTask(() nothrow{
+		scope (exit)
+			exitEventLoop();
+		try
+			serveStdio(s, &link.readLine, &link.writeLine);
+		catch (Exception)
+		{
+		}
+	});
+	runTask(() nothrow{
+		try
+		{
+			link.feed(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"slow"}}`);
+			// Wait until the handler is actually running, then EOF stdin while it
+			// is still blocked (reply not yet computed or written).
+			auto ec = entered.emitCount;
+			entered.wait(ec);
+			link.closeInput();
+			foreach (_; 0 .. 4)
+				yield();
+			// Now let the handler finish: its reply must still flush during the
+			// post-EOF drain rather than being abandoned.
+			release.emit();
+		}
+		catch (Exception)
+		{
+		}
+	});
+	runEventLoop();
+	outputs = link.outbound.dup;
 
 	assert(outputs.length == 1, "the in-flight handler's reply must survive stdin EOF");
 	auto resp = parseJsonString(outputs[0]);
@@ -2141,32 +2136,29 @@ unittest  // the EOF drain waits for a handler that finishes on a timer after st
 
 	auto link = new ServerLink;
 	string[] outputs;
-	() @trusted {
-		runTask(() nothrow{
-			scope (exit)
-				exitEventLoop();
-			try
-				serveStdio(s, &link.readLine, &link.writeLine);
-			catch (Exception)
-			{
-			}
-		});
-		runTask(() nothrow{
-			try
-			{
-				link.feed(
-					`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"slow"}}`);
-				auto ec = entered.emitCount;
-				entered.wait(ec);
-				link.closeInput();
-			}
-			catch (Exception)
-			{
-			}
-		});
-		runEventLoop();
-		outputs = link.outbound.dup;
-	}();
+	runTask(() nothrow{
+		scope (exit)
+			exitEventLoop();
+		try
+			serveStdio(s, &link.readLine, &link.writeLine);
+		catch (Exception)
+		{
+		}
+	});
+	runTask(() nothrow{
+		try
+		{
+			link.feed(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"slow"}}`);
+			auto ec = entered.emitCount;
+			entered.wait(ec);
+			link.closeInput();
+		}
+		catch (Exception)
+		{
+		}
+	});
+	runEventLoop();
+	outputs = link.outbound.dup;
 
 	assert(outputs.length == 1, "a handler finishing shortly after EOF must still reply");
 }
@@ -2182,7 +2174,7 @@ unittest  // the EOF drain gives up on a stuck handler once its deadline passes
 	s.registerTool(stuck, (Json args, RequestContext ctx) @safe {
 		entered.emit();
 		auto ec = never.emitCount;
-		() @trusted { never.wait(ec); }();
+		never.wait(ec);
 		return CallToolResult.init;
 	});
 
@@ -2192,38 +2184,35 @@ unittest  // the EOF drain gives up on a stuck handler once its deadline passes
 	MonoTime eofAt;
 	Duration drained;
 	bool returned;
-	() @trusted {
-		runTask(() nothrow{
-			try
-			{
-				link.feed(
-					`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"stuck"}}`);
-				auto ec = entered.emitCount;
-				entered.wait(ec);
-				eofAt = MonoTime.currTime;
-				link.closeInput();
-			}
-			catch (Exception)
-			{
-			}
-		});
-		runTask(() nothrow{
-			scope (exit)
-				exitEventLoop();
-			try
-			{
-				serveStdio(s, &link.readLine, &link.writeLine, opts);
-				drained = MonoTime.currTime - eofAt;
-				returned = true;
-			}
-			catch (Exception)
-			{
-			}
-			// Release the stuck handler so its task does not outlive the test.
-			never.emit();
-		});
-		runEventLoop();
-	}();
+	runTask(() nothrow{
+		try
+		{
+			link.feed(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"stuck"}}`);
+			auto ec = entered.emitCount;
+			entered.wait(ec);
+			eofAt = MonoTime.currTime;
+			link.closeInput();
+		}
+		catch (Exception)
+		{
+		}
+	});
+	runTask(() nothrow{
+		scope (exit)
+			exitEventLoop();
+		try
+		{
+			serveStdio(s, &link.readLine, &link.writeLine, opts);
+			drained = MonoTime.currTime - eofAt;
+			returned = true;
+		}
+		catch (Exception)
+		{
+		}
+		// Release the stuck handler so its task does not outlive the test.
+		never.emit();
+	});
+	runEventLoop();
 	assert(returned, "serveStdio must return despite a stuck handler");
 	assert(drained >= 150.msecs, "the drain must wait for in-flight handlers");
 	assert(drained < 5.seconds, "the drain must stop at its deadline");
@@ -2679,18 +2668,16 @@ unittest  // two tool handlers overlap concurrently over the duplex (barrier pro
 		// Each handler increments the entered count, signals, then waits until
 		// BOTH have entered. If handlers were serialized the second would never
 		// enter and this would hang (the test's event loop would time out).
-		() @trusted { import core.atomic : atomicOp;
+		() { import core.atomic : atomicOp;
 
 		atomicOp!"+="(entered, 1); }();
 		barrier.emit();
-		while (()@trusted {
-				import core.atomic : atomicLoad;
+		while (() { import core.atomic : atomicLoad;
 
-				return atomicLoad(entered);
-			}() < 2)
+			return atomicLoad(entered); }() < 2)
 		{
 			auto ec = barrier.emitCount;
-			() @trusted { barrier.wait(ec); }();
+			barrier.wait(ec);
 		}
 		CallToolResult r;
 		r.content = [Content.makeText("done")];
@@ -2752,7 +2739,7 @@ version (unittest) private final class DuplexLink
 		while (pos >= queue.length && !closed)
 		{
 			auto ec = evt.emitCount;
-			() @trusted { evt.wait(ec); }();
+			evt.wait(ec);
 		}
 		if (pos >= queue.length)
 			return null;
@@ -2775,7 +2762,7 @@ unittest  // END-TO-END: McpClient over stdio drives an McpServer; two concurren
 	auto s2c = new DuplexLink; // server -> client
 
 	string got1, got2;
-	() @trusted {
+	() {
 		// Server task.
 		runTask(() nothrow{
 			try
@@ -2867,7 +2854,7 @@ unittest  // END-TO-END: a server tool's ctx.sample round-trips to the client's 
 	auto s2c = new DuplexLink;
 
 	string toolText;
-	() @trusted {
+	() {
 		runTask(() nothrow{
 			try
 				serveStdio(s, () @safe { return c2s.take(); }, (string line) @safe {
@@ -2932,37 +2919,35 @@ unittest  // serveStdio runs at most maxInFlight requests, queues as many more a
 				'1' + i) ~ `,"method":"tools/call","params":{"name":"slow"}}`);
 	size_t readWhileBlocked, peakWhileBlocked;
 	string[] repliedWhileBlocked;
-	() @trusted {
-		runTask(() nothrow{
-			try
-				serveStdio(s, &link.readLine, &link.writeLine, opts);
-			catch (Exception)
-			{
-			}
-		});
-		runTask(() nothrow{
-			scope (exit)
-				exitEventLoop();
-			try
-			{
-				foreach (_; 0 .. 64)
-					yield();
-				readWhileBlocked = link.inPos;
-				peakWhileBlocked = peak;
-				repliedWhileBlocked = link.outbound.dup;
-				release = true;
-				foreach (_; 0 .. 256)
-					yield();
-				link.closeInput();
-				foreach (_; 0 .. 64)
-					yield();
-			}
-			catch (Exception)
-			{
-			}
-		});
-		runEventLoop();
-	}();
+	runTask(() nothrow{
+		try
+			serveStdio(s, &link.readLine, &link.writeLine, opts);
+		catch (Exception)
+		{
+		}
+	});
+	runTask(() nothrow{
+		scope (exit)
+			exitEventLoop();
+		try
+		{
+			foreach (_; 0 .. 64)
+				yield();
+			readWhileBlocked = link.inPos;
+			peakWhileBlocked = peak;
+			repliedWhileBlocked = link.outbound.dup;
+			release = true;
+			foreach (_; 0 .. 256)
+				yield();
+			link.closeInput();
+			foreach (_; 0 .. 64)
+				yield();
+		}
+		catch (Exception)
+		{
+		}
+	});
+	runEventLoop();
 	assert(peakWhileBlocked == 2, "no more than maxInFlight handlers run at once");
 	assert(readWhileBlocked == 5, "reading continues while maxInFlight handlers run");
 	assert(repliedWhileBlocked.length == 1, "only the request beyond the queue is answered early");
@@ -3076,7 +3061,7 @@ unittest  // notifications/cancelled reaches a running handler while maxInFlight
 	withServer(s, (ServerLink link) @safe {
 		link.feed(`{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"slow"}}`);
 		auto ec = entered.emitCount;
-		() @trusted { entered.wait(ec); }();
+		entered.wait(ec);
 		link.feed(`{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":2}}`);
 		foreach (_; 0 .. 16)
 			yield();

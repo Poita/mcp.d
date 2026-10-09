@@ -870,11 +870,11 @@ final class HttpClientTransport : ClientTransport
 			sessionId = null;
 		}
 		else if (status != 0 && (status < 200 || status >= 300))
-			() @trusted {
+		{
 			import vibe.core.log : logWarn;
 
 			logWarn("MCP oneway HTTP send rejected with status %d", status);
-		}();
+		}
 		return status;
 	}
 
@@ -1097,7 +1097,7 @@ final class HttpClientTransport : ClientTransport
 			postSockets = postSockets.remove!(s => s is slot);
 		}
 
-		() @trusted {
+		() {
 			try
 			{
 				auto sock = connectTimed(pinnedHost, ep.port);
@@ -1357,7 +1357,7 @@ final class HttpClientTransport : ClientTransport
 		}
 
 		auto outcome = ResumeOutcome.failed;
-		() @trusted {
+		() {
 			try
 			{
 				auto sock = connectTimed(pinnedHost, ep.port);
@@ -1800,7 +1800,7 @@ final class HttpClientTransport : ClientTransport
 				slot.closeSocket();
 				serverStreamSlots = serverStreamSlots.remove!(s => s is slot);
 			}
-			() @trusted {
+			() {
 				try
 				{
 					auto sock = connectTimed(pinnedHost, ep.port);
@@ -1894,7 +1894,7 @@ final class HttpClientTransport : ClientTransport
 		import vibe.core.core : runTask;
 		import core.time : seconds;
 
-		auto cancelled = () @trusted { return new shared bool(false); }();
+		auto cancelled = new shared bool(false);
 		// The background task fills this slot with its live socket once connected;
 		// the stream's onCancel delegate aborts it (closing the socket and
 		// interrupting the reader) so a blocked readLine / conn.read returns
@@ -1978,9 +1978,7 @@ final class HttpClientTransport : ClientTransport
 
 		// A local cancel and the transport's close() both end the stream without
 		// it counting as a server failure.
-		auto isCancelled = () @safe => closing || () @trusted {
-			return *cancelled;
-		}();
+		auto isCancelled = () @safe => closing || (*cancelled);
 
 		// Fire the establishment signal at most once: on the first dispatched frame
 		// (the stream is now confirmed open server-side) and, as a fallback, on any
@@ -2009,7 +2007,7 @@ final class HttpClientTransport : ClientTransport
 			return true;
 		}
 
-		() @trusted {
+		() {
 			scope (exit)
 			{
 				slot.closeSocket();
@@ -2267,7 +2265,7 @@ final class HttpClientTransport : ClientTransport
 				legacyStreamSlot = null;
 		}
 
-		() @trusted {
+		() {
 			try
 			{
 				if (closing)
@@ -2988,7 +2986,7 @@ unittest  // the transport's TLS refuses an untrusted server certificate unless 
 
 	auto listener = startSelfSignedTlsServer();
 	scope (exit)
-		() @trusted { listener.stopListening(); }();
+		listener.stopListening();
 	const port = listener.bindAddresses[0].port;
 	auto t = new HttpClientTransport("https://127.0.0.1:" ~ port.to!string ~ "/mcp");
 
@@ -3562,16 +3560,13 @@ unittest  // readSseBody records id:/retry: into the caller-owned cursor
 	import vibe.stream.memory : createMemoryStream;
 
 	auto t = new HttpClientTransport("http://host:8080/mcp");
-	auto stream = () @trusted {
-		return createMemoryStream(cast(ubyte[]) "id: evt-7\nretry: 1500\ndata: {}\n\n".dup, false);
-	}();
+	auto stream = createMemoryStream(cast(ubyte[]) "id: evt-7\nretry: 1500\ndata: {}\n\n".dup,
+			false);
 	SseCursor cursor;
 	string[] events;
-	() @trusted {
-		t.readSseBody(stream, false, cursor, () @safe => false, (string e, string d) @safe {
-			events ~= d;
-		});
-	}();
+	t.readSseBody(stream, false, cursor, () @safe => false, (string e, string d) @safe {
+		events ~= d;
+	});
 	assert(cursor.lastEventId == "evt-7");
 	assert(cursor.retryMs == 1500);
 	assert(events == ["{}"]);
@@ -3586,23 +3581,15 @@ unittest  // each readSseBody caller's cursor is independent (no shared resumpti
 	// so two decode passes with distinct cursors keep distinct state.
 	auto t = new HttpClientTransport("http://host:8080/mcp");
 
-	auto streamA = () @trusted {
-		return createMemoryStream(cast(ubyte[]) "id: A\nretry: 100\ndata: a\n\n".dup, false);
-	}();
+	auto streamA = createMemoryStream(cast(ubyte[]) "id: A\nretry: 100\ndata: a\n\n".dup, false);
 	SseCursor cursorA;
-	() @trusted {
-		t.readSseBody(streamA, false, cursorA, () @safe => false, (string e, string d) @safe {
-		});
-	}();
+	t.readSseBody(streamA, false, cursorA, () @safe => false, (string e, string d) @safe {
+	});
 
-	auto streamB = () @trusted {
-		return createMemoryStream(cast(ubyte[]) "id: B\nretry: 200\ndata: b\n\n".dup, false);
-	}();
+	auto streamB = createMemoryStream(cast(ubyte[]) "id: B\nretry: 200\ndata: b\n\n".dup, false);
 	SseCursor cursorB;
-	() @trusted {
-		t.readSseBody(streamB, false, cursorB, () @safe => false, (string e, string d) @safe {
-		});
-	}();
+	t.readSseBody(streamB, false, cursorB, () @safe => false, (string e, string d) @safe {
+	});
 
 	assert(cursorA.lastEventId == "A" && cursorA.retryMs == 100);
 	assert(cursorB.lastEventId == "B" && cursorB.retryMs == 200);
@@ -3616,13 +3603,9 @@ unittest  // readChunk decodes a multi-frame chunked body via readRemaining
 	// zero-size chunk; the shared `readChunk` framing must reassemble the bytes
 	// exactly and stop at the 0 chunk.
 	auto body = "5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n";
-	auto stream = () @trusted {
-		return createMemoryStream(cast(ubyte[])
-				body.dup, false);
-	}();
-	auto got = () @trusted {
-		return HttpClientTransport.readRemaining(stream, true, defaultMaxMessageBytes);
-	}();
+	auto stream = createMemoryStream(cast(ubyte[])
+			body.dup, false);
+	auto got = HttpClientTransport.readRemaining(stream, true, defaultMaxMessageBytes);
 	assert(got == "hello world");
 }
 
@@ -3634,13 +3617,9 @@ unittest  // readChunk consumes the per-chunk trailing CRLF so framing stays ali
 	// per-chunk CRLF consumed, the size line of the next chunk parses cleanly and
 	// the full payload is recovered rather than the decoder desyncing.
 	auto body = "3\r\nabc\r\n3\r\ndef\r\n0\r\n\r\n";
-	auto stream = () @trusted {
-		return createMemoryStream(cast(ubyte[])
-				body.dup, false);
-	}();
-	auto got = () @trusted {
-		return HttpClientTransport.readRemaining(stream, true, defaultMaxMessageBytes);
-	}();
+	auto stream = createMemoryStream(cast(ubyte[])
+			body.dup, false);
+	auto got = HttpClientTransport.readRemaining(stream, true, defaultMaxMessageBytes);
 	assert(got == "abcdef");
 }
 
@@ -3650,13 +3629,9 @@ unittest  // readRemaining rejects a chunk whose declared size exceeds the messa
 	import vibe.stream.memory : createMemoryStream;
 
 	auto body = "7fffffff\r\nabc\r\n0\r\n\r\n";
-	auto stream = () @trusted {
-		return createMemoryStream(cast(ubyte[])
-				body.dup, false);
-	}();
-	auto e = collectException(() @trusted {
-		return HttpClientTransport.readRemaining(stream, true, 1024);
-	}());
+	auto stream = createMemoryStream(cast(ubyte[])
+			body.dup, false);
+	auto e = collectException(HttpClientTransport.readRemaining(stream, true, 1024));
 	assert(cast(McpException) e !is null, "an oversized chunk must fail the read");
 }
 
@@ -3670,13 +3645,9 @@ unittest  // readRemaining rejects a chunked body whose total exceeds the messag
 	foreach (i; 0 .. 8)
 		body ~= "100\r\n" ~ "x".replicate(256) ~ "\r\n";
 	body ~= "0\r\n\r\n";
-	auto stream = () @trusted {
-		return createMemoryStream(cast(ubyte[])
-				body.dup, false);
-	}();
-	auto e = collectException(() @trusted {
-		return HttpClientTransport.readRemaining(stream, true, 1024);
-	}());
+	auto stream = createMemoryStream(cast(ubyte[])
+			body.dup, false);
+	auto e = collectException(HttpClientTransport.readRemaining(stream, true, 1024));
 	assert(cast(McpException) e !is null, "a chunked body past the limit must fail the read");
 }
 
@@ -3686,12 +3657,8 @@ unittest  // readRemaining rejects a raw body that exceeds the message limit
 	import std.exception : collectException;
 	import vibe.stream.memory : createMemoryStream;
 
-	auto stream = () @trusted {
-		return createMemoryStream(cast(ubyte[]) "x".replicate(4096).dup, false);
-	}();
-	auto e = collectException(() @trusted {
-		return HttpClientTransport.readRemaining(stream, false, 1024);
-	}());
+	auto stream = createMemoryStream(cast(ubyte[]) "x".replicate(4096).dup, false);
+	auto e = collectException(HttpClientTransport.readRemaining(stream, false, 1024));
 	assert(cast(McpException) e !is null, "a raw body past the limit must fail the read");
 }
 
@@ -3702,12 +3669,8 @@ unittest  // readHeaderLines rejects a header line longer than the header line l
 	import vibe.stream.memory : createMemoryStream;
 
 	auto head = "X-Big: " ~ "x".replicate(64 * 1024) ~ "\r\n\r\n";
-	auto stream = () @trusted {
-		return createMemoryStream(cast(ubyte[]) head.dup, false);
-	}();
-	auto e = collectException(() @trusted {
-		return HttpClientTransport.readHeaderLines(stream);
-	}());
+	auto stream = createMemoryStream(cast(ubyte[]) head.dup, false);
+	auto e = collectException(HttpClientTransport.readHeaderLines(stream));
 	assert(e !is null, "an unbounded header line must fail the read");
 }
 
@@ -3719,11 +3682,9 @@ unittest  // readSseBody rejects an SSE line that grows past the message limit w
 
 	auto t = new HttpClientTransport("http://host:8080/mcp");
 	t.setMaxMessageBytes(1024);
-	auto stream = () @trusted {
-		return createMemoryStream(cast(ubyte[])("data: " ~ "x".replicate(4096)).dup, false);
-	}();
+	auto stream = createMemoryStream(cast(ubyte[])("data: " ~ "x".replicate(4096)).dup, false);
 	SseCursor cursor;
-	auto e = collectException(() @trusted {
+	auto e = collectException(() {
 		t.readSseBody(stream, false, cursor, () @safe => false, (string e, string d) @safe {
 		});
 	}());
@@ -3743,13 +3704,11 @@ unittest  // readSseBody rejects an SSE event whose joined data lines exceed the
 	foreach (i; 0 .. 16)
 		body ~= "data: " ~ "x".replicate(200) ~ "\n";
 	body ~= "\n";
-	auto stream = () @trusted {
-		return createMemoryStream(cast(ubyte[])
-				body.dup, false);
-	}();
+	auto stream = createMemoryStream(cast(ubyte[])
+			body.dup, false);
 	SseCursor cursor;
 	bool delivered;
-	auto e = collectException(() @trusted {
+	auto e = collectException(() {
 		t.readSseBody(stream, false, cursor, () @safe => false, (string e, string d) @safe {
 			delivered = true;
 		});
@@ -3794,17 +3753,13 @@ unittest  // readSseBody decodes events delivered across chunked frames
 	// reader must rejoin the frames so the tokenizer sees one complete event.
 	auto body = "6\r\ndata: \r\n4\r\nhi\n\n\r\n0\r\n\r\n";
 	auto t = new HttpClientTransport("http://host:8080/mcp");
-	auto stream = () @trusted {
-		return createMemoryStream(cast(ubyte[])
-				body.dup, false);
-	}();
+	auto stream = createMemoryStream(cast(ubyte[])
+			body.dup, false);
 	SseCursor cursor;
 	string[] events;
-	() @trusted {
-		t.readSseBody(stream, true, cursor, () @safe => false, (string e, string d) @safe {
-			events ~= d;
-		});
-	}();
+	t.readSseBody(stream, true, cursor, () @safe => false, (string e, string d) @safe {
+		events ~= d;
+	});
 	assert(events == ["hi"]);
 }
 
@@ -3965,11 +3920,9 @@ unittest  // readSseBody handles a partial IOMode.once read without appending ze
 
 	SseCursor cursor;
 	string[] events;
-	() @trusted {
-		t.readSseBody(stream, false, cursor, () @safe => false, (string e, string d) @safe {
-			events ~= d;
-		});
-	}();
+	t.readSseBody(stream, false, cursor, () @safe => false, (string e, string d) @safe {
+		events ~= d;
+	});
 	assert(events == ["hello"],
 			"partial IOMode.once read must not corrupt the SSE accumulator with zero bytes; got: "
 			~ events.to!string);
@@ -4148,7 +4101,7 @@ version (unittest)
 			{
 				auto listener = listenHTTP(settings, router);
 				scope (exit)
-					() @trusted { listener.stopListening(); }();
+					listener.stopListening();
 				scenario("http://127.0.0.1:" ~ listener.bindAddresses[0].port.to!string ~ "/mcp");
 			}
 			catch (Exception e)
@@ -4161,7 +4114,7 @@ version (unittest)
 	/// Read a POST body as JSON inside a fake-server handler.
 	private Json requestJson(HTTPServerRequest req) @safe
 	{
-		return parseJsonString(() @trusted { return req.bodyReader.readAllUTF8(); }());
+		return parseJsonString(req.bodyReader.readAllUTF8());
 	}
 
 	/// A minimal initialize result for protocol `version_`, echoing the request id.
@@ -4802,10 +4755,8 @@ unittest  // an HTTP request whose SSE stream goes silent fails after requestTim
 	auto router = answeringRouter((Json req, HTTPServerResponse res) @safe {
 		silentId = req["id"].get!long;
 		res.contentType = "text/event-stream";
-		() @trusted {
-			res.bodyWriter.write(cast(const(ubyte)[]) ": open\n\n");
-			res.bodyWriter.flush();
-		}();
+		res.bodyWriter.write(cast(const(ubyte)[]) ": open\n\n");
+		res.bodyWriter.flush();
 		const until = MonoTime.currTime + 5.seconds;
 		while (!release && MonoTime.currTime < until)
 			sleep(20.msecs);
@@ -4855,10 +4806,8 @@ unittest  // cancelling a modern HTTP request closes its response stream and fai
 		{
 			while (MonoTime.currTime < until)
 			{
-				() @trusted {
-					res.bodyWriter.write(cast(const(ubyte)[]) ": keep-alive\n\n");
-					res.bodyWriter.flush();
-				}();
+				res.bodyWriter.write(cast(const(ubyte)[]) ": keep-alive\n\n");
+				res.bodyWriter.flush();
 				sleep(30.msecs);
 			}
 		}
@@ -4922,10 +4871,8 @@ version (unittest)
 		auto r = answeringRouter((Json req, HTTPServerResponse res) @safe {
 			droppedId = req["id"].get!long;
 			res.contentType = "text/event-stream";
-			() @trusted {
-				res.bodyWriter.write(cast(const(ubyte)[]) postPrelude);
-				res.bodyWriter.flush();
-			}();
+			res.bodyWriter.write(cast(const(ubyte)[]) postPrelude);
+			res.bodyWriter.flush();
 		});
 		r.get("/mcp", (HTTPServerRequest req, HTTPServerResponse res) @safe {
 			onGet(req.headers.get("Last-Event-ID", ""), droppedId, res);
@@ -4936,10 +4883,8 @@ version (unittest)
 	private void writeSse(HTTPServerResponse res, string frames) @safe
 	{
 		res.contentType = "text/event-stream";
-		() @trusted {
-			res.bodyWriter.write(cast(const(ubyte)[]) frames);
-			res.bodyWriter.flush();
-		}();
+		res.bodyWriter.write(cast(const(ubyte)[]) frames);
+		res.bodyWriter.flush();
 	}
 
 	private string toolsListFrame(long id) @safe
@@ -5051,15 +4996,11 @@ version (unittest)
 					{
 						scope (exit)
 							conn.close();
-						auto requestLine = () @trusted {
-							return cast(string) readLine(conn).idup;
-						}();
+						auto requestLine = cast(string) readLine(conn).idup;
 						size_t length;
 						for (;;)
 						{
-							auto h = () @trusted {
-								return cast(string) readLine(conn).idup;
-							}();
+							auto h = cast(string) readLine(conn).idup;
 							if (h.length && h[$ - 1] == '\r')
 								h = h[0 .. $ - 1];
 							if (h.length == 0)
@@ -6024,16 +5965,13 @@ unittest  // readSseBody frames events on bare CR line endings
 	import vibe.stream.memory : createMemoryStream;
 
 	auto t = new HttpClientTransport("http://host:8080/mcp");
-	auto stream = () @trusted {
-		return createMemoryStream(cast(ubyte[]) "id: 1\rdata: a\rdata: b\r\rdata: c\r\r".dup, false);
-	}();
+	auto stream = createMemoryStream(
+			cast(ubyte[]) "id: 1\rdata: a\rdata: b\r\rdata: c\r\r".dup, false);
 	SseCursor cursor;
 	string[] events;
-	() @trusted {
-		t.readSseBody(stream, false, cursor, () @safe => false, (string e, string d) @safe {
-			events ~= d;
-		});
-	}();
+	t.readSseBody(stream, false, cursor, () @safe => false, (string e, string d) @safe {
+		events ~= d;
+	});
 	assert(events == ["a\nb", "c"]);
 	assert(cursor.lastEventId == "1");
 }
@@ -6043,17 +5981,13 @@ unittest  // readSseBody treats a CRLF split across two reads as one line ending
 	import vibe.stream.memory : createMemoryStream;
 
 	auto t = new HttpClientTransport("http://host:8080/mcp");
-	auto stream = () @trusted {
-		return createMemoryStream(cast(
-				ubyte[]) "8\r\ndata: a\r\r\nc\r\n\ndata: b\r\n\r\n\r\n0\r\n\r\n".dup, false);
-	}();
+	auto stream = createMemoryStream(cast(
+			ubyte[]) "8\r\ndata: a\r\r\nc\r\n\ndata: b\r\n\r\n\r\n0\r\n\r\n".dup, false);
 	SseCursor cursor;
 	string[] events;
-	() @trusted {
-		t.readSseBody(stream, true, cursor, () @safe => false, (string e, string d) @safe {
-			events ~= d;
-		});
-	}();
+	t.readSseBody(stream, true, cursor, () @safe => false, (string e, string d) @safe {
+		events ~= d;
+	});
 	assert(events == ["a\nb"]);
 }
 
@@ -6062,16 +5996,12 @@ unittest  // readSseBody commits an event id only when its event is dispatched
 	import vibe.stream.memory : createMemoryStream;
 
 	auto t = new HttpClientTransport("http://host:8080/mcp");
-	auto stream = () @trusted {
-		return createMemoryStream(cast(ubyte[]) "id: 1\ndata: x\n\nid: 2\ndata: y\n".dup, false);
-	}();
+	auto stream = createMemoryStream(cast(ubyte[]) "id: 1\ndata: x\n\nid: 2\ndata: y\n".dup, false);
 	SseCursor cursor;
 	string[] events;
-	() @trusted {
-		t.readSseBody(stream, false, cursor, () @safe => false, (string e, string d) @safe {
-			events ~= d;
-		});
-	}();
+	t.readSseBody(stream, false, cursor, () @safe => false, (string e, string d) @safe {
+		events ~= d;
+	});
 	assert(events == ["x"]);
 	assert(cursor.lastEventId == "1", "an undelivered event's id must not become the resume cursor");
 }
@@ -6081,15 +6011,11 @@ unittest  // readSseBody keeps the resume cursor across a dispatched event witho
 	import vibe.stream.memory : createMemoryStream;
 
 	auto t = new HttpClientTransport("http://host:8080/mcp");
-	auto stream = () @trusted {
-		return createMemoryStream(cast(ubyte[]) "data: x\n\n".dup, false);
-	}();
+	auto stream = createMemoryStream(cast(ubyte[]) "data: x\n\n".dup, false);
 	SseCursor cursor;
 	cursor.lastEventId = "prev";
-	() @trusted {
-		t.readSseBody(stream, false, cursor, () @safe => false, (string e, string d) @safe {
-		});
-	}();
+	t.readSseBody(stream, false, cursor, () @safe => false, (string e, string d) @safe {
+	});
 	assert(cursor.lastEventId == "prev");
 }
 
@@ -6273,18 +6199,14 @@ unittest  // readSseBody frames a large single-line event in time linear in its 
 	body[6 .. 6 + size] = 'x';
 	body[$ - 2 .. $] = "\n\n";
 	auto t = new HttpClientTransport("http://host:8080/mcp");
-	auto stream = () @trusted {
-		return createMemoryStream(cast(ubyte[])
-				body, false);
-	}();
+	auto stream = createMemoryStream(cast(ubyte[])
+			body, false);
 	SseCursor cursor;
 	size_t got;
 	const start = MonoTime.currTime;
-	() @trusted {
-		t.readSseBody(stream, false, cursor, () @safe => false, (string e, string d) @safe {
-			got = d.length;
-		});
-	}();
+	t.readSseBody(stream, false, cursor, () @safe => false, (string e, string d) @safe {
+		got = d.length;
+	});
 	const took = MonoTime.currTime - start;
 	assert(got == size);
 	assert(took < 2.seconds);

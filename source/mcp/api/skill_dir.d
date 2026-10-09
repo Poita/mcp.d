@@ -1256,9 +1256,11 @@ version (Posix) unittest  // a symlinked root SKILL.md is rejected even when the
 	scope (exit)
 		removeTree(root);
 	const outside = root.dirName ~ "/outside.md";
-	() @trusted { import std.file : rename;
+	{
+		import std.file : rename;
 
-	rename(root ~ "/SKILL.md", outside); }();
+		rename(root ~ "/SKILL.md", outside);
+	}
 	makeSymlink(outside, root ~ "/SKILL.md");
 
 	auto s = new McpServer("t", "1");

@@ -295,7 +295,7 @@ CacheStore noCache() @safe nothrow
 {
 	auto s = new InMemoryCacheStore(0);
 	foreach (i; 0 .. 1000)
-		s.put(CacheKey("resources/read", () @trusted {
+		s.put(CacheKey("resources/read", () {
 				import std.conv : to;
 
 				return i.to!string;

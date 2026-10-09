@@ -180,7 +180,7 @@ final class StdioClientTransport : ClientTransport
 		Json listenId = ("id" in message) ? message["id"] : Json(null);
 		const key = listenId.toString();
 		auto ch = chan();
-		auto cancelled = () @trusted { return new shared bool(false); }();
+		auto cancelled = new shared bool(false);
 		void delegate() @safe nothrow onCancel = () @safe nothrow{
 			try
 			{
@@ -326,9 +326,7 @@ final class StdioClientTransport : ClientTransport
 			if (pipes is null)
 				return;
 			try
-				childExitStatus_ = () @trusted {
-				return pipes.process.wait(exitStatusGrace);
-			}();
+				childExitStatus_ = pipes.process.wait(exitStatusGrace);
 			catch (Exception)
 			{
 			}
@@ -501,14 +499,15 @@ final class StdioClientTransport : ClientTransport
 			}
 			if (writePending())
 				return;
-			() @trusted { pipes.stdin.close(); }();
+			pipes.stdin.close();
 			stdinClosed_ = true;
 		}
 		// Its stdout is at end-of-input too, so the loop exits promptly; the
 		// grace only bounds a grandchild still holding the pipe.
 		if (channel !is null && started && !channel.stopReadLoop(1.seconds))
 			return;
-		() @trusted { pipes.stdout.close(); destroy(*pipes); }();
+		pipes.stdout.close();
+		destroy(*pipes);
 	}
 
 	/// Whether a line is being written to the child's stdin right now.
@@ -530,24 +529,24 @@ final class StdioClientTransport : ClientTransport
 		// left open (and closed by `releaseProcess` once the child is gone).
 		if (!writePending())
 		{
-			() @trusted { p.stdin.close(); }();
+			p.stdin.close();
 			stdinClosed_ = true;
 		}
 
 		// Step 1: wait for a clean exit within the SIGTERM grace.
-		auto status = () @trusted { return p.process.wait(termGrace); }();
+		auto status = p.process.wait(termGrace);
 		if (!status.isNull)
 			return status.get;
 
 		// Step 2: escalate to SIGTERM and wait again.
-		() @trusted { p.process.kill(SIGTERM); }();
-		status = () @trusted { return p.process.wait(killGrace); }();
+		() { p.process.kill(SIGTERM); }();
+		status = p.process.wait(killGrace);
 		if (!status.isNull)
 			return status.get;
 
 		// Step 3: still alive -> force kill (SIGKILL) and reap.
-		() @trusted { p.process.kill(SIGKILL); }();
-		() @trusted { p.process.wait(); }();
+		() { p.process.kill(SIGKILL); }();
+		p.process.wait();
 		return -SIGKILL;
 	}
 
@@ -636,8 +635,8 @@ version (Posix) StdioClientTransport spawnStdioTransport(string[] args,
 	// Heap-box the pipes so the read/write closures capture a stable, long-lived
 	// handle past this function's return (`attachProcess` keeps the same pointer
 	// for the shutdown sequence).
-	auto pipes = () @trusted { return new ProcessPipes; }();
-	() @trusted { *pipes = pipeProcess(args, Redirect.stdin | Redirect.stdout); }();
+	auto pipes = new ProcessPipes;
+	*pipes = pipeProcess(args, Redirect.stdin | Redirect.stdout);
 	StdioClientTransport transport;
 
 	// Async, cooperative line read over the child's stdout, in chunks through a
@@ -662,9 +661,9 @@ version (Posix) StdioClientTransport spawnStdioTransport(string[] args,
 		// flood the pipe never runs dry of.
 		import vibe.core.core : yield;
 
-		if (stopping() || ()@trusted { return pipes.stdout.empty; }())
+		if (stopping() || pipes.stdout.empty)
 			return 0;
-		const n = () @trusted { return pipes.stdout.read(dst, IOMode.once); }();
+		const n = pipes.stdout.read(dst, IOMode.once);
 		// A read of buffered data completes without suspending, so a child that
 		// keeps the pipe full would otherwise hold the event loop; yielding lets
 		// other tasks (including the shutdown sequence) run between chunks.
@@ -685,7 +684,8 @@ version (Posix) StdioClientTransport spawnStdioTransport(string[] args,
 	void writeLine(string s) @safe
 	{
 		auto bytes = cast(const(ubyte)[])(s ~ "\n");
-		() @trusted { pipes.stdin.write(bytes); pipes.stdin.flush(); }();
+		pipes.stdin.write(bytes);
+		pipes.stdin.flush();
 	}
 
 	transport = new StdioClientTransport(&readLine, &writeLine);
@@ -1362,8 +1362,8 @@ version (Posix) unittest  // close() releases the child's stdout pipe and proces
 		// stdout) when close() runs.
 		auto transport = spawnStdioTransport(["cat"]);
 		transport.sendOneway(parseJsonString(`{"jsonrpc":"2.0","method":"notifications/x"}`));
-		auto stdoutFd = () @trusted { return transport.pipes.stdout.tupleof[0]; }();
-		auto pid = () @trusted { return transport.pipes.process.tupleof[0]; }();
+		auto stdoutFd = transport.pipes.stdout.tupleof[0];
+		auto pid = transport.pipes.process.tupleof[0];
 		assert(eventDriver.pipes.isValid(stdoutFd) && eventDriver.processes.isValid(pid));
 		transport.close();
 		assert(!transport.channel.readLoopRunning, "the read loop must have stopped");
@@ -1383,7 +1383,7 @@ version (Posix) unittest  // close() stops a read loop parked on a stdout pipe a
 		// read loop never sees end-of-input and has to be interrupted.
 		auto transport = spawnStdioTransport(["sh", "-c", "sleep 3 & cat"]);
 		transport.sendOneway(parseJsonString(`{"jsonrpc":"2.0","method":"notifications/x"}`));
-		auto stdoutFd = () @trusted { return transport.pipes.stdout.tupleof[0]; }();
+		auto stdoutFd = transport.pipes.stdout.tupleof[0];
 		auto sw = StopWatch(AutoStart.yes);
 		transport.close();
 		assert(sw.peek < 3.seconds, "close() must not wait for the grandchild");
@@ -1476,7 +1476,7 @@ version (unittest) private final class TestLines
 		while (queue.length == 0 && !closed)
 		{
 			auto ec = evt.emitCount;
-			() @trusted { evt.wait(ec); }();
+			evt.wait(ec);
 		}
 		if (queue.length == 0)
 			return null;

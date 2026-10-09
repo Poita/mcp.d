@@ -1457,7 +1457,7 @@ private bool formDecodes(string form) @safe
 	foreach (pair; form.split("&"))
 	{
 		try
-			() @trusted { decodeComponent(pair); }();
+			decodeComponent(pair);
 		catch (Exception)
 			return false;
 	}
@@ -1479,9 +1479,7 @@ private string formField(string form, string name) @safe
 		if (pair[0 .. eq] == name) // RFC 1866 §8.2.1 and the HTML Living Standard §4.10.21.6 define
 			// '+' as a space in application/x-www-form-urlencoded values; replace
 			// it before passing to decodeComponent, which handles %xx sequences.
-			return () @trusted {
 			return decodeComponent(pair[eq + 1 .. $].replace("+", " "));
-		}();
 	}
 	return "";
 }
@@ -1856,7 +1854,7 @@ unittest  // exchangeUpstream refuses an upstream response larger than maxAuthRe
 			"application/json");
 	});
 	scope (exit)
-		() @trusted { listener.stopListening(); }();
+		listener.stopListening();
 
 	string rb;
 	int st;
@@ -2140,7 +2138,7 @@ version (unittest)
 		import vibe.inet.url : URL;
 		import vibe.stream.memory : createMemoryOutputStream, createMemoryStream;
 
-		auto formBody = () @trusted { return cast(ubyte[]) form.dup; }();
+		auto formBody = cast(ubyte[]) form.dup;
 		auto req = createTestHTTPServerRequest(URL(url), HTTPMethod.POST,
 				createMemoryStream(formBody, false));
 		req.headers["Content-Type"] = "application/x-www-form-urlencoded";
@@ -2853,7 +2851,7 @@ unittest  // CONSENT: evicted redirect_uri between /authorize and POST /consent 
 
 	// POST /consent: with the redirect_uri evicted, proxy.authorize throws
 	// InvalidRedirectUriException. The handler must catch it and return 400.
-	auto formBody = () @trusted { return cast(ubyte[]) consentForm(html).dup; }();
+	auto formBody = cast(ubyte[]) consentForm(html).dup;
 	auto req2 = createTestHTTPServerRequest(URL("https://mcp.example.com/consent"),
 			HTTPMethod.POST, createMemoryStream(formBody, false));
 	req2.headers["Content-Type"] = "application/x-www-form-urlencoded";
@@ -2969,7 +2967,7 @@ unittest  // an issuer with a path serves its AS metadata at the RFC 8414 path-i
 		auto req = createTestHTTPServerRequest(URL(url));
 		auto res = createTestHTTPServerResponse(sink, null, TestHTTPResponseMode.bodyOnly);
 		router.handleRequest(req, res);
-		return () @trusted { return cast(string) sink.data.idup; }();
+		return cast(string) sink.data.idup;
 	}
 
 	// The URL an RFC 8414 client derives from the issuer is the one served.
@@ -3043,7 +3041,7 @@ unittest  // CORS: /register and /token responses are readable cross-origin
 			["/token", "grant_type=password"]
 		])
 	{
-		auto reqBody = () @trusted { return cast(ubyte[]) leg[1].dup; }();
+		auto reqBody = cast(ubyte[]) leg[1].dup;
 		auto req = createTestHTTPServerRequest(URL("https://mcp.example.com" ~ leg[0]),
 				HTTPMethod.POST, createMemoryStream(reqBody, false));
 		req.headers["Origin"] = "https://app.example.com";
@@ -3096,9 +3094,7 @@ unittest  // COMPOSE: the per-route helpers reproduce the /register leg
 	auto router = new URLRouter;
 	mountOAuthRegister(router, proxy);
 
-	auto formBody = () @trusted {
-		return cast(ubyte[]) `{"redirect_uris":["http://localhost:5000/cb"]}`.dup;
-	}();
+	auto formBody = cast(ubyte[]) `{"redirect_uris":["http://localhost:5000/cb"]}`.dup;
 	auto req = createTestHTTPServerRequest(URL("https://mcp.example.com/register"),
 			HTTPMethod.POST, createMemoryStream(formBody, false));
 	auto sink = createMemoryOutputStream();
@@ -3125,7 +3121,7 @@ unittest  // /register rejects a malformed JSON body with 400 invalid_client_met
 	auto router = new URLRouter;
 	mountOAuthRegister(router, proxy);
 
-	auto formBody = () @trusted { return cast(ubyte[]) `{ not valid json`.dup; }();
+	auto formBody = cast(ubyte[]) `{ not valid json`.dup;
 	auto req = createTestHTTPServerRequest(URL("https://mcp.example.com/register"),
 			HTTPMethod.POST, createMemoryStream(formBody, false));
 	auto sink = createMemoryOutputStream();
@@ -3153,7 +3149,7 @@ unittest  // /register rejects a body nested past the depth cap with 400 invalid
 
 	const json = `{"redirect_uris":["http://localhost:5000/cb"],"x":` ~ "[".replicate(
 			1000) ~ "]".replicate(1000) ~ `}`;
-	auto payload = () @trusted { return cast(ubyte[]) json.dup; }();
+	auto payload = cast(ubyte[]) json.dup;
 	auto req = createTestHTTPServerRequest(URL("https://mcp.example.com/register"),
 			HTTPMethod.POST, createMemoryStream(payload, false));
 	auto sink = createMemoryOutputStream();
@@ -3189,9 +3185,7 @@ unittest  // /register rejects a redirect_uri /authorize would never accept with
 
 	foreach (uri; ["com.example.app:/oauth/cb", "http://app.example.com/cb"])
 	{
-		auto formBody = () @trusted {
-			return cast(ubyte[])(`{"redirect_uris":["` ~ uri ~ `"]}`).dup;
-		}();
+		auto formBody = cast(ubyte[])(`{"redirect_uris":["` ~ uri ~ `"]}`).dup;
 		auto req = createTestHTTPServerRequest(URL("https://mcp.example.com/register"),
 				HTTPMethod.POST, createMemoryStream(formBody, false));
 		auto sink = createMemoryOutputStream();
@@ -3217,7 +3211,7 @@ unittest  // /register rejects a body with no usable redirect_uris with 400
 	auto router = new URLRouter;
 	mountOAuthRegister(router, proxy);
 
-	auto formBody = () @trusted { return cast(ubyte[]) `{"client_name":"x"}`.dup; }();
+	auto formBody = cast(ubyte[]) `{"client_name":"x"}`.dup;
 	auto req = createTestHTTPServerRequest(URL("https://mcp.example.com/register"),
 			HTTPMethod.POST, createMemoryStream(formBody, false));
 	auto sink = createMemoryOutputStream();
@@ -3262,7 +3256,7 @@ unittest  // COMPOSE: the authorize/consent/callback legs share a state store an
 	// POST /consent grants consent and 302s upstream (proving the consent leg sees
 	// the SAME store the authorize leg wrote to).
 	auto res2 = createTestHTTPServerResponse(null, null, TestHTTPResponseMode.bodyOnly);
-	auto formBody = () @trusted { return cast(ubyte[]) consentForm(html).dup; }();
+	auto formBody = cast(ubyte[]) consentForm(html).dup;
 	auto req2 = createTestHTTPServerRequest(URL("https://mcp.example.com/consent"),
 			HTTPMethod.POST, createMemoryStream(formBody, false));
 	req2.headers["Content-Type"] = "application/x-www-form-urlencoded";
@@ -3292,9 +3286,7 @@ unittest  // COMPOSE: an integrator's own /token wins without route-ordering sha
 		res.writeBody(`{"custom_broker":true}`, "application/json");
 	});
 
-	auto formBody = () @trusted {
-		return cast(ubyte[]) "grant_type=authorization_code&code=C&code_verifier=V".dup;
-	}();
+	auto formBody = cast(ubyte[]) "grant_type=authorization_code&code=C&code_verifier=V".dup;
 	auto req = createTestHTTPServerRequest(URL("https://mcp.example.com/token"),
 			HTTPMethod.POST, createMemoryStream(formBody, false));
 	req.headers["Content-Type"] = "application/x-www-form-urlencoded";
@@ -3539,9 +3531,7 @@ unittest  // BROKER MOUNT: /token returns OUR opaque token, never the upstream t
 	mountOAuthToken(router, proxy,
 			fixedUpstream(`{"access_token":"gho_upstream_secret","token_type":"bearer"}`));
 
-	auto formBody = () @trusted {
-		return cast(ubyte[]) redeemableCodeForm(proxy).dup;
-	}();
+	auto formBody = cast(ubyte[]) redeemableCodeForm(proxy).dup;
 	auto req = createTestHTTPServerRequest(URL("https://mcp.example.com/token"),
 			HTTPMethod.POST, createMemoryStream(formBody, false));
 	req.headers["Content-Type"] = "application/x-www-form-urlencoded";
@@ -3574,9 +3564,7 @@ unittest  // BROKER MOUNT: the resource server accepts the issued token and reje
 	mountOAuthToken(router, proxy,
 			fixedUpstream(`{"access_token":"gho_upstream_secret","token_type":"bearer"}`));
 
-	auto formBody = () @trusted {
-		return cast(ubyte[]) redeemableCodeForm(proxy).dup;
-	}();
+	auto formBody = cast(ubyte[]) redeemableCodeForm(proxy).dup;
 	auto req = createTestHTTPServerRequest(URL("https://mcp.example.com/token"),
 			HTTPMethod.POST, createMemoryStream(formBody, false));
 	req.headers["Content-Type"] = "application/x-www-form-urlencoded";
@@ -3609,9 +3597,7 @@ unittest  // BROKER MOUNT: the upstream token is retrievable server-side from th
 	mountOAuthToken(router, proxy,
 			fixedUpstream(`{"access_token":"gho_upstream_secret","token_type":"bearer"}`));
 
-	auto formBody = () @trusted {
-		return cast(ubyte[]) redeemableCodeForm(proxy).dup;
-	}();
+	auto formBody = cast(ubyte[]) redeemableCodeForm(proxy).dup;
 	auto req = createTestHTTPServerRequest(URL("https://mcp.example.com/token"),
 			HTTPMethod.POST, createMemoryStream(formBody, false));
 	req.headers["Content-Type"] = "application/x-www-form-urlencoded";
@@ -3787,9 +3773,7 @@ unittest  // PASSTHROUGH REGRESSION: with no issueToken/tokenStore the upstream 
 	mountOAuthToken(router, proxy,
 			fixedUpstream(`{"access_token":"gho_upstream_secret","token_type":"bearer"}`));
 
-	auto formBody = () @trusted {
-		return cast(ubyte[]) redeemableCodeForm(proxy).dup;
-	}();
+	auto formBody = cast(ubyte[]) redeemableCodeForm(proxy).dup;
 	auto req = createTestHTTPServerRequest(URL("https://mcp.example.com/token"),
 			HTTPMethod.POST, createMemoryStream(formBody, false));
 	req.headers["Content-Type"] = "application/x-www-form-urlencoded";
@@ -3853,7 +3837,7 @@ unittest  // every /token response forbids caching (RFC 6749 §5.1)
 			redeemableCodeForm(proxy), "grant_type=authorization_code&code=bad"
 		])
 		{
-			auto formBody = () @trusted { return cast(ubyte[]) form.dup; }();
+			auto formBody = cast(ubyte[]) form.dup;
 			auto req = createTestHTTPServerRequest(URL("https://mcp.example.com/token"),
 					HTTPMethod.POST, createMemoryStream(formBody, false));
 			req.headers["Content-Type"] = "application/x-www-form-urlencoded";
@@ -3987,9 +3971,7 @@ unittest  // BROKER MOUNT: a refresh_token grant is refused, never relaying the 
 		status = 200;
 	});
 
-	auto formBody = () @trusted {
-		return cast(ubyte[]) "grant_type=refresh_token&refresh_token=RT".dup;
-	}();
+	auto formBody = cast(ubyte[]) "grant_type=refresh_token&refresh_token=RT".dup;
 	auto req = createTestHTTPServerRequest(URL("https://mcp.example.com/token"),
 			HTTPMethod.POST, createMemoryStream(formBody, false));
 	req.headers["Content-Type"] = "application/x-www-form-urlencoded";

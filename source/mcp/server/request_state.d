@@ -44,7 +44,7 @@ private ubyte[] base64UrlDecode(string seg) @safe
 {
 	import std.base64 : Base64URLNoPadding;
 
-	return () @trusted { return Base64URLNoPadding.decode(seg); }();
+	return Base64URLNoPadding.decode(seg);
 }
 
 /// Current wall-clock time in unix seconds.

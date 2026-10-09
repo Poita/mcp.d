@@ -1503,7 +1503,7 @@ final class OAuthProxy
 	{
 		import std.uuid : randomUUID;
 
-		const handle = () @trusted { return randomUUID().toString(); }();
+		const handle = randomUUID().toString();
 		const capped = requestedRedirectUris.length > maxRedirectUrisPerRegistration
 			? requestedRedirectUris[0 .. maxRedirectUrisPerRegistration] : requestedRedirectUris;
 		string[] keys;
@@ -1751,9 +1751,7 @@ final class OAuthProxy
 			}, (scope HTTPClientResponse res) {
 				if (res.statusCode >= 200 && res.statusCode < 300)
 				{
-					responseBody = () @trusted {
-						return res.bodyReader.readAllUTF8(false, maxClientIdMetadataBytes);
-					}();
+					responseBody = res.bodyReader.readAllUTF8(false, maxClientIdMetadataBytes);
 					cacheControl = res.headers.get("Cache-Control", "");
 					ok = true;
 				}

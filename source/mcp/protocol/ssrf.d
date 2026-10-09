@@ -2070,7 +2070,7 @@ unittest  // secureRequestHTTP refuses a server whose certificate no trusted CA 
 
 	auto listener = startSelfSignedTlsServer();
 	scope (exit)
-		() @trusted { listener.stopListening(); }();
+		listener.stopListening();
 	const url = "https://127.0.0.1:" ~ listener.bindAddresses[0].port.to!string ~ "/";
 
 	bool reached;
@@ -2090,7 +2090,7 @@ unittest  // secureRequestHTTP trusts a server certificate issued by the configu
 
 	auto listener = startSelfSignedTlsServer();
 	scope (exit)
-		() @trusted { listener.stopListening(); }();
+		listener.stopListening();
 	const url = "https://127.0.0.1:" ~ listener.bindAddresses[0].port.to!string ~ "/";
 
 	int status;
@@ -2108,7 +2108,7 @@ unittest  // secureRequestHTTP skips certificate verification only when insecure
 
 	auto listener = startSelfSignedTlsServer();
 	scope (exit)
-		() @trusted { listener.stopListening(); }();
+		listener.stopListening();
 	const url = "https://127.0.0.1:" ~ listener.bindAddresses[0].port.to!string ~ "/";
 
 	int status;
@@ -2126,7 +2126,7 @@ unittest  // a connection opened with insecureSkipVerify is never reused by a ve
 
 	auto listener = startSelfSignedTlsServer();
 	scope (exit)
-		() @trusted { listener.stopListening(); }();
+		listener.stopListening();
 	const url = "https://127.0.0.1:" ~ listener.bindAddresses[0].port.to!string ~ "/";
 
 	FetchOptions insecure;

@@ -1766,7 +1766,7 @@ private TokenSet postTokenRequest(string tokenEndpoint, string body_,
 {
 	int status = 502;
 	string responseBody;
-	() @trusted {
+	{
 		import vibe.http.client : HTTPClientResponse;
 		import vibe.http.common : HTTPMethod;
 		import vibe.stream.operations : readAllUTF8;
@@ -1782,7 +1782,7 @@ private TokenSet postTokenRequest(string tokenEndpoint, string body_,
 			status = cres.statusCode;
 			responseBody = cres.bodyReader.readAllUTF8(false, maxAuthResponseBytes);
 		});
-	}();
+	}
 	return parseTokenResponse(status, responseBody);
 }
 
@@ -2007,7 +2007,7 @@ unittest  // exchangeAuthCode refuses a token response larger than maxAuthRespon
 			maxAuthResponseBytes) ~ `"}`, "application/json");
 	});
 	scope (exit)
-		() @trusted { listener.stopListening(); }();
+		listener.stopListening();
 	const endpoint = "http://127.0.0.1:" ~ listener.bindAddresses[0].port.to!string ~ "/token";
 
 	assertThrown(exchangeAuthCode(endpoint, "CODE", "http://127.0.0.1:1/cb",
@@ -2058,7 +2058,7 @@ package string extractQueryParam(string url, string key) @safe
 		const end = (amp < 0) ? query.length : i + amp;
 		auto pair = query[i .. end];
 		if (pair.length >= needle.length && pair[0 .. needle.length] == needle)
-			return () @trusted { return decodeComponent(pair[needle.length .. $]); }();
+			return decodeComponent(pair[needle.length .. $]);
 		i = end + 1;
 	}
 	return "";

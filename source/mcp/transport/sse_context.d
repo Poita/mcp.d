@@ -102,7 +102,7 @@ final class StreamCoordinator
 		auto ec = w.evt.emitCount;
 		while (!w.done)
 		{
-			const newEc = () @trusted { return w.evt.wait(timeout, ec); }();
+			const newEc = w.evt.wait(timeout, ec);
 			if (newEc == ec && !w.done)
 				throw new RequestTimeoutException("Timed out awaiting client response");
 			ec = newEc;
@@ -145,7 +145,7 @@ final class StreamCoordinator
 				break;
 			}
 			const thisSlice = remaining < slice ? remaining : slice;
-			const newEc = () @trusted { return w.evt.wait(thisSlice, ec); }();
+			const newEc = w.evt.wait(thisSlice, ec);
 			if (newEc == ec && !w.done)
 			{
 				remaining -= thisSlice;
@@ -684,7 +684,7 @@ final class ServerPushChannel : PushChannel
 				string uri) @safe plainEligible = null, string ownerToken = "",
 			string principal = "", bool replayable = true) @safe
 	{
-		return () @trusted {
+		return () {
 			auto lWriteMtx = new TaskMutex;
 			long id;
 			string[] replay; // frames to replay, snapshotted under the lock
@@ -809,10 +809,8 @@ final class ServerPushChannel : PushChannel
 	/// with an in-progress write or another list mutation.
 	void removeListener(long id) @safe
 	{
-		() @trusted {
-			synchronized (mtx)
-				removeListenerLocked(id);
-		}();
+		synchronized (mtx)
+			removeListenerLocked(id);
 	}
 
 	/// List-mutation half of `removeListener`, assuming the delivery mutex is
@@ -885,7 +883,7 @@ final class ServerPushChannel : PushChannel
 	/// resume it any more. Returns the number of streams closed.
 	size_t closeSession(string token) @safe
 	{
-		return () @trusted {
+		return () {
 			synchronized (mtx)
 			{
 				long[] ids;
@@ -917,17 +915,15 @@ final class ServerPushChannel : PushChannel
 	bool awaitClosed(long id, Duration timeout) @safe
 	{
 		ListenerClosed closed;
-		() @trusted {
-			synchronized (mtx)
-			{
-				foreach (l; listeners)
-					if (l.id == id)
-					{
-						closed = l.closed;
-						break;
-					}
-			}
-		}();
+		synchronized (mtx)
+		{
+			foreach (l; listeners)
+				if (l.id == id)
+				{
+					closed = l.closed;
+					break;
+				}
+		}
 		if (closed is null || closed.done)
 			return true;
 		closed.evt.wait(timeout, closed.evt.emitCount);
@@ -937,7 +933,7 @@ final class ServerPushChannel : PushChannel
 	/// Number of currently-connected listeners.
 	size_t listenerCount() @safe
 	{
-		return () @trusted {
+		return () {
 			synchronized (mtx)
 			{
 				return listeners.length;
@@ -953,7 +949,7 @@ final class ServerPushChannel : PushChannel
 	/// excluded, since that path is reached via the no-token `ping`/`requestOnSession`.
 	string[] connectedOwnerTokens() @safe
 	{
-		return () @trusted {
+		return () {
 			synchronized (mtx)
 			{
 				bool[string] seen;
@@ -975,7 +971,7 @@ final class ServerPushChannel : PushChannel
 	/// server->client request awaiter is released promptly if its stream drops.
 	private bool isRequestBound(WaiterKey key) @safe
 	{
-		return () @trusted {
+		return () {
 			synchronized (mtx)
 			{
 				auto lid = key in requestListener;
@@ -990,7 +986,7 @@ final class ServerPushChannel : PushChannel
 	/// streams of running POST requests.
 	size_t retainedHistoryStreams() @safe
 	{
-		return () @trusted {
+		return () {
 			synchronized (mtx)
 			{
 				return history.length;
@@ -1002,7 +998,7 @@ final class ServerPushChannel : PushChannel
 	/// `ReplayHistoryOptions.maxBytes`.
 	size_t retainedHistoryBytes() @safe
 	{
-		return () @trusted {
+		return () {
 			synchronized (mtx)
 			{
 				return historyBytes;
@@ -1068,18 +1064,16 @@ final class ServerPushChannel : PushChannel
 		// Snapshot the groups under the lock so the listener list cannot mutate
 		// while we enumerate; the writes happen off the lock inside `deliver`.
 		string[] groups;
-		() @trusted {
-			synchronized (mtx)
-			{
-				bool[string] seen;
-				foreach (l; listeners)
-					if (l.id in live && !l.postStream && (l.group in seen) is null && eligible(l))
-					{
-						seen[l.group] = true;
-						groups ~= l.group;
-					}
-			}
-		}();
+		synchronized (mtx)
+		{
+			bool[string] seen;
+			foreach (l; listeners)
+				if (l.id in live && !l.postStream && (l.group in seen) is null && eligible(l))
+				{
+					seen[l.group] = true;
+					groups ~= l.group;
+				}
+		}
 
 		size_t delivered;
 		foreach (group; groups)
@@ -1137,14 +1131,12 @@ final class ServerPushChannel : PushChannel
 		// Snapshot the eligible candidates (in registration order) under the lock so
 		// the list cannot mutate under us; the actual writes happen off the lock.
 		Listener[] candidates;
-		() @trusted {
-			synchronized (mtx)
-			{
-				foreach (l; listeners)
-					if (!l.postStream && eligible(l) && l.id in live)
-						candidates ~= l;
-			}
-		}();
+		synchronized (mtx)
+		{
+			foreach (l; listeners)
+				if (!l.postStream && eligible(l) && l.id in live)
+					candidates ~= l;
+		}
 
 		// Newest first: an older stream of the same session may be a half-open
 		// connection the client already replaced, whose writes still land in the
@@ -1168,7 +1160,7 @@ final class ServerPushChannel : PushChannel
 	{
 		import std.conv : to;
 
-		return () @trusted {
+		return () {
 			synchronized (l.writeMtx)
 			{
 				long seq, ordinal;
@@ -1409,14 +1401,12 @@ final class ServerPushChannel : PushChannel
 	/// `closeStream` or the session closes.
 	void openStream(long ordinal, string owner) @safe
 	{
-		() @trusted {
-			synchronized (mtx)
-			{
-				openStreams[ordinal] = owner;
-				postStreams[ordinal] = true;
-				reclassify(ordinal);
-			}
-		}();
+		synchronized (mtx)
+		{
+			openStreams[ordinal] = owner;
+			postStreams[ordinal] = true;
+			reclassify(ordinal);
+		}
 	}
 
 	/// End the POST-initiated stream `ordinal` opened by `openStream`. A GET
@@ -1424,10 +1414,8 @@ final class ServerPushChannel : PushChannel
 	/// Its event sequence is kept while history still refers to it.
 	void closeStream(long ordinal) @safe
 	{
-		() @trusted {
-			synchronized (mtx)
-				closeStreamLocked(ordinal);
-		}();
+		synchronized (mtx)
+			closeStreamLocked(ordinal);
 	}
 
 	private void closeStreamLocked(long ordinal) @safe
@@ -1454,7 +1442,7 @@ final class ServerPushChannel : PushChannel
 	/// history lost.
 	bool streamOpen(long ordinal) @safe
 	{
-		return () @trusted {
+		return () {
 			synchronized (mtx)
 				return (ordinal in openStreams) !is null && (ordinal in lostStreams) is null;
 		}();
@@ -1469,7 +1457,7 @@ final class ServerPushChannel : PushChannel
 	{
 		import std.conv : to;
 
-		return () @trusted {
+		return () {
 			synchronized (mtx)
 			{
 				streamOwner[ordinal] = owner;
@@ -1519,7 +1507,7 @@ final class ServerPushChannel : PushChannel
 			return frame;
 		}
 
-		return () @trusted {
+		return () {
 			while (true)
 			{
 				// Allocate directly when no listener has resumed this stream; otherwise
@@ -1612,10 +1600,8 @@ final class ServerPushChannel : PushChannel
 					"No GET SSE listener connected to receive the server->client request");
 		}
 		scope (exit)
-			() @trusted {
 			synchronized (mtx)
 				requestListener.remove(WaiterKey(sessionToken, id));
-		}();
 		// Liveness defense-in-depth: even if a disconnect is somehow missed, polling
 		// whether the bound listener is still connected releases the fiber within one
 		// slice instead of the full timeout (mirrors the POST path's `awaitLive`).
@@ -1668,17 +1654,15 @@ final class ServerPushChannel : PushChannel
 		// against a concurrent `deliver`/`emitTo` without holding the channel mutex
 		// across the blocking write.
 		Nullable!Listener target;
-		() @trusted {
-			synchronized (mtx)
-			{
-				foreach (l; listeners)
-					if (l.id == listenerId && l.id in live)
-					{
-						target = l;
-						break;
-					}
-			}
-		}();
+		synchronized (mtx)
+		{
+			foreach (l; listeners)
+				if (l.id == listenerId && l.id in live)
+				{
+					target = l;
+					break;
+				}
+		}
 		if (target.isNull)
 			return false;
 		return writeToListener(target.get, msg);
@@ -2940,24 +2924,22 @@ final class HttpStreamContext : RequestContext, ConnectionScoped
 	// to keep frames whole and their ids in order.
 	private void writeEvent(Json msg) @safe
 	{
-		() @trusted {
-			synchronized (writeMtx_)
+		synchronized (writeMtx_)
+		{
+			beginStream();
+			string frame;
+			if (replay_ !is null)
 			{
-				beginStream();
-				string frame;
-				if (replay_ !is null)
-				{
-					const ev = replay_.publishStreamEvent(streamId, token_, msg);
-					frame = ev.frame;
-					resumedElsewhere_ = resumedElsewhere_ || ev.forwarded;
-				}
-				else
-					frame = formatSseEvent(nextEventId(), msg);
-				eventSeq++;
-				if (!resumedElsewhere_)
-					writeFrame(frame);
+				const ev = replay_.publishStreamEvent(streamId, token_, msg);
+				frame = ev.frame;
+				resumedElsewhere_ = resumedElsewhere_ || ev.forwarded;
 			}
-		}();
+			else
+				frame = formatSseEvent(nextEventId(), msg);
+			eventSeq++;
+			if (!resumedElsewhere_)
+				writeFrame(frame);
+		}
 	}
 
 	// A client disconnect does not cancel the request (basic/transports
@@ -2989,7 +2971,7 @@ final class HttpStreamContext : RequestContext, ConnectionScoped
 		scope (exit)
 			watchdog.stop();
 		try
-			() @trusted {
+		{
 			auto bytes = cast(const(ubyte)[]) frame;
 			while (bytes.length)
 			{
@@ -2999,7 +2981,7 @@ final class HttpStreamContext : RequestContext, ConnectionScoped
 				watchdog.rearm(sseStallTimeout);
 			}
 			res.bodyWriter.flush();
-		}();
+		}
 		catch (Exception)
 			disconnected_ = true;
 	}
@@ -3657,7 +3639,8 @@ unittest  // a slow stream's write must not block delivery to a different stream
 
 	// Slow listener: announce its write is in progress, then block until released.
 	const slow = ch.addListener((string) @safe {
-		() @trusted { slowStarted.emit(); slowRelease.wait(releaseEc); }();
+		slowStarted.emit();
+		slowRelease.wait(releaseEc);
 	});
 	// Fast listener: completes immediately.
 	const fast = ch.addListener((string) @safe {});
@@ -3678,7 +3661,7 @@ unittest  // a slow stream's write must not block delivery to a different stream
 			});
 			// Wait until the slow write is actually in progress (blocked) — no timing
 			// guesswork.
-			() @trusted { slowStarted.wait(startEc); }();
+			() { slowStarted.wait(startEc); }();
 			auto tFast = runTask(() nothrow{
 				try
 				{
@@ -3693,7 +3676,7 @@ unittest  // a slow stream's write must not block delivery to a different stream
 			// The fast delivery completed while the slow write is still blocked; now
 			// release the slow write and let it finish.
 			tFast.join();
-			() @trusted { slowRelease.emit(); }();
+			slowRelease.emit();
 			tSlow.join();
 		}
 		catch (Exception)
@@ -4294,7 +4277,7 @@ unittest  // a 2025-11-25 stream that cannot be resumed sends no priming event
 	auto ctx = new HttpStreamContext(res, new StreamCoordinator, caps,
 			Json.undefined, TokenInfo.invalid(), false, ProtocolVersion.v2025_11_25);
 	ctx.log("info", Json("hello"));
-	const body_ = () @trusted { return cast(string) sink.data.idup; }();
+	const body_ = cast(string) sink.data.idup;
 	assert(body_.canFind("hello"));
 	assert(!body_.canFind("data: \n\n"), "priming invites a resume the server cannot serve");
 }
@@ -4509,7 +4492,7 @@ unittest  // a live POST stream keeps its event ids monotonic after its replay h
 	}
 
 	ctx.log("info", Json("second"));
-	const body_ = () @trusted { return cast(string) sink.data.idup; }();
+	const body_ = cast(string) sink.data.idup;
 	assert(body_.canFind("id: " ~ ordinal ~ "-2\n"), body_);
 }
 
@@ -4538,7 +4521,7 @@ unittest  // events after a GET resumes a live POST stream go only to the GET st
 	ctx.finishWith(makeResponse(Json(3), Json.emptyObject));
 
 	assert(resumed.length == 3 && resumed[1].canFind("after-resume"));
-	const body_ = () @trusted { return cast(string) sink.data.idup; }();
+	const body_ = cast(string) sink.data.idup;
 	assert(body_.canFind("before-resume"));
 	assert(!body_.canFind("after-resume"), "the resumed event is duplicated on the POST stream");
 	assert(!body_.canFind("\"id\":3"));
@@ -4692,7 +4675,7 @@ unittest  // a POST stream's server->client request times out after the mount's 
 	catch (RequestTimeoutException)
 		timedOut = true;
 	assert(timedOut);
-	const body_ = () @trusted { return cast(string) sink.data.idup; }();
+	const body_ = cast(string) sink.data.idup;
 	assert(body_.canFind(`"method":"notifications/cancelled"`), body_);
 	assert(body_.canFind(`"requestId":1`), body_);
 }

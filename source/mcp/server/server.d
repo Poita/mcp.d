@@ -12496,9 +12496,7 @@ unittest  // inputRequired(reqs, T) stores requestState as the JSON of the struc
 	auto resp = ToolResponse.inputRequired(cast(InputRequest[]) null, ResumeState("verify", 2));
 	assert(resp.needsInput);
 	auto j = resp.toJson();
-	auto back = () @trusted {
-		return deserializeJson!ResumeState(parseJsonString(j["requestState"].get!string));
-	}();
+	auto back = deserializeJson!ResumeState(parseJsonString(j["requestState"].get!string));
 	assert(back.step == "verify");
 	assert(back.attempt == 2);
 }

@@ -519,7 +519,7 @@ package TokenValidator githubTokenVerifierWith(string clientId, string clientSec
 				ti.subject = jsonString(doc["user"], "login");
 				auto scopes = doc["scopes"];
 				if (scopes.type == Json.Type.array)
-					foreach (s; ()@trusted { return scopes.get!(Json[]); }())
+					foreach (s; scopes.get!(Json[]))
 						if (s.type == Json.Type.string)
 							ti.scopes ~= s.get!string;
 				doc.remove("token");

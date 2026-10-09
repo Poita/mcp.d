@@ -367,7 +367,7 @@ unittest  // minted tokens carry at least 256 bits of entropy
 	t.expiresAt = long.max;
 	const tok = store.issue(t);
 	// base64url-no-pad of 32 bytes decodes back to 32 bytes (256 bits).
-	auto decoded = () @trusted { return Base64URLNoPadding.decode(tok); }();
+	auto decoded = Base64URLNoPadding.decode(tok);
 	assert(decoded.length >= 32);
 }
 

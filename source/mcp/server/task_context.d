@@ -568,7 +568,7 @@ unittest  // an executor that throws fails the task with a generic internal erro
 	assert(d["status"].get!string == "failed");
 	assert(d["error"]["code"].get!int == cast(int) ErrorCode.internalError);
 	assert(d["error"]["message"].get!string == "Internal error");
-	auto lines = () @trusted { return (cast() logger).lines; }();
+	auto lines = (cast() logger).lines;
 	assert(lines.any!(l => l.canFind("kaboom")));
 }
 

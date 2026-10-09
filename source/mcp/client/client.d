@@ -818,12 +818,12 @@ final class McpClient : ClientProtocol
 		sharedCache_ = settings.cache !is null;
 		defaultCacheTtl_ = settings.defaultCacheTtl;
 		cachePartition_ = settings.cachePartition;
-		clientPartition_ = () @trusted {
+		clientPartition_ = () {
 			import std.uuid : randomUUID;
 
 			return "client:" ~ randomUUID().toString();
 		}();
-		cacheServer_ = settings.cacheServer.length ? settings.cacheServer : () @trusted {
+		cacheServer_ = settings.cacheServer.length ? settings.cacheServer : () {
 			import std.conv : to;
 
 			return "client:" ~ (cast(size_t) cast(void*) this).to!string;
@@ -2312,9 +2312,7 @@ final class McpClient : ClientProtocol
 		Json fresh = Json.emptyObject;
 		if ("inputRequests" !in state || state["inputRequests"].type != Json.Type.object)
 			return fresh;
-		foreach (key, value; ()@trusted {
-				return state["inputRequests"].get!(Json[string]);
-			}())
+		foreach (key, value; state["inputRequests"].get!(Json[string]))
 		{
 			if (key in handled)
 				continue;
@@ -3301,9 +3299,7 @@ final class McpClient : ClientProtocol
 				return onEventNowForTest();
 		import core.time : MonoTime;
 
-		return () @trusted {
-			return MonoTime.currTime.ticks / (MonoTime.ticksPerSecond / 1000);
-		}();
+		return MonoTime.currTime.ticks / (MonoTime.ticksPerSecond / 1000);
 	}
 
 	version (unittest) package void delegate(Duration) @safe onStreamWatchSleepForTest;
@@ -3501,7 +3497,7 @@ final class McpClient : ClientProtocol
 		try
 		{
 			auto expiry = SysTime.fromISOExtString(res.refreshBefore.get);
-			auto now = () @trusted { return Clock.currTime(expiry.timezone); }();
+			auto now = Clock.currTime(expiry.timezone);
 			auto remaining = expiry - now;
 			if (remaining <= Duration.zero)
 				return minWebhookRefreshMs.msecs;
@@ -5099,7 +5095,7 @@ unittest  // awaitTask hands each inputRequests key to onInputRequired only once
 	c.awaitTask("t1", RequestOptions.init, (string id, Json reqs) @safe {
 		import std.algorithm : sort;
 
-		auto keys = () @trusted { return reqs.get!(Json[string]).keys; }();
+		auto keys = reqs.get!(Json[string]).keys;
 		sort(keys);
 		seen ~= keys;
 	});
@@ -7288,7 +7284,7 @@ unittest  // a reply to a server request that fails to send is logged
 		}
 	});
 	runEventLoop();
-	auto lines = () @trusted { return (cast() logger).lines; }();
+	auto lines = (cast() logger).lines;
 	assert(lines.any!(l => l.canFind("reply pipe broken")), "a failed reply must be logged");
 }
 
@@ -9269,7 +9265,7 @@ version (unittest)
 				listenFailures = listenFailures[1 .. $];
 				throw e;
 			}
-			auto cancelled = () @trusted { return new shared bool(false); }();
+			auto cancelled = new shared bool(false);
 			streams ~= new SubscriptionStream(cancelled);
 			if (listensEndAtOpen)
 				streams[$ - 1].finish();

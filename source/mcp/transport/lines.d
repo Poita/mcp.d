@@ -106,9 +106,7 @@ package(mcp) struct LineReader
 						return null;
 					if (acc.length && acc[$ - 1] == '\r')
 						acc = acc[0 .. $ - 1];
-					return acc.length ? () @trusted {
-						return cast(string) acc.idup;
-					}() : null;
+					return acc.length ? (cast(string) acc.idup) : null;
 				}
 			}
 
@@ -158,7 +156,7 @@ package(mcp) struct LineReader
 			// A blank line is "" rather than null, which the read loop takes as EOF.
 			if (!acc.length)
 				return "";
-			return () @trusted { return cast(string) acc.idup; }();
+			return cast(string) acc.idup;
 		}
 	}
 }

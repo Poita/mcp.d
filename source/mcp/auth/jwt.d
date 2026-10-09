@@ -219,7 +219,7 @@ string makeClientAssertion(string clientId, string[] audiences,
 		// Append 8 random bytes (base64url, no padding) so the JTI is unique
 		// even when two assertions are generated within the same wall-clock second.
 		// RFC 7523 §3 requires each jti to be unique per assertion.
-		auto randomSuffix = () @trusted { return cryptoRandomBytes(8); }();
+		auto randomSuffix = cryptoRandomBytes(8);
 		theJti = "jti-" ~ now.to!string ~ "-" ~ Base64URLNoPadding.encode(randomSuffix).idup;
 	}
 
@@ -335,9 +335,7 @@ unittest  // ES256 JWT client assertion has 3 parts and a 64-byte (raw) signatur
 	// Payload contains the expected claims.
 	import std.string : indexOf;
 
-	auto payloadJson = () @trusted {
-		return (cast(char[]) Base64URLNoPadding.decode(parts[1])).idup;
-	}();
+	auto payloadJson = (cast(char[]) Base64URLNoPadding.decode(parts[1])).idup;
 	assert(payloadJson.indexOf(`"iss":"client-1"`) >= 0);
 	assert(payloadJson.indexOf(`"aud":"https://as.example.com/token"`) >= 0);
 }
@@ -358,9 +356,7 @@ unittest  // A clientId containing a quote is JSON-escaped, not injected as raw 
 	auto jwt = makeClientAssertion(evil, "https://as.example.com/token", pem, 1_700_000_000);
 	auto parts = jwt.split('.');
 	assert(parts.length == 3);
-	auto payloadStr = () @trusted {
-		return (cast(char[]) Base64URLNoPadding.decode(parts[1])).idup;
-	}();
+	auto payloadStr = (cast(char[]) Base64URLNoPadding.decode(parts[1])).idup;
 	auto j = parseJsonString(payloadStr);
 	// The literal string is preserved verbatim in iss/sub, not split into claims.
 	assert(j["iss"].get!string == evil);
@@ -383,9 +379,7 @@ unittest  // iat/exp are emitted as JSON numbers, not strings
 	auto jwt = makeClientAssertion("client-1", "https://as.example.com/token",
 			pem, 1_700_000_000, 300);
 	auto parts = jwt.split('.');
-	auto payloadStr = () @trusted {
-		return (cast(char[]) Base64URLNoPadding.decode(parts[1])).idup;
-	}();
+	auto payloadStr = (cast(char[]) Base64URLNoPadding.decode(parts[1])).idup;
 	auto j = parseJsonString(payloadStr);
 	assert(j["iat"].get!long == 1_700_000_000);
 	assert(j["exp"].get!long == 1_700_000_300);
@@ -441,16 +435,12 @@ unittest  // mintJwtEs256 emits the supplied claims with iss/sub/aud varying ind
 	auto parts = jwt.split('.');
 	assert(parts.length == 3);
 
-	auto headerStr = () @trusted {
-		return (cast(char[]) Base64URLNoPadding.decode(parts[0])).idup;
-	}();
+	auto headerStr = (cast(char[]) Base64URLNoPadding.decode(parts[0])).idup;
 	auto h = parseJsonString(headerStr);
 	assert(h["alg"].get!string == "ES256");
 	assert(h["kid"].get!string == "as-1");
 
-	auto payloadStr = () @trusted {
-		return (cast(char[]) Base64URLNoPadding.decode(parts[1])).idup;
-	}();
+	auto payloadStr = (cast(char[]) Base64URLNoPadding.decode(parts[1])).idup;
 	auto j = parseJsonString(payloadStr);
 	assert(j["iss"].get!string == "https://auth.example.com");
 	assert(j["aud"].get!string == "https://rs.example.com/mcp");
@@ -473,9 +463,7 @@ unittest  // mintJwtEs256 JSON-escapes a subject containing a quote rather than 
 	claims.exp = 1_700_003_600;
 	auto jwt = mintJwtEs256(testEcPem, claims);
 	auto parts = jwt.split('.');
-	auto payloadStr = () @trusted {
-		return (cast(char[]) Base64URLNoPadding.decode(parts[1])).idup;
-	}();
+	auto payloadStr = (cast(char[]) Base64URLNoPadding.decode(parts[1])).idup;
 	auto j = parseJsonString(payloadStr);
 	assert(j["sub"].get!string == `x","admin":"true`);
 	assert(j["admin"].type == Json.Type.undefined);
@@ -493,9 +481,7 @@ unittest  // mintJwtEs256 omits empty string claims and zero iat/nbf
 	claims.exp = 1_700_003_600;
 	auto jwt = mintJwtEs256(testEcPem, claims);
 	auto parts = jwt.split('.');
-	auto payloadStr = () @trusted {
-		return (cast(char[]) Base64URLNoPadding.decode(parts[1])).idup;
-	}();
+	auto payloadStr = (cast(char[]) Base64URLNoPadding.decode(parts[1])).idup;
 	auto j = parseJsonString(payloadStr);
 	assert(j["aud"].type == Json.Type.undefined);
 	assert(j["scope"].type == Json.Type.undefined);
@@ -503,9 +489,7 @@ unittest  // mintJwtEs256 omits empty string claims and zero iat/nbf
 	assert(j["nbf"].type == Json.Type.undefined);
 	assert(j["exp"].get!long == 1_700_003_600);
 
-	auto headerStr = () @trusted {
-		return (cast(char[]) Base64URLNoPadding.decode(parts[0])).idup;
-	}();
+	auto headerStr = (cast(char[]) Base64URLNoPadding.decode(parts[0])).idup;
 	auto h = parseJsonString(headerStr);
 	assert(h["kid"].type == Json.Type.undefined);
 }
@@ -550,12 +534,8 @@ unittest  // auto-generated jti values are unique even when now is identical acr
 	const now = 1_700_000_000L;
 	auto jwt1 = makeClientAssertion("client-1", "https://as.example.com/token", pem, now);
 	auto jwt2 = makeClientAssertion("client-1", "https://as.example.com/token", pem, now);
-	auto payload1 = () @trusted {
-		return (cast(char[]) Base64URLNoPadding.decode(jwt1.split('.')[1])).idup;
-	}();
-	auto payload2 = () @trusted {
-		return (cast(char[]) Base64URLNoPadding.decode(jwt2.split('.')[1])).idup;
-	}();
+	auto payload1 = (cast(char[]) Base64URLNoPadding.decode(jwt1.split('.')[1])).idup;
+	auto payload2 = (cast(char[]) Base64URLNoPadding.decode(jwt2.split('.')[1])).idup;
 	auto j1 = parseJsonString(payload1);
 	auto j2 = parseJsonString(payload2);
 	// Each jti must include the timestamp prefix so an AS can bound its replay window.
@@ -614,9 +594,7 @@ unittest  // makeClientAssertion emits RS256 when given an RSA private key
 	assert(parts.length == 3);
 
 	// Header must declare RS256.
-	auto headerStr = () @trusted {
-		return (cast(char[]) Base64URLNoPadding.decode(parts[0])).idup;
-	}();
+	auto headerStr = (cast(char[]) Base64URLNoPadding.decode(parts[0])).idup;
 	auto h = parseJsonString(headerStr);
 	assert(h["alg"].get!string == "RS256", "RSA key must produce RS256, not ES256");
 

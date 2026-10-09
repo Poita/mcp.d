@@ -623,7 +623,7 @@ version (Posix) unittest  // an introspection endpoint on a non-loopback interna
 				res.writeBody(`{"active":true}`, "application/json");
 			});
 			scope (exit)
-				() @trusted { listener.stopListening(); }();
+				listener.stopListening();
 			// 0.0.0.0 is an internal, non-loopback address that still reaches
 			// this host's listener on POSIX (Windows refuses to connect to it).
 			IntrospectionConfig cfg;
@@ -700,7 +700,7 @@ unittest  // a failed introspection call is logged rather than silently rejected
 	cfg.introspectionEndpoint = "https://as.example.com/introspect";
 	auto v = introspectionValidator(cfg, new ThrowingIntrospector);
 	assert(!v("tok").valid);
-	auto lines = () @trusted { return (cast() logger).lines; }();
+	auto lines = (cast() logger).lines;
 	assert(lines.any!(l => l.canFind("introspection endpoint unreachable")));
 }
 
@@ -791,7 +791,7 @@ unittest  // a 503 introspection response is reported as an unavailable verifier
 				res.writeBody("down for maintenance", "text/plain");
 			});
 			scope (exit)
-				() @trusted { listener.stopListening(); }();
+				listener.stopListening();
 			IntrospectionConfig cfg;
 			cfg.introspectionEndpoint = "http://127.0.0.1:"
 				~ listener.bindAddresses[0].port.to!string ~ "/introspect";

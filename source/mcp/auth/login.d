@@ -325,7 +325,7 @@ class FileTokenStore : TokenStore
 			return Json.emptyObject;
 		try
 		{
-			auto data = () @trusted { return cast(const(ubyte)[]) read(path); }();
+			auto data = cast(const(ubyte)[]) read(path);
 			auto j = deserialize(data);
 			return j.type == Json.Type.object ? j : Json.emptyObject;
 		}
@@ -364,7 +364,7 @@ class FileTokenStore : TokenStore
 		if (dir.length && dir != "." && !(dir.exists && dir.isDir))
 		{
 			try
-				() @trusted { mkdirRecurse(dir); }();
+				mkdirRecurse(dir);
 			catch (Exception e)
 				throw internalError(
 						"FileTokenStore: could not create token directory " ~ dir ~ ": " ~ e.msg);
@@ -378,13 +378,13 @@ class FileTokenStore : TokenStore
 			// alongside (path~) so any recoverable tokens for other resources are not
 			// destroyed by this save.
 			if (corrupt)
-				() @trusted {
+			{
 				try
 					rename(path, path ~ "~");
 				catch (Exception)
 				{
 				}
-			}();
+			}
 			all[resource] = token.toJson();
 			auto bytes = serialize(all);
 			writeSecretFile(bytes);
@@ -440,7 +440,7 @@ class FileTokenStore : TokenStore
 			while (rc != 0 && (()@trusted => errno)() == EINTR);
 			if (rc != 0)
 			{
-				() @trusted { close(fd); }();
+				close(fd);
 				throw internalError("FileTokenStore: could not lock " ~ lockPath);
 			}
 			l.fd = fd;
@@ -480,7 +480,7 @@ class FileTokenStore : TokenStore
 			import core.sys.posix.unistd : close;
 
 			// Closing the descriptor releases the lock.
-			() @trusted { close(l.fd); }();
+			() { close(l.fd); }();
 			l.fd = -1;
 		}
 		else version (Windows)
@@ -554,13 +554,11 @@ class FileTokenStore : TokenStore
 
 			void discardTmp() @safe nothrow
 			{
-				() @trusted {
-					try
-						remove(tmp);
-					catch (Exception)
-					{
-					}
-				}();
+				try
+					remove(tmp);
+				catch (Exception)
+				{
+				}
 			}
 
 			if (wrote && ()@trusted {
@@ -575,7 +573,7 @@ class FileTokenStore : TokenStore
 			// afterwards in case the file had to be created by `write`.
 			discardTmp();
 			restrictPermissions();
-			() @trusted { write(path, bytes); }();
+			write(path, bytes);
 			restrictPermissions();
 			return;
 		}
@@ -615,14 +613,14 @@ class FileTokenStore : TokenStore
 			if (!path.exists)
 				return;
 			try
-				() @trusted { setAttributes(path, S_IRUSR | S_IWUSR); }();
+				setAttributes(path, S_IRUSR | S_IWUSR);
 			catch (Exception e)
 			{
 				logWarn("FileTokenStore: could not restrict token file %s to owner-only (0600); "
 						~ "OAuth tokens may be readable by other local users: %s", path, e.msg);
 				return;
 			}
-			const mode = () @trusted { return getAttributes(path); }();
+			const mode = getAttributes(path);
 			if (stillGroupOrOtherAccessible(mode))
 				logWarn("FileTokenStore: token file %s remains group/other-accessible after "
 						~ "chmod; OAuth tokens may be exposed to other local users", path);
@@ -649,7 +647,7 @@ class FileTokenStore : TokenStore
 			if (dir.length && dir.exists)
 			{
 				try
-					() @trusted { setAttributes(dir, S_IRWXU); }();
+					setAttributes(dir, S_IRWXU);
 				catch (Exception)
 				{
 				}
@@ -1079,9 +1077,7 @@ final class OAuthSession
 	{
 		import std.datetime.systime : Clock;
 
-		return bearerForRequest(() @trusted {
-			return Clock.currTime().toUnixTime();
-		}());
+		return bearerForRequest(Clock.currTime().toUnixTime());
 	}
 
 	/// Return a valid bearer access token for use at `now` (Unix seconds),
@@ -1255,7 +1251,7 @@ bool openSystemBrowser(string url, scope BrowserSpawn spawn = null) @safe
 		if (spawn !is null)
 			spawn(cmd);
 		else
-			() @trusted { spawnProcess(cmd, null, Config.detached); }();
+			spawnProcess(cmd, null, Config.detached);
 		return true;
 	}
 	catch (Exception e)
@@ -1322,7 +1318,7 @@ OAuthSession useOAuth(McpClient client, string mcpEndpoint, OAuthLogin opts) @sa
 	oauth.authMethod = opts.authMethod;
 	oauth.clientIdMetadataUrl = opts.clientIdMetadataUrl;
 
-	const long now = () @trusted { return Clock.currTime().toUnixTime(); }();
+	const long now = Clock.currTime().toUnixTime();
 
 	// Discover the issuer and AS metadata. Enforce the discovered AS document's
 	// issuer only on the modern RFC 9728 path (issuer named by a
@@ -1433,7 +1429,7 @@ OAuthSession useOAuth(McpClient client, string mcpEndpoint, OAuthLogin opts) @sa
 	// expiresAt = issuedAt + expiresIn reflects the actual token-issuance
 	// wall time, not the time useOAuth was entered (which predates the
 	// interactive browser wait by however long the user took to authenticate).
-	const long issuedAt = () @trusted { return Clock.currTime().toUnixTime(); }();
+	const long issuedAt = Clock.currTime().toUnixTime();
 	auto stored = StoredToken.fromTokenSet(ts, oauth.resource, issuedAt);
 	// An omitted `scope` means the requested scope was granted (RFC 6749 §5.1).
 	if (stored.scope_.length == 0)
@@ -1563,22 +1559,20 @@ private LoopbackCapture runBrowserLoopbackFlow(OAuthClient oauth,
 		{
 			result = cap;
 			done = true;
-			() @trusted { timeoutTimer.stop(); }();
+			timeoutTimer.stop();
 		}
 		res.contentType = "text/html; charset=utf-8";
 		res.writeBody(loopbackResponseHtml(cap.ok));
 		if (!inTask)
-			() @trusted { exitEventLoop(); }();
+			exitEventLoop();
 	}
 
 	HTTPListener listener;
 	ushort boundPort;
-	() @trusted {
-		listener = listenHTTP(settings, &handle);
-		boundPort = listener.bindAddresses[0].port;
-	}();
+	listener = listenHTTP(settings, &handle);
+	boundPort = listener.bindAddresses[0].port;
 	scope (exit)
-		() @trusted { listener.stopListening(); }();
+		listener.stopListening();
 
 	oauth.redirectUri = loopbackRedirectUri(boundPort, opts.callbackPath);
 	rc = resolveClient(oauth.redirectUri);
@@ -1600,19 +1594,17 @@ private LoopbackCapture runBrowserLoopbackFlow(OAuthClient oauth,
 			done = true;
 		}
 		if (!inTask)
-			() @trusted { exitEventLoop(); }();
+			exitEventLoop();
 	}
 
-	timeoutTimer = () @trusted {
-		return setTimer(opts.callbackTimeout, &onTimeout);
-	}();
+	timeoutTimer = setTimer(opts.callbackTimeout, &onTimeout);
 	scope (exit)
-		() @trusted { timeoutTimer.stop(); }();
+		timeoutTimer.stop();
 	if (inTask)
 		while (!done)
 			sleep(10.msecs);
 	else
-		() @trusted { runEventLoop(); }();
+		runEventLoop();
 	return result;
 }
 
@@ -2431,7 +2423,7 @@ version (Posix) unittest  // FileTokenStore.writeSecretFile does not draw from t
 	auto root = buildPath(tempDir, "mcp-login-mt-" ~ Clock.currTime().toUnixTime().to!string);
 	mkdirRecurse(root);
 	scope (exit)
-		() @trusted { rmdirRecurse(root); }();
+		rmdirRecurse(root);
 
 	auto before = rndGen; // snapshot the MT state before the save
 
@@ -2459,7 +2451,7 @@ version (Posix) unittest  // FileTokenStore creates the token file 0600 (never a
 	auto root = buildPath(tempDir, "mcp-login-perm-" ~ Clock.currTime().toUnixTime().to!string);
 	mkdirRecurse(root);
 	scope (exit)
-		() @trusted { rmdirRecurse(root); }();
+		rmdirRecurse(root);
 
 	auto file = buildPath(root, "sub", "tokens.json");
 	auto store = new FileTokenStore(file);
@@ -2487,8 +2479,8 @@ version (Posix) unittest  // FileTokenStore leaves the permissions of an existin
 	auto root = buildPath(tempDir, "mcp-login-owndir-" ~ Clock.currTime().toUnixTime().to!string);
 	mkdirRecurse(root);
 	scope (exit)
-		() @trusted { rmdirRecurse(root); }();
-	() @trusted { setAttributes(root, octal!755); }();
+		rmdirRecurse(root);
+	setAttributes(root, octal!755);
 
 	auto store = new FileTokenStore(buildPath(root, "tokens.json"));
 	StoredToken t;
@@ -2510,7 +2502,7 @@ version (Posix) unittest  // FileTokenStore makes a directory it creates owner-o
 	auto root = buildPath(tempDir, "mcp-login-newdir-" ~ Clock.currTime().toUnixTime().to!string);
 	mkdirRecurse(root);
 	scope (exit)
-		() @trusted { rmdirRecurse(root); }();
+		rmdirRecurse(root);
 
 	auto dir = buildPath(root, "dlang-mcp");
 	auto store = new FileTokenStore(buildPath(dir, "tokens.json"));
@@ -2568,12 +2560,12 @@ version (Posix) unittest  // FileTokenStore never writes secrets through a pre-e
 	auto root = buildPath(tempDir, "mcp-login-pre-" ~ Clock.currTime().toUnixTime().to!string);
 	mkdirRecurse(root);
 	scope (exit)
-		() @trusted { rmdirRecurse(root); }();
+		rmdirRecurse(root);
 
 	auto file = buildPath(root, "tokens.json");
 	// Pre-create the target as a world/group-readable (0644) file, as an earlier
 	// SDK version, an interrupted run, or an unusual umask might leave it.
-	() @trusted {
+	() {
 		write(file, "{}");
 		setAttributes(file, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
 	}();
@@ -2604,7 +2596,7 @@ version (Posix) unittest  // FileTokenStore never writes secrets through a pre-e
 	assert((() @trusted => readText(file))().indexOf("secret-refresh") >= 0);
 
 	// The loose-perm alias to the old inode must NOT have received the secrets.
-	auto aliasContents = () @trusted { return readText(alias_); }();
+	auto aliasContents = readText(alias_);
 	assert(aliasContents.indexOf("secret-refresh") < 0,
 			"secrets were written through a pre-existing group/world-readable inode");
 }
@@ -2621,7 +2613,7 @@ version (Posix) unittest  // FileTokenStore restricts the parent dir to 0700
 			.toUnixTime().to!string ~ "-d");
 	mkdirRecurse(root);
 	scope (exit)
-		() @trusted { rmdirRecurse(root); }();
+		rmdirRecurse(root);
 
 	auto file = buildPath(root, "sub", "tokens.json");
 	auto store = new FileTokenStore(file);
@@ -3158,7 +3150,7 @@ unittest  // a failed cached refresh is logged before useOAuth falls back to the
 
 	assertThrown(useOAuth(McpClient.http(endpoint), endpoint, opts));
 	assert(srv.refreshCalls == 1);
-	auto lines = () @trusted { return (cast() logger).lines; }();
+	auto lines = (cast() logger).lines;
 	assert(lines.any!(l => l.canFind("refresh")), "a failed refresh must not be silent");
 }
 
@@ -3437,23 +3429,21 @@ unittest  // a stray non-callback request does not abort the loopback flow
 		auto portStr = slash >= 0 ? rest[0 .. slash] : rest;
 		auto baseUrl = "http://127.0.0.1:" ~ portStr;
 
-		() @trusted {
-			runTask(() nothrow{
-				try
-				{
-					sleep(50.msecs);
-					requestHTTP(baseUrl ~ "/favicon.ico", (scope req) {}, (scope res) {
-						res.dropBody();
-					});
-					sleep(50.msecs);
-					requestHTTP(baseUrl ~ "/callback?code=real-code&state=state-xyz", (scope req) {
-					}, (scope res) { res.dropBody(); });
-				}
-				catch (Exception)
-				{
-				}
-			});
-		}();
+		runTask(() nothrow{
+			try
+			{
+				sleep(50.msecs);
+				requestHTTP(baseUrl ~ "/favicon.ico", (scope req) {}, (scope res) {
+					res.dropBody();
+				});
+				sleep(50.msecs);
+				requestHTTP(baseUrl ~ "/callback?code=real-code&state=state-xyz", (scope req) {
+				}, (scope res) { res.dropBody(); });
+			}
+			catch (Exception)
+			{
+			}
+		});
 	};
 
 	auto captured = runBrowserLoopbackFlow(oauth, as_, rc, pkce, opts, "state-xyz");
@@ -3484,27 +3474,22 @@ unittest  // a callback with the wrong state is refused (400) and the flow keeps
 		auto redirectUri = extractQueryParam(url, "redirect_uri");
 		auto rest = redirectUri[redirectUri.indexOf("127.0.0.1:") + "127.0.0.1:".length .. $];
 		auto baseUrl = "http://127.0.0.1:" ~ rest[0 .. rest.indexOf('/')];
-		() @trusted {
-			runTask(() nothrow{
-				try
-				{
-					// Any web page can make the browser hit the loopback callback; one
-					// without the flow's state must not end the login.
-					sleep(50.msecs);
-					requestHTTP(baseUrl ~ "/callback?error=access_denied&state=forged", (scope req) {
-					}, (scope res) {
-						forgedStatus = res.statusCode;
-						res.dropBody();
-					});
-					sleep(50.msecs);
-					requestHTTP(baseUrl ~ "/callback?code=real-code&state=state-xyz", (scope req) {
-					}, (scope res) { res.dropBody(); });
-				}
-				catch (Exception)
-				{
-				}
-			});
-		}();
+		runTask(() nothrow{
+			try
+			{
+				// Any web page can make the browser hit the loopback callback; one
+				// without the flow's state must not end the login.
+				sleep(50.msecs);
+				requestHTTP(baseUrl ~ "/callback?error=access_denied&state=forged", (scope req) {
+				}, (scope res) { forgedStatus = res.statusCode; res.dropBody(); });
+				sleep(50.msecs);
+				requestHTTP(baseUrl ~ "/callback?code=real-code&state=state-xyz", (scope req) {
+				}, (scope res) { res.dropBody(); });
+			}
+			catch (Exception)
+			{
+			}
+		});
 	};
 
 	auto captured = runBrowserLoopbackFlow(oauth, as_, rc, pkce, opts, "state-xyz");
@@ -3524,12 +3509,12 @@ version (Posix) unittest  // save() throws a typed error when the token director
 	auto root = buildPath(tempDir, "mcp-login-mkdir-" ~ Clock.currTime().toUnixTime().to!string);
 	mkdirRecurse(root);
 	scope (exit)
-		() @trusted { rmdirRecurse(root); }();
+		rmdirRecurse(root);
 
 	// A regular file standing where the token file's parent directory must be, so
 	// mkdirRecurse cannot create the directory.
 	auto blocker = buildPath(root, "blocker");
-	() @trusted { write(blocker, "x"); }();
+	write(blocker, "x");
 	auto store = new FileTokenStore(buildPath(blocker, "tokens.json"));
 	StoredToken t;
 	t.accessToken = "secret";
@@ -3559,7 +3544,7 @@ version (Posix) @system unittest  // save() waits for the token file's lock, so 
 	auto root = buildPath(tempDir, "mcp-login-lock-" ~ Clock.currTime().stdTime.to!string);
 	mkdirRecurse(root);
 	scope (exit)
-		() @trusted { rmdirRecurse(root); }();
+		rmdirRecurse(root);
 	auto file = buildPath(root, "tokens.json");
 
 	// Another process holds the lock mid read-modify-write.
@@ -3582,7 +3567,7 @@ version (Posix) @system unittest  // save() waits for the token file's lock, so 
 	assert(!atomicLoad(saved), "save must wait for the lock");
 
 	assert(() @trusted { return flock(fd, LOCK_UN); }() == 0);
-	assert(() @trusted { return close(fd); }() == 0);
+	assert(close(fd) == 0);
 	writer.join();
 	assert(atomicLoad(saved));
 	assert(new FileTokenStore(file).load("https://b.example.com").accessToken == "from-writer");
@@ -3598,10 +3583,10 @@ version (Posix) unittest  // save() backs up an unparseable token file instead o
 	auto root = buildPath(tempDir, "mcp-login-corrupt-" ~ Clock.currTime().toUnixTime().to!string);
 	mkdirRecurse(root);
 	scope (exit)
-		() @trusted { rmdirRecurse(root); }();
+		rmdirRecurse(root);
 
 	auto file = buildPath(root, "tokens.json");
-	() @trusted { write(file, "{ this is not valid json"); }();
+	write(file, "{ this is not valid json");
 
 	auto store = new FileTokenStore(file);
 	StoredToken t;
@@ -3678,46 +3663,43 @@ unittest  // useOAuth refreshes under the stored client_id before registering an
 	auto settings = new HTTPServerSettings;
 	settings.bindAddresses = ["127.0.0.1"];
 	settings.port = 0;
-	listener = () @trusted {
-		return listenHTTP(settings, (scope HTTPServerRequest req, scope HTTPServerResponse res) @safe {
-			if (req.path.canFind("oauth-protected-resource"))
-				res.writeBody(
-					`{"resource":"` ~ base ~ `/mcp","authorization_servers":["` ~ base ~ `"]}`,
+	listener = listenHTTP(settings, (scope HTTPServerRequest req, scope HTTPServerResponse res) @safe {
+		if (req.path.canFind("oauth-protected-resource"))
+			res.writeBody(`{"resource":"` ~ base ~ `/mcp","authorization_servers":["` ~ base ~ `"]}`,
+				"application/json");
+		else if (req.path.canFind("authorization-server"))
+			res.writeBody(`{"issuer":"http://` ~ req.host ~ `","authorization_endpoint":"` ~ base
+				~ `/authorize","token_endpoint":"` ~ base ~ `/token","registration_endpoint":"`
+				~ base ~ `/register","code_challenge_methods_supported":["S256"]}`,
+				"application/json");
+		else if (req.path == "/register")
+		{
+			registerCalls++;
+			res.writeBody(
+				`{"client_id":"fresh-id","redirect_uris":["http://localhost:8765/callback"]}`,
+				"application/json");
+		}
+		else if (req.path == "/token")
+		{
+			if (req.form.get("grant_type", "") == "refresh_token"
+				&& req.form.get("refresh_token", "") == "rt"
+				&& req.form.get("client_id", "") == "abc123")
+				res.writeBody(`{"access_token":"new-access","token_type":"Bearer","expires_in":3600,"refresh_token":"rt2"}`,
 					"application/json");
-			else if (req.path.canFind("authorization-server"))
-				res.writeBody(`{"issuer":"http://` ~ req.host ~ `","authorization_endpoint":"` ~ base
-					~ `/authorize","token_endpoint":"` ~ base ~ `/token","registration_endpoint":"`
-					~ base ~ `/register","code_challenge_methods_supported":["S256"]}`,
-					"application/json");
-			else if (req.path == "/register")
-			{
-				registerCalls++;
-				res.writeBody(
-					`{"client_id":"fresh-id","redirect_uris":["http://localhost:8765/callback"]}`,
-					"application/json");
-			}
-			else if (req.path == "/token")
-			{
-				if (req.form.get("grant_type", "") == "refresh_token"
-					&& req.form.get("refresh_token", "") == "rt"
-					&& req.form.get("client_id", "") == "abc123")
-					res.writeBody(`{"access_token":"new-access","token_type":"Bearer","expires_in":3600,"refresh_token":"rt2"}`,
-						"application/json");
-				else
-				{
-					res.statusCode = 400;
-					res.writeBody(`{"error":"invalid_grant"}`, "application/json");
-				}
-			}
 			else
 			{
-				res.statusCode = 404;
-				res.writeBody("", "text/plain");
+				res.statusCode = 400;
+				res.writeBody(`{"error":"invalid_grant"}`, "application/json");
 			}
-		});
-	}();
+		}
+		else
+		{
+			res.statusCode = 404;
+			res.writeBody("", "text/plain");
+		}
+	});
 	scope (exit)
-		() @trusted { listener.stopListening(); }();
+		listener.stopListening();
 	import std.conv : to;
 
 	base = "http://127.0.0.1:" ~ listener.bindAddresses[0].port.to!string;
@@ -3775,35 +3757,31 @@ unittest  // the loopback flow completes when invoked from inside a vibe task
 		auto rest = redirectUri[hostStart + "127.0.0.1:".length .. $];
 		auto slash = rest.indexOf('/');
 		auto baseUrl = "http://127.0.0.1:" ~ (slash >= 0 ? rest[0 .. slash] : rest);
-		() @trusted {
-			runTask(() nothrow{
-				try
-				{
-					sleep(50.msecs);
-					requestHTTP(baseUrl ~ "/callback?code=in-task-code&state=state-xyz", (scope req) {
-					}, (scope res) { res.dropBody(); });
-				}
-				catch (Exception)
-				{
-				}
-			});
-		}();
+		runTask(() nothrow{
+			try
+			{
+				sleep(50.msecs);
+				requestHTTP(baseUrl ~ "/callback?code=in-task-code&state=state-xyz", (scope req) {
+				}, (scope res) { res.dropBody(); });
+			}
+			catch (Exception)
+			{
+			}
+		});
 	};
 
 	// Hosts such as a worker loop call the login from a task; the wait must
 	// yield to that loop rather than nest an event loop (which asserts).
 	bool finished;
 	LoopbackCapture captured;
-	() @trusted {
-		runTask(() nothrow{
-			try
-				captured = runBrowserLoopbackFlow(oauth, as_, rc, pkce, opts, "state-xyz");
-			catch (Exception)
-			{
-			}
-			finished = true;
-		});
-	}();
+	runTask(() nothrow{
+		try
+			captured = runBrowserLoopbackFlow(oauth, as_, rc, pkce, opts, "state-xyz");
+		catch (Exception)
+		{
+		}
+		finished = true;
+	});
 	auto sw = StopWatch(AutoStart.yes);
 	while (!finished && sw.peek < 8.seconds)
 		sleep(10.msecs);
@@ -3840,19 +3818,17 @@ unittest  // the client is registered with the redirect URI the listener actuall
 		auto rest = openedWith[hostStart + "127.0.0.1:".length .. $];
 		auto slash = rest.indexOf('/');
 		auto baseUrl = "http://127.0.0.1:" ~ (slash >= 0 ? rest[0 .. slash] : rest);
-		() @trusted {
-			runTask(() nothrow{
-				try
-				{
-					sleep(50.msecs);
-					requestHTTP(baseUrl ~ "/callback?code=c&state=state-xyz", (scope req) {
-					}, (scope res) { res.dropBody(); });
-				}
-				catch (Exception)
-				{
-				}
-			});
-		}();
+		runTask(() nothrow{
+			try
+			{
+				sleep(50.msecs);
+				requestHTTP(baseUrl ~ "/callback?code=c&state=state-xyz", (scope req) {
+				}, (scope res) { res.dropBody(); });
+			}
+			catch (Exception)
+			{
+			}
+		});
 	};
 
 	RegisteredClient rc;
@@ -3905,9 +3881,7 @@ version (unittest)
 		settings.port = 0;
 		srv.listener = listenHTTP(settings, (scope HTTPServerRequest req,
 				scope HTTPServerResponse res) @safe {
-			auto j = parseJsonString(() @trusted {
-				return req.bodyReader.readAllUTF8();
-			}());
+			auto j = parseJsonString(req.bodyReader.readAllUTF8());
 			if ("id" !in j)
 			{
 				res.statusCode = 202;

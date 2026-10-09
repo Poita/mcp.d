@@ -171,7 +171,7 @@ final class OAuthClient
 		if (privateKeyPem.length == 0)
 			throw invalidRequest(
 					"OAuthClient.privateKeyPem must be set when authMethod is " ~ "private_key_jwt");
-		const now = () @trusted { return Clock.currTime().toUnixTime(); }();
+		const now = Clock.currTime().toUnixTime();
 		const jwt = makeClientAssertion(clientId, audiences, privateKeyPem, now);
 		return "&client_assertion_type=" ~ encodeComponent(
 				jwtBearerAssertionType) ~ "&client_assertion=" ~ encodeComponent(jwt);
@@ -1342,15 +1342,14 @@ unittest  // postParse treats a non-2xx token-endpoint response as an error
 	auto settings = new HTTPServerSettings();
 	settings.bindAddresses = ["127.0.0.1"];
 	settings.port = 0;
-	auto listener = () @trusted {
-		return listenHTTP(settings, (scope HTTPServerRequest req, scope HTTPServerResponse res) @safe {
-			res.statusCode = 400;
-			res.writeBody(`{"error":"invalid_client","error_description":"bad credentials"}`,
-				"application/json");
-		});
-	}();
+	auto listener = listenHTTP(settings, (scope HTTPServerRequest req,
+			scope HTTPServerResponse res) @safe {
+		res.statusCode = 400;
+		res.writeBody(`{"error":"invalid_client","error_description":"bad credentials"}`,
+			"application/json");
+	});
 	scope (exit)
-		() @trusted { listener.stopListening(); }();
+		listener.stopListening();
 
 	const port = listener.bindAddresses[0].port;
 	const tokenUrl = "http://127.0.0.1:" ~ port.to!string ~ "/token";
@@ -1374,14 +1373,13 @@ unittest  // a failed dynamic registration names the registration endpoint, not 
 	auto settings = new HTTPServerSettings();
 	settings.bindAddresses = ["127.0.0.1"];
 	settings.port = 0;
-	auto listener = () @trusted {
-		return listenHTTP(settings, (scope HTTPServerRequest req, scope HTTPServerResponse res) @safe {
-			res.statusCode = 400;
-			res.writeBody(`{"error":"invalid_client_metadata"}`, "application/json");
-		});
-	}();
+	auto listener = listenHTTP(settings, (scope HTTPServerRequest req,
+			scope HTTPServerResponse res) @safe {
+		res.statusCode = 400;
+		res.writeBody(`{"error":"invalid_client_metadata"}`, "application/json");
+	});
 	scope (exit)
-		() @trusted { listener.stopListening(); }();
+		listener.stopListening();
 
 	AuthorizationServerMetadata as_;
 	as_.registrationEndpoint = "http://127.0.0.1:"
@@ -1442,15 +1440,14 @@ unittest  // refresh() sends client_secret in the POST body for client_secret_po
 	auto settings = new HTTPServerSettings();
 	settings.bindAddresses = ["127.0.0.1"];
 	settings.port = 0;
-	auto listener = () @trusted {
-		return listenHTTP(settings, (scope HTTPServerRequest req, scope HTTPServerResponse res) @safe {
-			capturedBody = req.bodyReader.readAllUTF8();
-			res.statusCode = 200;
-			res.writeBody(`{"access_token":"at","token_type":"bearer"}`, "application/json");
-		});
-	}();
+	auto listener = listenHTTP(settings, (scope HTTPServerRequest req,
+			scope HTTPServerResponse res) @safe {
+		capturedBody = req.bodyReader.readAllUTF8();
+		res.statusCode = 200;
+		res.writeBody(`{"access_token":"at","token_type":"bearer"}`, "application/json");
+	});
 	scope (exit)
-		() @trusted { listener.stopListening(); }();
+		listener.stopListening();
 
 	const port = listener.bindAddresses[0].port;
 	const tokenUrl = "http://127.0.0.1:" ~ port.to!string ~ "/token";
@@ -1478,14 +1475,13 @@ unittest  // a remote MCP server cannot steer the client to a plain-http loopbac
 	auto settings = new HTTPServerSettings();
 	settings.bindAddresses = ["127.0.0.1"];
 	settings.port = 0;
-	auto listener = () @trusted {
-		return listenHTTP(settings, (scope HTTPServerRequest req, scope HTTPServerResponse res) @safe {
-			hits++;
-			res.writeBody(`{"access_token":"at","token_type":"bearer"}`, "application/json");
-		});
-	}();
+	auto listener = listenHTTP(settings, (scope HTTPServerRequest req,
+			scope HTTPServerResponse res) @safe {
+		hits++;
+		res.writeBody(`{"access_token":"at","token_type":"bearer"}`, "application/json");
+	});
 	scope (exit)
-		() @trusted { listener.stopListening(); }();
+		listener.stopListening();
 
 	auto c = new OAuthClient();
 	c.resource = "https://mcp.example.com/mcp";
@@ -1504,13 +1500,12 @@ unittest  // a loopback MCP server may name a plain-http loopback authorization 
 	auto settings = new HTTPServerSettings();
 	settings.bindAddresses = ["127.0.0.1"];
 	settings.port = 0;
-	auto listener = () @trusted {
-		return listenHTTP(settings, (scope HTTPServerRequest req, scope HTTPServerResponse res) @safe {
-			res.writeBody(`{"access_token":"at","token_type":"bearer"}`, "application/json");
-		});
-	}();
+	auto listener = listenHTTP(settings, (scope HTTPServerRequest req,
+			scope HTTPServerResponse res) @safe {
+		res.writeBody(`{"access_token":"at","token_type":"bearer"}`, "application/json");
+	});
 	scope (exit)
-		() @trusted { listener.stopListening(); }();
+		listener.stopListening();
 
 	auto c = new OAuthClient();
 	c.resource = "http://localhost:3000/mcp";
@@ -1540,7 +1535,7 @@ version (unittest)
 		ushort port;
 		void stop() @safe
 		{
-			() @trusted { listener.stopListening(); }();
+			listener.stopListening();
 		}
 		// The loopback base URL ("http://127.0.0.1:<port>").
 		string base() @safe const
@@ -1557,7 +1552,7 @@ version (unittest)
 		auto settings = new HTTPServerSettings();
 		settings.bindAddresses = ["127.0.0.1"];
 		settings.port = 0;
-		auto l = () @trusted { return listenHTTP(settings, handler); }();
+		auto l = listenHTTP(settings, handler);
 		return LoopbackServer(l, l.bindAddresses[0].port);
 	}
 }

@@ -731,10 +731,8 @@ private Json parametersSchema(alias func)() @safe
 				static if (!is(defs[i] == void))
 					if ("default" !in ps)
 						{
-						auto d = () @trusted {
-							return serializeWithPolicy!(JsonSerializer, EnumByNamePolicy)(
-									cast(P) defs[i]);
-						}();
+						auto d = serializeWithPolicy!(JsonSerializer, EnumByNamePolicy)(
+								cast(P) defs[i]);
 						if (d.type != Json.Type.null_ && d.type != Json.Type.undefined)
 							ps["default"] = d;
 					}

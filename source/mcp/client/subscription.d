@@ -136,7 +136,7 @@ final class SubscriptionStream
 
 unittest  // finish records the server's end and its error once
 {
-	auto s = new SubscriptionStream(() @trusted { return new shared bool(false); }());
+	auto s = new SubscriptionStream(new shared bool(false));
 	assert(!s.ended && s.error is null);
 	auto e = new McpException(-32601, "no listen");
 	s.finish(e);
@@ -147,7 +147,7 @@ unittest  // finish records the server's end and its error once
 
 unittest  // an end reported after a local cancel is ignored
 {
-	auto s = new SubscriptionStream(() @trusted { return new shared bool(false); }());
+	auto s = new SubscriptionStream(new shared bool(false));
 	s.cancel();
 	s.finish(new McpException(-32603, "aborted"));
 	assert(s.ended && s.error is null);
@@ -193,13 +193,13 @@ package final class ListenGate
 	bool wait(Duration timeout) @safe
 	{
 		if (waiting_)
-			() @trusted {
+		{
 			try
 				event_.waitUninterruptible(timeout, emitCount_);
 			catch (Exception)
 			{
 			}
-		}();
+		}
 		waiting_ = false;
 		return established_;
 	}
@@ -207,7 +207,7 @@ package final class ListenGate
 
 unittest  // a SubscriptionStream handle reports and toggles its cancelled state
 {
-	auto cancelled = () @trusted { return new shared bool(false); }();
+	auto cancelled = new shared bool(false);
 	auto s = new SubscriptionStream(cancelled);
 	assert(!s.cancelled);
 	s.cancel();
@@ -225,7 +225,7 @@ unittest  // onCancel fires exactly once even when many threads call cancel() co
 	// Repeat to give the read-then-write race ample opportunity to surface.
 	foreach (iteration; 0 .. 500)
 	{
-		auto cancelled = () @trusted { return new shared bool(false); }();
+		auto cancelled = new shared bool(false);
 		shared int closes = 0;
 		auto s = new SubscriptionStream(cancelled, () @safe nothrow{
 			atomicOp!"+="(closes, 1);
@@ -261,7 +261,7 @@ unittest  // cleanups run exactly once when cancel() and finish() race across th
 
 	foreach (iteration; 0 .. 2000)
 	{
-		auto cancelled = () @trusted { return new shared bool(false); }();
+		auto cancelled = new shared bool(false);
 		shared int cleanups = 0;
 		auto s = new SubscriptionStream(cancelled);
 		s.addCleanup(() @safe nothrow{
@@ -293,7 +293,7 @@ unittest  // cleanups run exactly once when cancel() and finish() race across th
 
 unittest  // a transport onCancel (e.g. HTTP socket close) runs exactly once on first cancel
 {
-	auto cancelled = () @trusted { return new shared bool(false); }();
+	auto cancelled = new shared bool(false);
 	int closes;
 	auto s = new SubscriptionStream(cancelled, () @safe nothrow{ closes++; });
 	assert(closes == 0);

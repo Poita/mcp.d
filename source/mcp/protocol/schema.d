@@ -48,9 +48,7 @@ template EnumByNamePolicy(T) if (isSumType!T)
 		import vibe.data.json : JsonSerializer;
 		import vibe.data.serialization : serializeWithPolicy;
 
-		return v.match!(held => () @trusted {
-			return serializeWithPolicy!(JsonSerializer, EnumByNamePolicy)(held);
-		}());
+		return v.match!(held => serializeWithPolicy!(JsonSerializer, EnumByNamePolicy)(held));
 	}
 
 	static T fromRepresentation(Json j)
@@ -65,12 +63,8 @@ template EnumByNamePolicy(T) if (isSumType!T)
 		{
 			try
 			{
-				auto v = () @trusted {
-					return deserializeWithPolicy!(JsonSerializer, EnumByNamePolicy, V)(j);
-				}();
-				auto back = () @trusted {
-					return serializeWithPolicy!(JsonSerializer, EnumByNamePolicy)(v);
-				}();
+				auto v = deserializeWithPolicy!(JsonSerializer, EnumByNamePolicy, V)(j);
+				auto back = serializeWithPolicy!(JsonSerializer, EnumByNamePolicy)(v);
 				if (back.type == j.type)
 				{
 					if (j.type != Json.Type.object)
@@ -94,9 +88,7 @@ template EnumByNamePolicy(T) if (isSumType!T)
 		static foreach (V; TemplateArgsOf!T)
 		{
 			try
-				return T(() @trusted {
-					return deserializeWithPolicy!(JsonSerializer, EnumByNamePolicy, V)(j);
-				}());
+				return T(deserializeWithPolicy!(JsonSerializer, EnumByNamePolicy, V)(j));
 			catch (Exception)
 			{
 			}
@@ -130,11 +122,9 @@ unittest  // a SumType is written as the value it holds, at any depth
 		U[] us;
 	}
 
-	auto j = () @trusted {
-		return serializeWithPolicy!(JsonSerializer, EnumByNamePolicy)(S(U("a"), [
-			U(1), U("b")
-		]));
-	}();
+	auto j = serializeWithPolicy!(JsonSerializer, EnumByNamePolicy)(S(U("a"), [
+		U(1), U("b")
+	]));
 	assert(j["u"] == Json("a"), j.toString);
 	assert(j["us"] == Json([Json(1), Json("b")]), j.toString);
 }
@@ -146,9 +136,7 @@ unittest  // a SumType reads back as the member matching the JSON value's own ty
 	import vibe.data.serialization : deserializeWithPolicy;
 
 	alias N = SumType!(double, int);
-	auto n = () @trusted {
-		return deserializeWithPolicy!(JsonSerializer, EnumByNamePolicy, N)(Json(3));
-	}();
+	auto n = deserializeWithPolicy!(JsonSerializer, EnumByNamePolicy, N)(Json(3));
 	assert(n.has!int);
 }
 
@@ -170,10 +158,8 @@ unittest  // a SumType of structs reads an object as the member that keeps every
 	}
 
 	alias U = SumType!(A, B);
-	auto u = () @trusted {
-		return deserializeWithPolicy!(JsonSerializer, EnumByNamePolicy, U)(
-				parseJsonString(`{"x":1,"y":2}`));
-	}();
+	auto u = deserializeWithPolicy!(JsonSerializer, EnumByNamePolicy, U)(
+			parseJsonString(`{"x":1,"y":2}`));
 	assert(u.has!B);
 	assert(u.match!((B b) => b.y, (A a) => -1) == 2);
 }
@@ -196,10 +182,7 @@ unittest  // a SumType of structs prefers the member with no keys beyond the inp
 	}
 
 	alias U = SumType!(B, A);
-	auto u = () @trusted {
-		return deserializeWithPolicy!(JsonSerializer, EnumByNamePolicy, U)(
-				parseJsonString(`{"x":1}`));
-	}();
+	auto u = deserializeWithPolicy!(JsonSerializer, EnumByNamePolicy, U)(parseJsonString(`{"x":1}`));
 	assert(u.has!A);
 }
 

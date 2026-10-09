@@ -128,7 +128,7 @@ final class DuplexCoordinator
 		auto ec = w.evt.emitCount;
 		while (!w.done)
 		{
-			const newEc = () @trusted { return w.evt.wait(timeout, ec); }();
+			const newEc = w.evt.wait(timeout, ec);
 			if (newEc == ec && !w.done)
 				throw new RequestTimeoutException(
 						"Timed out awaiting peer response to request " ~ idStr(id));

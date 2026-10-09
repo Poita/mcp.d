@@ -584,7 +584,7 @@ version (unittest) private final class LineLink
 		while (queue.length == 0 && !closed)
 		{
 			auto ec = evt.emitCount;
-			() @trusted { evt.wait(ec); }();
+			evt.wait(ec);
 		}
 		if (queue.length == 0)
 			return null; // EOF
@@ -669,7 +669,7 @@ unittest  // two concurrent deliver() calls get their correct, distinct results 
 			});
 			auto ec = done.emitCount;
 			if (remaining > 0)
-				() @trusted { done.wait(ec); }();
+				done.wait(ec);
 		}
 		catch (Exception)
 		{
@@ -895,15 +895,15 @@ version (Posix) unittest  // an exception thrown by the onInbound notification h
 	import core.sys.posix.fcntl : fcntl, F_SETFL, O_NONBLOCK;
 
 	int[2] errPipe;
-	assert(() @trusted { return pipe(errPipe); }() == 0, "pipe() failed");
+	assert(pipe(errPipe) == 0, "pipe() failed");
 	scope (exit)
-		() @trusted { close(errPipe[0]); }();
+		close(errPipe[0]);
 
 	// Save the real stderr fd and redirect stderr to the write end of the pipe.
 	import std.stdio : stderr;
 
 	const stderrFd = () @trusted { return stderr.fileno(); }();
-	const savedStderrFd = () @trusted {
+	const savedStderrFd = () {
 		import core.sys.posix.unistd : dup;
 
 		return dup(stderrFd);
@@ -918,12 +918,12 @@ version (Posix) unittest  // an exception thrown by the onInbound notification h
 			close(savedStderrFd);
 		}();
 	}
-	() @trusted {
+	{
 		import core.sys.posix.unistd : dup2;
 
 		dup2(errPipe[1], stderrFd);
 		close(errPipe[1]);
-	}();
+	}
 
 	auto inbound = new LineLink;
 	int goodSeen;
