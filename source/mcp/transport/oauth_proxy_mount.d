@@ -1193,14 +1193,19 @@ in (exchange !is null)
 		}
 		// Branch on the OAuth grant the client requests. The proxy advertises both
 		// `authorization_code` and `refresh_token` in its AS metadata, so the /token
-		// endpoint MUST honour either: an authorization_code exchange (default, also
-		// when grant_type is omitted, for backward compatibility) and a
+		// endpoint MUST honour either: an authorization_code exchange and a
 		// refresh_token exchange (OAuth 2.1 §4.3), relaying the refresh token to the
-		// upstream token endpoint with the fixed upstream credentials. Any other
-		// grant is refused (RFC 6749 §5.2).
+		// upstream token endpoint with the fixed upstream credentials. grant_type
+		// is required (RFC 6749 §4.1.3); any other grant is refused (§5.2).
 		const grantType = formField(form, "grant_type");
+		if (grantType.length == 0)
+		{
+			res.statusCode = HTTPStatus.badRequest;
+			res.writeJsonBody(invalidRequestJson("grant_type is required"));
+			return;
+		}
 		const isRefresh = grantType == "refresh_token";
-		if (grantType.length && grantType != "authorization_code" && !isRefresh)
+		if (grantType != "authorization_code" && !isRefresh)
 		{
 			Json err = Json.emptyObject;
 			err["error"] = "unsupported_grant_type";
@@ -3935,6 +3940,30 @@ unittest  // an unknown grant_type is refused with unsupported_grant_type (RFC 6
 	const hit = browserPost(router, "https://mcp.example.com/token", form, "");
 	assert(hit.status == 400);
 	assert(hit.body_.canFind("unsupported_grant_type"));
+	assert(!upstreamCalled);
+}
+
+unittest  // a /token request with no grant_type is refused with invalid_request (RFC 6749 §4.1.3)
+{
+	import std.algorithm : canFind;
+	import std.array : replace;
+	import vibe.data.json : parseJsonString;
+
+	auto proxy = mountSampleProxy();
+	auto router = new URLRouter;
+	bool upstreamCalled;
+	mountOAuthToken(router, proxy, (string endpoint, string body_,
+			string authHeader, out string rb, out int status) @safe {
+		upstreamCalled = true;
+		rb = `{"access_token":"gho_upstream","token_type":"bearer"}`;
+		status = 200;
+	});
+
+	const form = redeemableCodeForm(proxy).replace("grant_type=authorization_code&", "");
+	assert(!form.canFind("grant_type"));
+	const hit = browserPost(router, "https://mcp.example.com/token", form, "");
+	assert(hit.status == 400);
+	assert(parseJsonString(hit.body_)["error"].get!string == "invalid_request");
 	assert(!upstreamCalled);
 }
 
