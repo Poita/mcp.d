@@ -131,7 +131,7 @@ int main(string[] args) @safe
 
 			// Run the receiver as a loopback HTTP listener the server can POST to.
 			HTTPListener listener;
-			() @trusted {
+			{
 				auto settings = new HTTPServerSettings;
 				settings.port = receiverPort;
 				settings.bindAddresses = ["127.0.0.1"];
@@ -152,9 +152,9 @@ int main(string[] args) @safe
 					res.statusCode = resp.status;
 					res.writeBody(resp.body, "application/json");
 				});
-			}();
+			}
 			scope (exit)
-				() @trusted { listener.stopListening(); }();
+				listener.stopListening();
 
 			// One managed call: subscribe, register the receiver under the
 			// server-derived id, and (when the grant expires) keep it refreshed.

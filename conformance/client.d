@@ -55,7 +55,7 @@ int main(string[] args)
 /// (dated revisions through 2025-11-25 use the stateful initialize handshake,
 /// 2026-07-28 is stateless with per-request `_meta`); `MCP_MODERN=1` forces it
 /// for ad-hoc runs outside the harness.
-private bool modernRequested() @trusted
+private bool modernRequested() @safe
 {
 	import std.process : environment;
 
@@ -357,11 +357,9 @@ private ElicitResult handleElicitation(ElicitParams params) @safe
 	if (schema.type == Json.Type.object && "properties" in schema)
 	{
 		auto props = schema["properties"];
-		() @trusted {
-			foreach (string key, Json prop; props)
-				if ("default" in prop)
-					content[key] = prop["default"];
-		}();
+		foreach (key, prop; props.byKeyValue)
+			if ("default" in prop)
+				content[key] = prop["default"];
 	}
 	return ElicitResult.accept(content);
 }
@@ -595,7 +593,7 @@ private TokenEndpointAuthMethod chooseAuthMethod(AuthorizationServerMetadata as_
 }
 
 /// Parse the `MCP_CONFORMANCE_CONTEXT` environment variable (scenario context).
-private Json readContext() @trusted
+private Json readContext() @safe
 {
 	import std.process : environment;
 	import vibe.data.json : parseJsonString;

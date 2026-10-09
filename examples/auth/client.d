@@ -142,7 +142,7 @@ string mintToken(string subject, string scope_, string audience) @safe
 /// response JSON. This stands in for the real AS so the happy path can drive the
 /// SDK's `OAuthClient.clientCredentials` acquisition surface end to end while
 /// staying offline.
-string startTokenEndpoint(string audience) @trusted
+string startTokenEndpoint(string audience) @safe
 {
 	auto router = new URLRouter;
 	router.post("/token", (scope HTTPServerRequest req, scope HTTPServerResponse res) {
@@ -186,17 +186,15 @@ int run() @safe
 	{
 		int status;
 		string wwwAuth;
-		() @trusted {
-			requestHTTP(serverUrl, (scope HTTPClientRequest req) {
-				req.method = HTTPMethod.POST;
-				req.headers["Content-Type"] = "application/json";
-				req.writeBody(cast(const(ubyte)[]) `{"jsonrpc":"2.0","id":1,"method":"ping"}`);
-			}, (scope HTTPClientResponse res) {
-				status = res.statusCode;
-				wwwAuth = res.headers.get("WWW-Authenticate", "");
-				res.bodyReader.readAllUTF8();
-			});
-		}();
+		requestHTTP(serverUrl, (scope HTTPClientRequest req) {
+			req.method = HTTPMethod.POST;
+			req.headers["Content-Type"] = "application/json";
+			req.writeBody(cast(const(ubyte)[]) `{"jsonrpc":"2.0","id":1,"method":"ping"}`);
+		}, (scope HTTPClientResponse res) {
+			status = res.statusCode;
+			wwwAuth = res.headers.get("WWW-Authenticate", "");
+			res.bodyReader.readAllUTF8();
+		});
 		checkEq(status, 401, "no-token POST status");
 		check(wwwAuth.indexOf("Bearer") >= 0, "challenge should be a Bearer scheme: " ~ wwwAuth);
 		check(wwwAuth.indexOf("resource_metadata=") >= 0,
@@ -227,14 +225,12 @@ int run() @safe
 	{
 		int status;
 		string body_;
-		() @trusted {
-			requestHTTP(baseOrigin ~ "/.well-known/oauth-protected-resource/mcp",
-					(scope HTTPClientRequest req) { req.method = HTTPMethod.GET; },
-					(scope HTTPClientResponse res) {
-				status = res.statusCode;
-				body_ = res.bodyReader.readAllUTF8();
-			});
-		}();
+		requestHTTP(baseOrigin ~ "/.well-known/oauth-protected-resource/mcp",
+				(scope HTTPClientRequest req) { req.method = HTTPMethod.GET; },
+				(scope HTTPClientResponse res) {
+			status = res.statusCode;
+			body_ = res.bodyReader.readAllUTF8();
+		});
 		checkEq(status, 200, "PRM document status");
 		auto prm = parseJsonString(body_);
 		checkEq(prm["resource"].get!string, serverUrl, "PRM resource (raw)");
@@ -341,18 +337,16 @@ int run() @safe
 		const tok = mintToken("user-42", "some:other", serverUrl);
 		int status;
 		string wwwAuth;
-		() @trusted {
-			requestHTTP(serverUrl, (scope HTTPClientRequest req) {
-				req.method = HTTPMethod.POST;
-				req.headers["Content-Type"] = "application/json";
-				req.headers["Authorization"] = "Bearer " ~ tok;
-				req.writeBody(cast(const(ubyte)[]) `{"jsonrpc":"2.0","id":1,"method":"ping"}`);
-			}, (scope HTTPClientResponse res) {
-				status = res.statusCode;
-				wwwAuth = res.headers.get("WWW-Authenticate", "");
-				res.bodyReader.readAllUTF8();
-			});
-		}();
+		requestHTTP(serverUrl, (scope HTTPClientRequest req) {
+			req.method = HTTPMethod.POST;
+			req.headers["Content-Type"] = "application/json";
+			req.headers["Authorization"] = "Bearer " ~ tok;
+			req.writeBody(cast(const(ubyte)[]) `{"jsonrpc":"2.0","id":1,"method":"ping"}`);
+		}, (scope HTTPClientResponse res) {
+			status = res.statusCode;
+			wwwAuth = res.headers.get("WWW-Authenticate", "");
+			res.bodyReader.readAllUTF8();
+		});
 		checkEq(status, 403, "missing-scope token status");
 		check(wwwAuth.indexOf(`error="insufficient_scope"`) >= 0,
 				"403 challenge should carry insufficient_scope: " ~ wwwAuth);

@@ -216,7 +216,7 @@ int run(string[] args) @safe
 	const deadline = MonoTime.currTime + 5000.msecs;
 	while (MonoTime.currTime < deadline && (updated == 0 || listChanged == 0))
 	{
-		() @trusted { yield(); }();
+		yield();
 		sleep(50.msecs);
 		// On stdio, notifications only drain while the client is reading a
 		// response, so issue a cheap request to pump the channel.

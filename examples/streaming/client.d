@@ -251,7 +251,7 @@ private void phaseErrorCode(McpClient client) @safe
 
 // --- Phase D: cancellation via stream disconnect (HTTP only) -----------------
 
-private int phaseCancellation(string url, int cancelledBefore) @trusted
+private int phaseCancellation(string url, int cancelledBefore) @safe
 {
 	auto client = McpClient.http(url);
 	// Modern mode: on Streamable HTTP the cancellation signal is the client
