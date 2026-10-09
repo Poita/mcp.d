@@ -2902,9 +2902,9 @@ private void handlePost(McpServer server, ServerPushChannel push,
 		}
 		// The handler tried to stream but this POST's Accept excludes
 		// text/event-stream, so the context refused the SSE upgrade (no body was
-		// written). Surface 406 Not Acceptable with the refusal as a JSON-RPC error,
-		// rather than the would-be SSE body the client declared it cannot read.
-		if (ctx.streamRefused)
+		// written). When the handler failed, surface 406 Not Acceptable with the
+		// error; a handler that recovered from the refusal answers normally.
+		if (ctx.streamRefused && "error" in j)
 		{
 			res.statusCode = HTTPStatus.notAcceptable;
 			res.writeBody(j.toString(), "application/json");
@@ -5379,6 +5379,63 @@ unittest  // a POST accepting only text/event-stream gets its non-streamed reply
 	assert(res.headers.get("Content-Type", "").canFind("text/event-stream"));
 	const body_ = () @trusted { return cast(string) sink.data.idup; }();
 	assert(body_.canFind("data: ") && body_.canFind(`"id":7`), body_);
+}
+
+version (unittest) private HTTPServerResponse callElicitingTool(bool catchRefusal,
+		out string responseBody) @safe
+{
+	import vibe.http.server : createTestHTTPServerResponse, TestHTTPResponseMode;
+	import vibe.stream.memory : createMemoryOutputStream;
+	import mcp.protocol.types : Tool, CallToolResult;
+	import mcp.server.responses : ToolResponse;
+
+	auto server = McpServer.stateful("t", "1");
+	Tool descriptor;
+	descriptor.name = "ask";
+	server.registerTool(descriptor, (Json args, RequestContext ctx) @safe {
+		if (catchRefusal)
+		{
+			try
+				ctx.elicitRaw(Json.emptyObject);
+			catch (Exception)
+			{
+			}
+		}
+		else
+			ctx.elicitRaw(Json.emptyObject);
+		CallToolResult r;
+		return ToolResponse.complete(r);
+	});
+	auto router = new URLRouter;
+	mountMcp(router, server);
+	const sid = initSession(router);
+	auto sink = createMemoryOutputStream();
+	auto res = createTestHTTPServerResponse(sink, null, TestHTTPResponseMode.bodyOnly);
+	router.handleRequest(sessionReq(HTTPMethod.POST, sid,
+			`{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"ask","arguments":{}}}`,
+			"application/json"), res);
+	responseBody = () @trusted { return cast(string) sink.data.idup; }();
+	return res;
+}
+
+unittest  // a handler that catches a refused SSE upgrade still answers 200 with its result
+{
+	import vibe.data.json : parseJsonString;
+
+	string reply;
+	auto res = callElicitingTool(true, reply);
+	assert(res.statusCode == HTTPStatus.ok, reply);
+	assert("result" in parseJsonString(reply), reply);
+}
+
+unittest  // a handler failing on a refused SSE upgrade answers 406 Not Acceptable
+{
+	import vibe.data.json : parseJsonString;
+
+	string reply;
+	auto res = callElicitingTool(false, reply);
+	assert(res.statusCode == HTTPStatus.notAcceptable, reply);
+	assert("error" in parseJsonString(reply), reply);
 }
 
 unittest  // an Accept range with q=0 excludes the media types it matches most specifically
