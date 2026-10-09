@@ -23,7 +23,7 @@ jobs:
       # if the working tree changed. The dfmt config lives in dfmt.json.
       - name: Check formatting (dfmt)
         run: |
-          dub run dfmt -- --inplace source/ conformance/
+          dub run dfmt -- --inplace source/ conformance/ examples/ bench/ deploy/ci-smoke/
           git diff --exit-code
 
   dscanner-lint:

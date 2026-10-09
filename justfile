@@ -26,9 +26,9 @@ build:
 test:
     ulimit -n 65536 && dub test
 
-# Format the source in place (source/ + conformance/, matching CI).
+# Format every D source tree in place (matching CI's format check).
 fmt:
-    ulimit -n 65536 && dub run dfmt -- --inplace source/ conformance/
+    ulimit -n 65536 && dub run dfmt -- --inplace source/ conformance/ examples/ bench/ deploy/ci-smoke/
 
 # Run CI's lint gates: D-Scanner (with documented filters) + README toolchain check.
 lint:

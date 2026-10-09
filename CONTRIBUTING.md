@@ -63,7 +63,7 @@ wraps these (and the conformance suites) as one-word recipes — each sets the
 just            # list all recipes
 just build      # dub build
 just test       # dub test
-just fmt        # dub run dfmt -- --inplace source/ conformance/
+just fmt        # dub run dfmt -- --inplace source/ conformance/ examples/ bench/ deploy/ci-smoke/
 just lint       # ./scripts/dscanner-lint.sh + ./scripts/check-readme-versions.sh
 just examples   # ./scripts/run-examples.sh (build + e2e-run every example)
 just docs       # ./scripts/gen-docs.sh (API docs into docs/)
@@ -77,7 +77,7 @@ just conformance-server-lane 2026-07-28   # one revision (likewise -client-lane)
 CI (`.github/workflows/ci.yml`) runs these jobs on every push and PR, and your
 change must pass all of them:
 
-1. **dfmt format check** — `dub run dfmt -- --inplace source/ conformance/`
+1. **dfmt format check** — `dub run dfmt -- --inplace source/ conformance/ examples/ bench/ deploy/ci-smoke/`
    followed by `git diff --exit-code` (dfmt has no `--check` flag, so the idiom
    is format-in-place then fail if the tree changed). Run dfmt before you commit.
 2. **dscanner lint** — `./scripts/dscanner-lint.sh` (the dub config lives in
