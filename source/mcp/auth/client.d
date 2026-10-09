@@ -385,7 +385,7 @@ final class OAuthClient
 		{
 			// Genuine pre-RFC-9728 server: no PRM document at all -> origin fallback.
 		}
-		return IssuerResolution(originOf(mcpEndpoint), false);
+		return IssuerResolution(urlOrigin(mcpEndpoint), false);
 	}
 
 	/// Convenience overload that discards the discovery-source signal.
@@ -393,18 +393,6 @@ final class OAuthClient
 	{
 		bool fromPrm;
 		return resolveIssuer(mcpEndpoint, fromPrm, wwwAuthenticateHeader);
-	}
-
-	private static string originOf(string url) @safe
-	{
-		import std.string : indexOf;
-
-		const schemeEnd = url.indexOf("://");
-		if (schemeEnd < 0)
-			return url;
-		const afterScheme = schemeEnd + 3;
-		const slash = url[afterScheme .. $].indexOf('/');
-		return (slash < 0) ? url : url[0 .. afterScheme + slash];
 	}
 
 	/// Register a client dynamically (RFC 7591) at the AS registration endpoint.
@@ -1095,6 +1083,20 @@ unittest  // resolveIssuerFrom downgrades to the origin only when the PRM docume
 	}, "https://mcp.example.com/sse");
 	assert(!r.fromProtectedResourceMetadata);
 	assert(r.issuer == "https://mcp.example.com");
+}
+
+unittest  // the origin fallback ends the authority at a query or fragment
+{
+	foreach (endpoint; [
+			"https://mcp.example.com?tenant=x", "https://mcp.example.com#frag"
+		])
+	{
+		const r = OAuthClient.resolveIssuerFrom(() @safe {
+			throw new PrmAbsentException("no PRM");
+			return ProtectedResourceMetadata.init;
+		}, endpoint);
+		assert(r.issuer == "https://mcp.example.com", r.issuer);
+	}
 }
 
 unittest  // resolveIssuerFrom does NOT silently downgrade on a fetch/security error — it propagates

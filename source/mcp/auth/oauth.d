@@ -363,6 +363,21 @@ private string[] stringArray(Json j, string key) @safe
 	return out_;
 }
 
+/// The `scheme://authority` prefix of `url`: everything before the first `/`,
+/// `?` or `#` after the scheme separator. A string without `://` is returned
+/// unchanged.
+package string urlOrigin(string url) @safe
+{
+	import std.string : indexOf, indexOfAny;
+
+	const schemeEnd = url.indexOf("://");
+	if (schemeEnd < 0)
+		return url;
+	const afterScheme = schemeEnd + 3;
+	const end = url[afterScheme .. $].indexOfAny("/?#");
+	return end < 0 ? url : url[0 .. afterScheme + end];
+}
+
 /// Build the ordered list of well-known protected-resource-metadata URLs to try
 /// for an MCP endpoint URL, per RFC 9728: the path-scoped URL first, then root.
 string[] protectedResourceMetadataUrls(string mcpEndpoint) @safe
@@ -370,14 +385,10 @@ string[] protectedResourceMetadataUrls(string mcpEndpoint) @safe
 	import std.algorithm : min;
 	import std.string : indexOf;
 
-	// Split scheme://host[/path]
-	auto schemeEnd = mcpEndpoint.indexOf("://");
-	if (schemeEnd < 0)
+	if (mcpEndpoint.indexOf("://") < 0)
 		return [mcpEndpoint];
-	const afterScheme = schemeEnd + 3;
-	const slash = mcpEndpoint[afterScheme .. $].indexOf('/');
-	string origin = (slash < 0) ? mcpEndpoint : mcpEndpoint[0 .. afterScheme + slash];
-	string path = (slash < 0) ? "" : mcpEndpoint[afterScheme + slash .. $];
+	const origin = urlOrigin(mcpEndpoint);
+	string path = mcpEndpoint[origin.length .. $];
 
 	// RFC 9728 uses scheme+host+path only; strip query string and fragment.
 	auto cut = path.length;
@@ -626,6 +637,23 @@ unittest  // protectedResourceMetadataUrls strips query string from path per RFC
 	assert(urls.length == 2);
 	assert(urls[0] == "https://api.example.com/.well-known/oauth-protected-resource/mcp");
 	assert(urls[1] == "https://api.example.com/.well-known/oauth-protected-resource");
+}
+
+unittest  // protectedResourceMetadataUrls ends the origin at a query or fragment with no path
+{
+	assert(protectedResourceMetadataUrls("https://h.example.com?tenant=x")
+			== ["https://h.example.com/.well-known/oauth-protected-resource"]);
+	assert(protectedResourceMetadataUrls("https://h.example.com#frag")
+			== ["https://h.example.com/.well-known/oauth-protected-resource"]);
+}
+
+unittest  // urlOrigin keeps scheme and authority only
+{
+	assert(urlOrigin("https://h.example.com:8443/a/b?q#f") == "https://h.example.com:8443");
+	assert(urlOrigin("https://h.example.com?tenant=x") == "https://h.example.com");
+	assert(urlOrigin("https://h.example.com#f") == "https://h.example.com");
+	assert(urlOrigin("https://h.example.com") == "https://h.example.com");
+	assert(urlOrigin("not-a-url") == "not-a-url");
 }
 
 unittest  // protectedResourceMetadataUrls strips fragment from path per RFC 9728
