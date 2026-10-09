@@ -4342,7 +4342,7 @@ version (unittest) private final class StallingSink : OutputStream
 @safe:
 	bool released;
 
-	size_t write(scope const(ubyte)[] bytes, IOMode) @trusted
+	size_t write(scope const(ubyte)[] bytes, IOMode) @safe
 	{
 		import core.time : MonoTime, msecs;
 		import vibe.core.core : sleep;
@@ -4367,7 +4367,7 @@ version (unittest) private final class SlowSink : OutputStream
 @safe:
 	size_t received;
 
-	size_t write(scope const(ubyte)[] bytes, IOMode) @trusted
+	size_t write(scope const(ubyte)[] bytes, IOMode) @safe
 	{
 		import core.time : msecs;
 		import vibe.core.core : sleep;
@@ -4466,7 +4466,7 @@ unittest  // a stalled SSE reader blocks neither notify nor other streams, and i
 version (unittest) private final class FailingSink : OutputStream
 {
 @safe:
-	size_t write(scope const(ubyte)[] bytes, IOMode) @trusted
+	size_t write(scope const(ubyte)[] bytes, IOMode) @safe
 	{
 		import core.time : msecs;
 		import vibe.core.core : sleep;
@@ -7301,7 +7301,7 @@ unittest  // legacy HTTP+SSE streams receive server notifications and answer ser
 	mountLegacyHttpSse(router, server, opts);
 
 	auto sse = createMemoryOutputStream();
-	string text() @trusted
+	string text() @safe
 	{
 		return cast(string) sse.data.idup;
 	}

@@ -258,7 +258,7 @@ string introspectionBody(IntrospectionConfig cfg, string token) @safe
 	return body_;
 }
 
-private string postIntrospect(IntrospectionConfig cfg, string token) @trusted
+private string postIntrospect(IntrospectionConfig cfg, string token) @safe
 {
 	import vibe.http.client : HTTPClientRequest, HTTPClientResponse;
 	import vibe.http.common : HTTPMethod;

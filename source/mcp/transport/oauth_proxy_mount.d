@@ -1493,7 +1493,7 @@ private string formField(string form, string name) @safe
 /// integrator overriding `/token` can reuse this for the SSRF-pinned upstream
 /// call.
 void exchangeUpstream(string endpoint, string body_, string authHeader,
-		out string responseBody, out int status, SsrfPolicy policy = SsrfPolicy.allowLoopback) @trusted
+		out string responseBody, out int status, SsrfPolicy policy = SsrfPolicy.allowLoopback) @safe
 {
 	import vibe.http.client : HTTPClientRequest, HTTPClientResponse;
 	import vibe.stream.operations : readAllUTF8;

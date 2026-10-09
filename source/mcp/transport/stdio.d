@@ -1660,7 +1660,7 @@ version (unittest) private final class ServerLink
 // asserts. `serveStdio` runs as its own task; `drive` as another; the loop exits
 // when `drive` returns and the server task is told to stop (closeInput).
 version (unittest) private void withServer(McpServer server,
-		scope void delegate(ServerLink) @safe drive, StdioOptions opts = StdioOptions.init) @trusted
+		scope void delegate(ServerLink) @safe drive, StdioOptions opts = StdioOptions.init) @safe
 {
 	auto link = new ServerLink;
 	runTask(() nothrow{

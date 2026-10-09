@@ -3831,7 +3831,7 @@ final class McpClient : ClientProtocol
 
 	/// Identity of the running task for `callTokens_` (its fiber; null outside
 	/// any fiber).
-	private static void* currentFiberKey() @trusted nothrow
+	private static void* currentFiberKey() @safe nothrow
 	{
 		import core.thread : Fiber;
 
@@ -5414,7 +5414,7 @@ unittest  // awaitTask gives up once ClientSettings.taskTimeout elapses
 	ClientSettings s;
 	s.taskTimeout = 30.msecs;
 	auto c = McpClient.http("http://localhost", s);
-	c.onTaskSleepForTest = (Duration d) @trusted { Thread.sleep(10.msecs); };
+	c.onTaskSleepForTest = (Duration d) @safe { Thread.sleep(10.msecs); };
 	c.onRpcForTest = (string method, Json params) @safe {
 		return Json(["taskId": Json("t1"), "status": Json("working")]);
 	};

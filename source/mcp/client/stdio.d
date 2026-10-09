@@ -998,7 +998,7 @@ version (unittest)
 
 // Run `body` inside a vibe task + event loop, exiting the loop when it returns,
 // and rethrow anything it threw so the calling test fails.
-version (unittest) private void inLoop(scope void delegate() @safe body) @trusted
+version (unittest) private void inLoop(scope void delegate() @safe body) @safe
 {
 	Exception failure;
 	runTask(() nothrow{
@@ -1488,7 +1488,7 @@ version (unittest) private final class TestLines
 
 // Run `body` inside a vibe task + event loop and return what it threw (empty
 // when it completed).
-version (unittest) private string inLoopCapturing(scope void delegate() @safe body) @trusted
+version (unittest) private string inLoopCapturing(scope void delegate() @safe body) @safe
 {
 	string failure;
 	runTask(() nothrow{

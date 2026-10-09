@@ -559,7 +559,7 @@ package bool jwkUsableForSig(Jwk jwk) @safe
 /// and EC P-256 (crv/x/y, RFC 7518), the key types RS256 and ES256 verify with.
 /// Returns null for unsupported keys and for key material that is not valid
 /// base64url, so one malformed key never invalidates the rest of a JWKS.
-package string jwkToPem(Jwk jwk) @trusted
+package string jwkToPem(Jwk jwk) @safe
 {
 	try
 	{
@@ -941,7 +941,7 @@ private enum size_t maxJwksBytes = 256 * 1024;
 
 /// Fetch a JWKS document over HTTP(S) under `policy`. Returns the body, or
 /// empty on failure (logged, since every token then fails verification).
-private string fetchJwks(string uri, SsrfPolicy policy) @trusted
+private string fetchJwks(string uri, SsrfPolicy policy) @safe
 {
 	import vibe.core.log : logWarn;
 	import vibe.http.client : HTTPClientRequest, HTTPClientResponse;

@@ -396,7 +396,7 @@ version (unittest)
 	// Serve one canned HTTP response per connection on a loopback port and run
 	// `client` against it inside the event loop. `respond` writes the response.
 	private void withLoopbackServer(void delegate(scope TCPConnection conn) @safe respond,
-			void delegate(ushort port) @safe client) @trusted
+			void delegate(ushort port) @safe client) @safe
 	{
 		import vibe.core.core : runTask, runEventLoop, exitEventLoop;
 		import vibe.core.net : listenTCP;

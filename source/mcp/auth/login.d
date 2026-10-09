@@ -2857,14 +2857,14 @@ version (unittest)
 		/// The PRM `scopes_supported`; empty omits it.
 		string[] prmScopes;
 
-		void stop() @trusted
+		void stop() @safe
 		{
 			listener.stopListening();
 		}
 	}
 
 	/// ditto
-	private IssuerTestAuthServer startIssuerTestAuthServer() @trusted
+	private IssuerTestAuthServer startIssuerTestAuthServer() @safe
 	{
 		import std.algorithm : canFind;
 		import std.conv : to;
@@ -3860,14 +3860,14 @@ version (unittest)
 		string accepted;
 		string[] toolsAuth;
 
-		void stop() @trusted
+		void stop() @safe
 		{
 			listener.stopListening();
 		}
 	}
 
 	/// ditto
-	private RejectingMcpServer startRejectingMcpServer(string accepted) @trusted
+	private RejectingMcpServer startRejectingMcpServer(string accepted) @safe
 	{
 		import std.conv : to;
 		import vibe.http.server : HTTPServerRequest, HTTPServerResponse,

@@ -660,7 +660,7 @@ private string joinPath(string a, string b) @safe pure
 	return a.length && a[$ - 1] == '/' ? a ~ b : a ~ "/" ~ b;
 }
 
-private bool pathExists(string p) @trusted
+private bool pathExists(string p) @safe
 {
 	import std.file : exists;
 
@@ -668,14 +668,14 @@ private bool pathExists(string p) @trusted
 }
 
 /// Whether `p` is itself a regular file: a symlink, even to one, is not.
-private bool isPlainFile(string p) @trusted
+private bool isPlainFile(string p) @safe
 {
 	import std.file : attrIsFile, getLinkAttributes;
 
 	return attrIsFile(getLinkAttributes(p));
 }
 
-private bool pathIsDir(string p) @trusted
+private bool pathIsDir(string p) @safe
 {
 	import std.file : exists, isDir;
 
@@ -703,7 +703,7 @@ private immutable(ubyte)[] readBytes(string p) @trusted
 	return cast(immutable(ubyte)[]) read(p);
 }
 
-private ulong fileSize(string p) @trusted
+private ulong fileSize(string p) @safe
 {
 	import std.file : getSize;
 
@@ -736,7 +736,7 @@ version (unittest)
 
 	// A throwaway skill directory: SKILL.md with authored frontmatter (mixed
 	// scalar types) plus one supporting file in a subdirectory.
-	private void writeSkillFixture(string root) @trusted
+	private void writeSkillFixture(string root) @safe
 	{
 		import std.file : mkdirRecurse, write, rmdirRecurse, exists;
 
@@ -749,14 +749,14 @@ version (unittest)
 		write(root ~ "/references/FORMS.md", "# Form Fields\n- applicant_name\n");
 	}
 
-	private void writeFile(string path, string content) @trusted
+	private void writeFile(string path, string content) @safe
 	{
 		import std.file : write;
 
 		write(path, content);
 	}
 
-	private void writeNestedDir(string path) @trusted
+	private void writeNestedDir(string path) @safe
 	{
 		import std.file : mkdirRecurse;
 
@@ -764,7 +764,7 @@ version (unittest)
 	}
 
 	// A skill directory with a single, caller-supplied SKILL.md and no other files.
-	private void writeRawSkill(string root, string skillMd) @trusted
+	private void writeRawSkill(string root, string skillMd) @safe
 	{
 		import std.file : mkdirRecurse, write, rmdirRecurse, exists;
 
@@ -775,7 +775,7 @@ version (unittest)
 	}
 
 	// Removes a `tmpRoot` skill directory together with its per-test parent.
-	private void removeTree(string root) @trusted
+	private void removeTree(string root) @safe
 	{
 		import std.file : rmdirRecurse, exists;
 		import std.path : dirName;
@@ -786,7 +786,7 @@ version (unittest)
 
 	// A skill directory named `name` (the Agent Skills convention requires it to
 	// match the frontmatter name) inside a per-test temporary parent.
-	private string tmpRoot(string suffix, string name) @trusted
+	private string tmpRoot(string suffix, string name) @safe
 	{
 		import std.path : buildPath;
 		import std.file : tempDir;
@@ -943,7 +943,7 @@ version (unittest)
 {
 	// A skill directory containing a nested skill two levels down, plus an
 	// ordinary supporting file at each level.
-	private void writeNestedFixture(string root) @trusted
+	private void writeNestedFixture(string root) @safe
 	{
 		import std.file : mkdirRecurse, write, rmdirRecurse, exists;
 
@@ -1215,7 +1215,7 @@ unittest  // an include filter opts dot-prefixed paths back in
 	], manifestPaths(s).text);
 }
 
-version (unittest) version (Posix) private void makeSymlink(string target, string link) @trusted
+version (unittest) version (Posix) private void makeSymlink(string target, string link) @safe
 {
 	import std.file : symlink;
 
@@ -1635,7 +1635,7 @@ unittest  // parseSkillFrontmatter still resolves a modest alias
 	assert(fm["again"].get!string == "hi", fm.toString);
 }
 
-version (unittest) private void writeSkillBytes(string root, const(ubyte)[] bytes) @trusted
+version (unittest) private void writeSkillBytes(string root, const(ubyte)[] bytes) @safe
 {
 	import std.file : exists, mkdirRecurse, rmdirRecurse, write;
 

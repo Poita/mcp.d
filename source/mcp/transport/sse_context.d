@@ -2632,7 +2632,7 @@ package(mcp) enum Duration sseStallTimeout = 2.seconds;
 /// stopped reading fails at once. vibe.d exposes no public close for a server
 /// response, so its private raw-connection field is located by name; a test
 /// response has none, and then nothing happens.
-package(mcp) void closeRawConnection(HTTPServerResponse res) @trusted nothrow
+package(mcp) void closeRawConnection(HTTPServerResponse res) @safe nothrow
 {
 	foreach (i, ref field; res.tupleof)
 	{
@@ -2657,7 +2657,7 @@ package(mcp) void closeRawConnection(HTTPServerResponse res) @trusted nothrow
 /// the connection for the next reader, and an end-of-stream means the client
 /// is gone. A response without a TCP connection (a test response) reports
 /// `res.connected`.
-package(mcp) bool clientConnected(HTTPServerResponse res) @trusted nothrow
+package(mcp) bool clientConnected(HTTPServerResponse res) @safe nothrow
 {
 	import vibe.core.net : TCPConnection, WaitForDataStatus;
 

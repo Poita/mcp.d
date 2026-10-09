@@ -795,7 +795,7 @@ private struct Resolution
 
 /// Resolve `host` with the system resolver (`getaddrinfo`), keeping every
 /// IPv4/IPv6 address. Blocks the calling thread.
-private Resolution systemResolve(string host) @trusted nothrow
+private Resolution systemResolve(string host) @safe nothrow
 {
 	import std.socket : getAddressInfo, AddressFamily;
 
@@ -1629,7 +1629,7 @@ unittest  // classifyHost resolves a name without stalling other tasks on the ev
 	import core.time : msecs;
 	import vibe.core.core : runTask, sleep;
 
-	static Resolution slowResolve(string host) @trusted nothrow
+	static Resolution slowResolve(string host) @safe nothrow
 	{
 		Thread.sleep(300.msecs);
 		return Resolution(["93.184.216.34"], false);
@@ -2032,7 +2032,7 @@ MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgyac0Dphvj23tfCMC
 `;
 
 	/// Write `pem` to a fresh temporary file and return its path.
-	package(mcp) string writeTestPemFile(string pem) @trusted
+	package(mcp) string writeTestPemFile(string pem) @safe
 	{
 		import std.conv : to;
 		import std.file : tempDir, write;
@@ -2046,7 +2046,7 @@ MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgyac0Dphvj23tfCMC
 
 	/// Listen for HTTPS on an ephemeral `127.0.0.1` port presenting the
 	/// self-signed test certificate, answering every request with 200 "ok".
-	package(mcp) HTTPListener startSelfSignedTlsServer() @trusted
+	package(mcp) HTTPListener startSelfSignedTlsServer() @safe
 	{
 		import vibe.http.server : HTTPServerRequest, HTTPServerResponse,
 			HTTPServerSettings, listenHTTP;

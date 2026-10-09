@@ -117,7 +117,7 @@ private final class ListenSocketSlot
 
 	/// Record the connected socket. If a cancel already arrived (`closeSocket`
 	/// ran before the task connected), close immediately.
-	void attach(TCPConnection s) @trusted nothrow
+	void attach(TCPConnection s) @safe nothrow
 	{
 		if (closed)
 		{
@@ -136,7 +136,7 @@ private final class ListenSocketSlot
 
 	/// Force-close the socket (idempotent). Safe to call before `attach`: it sets
 	/// a flag so the subsequent `attach` closes the socket on arrival.
-	void closeSocket() @trusted nothrow
+	void closeSocket() @safe nothrow
 	{
 		closed = true;
 		if (open)
@@ -152,7 +152,7 @@ private final class ListenSocketSlot
 
 	/// Close the attached socket but keep the slot open for the stream's next
 	/// connection; a cancel that already arrived still closes that one on `attach`.
-	void detach() @trusted nothrow
+	void detach() @safe nothrow
 	{
 		if (open)
 		{
@@ -569,7 +569,7 @@ final class HttpClientTransport : ClientTransport
 	/// The client TLS context for this transport's https connections: it
 	/// requires a server certificate chaining to a trusted CA and matching the
 	/// endpoint host name, unless `tlsTrust` disables verification.
-	private TLSContext tlsContext() @trusted
+	private TLSContext tlsContext() @safe
 	{
 		import mcp.protocol.ssrf : tlsContextSetup;
 
@@ -1039,7 +1039,7 @@ final class HttpClientTransport : ClientTransport
 	/// `McpException` so an exhausted local ephemeral-port range surfaces as a clear
 	/// error instead of parking the calling fiber forever. Any other connect failure
 	/// (e.g. connection refused) is rethrown unchanged for the caller's own handling.
-	private TCPConnection connectTimed(string host, ushort port) @trusted
+	private TCPConnection connectTimed(string host, ushort port) @safe
 	{
 		import std.algorithm : canFind;
 		import std.conv : to;
@@ -1196,7 +1196,7 @@ final class HttpClientTransport : ClientTransport
 
 	/// Parse the numeric status code out of an HTTP status line
 	/// (`HTTP/1.1 200 OK` -> 200). Returns 0 when it cannot be parsed.
-	private static int parseHttpStatus(string statusLine) @trusted
+	private static int parseHttpStatus(string statusLine) @safe
 	{
 		import std.string : split, strip;
 		import std.conv : to;
@@ -1215,7 +1215,7 @@ final class HttpClientTransport : ClientTransport
 	/// Read the response header block from `conn` (up to the blank line),
 	/// returning each header line with its trailing CR stripped. Each line is
 	/// bounded by `maxHeaderLineBytes` and the block by `maxHeaderBlockBytes`.
-	private static string[] readHeaderLines(Conn)(Conn conn) @trusted
+	private static string[] readHeaderLines(Conn)(Conn conn) @safe
 	{
 		import vibe.stream.operations : readLine;
 		import std.conv : to;
@@ -1246,7 +1246,7 @@ final class HttpClientTransport : ClientTransport
 	/// single chunk-framing primitive shared by `readRemaining` and `readSseBody`,
 	/// so size parsing and trailing-CRLF consumption live in exactly one place.
 	/// A chunk declaring more than `maxBytes` fails before anything is allocated.
-	private static bool readChunk(Conn)(Conn conn, size_t maxBytes, out string data) @trusted
+	private static bool readChunk(Conn)(Conn conn, size_t maxBytes, out string data) @safe
 	{
 		import vibe.stream.operations : readLine;
 		import vibe.core.stream : IOMode;
@@ -1290,7 +1290,7 @@ final class HttpClientTransport : ClientTransport
 	/// chunked transfer-encoding when `chunked` is true. Used for the small
 	/// non-streaming JSON body and the 4xx legacy-fallback body. A body longer than
 	/// `maxBytes` fails with an `McpException`.
-	private static string readRemaining(Conn)(Conn conn, bool chunked, size_t maxBytes) @trusted
+	private static string readRemaining(Conn)(Conn conn, bool chunked, size_t maxBytes) @safe
 	{
 		import vibe.core.stream : IOMode;
 
@@ -1576,7 +1576,7 @@ final class HttpClientTransport : ClientTransport
 
 	/// Read the status line and header block of a raw HTTP response from `conn`.
 	/// Must run inside a `@trusted` block (raw socket I/O).
-	private static ResponseHead readResponseHead(Conn)(Conn conn) @trusted
+	private static ResponseHead readResponseHead(Conn)(Conn conn) @safe
 	{
 		import vibe.stream.operations : readLine;
 
@@ -1605,7 +1605,7 @@ final class HttpClientTransport : ClientTransport
 	/// returns true. Must run inside a `@trusted` block (raw socket I/O).
 	private void readSseBody(Conn)(Conn conn, bool chunked, ref SseCursor cursor,
 			scope bool delegate() @safe shouldStop,
-			scope void delegate(string eventType, string data) @safe onEvent) @trusted
+			scope void delegate(string eventType, string data) @safe onEvent) @safe
 	{
 		import vibe.core.stream : IOMode;
 		import std.string : indexOfAny, startsWith, strip;
@@ -2596,7 +2596,7 @@ private final class ClientStream : ProxyStream
 		this.socketLayer = socketLayer;
 	}
 
-	void release() @trusted nothrow
+	void release() @safe nothrow
 	{
 		try
 		{
@@ -2615,7 +2615,7 @@ private final class ClientStream : ProxyStream
 /// request path shares one TLS-handling site. `host` is the TLS peer name the
 /// server certificate is validated against under `ctx`. `conn` must outlive
 /// the returned stream.
-private ClientStream openClientStream(TCPConnection conn, TLSContext ctx, string host) @trusted
+private ClientStream openClientStream(TCPConnection conn, TLSContext ctx, string host) @safe
 {
 	if (ctx !is null)
 	{
@@ -3885,7 +3885,7 @@ unittest  // readSseBody handles a partial IOMode.once read without appending ze
 
 		// read with IOMode.once delivers at most half the bytes to simulate a partial
 		// TCP read; IOMode.all delivers everything requested (required for readLine).
-		size_t read(scope ubyte[] dst, IOMode mode) @trusted
+		size_t read(scope ubyte[] dst, IOMode mode) @safe
 		{
 			if (pos >= data.length)
 				return 0;

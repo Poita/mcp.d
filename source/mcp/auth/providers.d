@@ -385,7 +385,7 @@ package alias ProviderHttp = ProviderHttpResponse delegate(ProviderHttpRequest) 
 /// Upper bound on a provider verifier response body.
 private enum size_t maxProviderResponseBytes = 64 * 1024;
 
-private ProviderHttpResponse providerHttp(ProviderHttpRequest r) @trusted
+private ProviderHttpResponse providerHttp(ProviderHttpRequest r) @safe
 {
 	import vibe.http.client : HTTPClientRequest, HTTPClientResponse;
 	import vibe.http.common : HTTPMethod;
