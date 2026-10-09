@@ -660,9 +660,16 @@ version (Posix) StdioClientTransport spawnStdioTransport(string[] args,
 	{
 		// Checked before each read so `stopReadLoop` also ends a loop skipping a
 		// flood the pipe never runs dry of.
+		import vibe.core.core : yield;
+
 		if (stopping() || ()@trusted { return pipes.stdout.empty; }())
 			return 0;
-		return () @trusted { return pipes.stdout.read(dst, IOMode.once); }();
+		const n = () @trusted { return pipes.stdout.read(dst, IOMode.once); }();
+		// A read of buffered data completes without suspending, so a child that
+		// keeps the pipe full would otherwise hold the event loop; yielding lets
+		// other tasks (including the shutdown sequence) run between chunks.
+		yield();
+		return n;
 	}
 
 	string readLine() @safe
@@ -1274,8 +1281,10 @@ version (Posix) unittest  // an over-long newline-less stream is reported and sk
 		// The child floods stdout with newline-less bytes. With a small
 		// maxLineBytes the reader reports the line once it passes the bound and
 		// then skips its bytes rather than accumulating them without limit.
+		// One exec'd process, so terminating the child ends the flood; a shell
+		// pipeline would leave its stages writing to the pipe.
 		auto transport = spawnStdioTransport([
-			"sh", "-c", "yes A | tr -d \"\\n\""
+			"sh", "-c", "exec tr '\\000' A < /dev/zero"
 		], 4096);
 		transport.chan().onError = (string m) @safe nothrow{ reported ~= m; };
 		auto sw = StopWatch(AutoStart.yes);
