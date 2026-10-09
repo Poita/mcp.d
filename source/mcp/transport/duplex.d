@@ -57,11 +57,13 @@ final class DuplexChannel
 	// keyed by request id, so `abort` can withdraw one.
 	private PendingWrite[long] pendingWrites_;
 	private bool closed_;
+	// Set by `close`: nothing more is written.
+	private bool shut_;
 	// How many lines are being written right now (0 or 1: writes are serialized).
 	private size_t writing_;
 	private Task readTask_;
-	// Set by `stopReadLoop`: the read loop exits at its next iteration and a read
-	// it was interrupted out of is not reported as a failure.
+	// Set by `stopReadLoop` and `close`: the read loop exits at its next
+	// iteration and a read it was interrupted out of is not reported as a failure.
 	private bool stopping_;
 
 	/// Receives a description of each failure the read loop survives or ends on
@@ -155,7 +157,7 @@ final class DuplexChannel
 		return true;
 	}
 
-	/// Whether `stopReadLoop` is ending the read loop. A `readLine` that keeps
+	/// Whether `stopReadLoop` or `close` is ending the read loop. A `readLine` that keeps
 	/// consuming input without completing a line (a peer flooding an over-long
 	/// one) checks it to give up and return null.
 	bool stopping() const @safe nothrow
@@ -430,7 +432,7 @@ final class DuplexChannel
 	/// has closed.
 	void post(Json message) @safe nothrow
 	{
-		if (closed_)
+		if (shut_)
 			return;
 		runTask((Json msg) nothrow{
 			try
@@ -449,12 +451,17 @@ final class DuplexChannel
 	}
 
 	/// Write `text` under the writer lock, unless `write` was abandoned while it
-	/// waited for the lock.
+	/// waited for the lock. Throws once `close` has been called, including for a
+	/// line that was waiting for the lock then.
 	private void writeLine(string text, PendingWrite write) @safe
 	{
+		if (shut_)
+			throw internalError("stdio channel closed");
 		writeMutex.lock();
 		scope (exit)
 			writeMutex.unlock();
+		if (shut_)
+			throw internalError("stdio channel closed");
 		if (write !is null)
 		{
 			if (write.abandoned)
@@ -480,13 +487,16 @@ final class DuplexChannel
 
 	/// Close the channel. Marks it closed and fails every still-pending request so
 	/// awaiting callers are released immediately instead of waiting out their
-	/// timeout; any request issued after this point also fails fast. The owning
-	/// transport still closes the underlying byte stream to stop the read loop;
-	/// `close` is idempotent and the read loop's own EOF path is equivalent.
+	/// timeout; any request issued after this point also fails fast, and every
+	/// send throws. The read loop ends without dispatching another line: it exits
+	/// once its pending read returns (the owning transport ends that read by
+	/// closing the byte stream, or with `stopReadLoop`). `close` is idempotent.
 	void close() @safe
 	{
-		if (closed_)
+		if (shut_)
 			return;
+		shut_ = true;
+		stopping_ = true;
 		closed_ = true;
 		coord.failPending(internalError("stdio channel closed"));
 	}
@@ -1496,4 +1506,65 @@ unittest  // request() times out on schedule while its line is stalled on a peer
 	runEventLoop();
 	assert(timedOut);
 	assert(took < 1.seconds, "a stalled write must not hold request() past its timeout");
+}
+
+unittest  // close() ends the read loop: a line arriving afterwards is not dispatched
+{
+	auto inbound = new LineLink;
+	int dispatched;
+	bool loopRunning = true;
+	runTask(() nothrow{
+		scope (exit)
+			exitEventLoop();
+		try
+		{
+			auto channel = new DuplexChannel(() @safe { return inbound.take(); }, (string) @safe {
+			}, (Message) @safe { dispatched++; });
+			channel.start();
+			yield();
+			channel.close();
+			inbound.put(`{"jsonrpc":"2.0","method":"notifications/x"}`);
+			foreach (_; 0 .. 8)
+				yield();
+			loopRunning = channel.readLoopRunning;
+			inbound.closeEnd();
+		}
+		catch (Exception)
+		{
+		}
+	});
+	runEventLoop();
+	assert(dispatched == 0, "a closed channel must not dispatch inbound lines");
+	assert(!loopRunning, "close() must end the read loop");
+}
+
+unittest  // send() and sendRaw() on a closed channel throw instead of writing
+{
+	string[] written;
+	int threw;
+	runTask(() nothrow{
+		scope (exit)
+			exitEventLoop();
+		try
+		{
+			auto channel = new DuplexChannel(() @safe => cast(string) null, (string s) @safe {
+				written ~= s;
+			}, (Message) @safe {});
+			channel.close();
+			try
+				channel.send(Json.emptyObject);
+			catch (McpException)
+				threw++;
+			try
+				channel.sendRaw("{}");
+			catch (McpException)
+				threw++;
+		}
+		catch (Exception)
+		{
+		}
+	});
+	runEventLoop();
+	assert(threw == 2, "sends on a closed channel must throw");
+	assert(written.length == 0, "a closed channel must write nothing");
 }
