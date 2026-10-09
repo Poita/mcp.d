@@ -3137,13 +3137,15 @@ final class EventsRuntime
 	// Run a type's check function and stamp the identity fields it left empty on
 	// each returned event: poll clients dedup on `eventId`, and the webhook outbox
 	// keys each delivery job on it, so id-less events would otherwise collapse
-	// into one job.
+	// into one job. An event with no position of its own, fetched from no
+	// position, cannot be re-fetched, so it gets a random id: deriving one would
+	// collide with a later identical event and dedup it away.
 	private EventResult runCheck(ref EventRegistration reg, EventContext ctx) @safe
 	{
 		auto er = reg.check(ctx);
 		foreach (i, ref occ; er.events)
 		{
-			if (occ.eventId.length == 0)
+			if (occ.eventId.length == 0 && !(occ.cursor.isNull && ctx.cursor.isNull))
 				occ.eventId = derivedEventId(reg.descriptor.name, ctx.cursor, i, occ);
 			stamp(occ);
 		}
@@ -3152,9 +3154,11 @@ final class EventsRuntime
 
 	// The id of a check-returned event its author left without one, derived from
 	// what places it in the check's output — its own position when it carries
-	// one, else the position fetched from and its index in the batch — plus its
-	// timestamp and payload. A re-fetch of the same batch (a client replaying
-	// after a crash, a webhook re-poll) yields the same id, so it dedups.
+	// one, else the position fetched from and its index in the batch — plus the
+	// author's timestamp and payload. A re-fetch of the same batch (a client
+	// replaying after a crash, a webhook re-poll) yields the same id, so it
+	// dedups; a server-stamped timestamp would differ per fetch, so the id is
+	// derived before stamping.
 	private static string derivedEventId(string name, Nullable!string from,
 			size_t index, ref EventOccurrence occ) @safe
 	{
@@ -3164,7 +3168,7 @@ final class EventsRuntime
 		if (!occ.cursor.isNull)
 			key ~= "at\0" ~ occ.cursor.get;
 		else
-			key ~= (from.isNull ? "boot\0" : "from\0" ~ from.get) ~ "\0" ~ index.to!string;
+			key ~= "from\0" ~ from.get ~ "\0" ~ index.to!string;
 		key ~= "\0" ~ occ.timestamp ~ "\0" ~ canonicalJsonString(occ.data);
 		return "evt_" ~ sha256Hex(key)[0 .. 32];
 	}
@@ -8413,6 +8417,30 @@ unittest  // an onFetch event with no eventId gets the same id each time it is r
 		assert(first.events[i].eventId == replay.events[i].eventId);
 	assert(first.events[0].eventId != first.events[1].eventId);
 	assert(first.events[1].eventId != first.events[2].eventId);
+}
+
+unittest  // a no-replay check's identical id-less events get distinct ids across polls
+{
+	auto rt = testRuntime();
+	EventRegistration reg;
+	reg.descriptor.name = "tick";
+	reg.check = (EventContext ctx) @safe {
+		EventOccurrence a;
+		a.name = "tick";
+		a.data = Json(["n": Json(1)]);
+		return EventResult.noReplay([a]);
+	};
+	rt.register(reg);
+	PollResult fetch() @safe
+	{
+		return rt.poll("tick", Json.emptyObject, "", Nullable!string.init,
+				Nullable!long.init, Nullable!long.init);
+	}
+
+	auto first = fetch();
+	auto second = fetch();
+	assert(first.events.length == 1 && second.events.length == 1);
+	assert(first.events[0].eventId != second.events[0].eventId);
 }
 
 unittest  // a dead-lettered delivery is logged and owed a gap
