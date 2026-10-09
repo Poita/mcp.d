@@ -2425,9 +2425,9 @@ final class McpServer : ServerCore
 		// request, and the cancellation token, regardless of which transport
 		// supplied the base context.
 		auto scoped = new RequestScope(ctx, mrtr, inputResponses,
-				requestLogLevel, loggingRequested, token,
-				incomingState, effective, effective.isModern
-				? meta.clientCapabilities : conn.clientCaps);
+				requestLogLevel, loggingRequested, token, incomingState,
+				effective, effective.isModern
+				? meta.clientCapabilities : conn.clientCaps, mode_ == ServerMode.stateless);
 
 		try
 		{
@@ -11035,7 +11035,7 @@ unittest  // elicit() is rejected on a modern (2026-07-28) request
 
 unittest  // 2025-era request: ctx.elicit() blocks and the handler completes
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateful("t", "1");
 	registerBookTool(s);
 	Json p = Json.emptyObject;
 	auto resp = s.handle(req(4, "tools/call", buildName(p, "book")), new FakeCtx).get;

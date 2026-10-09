@@ -99,6 +99,26 @@ ConnectionState connectionStateOf(RequestContext ctx) @safe
 	return null;
 }
 
+/// The message every server->client request (elicitation / sampling / roots)
+/// fails with on a stateless server, which keeps no per-peer channel to carry it.
+enum string statelessServerRequestError = "server-initiated requests"
+	~ " (elicitation/sampling/roots) require a stateful server; construct with McpServer.stateful()";
+
+/// Refuse `what` (`sample`, `elicit`, ...) when this request has no
+/// server->client channel: on a stateless (MRTR) request, or on a legacy request
+/// dispatched by a stateless server. Checked before the client's capabilities so
+/// the error names the server-side remedy rather than a client shortcoming.
+private void requireServerChannel(RequestContext ctx, string what) @safe
+{
+	if (ctx.usesInputRequired)
+		throw internalError(what ~ "() is unavailable on a stateless (MRTR) request;"
+				~ " return ToolResponse.inputRequired instead, or construct the server with"
+				~ " McpServer.stateful() for a blocking server->client round-trip");
+	if (auto s = cast(RequestScope) ctx)
+		if (s.serverStateless)
+			throw internalError(statelessServerRequestError);
+}
+
 /// Per-request context handed to tool handlers. It is the channel through which
 /// a handler emits server->client traffic while a request is in flight:
 /// progress + logging notifications, and (blocking) sampling / elicitation
@@ -201,10 +221,7 @@ interface RequestContext
 	/// instead — or if the client does not support sampling.
 	final Json sample(Json params) @safe
 	{
-		if (usesInputRequired)
-			throw internalError("sample() is unavailable on a stateless (MRTR) request;"
-					~ " return ToolResponse.inputRequired instead, or construct the server with"
-					~ " McpServer.stateful() for a blocking server->client round-trip");
+		requireServerChannel(this, "sample");
 		if (!clientSupports(ClientCapability.sampling))
 			throw missingClientCapability(ClientCapability.sampling,
 					"Client does not support sampling");
@@ -252,10 +269,7 @@ interface RequestContext
 	/// `.action`; read collected values via `.content` or `.contentAs!T`).
 	final ElicitResult elicit(string message, Json requestedSchema) @safe
 	{
-		if (usesInputRequired)
-			throw internalError("elicit() is unavailable on a stateless (MRTR) request;"
-					~ " return ToolResponse.inputRequired instead, or construct the server with"
-					~ " McpServer.stateful() for a blocking server->client round-trip");
+		requireServerChannel(this, "elicit");
 		// Per client/elicitation: servers MUST NOT send elicitation requests
 		// with modes the client does not support. A bare `elicitation:{}` is
 		// form-only, so a generic declaration already sets the form submode.
@@ -298,10 +312,7 @@ interface RequestContext
 	/// contain a valid URL).
 	final ElicitResult elicitUrl(string message, string url, string elicitationId) @safe
 	{
-		if (usesInputRequired)
-			throw internalError("elicitUrl() is unavailable on a stateless (MRTR) request;"
-					~ " return ToolResponse.inputRequired instead, or construct the server with"
-					~ " McpServer.stateful() for a blocking server->client round-trip");
+		requireServerChannel(this, "elicitUrl");
 		// Per client/elicitation: servers MUST NOT send a url-mode request to a
 		// client that only declared form mode (e.g. a bare `elicitation:{}`).
 		if (!clientSupports(ClientCapability.elicitationUrl))
@@ -329,10 +340,7 @@ interface RequestContext
 	/// channel on the stateless protocol; use `ToolResponse.inputRequired` instead.
 	final ListRootsResult listRoots() @safe
 	{
-		if (usesInputRequired)
-			throw internalError("listRoots() is unavailable on a stateless (MRTR) request;"
-					~ " return ToolResponse.inputRequired instead, or construct the server with"
-					~ " McpServer.stateful() for a blocking server->client round-trip");
+		requireServerChannel(this, "listRoots");
 		if (!clientSupports(ClientCapability.roots))
 			throw missingClientCapability(ClientCapability.roots, "Client does not support roots");
 		return ListRootsResult.fromJson(listRootsRaw());
@@ -612,7 +620,7 @@ final class StdioContext : RequestContext
 		// `McpServer.stateful()`; on the modern stateless protocol, return
 		// `ToolResponse.inputRequired` (MRTR) instead.
 		if (serverStateless_)
-			throw internalError("server-initiated requests (elicitation/sampling/roots) require a stateful server; construct with McpServer.stateful()");
+			throw internalError(statelessServerRequestError);
 		if (serverRequestFn is null)
 			throw internalError("The stdio transport has no server-to-client request channel");
 		return serverRequestFn(method, params);
@@ -700,13 +708,18 @@ final class RequestScope : RequestContext, ConnectionScoped
 	private CancellationToken cancellation;
 	private ProtocolVersion effectiveVersion_;
 	private ClientCapabilities clientCaps_;
+	private bool serverStateless_;
 
+	/// `serverStateless` mirrors `server.mode == ServerMode.stateless`: such a
+	/// server has no per-peer channel, so `sample`/`elicit`/`listRoots` refuse
+	/// before consulting the client's capabilities.
 	this(RequestContext inner, bool inputRequired, Json[string] responses, string minLevel = "info",
 			bool loggingRequested = true, CancellationToken cancellation = null,
 			string requestState = "",
 			ProtocolVersion effectiveVersion = latestLegacy,
-			ClientCapabilities clientCaps = ClientCapabilities.init) @safe
+			ClientCapabilities clientCaps = ClientCapabilities.init, bool serverStateless = false) @safe
 	{
+		this.serverStateless_ = serverStateless;
 		this.clientCaps_ = clientCaps;
 		this.inner = inner;
 		this.inputRequired = inputRequired;
@@ -727,6 +740,12 @@ final class RequestScope : RequestContext, ConnectionScoped
 	ProtocolVersion effectiveVersion() @safe
 	{
 		return effectiveVersion_;
+	}
+
+	/// Whether the dispatching server is stateless (has no server->client channel).
+	bool serverStateless() const @safe
+	{
+		return serverStateless_;
 	}
 
 	/// The client capabilities in effect for THIS request (the session's
@@ -1714,4 +1733,48 @@ unittest  // elicitUrl() on a stateless (MRTR) request throws an internalError (
 		assert(e.code == ErrorCode.internalError);
 	}
 	assert(threw);
+}
+
+version (unittest) private void assertStatefulRequired(void delegate() @safe call) @safe
+{
+	import mcp.protocol.errors : McpException, ErrorCode;
+	import std.algorithm.searching : canFind;
+
+	bool threw;
+	try
+		call();
+	catch (McpException e)
+	{
+		threw = true;
+		assert(e.code == ErrorCode.internalError, e.msg);
+		assert(e.msg.canFind("McpServer.stateful()"), e.msg);
+	}
+	assert(threw);
+}
+
+unittest  // sample() on a stateless server's legacy request names McpServer.stateful(), not a missing capability
+{
+	Json[string] empty;
+	auto scope_ = new RequestScope(new LogProbe, false, empty, "info", true,
+			null, "", latestLegacy, ClientCapabilities.init, true);
+	assertStatefulRequired(() @safe { scope_.sample(Json.emptyObject); });
+}
+
+unittest  // elicit() and elicitUrl() on a stateless server's legacy request name McpServer.stateful()
+{
+	Json[string] empty;
+	auto scope_ = new RequestScope(new LogProbe, false, empty, "info", true,
+			null, "", latestLegacy, ClientCapabilities.init, true);
+	assertStatefulRequired(() @safe { scope_.elicit("m", Json.emptyObject); });
+	assertStatefulRequired(() @safe {
+		scope_.elicitUrl("m", "https://example.com", "e-1");
+	});
+}
+
+unittest  // listRoots() on a stateless server's legacy request names McpServer.stateful()
+{
+	Json[string] empty;
+	auto scope_ = new RequestScope(new LogProbe, false, empty, "info", true,
+			null, "", latestLegacy, ClientCapabilities.init, true);
+	assertStatefulRequired(() @safe { scope_.listRoots(); });
 }
