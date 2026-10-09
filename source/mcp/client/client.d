@@ -3149,7 +3149,7 @@ final class McpClient : ClientProtocol
 			const dead = eventSettings_.streamDeadAfter;
 			if (dead <= Duration.zero)
 			{
-				streamWatchSleep(ms, Duration.max, true);
+				streamWatchSleep(sub, ms, Duration.max, true);
 				if (!sub.active || closed_)
 					return;
 				if (!ms.stream.ended)
@@ -3158,7 +3158,7 @@ final class McpClient : ClientProtocol
 						: internalError("the server ended the event stream"));
 				return;
 			}
-			streamWatchSleep(ms, dead * (1L << (failures < 5 ? failures : 5)), failures == 0);
+			streamWatchSleep(sub, ms, dead * (1L << (failures < 5 ? failures : 5)), failures == 0);
 			if (!sub.active || closed_)
 				return;
 			if (!ms.stream.ended && eventNowMs() - ms.lastFrameMs < dead.total!"msecs")
@@ -3276,12 +3276,11 @@ final class McpClient : ClientProtocol
 	private enum minStreamLifetime = 1.seconds;
 
 	/// Wait up to `d` between watchdog checks, returning early once `ms`'s
-	/// current stream ends when `wakeOnEnd` is set. A test seam runs the loop
-	/// synchronously.
-	private void streamWatchSleep(ManagedStream ms, Duration d, bool wakeOnEnd) @safe
+	/// current stream ends when `wakeOnEnd` is set, and otherwise once `sub` is
+	/// cancelled or terminated. A test seam runs the loop synchronously.
+	private void streamWatchSleep(EventSubscription sub, ManagedStream ms,
+			Duration d, bool wakeOnEnd) @safe
 	{
-		import vibe.core.core : sleep;
-
 		version (unittest)
 			if (onStreamWatchSleepForTest !is null)
 			{
@@ -3291,7 +3290,7 @@ final class McpClient : ClientProtocol
 		if (wakeOnEnd)
 			ms.wake.wait(d, ms.wakeCount);
 		else
-			sleep(d);
+			sub.sleepWhileActive(d);
 	}
 
 	/// Monotonic milliseconds for stream liveness. A test seam supplies the clock.
@@ -10892,6 +10891,55 @@ unittest  // the watchdog reopens a stream the server closed without waiting out
 	});
 	runEventLoop();
 	assert(took < 1.seconds, "a server-closed stream must be reopened promptly");
+}
+
+unittest  // cancelling a managed stream wakes a watchdog that is backing off
+{
+	import core.time : MonoTime;
+	import vibe.core.core : exitEventLoop, runEventLoop, runTask, sleep;
+
+	auto t = new RecordingClientTransport();
+	auto c = new McpClient(t);
+	c.enableModern();
+	EventClientSettings es;
+	es.streamDeadAfter = 2.seconds;
+	c.eventSettings = es;
+	auto sub = c.subscribeStream(StreamParams("incident.created"), null);
+	bool done;
+	MonoTime finished;
+	runTask(() nothrow{
+		try
+			c.runStreamWatchdog(sub);
+		catch (Exception)
+		{
+		}
+		finished = MonoTime.currTime;
+		done = true;
+	});
+	Duration took = Duration.max;
+	runTask(() nothrow{
+		scope (exit)
+			exitEventLoop();
+		try
+		{
+			sleep(50.msecs);
+			t.listenFailures ~= new HttpStatusException(503, "unavailable");
+			t.streams[0].finish(); // the reopen fails, so the watchdog backs off
+			sleep(200.msecs);
+			const cancelled = MonoTime.currTime;
+			sub.cancel();
+			while (!done && MonoTime.currTime - cancelled < 6.seconds)
+				sleep(10.msecs);
+			if (done)
+				took = finished - cancelled;
+		}
+		catch (Exception)
+		{
+		}
+	});
+	runEventLoop();
+	assert(t.listens.length == 2, "the watchdog must have tried to reopen the stream");
+	assert(took < 1.seconds, "cancel must wake a watchdog in its backoff sleep");
 }
 
 unittest  // transient reopen failures back off between attempts
