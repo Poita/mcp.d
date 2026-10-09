@@ -6,10 +6,12 @@
 /// The verifier POSTs the presented token to the authorization server's
 /// introspection endpoint (authenticating as a resource server with
 /// `client_secret_basic` or `client_secret_post`), then maps the RFC 7662
-/// response to a `TokenInfo`: `active:false` (or any HTTP/parse error) yields an
-/// invalid result, while `active:true` yields a valid `TokenInfo` with `scope`,
-/// `sub`, and `aud` mapped across, after enforcing the configured audience and
-/// required scopes. Positive results may be briefly cached.
+/// response to a `TokenInfo`: `active:false` (or a 4xx answer or parse error)
+/// yields an invalid result, an unreachable endpoint or a 429/5xx answer yields
+/// `TokenInfo.temporarilyUnavailable`, and `active:true` yields a valid
+/// `TokenInfo` with `scope`, `sub`, and `aud` mapped across, after enforcing the
+/// configured audience and required scopes. Positive results may be briefly
+/// cached.
 module mcp.auth.introspection_verifier;
 
 import core.time : Duration, seconds;
@@ -20,7 +22,8 @@ import vibe.data.json : Json, parseJsonString;
 
 import mcp.auth.jwt_verifier : audiences, currentUnixTime, includesAudience, jsonStr, splitScopes;
 import mcp.auth.oauth : TokenEndpointAuthMethod, basicAuthHeader, secureRequestHTTP;
-import mcp.auth.resource_server : TokenInfo, TokenValidator;
+import mcp.auth.resource_server : TokenInfo, TokenValidator,
+	TokenVerifierUnavailableException, isSsrfRefusal, isUnavailableStatus, parseRetryAfter;
 import mcp.protocol.jsonrpc : parseUntrustedJson;
 import mcp.protocol.ssrf : SsrfPolicy;
 
@@ -120,6 +123,14 @@ package TokenValidator introspectionValidator(IntrospectionConfig cfg, Introspec
 			const doc = introspector.introspect(token);
 			ti = introspectionResult(cfg, doc);
 		}
+		catch (TokenVerifierUnavailableException e)
+		{
+			import vibe.core.log : logWarn;
+
+			logWarn("Token introspection at %s is unavailable: %s",
+					cfg.introspectionEndpoint, e.msg);
+			return TokenInfo.temporarilyUnavailable(e.retryAfter);
+		}
 		catch (Exception e)
 		{
 			import vibe.core.log : logWarn;
@@ -152,7 +163,9 @@ private TokenInfo detached(TokenInfo ti) @safe
 /// tests can drive verification against a stub endpoint.
 interface Introspector
 {
-	/// Return the raw RFC 7662 introspection response JSON for `token`.
+	/// Return the raw RFC 7662 introspection response JSON for `token`. Throws
+	/// `TokenVerifierUnavailableException` when the endpoint is unreachable or
+	/// answers 429/5xx, so the request gets 503 rather than 401.
 	string introspect(string token) @safe;
 }
 
@@ -261,25 +274,37 @@ private string postIntrospect(IntrospectionConfig cfg, string token) @trusted
 	const body_ = introspectionBody(cfg, token);
 	string responseBody;
 	int status;
-	secureRequestHTTP(cfg.introspectionEndpoint, cfg.ssrfPolicy, (scope HTTPClientRequest req) {
-		req.method = HTTPMethod.POST;
-		req.headers["Content-Type"] = "application/x-www-form-urlencoded";
-		req.headers["Accept"] = "application/json";
-		if (cfg.authMethod == TokenEndpointAuthMethod.clientSecretBasic)
-			req.headers["Authorization"] = basicAuthHeader(cfg.clientId, cfg.clientSecret);
-		req.writeBody(cast(const(ubyte)[]) body_);
-	}, (scope HTTPClientResponse res) {
-		status = res.statusCode;
-		if (status >= 200 && status < 300)
-			responseBody = res.bodyReader.readAllUTF8(false, maxIntrospectionBodyBytes);
-		else
-			res.dropBody();
-	});
+	Duration retryAfter;
+	try
+		secureRequestHTTP(cfg.introspectionEndpoint, cfg.ssrfPolicy, (scope HTTPClientRequest req) {
+			req.method = HTTPMethod.POST;
+			req.headers["Content-Type"] = "application/x-www-form-urlencoded";
+			req.headers["Accept"] = "application/json";
+			if (cfg.authMethod == TokenEndpointAuthMethod.clientSecretBasic)
+				req.headers["Authorization"] = basicAuthHeader(cfg.clientId, cfg.clientSecret);
+			req.writeBody(cast(const(ubyte)[]) body_);
+		}, (scope HTTPClientResponse res) {
+			status = res.statusCode;
+			retryAfter = parseRetryAfter(res.headers.get("Retry-After", ""));
+			if (status >= 200 && status < 300)
+				responseBody = res.bodyReader.readAllUTF8(false, maxIntrospectionBodyBytes);
+			else
+				res.dropBody();
+		});
+	catch (Exception e)
+	{
+		if (isSsrfRefusal(e))
+			throw e;
+		throw new TokenVerifierUnavailableException("introspection endpoint unreachable: " ~ e.msg);
+	}
 	if (status < 200 || status >= 300)
 	{
 		import std.format : format;
 
-		throw new Exception(format("introspection endpoint returned HTTP %d", status));
+		const msg = format("introspection endpoint returned HTTP %d", status);
+		if (isUnavailableStatus(status))
+			throw new TokenVerifierUnavailableException(msg, retryAfter);
+		throw new Exception(msg);
 	}
 	return responseBody;
 }
@@ -975,7 +1000,28 @@ unittest  // a caller mutating a cached result's claims, scopes, or audience lea
 	assert(third.audience == ["https://mcp.example.com/mcp"]);
 }
 
-unittest  // a non-2xx introspection response is reported with its status code
+unittest  // an unavailable introspection endpoint yields a temporarily-unavailable TokenInfo
+{
+	final class DownIntrospector : Introspector
+	{
+		string introspect(string token) @safe
+		{
+			throw new TokenVerifierUnavailableException("HTTP 503", 12.seconds);
+		}
+	}
+
+	IntrospectionConfig cfg;
+	cfg.introspectionEndpoint = "https://as.example.com/introspect";
+	auto ti = introspectionValidator(cfg, new DownIntrospector)("tok");
+	assert(!ti.valid && ti.unavailable);
+	assert(ti.retryAfter == 12.seconds);
+
+	// Any other failure still rejects the token outright.
+	ti = introspectionValidator(cfg, new ThrowingIntrospector)("tok");
+	assert(!ti.valid && !ti.unavailable);
+}
+
+unittest  // a 503 introspection response is reported as an unavailable verifier with its status code and Retry-After
 {
 	import std.algorithm : canFind;
 	import std.conv : to;
@@ -984,6 +1030,7 @@ unittest  // a non-2xx introspection response is reported with its status code
 		HTTPServerSettings, listenHTTP;
 
 	string failure, thrown;
+	Duration retryAfter;
 	runTask(() @safe nothrow{
 		try
 		{
@@ -993,6 +1040,7 @@ unittest  // a non-2xx introspection response is reported with its status code
 			auto listener = listenHTTP(settings, (scope HTTPServerRequest req,
 				scope HTTPServerResponse res) @safe {
 				res.statusCode = 503;
+				res.headers["Retry-After"] = "20";
 				res.writeBody("down for maintenance", "text/plain");
 			});
 			scope (exit)
@@ -1002,8 +1050,11 @@ unittest  // a non-2xx introspection response is reported with its status code
 				~ listener.bindAddresses[0].port.to!string ~ "/introspect";
 			try
 				cast(void) new HttpIntrospector(cfg).introspect("tok");
-			catch (Exception e)
+			catch (TokenVerifierUnavailableException e)
+			{
 				thrown = e.msg;
+				retryAfter = e.retryAfter;
+			}
 		}
 		catch (Exception e)
 			failure = e.msg;
@@ -1013,4 +1064,5 @@ unittest  // a non-2xx introspection response is reported with its status code
 
 	assert(failure.length == 0, failure);
 	assert(thrown.canFind("HTTP 503"), thrown);
+	assert(retryAfter == 20.seconds);
 }

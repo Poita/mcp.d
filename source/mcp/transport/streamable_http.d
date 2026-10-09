@@ -1500,8 +1500,10 @@ private void mountCorsPreflight(URLRouter router, string path, string methods,
 /// and, on failure, write the spec-mandated response: `401` with a
 /// `WWW-Authenticate: Bearer` header carrying the `resource_metadata` URL for a
 /// missing/invalid token, or `403` with `error="insufficient_scope"` when a
-/// required scope is absent. Returns true (with `token` populated) when the
-/// request may proceed; false when a failure response was written.
+/// required scope is absent. When the token verifier is temporarily unavailable
+/// it answers `503` instead, with `Retry-After` when the verifier gave a hint.
+/// Returns true (with `token` populated) when the request may proceed; false
+/// when a failure response was written.
 private bool guardAuth(scope HTTPServerRequest req, scope HTTPServerResponse res,
 		StreamableHttpOptions opts, out TokenInfo token) @safe
 {
@@ -1511,6 +1513,20 @@ private bool guardAuth(scope HTTPServerRequest req, scope HTTPServerResponse res
 	const failure = authorize(opts.auth, req.headers.get("Authorization", ""), token);
 	if (failure == AuthFailure.none)
 		return true;
+
+	// The verifier, not the token, failed: 503 keeps the client from
+	// discarding a token that may well be good.
+	if (failure == AuthFailure.temporarilyUnavailable)
+	{
+		import std.conv : to;
+
+		const retrySeconds = token.retryAfter.total!"seconds";
+		if (retrySeconds > 0)
+			res.headers["Retry-After"] = retrySeconds.to!string;
+		res.statusCode = HTTPStatus.serviceUnavailable;
+		res.writeBody("Token verification is temporarily unavailable", "text/plain");
+		return false;
+	}
 
 	const metaUrl = resourceMetadataUrl(req, opts);
 	res.headers["WWW-Authenticate"] = wwwAuthenticate(failure, metaUrl, opts.auth.scopeHint());
@@ -7682,6 +7698,27 @@ unittest  // the Protected Resource Metadata is served at the RFC 9728 path-inse
 	const www = challenge.headers.get("WWW-Authenticate", "");
 	assert(www.canFind(`resource_metadata="https://mcp.example.com/.well-known/oauth-protected-resource/tenant-a/mcp"`),
 			www);
+}
+
+unittest  // an unavailable token verifier answers 503 with Retry-After, not a 401 challenge
+{
+	StreamableHttpOptions opts;
+	opts.auth.validator = (string t) @safe => TokenInfo.temporarilyUnavailable(15.seconds);
+	opts.auth.resource = "https://mcp.example.com/mcp";
+	opts.auth.authorizationServers = ["https://auth.example.com"];
+	opts.allowedHosts = ["mcp.example.com"];
+	auto router = new URLRouter;
+	mountMcp(router, McpServer.stateless("t", "1"), opts);
+
+	auto res = corsRequest(router, HTTPMethod.POST, [
+		"Host": "mcp.example.com",
+		"Authorization": "Bearer tok",
+		"Content-Type": "application/json",
+		"Accept": "application/json, text/event-stream",
+	], initializeBody(), "/mcp");
+	assert(res.statusCode == 503);
+	assert(res.headers.get("Retry-After", "") == "15");
+	assert("WWW-Authenticate" !in res.headers);
 }
 
 unittest  // a resource without a path keeps its metadata at the well-known root

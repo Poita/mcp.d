@@ -33,7 +33,7 @@ static if (!is(typeof(EVP_DigestVerify)))
 	extern (C) @system nothrow @nogc int EVP_DigestVerify(EVP_MD_CTX* ctx,
 			const(ubyte)* sig, size_t siglen, const(ubyte)* tbs, size_t tbslen);
 
-import mcp.auth.resource_server : TokenInfo, TokenValidator;
+import mcp.auth.resource_server : TokenInfo, TokenValidator, TokenVerifierUnavailableException;
 import mcp.protocol.jsonrpc : parseUntrustedJson;
 import mcp.protocol.ssrf : SsrfPolicy;
 
@@ -148,16 +148,24 @@ TokenValidator jwtVerifier(JwtVerifierConfig cfg) @safe
 	};
 }
 
-/// Run `verify` fail-closed: any exception (a JWKS-fetch outage, a key-parse
-/// error, an OpenSSL-internal failure) yields an invalid token rather than
-/// propagating, so an exception can never be mistaken for a valid credential.
-/// The exception is logged first — otherwise a verifier-side outage is
+/// Run `verify` fail-closed: any exception (a key-parse error, an
+/// OpenSSL-internal failure) yields an invalid token rather than propagating,
+/// so an exception can never be mistaken for a valid credential. A
+/// `TokenVerifierUnavailableException` yields `TokenInfo.temporarilyUnavailable`.
+/// The exception is logged first — otherwise a verifier-side fault is
 /// indistinguishable from a flood of genuinely-bad-token rejections. The token
 /// itself is never logged (it is a bearer credential).
 package TokenInfo verifyOrInvalid(scope TokenInfo delegate() @safe verify) @safe
 {
 	try
 		return verify();
+	catch (TokenVerifierUnavailableException e)
+	{
+		import vibe.core.log : logWarn;
+
+		logWarn("jwtVerifier: verification keys are unavailable: %s", e.msg);
+		return TokenInfo.temporarilyUnavailable(e.retryAfter);
+	}
 	catch (Exception e)
 	{
 		import vibe.core.log : logWarn;
@@ -178,6 +186,11 @@ package TokenInfo verifyOrInvalid(scope TokenInfo delegate() @safe verify) @safe
 package interface KeySource
 {
 	string[] keysFor(string kid) @safe;
+
+	/// Whether the source holds no keys because fetching them failed, so a
+	/// token it cannot verify may still be good. `retryAfter` is set to when
+	/// the next fetch may be attempted.
+	bool unavailable(out Duration retryAfter) @safe;
 }
 
 /// Reject a token, logging `reason` at diagnostic level so a misconfigured
@@ -189,6 +202,16 @@ private TokenInfo reject(string reason) @safe
 
 	logDiagnostic("jwtVerifier: token rejected: %s", reason);
 	return TokenInfo.invalid();
+}
+
+/// Answer a token that cannot be judged because the JWKS could not be fetched:
+/// the verifier, not the token, is at fault.
+private TokenInfo keysOutage(Duration retryAfter) @safe
+{
+	import vibe.core.log : logDiagnostic;
+
+	logDiagnostic("jwtVerifier: token not judged: the JWKS is unavailable");
+	return TokenInfo.temporarilyUnavailable(retryAfter);
 }
 
 /// Verify `token` against `cfg` at wall-clock time `now` (unix seconds), drawing
@@ -225,8 +248,10 @@ package TokenInfo verifyToken(JwtVerifierConfig cfg, string token, KeySource key
 	// Gather candidate keys: pinned PEM keys plus any JWKS keys for this kid.
 	string[] candidates = cfg.staticPublicKeysPem.dup;
 	candidates ~= keys.keysFor(kid);
+	Duration retryAfter;
+	const keysUnavailable = keys.unavailable(retryAfter);
 	if (candidates.length == 0)
-		return reject("no verification key available");
+		return keysUnavailable ? keysOutage(retryAfter) : reject("no verification key available");
 
 	const signingInput = parts[0] ~ "." ~ parts[1];
 	// A malformed signature segment is an ordinary bad token, not a verifier
@@ -247,7 +272,8 @@ package TokenInfo verifyToken(JwtVerifierConfig cfg, string token, KeySource key
 		}
 	}
 	if (!sigOk)
-		return reject("signature does not verify against any candidate key");
+		return keysUnavailable ? keysOutage(retryAfter) : reject(
+				"signature does not verify against any candidate key");
 
 	return validateClaims(cfg, payloadJson, now);
 }
@@ -761,6 +787,16 @@ package final class JwksCache : KeySource
 		return kidKeys(kid);
 	}
 
+	/// Whether a fetch has failed and no keys are held.
+	bool unavailable(out Duration retryAfter) @safe
+	{
+		if (uri.length == 0 || loaded || lastAttemptAt < 0)
+			return false;
+		const wait = minRefetchInterval.total!"seconds" - (now() - lastAttemptAt);
+		retryAfter = (wait > 1 ? wait : 1).seconds;
+		return true;
+	}
+
 	private long now() @safe
 	{
 		return clock !is null ? clock() : currentUnixTime();
@@ -1113,6 +1149,11 @@ version (unittest)
 		string[] keysFor(string kid) @safe
 		{
 			return null;
+		}
+
+		bool unavailable(out Duration retryAfter) @safe
+		{
+			return false;
 		}
 	}
 }
@@ -2089,6 +2130,42 @@ unittest  // JwksCache spaces fetch attempts from when the last one finished, no
 	assert(s.cache.keysFor("rsa-1").length == 0);
 	assert(s.fetches == 1,
 			"a request arriving right after a slow failed fetch must not stall again");
+}
+
+unittest  // a token is answered as temporarily unavailable, not invalid, while the JWKS cannot be fetched
+{
+	JwtVerifierConfig cfg;
+	cfg.issuer = "https://as.example.com";
+	auto s = new ScriptedJwks(null);
+	auto ti = verifyToken(cfg, testRs256Jwt, s.cache, 1_700_001_000);
+	assert(!ti.valid);
+	assert(ti.unavailable);
+	assert(ti.retryAfter == JwksCache.minRefetchInterval);
+
+	// Once keys load, a token they do not verify is plainly invalid.
+	s.served = `{"keys":[{"kty":"RSA","kid":"rsa-1","n":"` ~ testRsaN2 ~ `","e":"`
+		~ testRsaE ~ `"}]}`;
+	s.clock += JwksCache.minRefetchInterval.total!"seconds";
+	ti = verifyToken(cfg, testRs256Jwt, s.cache, 1_700_001_000);
+	assert(!ti.valid && !ti.unavailable);
+}
+
+unittest  // a pinned-key-only verifier never reports itself unavailable
+{
+	JwtVerifierConfig cfg;
+	cfg.issuer = "https://as.example.com";
+	cfg.staticPublicKeysPem = [testEcPubPem];
+	auto ti = verifyToken(cfg, testRs256Jwt, new NoKeys, 1_700_001_000);
+	assert(!ti.valid && !ti.unavailable);
+}
+
+unittest  // verifyOrInvalid maps TokenVerifierUnavailableException to temporarily unavailable
+{
+	auto ti = verifyOrInvalid(() @safe {
+		throw new TokenVerifierUnavailableException("down", 5.seconds);
+		return TokenInfo.init;
+	});
+	assert(ti.unavailable && ti.retryAfter == 5.seconds);
 }
 
 unittest  // JwksCache rate-limits unknown-kid refetches (junk kids cannot drive outbound fetches)

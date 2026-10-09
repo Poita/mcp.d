@@ -27,7 +27,8 @@ import mcp.auth.jwt_verifier : JwtVerifierConfig, jwtVerifier;
 import mcp.auth.oauth : TokenEndpointAuthMethod;
 import mcp.auth.oauth_proxy : IssueTokenHook, OAuthProxyConfig;
 import mcp.auth.reference_token : ReferenceTokenStore;
-import mcp.auth.resource_server : ResourceServerConfig, TokenInfo, TokenValidator;
+import mcp.auth.resource_server : ResourceServerConfig, TokenInfo, TokenValidator,
+	TokenVerifierUnavailableException, isSsrfRefusal, isUnavailableStatus, parseRetryAfter;
 
 @safe:
 
@@ -367,8 +368,12 @@ package struct ProviderHttpRequest
 /// The status and body of a provider verifier's HTTP response.
 package struct ProviderHttpResponse
 {
+	import core.time : Duration;
+
 	int status;
 	string body;
+	/// The response's `Retry-After` hint; zero when absent.
+	Duration retryAfter;
 }
 
 /// Performs a provider verifier's HTTP request. The default is the
@@ -400,6 +405,7 @@ private ProviderHttpResponse providerHttp(ProviderHttpRequest r) @trusted
 		}
 	}, (scope HTTPClientResponse res) {
 		out_.status = res.statusCode;
+		out_.retryAfter = parseRetryAfter(res.headers.get("Retry-After", ""));
 		if (out_.status / 100 == 2)
 			out_.body = res.bodyReader.readAllUTF8(false, maxProviderResponseBytes);
 		else
@@ -408,11 +414,49 @@ private ProviderHttpResponse providerHttp(ProviderHttpRequest r) @trusted
 	return out_;
 }
 
-/// Run `check` fail-closed, logging a failed provider call.
+/// Call the provider, mapping an unreachable endpoint or a 429/5xx answer to
+/// `TokenVerifierUnavailableException` (logged by `providerCheck`) and logging
+/// any other non-200 status.
+private ProviderHttpResponse callProvider(string provider, ProviderHttp http,
+		ProviderHttpRequest req) @safe
+{
+	import vibe.core.log : logDiagnostic;
+
+	ProviderHttpResponse res;
+	try
+		res = http(req);
+	catch (Exception e)
+	{
+		if (isSsrfRefusal(e))
+			throw e;
+		throw new TokenVerifierUnavailableException(provider ~ " token API unreachable: " ~ e.msg);
+	}
+	if (isUnavailableStatus(res.status))
+	{
+		import std.conv : to;
+
+		throw new TokenVerifierUnavailableException(
+				provider ~ " token API answered HTTP " ~ res.status.to!string, res.retryAfter);
+	}
+	if (res.status != 200)
+		logDiagnostic("%s token API answered HTTP %d; rejecting the token", provider, res.status);
+	return res;
+}
+
+/// Run `check` fail-closed, logging a failed provider call. An unavailable
+/// provider yields `TokenInfo.temporarilyUnavailable`; any other failure an
+/// invalid token.
 private TokenInfo providerCheck(string provider, TokenInfo delegate() @safe check) @safe
 {
 	try
 		return check();
+	catch (TokenVerifierUnavailableException e)
+	{
+		import vibe.core.log : logWarn;
+
+		logWarn("%s token verification is unavailable: %s", provider, e.msg);
+		return TokenInfo.temporarilyUnavailable(e.retryAfter);
+	}
 	catch (Exception e)
 	{
 		import vibe.core.log : logWarn;
@@ -457,7 +501,8 @@ package TokenValidator githubTokenVerifierWith(string clientId,
 		return providerCheck("GitHub", () @safe {
 			Json req = Json.emptyObject;
 			req["access_token"] = token;
-			const res = http(ProviderHttpRequest("POST", url, authorization, req.toString()));
+			const res = callProvider("GitHub", http,
+				ProviderHttpRequest("POST", url, authorization, req.toString()));
 			if (res.status != 200)
 				return TokenInfo.invalid();
 			auto doc = parseUntrustedJson(res.body);
@@ -508,9 +553,10 @@ package TokenValidator googleTokenVerifierWith(string clientId, ProviderHttp htt
 		if (token.length == 0)
 			return TokenInfo.invalid();
 		return providerCheck("Google", () @safe {
-			const res = http(ProviderHttpRequest("POST",
-				"https://oauth2.googleapis.com/tokeninfo", null,
-				"access_token=" ~ encodeComponent(token), "application/x-www-form-urlencoded"));
+			const res = callProvider("Google", http, ProviderHttpRequest("POST",
+				"https://oauth2.googleapis.com/tokeninfo",
+				null, "access_token=" ~ encodeComponent(token),
+				"application/x-www-form-urlencoded"));
 			if (res.status != 200)
 				return TokenInfo.invalid();
 			auto doc = parseUntrustedJson(res.body);
@@ -1060,7 +1106,7 @@ unittest  // GOOGLE: a tokeninfo response nested past the depth cap rejects the 
 	assert(!v("ya29.valid").valid);
 }
 
-unittest  // GITHUB: a failed check-token call rejects the token without throwing
+unittest  // GITHUB: an unreachable check-token API reports the verifier unavailable without throwing
 {
 	auto fake = new FakeProviderHttp;
 	fake.answer = (ProviderHttpRequest req) @safe {
@@ -1068,9 +1114,41 @@ unittest  // GITHUB: a failed check-token call rejects the token without throwin
 		return ProviderHttpResponse.init;
 	};
 	auto v = githubTokenVerifierWith("Iv1.client", "ghsecret", fake.call());
-	assert(!v("gho_valid").valid);
+	auto info = v("gho_valid");
+	assert(!info.valid && info.unavailable);
 	assert(!v("").valid);
 	assert(fake.calls == 1, "an empty token is rejected without a call");
+}
+
+unittest  // GITHUB: a 5xx or 429 answer reports the verifier unavailable; a 404 rejects the token
+{
+	import core.time : seconds;
+
+	auto fake = new FakeProviderHttp;
+	fake.answer = (ProviderHttpRequest req) @safe => ProviderHttpResponse(503, null, 30.seconds);
+	auto v = githubTokenVerifierWith("Iv1.client", "ghsecret", fake.call());
+	auto info = v("gho_a");
+	assert(info.unavailable && info.retryAfter == 30.seconds);
+
+	fake.answer = (ProviderHttpRequest req) @safe => ProviderHttpResponse(429);
+	assert(v("gho_b").unavailable);
+
+	fake.answer = (ProviderHttpRequest req) @safe => ProviderHttpResponse(404);
+	info = v("gho_c");
+	assert(!info.valid && !info.unavailable);
+}
+
+unittest  // GOOGLE: a 5xx answer reports the verifier unavailable; a 400 rejects the token
+{
+	auto fake = new FakeProviderHttp;
+	fake.answer = (ProviderHttpRequest req) @safe => ProviderHttpResponse(502);
+	auto v = googleTokenVerifierWith("client.apps.googleusercontent.com", fake.call());
+	assert(v("ya29.a").unavailable);
+
+	fake.answer = (ProviderHttpRequest req) @safe => ProviderHttpResponse(400,
+			`{"error":"invalid_token"}`);
+	auto info = v("ya29.b");
+	assert(!info.valid && !info.unavailable);
 }
 
 unittest  // GOOGLE: the verifier accepts a token whose tokeninfo aud or azp is this client

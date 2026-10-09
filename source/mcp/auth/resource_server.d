@@ -1,5 +1,6 @@
 module mcp.auth.resource_server;
 
+import core.time : Duration;
 import std.typecons : Nullable, nullable;
 import vibe.data.json : Json;
 
@@ -19,6 +20,16 @@ struct TokenInfo
 	string[] scopes; /// the scopes the token grants
 	string[] audience; /// the audiences the token was issued for (RFC 8707)
 	Json claims = Json.undefined; /// the full claim set, for handler inspection
+
+	/// true when the validator could not judge the token because its verifier
+	/// is temporarily out of reach (an IdP outage, a rate limit, a JWKS that
+	/// could not be fetched). The transport answers 503 rather than 401, so a
+	/// client keeps a token that may well be good. Always false when `valid`.
+	bool unavailable;
+
+	/// With `unavailable`, how long the client should wait before retrying;
+	/// zero when unknown. Sent as `Retry-After`.
+	Duration retryAfter;
 
 	/// Whether the token grants the named scope.
 	bool hasScope(string scope_) const @safe
@@ -52,12 +63,94 @@ struct TokenInfo
 		t.valid = false;
 		return t;
 	}
+
+	/// A convenience constructor for a token that could not be judged because
+	/// the verifier is temporarily unavailable; see `unavailable`.
+	static TokenInfo temporarilyUnavailable(Duration retryAfter = Duration.zero) @safe
+	{
+		TokenInfo t;
+		t.unavailable = true;
+		t.retryAfter = retryAfter;
+		return t;
+	}
+}
+
+/// Thrown by a token verifier's upstream call (an introspection endpoint, a
+/// provider token API) when the verifier is temporarily unavailable rather than
+/// the token being bad: a 429 or 5xx answer, or an unreachable endpoint. A
+/// `TokenValidator` may throw it directly; `authorize` maps it to
+/// `AuthFailure.temporarilyUnavailable` just like a returned
+/// `TokenInfo.temporarilyUnavailable`.
+class TokenVerifierUnavailableException : Exception
+{
+	/// How long to wait before retrying; zero when unknown.
+	Duration retryAfter;
+
+	this(string msg, Duration retryAfter = Duration.zero, string file = __FILE__,
+			size_t line = __LINE__) @safe pure nothrow
+	{
+		super(msg, file, line);
+		this.retryAfter = retryAfter;
+	}
+}
+
+/// Whether `e` is the SSRF guard refusing a URL (a configuration fault, not an
+/// outage), as opposed to a failed connection or a timeout.
+package bool isSsrfRefusal(Exception e) @safe
+{
+	import mcp.protocol.errors : ErrorCode, McpException;
+
+	auto m = cast(McpException) e;
+	return m !is null && m.code == ErrorCode.invalidRequest;
+}
+
+/// Whether an upstream verifier's HTTP status means it is temporarily
+/// unavailable (429 Too Many Requests or any 5xx) rather than that the token is
+/// bad.
+package bool isUnavailableStatus(int status) @safe pure nothrow @nogc
+{
+	return status == 429 || status >= 500;
+}
+
+/// Parse a `Retry-After` header given in delta-seconds (RFC 9110 §10.2.3).
+/// Zero for an absent, HTTP-date, or malformed value.
+package Duration parseRetryAfter(string value) @safe
+{
+	import core.time : seconds;
+	import std.conv : to;
+	import std.string : strip;
+
+	try
+	{
+		const n = value.strip.to!uint;
+		return (cast(long) n).seconds;
+	}
+	catch (Exception)
+		return Duration.zero;
+}
+
+unittest  // parseRetryAfter reads delta-seconds and ignores anything else
+{
+	import core.time : seconds;
+
+	assert(parseRetryAfter("120") == 120.seconds);
+	assert(parseRetryAfter(" 5 ") == 5.seconds);
+	assert(parseRetryAfter("") == Duration.zero);
+	assert(parseRetryAfter("Wed, 21 Oct 2015 07:28:00 GMT") == Duration.zero);
+	assert(parseRetryAfter("-3") == Duration.zero);
+}
+
+unittest  // isUnavailableStatus flags 429 and 5xx only
+{
+	assert(isUnavailableStatus(429) && isUnavailableStatus(500) && isUnavailableStatus(503));
+	assert(!isUnavailableStatus(400) && !isUnavailableStatus(401) && !isUnavailableStatus(404));
 }
 
 /// A delegate the server calls to validate a presented bearer token. It receives
 /// the raw token string (the value after `Bearer `) and returns a `TokenInfo`.
 /// Returning `TokenInfo` with `valid == false` (or throwing) rejects the request
-/// with HTTP 401.
+/// with HTTP 401; returning `TokenInfo.temporarilyUnavailable` (or throwing
+/// `TokenVerifierUnavailableException`) answers HTTP 503 instead.
 alias TokenValidator = TokenInfo delegate(string token) @safe;
 
 /// Wrap `validator` so every token it accepts also lists `resource` among its
@@ -98,6 +191,7 @@ enum AuthFailure
 	missingToken, /// no Authorization: Bearer header -> 401 (no error code)
 	invalidToken, /// token rejected / wrong audience -> 401 invalid_token
 	insufficientScope, /// token lacks a required scope -> 403 insufficient_scope
+	temporarilyUnavailable, /// the verifier is out of reach -> 503 (with Retry-After when known)
 }
 
 /// Server-side OAuth 2.1 Resource Server configuration (RFC 6750 / 8707 / 9728).
@@ -228,8 +322,9 @@ unittest  // bearerToken rejects non-Bearer / absent headers
 
 /// Decide whether a request bearing `authHeader` is authorized under `cfg`,
 /// returning the failure kind (`AuthFailure.none` on success) and, on success,
-/// the validated `TokenInfo`. Pure of HTTP concerns so it can be unit-tested and
-/// reused by any transport.
+/// the validated `TokenInfo`. For `AuthFailure.temporarilyUnavailable`, `info`
+/// carries the `retryAfter` hint. Pure of HTTP concerns so it can be unit-tested
+/// and reused by any transport.
 AuthFailure authorize(ResourceServerConfig cfg, string authHeader, out TokenInfo info) @safe
 {
 	if (!cfg.enabled)
@@ -242,9 +337,19 @@ AuthFailure authorize(ResourceServerConfig cfg, string authHeader, out TokenInfo
 	TokenInfo ti;
 	try
 		ti = cfg.validator(tok);
+	catch (TokenVerifierUnavailableException e)
+	{
+		info = TokenInfo.temporarilyUnavailable(e.retryAfter);
+		return AuthFailure.temporarilyUnavailable;
+	}
 	catch (Exception)
 		return AuthFailure.invalidToken;
 
+	if (!ti.valid && ti.unavailable)
+	{
+		info = TokenInfo.temporarilyUnavailable(ti.retryAfter);
+		return AuthFailure.temporarilyUnavailable;
+	}
 	if (!ti.valid)
 		return AuthFailure.invalidToken;
 
@@ -352,6 +457,8 @@ string wwwAuthenticate(AuthFailure failure, string resourceMetadataUrl, string s
 		if (scope_.length)
 			parts ~= `scope="` ~ quoteParamValue(scope_) ~ `"`;
 		break;
+	case AuthFailure.temporarilyUnavailable:
+		break;
 	}
 	foreach (i, p; parts)
 		v ~= (i == 0 ? " " : ", ") ~ p;
@@ -447,6 +554,34 @@ unittest  // a validator that throws yields invalidToken (not a crash)
 	};
 	TokenInfo info;
 	assert(authorize(cfg, "Bearer x", info) == AuthFailure.invalidToken);
+}
+
+unittest  // a validator reporting its verifier unavailable yields temporarilyUnavailable with the retry hint
+{
+	import core.time : seconds;
+
+	ResourceServerConfig cfg;
+	cfg.allowAnyAudience = true;
+	cfg.validator = (string t) @safe => TokenInfo.temporarilyUnavailable(7.seconds);
+	TokenInfo info;
+	assert(authorize(cfg, "Bearer t", info) == AuthFailure.temporarilyUnavailable);
+	assert(info.retryAfter == 7.seconds);
+	assert(!info.valid);
+}
+
+unittest  // a validator throwing TokenVerifierUnavailableException yields temporarilyUnavailable
+{
+	import core.time : seconds;
+
+	ResourceServerConfig cfg;
+	cfg.allowAnyAudience = true;
+	cfg.validator = (string t) @safe {
+		throw new TokenVerifierUnavailableException("IdP down", 3.seconds);
+		return TokenInfo.init;
+	};
+	TokenInfo info;
+	assert(authorize(cfg, "Bearer t", info) == AuthFailure.temporarilyUnavailable);
+	assert(info.retryAfter == 3.seconds);
 }
 
 unittest  // a valid token authorizes and surfaces TokenInfo
