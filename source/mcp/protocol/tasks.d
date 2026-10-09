@@ -394,9 +394,9 @@ unittest  // Task.fromJson treats a missing status as unknown, which is terminal
 unittest  // Task.fromJson treats a non-string status as unknown, which is terminal
 {
 	auto t = Task.fromJson(Json([
-			"taskId": Json("x"),
-			"status": Json(3),
-			"ttlMs": Json(null)
+		"taskId": Json("x"),
+		"status": Json(3),
+		"ttlMs": Json(null)
 	]));
 	assert(t.status == TaskStatus.unknown && isTerminal(t.status));
 }

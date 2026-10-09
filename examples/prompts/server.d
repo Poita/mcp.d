@@ -133,7 +133,8 @@ private McpServer buildServer() @safe
 	// matching the partial value with the built-in `CompleteResult.prefixMatch`
 	// helper. Any other (prompt, argument) pair falls through to an empty result.
 	server.setArgumentCompleter(CompletionReference.forPrompt("code_review"), "language",
-			(CompleteRequest r) @safe => CompleteResult.prefixMatch(knownLanguages, r.argumentValue));
+			(CompleteRequest r) @safe => CompleteResult.prefixMatch(knownLanguages,
+				r.argumentValue));
 
 	return server;
 }
