@@ -486,10 +486,13 @@ final class StdioClientTransport : ClientTransport
 	{
 		import vibe.core.core : sleep;
 
-		// The child is gone, so a write it left undrained fails promptly, after
-		// which its stdin can be closed.
+		// The child is gone, so a write it left undrained can never complete. Not
+		// every event loop reports the dead reader (epoll does not), so the write
+		// is interrupted; once it has failed, the child's stdin can be closed.
 		if (!stdinClosed_)
 		{
+			if (channel !is null)
+				channel.interruptWrite();
 			foreach (_; 0 .. 100)
 			{
 				if (!writePending())

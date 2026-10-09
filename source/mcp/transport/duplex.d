@@ -61,6 +61,8 @@ final class DuplexChannel
 	private bool shut_;
 	// How many lines are being written right now (0 or 1: writes are serialized).
 	private size_t writing_;
+	// The task performing the write in progress, so `interruptWrite` can end it.
+	private Task writer_;
 	private Task readTask_;
 	// Set by `stopReadLoop` and `close`: the read loop exits at its next
 	// iteration and a read it was interrupted out of is not reported as a failure.
@@ -450,6 +452,23 @@ final class DuplexChannel
 		return writing_ != 0;
 	}
 
+	/// End a write in progress by interrupting the task performing it, which then
+	/// fails as a write failure. Only for a peer known to be gone: the line may be
+	/// left partly written, and an event loop may never report a pipe whose
+	/// reader has exited (epoll does not wake a write parked on it), so such a
+	/// write would otherwise never end. A no-op when nothing is being written.
+	void interruptWrite() @safe nothrow
+	{
+		if (writing_ != 0 && writer_ != Task.init && writer_.running)
+		{
+			try
+				writer_.interrupt();
+			catch (Exception)
+			{
+			}
+		}
+	}
+
 	/// Write `text` under the writer lock, unless `write` was abandoned while it
 	/// waited for the lock. Throws once `close` has been called, including for a
 	/// line that was waiting for the lock then.
@@ -469,8 +488,12 @@ final class DuplexChannel
 			write.started = true;
 		}
 		++writing_;
+		writer_ = Task.getThis();
 		scope (exit)
+		{
 			--writing_;
+			writer_ = Task.init;
+		}
 		try
 			writeLineDg(text);
 		catch (Exception e)
