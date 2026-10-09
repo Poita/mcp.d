@@ -3541,6 +3541,13 @@ final class McpClient : ClientProtocol
 				uris ~= Json(uri);
 			notifications["resourceSubscriptions"] = uris;
 		}
+		if (filter.taskIds.length)
+		{
+			Json ids = Json.emptyArray;
+			foreach (id; filter.taskIds)
+				ids ~= Json(id);
+			notifications["taskIds"] = ids;
+		}
 		Json p = Json.emptyObject;
 		p["notifications"] = notifications;
 		return p;
@@ -7786,6 +7793,18 @@ unittest  // buildSubscriptionsListenParams nests resourceSubscriptions URIs as 
 	assert(rs.length == 2);
 	assert(rs[0].get!string == "file:///a");
 	assert(rs[1].get!string == "file:///b");
+}
+
+unittest  // buildSubscriptionsListenParams nests taskIds as a string array
+{
+	SubscriptionFilter f;
+	f.taskIds = ["task-1", "task-2"];
+	auto p = McpClient.buildSubscriptionsListenParams(f);
+	auto ids = p["notifications"]["taskIds"];
+	assert(ids.type == Json.Type.array);
+	assert(ids.length == 2);
+	assert(ids[0].get!string == "task-1");
+	assert(ids[1].get!string == "task-2");
 }
 
 unittest  // buildSubscriptionsListenParams emits an empty notifications filter for an empty subscription

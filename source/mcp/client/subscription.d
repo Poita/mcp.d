@@ -20,6 +20,9 @@ struct SubscriptionFilter
 	bool resourcesListChanged;
 	/// Resource URIs to receive `notifications/resources/updated` for.
 	string[] resourceSubscriptions;
+	/// Task ids to receive `notifications/tasks` for (Tasks extension, SEP-2663).
+	/// The server accepts this key only when both sides negotiated the extension.
+	string[] taskIds;
 }
 
 /// A handle to an open `subscriptions/listen` stream. The stream runs on a
