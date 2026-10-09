@@ -201,7 +201,8 @@ McpException resourceNotFound(string uri, ProtocolVersion v, Json data = Json.un
 /// accepted rather than rejected here.) Beyond the scheme this requires an
 /// absolute URI: the scheme is followed by `:` and a hierarchical `//authority`
 /// with a non-empty host. Relative references, bare strings such as
-/// `"not a url"`, and `scheme:`-only values are rejected. Validation is
+/// `"not a url"`, `scheme:`-only values, whitespace, control characters, a
+/// backslash and an unbalanced IPv6 bracket are rejected. Validation is
 /// permissive about the path/query/fragment so any real `https://…` consent or
 /// OAuth URL passes.
 bool isValidElicitationUrl(string url) @safe pure nothrow @nogc
@@ -211,6 +212,13 @@ bool isValidElicitationUrl(string url) @safe pure nothrow @nogc
 
 	if (url.length == 0)
 		return false;
+
+	// A URI never contains whitespace or control characters, and browsers read
+	// a backslash as '/', so `https://evil.com\@good.com` would navigate to a
+	// different host than the one parsed here.
+	foreach (c; url)
+		if (c <= ' ' || c == 0x7F || c == '\\')
+			return false;
 
 	// Scheme: ALPHA *( ALPHA / DIGIT / "+" / "-" / "." ) ":" (RFC 3986 §3.1)
 	if (!isAlpha(url[0]))
@@ -259,6 +267,18 @@ bool isValidElicitationUrl(string url) @safe pure nothrow @nogc
 			break;
 		}
 	}
+	// A bracketed IPv6 literal must close its bracket and be followed only by
+	// an optional port; brackets are not allowed anywhere else in the host.
+	if (authority.length && authority[0] == '[')
+	{
+		const close = indexOf(authority, ']');
+		if (close < 2 || indexOf(authority[close + 1 .. $], ']') >= 0)
+			return false;
+		const rest = authority[close + 1 .. $];
+		return rest.length == 0 || rest[0] == ':';
+	}
+	if (indexOf(authority, '[') >= 0 || indexOf(authority, ']') >= 0)
+		return false;
 	// Strip the port suffix before checking that the host is non-empty.
 	// A URL such as "https://:8080/" has authority ":8080" with an empty host.
 	const colon = indexOf(authority, ':');
@@ -596,6 +616,42 @@ unittest  // isValidElicitationUrl still accepts http/https (case-insensitive sc
 	assert(isValidElicitationUrl("https://example.com/consent"));
 	assert(isValidElicitationUrl("HTTPS://example.com/consent"));
 	assert(isValidElicitationUrl("HtTp://example.com"));
+}
+
+unittest  // isValidElicitationUrl rejects whitespace anywhere in the URL
+{
+	assert(!isValidElicitationUrl("https://exa mple.com/"));
+	assert(!isValidElicitationUrl("https://example.com/a b"));
+	assert(!isValidElicitationUrl(" https://example.com/"));
+	assert(!isValidElicitationUrl("https://example.com/\t"));
+}
+
+unittest  // isValidElicitationUrl rejects control characters
+{
+	assert(!isValidElicitationUrl("https://example.com/\n"));
+	assert(!isValidElicitationUrl("https://exa\x00mple.com/"));
+	assert(!isValidElicitationUrl("https://example.com/\x7f"));
+}
+
+unittest  // isValidElicitationUrl rejects a backslash, which browsers read as a path separator
+{
+	assert(!isValidElicitationUrl(`https://evil.com\@good.com`));
+	assert(!isValidElicitationUrl(`https://good.com/a\b`));
+}
+
+unittest  // isValidElicitationUrl rejects an unbalanced IPv6 bracket in the authority
+{
+	assert(!isValidElicitationUrl("https://["));
+	assert(!isValidElicitationUrl("https://[::1/"));
+	assert(!isValidElicitationUrl("https://::1]/"));
+	assert(!isValidElicitationUrl("https://[]/"));
+	assert(!isValidElicitationUrl("https://[::1]x/"));
+}
+
+unittest  // isValidElicitationUrl accepts a bracketed IPv6 host with or without a port
+{
+	assert(isValidElicitationUrl("https://[::1]/consent"));
+	assert(isValidElicitationUrl("https://[2001:db8::1]:8443/"));
 }
 
 unittest  // urlElicitationRequired throws on a malformed url
