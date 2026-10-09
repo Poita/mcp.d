@@ -9,6 +9,30 @@
 A feature-complete [Model Context Protocol](https://modelcontextprotocol.io) (MCP) SDK for
 the D programming language — client and server, built on [vibe-d](https://vibed.org).
 
+## Contents
+
+- [Quickstart](#quickstart)
+- [Installation](#installation)
+- [Goals](#goals)
+- [Status](#status)
+- [Requirements](#requirements)
+- [Build & test](#build--test)
+- [Deploying](#deploying)
+- [API documentation](#api-documentation)
+- [Statefulness](#statefulness)
+- [Implementing a custom server transport](#implementing-a-custom-server-transport)
+- [Client response cache](#client-response-cache)
+- [Client authentication (OAuth login)](#client-authentication-oauth-login)
+- [Examples](#examples)
+- [MCP Apps (interactive UI)](#mcp-apps-interactive-ui)
+- [MCP Tasks (asynchronous execution)](#mcp-tasks-asynchronous-execution)
+- [MCP Events (triggers)](#mcp-events-triggers)
+- [Skills](#skills)
+- [Concurrency model](#concurrency-model)
+- [Running the conformance suite](#running-the-conformance-suite)
+- [Contributing](#contributing)
+- [License](#license)
+
 ## Quickstart
 
 A server is a handful of annotated functions plus `runStdio`. Save it as
@@ -72,6 +96,32 @@ ulimit -n 65536                 # see Build & test
 dub build --single server.d     # produces ./demo-server
 dub run --single client.d       # prints "2 + 3 = 5"
 ```
+
+### Serving over HTTP
+
+The same server speaks Streamable HTTP by swapping `runStdio` for
+`runStreamableHttp`, which blocks serving `http://127.0.0.1:8080/mcp`:
+
+```d
+import mcp;
+import mcp.transport : runStreamableHttp, StreamableHttpOptions;
+
+void main()
+{
+    auto server = new McpServer("demo", "1.0.0");
+    registerModule!demo(server);
+
+    StreamableHttpOptions opts;
+    opts.port = 8080;               // binds 127.0.0.1 by default
+    runStreamableHttp(server, opts);
+}
+```
+
+A client reaches it with `McpClient.http("http://127.0.0.1:8080/mcp")` in place
+of `McpClient.spawn`; the rest of `client.d` is unchanged. To listen on a public
+interface, also set `opts.bindAddresses` and `opts.allowedHosts` (see
+[Deploying](#deploying)). [`examples/hello`](examples/hello/) is a complete
+server/client pair that does both transports from one binary.
 
 ## Installation
 
