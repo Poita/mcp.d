@@ -47,7 +47,6 @@ module mrtr_client;
 import std.conv : to;
 import std.stdio : writeln;
 
-
 import mcp;
 
 import examples_common : check, runClient, connectFromArgs;

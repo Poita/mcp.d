@@ -43,7 +43,6 @@ import std.algorithm : canFind, map;
 import std.array : array;
 import std.conv : to;
 
-
 import mcp;
 import mcp.protocol.modern : CacheScope;
 

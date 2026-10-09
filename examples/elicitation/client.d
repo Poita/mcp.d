@@ -64,7 +64,6 @@ import std.algorithm : canFind, map;
 import std.array : array;
 import std.stdio : writeln;
 
-
 import mcp;
 import examples_common : check, checkEq, runClient, connectFromArgs;
 import mcp.protocol.errors : McpException;

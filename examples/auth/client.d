@@ -241,8 +241,8 @@ int run() @safe
 		checkEq(prm["authorization_servers"][0].get!string, Issuer,
 				"PRM authorization_servers (raw)");
 		auto scopes = prm["scopes_supported"];
-		check(scopes[0].get!string == "mcp:read" && scopes[1].get!string == "mcp:write",
-				"PRM scopes_supported mismatch (raw)");
+		check(scopes[0].get!string == "mcp:read"
+				&& scopes[1].get!string == "mcp:write", "PRM scopes_supported mismatch (raw)");
 	}
 
 	// ---- 3. Happy path: full-scope token, connect + tools ----

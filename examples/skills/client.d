@@ -36,7 +36,6 @@ import std.algorithm : any, canFind, filter, map;
 import std.array : array;
 import std.stdio : writeln;
 
-
 import mcp;
 import examples_common : check, checkEq, runClient, connectFromArgs;
 
@@ -69,7 +68,8 @@ int main(string[] args) @safe
 		// The result carries the CacheableResult fields the stable spec
 		// requires on a 2026-07-28 session; `entries` types the drained pages.
 		auto listed = client.skillsList();
-		check(!listed.cache.isNull, "skills/list on a modern session should carry ttlMs/cacheScope");
+		check(!listed.cache.isNull,
+			"skills/list on a modern session should carry ttlMs/cacheScope");
 		auto skills = listed.entries;
 		auto names = skills.map!(s => s.name).array;
 		checkEq(skills.length, 5, "skills/list should carry five entries");
@@ -131,8 +131,7 @@ int main(string[] args) @safe
 
 		// --- 5. skills/get + host-side verification --------------------------
 		auto got = client.skillsGet("skill://team/release-helper/SKILL.md");
-		check(!got.cache.isNull,
-			"skills/get on a modern session should carry ttlMs/cacheScope");
+		check(!got.cache.isNull, "skills/get on a modern session should carry ttlMs/cacheScope");
 		auto fetched = got.entry;
 		checkEq(fetched.name, "release-helper", "skills/get should return the entry by uri");
 		auto relMd = readSkillUri(client, fetched.uri);

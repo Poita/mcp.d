@@ -42,7 +42,6 @@ module sampling_client;
 import std.algorithm : canFind, map;
 import std.array : array;
 
-
 import mcp;
 import examples_common : check, runClient, connectFromArgs;
 

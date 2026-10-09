@@ -36,7 +36,6 @@ module tasks_client;
 
 import std.stdio : writeln;
 
-
 import mcp;
 import examples_common : check, checkEq, runClient, connectFromArgs;
 
