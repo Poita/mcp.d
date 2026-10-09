@@ -126,8 +126,9 @@ struct JwtVerifierConfig
 /// Concurrency: the returned validator and its internal `JwksCache` hold
 /// unsynchronized mutable state (the cached PEM keys and fetch timestamp). Like
 /// the rest of the SDK they are bound to vibe.d's default single-threaded event
-/// loop, where the only fiber yield is the JWKS network fetch (which completes
-/// before the cache is mutated), so concurrent fibers never corrupt the cache.
+/// loop, where the only fiber yield is the JWKS network fetch (run inline or as
+/// a background refresh task, and completed before the cache is mutated), so
+/// concurrent fibers never corrupt the cache.
 /// Do not share the validator across worker threads; running the router with
 /// `HTTPServerOption.distribute` or worker threads is unsupported (see the
 /// concurrency contract in `mcp.transport.session`).
@@ -673,11 +674,16 @@ private string pkeyToPem(EVP_PKEY* pkey) @trusted
 /// A TTL cache for a JWKS document, refetched on demand. Selects keys by `kid`;
 /// when a token's `kid` is unknown, every JWKS key is offered as a candidate.
 ///
-/// The document is refetched when the TTL lapses and when a token names a `kid`
-/// the cache does not hold (the IdP may have rotated in a new key). Fetch
-/// attempts, successful or not, are spaced at least `minRefetchInterval` apart
-/// and single-flighted, so neither an unreachable IdP nor a stream of tokens
-/// with made-up `kid`s can turn every request into an outbound fetch.
+/// Once the TTL lapses the cached keys keep verifying tokens while a background
+/// task refetches the document (stale-while-revalidate), so an IdP outage never
+/// stalls requests whose keys are already cached. A request blocks on a fetch
+/// only when no usable keys are held (never loaded, or older than
+/// `maxStaleness`) or when its token names a `kid` the cache does not hold (the
+/// IdP may have rotated in a new key). Fetch attempts, successful or not, are
+/// spaced at least `minRefetchInterval` apart, measured from when the previous
+/// attempt finished, and single-flighted, so neither an unreachable IdP nor a
+/// stream of tokens with made-up `kid`s can turn every request into an outbound
+/// fetch.
 package final class JwksCache : KeySource
 {
 	import vibe.core.sync : TaskMutex;
@@ -701,8 +707,9 @@ package final class JwksCache : KeySource
 	private string[string] pemByKid; // kid -> PEM
 	private string[] allPems;
 	private long fetchedAt = -1;
-	private long lastAttemptAt = -1;
+	private long lastAttemptAt = -1; // when the last fetch attempt finished
 	private bool loaded = false;
+	private bool refreshQueued = false;
 	private TaskMutex fetchLock;
 
 	/// Fetches the JWKS document at a URI, returning its body or null on
@@ -713,6 +720,10 @@ package final class JwksCache : KeySource
 	/// drive it by hand.
 	package long delegate() @safe clock;
 
+	/// Starts a background refresh. Null selects `vibe.core.core.runTask`;
+	/// tests queue the refresh and run it by hand.
+	package void delegate(void delegate() @safe nothrow) @safe spawn;
+
 	this(string uri, Duration ttl, SsrfPolicy policy = SsrfPolicy.allowLoopback) @safe
 	{
 		this.uri = uri;
@@ -721,8 +732,9 @@ package final class JwksCache : KeySource
 		this.fetchLock = new TaskMutex;
 	}
 
-	/// Candidate PEM keys for a `kid`. Triggers a (re)fetch when the cache is
-	/// stale or does not hold `kid`.
+	/// Candidate PEM keys for a `kid`. Blocks on a (rate-limited) fetch when no
+	/// usable keys are held or `kid` is unknown; when the keys are merely past
+	/// their TTL, returns them and refreshes in the background.
 	string[] keysFor(string kid) @safe
 	{
 		if (uri.length == 0)
@@ -731,11 +743,12 @@ package final class JwksCache : KeySource
 				return kidKeys(kid);
 			return null;
 		}
-		const stale = !loaded || now() - fetchedAt >= cast(long) ttl.total!"seconds";
 		const unknownKid = kid.length && (kid in pemByKid) is null;
-		if (stale || unknownKid)
+		if (!loaded || tooStale() || unknownKid)
 			refetch();
-		if (loaded && now() - fetchedAt >= cast(long) maxStaleness.total!"seconds")
+		else if (now() - fetchedAt >= cast(long) ttl.total!"seconds")
+			refreshInBackground();
+		if (tooStale())
 		{
 			import vibe.core.log : logWarn;
 
@@ -753,6 +766,17 @@ package final class JwksCache : KeySource
 		return clock !is null ? clock() : currentUnixTime();
 	}
 
+	/// Whether the held keys are older than `maxStaleness`.
+	private bool tooStale() @safe
+	{
+		return loaded && now() - fetchedAt >= cast(long) maxStaleness.total!"seconds";
+	}
+
+	private bool attemptedRecently() @safe
+	{
+		return lastAttemptAt >= 0 && now() - lastAttemptAt < minRefetchInterval.total!"seconds";
+	}
+
 	private string[] kidKeys(string kid) @safe
 	{
 		if (kid.length)
@@ -762,7 +786,36 @@ package final class JwksCache : KeySource
 		return allPems.dup;
 	}
 
-	/// Fetch the document unless an attempt happened within
+	/// Queue one background `refetch` unless one is already queued or an
+	/// attempt finished within `minRefetchInterval`.
+	private void refreshInBackground() @safe
+	{
+		if (refreshQueued || attemptedRecently())
+			return;
+		refreshQueued = true;
+		void delegate() @safe nothrow refresh = () @safe nothrow{
+			scope (exit)
+				refreshQueued = false;
+			try
+				refetch();
+			catch (Exception e)
+			{
+				import vibe.core.log : logWarn;
+
+				logWarn("JWKS background refresh from %s failed: %s", uri, e.msg);
+			}
+		};
+		if (spawn !is null)
+			spawn(refresh);
+		else
+		{
+			import vibe.core.core : runTask;
+
+			runTask(refresh);
+		}
+	}
+
+	/// Fetch the document unless an attempt finished within
 	/// `minRefetchInterval`. Holding `fetchLock` for the fetch makes concurrent
 	/// callers wait for the one in flight and then find the attempt recent.
 	private void refetch() @safe
@@ -770,10 +823,10 @@ package final class JwksCache : KeySource
 		fetchLock.lock();
 		scope (exit)
 			fetchLock.unlock();
-		const t = now();
-		if (lastAttemptAt >= 0 && t - lastAttemptAt < minRefetchInterval.total!"seconds")
+		if (attemptedRecently())
 			return;
-		lastAttemptAt = t;
+		scope (exit)
+			lastAttemptAt = now();
 		const doc = fetcher !is null ? fetcher(uri) : fetchJwks(uri, policy);
 		if (doc.length == 0)
 			return;
@@ -1966,6 +2019,7 @@ version (unittest)
 		long clock = 1_000;
 		string served;
 		JwksCache cache;
+		void delegate() @safe nothrow[] pending;
 
 		this(string served, void delegate() @safe duringFetch = null) @safe
 		{
@@ -1978,6 +2032,18 @@ version (unittest)
 				return this.served;
 			};
 			cache.clock = () @safe => clock;
+			cache.spawn = (void delegate() @safe nothrow refresh) @safe {
+				pending ~= refresh;
+			};
+		}
+
+		/// Run the background refreshes queued so far.
+		void drain() @safe
+		{
+			auto queued = pending;
+			pending = null;
+			foreach (refresh; queued)
+				refresh();
 		}
 	}
 }
@@ -1994,6 +2060,35 @@ unittest  // JwksCache refetches on an unknown kid so a rotated-in key verifies 
 	auto keys = s.cache.keysFor("ec-new");
 	assert(s.fetches == 2);
 	assert(keys.length == 1, "the rotated-in key must be selected by its kid");
+}
+
+unittest  // JwksCache serves stale keys immediately and refreshes them in the background
+{
+	auto s = new ScriptedJwks(rsaOnlyJwks);
+	assert(s.cache.keysFor("rsa-1").length == 1);
+
+	s.served = rotatedJwks;
+	s.clock += 300;
+	foreach (i; 0 .. 3)
+		assert(s.cache.keysFor("rsa-1").length == 1, "stale keys must keep verifying");
+	assert(s.fetches == 1, "a merely stale cache must not block the request on a fetch");
+	assert(s.pending.length == 1, "exactly one background refresh is queued");
+
+	s.drain();
+	assert(s.fetches == 2);
+	assert(s.cache.keysFor("ec-new").length == 1);
+	assert(s.fetches == 2, "the background refresh already loaded the rotated key");
+}
+
+unittest  // JwksCache spaces fetch attempts from when the last one finished, not started
+{
+	ScriptedJwks s;
+	// Each fetch hangs for 15 seconds (an unreachable IdP) and then fails.
+	s = new ScriptedJwks(null, () @safe { s.clock += 15; });
+	assert(s.cache.keysFor("rsa-1").length == 0);
+	assert(s.cache.keysFor("rsa-1").length == 0);
+	assert(s.fetches == 1,
+			"a request arriving right after a slow failed fetch must not stall again");
 }
 
 unittest  // JwksCache rate-limits unknown-kid refetches (junk kids cannot drive outbound fetches)
@@ -2039,6 +2134,8 @@ unittest  // a refetched JWKS with no usable keys keeps the previously cached ke
 	s.served = `{"keys":[{"kty":"RSA","kid":"enc","use":"enc","n":"` ~ testRsaN
 		~ `","e":"` ~ testRsaE ~ `"}]}`;
 	s.clock += 300;
+	s.cache.keysFor("rsa-1");
+	s.drain();
 	assert(s.cache.keysFor("rsa-1").length == 1, "an empty key set must not evict the cached keys");
 	assert(s.fetches == 2);
 }
@@ -2059,6 +2156,8 @@ unittest  // a refetched JWKS that is not valid JSON keeps the cached keys and d
 
 	s.served = `{not valid json`;
 	s.clock += 300;
+	s.cache.keysFor("rsa-1");
+	s.drain();
 	assert(s.cache.keysFor("rsa-1").length == 1);
 	assert(s.fetches == 2);
 }
@@ -2072,6 +2171,9 @@ unittest  // cached JWKS keys are dropped once refetches have failed for longer 
 	s.served = null;
 	s.clock += 300;
 	assert(s.cache.keysFor("rsa-1").length == 1);
+	s.drain();
+	assert(s.cache.keysFor("rsa-1").length == 1);
+	assert(s.fetches == 2);
 
 	s.clock += JwksCache.defaultMaxStaleness.total!"seconds";
 	assert(s.cache.keysFor("rsa-1").length == 0);
