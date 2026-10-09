@@ -142,6 +142,15 @@ These conventions are enforced by review (and some by CI). Please follow them:
   via `source/mcp/package.d` and usable from `McpServer` / `McpClient` /
   `RequestContext` (or the UDA layer), with a runnable path for callers.
 - **Use `std.getopt`** for any command-line argument parsing.
+- **`@trusted` only around a specific `@system` operation.** Code is `@safe`
+  by default. Reach for `@trusted` only after the compiler rejects the `@safe`
+  version, and wrap just the offending call or cast (e.g.
+  `() @trusted { return cast(string) buf; }()`) rather than the surrounding
+  function, so the rest of the body stays checked. Most vibe.d and Phobos calls
+  are already `@safe`, and a vibe `Json` iterates safely via `byKeyValue` /
+  `byValue` rather than `foreach` over the `Json` itself. A whole function is
+  `@trusted` only when it presents a safe interface over a C API (OpenSSL,
+  POSIX, Win32) whose body is mostly foreign calls.
 
 ## Running the conformance suite locally
 
