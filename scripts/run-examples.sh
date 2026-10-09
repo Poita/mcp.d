@@ -38,6 +38,7 @@ port_for() {
     streaming) echo 9357 ;;
     tasks) echo 8643 ;;
     events) echo 8646 ;;
+    hello) echo 8540 ;;
     tools) echo 8530 ;;
     *) echo 8600 ;;
   esac

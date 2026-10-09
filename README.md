@@ -580,14 +580,18 @@ exchange) use the lower-level `OAuthClient` and `setBearerToken`.
 
 ## Examples
 
-The repository ships fifteen runnable, self-verifying server/client pairs in
+The repository ships sixteen runnable, self-verifying server/client pairs in
 [`examples/`](examples/) (plus `examples/common`, a small shared helper package).
+[`examples/hello`](examples/hello/) is the standalone one to copy into a new
+project; the others use the repo-only `examples/common` scaffold, and
+[`examples/README.md`](examples/README.md) lists the SDK calls that replace it.
 Each `client.d` is an end-to-end test that asserts the matching server's
 behaviour, and CI runs every pair over **both** stdio and Streamable HTTP, except
 Auth, which is HTTP-only.
 
 | Example | What it shows | Server | Client |
 | --- | --- | --- | --- |
+| Hello | minimal standalone server + client (no shared scaffold) | [server](examples/hello/server.d) | [client](examples/hello/client.d) |
 | Tools | `@tool` handlers with typed args/results | [server](examples/tools/server.d) | [client](examples/tools/client.d) |
 | Prompts | `@prompt` templates | [server](examples/prompts/server.d) | [client](examples/prompts/client.d) |
 | Resources | resources + templates + `subscriptions/listen` push | [server](examples/resources/server.d) | [client](examples/resources/client.d) |

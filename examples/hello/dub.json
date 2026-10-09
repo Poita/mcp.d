@@ -1,0 +1,22 @@
+{
+	"name": "hello",
+	"description": "Minimal standalone mcp.d server + client (stdio and Streamable HTTP)",
+	"license": "Apache-2.0",
+	"dependencies": {
+		"mcp-d": { "path": "../.." }
+	},
+	"configurations": [
+		{
+			"name": "server",
+			"targetType": "executable",
+			"targetName": "hello-server",
+			"mainSourceFile": "server.d"
+		},
+		{
+			"name": "client",
+			"targetType": "executable",
+			"targetName": "hello-client",
+			"mainSourceFile": "client.d"
+		}
+	]
+}
