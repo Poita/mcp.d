@@ -139,6 +139,7 @@ struct ModelHint
 
 	static ModelHint fromJson(Json j) @safe
 	{
+		requireObject(j, "ModelHint");
 		ModelHint h;
 		h.name = j.getOr("name", "");
 		return h;
@@ -762,6 +763,15 @@ unittest  // ModelPreferences round-trips through fromJson
 	assert(back.hints.length == 1 && back.hints[0].name == "gemini");
 	assert(back.speedPriority.get == 0.5);
 	assert(back.costPriority.isNull);
+}
+
+unittest  // ModelHint.fromJson rejects a non-object value with -32602
+{
+	import mcp.protocol.errors : ErrorCode;
+	import std.exception : collectException;
+
+	auto ex = cast(McpException) collectException(ModelHint.fromJson(Json("claude")));
+	assert(ex !is null && ex.code == ErrorCode.invalidParams);
 }
 
 unittest  // CreateMessageRequest serializes all set params and omits unset
