@@ -180,12 +180,13 @@ package TokenInfo verifyOrInvalid(scope TokenInfo delegate() @safe verify) @safe
 // Verification core (pure of HTTP / clock; unit-testable)
 // ===========================================================================
 
-/// A source of candidate verification keys. `keysFor(kid)` returns the PEM
+/// A source of candidate verification keys. `keysFor(kid, alg)` returns the PEM
 /// public keys to try for a token bearing the given `kid` (empty `kid` means the
-/// header had none).
+/// header had none), restricted to the key family `alg` verifies with (empty
+/// `alg` means any family).
 package interface KeySource
 {
-	string[] keysFor(string kid) @safe;
+	string[] keysFor(string kid, string alg = null) @safe;
 
 	/// Whether the source holds no keys because fetching them failed, so a
 	/// token it cannot verify may still be good. `retryAfter` is set to when
@@ -247,7 +248,7 @@ package TokenInfo verifyToken(JwtVerifierConfig cfg, string token, KeySource key
 
 	// Gather candidate keys: pinned PEM keys plus any JWKS keys for this kid.
 	string[] candidates = cfg.staticPublicKeysPem.dup;
-	candidates ~= keys.keysFor(kid);
+	candidates ~= keys.keysFor(kid, alg);
 	Duration retryAfter;
 	const keysUnavailable = keys.unavailable(retryAfter);
 	if (candidates.length == 0)
@@ -730,8 +731,16 @@ package final class JwksCache : KeySource
 	private string uri;
 	private Duration ttl;
 	private SsrfPolicy policy;
-	private string[string] pemByKid; // kid -> PEM
-	private string[] allPems;
+	private static struct Key
+	{
+		string kty;
+		string pem;
+	}
+
+	// RFC 7517 4.5 lets keys of different types share a kid, so each kid maps
+	// to every key carrying it.
+	private Key[][string] keysByKid;
+	private Key[] allKeys;
 	private long fetchedAt = -1;
 	private long lastAttemptAt = -1; // when the last fetch attempt finished
 	private bool loaded = false;
@@ -761,15 +770,15 @@ package final class JwksCache : KeySource
 	/// Candidate PEM keys for a `kid`. Blocks on a (rate-limited) fetch when no
 	/// usable keys are held or `kid` is unknown; when the keys are merely past
 	/// their TTL, returns them and refreshes in the background.
-	string[] keysFor(string kid) @safe
+	string[] keysFor(string kid, string alg = null) @safe
 	{
 		if (uri.length == 0)
 		{
 			if (loaded)
-				return kidKeys(kid);
+				return kidKeys(kid, alg);
 			return null;
 		}
-		const unknownKid = kid.length && (kid in pemByKid) is null;
+		const unknownKid = kid.length && (kid in keysByKid) is null;
 		if (!loaded || tooStale() || unknownKid)
 			refetch();
 		else if (now() - fetchedAt >= cast(long) ttl.total!"seconds")
@@ -780,11 +789,11 @@ package final class JwksCache : KeySource
 
 			logWarn("JWKS from %s has not been refreshed within %s; dropping the cached keys",
 					uri, maxStaleness);
-			pemByKid = null;
-			allPems = null;
+			keysByKid = null;
+			allKeys = null;
 			loaded = false;
 		}
-		return kidKeys(kid);
+		return kidKeys(kid, alg);
 	}
 
 	/// Whether a fetch has failed and no keys are held.
@@ -813,13 +822,20 @@ package final class JwksCache : KeySource
 		return lastAttemptAt >= 0 && now() - lastAttemptAt < minRefetchInterval.total!"seconds";
 	}
 
-	private string[] kidKeys(string kid) @safe
+	/// The PEMs of the keys under `kid` (every key when `kid` is absent or
+	/// unknown) whose type `alg` verifies with.
+	private string[] kidKeys(string kid, string alg) @safe
 	{
+		const(Key)[] pool = allKeys;
 		if (kid.length)
-			if (auto p = kid in pemByKid)
-				return [*p];
-		// Unknown/absent kid: offer all keys.
-		return allPems.dup;
+			if (auto p = kid in keysByKid)
+				pool = *p;
+		const kty = alg == "RS256" ? "RSA" : alg == "ES256" ? "EC" : null;
+		string[] pems;
+		foreach (k; pool)
+			if (kty.length == 0 || k.kty == kty)
+				pems ~= k.pem;
+		return pems;
 	}
 
 	/// Queue one background `refetch` unless one is already queued or an
@@ -884,8 +900,8 @@ package final class JwksCache : KeySource
 		// Build new key maps in temporaries so that a parse exception (malformed
 		// JSON or invalid base64url in a JWK field) leaves the existing cache
 		// state untouched rather than clearing it and marking it stale.
-		string[string] newPemByKid;
-		string[] newAllPems;
+		Key[][string] newKeysByKid;
+		Key[] newAllKeys;
 		foreach (jwk; parseJwks(jwksJson))
 		{
 			if (!jwkUsableForSig(jwk))
@@ -893,14 +909,15 @@ package final class JwksCache : KeySource
 			const pem = jwkToPem(jwk);
 			if (pem.length == 0)
 				continue;
-			newAllPems ~= pem;
+			const key = Key(jwk.kty, pem);
+			newAllKeys ~= key;
 			if (jwk.kid.length)
-				newPemByKid[jwk.kid] = pem;
+				newKeysByKid[jwk.kid] ~= key;
 		}
 		// A document with no usable key is treated like a failed fetch: the
 		// previous keys stay and the cache stays stale, so the next fetch is
 		// governed by `minRefetchInterval` rather than the full TTL.
-		if (newAllPems.length == 0)
+		if (newAllKeys.length == 0)
 		{
 			import vibe.core.log : logWarn;
 
@@ -910,8 +927,8 @@ package final class JwksCache : KeySource
 			return;
 		}
 		// Swap atomically into the cache fields only after all parsing succeeds.
-		pemByKid = newPemByKid;
-		allPems = newAllPems;
+		keysByKid = newKeysByKid;
+		allKeys = newAllKeys;
 		loaded = true;
 		fetchedAt = now();
 	}
@@ -1146,7 +1163,7 @@ version (unittest)
 	// A KeySource that returns no JWKS keys (pinned-PEM-only tests).
 	private final class NoKeys : KeySource
 	{
-		string[] keysFor(string kid) @safe
+		string[] keysFor(string kid, string alg = null) @safe
 		{
 			return null;
 		}
@@ -1683,6 +1700,28 @@ unittest  // JwksCache.keysFor selects by kid, then refreshes from a new documen
 			~ testEcX ~ `","y":"` ~ testEcY ~ `"}]}`);
 	assert(cache.keysFor("rsa-1").length == 1); // falls back to all keys
 	assert(cache.keysFor("ec-9").length == 1);
+}
+
+unittest  // JWKs of different key types sharing a kid are all kept and selected by the token's alg
+{
+	JwtVerifierConfig cfg;
+	cfg.allowAnyIssuer = true;
+	const rsa = `{"kty":"RSA","kid":"rsa-1","n":"` ~ testRsaN ~ `","e":"` ~ testRsaE ~ `"}`;
+	const ec = `{"kty":"EC","kid":"rsa-1","crv":"P-256","x":"` ~ testEcX ~ `","y":"` ~ testEcY
+		~ `"}`;
+	const es256 = makeEs256(`{"exp":1700003600}`, "rsa-1");
+
+	foreach (doc; [
+			`{"keys":[` ~ rsa ~ `,` ~ ec ~ `]}`, `{"keys":[` ~ ec ~ `,` ~ rsa ~ `]}`
+		])
+	{
+		auto cache = new JwksCache("", cfg.jwksCacheTtl);
+		cache.load(doc);
+		assert(cache.keysFor("rsa-1", "RS256").length == 1);
+		assert(cache.keysFor("rsa-1", "ES256").length == 1);
+		assert(verifyToken(cfg, testRs256Jwt, cache, 1_700_001_000).valid);
+		assert(verifyToken(cfg, es256, cache, 1_700_001_000).valid);
+	}
 }
 
 unittest  // a JWK declaring use!="sig" is excluded as a verification candidate (RFC 7517 4.2)
