@@ -2753,6 +2753,18 @@ final class McpClient : ClientProtocol
 	}
 
 	// --- MCP Events extension (2026-07-28) --------------------------------------
+	// Modern sessions only: on a released protocol every Events call below throws
+	// a `methodNotFound` `McpException` without contacting the server.
+
+	/// Throw when the Events extension method `method` is called on a session
+	/// that is not modern: the extension exists only on the 2026-07-28 protocol.
+	private void ensureEventsSession(string method) @safe
+	{
+		if (!useModern)
+			throw new McpException(ErrorCode.methodNotFound, method
+					~ " requires the 2026-07-28 protocol; "
+					~ "call enableModern() or connect() first");
+	}
 
 	/// Whether the connected server advertised the Events extension. Only true on
 	/// a modern session whose `server/discover`/`initialize` capabilities carried
@@ -2767,6 +2779,7 @@ final class McpClient : ClientProtocol
 	/// `events` aggregates every page (and `nextCursor` is null).
 	EventListResult listEvents(RequestOptions opts = RequestOptions.init) @safe
 	{
+		ensureEventsSession("events/list");
 		return drainList!EventListResult("events/list", Json.emptyObject,
 				(ref EventListResult a, ref EventListResult r) @safe {
 			a.events ~= r.events;
@@ -2778,6 +2791,7 @@ final class McpClient : ClientProtocol
 	/// `nextPollMs`, persisting the returned `cursor` and passing it back.
 	PollResult pollEvents(PollParams p, RequestOptions opts = RequestOptions.init) @safe
 	{
+		ensureEventsSession("events/poll");
 		return PollResult.fromJson(rpcWith("events/poll", p.toJson(), opts));
 	}
 
@@ -2795,10 +2809,9 @@ final class McpClient : ClientProtocol
 	{
 		import std.conv : to;
 
+		ensureEventsSession("events/stream");
 		const id = nextId++;
-		Json params = p.toJson();
-		if (useModern)
-			params = injectModernMeta(params);
+		Json params = injectModernMeta(p.toJson());
 		auto message = makeRequest(Json(id), "events/stream", params);
 		const key = id.to!string;
 		// Register before opening so an occurrence racing the open is routable.
@@ -2824,6 +2837,7 @@ final class McpClient : ClientProtocol
 	SubscribeResult subscribeWebhookEvents(SubscribeParams p,
 			RequestOptions opts = RequestOptions.init) @safe
 	{
+		ensureEventsSession("events/subscribe");
 		return SubscribeResult.fromJson(rpcWith("events/subscribe", p.toJson(), opts));
 	}
 
@@ -2831,6 +2845,7 @@ final class McpClient : ClientProtocol
 	/// keyed by `(principal, url, name, arguments)`.
 	void unsubscribeWebhookEvents(UnsubscribeParams p, RequestOptions opts = RequestOptions.init) @safe
 	{
+		ensureEventsSession("events/unsubscribe");
 		rpcWith("events/unsubscribe", p.toJson(), opts);
 	}
 
@@ -2935,6 +2950,7 @@ final class McpClient : ClientProtocol
 	EventSubscription subscribePoll(PollParams p, void delegate(EventOccurrence) @safe onEvent,
 			void delegate(EventControl) @safe onControl = null) @safe
 	{
+		ensureEventsSession("events/poll");
 		auto sub = new EventSubscription();
 		sub.setMode(DeliveryMode.poll);
 		sub.dedupCapacity(eventSettings_.dedupWindow);
@@ -3023,6 +3039,7 @@ final class McpClient : ClientProtocol
 	EventSubscription subscribeStream(StreamParams p, void delegate(EventOccurrence) @safe onEvent,
 			void delegate(EventControl) @safe onControl = null) @safe
 	{
+		ensureEventsSession("events/stream");
 		auto sub = new EventSubscription();
 		sub.setMode(DeliveryMode.push);
 		sub.dedupCapacity(eventSettings_.dedupWindow);
@@ -5490,8 +5507,6 @@ unittest  // plain verbs honour RequestOptions: progress token, log level and ca
 		seen[method] = params;
 		if (method == "skills/list")
 			return Json(["skills": Json.emptyArray]);
-		if (method == "events/list")
-			return Json(["events": Json.emptyArray]);
 		if (method == "resources/directory/read")
 			return Json(["resources": Json.emptyArray]);
 		if (method == "tasks/get")
@@ -5507,18 +5522,13 @@ unittest  // plain verbs honour RequestOptions: progress token, log level and ca
 	c.unsubscribe("file:///a", opts);
 	c.readDirectory("file:///d", opts);
 	c.skillsList(opts);
-	c.listEvents(opts);
 	c.getTaskState("t1", opts);
 	c.cancelTask("t1", opts);
 	c.setLogLevel("info", opts);
-	UnsubscribeParams u;
-	u.name = "e";
-	u.url = "https://example.com/hook";
-	c.unsubscribeWebhookEvents(u, opts);
 	foreach (method; [
 		"ping", "resources/subscribe", "resources/unsubscribe",
-		"resources/directory/read", "skills/list", "events/list", "tasks/get",
-		"tasks/cancel", "logging/setLevel", "events/unsubscribe"
+		"resources/directory/read", "skills/list", "tasks/get",
+		"tasks/cancel", "logging/setLevel"
 	])
 		assert(seen[method]["_meta"]["progressToken"].get!string == "p1", method);
 
@@ -5532,6 +5542,28 @@ unittest  // plain verbs honour RequestOptions: progress token, log level and ca
 	catch (McpException e)
 		code = e.code;
 	assert(code == ErrorCode.requestCancelled);
+}
+
+unittest  // the Events extension verbs honour RequestOptions' progress token
+{
+	auto c = McpClient.http("http://localhost");
+	c.enableModern();
+	Json[string] seen;
+	c.onRpcForTest = (string method, Json params) @safe {
+		seen[method] = params;
+		if (method == "events/list")
+			return Json(["events": Json.emptyArray]);
+		return Json.emptyObject;
+	};
+	RequestOptions opts;
+	opts.progressToken = ProgressToken("p1");
+	c.listEvents(opts);
+	UnsubscribeParams u;
+	u.name = "e";
+	u.url = "https://example.com/hook";
+	c.unsubscribeWebhookEvents(u, opts);
+	foreach (method; ["events/list", "events/unsubscribe"])
+		assert(seen[method]["_meta"]["progressToken"].get!string == "p1", method);
 }
 
 unittest  // callToolAwait takes RequestOptions in the same position as callTool
@@ -8465,6 +8497,7 @@ unittest  // a non-converging pagination cursor is reported as a server fault, n
 unittest  // pollEvents sends every field of its PollParams
 {
 	auto c = McpClient.http("http://localhost");
+	c.enableModern();
 	Json sent;
 	c.onRpcForTest = (string method, Json params) @safe {
 		assert(method == "events/poll");
@@ -8488,6 +8521,7 @@ unittest  // streamEvents opens events/stream from its StreamParams
 {
 	auto t = new RecordingClientTransport();
 	auto c = new McpClient(t);
+	c.enableModern();
 	StreamParams p;
 	p.name = "incident.created";
 	p.cursor = "c1";
@@ -10023,6 +10057,7 @@ unittest  // concurrent push streams for one event type each get only their own 
 	// two same-event streams independent.
 	auto transport = new RecordingClientTransport();
 	auto c = new McpClient(transport);
+	c.enableModern();
 
 	int aCount, bCount;
 	string aSev, bSev;
@@ -10061,6 +10096,7 @@ unittest  // a push terminated control is delivered typed and drops the stream's
 {
 	auto transport = new RecordingClientTransport();
 	auto c = new McpClient(transport);
+	c.enableModern();
 
 	int events;
 	EventControl gotCtrl;
@@ -10090,6 +10126,7 @@ unittest  // cancelling a stream deregisters its handlers (later occurrences ign
 {
 	auto transport = new RecordingClientTransport();
 	auto c = new McpClient(transport);
+	c.enableModern();
 
 	int events;
 	auto s = c.streamEvents(StreamParams("incident.created"), (EventOccurrence o) @safe {
@@ -10112,6 +10149,7 @@ version (unittest) private enum managedTestWhsec = "whsec_AAAAAAAAAAAAAAAAAAAAAA
 unittest  // subscribePoll's loop: delivers events, advances the cursor, drains hasMore, signals a gap
 {
 	auto c = new McpClient(new RecordingClientTransport());
+	c.enableModern();
 	int polls;
 	c.onRpcForTest = (string method, Json params) @safe {
 		assert(method == "events/poll");
@@ -10151,6 +10189,7 @@ unittest  // subscribePoll's loop: delivers events, advances the cursor, drains 
 unittest  // the poll loop clamps a tiny nextPollMs up to the default 1000 ms floor
 {
 	auto c = new McpClient(new RecordingClientTransport());
+	c.enableModern();
 	c.onRpcForTest = (string method, Json params) @safe {
 		PollResult r;
 		r.cursor = "c";
@@ -10167,6 +10206,7 @@ unittest  // the poll loop clamps a tiny nextPollMs up to the default 1000 ms fl
 unittest  // the poll loop caps a huge nextPollMs at EventClientSettings.pollCeiling
 {
 	auto c = new McpClient(new RecordingClientTransport());
+	c.enableModern();
 	c.onRpcForTest = (string method, Json params) @safe {
 		PollResult r;
 		r.cursor = "c";
@@ -10186,6 +10226,7 @@ unittest  // cancelling a poll subscription wakes its loop from a long nextPollM
 	import vibe.core.core : exitEventLoop, runEventLoop, runTask, sleep;
 
 	auto c = new McpClient(new RecordingClientTransport());
+	c.enableModern();
 	c.onRpcForTest = (string method, Json params) @safe {
 		PollResult r;
 		r.cursor = "c";
@@ -10222,6 +10263,7 @@ unittest  // cancelling a poll subscription wakes its loop from a long nextPollM
 unittest  // the poll floor is configurable via EventClientSettings
 {
 	auto c = new McpClient(new RecordingClientTransport());
+	c.enableModern();
 	EventClientSettings es;
 	es.pollFloor = 5.seconds;
 	c.eventSettings = es;
@@ -10241,6 +10283,7 @@ unittest  // the poll floor is configurable via EventClientSettings
 unittest  // the poll loop delivers a redelivered eventId only once
 {
 	auto c = new McpClient(new RecordingClientTransport());
+	c.enableModern();
 	int polls;
 	c.onRpcForTest = (string method, Json params) @safe {
 		polls++;
@@ -10325,6 +10368,7 @@ unittest  // subscribeEvents looks the type up and opens a push stream for a pus
 {
 	auto t = new RecordingClientTransport();
 	auto c = new McpClient(t);
+	c.enableModern();
 	c.onRpcForTest = (string method, Json params) @safe {
 		assert(method == "events/list");
 		EventListResult r;
@@ -10346,6 +10390,7 @@ unittest  // subscribeEvents looks the type up and opens a push stream for a pus
 unittest  // subscribeEvents falls back to poll and reports an unknown type as NotFound
 {
 	auto c = new McpClient(new RecordingClientTransport());
+	c.enableModern();
 	c.onRpcForTest = (string method, Json params) @safe {
 		EventListResult r;
 		r.events = [
@@ -10366,6 +10411,7 @@ unittest  // subscribeEvents falls back to poll and reports an unknown type as N
 unittest  // subscribeEvents in webhook mode mints a secret, registers the receiver, and subscribes
 {
 	auto c = new McpClient(new RecordingClientTransport());
+	c.enableModern();
 	auto rx = new WebhookReceiver();
 	EventClientSettings es;
 	es.webhook.url = "https://proxy.example.com/hooks/c1";
@@ -10405,6 +10451,7 @@ unittest  // subscribeEvents in webhook mode mints a secret, registers the recei
 unittest  // subscribePoll surfaces a poll error as a typed control and ends the subscription
 {
 	auto c = new McpClient(new RecordingClientTransport());
+	c.enableModern();
 	c.onRpcForTest = (string method, Json params) @safe {
 		throw new McpException(ErrorCode.invalidRequest, "boom");
 	};
@@ -10421,6 +10468,7 @@ unittest  // subscribePoll surfaces a poll error as a typed control and ends the
 unittest  // a throwing poll onEvent ends the subscription with an error control at the last handled cursor
 {
 	auto c = new McpClient(new RecordingClientTransport());
+	c.enableModern();
 	c.onRpcForTest = (string method, Json params) @safe {
 		PollResult r;
 		auto ok = EventOccurrence("e1", "incident.created", "t");
@@ -10454,6 +10502,7 @@ unittest  // a throwing stream onEvent ends the subscription without advancing p
 {
 	auto t = new RecordingClientTransport();
 	auto c = new McpClient(t);
+	c.enableModern();
 	EventControl[] ctrls;
 	auto sub = c.subscribeStream(StreamParams("incident.created"), (EventOccurrence o) @safe {
 		throw new Exception("handler failed");
@@ -10480,6 +10529,7 @@ unittest  // a throwing stream onEvent ends the subscription without advancing p
 unittest  // a poll on a closed transport ends the subscription instead of retrying forever
 {
 	auto c = new McpClient(new RecordingClientTransport());
+	c.enableModern();
 	int polls;
 	c.onRpcForTest = (string method, Json params) @safe {
 		polls++;
@@ -10514,6 +10564,7 @@ unittest  // a request on a closed client fails with TransportClosedException
 unittest  // a transient poll failure is retried with backoff instead of ending the subscription
 {
 	auto c = new McpClient(new RecordingClientTransport());
+	c.enableModern();
 	int polls;
 	c.onRpcForTest = (string method, Json params) @safe {
 		if (++polls <= 3)
@@ -10544,6 +10595,7 @@ unittest  // a transient poll failure is retried with backoff instead of ending 
 unittest  // subscribeStream tracks the cursor and ends the handle on a terminated control
 {
 	auto c = new McpClient(new RecordingClientTransport());
+	c.enableModern();
 	int events;
 	auto sub = c.subscribeStream(StreamParams("incident.created"), (EventOccurrence o) @safe {
 		events++;
@@ -10570,6 +10622,7 @@ unittest  // an events stream the server ends drops its handlers
 {
 	auto t = new RecordingClientTransport();
 	auto c = new McpClient(t);
+	c.enableModern();
 	c.streamEvents(StreamParams("incident.created"), (EventOccurrence o) @safe {});
 	assert(c.eventStreams_.length == 1);
 	t.streams[0].finish();
@@ -10580,6 +10633,7 @@ unittest  // a terminated managed push subscription releases its stream
 {
 	auto t = new RecordingClientTransport();
 	auto c = new McpClient(t);
+	c.enableModern();
 	auto sub = c.subscribeStream(StreamParams("incident.created"), (EventOccurrence o) @safe {
 	});
 	c.dispatchInbound(Message(makeNotification(eventsTerminatedNotification,
@@ -10592,6 +10646,7 @@ unittest  // a terminated managed push subscription releases its stream
 unittest  // a managed push stream drops an occurrence whose eventId was already delivered
 {
 	auto c = new McpClient(new RecordingClientTransport());
+	c.enableModern();
 	int events;
 	auto sub = c.subscribeStream(StreamParams("incident.created"), (EventOccurrence o) @safe {
 		events++;
@@ -10612,6 +10667,7 @@ unittest  // a quiet managed stream is reopened from the last cursor after strea
 {
 	auto t = new RecordingClientTransport();
 	auto c = new McpClient(t);
+	c.enableModern();
 	long now = 0;
 	c.onEventNowForTest = () @safe => now;
 	int events;
@@ -10674,6 +10730,7 @@ unittest  // a managed stream cancelled while its reopen is in flight closes the
 {
 	auto t = new RecordingClientTransport();
 	auto c = new McpClient(t);
+	c.enableModern();
 	long now = 0;
 	c.onEventNowForTest = () @safe => now;
 	int controls;
@@ -10699,6 +10756,7 @@ unittest  // a managed stream whose reopen is refused with a non-transient error
 {
 	auto t = new RecordingClientTransport();
 	auto c = new McpClient(t);
+	c.enableModern();
 	long now = 0;
 	c.onEventNowForTest = () @safe => now;
 	EventControl[] ctrls;
@@ -10724,6 +10782,7 @@ unittest  // a managed stream the server ended with a non-transient error stops 
 {
 	auto t = new RecordingClientTransport();
 	auto c = new McpClient(t);
+	c.enableModern();
 	long now = 0;
 	c.onEventNowForTest = () @safe => now;
 	auto sub = c.subscribeStream(StreamParams("incident.created"), null);
@@ -10742,6 +10801,7 @@ unittest  // a managed stream the server closed cleanly is reopened at the next 
 {
 	auto t = new RecordingClientTransport();
 	auto c = new McpClient(t);
+	c.enableModern();
 	long now = 0;
 	c.onEventNowForTest = () @safe => now;
 	auto sub = c.subscribeStream(StreamParams("incident.created"), null);
@@ -10763,6 +10823,7 @@ unittest  // the watchdog reopens a stream the server closed without waiting out
 
 	auto t = new RecordingClientTransport();
 	auto c = new McpClient(t);
+	c.enableModern();
 	EventClientSettings es;
 	es.streamDeadAfter = 10.seconds;
 	c.eventSettings = es;
@@ -10802,6 +10863,7 @@ unittest  // transient reopen failures back off between attempts
 {
 	auto t = new RecordingClientTransport();
 	auto c = new McpClient(t);
+	c.enableModern();
 	long now = 0;
 	c.onEventNowForTest = () @safe => now;
 	auto sub = c.subscribeStream(StreamParams("incident.created"), null);
@@ -10825,6 +10887,7 @@ unittest  // reopens that end before their leading frame back off between attemp
 {
 	auto t = new RecordingClientTransport();
 	auto c = new McpClient(t);
+	c.enableModern();
 	long now = 0;
 	c.onEventNowForTest = () @safe => now;
 	auto sub = c.subscribeStream(StreamParams("incident.created"), null);
@@ -10847,6 +10910,7 @@ unittest  // streams the server keeps ending right after they open back off betw
 {
 	auto t = new RecordingClientTransport();
 	auto c = new McpClient(t);
+	c.enableModern();
 	long now = 0;
 	c.onEventNowForTest = () @safe => now;
 	auto sub = c.subscribeStream(StreamParams("incident.created"), null);
@@ -10879,6 +10943,7 @@ unittest  // close() cancels managed subscriptions and their watchdog does not r
 {
 	auto t = new RecordingClientTransport();
 	auto c = new McpClient(t);
+	c.enableModern();
 	long now = 0;
 	c.onEventNowForTest = () @safe => now;
 	auto pushed = c.subscribeStream(StreamParams("incident.created"), null);
@@ -10933,6 +10998,40 @@ unittest  // subscriptionsListen fails locally on a legacy session
 	assert(t.listens.length == 0, "a modern-only stream must not be opened on a legacy session");
 }
 
+unittest  // the Events extension calls fail locally on a legacy session
+{
+	import std.exception : collectException;
+
+	auto t = new RecordingClientTransport();
+	auto c = new McpClient(t);
+	string[] sent;
+	c.onRpcForTest = (string method, Json params) @safe {
+		sent ~= method;
+		return Json.emptyObject;
+	};
+	void refused(E)(lazy E call, string what)
+	{
+		auto e = collectException!McpException(call);
+		assert(e !is null && e.code == ErrorCode.methodNotFound,
+				what ~ " must be refused on a legacy session");
+	}
+
+	refused(c.listEvents(), "events/list");
+	refused(c.pollEvents(PollParams("incident.created")), "events/poll");
+	refused(c.streamEvents(StreamParams("incident.created"), (EventOccurrence o) @safe {
+		}), "events/stream");
+	refused(c.subscribeWebhookEvents(SubscribeParams.init), "events/subscribe");
+	refused(c.unsubscribeWebhookEvents(UnsubscribeParams.init), "events/unsubscribe");
+	refused(c.subscribeEvents("incident.created", SubscribeOptions.init, (EventOccurrence o) @safe {
+		}), "subscribeEvents");
+	refused(c.subscribePoll(PollParams("incident.created"), (EventOccurrence o) @safe {
+		}), "subscribePoll");
+	refused(c.subscribeStream(StreamParams("incident.created"), (EventOccurrence o) @safe {
+		}), "subscribeStream");
+	assert(sent.length == 0, "an Events request must not be sent on a legacy session");
+	assert(t.listens.length == 0, "an events/stream must not be opened on a legacy session");
+}
+
 unittest  // a closed client refuses to open a new listen stream
 {
 	import std.exception : collectException;
@@ -10949,6 +11048,7 @@ unittest  // reconnection is disabled by a zero streamDeadAfter
 {
 	auto t = new RecordingClientTransport();
 	auto c = new McpClient(t);
+	c.enableModern();
 	EventClientSettings es;
 	es.streamDeadAfter = Duration.zero;
 	c.eventSettings = es;
@@ -10967,6 +11067,7 @@ unittest  // with reconnection disabled a stream the server ends cleanly ends th
 {
 	auto t = new RecordingClientTransport();
 	auto c = new McpClient(t);
+	c.enableModern();
 	EventClientSettings es;
 	es.streamDeadAfter = Duration.zero;
 	c.eventSettings = es;
@@ -10984,6 +11085,7 @@ unittest  // with reconnection disabled a stream the server fails reports its er
 {
 	auto t = new RecordingClientTransport();
 	auto c = new McpClient(t);
+	c.enableModern();
 	EventClientSettings es;
 	es.streamDeadAfter = Duration.zero;
 	c.eventSettings = es;
@@ -11002,6 +11104,7 @@ unittest  // with reconnection disabled a stream the server fails reports its er
 unittest  // cancelling a managed stream stops delivery
 {
 	auto c = new McpClient(new RecordingClientTransport());
+	c.enableModern();
 	int events;
 	auto sub = c.subscribeStream(StreamParams("incident.created"), (EventOccurrence o) @safe {
 		events++;
@@ -11021,6 +11124,7 @@ unittest  // cancelling a managed stream stops delivery
 unittest  // subscribeWebhook registers the receiver under the server id and tears it down on cancel
 {
 	auto c = new McpClient(new RecordingClientTransport());
+	c.enableModern();
 	int subs, unsubs;
 	c.onRpcForTest = (string method, Json params) @safe {
 		if (method == "events/subscribe")
@@ -11064,6 +11168,7 @@ unittest  // cancelling a webhook subscription wakes its refresh loop from a lon
 	import vibe.core.core : exitEventLoop, runEventLoop, runTask, sleep;
 
 	auto c = new McpClient(new RecordingClientTransport());
+	c.enableModern();
 	c.onRpcForTest = (string method, Json params) @safe => Json.emptyObject;
 	auto sub = new EventSubscription();
 	SubscribeResult first;
@@ -11099,6 +11204,7 @@ unittest  // cancelling a webhook subscription wakes its refresh loop from a lon
 unittest  // cancelling a webhook subscription deregisters the receiver even when unsubscribe fails
 {
 	auto c = new McpClient(new RecordingClientTransport());
+	c.enableModern();
 	c.onRpcForTest = (string method, Json params) @safe {
 		if (method == "events/unsubscribe")
 			throw new McpException(ErrorCode.internalError, "server down");
@@ -11149,6 +11255,7 @@ version (unittest)
 	{
 		auto h = new WebhookHarness;
 		h.client = new McpClient(new RecordingClientTransport());
+		h.client.enableModern();
 		h.client.onRpcForTest = (string method, Json params) @safe {
 			SubscribeResult r;
 			r.id = "sub_x";
@@ -11245,6 +11352,7 @@ unittest  // a webhook occurrence whose handler throws does not advance the curs
 	import mcp.server.webhook_delivery : DeliverySigning, signDeliveryHeaders;
 
 	auto c = new McpClient(new RecordingClientTransport());
+	c.enableModern();
 	c.onRpcForTest = (string method, Json params) @safe {
 		SubscribeResult r;
 		r.id = "sub_x";
@@ -11280,6 +11388,7 @@ unittest  // a webhook occurrence whose handler throws is handled again on redel
 	import mcp.server.webhook_delivery : DeliverySigning, signDeliveryHeaders;
 
 	auto c = new McpClient(new RecordingClientTransport());
+	c.enableModern();
 	c.onRpcForTest = (string method, Json params) @safe {
 		SubscribeResult r;
 		r.id = "sub_x";
@@ -11317,6 +11426,7 @@ unittest  // a webhook occurrence whose handler throws is handled again on redel
 unittest  // a no-expiry grant still refreshes at the health-check cadence
 {
 	auto c = new McpClient(new RecordingClientTransport());
+	c.enableModern();
 	int subs;
 	c.onRpcForTest = (string method, Json params) @safe {
 		if (method == "events/subscribe")
@@ -11350,6 +11460,7 @@ unittest  // a no-expiry grant still refreshes at the health-check cadence
 unittest  // disabling the health-check interval ends the loop for a no-expiry grant
 {
 	auto c = new McpClient(new RecordingClientTransport());
+	c.enableModern();
 	EventClientSettings es;
 	es.noExpiryRefreshInterval = Duration.zero;
 	c.eventSettings = es;
@@ -11373,6 +11484,7 @@ unittest  // disabling the health-check interval ends the loop for a no-expiry g
 unittest  // a webhook refresh the server rejects ends the subscription and reports the error
 {
 	auto c = new McpClient(new RecordingClientTransport());
+	c.enableModern();
 	int subs;
 	c.onRpcForTest = (string method, Json params) @safe {
 		subs++;
@@ -11402,6 +11514,7 @@ unittest  // a webhook refresh the server rejects ends the subscription and repo
 unittest  // transient webhook refresh failures back off between attempts
 {
 	auto c = new McpClient(new RecordingClientTransport());
+	c.enableModern();
 	c.onRpcForTest = (string method, Json params) @safe {
 		throw new McpException(ErrorCode.internalError, "connection lost");
 	};
@@ -11427,6 +11540,7 @@ unittest  // transient webhook refresh failures back off between attempts
 unittest  // the webhook refresh loop re-subscribes before the grant expires
 {
 	auto c = new McpClient(new RecordingClientTransport());
+	c.enableModern();
 	int subs;
 	c.onRpcForTest = (string method, Json params) @safe {
 		if (method == "events/subscribe")
