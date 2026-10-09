@@ -340,6 +340,7 @@ OAuthProxyConfig google(string clientId, string clientSecret, string[] scopes = 
 	OAuthProxyConfig cfg;
 	cfg.upstreamAuthorizationEndpoint = "https://accounts.google.com/o/oauth2/v2/auth";
 	cfg.upstreamTokenEndpoint = "https://oauth2.googleapis.com/token";
+	cfg.upstreamIssuer = "https://accounts.google.com";
 	cfg.upstreamClientId = clientId;
 	cfg.upstreamClientSecret = clientSecret;
 	cfg.tokenEndpointAuthMethod = TokenEndpointAuthMethod.clientSecretPost;
@@ -694,6 +695,12 @@ unittest  // Google fills in its fixed authorize/token endpoints + credentials
 	assert(cfg.upstreamClientId == "client.apps.googleusercontent.com");
 	assert(cfg.upstreamClientSecret == "gsecret");
 	assert(cfg.scopesSupported == ["openid", "email"]);
+}
+
+unittest  // Google pins its RFC 9207 issuer so a mixed-up authorization response is refused
+{
+	auto cfg = google("client.apps.googleusercontent.com", "gsecret");
+	assert(cfg.upstreamIssuer == "https://accounts.google.com");
 }
 
 unittest  // entraId and entraIdTenants require an explicit audience instead of defaulting to the MCP URL
