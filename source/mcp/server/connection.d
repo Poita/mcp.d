@@ -11,9 +11,12 @@ import mcp.server.push : ListenFilter;
 ///
 /// This is the designated home for the mutable per-peer state that would
 /// otherwise leak across concurrently-served connections that share one server
-/// instance. A `McpServer`
-/// itself holds only immutable registration data, declared capabilities, the
-/// `serverInfo`, and the chosen `ServerMode`; per-peer state lives here.
+/// instance. A `McpServer` holds its registrations, declared capabilities, the
+/// `serverInfo`, the chosen `ServerMode`, and server-wide runtimes (tasks,
+/// events); per-peer state lives here. The exception is stdio, which serves a
+/// single peer per process: `McpServer` keeps that peer's stream state itself
+/// (the write sink, the `subscriptions/listen` sink and filter, the open
+/// `events/stream`s) beside the bound `activeConnection`.
 ///
 /// Ownership by mode:
 ///   - stateful: exactly one `ConnectionState` per session, owned by the
