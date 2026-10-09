@@ -2136,18 +2136,29 @@ private void handleEventsStream(McpServer server, Message msg,
 	// (`eventStreamTick`/`eventStreamSleepMs`); this loop only supplies the clock,
 	// the I/O, and the disconnect-on-write-failure break.
 	import core.time : MonoTime;
+	import vibe.core.core : yield;
 
 	const sleepMs = eventStreamSleepMs(emitOnly, pollMs);
 	auto lastHeartbeat = MonoTime.currTime;
+	// Set when the check reported more events than one batch carried: the next
+	// batch is fetched without waiting out the poll cadence (yielding only, so a
+	// check that always reports more cannot monopolise the thread).
+	bool more;
 	while (!handle.stream.terminated)
 	{
 		try
 		{
-			const ec = terminatedEvt.emitCount;
-			() @trusted { terminatedEvt.wait(sleepMs.msecs, ec); }();
+			if (more)
+				yield();
+			else
+			{
+				const ec = terminatedEvt.emitCount;
+				() @trusted { terminatedEvt.wait(sleepMs.msecs, ec); }();
+			}
 		}
 		catch (Exception)
 			break;
+		more = false;
 		if (handle.stream.terminated)
 			break; // the server ended the stream; its final frame is already written
 		const sinceHeartbeatMs = (MonoTime.currTime - lastHeartbeat).total!"msecs";
@@ -2155,7 +2166,7 @@ private void handleEventsStream(McpServer server, Message msg,
 		if (tick.poll)
 		{
 			try
-				rt.advancePushStream(handle.stream);
+				more = rt.advancePushStream(handle.stream);
 			catch (Exception)
 			{
 				break; // client disconnected mid-delivery

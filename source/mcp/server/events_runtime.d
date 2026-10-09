@@ -536,6 +536,10 @@ private enum Verification
 /// The longest wait between two delivery attempts of one job.
 private enum Duration maxRetryBackoff = 60.minutes;
 
+/// The most batches one poll-driven webhook pass fetches for a subscription
+/// whose check keeps reporting more; the next pass carries on from there.
+private enum int maxWebhookFetchesPerPass = 16;
+
 /// The verification backoff bounds: the first probe after a failure waits this long,
 /// doubling on each failure up to the cap.
 private enum long verifyBackoffBaseMs = 30 * 1000;
@@ -1051,27 +1055,30 @@ final class EventsRuntime
 		else
 		{
 			auto er = runCheck(p, ctx);
+			capBatch(er, maxEvents);
 			out_.events = er.events;
 			out_.cursor = er.cursor;
 			out_.truncated = er.truncated;
 			out_.hasMore = er.hasMore;
-			// Enforce maxEvents on a check that returned more. The batch can only be
-			// cut where the last kept event carries its own cursor to resume from;
-			// otherwise the remainder would be skipped, so the batch goes out whole.
-			if (!maxEvents.isNull && maxEvents.get >= 1 && out_.events.length > maxEvents.get)
-			{
-				const n = cast(size_t) maxEvents.get;
-				auto resume = out_.events[n - 1].cursor;
-				if (!resume.isNull)
-				{
-					out_.events = out_.events[0 .. n];
-					out_.cursor = resume;
-					out_.hasMore = true;
-				}
-			}
 		}
 		out_.nextPollMs = nextPollMsFor(p);
 		return out_;
+	}
+
+	// Enforce `maxEvents` on a check that returned more. The batch can only be
+	// cut where the last kept event carries its own cursor to resume from;
+	// otherwise the remainder would be skipped, so the batch goes out whole.
+	private static void capBatch(ref EventResult er, Nullable!long maxEvents) @safe
+	{
+		if (maxEvents.isNull || maxEvents.get < 1 || er.events.length <= maxEvents.get)
+			return;
+		const n = cast(size_t) maxEvents.get;
+		auto resume = er.events[n - 1].cursor;
+		if (resume.isNull)
+			return;
+		er.events = er.events[0 .. n];
+		er.cursor = resume;
+		er.hasMore = true;
 	}
 
 	/// Broadcast an emitted event: append it to the ring buffer (assigning a
@@ -1272,28 +1279,30 @@ final class EventsRuntime
 	}
 
 	/// Advance a push stream on a check-backed type: run the check function from
-	/// the stream's cursor and deliver what it returns. A gap (`truncated`) re-sends
-	/// `notifications/events/active` with `truncated: true` and the fresh cursor
-	/// before the events; a throwing check sends a recoverable
-	/// `notifications/events/error` and the stream stays open. Emit-only streams
-	/// receive their events live from `emit` and need no advancing. Both transports
-	/// call this on their poll cadence.
-	void advancePushStream(PushStream s) @safe
+	/// the stream's cursor, under the server's poll batch cap, and deliver what it
+	/// returns. A gap (`truncated`) re-sends `notifications/events/active` with
+	/// `truncated: true` and the fresh cursor before the events; a throwing check
+	/// sends a recoverable `notifications/events/error` and the stream stays open.
+	/// Emit-only streams receive their events live from `emit` and need no
+	/// advancing. Both transports call this on their poll cadence, and again
+	/// straight away while it returns true: the check reported more events than
+	/// one batch carried.
+	bool advancePushStream(PushStream s) @safe
 	{
 		if (s.terminated || !s.started_)
-			return;
+			return false;
 		auto reg = s.name in types_;
 		if (regIsEmitOnly(reg))
-			return;
+			return false;
 		PollResult r;
 		try
 			r = runPoll(*reg, s.name, s.arguments, s.principal, s.cursor,
-					Nullable!long.init, Nullable!long.init);
+					Nullable!long.init, pollBatchCap(Nullable!long.init));
 		catch (Exception e)
 		{
 			logEventsError("push stream check threw", e);
 			deliverCheckError(s, e);
-			return;
+			return false;
 		}
 		if (r.truncated)
 			s.deliver(eventsActiveNotification,
@@ -1302,6 +1311,7 @@ final class EventsRuntime
 			s.deliver(eventsEventNotification, withSubscriptionId(ev.toJson(), s.subscriptionId));
 		if (!r.cursor.isNull)
 			s.cursor = r.cursor;
+		return r.hasMore;
 	}
 
 	// Report a check that threw on a push stream as a recoverable
@@ -1666,7 +1676,12 @@ final class EventsRuntime
 			er = buffer_.readSince(sub.name, sub.cursor, maxAgeMs, Nullable!long.init);
 		else
 		{
-			auto ctx = new EventContext(sub.fetchCursor, sub.arguments, sub.principal, maxAgeMs);
+			// Replay one capped batch; the poll-driven pass fetches the rest.
+			Nullable!long cap;
+			if (!webhookFetchCap(sub.id, cap))
+				return false;
+			auto ctx = new EventContext(sub.fetchCursor, sub.arguments,
+					sub.principal, maxAgeMs, cap);
 			try
 				er = runCheck(*reg, ctx);
 			catch (Exception e)
@@ -1675,6 +1690,7 @@ final class EventsRuntime
 				logEventsError("webhook backfill check threw", e);
 				return false;
 			}
+			capBatch(er, cap);
 			foreach (ref occ; er.events)
 				if (occ.cursor.isNull)
 					occ.cursor = er.cursor; // a batch-cursor event settles with its batch
@@ -1704,10 +1720,11 @@ final class EventsRuntime
 
 	/// The poll-driven webhook pass: for every live subscription to a check-backed
 	/// type whose cadence has come round, run the check function from the
-	/// subscription's fetch position and enqueue what it returns. A quiet fetch
-	/// with nothing in flight advances the watermark (so the client's cursor moves
-	/// during quiet periods); a fetch that reports `truncated` queues a `gap`
-	/// envelope. Emit-only types are not polled — `emit` routes them live.
+	/// subscription's fetch position and enqueue what it returns, fetching again
+	/// while the check reports more. A quiet fetch with nothing in flight advances
+	/// the watermark (so the client's cursor moves during quiet periods); a fetch
+	/// that reports `truncated` queues a `gap` envelope. Emit-only types are not
+	/// polled — `emit` routes them live.
 	void pollWebhookSubscriptions() @safe
 	{
 		if (!opts_.webhookEnabled)
@@ -1730,48 +1747,90 @@ final class EventsRuntime
 					if (now < *next)
 						continue;
 				nextFetchAt_[sub.id] = now + nextPollMsFor(*reg);
-				auto ctx = new EventContext(sub.fetchCursor, sub.arguments, sub.principal);
-				EventResult er;
-				try
-					er = runCheck(*reg, ctx);
-				catch (Exception e)
+				foreach (_; 0 .. maxWebhookFetchesPerPass)
 				{
-					// A transient upstream failure: the next pass tries again.
-					logEventsError("webhook poll check threw", e);
-					continue;
+					bool more;
+					any |= fetchForWebhook(sub, reg, more);
+					if (!more)
+						break;
 				}
-				foreach (ref occ; er.events)
-					if (occ.cursor.isNull)
-						occ.cursor = er.cursor;
-				// The check can yield, so the subscription may have been removed,
-				// refreshed, or advanced meanwhile: apply this pass's cursors to the
-				// current record, and drop the batch if another pass already fetched it.
-				const gap = er.truncated && !er.cursor.isNull;
-				const fetchedFrom = sub.fetchCursor;
-				WebhookSubscription cur;
-				const applied = modifyWebhook(sub.id, (ref WebhookSubscription s) @safe {
-					if (s.isExpired(opts_.nowMs()) || !s.active || s.fetchCursor != fetchedFrom)
-						return false;
-					s.fetchCursor = er.cursor;
-					// A quiet fetch advances the watermark only when no delivery is
-					// in flight for the subscription — on this node, or, over a
-					// shared queue, on any other.
-					if (!gap && er.events.length == 0 && (s.id in outstanding_) is null
-						&& !deliveryQueue_.hasPendingFor(s.id))
-						s.cursor = er.cursor;
-					return true;
-				}, cur);
-				if (!applied)
-					continue;
-				foreach (occ; er.events)
-					any |= enqueueForWebhook(cur, reg, occ, false);
-				// The gap is queued behind the batch, so the watermark reaches its
-				// position only after the batch settles and the endpoint is verified.
-				if (gap)
-					any |= enqueueGap(cur, er.cursor);
 			}
 		if (any)
 			opts_.deliveryExecutor(() @safe { drainDeliveries(); });
+	}
+
+	// Fetch one batch for `sub` from its fetch position and enqueue it. `more` is
+	// set when the check reported further events and the batch was applied, with
+	// `sub` updated to the record it was applied to. A subscription whose pending
+	// deliveries are at their bound is not fetched: its position stays put, so
+	// the events are fetched once deliveries settle rather than dropped.
+	private bool fetchForWebhook(ref WebhookSubscription sub, EventRegistration* reg, out bool more) @safe
+	{
+		Nullable!long cap;
+		if (!webhookFetchCap(sub.id, cap))
+			return false;
+		auto ctx = new EventContext(sub.fetchCursor, sub.arguments,
+				sub.principal, Nullable!long.init, cap);
+		EventResult er;
+		try
+			er = runCheck(*reg, ctx);
+		catch (Exception e)
+		{
+			// A transient upstream failure: the next pass tries again.
+			logEventsError("webhook poll check threw", e);
+			return false;
+		}
+		capBatch(er, cap);
+		foreach (ref occ; er.events)
+			if (occ.cursor.isNull)
+				occ.cursor = er.cursor;
+		// The check can yield, so the subscription may have been removed,
+		// refreshed, or advanced meanwhile: apply this fetch's cursors to the
+		// current record, and drop the batch if another pass already fetched it.
+		const gap = er.truncated && !er.cursor.isNull;
+		const fetchedFrom = sub.fetchCursor;
+		WebhookSubscription cur;
+		const applied = modifyWebhook(sub.id, (ref WebhookSubscription s) @safe {
+			if (s.isExpired(opts_.nowMs()) || !s.active || s.fetchCursor != fetchedFrom)
+				return false;
+			s.fetchCursor = er.cursor;
+			// A quiet fetch advances the watermark only when no delivery is
+			// in flight for the subscription — on this node, or, over a
+			// shared queue, on any other.
+			if (!gap && er.events.length == 0 && (s.id in outstanding_) is null
+				&& !deliveryQueue_.hasPendingFor(s.id))
+				s.cursor = er.cursor;
+			return true;
+		}, cur);
+		if (!applied)
+			return false;
+		bool any;
+		foreach (occ; er.events)
+			any |= enqueueForWebhook(cur, reg, occ, false);
+		// The gap is queued behind the batch, so the watermark reaches its
+		// position only after the batch settles and the endpoint is verified.
+		if (gap)
+			any |= enqueueGap(cur, er.cursor);
+		sub = cur;
+		more = er.hasMore;
+		return any;
+	}
+
+	// The batch cap for a webhook fetch: the server's poll batch cap, lowered to
+	// the subscription's free pending-delivery slots on this node. False when no
+	// slot is free.
+	private bool webhookFetchCap(string subId, out Nullable!long cap) @safe
+	{
+		cap = pollBatchCap(Nullable!long.init);
+		const bound = opts_.webhookMaxPendingPerSubscription;
+		if (bound <= 0)
+			return true;
+		const room = cast(long) bound - pendingCount_.get(subId, 0);
+		if (room <= 0)
+			return false;
+		if (cap.isNull || cap.get > room)
+			cap = room;
+		return true;
 	}
 
 	// Enqueue one delivery of `occ` for `sub`, applying the type's `match`/
@@ -7557,6 +7616,119 @@ unittest  // a delivered cursor-less job frees its slot under the pending bound
 		rt.pollWebhookSubscriptions();
 	}
 	assert(ft.eventPosts().length == before + 3);
+}
+
+version (unittest)
+{
+	// A check over `total` upstream events at positions "c1".."c<total>" that
+	// honours the batch cap and reports `hasMore` when it stopped short.
+	private EventRegistration pagedCheckType(string name, size_t total) @safe
+	{
+		import std.algorithm : min;
+		import std.conv : to;
+
+		EventRegistration reg;
+		reg.descriptor.name = name;
+		reg.pollInterval = 1.seconds;
+		reg.check = (EventContext ctx) @safe {
+			if (ctx.isBootstrap())
+				return EventResult.empty("c0");
+			const from = ctx.cursor.get[1 .. $].to!size_t;
+			size_t end = total;
+			if (!ctx.maxEvents.isNull)
+				end = min(end, from + cast(size_t) ctx.maxEvents.get);
+			EventOccurrence[] batch;
+			foreach (i; from .. end)
+			{
+				auto occ = EventOccurrence("e" ~ (i + 1).to!string, name, "t");
+				occ.cursor = "c" ~ (i + 1).to!string;
+				batch ~= occ;
+			}
+			return EventResult.of(batch, "c" ~ end.to!string, false, end < total);
+		};
+		return reg;
+	}
+}
+
+unittest  // a push stream advance is batch-capped and reports when more remain
+{
+	EventsOptions o;
+	o.nowMs = () @safe => 1_000_000L;
+	o.nowIso = () @safe => "t";
+	o.pushExecutor = (void delegate() @safe job) @safe { job(); };
+	o.pollDefaultMaxEvents = 2;
+	auto rt = new EventsRuntime(null, o);
+	rt.register(pagedCheckType("paged", 5));
+	int delivered;
+	auto handle = openLive(rt, "paged", Json.emptyObject, "u", Json(1), (string m, Json p) @safe {
+		if (m == eventsEventNotification)
+			delivered++;
+	});
+	handle.stream.cursor = "c0";
+	assert(rt.advancePushStream(handle.stream));
+	assert(delivered == 2);
+	assert(rt.advancePushStream(handle.stream));
+	assert(!rt.advancePushStream(handle.stream));
+	assert(delivered == 5 && handle.stream.cursor.get == "c5");
+	handle.close();
+}
+
+unittest  // a webhook subscription at its pending bound is not fetched past, so nothing is dropped
+{
+	long now = 1_000_000;
+	auto ft = new FakeWebhookTransport();
+	EventsOptions o;
+	o.nowMs = () @safe => now;
+	o.nowIso = () @safe => "t";
+	o.allowPrivateCallbackHosts = true;
+	o.webhookTransport = ft;
+	o.webhookMaxPendingPerSubscription = 2;
+	o.deliverySleep = (Duration d) @safe {};
+	void delegate() @safe[] deferred;
+	o.deliveryExecutor = (void delegate() @safe job) @safe { deferred ~= job; };
+	void runAll() @safe
+	{
+		for (size_t i = 0; i < deferred.length; i++)
+			deferred[i]();
+		deferred = null;
+	}
+
+	auto rt = new EventsRuntime(null, o);
+	rt.register(pagedCheckType("paged", 5));
+	auto p = webhookSub("paged", "https://proxy/hooks");
+	p.cursor = "c0";
+	auto r = rt.subscribeWebhook(p, "user-1");
+	foreach (_; 0 .. 4)
+	{
+		now += 1_000;
+		rt.pollWebhookSubscriptions(); // at the bound: nothing more is fetched
+		runAll();
+	}
+	assert(ft.eventPosts().length == 5);
+	assert(controlPostsOf(ft, "gap").length == 0);
+	assert(rt.webhookStore().get(r.id).get.cursor.get == "c5");
+}
+
+unittest  // a webhook poll pass keeps fetching while the check reports more
+{
+	long now = 1_000_000;
+	auto ft = new FakeWebhookTransport();
+	EventsOptions o;
+	o.nowMs = () @safe => now;
+	o.nowIso = () @safe => "t";
+	o.allowPrivateCallbackHosts = true;
+	o.webhookTransport = ft;
+	o.pollDefaultMaxEvents = 2;
+	o.deliverySleep = (Duration d) @safe {};
+	o.deliveryExecutor = (void delegate() @safe job) @safe { job(); };
+	auto rt = new EventsRuntime(null, o);
+	rt.register(pagedCheckType("paged", 5));
+	auto p = webhookSub("paged", "https://proxy/hooks");
+	p.cursor = "c0";
+	rt.subscribeWebhook(p, "user-1");
+	now += 1_000;
+	rt.pollWebhookSubscriptions();
+	assert(ft.eventPosts().length == 5);
 }
 
 unittest  // endpoint verification and well-known caches are evicted once stale

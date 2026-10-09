@@ -1947,7 +1947,15 @@ final class McpServer : ServerCore
 			auto s = handle.stream;
 			if (s.terminated || !isOpenStdioEventStream(kv.key, handle))
 				continue;
-			eventsRuntime_.advancePushStream(s);
+			// Batches the check reports more of follow straight away, up to a
+			// bound per tick so one busy stream cannot starve the others.
+			foreach (_; 0 .. 16)
+			{
+				if (!eventsRuntime_.advancePushStream(s))
+					break;
+				if (s.terminated || !isOpenStdioEventStream(kv.key, handle))
+					break;
+			}
 			// advancePushStream can yield to a cancel that closes this stream.
 			if (!isOpenStdioEventStream(kv.key, handle))
 				continue;
