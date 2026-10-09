@@ -360,8 +360,12 @@ unittest  // a disabled (no-validator) config is never rejected, even with no AS
 
 /// Mount an `McpServer` onto a vibe.d `URLRouter` at the configured path,
 /// implementing the modern Streamable HTTP transport (single endpoint):
-///   - POST: a JSON-RPC message/batch; returns `application/json` for requests,
-///     or `202 Accepted` with no body when the payload needs no reply.
+///   - POST: a JSON-RPC message/batch; `202 Accepted` with no body when the
+///     payload needs no reply. A request's reply is `application/json`, or a
+///     `text/event-stream` when the handler sends progress, log or
+///     server->client messages first, or when the client's Accept admits only
+///     `text/event-stream`. `subscriptions/listen` and `events/stream` always
+///     answer with a long-lived `text/event-stream`.
 ///   - GET: on a stateful server, opens the session's standalone
 ///     server->client SSE stream wired to the server-push channel
 ///     (`McpServer.notify`): 400 without `Mcp-Session-Id`, 404 for an unknown
