@@ -1832,7 +1832,7 @@ version (unittest)
 	import mcp.protocol.jsonrpc : Message, makeRequest;
 	import core.time : Duration;
 	import mcp.client.transport : BearerProvider, ClientTransport,
-		SubscriptionStream, ClientProtocol;
+		SubscriptionStream, ClientProtocol, InboundOrigin;
 	import mcp.protocol.errors : McpException;
 
 	// A client transport that hands each request straight to an in-process
@@ -1878,7 +1878,7 @@ version (unittest)
 			return null;
 		}
 
-		void setInboundHandler(void delegate(Message) @safe) @safe
+		void setInboundHandler(void delegate(Message, InboundOrigin) @safe) @safe
 		{
 		}
 

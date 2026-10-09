@@ -20,7 +20,8 @@ import mcp.protocol.jsonrpc;
 import mcp.protocol.errors;
 import mcp.protocol.mrtr : isHeaderValueUnsafe;
 import mcp.protocol.ssrf : FetchOptions, TlsTrust;
-import mcp.client.transport : BearerProvider, ClientTransport, ClientProtocol, modernFraming;
+import mcp.client.transport : BearerProvider, ClientTransport, ClientProtocol,
+	InboundOrigin, modernFraming;
 import mcp.client.subscription : SubscriptionStream, ListenGate;
 
 /// A request rejected at the HTTP layer: the server answered with a non-success
@@ -445,7 +446,7 @@ final class HttpClientTransport : ClientTransport
 
 	/// Inbound dispatcher installed by `McpClient` (its `dispatchInbound`),
 	/// invoked for notifications and server->client requests on any stream.
-	private void delegate(Message) @safe inbound;
+	private void delegate(Message, InboundOrigin) @safe inbound;
 	/// The owning client's `ClientProtocol`, installed via `setProtocol`. Supplies
 	/// the protocol-derived request headers (`headersFor`) and the
 	/// cancelled-response predicate (`isCancelled`), so this transport never needs
@@ -474,7 +475,7 @@ final class HttpClientTransport : ClientTransport
 		this.maxInFlight = maxInFlight;
 	}
 
-	void setInboundHandler(void delegate(Message) @safe handler) @safe
+	void setInboundHandler(void delegate(Message, InboundOrigin) @safe handler) @safe
 	{
 		inbound = handler;
 	}
@@ -1442,7 +1443,7 @@ final class HttpClientTransport : ClientTransport
 				err = errorFrom(msg.error);
 			break;
 		case MessageKind.request:
-			dispatchOffReader(msg);
+			dispatchOffReader(msg, InboundOrigin.of(expectId));
 			break;
 		case MessageKind.notification:
 			auto slot = expectId in inflightPosts;
@@ -1452,16 +1453,16 @@ final class HttpClientTransport : ClientTransport
 			scope (exit)
 				if (req !is null)
 					req.inHandler--;
-			dispatch(msg);
+			dispatch(msg, InboundOrigin.of(expectId));
 			break;
 		}
 	}
 
-	/// Hand an inbound message to the client's dispatcher.
-	private void dispatch(Message msg) @safe
+	/// Hand an inbound message, read on a stream of `origin`, to the client's dispatcher.
+	private void dispatch(Message msg, InboundOrigin origin) @safe
 	{
 		if (inbound !is null)
-			inbound(msg);
+			inbound(msg, origin);
 	}
 
 	// --- shared raw-HTTP/SSE plumbing -----------------------------------------
@@ -1774,14 +1775,14 @@ final class HttpClientTransport : ClientTransport
 							return;
 						if (m.kind == MessageKind.request)
 						{
-							dispatchOffReader(m);
+							dispatchOffReader(m, InboundOrigin.standaloneStream);
 							return;
 						}
 						slot.inHandler++;
 						scope (exit)
 							slot.inHandler--;
 						try
-							dispatch(m);
+							dispatch(m, InboundOrigin.standaloneStream);
 						catch (Exception)
 						{
 						}
@@ -2026,14 +2027,14 @@ final class HttpClientTransport : ClientTransport
 						markEstablished(true);
 						if (m.kind == MessageKind.request)
 						{
-							dispatchOffReader(m);
+							dispatchOffReader(m, InboundOrigin.standaloneStream);
 							return;
 						}
 						slot.inHandler++;
 						scope (exit)
 							slot.inHandler--;
 						try
-							dispatch(m);
+							dispatch(m, InboundOrigin.standaloneStream);
 						catch (Exception)
 						{
 						}
@@ -2297,7 +2298,7 @@ final class HttpClientTransport : ClientTransport
 			notifyLegacy(); // wake the matching `legacyRpc`
 		}
 		else
-			dispatchOffReader(m);
+			dispatchOffReader(m, InboundOrigin.init);
 	}
 
 	/// Run the inbound handler for `m` on its own task, so the stream's reader
@@ -2308,11 +2309,11 @@ final class HttpClientTransport : ClientTransport
 	/// response. `runTask` switches to the new task at once, so a handler that
 	/// does not block finishes before the next event is read and arrival order is
 	/// kept.
-	private void dispatchOffReader(Message m) @safe
+	private void dispatchOffReader(Message m, InboundOrigin origin) @safe
 	{
 		import vibe.core.core : runTask;
 
-		runTask((Message msg, bool isRequest) nothrow{
+		runTask((Message msg, InboundOrigin from, bool isRequest) nothrow{
 			import std.algorithm.mutation : remove;
 
 			auto self = Task.getThis();
@@ -2322,14 +2323,14 @@ final class HttpClientTransport : ClientTransport
 				if (isRequest)
 					handlerTasks = handlerTasks.remove!(t => t == self);
 			try
-				dispatch(msg);
+				dispatch(msg, from);
 			catch (Exception e)
 			{
 				import vibe.core.log : logWarn;
 
 				logWarn("[mcp.client] inbound handler threw: %s", e.msg);
 			}
-		}, m, m.kind == MessageKind.request);
+		}, m, origin, m.kind == MessageKind.request);
 	}
 
 	/// Fail every still-outstanding legacy waiter with a typed error so each blocked
@@ -3230,7 +3231,7 @@ unittest  // a legacy server->client request is handled off the reader so the re
 	const failure = runAgainstFakeServer(new URLRouter, (string url) @safe {
 		auto t = new HttpClientTransport(url);
 		auto release = createManualEvent();
-		t.setInboundHandler((Message m) @safe {
+		t.setInboundHandler((Message m, InboundOrigin) @safe {
 			started = true;
 			// Stands in for a handler awaiting a response only the reader can deliver.
 			auto ec = release.emitCount;
@@ -5035,7 +5036,9 @@ unittest  // the standalone stream reconnects after a transient 5xx and keeps de
 		auto t = new HttpClientTransport(url);
 		scope (exit)
 			t.close();
-		t.setInboundHandler((Message m) @safe { methods ~= m.method; });
+		t.setInboundHandler((Message m, InboundOrigin) @safe {
+			methods ~= m.method;
+		});
 		t.startServerStream();
 		const until = MonoTime.currTime + 3.seconds;
 		while (methods.length == 0 && MonoTime.currTime < until)

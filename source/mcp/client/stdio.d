@@ -6,7 +6,7 @@ import vibe.data.json : Json, parseJsonString;
 
 import mcp.protocol.jsonrpc;
 import mcp.protocol.errors;
-import mcp.client.transport : BearerProvider, ClientTransport, ClientProtocol;
+import mcp.client.transport : BearerProvider, ClientTransport, ClientProtocol, InboundOrigin;
 import mcp.client.subscription : SubscriptionStream, ListenGate;
 import mcp.transport.duplex : DuplexChannel, defaultMaxLineBytes;
 import mcp.protocol.mrtr : MetaKey;
@@ -44,7 +44,7 @@ final class StdioClientTransport : ClientTransport
 
 	private string delegate() @safe readLine;
 	private void delegate(string) @safe writeLine;
-	private void delegate(Message) @safe inbound;
+	private void delegate(Message, InboundOrigin) @safe inbound;
 	private DuplexChannel channel;
 	private bool started;
 	private bool closed_;
@@ -83,7 +83,7 @@ final class StdioClientTransport : ClientTransport
 		this.writeLine = writeLine;
 	}
 
-	void setInboundHandler(void delegate(Message) @safe handler) @safe
+	void setInboundHandler(void delegate(Message, InboundOrigin) @safe handler) @safe
 	{
 		inbound = handler;
 	}
@@ -144,7 +144,7 @@ final class StdioClientTransport : ClientTransport
 			channel = new DuplexChannel(readLine, writeLine, (Message m) @safe {
 				noteListenFrame(m);
 				if (inbound !is null)
-					inbound(m);
+					inbound(m, InboundOrigin.init);
 			});
 		if (!started)
 		{

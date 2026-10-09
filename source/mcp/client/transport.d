@@ -27,6 +27,38 @@ struct BearerProvider
 	bool delegate(string rejectedToken) @safe onRejected;
 }
 
+/// Which of the client's in-flight requests an inbound message arrived for, as
+/// far as the transport can tell. `McpClient` uses it to decide whose deadline
+/// stops while it answers a server->client request: the server withholds the
+/// carrying request's response until it receives the reply.
+struct InboundOrigin
+{
+	/// Where the message was read.
+	enum Source
+	{
+		/// A stream shared by every request (stdio, the legacy HTTP+SSE GET
+		/// stream): the message cannot be attributed to a request.
+		shared_,
+		/// The response stream of request `requestId`.
+		request,
+		/// A stream that belongs to no request (the standalone GET stream, a
+		/// `subscriptions/listen` stream).
+		standalone,
+	}
+
+	Source source; /// Where the message was read.
+	long requestId; /// The carrying request's id when `source` is `request`.
+
+	/// A message read on the response stream of request `id`.
+	static InboundOrigin of(long id) @safe pure nothrow @nogc
+	{
+		return InboundOrigin(Source.request, id);
+	}
+
+	/// A message read on a stream that belongs to no request.
+	enum InboundOrigin standaloneStream = InboundOrigin(Source.standalone);
+}
+
 /// The protocol-side collaborator an `McpClient` hands to its transport at
 /// construction (`ClientTransport.setProtocol`). It lets the transport pull the
 /// protocol-derived request headers and consult the cancelled-request set
@@ -119,8 +151,9 @@ interface ClientTransport
 	SubscriptionStream openListen(Json listenMessage) @safe;
 
 	/// Install the client's inbound dispatcher (`McpClient.dispatchInbound`),
-	/// invoked for notifications and server->client requests on any stream.
-	void setInboundHandler(void delegate(Message) @safe handler) @safe;
+	/// invoked for notifications and server->client requests on any stream, with
+	/// the `InboundOrigin` of the stream each was read on.
+	void setInboundHandler(void delegate(Message, InboundOrigin) @safe handler) @safe;
 
 	/// Install the client's `ClientProtocol` collaborator, through which the
 	/// transport obtains the protocol-derived request headers (`headersFor`) and

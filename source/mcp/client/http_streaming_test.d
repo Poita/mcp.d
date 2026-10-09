@@ -613,6 +613,98 @@ unittest
 	assert(text == "1", "unexpected tool result: " ~ text);
 }
 
+// A server->client request that arrives on one call's response stream holds only
+// that call open: while the client's handler answers it, a concurrent call the
+// server never answers still times out on its own `requestTimeout`.
+unittest
+{
+	import mcp.protocol.types : ListRootsResult, Root;
+	import mcp.protocol.errors : RequestTimeoutException;
+	import core.time : Duration;
+
+	auto server = McpServer.stateful("handler-scoped-pause", "1.0.0");
+	Tool rootsTool;
+	rootsTool.name = "roots";
+	rootsTool.description = "Asks the client for its roots";
+	server.registerTool(rootsTool, (Json args, RequestContext ctx) @safe {
+		const n = ctx.listRoots().roots.length;
+		return CallToolResult([Content.makeText(n.to!string)]);
+	});
+	Tool hangTool;
+	hangTool.name = "hang";
+	hangTool.description = "Answers long after the client gives up";
+	server.registerTool(hangTool, (Json args, RequestContext ctx) @safe {
+		sleep(3.seconds);
+		return CallToolResult([Content.makeText("late")]);
+	});
+
+	auto router = new URLRouter;
+	mountMcp(router, server);
+
+	auto settings = new HTTPServerSettings;
+	settings.port = 0;
+	settings.bindAddresses = ["127.0.0.1"];
+
+	enum handlerTime = 1500.msecs;
+	string rootsText;
+	string failure;
+	bool hangTimedOut;
+	Duration hangElapsed;
+
+	void delegate() @safe nothrow body_ = () @safe nothrow{
+		try
+		{
+			auto listener = listenHTTP(settings, router);
+			scope (exit)
+				() @trusted { listener.stopListening(); }();
+			const port = listener.bindAddresses[0].port;
+			auto url = "http://127.0.0.1:" ~ port.to!string ~ "/mcp";
+
+			ClientSettings s;
+			s.requestTimeout = 300.msecs;
+			auto client = McpClient.http(url, s);
+			scope (exit)
+				closeQuietly(client);
+			client.onListRoots = () @safe {
+				sleep(handlerTime);
+				ListRootsResult r;
+				r.roots = [Root("file:///a")];
+				return r;
+			};
+			client.initialize("2025-11-25");
+
+			auto hangCall = runTask(() nothrow{
+				const started = MonoTime.currTime;
+				try
+					client.callTool("hang", Json.emptyObject);
+				catch (RequestTimeoutException)
+					hangTimedOut = true;
+				catch (Exception e)
+					failure = "hang: " ~ e.msg;
+				hangElapsed = MonoTime.currTime - started;
+			});
+			sleep(50.msecs); // the hang call is in flight before the roots request arrives
+			auto res = client.callTool("roots", Json.emptyObject);
+			if (res.content.length)
+				rootsText = res.content[0].text;
+			hangCall.join();
+		}
+		catch (Exception e)
+			failure = e.msg;
+		exitEventLoop();
+	};
+
+	runTask(body_);
+	runEventLoop();
+
+	assert(failure.length == 0, "unexpected failure: " ~ failure);
+	assert(rootsText == "1", "unexpected roots result: " ~ rootsText);
+	assert(hangTimedOut, "the unanswered call did not time out");
+	assert(hangElapsed < handlerTime - 300.msecs,
+			"the unanswered call's deadline was paused by another call's handler: "
+			~ hangElapsed.toString());
+}
+
 // A modern server that does not serve the client's probe version answers
 // `server/discover` with HTTP 400 and an UnsupportedProtocolVersionError whose
 // `data.supported` lists what it does serve; connect() negotiates from that list

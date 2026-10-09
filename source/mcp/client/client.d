@@ -17,7 +17,7 @@ import mcp.protocol.tasks : Task, TaskStatus;
 import mcp.protocol.sampling : validateSamplingMessages, CreateMessageRequest, CreateMessageResult;
 import mcp.protocol.modern;
 import mcp.protocol.mrtr;
-import mcp.client.transport : BearerProvider, ClientTransport, ClientProtocol;
+import mcp.client.transport : BearerProvider, ClientTransport, ClientProtocol, InboundOrigin;
 import mcp.client.http_transport : HttpClientTransport, HttpStatusException,
 	isLegacyFallbackStatus, defaultMaxMessageBytes;
 import mcp.client.stdio : StdioClientTransport, spawnStdioTransport;
@@ -441,7 +441,6 @@ private final class InFlightRequest
 	string progressKey; // the request's progress token rendered as JSON, or empty
 	bool modern; // whether the request was sent with modern framing
 	McpException abortReason;
-	void* owner; // the fiber awaiting the response
 	uint paused; // server->client handlers currently running on this request's behalf
 }
 
@@ -3655,7 +3654,6 @@ final class McpClient : ClientProtocol
 		import vibe.core.core : createTimer;
 
 		auto req = new InFlightRequest;
-		req.owner = currentFiberKey();
 		if (params.type == Json.Type.object && "_meta" in params
 				&& params["_meta"].type == Json.Type.object && "progressToken" in params["_meta"])
 			req.progressKey = params["_meta"]["progressToken"].toString();
@@ -3755,25 +3753,32 @@ final class McpClient : ClientProtocol
 			}
 	}
 
-	/// Stop the deadlines of the requests a server->client request may belong to
-	/// while the client's handler answers it, since the server withholds those
-	/// requests' responses until it gets the reply. A request awaited on the
-	/// current task is the one whose response stream carried the server request
-	/// (HTTP); when there is none (a shared read loop, as on stdio) the server
-	/// request cannot be attributed, so every in-flight request is paused.
-	/// The `maxTotalTimeout` cap stays armed while paused, so a handler that
-	/// never returns cannot hold a capped request open. Returns the paused
-	/// requests for `resumeDeadlines`.
-	private InFlightRequest[] pauseDeadlines() @safe nothrow
+	/// Stop the deadlines of the requests a server->client request read on a
+	/// stream of `origin` may belong to while the client's handler answers it,
+	/// since the server withholds those requests' responses until it gets the
+	/// reply. One read on a client request's response stream (HTTP) pauses
+	/// only that request; one read on a stream that belongs to no request (the
+	/// standalone GET stream, a listen stream) pauses none; one read on a stream
+	/// shared by every request (stdio, legacy HTTP+SSE) cannot be attributed, so
+	/// every in-flight request is paused. The `maxTotalTimeout` cap stays armed
+	/// while paused, so a handler that never returns cannot hold a capped request
+	/// open. Returns the paused requests for `resumeDeadlines`.
+	private InFlightRequest[] pauseDeadlines(InboundOrigin origin) @safe nothrow
 	{
 		InFlightRequest[] related;
-		const self = currentFiberKey();
-		foreach (r; inFlight_.byValue)
-			if (r.owner is self)
-				related ~= r;
-		if (related.length == 0)
+		final switch (origin.source)
+		{
+		case InboundOrigin.Source.request:
+			if (auto r = origin.requestId in inFlight_)
+				related ~= *r;
+			break;
+		case InboundOrigin.Source.standalone:
+			break;
+		case InboundOrigin.Source.shared_:
 			foreach (r; inFlight_.byValue)
 				related ~= r;
+			break;
+		}
 		const now = MonoTime.currTime;
 		foreach (r; related)
 		{
@@ -4418,13 +4423,14 @@ final class McpClient : ClientProtocol
 	}
 
 	/// Dispatch an inbound message handed up by the transport: server->
-	/// client requests and notifications (never an awaited response).
-	private void dispatchInbound(Message msg) @safe
+	/// client requests and notifications (never an awaited response), read on a
+	/// stream of `origin`.
+	private void dispatchInbound(Message msg, InboundOrigin origin = InboundOrigin.init) @safe
 	{
 		final switch (msg.kind)
 		{
 		case MessageKind.request:
-			handleServerRequest(msg);
+			handleServerRequest(msg, origin);
 			break;
 		case MessageKind.notification:
 			// A notification shares its stream with unrelated responses, so a
@@ -4463,21 +4469,22 @@ final class McpClient : ClientProtocol
 		transport.startServerStream();
 	}
 
-	/// Answer a server->client request by dispatching to the matching handler and
-	/// sending the response. We are inside the transport's inbound-read callback of
-	/// an in-flight request, and the server withholds that request's final response
-	/// until it receives this reply, so the reply is sent from its own task: the
-	/// read loop keeps draining and the two directions cannot wedge each other
-	/// (stdio would block the read loop on the child's stdin pipe while the child
-	/// blocks on its stdout; HTTP's reply travels on a different request).
-	private void handleServerRequest(Message msg) @safe
+	/// Answer a server->client request, read on a stream of `origin`, by
+	/// dispatching to the matching handler and sending the response. The server
+	/// may withhold the response of the request whose stream carried it until it
+	/// receives this reply, so that request's deadline stops while the handler
+	/// runs (see `pauseDeadlines`). The reply is sent from its own task, so the
+	/// caller's read loop keeps draining and the two directions cannot wedge each
+	/// other (stdio would block the read loop on the child's stdin pipe while the
+	/// child blocks on its stdout; HTTP's reply travels on a different request).
+	private void handleServerRequest(Message msg, InboundOrigin origin) @safe
 	{
 		import vibe.core.core : runTask;
 
 		Json response;
 		// A ping is answered at once and holds up no request, so it leaves the
 		// deadlines running.
-		auto paused = msg.method == "ping" ? null : pauseDeadlines();
+		auto paused = msg.method == "ping" ? null : pauseDeadlines(origin);
 		scope (exit)
 			resumeDeadlines(paused);
 		// The handler runs under a token the server's `notifications/cancelled`
@@ -9110,7 +9117,7 @@ version (unittest)
 			protocol = p;
 		}
 
-		void setInboundHandler(void delegate(Message) @safe handler) @safe
+		void setInboundHandler(void delegate(Message, InboundOrigin) @safe handler) @safe
 		{
 		}
 
@@ -9247,7 +9254,7 @@ version (unittest)
 			return null;
 		}
 
-		void setInboundHandler(void delegate(Message) @safe) @safe
+		void setInboundHandler(void delegate(Message, InboundOrigin) @safe) @safe
 		{
 		}
 
