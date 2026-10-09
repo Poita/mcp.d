@@ -728,24 +728,16 @@ final class HttpClientTransport : ClientTransport
 			inflightPosts.remove(expectId);
 		try
 		{
-			// The token this request carries. A refresh between here and the send
+			// The token this attempt carries. A refresh between here and the send
 			// can only make it stale, and `onRejected` ignores a token already
-			// replaced. The provider runs shielded from an abort's interrupt, so a
-			// token refresh is never cut off part-way; the abort is observed once
-			// it returns.
-			string sentBearer;
-			if (bearerProvider.onRejected !is null)
-			{
-				req.inHandler++;
-				scope (exit)
-					req.inHandler--;
-				sentBearer = currentBearer();
-			}
+			// replaced.
+			const sentBearer = attemptBearer(req);
 			try
-				return postAndAwait(message, expectId, req);
+				return postAndAwait(message, expectId, req, sentBearer);
 			catch (HttpStatusException e)
 			{
-				if (sentBearer.length == 0 || !isRejectedBearer(e))
+				if (bearerProvider.onRejected is null || sentBearer.length == 0
+						|| !isRejectedBearer(e))
 					throw e;
 				req.inHandler++;
 				scope (exit)
@@ -753,7 +745,7 @@ final class HttpClientTransport : ClientTransport
 				if (!refreshBearer(sentBearer))
 					throw e;
 			}
-			return postAndAwait(message, expectId, req);
+			return postAndAwait(message, expectId, req, attemptBearer(req));
 		}
 		catch (InterruptException e)
 		{
@@ -761,6 +753,17 @@ final class HttpClientTransport : ClientTransport
 				throw req.aborted;
 			throw e;
 		}
+	}
+
+	/// The bearer for one attempt of `req`. The provider runs shielded from an
+	/// abort's interrupt, so a token refresh is never cut off part-way; the abort
+	/// is observed once it returns.
+	private string attemptBearer(PostRequest req) @safe
+	{
+		req.inHandler++;
+		scope (exit)
+			req.inHandler--;
+		return currentBearer();
 	}
 
 	/// Whether `e` rejects the bearer token a request carried (RFC 6750 §3.1): a
@@ -880,17 +883,18 @@ final class HttpClientTransport : ClientTransport
 	/// SSE stream closes before the final response and carried an SSE `retry:`
 	/// hint, wait that long and reconnect (resuming with `Last-Event-ID`), per
 	/// the Streamable HTTP resumability rules. `req` carries the request's abort
-	/// state; a request already aborted is not sent.
-	private Json postAndAwait(Json message, long expectId, PostRequest req) @safe
+	/// state; a request already aborted is not sent. The POST carries `bearer`.
+	private Json postAndAwait(Json message, long expectId, PostRequest req, string bearer) @safe
 	{
 		if (req.aborted !is null)
 			throw req.aborted;
-		return awaitPostResponse(message, expectId, req);
+		return awaitPostResponse(message, expectId, req, bearer);
 	}
 
-	/// Send `message` and read the response with id `expectId` for `postAndAwait`,
-	/// resuming a dropped 2025-era stream; `req` carries the request's abort state.
-	private Json awaitPostResponse(Json message, long expectId, PostRequest req) @safe
+	/// Send `message` (carrying `bearer`) and read the response with id `expectId`
+	/// for `postAndAwait`, resuming a dropped 2025-era stream; `req` carries the
+	/// request's abort state.
+	private Json awaitPostResponse(Json message, long expectId, PostRequest req, string bearer) @safe
 	{
 		import core.time : msecs;
 		import vibe.core.core : sleep;
@@ -918,7 +922,7 @@ final class HttpClientTransport : ClientTransport
 		const sentSession = sessionId.length > 0;
 		int status;
 		string failure;
-		postAndAwaitRaw(message, expectId, cursor, result, got, err, status, failure, req);
+		postAndAwaitRaw(message, expectId, bearer, cursor, result, got, err, status, failure, req);
 		if (req.aborted !is null)
 			throw req.aborted;
 
@@ -971,7 +975,8 @@ final class HttpClientTransport : ClientTransport
 					throw req.aborted;
 				const before = cursor.lastEventId;
 				const started = MonoTime.currTime;
-				const outcome = resumeViaGet(expectId, cursor, result, got, err, failure, req);
+				const outcome = resumeViaGet(expectId, attemptBearer(req),
+						cursor, result, got, err, failure, req);
 				if (req.aborted !is null)
 					throw req.aborted;
 				if (err !is null)
@@ -1058,9 +1063,9 @@ final class HttpClientTransport : ClientTransport
 	/// the key property the pooled `requestHTTP` reader does not provide (see
 	/// `postAndAwait`). Mirrors the chunked-decode SSE parser of
 	/// `runServerStream`/`resumeViaGet`.
-	private void postAndAwaitRaw(Json message, long expectId, ref SseCursor cursor, ref Json result,
-			ref bool got, ref McpException err, out int status, out string dropped,
-			PostRequest req = null) @safe
+	private void postAndAwaitRaw(Json message, long expectId, string bearer, ref SseCursor cursor,
+			ref Json result, ref bool got, ref McpException err, out int status,
+			out string dropped, PostRequest req = null) @safe
 	{
 		const ep = parseHttpEndpoint(url);
 		// Resolve + pin the user-configured endpoint host to a numeric address; the
@@ -1107,7 +1112,8 @@ final class HttpClientTransport : ClientTransport
 					conn.release();
 
 				const req = buildHttpRequest("POST", ep.path, ep.hostHeader,
-						"application/json, text/event-stream", "close", true, hdrs, null, payload);
+						"application/json, text/event-stream", "close",
+						bearer, hdrs, null, payload);
 				conn.write(cast(const(ubyte)[]) req);
 
 				const head = readResponseHead(conn);
@@ -1323,8 +1329,9 @@ final class HttpClientTransport : ClientTransport
 	/// Reports whether the stream opened, the server refused it with a 4xx (other
 	/// than 408/429), or it failed transiently: a connection failure or another
 	/// non-200 status, whose description is left in `failure`.
-	private ResumeOutcome resumeViaGet(long expectId, ref SseCursor cursor, ref Json result,
-			ref bool got, ref McpException err, ref string failure, PostRequest req = null) @safe
+	private ResumeOutcome resumeViaGet(long expectId, string bearer, ref SseCursor cursor,
+			ref Json result, ref bool got, ref McpException err,
+			ref string failure, PostRequest req = null) @safe
 	{
 		const ep = parseHttpEndpoint(url);
 		// Resolve + pin the user-configured endpoint host to a numeric address.
@@ -1364,7 +1371,7 @@ final class HttpClientTransport : ClientTransport
 				scope (exit)
 					conn.release();
 				const getReq = buildHttpRequest("GET", ep.path, ep.hostHeader,
-						"text/event-stream", "keep-alive", true, verHeaders,
+						"text/event-stream", "keep-alive", bearer, verHeaders,
 						cursor.lastEventId, null);
 				conn.write(cast(const(ubyte)[]) getReq);
 
@@ -1529,16 +1536,16 @@ final class HttpClientTransport : ClientTransport
 	/// Build a raw HTTP/1.1 request for one of the SSE stream methods, collapsing
 	/// the five hand-written header builders into a single, consistent policy.
 	/// `accept` is the `Accept` header value, `connection` the `Connection` value.
-	/// When `includeAuth` is set and a bearer token is present, an
-	/// `Authorization: Bearer` header is emitted; the `Mcp-Session-Id` header
+	/// A non-empty `bearer` (the caller reads it once per attempt) emits an
+	/// `Authorization: Bearer` header; the `Mcp-Session-Id` header
 	/// follows whenever a session id is known. `extraHeaders` (the protocol-derived
 	/// version/modern headers) are appended, skipping any unsafe value. A non-empty
 	/// `lastEventId` adds `Last-Event-ID` for SSE resumption, and a non-empty `body`
 	/// adds `Content-Length` and the payload. The terminating blank line is always
 	/// written.
-	private string buildHttpRequest(string verb, string path, string host,
-			string accept, string connection,
-			bool includeAuth, string[string] extraHeaders, string lastEventId, string body) @safe
+	private string buildHttpRequest(string verb, string path, string host, string accept,
+			string connection, string bearer, string[string] extraHeaders,
+			string lastEventId, string body) @safe
 	{
 		import std.conv : to;
 
@@ -1547,7 +1554,6 @@ final class HttpClientTransport : ClientTransport
 		if (body.length)
 			req ~= "Content-Type: application/json\r\n";
 		req ~= "Connection: " ~ connection ~ "\r\n";
-		const bearer = includeAuth ? currentBearer() : null;
 		if (bearer.length)
 		{
 			warnIfInsecureBearer();
@@ -1780,7 +1786,8 @@ final class HttpClientTransport : ClientTransport
 			int status;
 			string wwwAuthenticate;
 			const sentSession = sessionId;
-			const sentBearer = bearerProvider.onRejected !is null ? currentBearer() : null;
+			const bearer = currentBearer();
+			const sentBearer = bearerProvider.onRejected !is null ? bearer : null;
 			// Register a slot so `close()` can force-close this connection's socket
 			// even while the reader is parked on a long-lived SSE read.
 			auto slot = new ListenSocketSlot;
@@ -1811,7 +1818,7 @@ final class HttpClientTransport : ClientTransport
 					// after a re-negotiation carries the current version.
 					const req = buildHttpRequest("GET", ep.path, ep.hostHeader,
 							"text/event-stream", "keep-alive",
-							true, requestHeaders(Json.undefined), cursor.lastEventId, null);
+							bearer, requestHeaders(Json.undefined), cursor.lastEventId, null);
 					conn.write(cast(const(ubyte)[]) req);
 
 					const head = readResponseHead(conn);
@@ -2018,8 +2025,9 @@ final class HttpClientTransport : ClientTransport
 				{
 					if (isCancelled())
 						return;
-					const sentBearer = mayRetry
-						&& bearerProvider.onRejected !is null ? currentBearer() : null;
+					const bearer = currentBearer();
+					const sentBearer = mayRetry && bearerProvider.onRejected !is null ? bearer
+						: null;
 					auto sock = connectTimed(pinnedHost, ep.port);
 					slot.attach(sock);
 					scope (exit)
@@ -2035,8 +2043,8 @@ final class HttpClientTransport : ClientTransport
 					// One response per connection: `close` lets a non-streamed answer
 					// (an error body) be read to end-of-stream.
 					const req = buildHttpRequest("POST", ep.path, ep.hostHeader,
-							"application/json, text/event-stream", "close",
-							true, reqHeaders, null, body);
+							"application/json, text/event-stream",
+							"close", bearer, reqHeaders, null, body);
 					conn.write(cast(const(ubyte)[]) req);
 
 					const head = readResponseHead(conn);
@@ -2276,7 +2284,7 @@ final class HttpClientTransport : ClientTransport
 					conn.release();
 
 				const req = buildHttpRequest("GET", ep.path, ep.hostHeader,
-						"text/event-stream", "keep-alive", true, null, null, null);
+						"text/event-stream", "keep-alive", currentBearer(), null, null, null);
 				conn.write(cast(const(ubyte)[]) req);
 
 				const head = readResponseHead(conn);
@@ -3829,62 +3837,36 @@ unittest  // warnIfInsecureBearer is a no-op when no bearer token is set
 	assert(!t.warnedInsecureBearer);
 }
 
-unittest  // resumeViaGet GET includes Authorization: Bearer when a bearer token is set
+unittest  // buildHttpRequest sends Authorization only for a non-empty bearer
 {
-	// Regression: the GET paths (resumeViaGet, runServerStream) must pass
-	// includeAuth=true so the bearer token is forwarded on resume and standalone
-	// server-stream GETs against OAuth-protected 2025-era servers.
 	import std.algorithm : canFind;
 
 	auto t = new HttpClientTransport("https://host:8080/mcp");
-	t.setBearerToken("my-token");
-	const req = t.buildHttpRequest("GET", "/mcp", "host:8080", "text/event-stream",
-			"keep-alive", true, (string[string]).init, "last-id", null);
-	assert(req.canFind("Authorization: Bearer my-token"),
-			"GET resume path must include Authorization header when bearer token is set");
+	const withAuth = t.buildHttpRequest("GET", "/mcp", "host:8080", "text/event-stream",
+			"keep-alive", "my-token", (string[string]).init, "last-id", null);
+	assert(withAuth.canFind("Authorization: Bearer my-token"));
+	const without = t.buildHttpRequest("GET", "/mcp", "host:8080",
+			"text/event-stream", "keep-alive", null, (string[string]).init, null, null);
+	assert(!without.canFind("Authorization"));
 }
 
-unittest  // a bearer provider is consulted on every request, so a refreshed token is sent
+unittest  // a bearer provider is consulted on every read, so a refreshed token is sent
 {
-	import std.algorithm : canFind;
-
 	auto t = new HttpClientTransport("https://host:8080/mcp");
 	int calls;
 	t.setBearerProvider(BearerProvider(() @safe {
 			return ++calls == 1 ? "first-token" : "refreshed-token";
 		}));
-	auto first = t.buildHttpRequest("GET", "/mcp", "host:8080",
-			"text/event-stream", "keep-alive", true, (string[string]).init, null, null);
-	auto second = t.buildHttpRequest("GET", "/mcp", "host:8080",
-			"text/event-stream", "keep-alive", true, (string[string]).init, null, null);
-	assert(first.canFind("Authorization: Bearer first-token"));
-	assert(second.canFind("Authorization: Bearer refreshed-token"));
+	assert(t.currentBearer() == "first-token");
+	assert(t.currentBearer() == "refreshed-token");
 }
 
 unittest  // setBearerToken replaces an installed bearer provider
 {
-	import std.algorithm : canFind;
-
 	auto t = new HttpClientTransport("https://host:8080/mcp");
 	t.setBearerProvider(BearerProvider(() @safe => "provided"));
 	t.setBearerToken("static");
-	const req = t.buildHttpRequest("GET", "/mcp", "host:8080",
-			"text/event-stream", "keep-alive", true, (string[string]).init, null, null);
-	assert(req.canFind("Authorization: Bearer static"));
-}
-
-unittest  // runServerStream GET includes Authorization: Bearer when a bearer token is set
-{
-	// Regression: the standalone server->client stream GET passed includeAuth=false,
-	// so the bearer token was dropped on OAuth-protected 2025-era servers.
-	import std.algorithm : canFind;
-
-	auto t = new HttpClientTransport("https://host:8080/mcp");
-	t.setBearerToken("stream-token");
-	const req = t.buildHttpRequest("GET", "/mcp", "host:8080",
-			"text/event-stream", "keep-alive", true, (string[string]).init, null, null);
-	assert(req.canFind("Authorization: Bearer stream-token"),
-			"standalone server-stream GET must include Authorization header when bearer token is set");
+	assert(t.currentBearer() == "static");
 }
 
 unittest  // postAndAwait skips resumeViaGet when the session is in modern mode
@@ -4573,6 +4555,50 @@ unittest  // a rejected bearer is reported once and the request retried only onc
 	assert(attempts == 2);
 	assert(rejectedBearers(`Bearer realm="mcp"`, attempts) == ["tok"]);
 	assert(attempts == 2);
+}
+
+unittest  // a POST carries the bearer its rejection is reported for, read once per attempt
+{
+	import std.conv : to;
+	import mcp.client.client : McpClient;
+
+	int issued, calls;
+	string[] rejected;
+	auto router = answeringRouter((Json req, HTTPServerResponse res) @safe {
+		if (++calls == 1)
+		{
+			res.statusCode = 401;
+			res.headers["WWW-Authenticate"] = `Bearer error="invalid_token"`;
+			res.writeBody("", "text/plain");
+			return;
+		}
+		auto reply = parseJsonString(`{"jsonrpc":"2.0","result":{"tools":[]}}`);
+		reply["id"] = req["id"];
+		res.writeBody(reply.toString(), "application/json");
+	});
+	// Records each POST's Authorization, then falls through to `router`.
+	string[] authorizations;
+	auto outer = new URLRouter;
+	outer.post("/mcp", (HTTPServerRequest req, HTTPServerResponse res) @safe {
+		authorizations ~= req.headers.get("Authorization", "");
+	});
+	outer.any("*", router);
+	const failure = runAgainstFakeServer(outer, (string url) @safe {
+		auto client = McpClient.http(url);
+		scope (exit)
+			client.close();
+		client.initialize("2025-11-25");
+		authorizations = null;
+		client.setBearerProvider(BearerProvider(() @safe => "tok-" ~ (++issued)
+			.to!string, (string t) @safe { rejected ~= t; return true; }));
+		client.listTools();
+	});
+	assert(failure.length == 0, "scenario failed: " ~ failure);
+	assert(authorizations.length == 2, authorizations.to!string);
+	assert(rejected.length == 1 && authorizations[0] == "Bearer " ~ rejected[0],
+			"onRejected must get the token the rejected POST carried: sent "
+			~ authorizations.to!string ~ ", rejected " ~ rejected.to!string);
+	assert(issued == 2, "the provider runs once per attempt, ran " ~ issued.to!string);
 }
 
 unittest  // a rejected bearer with no replacement surfaces the 401 without a retry
