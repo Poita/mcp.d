@@ -271,16 +271,6 @@ struct BoundedExpiringMap(V)
 			evict(n);
 	}
 
-	/// Number of live entries for which `pred` holds.
-	size_t count(scope bool delegate(ref V value) @safe pred) @safe
-	{
-		size_t n;
-		foreach (node; nodes)
-			if (pred(node.value))
-				n++;
-		return n;
-	}
-
 	/// Evict the least-recently-active never-used entry, or the
 	/// least-recently-active entry when every entry has been used, among the
 	/// entries `among` accepts (every entry when null). A busy entry is never
@@ -482,6 +472,8 @@ final class SessionManager
 	private BoundedExpiringMap!Session sessions;
 	private size_t maxPerPrincipal;
 	private size_t maxAnonymousPerAddress;
+	/// Live sessions per non-empty `Session.bucket`.
+	private size_t[string] perBucket;
 
 	/// A session's state together with the authenticated principal (token
 	/// subject, "" when unauthenticated) that created it.
@@ -522,6 +514,7 @@ final class SessionManager
 	/// expire or are evicted, so it has no request to cancel.
 	private void evicted(string id, Session s) @safe
 	{
+		forget(s.bucket);
 		if (onExpire !is null)
 			onExpire(id);
 	}
@@ -561,7 +554,7 @@ final class SessionManager
 				return s.bucket == bucket;
 			}
 
-			while (sessions.count(&mine) >= cap)
+			while (perBucket.get(bucket, 0) >= cap)
 				if (!sessions.evictOldest(&mine))
 					throw new SessionCapacityException(principal.length
 							? "too many active sessions for this principal"
@@ -572,7 +565,21 @@ final class SessionManager
 		// abandoned session is reclaimed the next time any client initializes.
 		if (!sessions.put(id, Session(new ConnectionState, principal, bucket)))
 			throw new SessionCapacityException("too many active sessions");
+		if (bucket.length)
+			perBucket[bucket] = perBucket.get(bucket, 0) + 1;
 		return id;
+	}
+
+	/// Release one session's slot in `bucket`.
+	private void forget(string bucket) @safe
+	{
+		if (auto n = bucket in perBucket)
+		{
+			if (*n <= 1)
+				perBucket.remove(bucket);
+			else
+				(*n)--;
+		}
 	}
 
 	/// Record that a standalone GET stream opened on session `id`. While any is
@@ -647,9 +654,12 @@ final class SessionManager
 	{
 		if (id.length == 0)
 			return false;
-		if (auto p = sessions.get(id, false))
-			foreach (tok; p.state.inFlight)
-				tok.cancel();
+		auto p = sessions.get(id, false);
+		if (p is null)
+			return false;
+		foreach (tok; p.state.inFlight)
+			tok.cancel();
+		forget(p.bucket);
 		return sessions.remove(id);
 	}
 
@@ -1169,4 +1179,31 @@ unittest  // past the per-address cap, an anonymous caller evicts only its own a
 	assert(mgr.isActive(other), "another address's sessions are untouched");
 	assert(mgr.isActive(alice), "an authenticated session is not in the anonymous bucket");
 	assert(mgr.ownedBy(a3, ""), "an anonymous session is still owned by the empty principal");
+}
+
+unittest  // terminated and cap-evicted sessions free their slot in the creator's bucket
+{
+	import core.thread : Thread;
+	import core.time : msecs;
+
+	SessionLimits limits;
+	limits.idleTtl = Duration.zero;
+	limits.maxSessions = 3;
+	limits.maxPerPrincipal = 2;
+	auto mgr = new SessionManager(limits);
+	const a1 = mgr.create("alice");
+	Thread.sleep(2.msecs);
+	const a2 = mgr.create("alice");
+	Thread.sleep(2.msecs);
+	assert(mgr.terminate(a1));
+	const a3 = mgr.create("alice");
+	Thread.sleep(2.msecs);
+	assert(mgr.isActive(a2) && mgr.isActive(a3), "a terminated session frees its slot");
+	mgr.create("bob");
+	Thread.sleep(2.msecs);
+	mgr.create("bob");
+	assert(!mgr.isActive(a2), "the global cap evicts the oldest session");
+	mgr.streamOpened(a3);
+	mgr.create("alice");
+	assert(mgr.isActive(a3), "a cap-evicted session frees its slot");
 }
