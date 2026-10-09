@@ -354,7 +354,8 @@ delivery is decoupled from `publish` via a pluggable `DeliveryQueue`
 subscription, and the periodic worker `enableEvents` starts (every
 `EventsOptions.workerInterval`) leases/delivers/acks — the same pass also expires
 poll leases, sweeps lapsed webhook subscriptions, and runs poll-driven webhook
-delivery for fetch-handler types. The in-memory default is single-node; injecting
+delivery for fetch-handler types. `McpServer.shutdown()` stops this worker and the
+Tasks TTL sweeper. The in-memory default is single-node; injecting
 a shared, durable queue (Redis/SQS/DB) plus a `WebhookSubscriptionStore` makes webhook
 delivery node-agnostic (any node's worker delivers; a crashed node's leased job
 is re-leased) — mirroring the `TaskStore`/`TaskDispatcher` split. Like

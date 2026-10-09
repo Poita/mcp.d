@@ -1211,7 +1211,8 @@ final class McpServer : ServerCore
 	/// (default: in-memory). `opts` also picks the `dispatcher` that decides where
 	/// a `@taskTool` executor runs (default: an in-process fiber; supply a
 	/// queue-backed dispatcher for a durable, multi-node deployment) and tunes the
-	/// ID generator, default TTL / poll interval, and TTL sweep cadence. The runtime emits
+	/// ID generator, default TTL / poll interval, and TTL sweep cadence (the
+	/// sweeper runs until `shutdown`). The runtime emits
 	/// `notifications/tasks` on status changes to the task owner's streams (for
 	/// a task created without an authenticated principal, only over stdio; HTTP
 	/// clients poll `tasks/get`). Returns the `TaskRuntime` so tools can create and resolve tasks.
@@ -1444,6 +1445,7 @@ final class McpServer : ServerCore
 	/// the extension requires. Registering an event type enables the extension
 	/// with default options, so call this first to choose them: once a type is
 	/// registered it throws rather than replace the runtime holding that type.
+	/// The periodic delivery worker runs until `shutdown`.
 	EventsRuntime enableEvents(WebhookSubscriptionStore store = null,
 			EventsOptions opts = EventsOptions.init) @safe
 	{
@@ -1480,6 +1482,19 @@ final class McpServer : ServerCore
 		settings["listChanged"] = true;
 		enableExtension(eventsExtensionKey, settings);
 		return eventsRuntime_;
+	}
+
+	/// Stop the server's background timers: the Tasks TTL sweeper
+	/// (`TaskOptions.sweepInterval`) and the Events delivery worker
+	/// (`EventsOptions.workerInterval`). Call it when tearing the server down so
+	/// neither keeps running; transports do not call it. Idempotent, and safe
+	/// when neither extension is enabled.
+	void shutdown() @safe nothrow
+	{
+		if (taskRuntime_ !is null)
+			taskRuntime_.stopSweeper();
+		if (eventsRuntime_ !is null)
+			eventsRuntime_.stopDeliveryWorker();
 	}
 
 	/// Register an event type against the events runtime. `check` is the author's
@@ -12920,4 +12935,18 @@ unittest  // a per-argument completer sees context.arguments and returns its own
 	assert(resp["result"]["completion"]["values"].length == 2);
 	assert(resp["result"]["completion"]["total"].get!long == 40);
 	assert(resp["result"]["completion"]["hasMore"].get!bool);
+}
+
+unittest  // shutdown stops the background timers and is idempotent
+{
+	import core.time : msecs;
+
+	auto s = new McpServer("t", "1");
+	s.shutdown();
+	auto tasks = s.enableTasks();
+	auto events = s.enableEvents();
+	tasks.startSweeper(10.msecs);
+	events.startDeliveryWorker(10.msecs);
+	s.shutdown();
+	s.shutdown();
 }
