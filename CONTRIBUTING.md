@@ -49,8 +49,7 @@ ulimit -n 65536                          # required (see gotcha above)
 dub build                                # build the library
 dub test                                 # run all unit tests (every module must pass)
 
-dub run dfmt -- --inplace source/        # format the source in place
-dub run dfmt -- --inplace source/ conformance/   # format source + conformance (matches CI)
+just fmt                                 # format every D tree in place (matches CI)
 dub run dscanner -- --styleCheck source/ # static analysis / style lint
 ./scripts/dscanner-lint.sh               # the exact lint gate CI runs (with documented filters)
 ```
@@ -80,7 +79,8 @@ change must pass all of them:
 
 1. **dfmt format check** — `dub run dfmt -- --inplace source/ conformance/ examples/ bench/ deploy/ci-smoke/`
    followed by `git diff --exit-code` (dfmt has no `--check` flag, so the idiom
-   is format-in-place then fail if the tree changed). Run dfmt before you commit.
+   is format-in-place then fail if the tree changed). Run `just fmt` before you
+   commit.
 2. **dscanner lint** — `./scripts/dscanner-lint.sh` (the dub config lives in
    `dscanner.ini`; the wrapper documents the false positives it filters out),
    plus `./scripts/check-readme-versions.sh`, which fails if the README's
@@ -129,8 +129,7 @@ These conventions are enforced by review (and some by CI). Please follow them:
   failures isolated and readable.
 - **Commit per change.** Make small, focused commits — one logical change (or
   bug fix) per commit — rather than large mixed commits.
-- **Format and lint before committing.** Run `dub run dfmt -- --inplace source/`
-  (and `conformance/` if you touched it) and `./scripts/dscanner-lint.sh` so the
+- **Format and lint before committing.** Run `just fmt` and `just lint` so the
   CI format/lint gates stay green.
 - **Match the MCP spec exactly.** Field names, JSON shapes, and error codes must
   match the authoritative schema for the relevant protocol version. **Revision-specific
@@ -202,7 +201,7 @@ ones (extensions, scenarios added after a revision shipped) are reported only.
 3. **Run the gates locally** before pushing:
    ```bash
    ulimit -n 65536
-   dub run dfmt -- --inplace source/ conformance/
+   just fmt
    dub test
    ./scripts/dscanner-lint.sh
    ```
