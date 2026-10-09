@@ -1797,9 +1797,10 @@ final class EventsRuntime
 			s.fetchCursor = er.cursor;
 			// A quiet fetch advances the watermark only when no delivery is
 			// in flight for the subscription — on this node, or, over a
-			// shared queue, on any other.
+			// shared queue, on any other — and no dropped position is still
+			// owed a gap, which would otherwise be skipped past unreported.
 			if (!gap && er.events.length == 0 && (s.id in outstanding_) is null
-				&& !deliveryQueue_.hasPendingFor(s.id))
+				&& (s.id in missed_) is null && !deliveryQueue_.hasPendingFor(s.id))
 				s.cursor = er.cursor;
 			return true;
 		}, cur);
@@ -7774,6 +7775,37 @@ unittest  // a no-replay check's truncation is reported to a webhook subscriber 
 	auto gaps = controlPostsOf(ft, "gap");
 	assert(gaps.length == before + 1);
 	assert(parseJsonString(gaps[$ - 1].body)["cursor"].type == Json.Type.null_);
+}
+
+unittest  // a quiet fetch does not advance the watermark past a position still owed a gap
+{
+	long now = 1_000_000;
+	auto ft = new FakeWebhookTransport();
+	ft.throwEvents = 1;
+	EventsOptions o;
+	o.nowMs = () @safe => now;
+	o.nowIso = () @safe => "t";
+	o.allowPrivateCallbackHosts = true;
+	o.webhookTransport = ft;
+	o.webhookMaxAttempts = 1;
+	o.deliverySleep = (Duration d) @safe {};
+	o.deliveryExecutor = (void delegate() @safe job) @safe { job(); };
+	auto rt = new EventsRuntime(null, o);
+	EventRegistration reg;
+	reg.descriptor.name = "n";
+	reg.pollInterval = 1.seconds;
+	reg.check = (EventContext ctx) @safe {
+		if (ctx.cursor.get == "c0")
+			return EventResult.of([EventOccurrence("e1", "n", "t")], "c1");
+		return EventResult.empty("c2");
+	};
+	rt.register(reg);
+	auto p = webhookSub("n", "https://proxy/hooks");
+	p.cursor = "c0";
+	auto r = rt.subscribeWebhook(p, "user-1"); // e1's only attempt fails: owed a gap
+	now += 1_000;
+	rt.pollWebhookSubscriptions();
+	assert(rt.webhookStore().get(r.id).get.cursor.get != "c2");
 }
 
 unittest  // emits arriving before a drain runs share one drain kick
