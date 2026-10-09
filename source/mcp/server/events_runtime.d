@@ -1787,7 +1787,7 @@ final class EventsRuntime
 		// The check can yield, so the subscription may have been removed,
 		// refreshed, or advanced meanwhile: apply this fetch's cursors to the
 		// current record, and drop the batch if another pass already fetched it.
-		const gap = er.truncated && !er.cursor.isNull;
+		const gap = er.truncated;
 		const fetchedFrom = sub.fetchCursor;
 		WebhookSubscription cur;
 		const applied = modifyWebhook(sub.id, (ref WebhookSubscription s) @safe {
@@ -7729,6 +7729,36 @@ unittest  // a webhook poll pass keeps fetching while the check reports more
 	now += 1_000;
 	rt.pollWebhookSubscriptions();
 	assert(ft.eventPosts().length == 5);
+}
+
+unittest  // a no-replay check's truncation is reported to a webhook subscriber as a gap
+{
+	long now = 1_000_000;
+	auto ft = new FakeWebhookTransport();
+	EventsOptions o;
+	o.nowMs = () @safe => now;
+	o.nowIso = () @safe => "t";
+	o.allowPrivateCallbackHosts = true;
+	o.webhookTransport = ft;
+	o.deliverySleep = (Duration d) @safe {};
+	o.deliveryExecutor = (void delegate() @safe job) @safe { job(); };
+	auto rt = new EventsRuntime(null, o);
+	EventRegistration reg;
+	reg.descriptor.name = "lossy";
+	reg.pollInterval = 1.seconds;
+	reg.check = (EventContext ctx) @safe {
+		auto er = EventResult.noReplay([EventOccurrence("e1", "lossy", "t")]);
+		er.truncated = true;
+		return er;
+	};
+	rt.register(reg);
+	rt.subscribeWebhook(webhookSub("lossy", "https://proxy/hooks"), "user-1");
+	const before = controlPostsOf(ft, "gap").length;
+	now += 1_000;
+	rt.pollWebhookSubscriptions();
+	auto gaps = controlPostsOf(ft, "gap");
+	assert(gaps.length == before + 1);
+	assert(parseJsonString(gaps[$ - 1].body)["cursor"].type == Json.Type.null_);
 }
 
 unittest  // endpoint verification and well-known caches are evicted once stale
