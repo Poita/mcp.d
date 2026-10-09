@@ -180,17 +180,28 @@ private bool containsControlChar(string s) @safe pure nothrow
 
 /// Build a signed JWT client assertion (RFC 7523) for OAuth client
 /// authentication, signed RS256 or ES256 according to the key type:
-/// `iss`/`sub` = client id, `aud` = `audience`. `OAuthClient` passes the
-/// authorization server's issuer identifier as `audience`, or its token
-/// endpoint when no issuer is known.
+/// `iss`/`sub` = client id, `aud` = `audience`.
 string makeClientAssertion(string clientId, string audience, string privateKeyPem,
 		long now, long lifetimeSeconds = 300, string jti = "") @safe
 {
+	return makeClientAssertion(clientId, [audience], privateKeyPem, now, lifetimeSeconds, jti);
+}
+
+/// As above, naming every one of `audiences` in `aud` (a single audience is
+/// sent as a string, several as an array). `OAuthClient` chooses them per its
+/// `assertionAudience`.
+string makeClientAssertion(string clientId, string[] audiences,
+		string privateKeyPem, long now, long lifetimeSeconds = 300, string jti = "") @safe
+{
+	import std.algorithm : any, map;
+	import std.array : array;
 	import std.conv : to;
 
+	if (audiences.length == 0)
+		throw new Exception("makeClientAssertion: no audience");
 	if (containsControlChar(clientId))
 		throw new Exception("makeClientAssertion: clientId contains control characters");
-	if (containsControlChar(audience))
+	if (audiences.any!(a => containsControlChar(a)))
 		throw new Exception("makeClientAssertion: audience contains control characters");
 	if (jti.length && containsControlChar(jti))
 		throw new Exception("makeClientAssertion: jti contains control characters");
@@ -215,7 +226,8 @@ string makeClientAssertion(string clientId, string audience, string privateKeyPe
 	auto payloadJson = Json.emptyObject;
 	payloadJson["iss"] = clientId;
 	payloadJson["sub"] = clientId;
-	payloadJson["aud"] = audience;
+	payloadJson["aud"] = audiences.length == 1
+		? Json(audiences[0]) : Json(audiences.map!(a => Json(a)).array);
 	payloadJson["jti"] = theJti;
 	payloadJson["iat"] = now;
 	payloadJson["exp"] = now + lifetimeSeconds;

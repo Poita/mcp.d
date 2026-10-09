@@ -1712,8 +1712,8 @@ unittest  // JWKs of different key types sharing a kid are all kept and selected
 	const es256 = makeEs256(`{"exp":1700003600}`, "rsa-1");
 
 	foreach (doc; [
-			`{"keys":[` ~ rsa ~ `,` ~ ec ~ `]}`, `{"keys":[` ~ ec ~ `,` ~ rsa ~ `]}`
-		])
+		`{"keys":[` ~ rsa ~ `,` ~ ec ~ `]}`, `{"keys":[` ~ ec ~ `,` ~ rsa ~ `]}`
+	])
 	{
 		auto cache = new JwksCache("", cfg.jwksCacheTtl);
 		cache.load(doc);

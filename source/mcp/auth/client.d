@@ -70,6 +70,20 @@ struct IssuerResolution
 	ProtectedResourceMetadata metadata;
 }
 
+/// The `aud` an `OAuthClient` puts in a `private_key_jwt` client assertion
+/// (RFC 7523 §3). Authorization servers differ: some require their issuer
+/// identifier, others (OIDC Core §9) their token endpoint URL.
+enum AssertionAudience
+{
+	/// The authorization server's issuer identifier, falling back to the token
+	/// endpoint when the metadata names no issuer.
+	issuer,
+	/// The token endpoint URL.
+	tokenEndpoint,
+	/// Both the issuer identifier and the token endpoint URL.
+	both,
+}
+
 /// A production OAuth 2.1 client for MCP: drives protected-resource and
 /// authorization-server metadata discovery (RFC 9728 / RFC 8414), Dynamic Client
 /// Registration (RFC 7591), and the token endpoint (authorization-code + PKCE,
@@ -104,6 +118,8 @@ final class OAuthClient
 	/// RSA or EC (P-256) private key (PKCS#8 PEM) for `private_key_jwt` client
 	/// assertions. Required when `authMethod` is `privateKeyJwt`.
 	string privateKeyPem;
+	/// The `aud` of `private_key_jwt` client assertions.
+	AssertionAudience assertionAudience = AssertionAudience.issuer;
 	/// SEP-991: this client's OAuth Client ID Metadata Document URL — an
 	/// HTTPS URL (with a path component) at which the client hosts its metadata
 	/// document. When set and the authorization server advertises
@@ -144,7 +160,7 @@ final class OAuthClient
 	/// `private_key_jwt` token-endpoint authentication (RFC 7523), or "" for any
 	/// other method. Throws when `private_key_jwt` is selected without a
 	/// `privateKeyPem`, rather than sending an unauthenticated request.
-	private string clientAssertionParams(string clientId, string audience) @safe
+	private string clientAssertionParams(string clientId, string[] audiences) @safe
 	{
 		import std.uri : encodeComponent;
 		import std.datetime.systime : Clock;
@@ -156,24 +172,40 @@ final class OAuthClient
 			throw invalidRequest(
 					"OAuthClient.privateKeyPem must be set when authMethod is " ~ "private_key_jwt");
 		const now = () @trusted { return Clock.currTime().toUnixTime(); }();
-		const jwt = makeClientAssertion(clientId, audience, privateKeyPem, now);
+		const jwt = makeClientAssertion(clientId, audiences, privateKeyPem, now);
 		return "&client_assertion_type=" ~ encodeComponent(
 				jwtBearerAssertionType) ~ "&client_assertion=" ~ encodeComponent(jwt);
 	}
 
+	/// The client-assertion audiences for a token request to `as_`, per
+	/// `assertionAudience`.
+	private string[] assertionAudiences(AuthorizationServerMetadata as_) const @safe
+	{
+		final switch (assertionAudience)
+		{
+		case AssertionAudience.issuer:
+			return [as_.issuer.length ? as_.issuer : as_.tokenEndpoint];
+		case AssertionAudience.tokenEndpoint:
+			return [as_.tokenEndpoint];
+		case AssertionAudience.both:
+			return as_.issuer.length && as_.issuer != as_.tokenEndpoint
+				? [as_.issuer, as_.tokenEndpoint] : [as_.tokenEndpoint];
+		}
+	}
+
 	/// The token-endpoint client-authentication form fields for grants whose
 	/// form builders do not carry them: `client_secret` under
-	/// `client_secret_post`, or a client assertion (audience `assertionAudience`)
-	/// under `private_key_jwt`. `client_secret_basic` travels in the
-	/// `Authorization` header instead (see `postForm`).
-	private string clientAuthParams(RegisteredClient client, string assertionAudience) @safe
+	/// `client_secret_post`, or a client assertion naming `audiences` under
+	/// `private_key_jwt`. `client_secret_basic` travels in the `Authorization`
+	/// header instead (see `postForm`).
+	private string clientAuthParams(RegisteredClient client, string[] audiences) @safe
 	{
 		import std.uri : encodeComponent;
 
 		string s;
 		if (authMethod == TokenEndpointAuthMethod.clientSecretPost && client.clientSecret.length)
 			s = "&client_secret=" ~ encodeComponent(client.clientSecret);
-		return s ~ clientAssertionParams(client.clientId, assertionAudience);
+		return s ~ clientAssertionParams(client.clientId, audiences);
 	}
 
 	/// Discover the protected-resource metadata for an MCP endpoint, using the
@@ -486,7 +518,7 @@ final class OAuthClient
 		const post = authMethod == TokenEndpointAuthMethod.clientSecretPost;
 		auto form = buildAuthCodeTokenForm(code, redirectUri, codeVerifier,
 				client.clientId, resource, post ? client.clientSecret : "") ~ clientAssertionParams(
-				client.clientId, as_.issuer.length ? as_.issuer : as_.tokenEndpoint);
+				client.clientId, assertionAudiences(as_));
 		return requireBearer(TokenSet.fromJson(postForm(as_.tokenEndpoint, form, client)));
 	}
 
@@ -497,8 +529,8 @@ final class OAuthClient
 		requireResource();
 		const post = authMethod == TokenEndpointAuthMethod.clientSecretPost;
 		auto form = buildClientCredentialsForm(client.clientId, scopeStr,
-				resource, post ? client.clientSecret : "") ~ clientAssertionParams(client.clientId,
-				as_.issuer.length ? as_.issuer : as_.tokenEndpoint);
+				resource, post ? client.clientSecret : "") ~ clientAssertionParams(
+				client.clientId, assertionAudiences(as_));
 		return requireBearer(TokenSet.fromJson(postForm(as_.tokenEndpoint, form, client)));
 	}
 
@@ -512,7 +544,7 @@ final class OAuthClient
 		requireResource();
 		auto form = buildTokenExchangeForm(subjectToken, subjectTokenType,
 				requestedTokenType, audience, resource, client.clientId) ~ clientAuthParams(client,
-				tokenEndpoint);
+				[tokenEndpoint]);
 		return TokenSet.fromJson(postForm(tokenEndpoint, form, client));
 	}
 
@@ -522,7 +554,7 @@ final class OAuthClient
 	{
 		requireResource();
 		auto form = buildJwtBearerForm(assertion, scopeStr, resource, client.clientId)
-			~ clientAuthParams(client, as_.issuer.length ? as_.issuer : as_.tokenEndpoint);
+			~ clientAuthParams(client, assertionAudiences(as_));
 		return requireBearer(TokenSet.fromJson(postForm(as_.tokenEndpoint, form, client)));
 	}
 
@@ -532,8 +564,8 @@ final class OAuthClient
 		requireResource();
 		const post = authMethod == TokenEndpointAuthMethod.clientSecretPost;
 		auto form = buildRefreshTokenForm(refreshToken, client.clientId,
-				resource, post ? client.clientSecret : "") ~ clientAssertionParams(client.clientId,
-				as_.issuer.length ? as_.issuer : as_.tokenEndpoint);
+				resource, post ? client.clientSecret : "") ~ clientAssertionParams(
+				client.clientId, assertionAudiences(as_));
 		return requireBearer(TokenSet.fromJson(postForm(as_.tokenEndpoint, form, client)));
 	}
 
@@ -2033,6 +2065,46 @@ unittest  // private_key_jwt: the JWT-bearer grant carries a client_assertion
 	as_.tokenEndpoint = srv.base ~ "/token";
 	c.jwtBearerGrant(as_, RegisteredClient("cid", ""), "the-assertion", "");
 	assert(lastForm.canFind("client_assertion="));
+}
+
+unittest  // private_key_jwt: assertionAudience picks the issuer, the token endpoint, or both as aud
+{
+	import std.algorithm : find, startsWith;
+	import std.array : split;
+	import std.uri : decodeComponent;
+	import vibe.data.json : Json, parseJsonString;
+	import mcp.auth.jwt_verifier : base64UrlDecode;
+
+	string lastForm;
+	auto srv = startLoopback((scope HTTPServerRequest req, scope HTTPServerResponse res) @safe {
+		lastForm = req.bodyReader.readAllUTF8();
+		res.writeBody(`{"access_token":"at","token_type":"bearer"}`, "application/json");
+	});
+	scope (exit)
+		srv.stop();
+
+	Json sentAud(AssertionAudience mode) @safe
+	{
+		auto c = new OAuthClient();
+		c.resource = "http://127.0.0.1:3000/mcp";
+		c.authMethod = TokenEndpointAuthMethod.privateKeyJwt;
+		c.privateKeyPem = testEcPem;
+		c.assertionAudience = mode;
+		AuthorizationServerMetadata as_;
+		as_.issuer = "https://as.example.com";
+		as_.tokenEndpoint = srv.base ~ "/token";
+		c.clientCredentials(as_, RegisteredClient("cid", ""), "");
+		const field = lastForm.split('&').find!(f => f.startsWith("client_assertion="));
+		const jwt = decodeComponent(field[0]["client_assertion=".length .. $]);
+		const payload = (cast(const(char)[]) base64UrlDecode(jwt.split('.')[1])).idup;
+		return parseJsonString(payload)["aud"];
+	}
+
+	assert(sentAud(AssertionAudience.issuer) == Json("https://as.example.com"));
+	assert(sentAud(AssertionAudience.tokenEndpoint) == Json(srv.base ~ "/token"));
+	const both = sentAud(AssertionAudience.both);
+	assert(both.type == Json.Type.array && both.length == 2);
+	assert(both[0] == Json("https://as.example.com") && both[1] == Json(srv.base ~ "/token"));
 }
 
 unittest  // a rejected refresh carries the OAuth error code for oauthErrorCode
