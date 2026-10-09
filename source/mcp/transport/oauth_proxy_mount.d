@@ -56,7 +56,7 @@ import vibe.http.server : HTTPServerRequest, HTTPServerResponse, HTTPStatus;
 import vibe.http.router : URLRouter;
 import vibe.http.common : HTTPMethod;
 
-import mcp.auth.oauth : isValidClientIdMetadataUrl, TokenSet;
+import mcp.auth.oauth : canonicalResourceUri, isValidClientIdMetadataUrl, TokenSet;
 import mcp.auth.oauth_proxy : BrokeredToken, ConsentRequiredException,
 	InvalidClientIdMetadataException,
 	InvalidScopeException,
@@ -706,10 +706,16 @@ void mountOAuthRegister(URLRouter router, OAuthProxy proxy, ProxyRequestLimit li
 /// `ConsentRequiredException` for an un-consented client; the handler then renders
 /// the proxy's own consent screen instead of forwarding.
 ///
-/// A request is refused with 400 before any of that unless it carries
-/// `response_type=code` (otherwise `invalid_request` when absent,
-/// `unsupported_response_type` when another value) and a `code_challenge` with
-/// `code_challenge_method=S256` (otherwise `invalid_request`).
+/// The client is checked first: a DCR request must name the shared upstream
+/// `client_id` and a registered `redirect_uri`, a CIMD request a valid metadata
+/// document listing its `redirect_uri`; otherwise the request is answered 400
+/// `invalid_request` and never redirected (RFC 6749 §4.1.2.1). Once the
+/// `redirect_uri` is known good, any other error is redirected to it with the
+/// client's `state`: a `response_type` other than `code` (`invalid_request` when
+/// absent, `unsupported_response_type` otherwise), a missing `code_challenge` or a
+/// `code_challenge_method` other than `S256` (`invalid_request`), a `resource`
+/// other than the proxy's own (`invalid_target`, RFC 8707), or too many scopes
+/// (`invalid_scope`).
 ///
 /// The `store` MUST be shared with `mountOAuthConsent` and `mountOAuthCallback`
 /// so the consent approval and the upstream callback can read back the pending
@@ -733,30 +739,72 @@ void mountOAuthAuthorize(URLRouter router, OAuthProxy proxy,
 		const clientState = req.query.get("state", "");
 		const clientId = req.query.get("client_id", "");
 
+		// Identify the client and validate its redirect_uri first: until both are
+		// known good, an error is shown here rather than redirected (RFC 6749
+		// §4.1.2.1), so the endpoint cannot be used as an open redirector.
+		//
 		// A URL-formatted client_id selects the SEP-991 Client ID Metadata Document
 		// flow (when CIMD is enabled): the client's allowlist of redirect URIs comes
 		// from its hosted document rather than a prior DCR /register, and consent is
-		// keyed on the stable client_id URL. Otherwise this is a DCR client and the
-		// redirect_uri is validated against the registry.
+		// keyed on the stable client_id URL. Otherwise this is a DCR client, whose
+		// client_id is the shared upstream one and whose redirect_uri is validated
+		// against the registry.
+		import mcp.auth.oauth : ClientIdMetadataDocument;
+		import mcp.auth.oauth_proxy : validateClientIdMetadata;
+
 		const isCimd = cfg.clientIdMetadataDocumentSupported && isValidClientIdMetadataUrl(clientId);
+		ClientIdMetadataDocument doc;
+		if (isCimd)
+		{
+			// Fetch (SSRF-guarded) and validate the document: a bad document, a
+			// mismatched client_id, or a redirect_uri not listed in it is
+			// invalid_request, and nothing is forwarded.
+			try
+			{
+				doc = proxy.fetchClientIdMetadata(clientId);
+				validateClientIdMetadata(clientId, doc, clientRedirect);
+			}
+			catch (InvalidClientIdMetadataException)
+			{
+				res.statusCode = HTTPStatus.badRequest;
+				res.writeJsonBody(invalidRequestJson("invalid client_id metadata document"));
+				return;
+			}
+		}
+		else
+		{
+			if (clientId != cfg.upstreamClientId)
+			{
+				res.statusCode = HTTPStatus.badRequest;
+				res.writeJsonBody(invalidRequestJson("unknown client_id"));
+				return;
+			}
+			// Reject an unregistered or disallowed redirect_uri BEFORE minting any
+			// proxy state or rendering the consent screen (RFC 6749 §3.1.2.2 /
+			// §10.6, RFC 8252), so the upstream code can never be relayed to a URI
+			// the client never registered.
+			try
+				proxy.validateRedirectUri(clientRedirect);
+			catch (InvalidRedirectUriException)
+			{
+				res.statusCode = HTTPStatus.badRequest;
+				res.writeJsonBody(invalidRequestJson("invalid redirect_uri"));
+				return;
+			}
+		}
+
+		void redirectError(string error, string description) @safe
+		{
+			res.redirect(buildClientCallbackError(clientRedirect, error,
+				description, "", clientState), HTTPStatus.found);
+		}
 
 		// The proxy supports only the authorization-code grant (RFC 6749 §4.1.1).
 		const responseType = req.query.get("response_type", "");
 		if (responseType.length == 0)
-		{
-			res.statusCode = HTTPStatus.badRequest;
-			res.writeJsonBody(invalidRequestJson("response_type is required"));
-			return;
-		}
+			return redirectError("invalid_request", "response_type is required");
 		if (responseType != "code")
-		{
-			Json err = Json.emptyObject;
-			err["error"] = "unsupported_response_type";
-			err["error_description"] = "response_type must be code";
-			res.statusCode = HTTPStatus.badRequest;
-			res.writeJsonBody(err);
-			return;
-		}
+			return redirectError("unsupported_response_type", "response_type must be code");
 
 		// Enforce PKCE on the proxy->upstream leg. The proxy advertises S256-only
 		// support and checks S256 at /token, so a missing code_challenge — or a
@@ -764,28 +812,20 @@ void mountOAuthAuthorize(URLRouter router, OAuthProxy proxy,
 		// RFC 7636 §4.3 defines as plain) — is refused with invalid_request rather
 		// than forwarding a non-PKCE / malformed-PKCE request upstream.
 		if (codeChallenge.length == 0)
-		{
-			res.statusCode = HTTPStatus.badRequest;
-			res.writeJsonBody(invalidRequestJson("code_challenge is required"));
-			return;
-		}
+			return redirectError("invalid_request", "code_challenge is required");
 		if (codeChallengeMethod != "S256")
-		{
-			res.statusCode = HTTPStatus.badRequest;
-			res.writeJsonBody(invalidRequestJson("code_challenge_method must be S256"));
-			return;
-		}
+			return redirectError("invalid_request", "code_challenge_method must be S256");
+
+		// RFC 8707 §2: tokens from this proxy are only ever for its own resource.
+		const resource = req.query.get("resource", "");
+		if (resource.length && canonicalResourceUri(resource) != canonicalResourceUri(cfg.resource))
+			return redirectError("invalid_target",
+				"resource is not served by this authorization server");
+
 		try
 			cast(void) proxy.forwardedScopes(scope_);
 		catch (InvalidScopeException e)
-		{
-			Json err = Json.emptyObject;
-			err["error"] = "invalid_scope";
-			err["error_description"] = e.msg;
-			res.statusCode = HTTPStatus.badRequest;
-			res.writeJsonBody(err);
-			return;
-		}
+			return redirectError("invalid_scope", e.msg);
 
 		// Consent is recorded per browser: the consent cookie names this browser,
 		// and a browser without one is given a fresh, unguessable handle (set only
@@ -817,21 +857,6 @@ void mountOAuthAuthorize(URLRouter router, OAuthProxy proxy,
 
 		if (isCimd)
 		{
-			// Fetch + validate the document up front (SSRF-guarded). A fetch/validation
-			// failure — bad document, mismatched client_id, or a redirect_uri not listed
-			// in the document — is RFC 6749 §5.2 invalid_request; nothing is forwarded.
-			import mcp.auth.oauth : ClientIdMetadataDocument;
-
-			ClientIdMetadataDocument doc;
-			try
-				doc = proxy.fetchClientIdMetadata(clientId);
-			catch (InvalidClientIdMetadataException)
-			{
-				res.statusCode = HTTPStatus.badRequest;
-				res.writeJsonBody(invalidRequestJson("invalid client_id metadata document"));
-				return;
-			}
-
 			const proxyState = mintState();
 			store.put(proxyState, ProxyAuthState(clientRedirect, clientState,
 				codeChallenge, scope_, clientId, consentSession, csrfToken));
@@ -850,19 +875,6 @@ void mountOAuthAuthorize(URLRouter router, OAuthProxy proxy,
 				res.statusCode = HTTPStatus.badRequest;
 				res.writeJsonBody(invalidRequestJson("invalid client_id metadata document"));
 			}
-			return;
-		}
-
-		// DCR client: reject an unregistered or disallowed-scheme redirect_uri BEFORE
-		// minting any proxy state or rendering the consent screen (RFC 6749 §3.1.2.2 /
-		// §10.6, RFC 8252). Failing closed here means the upstream code can never be
-		// relayed to a URI the client never registered.
-		try
-			proxy.validateRedirectUri(clientRedirect);
-		catch (InvalidRedirectUriException)
-		{
-			res.statusCode = HTTPStatus.badRequest;
-			res.writeJsonBody(invalidRequestJson("invalid redirect_uri"));
 			return;
 		}
 
@@ -1643,7 +1655,7 @@ unittest  // RATE LIMIT: /register and /authorize refuse a client past maxReques
 	assert(browserPost(router, "https://mcp.example.com/register?k=a", body_, "").status == 201);
 	assert(browserPost(router, "https://mcp.example.com/register?k=a", body_, "").status == 429);
 	const authorize = browserGet(router,
-			"https://mcp.example.com/authorize?k=a&response_type=code"
+			"https://mcp.example.com/authorize?client_id=Iv1.upstream&k=a&response_type=code"
 			~ "&code_challenge=CH&code_challenge_method=S256"
 			~ "&redirect_uri=http%3A%2F%2Flocalhost%3A5000%2Fcb&state=cs", "");
 	assert(authorize.status == 429);
@@ -1961,7 +1973,7 @@ unittest  // CONSENT: a consented browser asking for broader scopes sees the con
 	int statusFor(string scope_) @safe
 	{
 		auto sink = createMemoryOutputStream();
-		auto req = createTestHTTPServerRequest(URL("https://mcp.example.com/authorize?response_type=code&code_challenge_method=S256&code_challenge=CH&scope=" ~ scope_ ~ "&redirect_uri=http%3A%2F%2Flocalhost%3A5000%2Fcb&state=cs"));
+		auto req = createTestHTTPServerRequest(URL("https://mcp.example.com/authorize?client_id=Iv1.upstream&response_type=code&code_challenge_method=S256&code_challenge=CH&scope=" ~ scope_ ~ "&redirect_uri=http%3A%2F%2Flocalhost%3A5000%2Fcb&state=cs"));
 		req.headers["Cookie"] = consentCookieName ~ "=browser-1";
 		auto res = createTestHTTPServerResponse(sink, null, TestHTTPResponseMode.bodyOnly);
 		router.handleRequest(req, res);
@@ -2006,7 +2018,7 @@ unittest  // CONFUSED DEPUTY: an un-consented client gets the consent screen, NO
 	mountOAuthProxy(router, proxy);
 
 	auto sink = createMemoryOutputStream();
-	auto req = createTestHTTPServerRequest(URL("https://mcp.example.com/authorize?response_type=code&code_challenge_method=S256&code_challenge=CH&scope=read&redirect_uri=http%3A%2F%2Flocalhost%3A5000%2Fcb&state=cs"));
+	auto req = createTestHTTPServerRequest(URL("https://mcp.example.com/authorize?client_id=Iv1.upstream&response_type=code&code_challenge_method=S256&code_challenge=CH&scope=read&redirect_uri=http%3A%2F%2Flocalhost%3A5000%2Fcb&state=cs"));
 	auto res = createTestHTTPServerResponse(sink, null, TestHTTPResponseMode.bodyOnly);
 	router.handleRequest(req, res);
 
@@ -2027,7 +2039,7 @@ unittest  // CONFUSED DEPUTY: after the user approves, POST /consent records con
 
 	// 1) /authorize renders the consent screen, stashing the pending auth under the
 	//    proxy state carried in the form, and sets this browser's consent cookie.
-	const page = browserGet(router, "https://mcp.example.com/authorize?response_type=code&code_challenge_method=S256&code_challenge=CH" ~ "&scope=read&redirect_uri=http%3A%2F%2Flocalhost%3A5000%2Fcb&state=cs",
+	const page = browserGet(router, "https://mcp.example.com/authorize?client_id=Iv1.upstream&response_type=code&code_challenge_method=S256&code_challenge=CH" ~ "&scope=read&redirect_uri=http%3A%2F%2Flocalhost%3A5000%2Fcb&state=cs",
 			"");
 	assert(hiddenField(page.body_, "state").length > 0);
 	assert(page.setCookie.length > 0);
@@ -2145,7 +2157,7 @@ unittest  // CONSENT BINDING: one browser's approval does not let another browse
 	auto router = new URLRouter;
 	mountOAuthProxy(router, proxy);
 
-	const authorizeUrl = "https://mcp.example.com/authorize?response_type=code&code_challenge_method=S256&code_challenge=ATTACKER" ~ "&redirect_uri=https%3A%2F%2Fevil.example%2Fcb&state=x";
+	const authorizeUrl = "https://mcp.example.com/authorize?client_id=Iv1.upstream&response_type=code&code_challenge_method=S256&code_challenge=ATTACKER" ~ "&redirect_uri=https%3A%2F%2Fevil.example%2Fcb&state=x";
 	const attackerPage = browserGet(router, authorizeUrl, "");
 	assert(attackerPage.body_.canFind("Authorize application"));
 	const approved = browserPost(router, "https://mcp.example.com/consent",
@@ -2170,7 +2182,7 @@ unittest  // CONSENT BINDING: the approving browser skips the consent screen on 
 	auto router = new URLRouter;
 	mountOAuthProxy(router, proxy);
 
-	const authorizeUrl = "https://mcp.example.com/authorize?response_type=code&code_challenge_method=S256&code_challenge=CH" ~ "&redirect_uri=http%3A%2F%2Flocalhost%3A5000%2Fcb&state=cs";
+	const authorizeUrl = "https://mcp.example.com/authorize?client_id=Iv1.upstream&response_type=code&code_challenge_method=S256&code_challenge=CH" ~ "&redirect_uri=http%3A%2F%2Flocalhost%3A5000%2Fcb&state=cs";
 	const page = browserGet(router, authorizeUrl, "");
 	assert(page.setCookie.length);
 	assert(browserPost(router, "https://mcp.example.com/consent",
@@ -2188,7 +2200,7 @@ unittest  // CONSENT CSRF: a POST /consent from a browser other than the one sho
 	auto router = new URLRouter;
 	mountOAuthProxy(router, proxy);
 
-	const page = browserGet(router, "https://mcp.example.com/authorize?response_type=code&code_challenge_method=S256&code_challenge=CH" ~ "&redirect_uri=http%3A%2F%2Flocalhost%3A5000%2Fcb&state=cs",
+	const page = browserGet(router, "https://mcp.example.com/authorize?client_id=Iv1.upstream&response_type=code&code_challenge_method=S256&code_challenge=CH" ~ "&redirect_uri=http%3A%2F%2Flocalhost%3A5000%2Fcb&state=cs",
 			"");
 	// A cross-site form auto-submitted from the victim's browser carries the
 	// victim's cookie (or none), not the one bound to this pending authorization.
@@ -2205,7 +2217,7 @@ unittest  // CONSENT CSRF: a POST /consent without the anti-CSRF token is refuse
 	auto router = new URLRouter;
 	mountOAuthProxy(router, proxy);
 
-	const page = browserGet(router, "https://mcp.example.com/authorize?response_type=code&code_challenge_method=S256&code_challenge=CH" ~ "&redirect_uri=http%3A%2F%2Flocalhost%3A5000%2Fcb&state=cs",
+	const page = browserGet(router, "https://mcp.example.com/authorize?client_id=Iv1.upstream&response_type=code&code_challenge_method=S256&code_challenge=CH" ~ "&redirect_uri=http%3A%2F%2Flocalhost%3A5000%2Fcb&state=cs",
 			"");
 	const noToken = browserPost(router, "https://mcp.example.com/consent",
 			"state=" ~ encodeComponent(hiddenField(page.body_, "state")), page.setCookie);
@@ -2219,7 +2231,7 @@ unittest  // CONSENT CSRF: a refused POST /consent leaves the pending authorizat
 	auto router = new URLRouter;
 	mountOAuthProxy(router, proxy);
 
-	const page = browserGet(router, "https://mcp.example.com/authorize?response_type=code&code_challenge_method=S256&code_challenge=CH" ~ "&redirect_uri=http%3A%2F%2Flocalhost%3A5000%2Fcb&state=cs",
+	const page = browserGet(router, "https://mcp.example.com/authorize?client_id=Iv1.upstream&response_type=code&code_challenge_method=S256&code_challenge=CH" ~ "&redirect_uri=http%3A%2F%2Flocalhost%3A5000%2Fcb&state=cs",
 			"");
 	// A forged cross-site post (no consent cookie) and one missing the token.
 	assert(browserPost(router, "https://mcp.example.com/consent",
@@ -2256,7 +2268,7 @@ unittest  // CONSENT HARDENING: the consent screen cannot be framed (clickjackin
 	auto router = new URLRouter;
 	mountOAuthProxy(router, proxy);
 
-	const page = browserGet(router, "https://mcp.example.com/authorize?response_type=code&code_challenge_method=S256&code_challenge=CH" ~ "&redirect_uri=http%3A%2F%2Flocalhost%3A5000%2Fcb&state=cs",
+	const page = browserGet(router, "https://mcp.example.com/authorize?client_id=Iv1.upstream&response_type=code&code_challenge_method=S256&code_challenge=CH" ~ "&redirect_uri=http%3A%2F%2Flocalhost%3A5000%2Fcb&state=cs",
 			"");
 	assert(page.xFrameOptions == "DENY");
 	assert(page.csp.canFind("frame-ancestors 'none'"));
@@ -2283,7 +2295,7 @@ unittest  // CONSENT HARDENING: a GET to /consent cannot grant consent (no auto-
 
 	// Drive /authorize to mint a proxy state and stash the pending authorization.
 	auto sink = createMemoryOutputStream();
-	auto req = createTestHTTPServerRequest(URL("https://mcp.example.com/authorize?response_type=code&code_challenge_method=S256&code_challenge=CH&scope=read&redirect_uri=http%3A%2F%2Flocalhost%3A5000%2Fcb&state=cs"));
+	auto req = createTestHTTPServerRequest(URL("https://mcp.example.com/authorize?client_id=Iv1.upstream&response_type=code&code_challenge_method=S256&code_challenge=CH&scope=read&redirect_uri=http%3A%2F%2Flocalhost%3A5000%2Fcb&state=cs"));
 	auto res = createTestHTTPServerResponse(sink, null, TestHTTPResponseMode.bodyOnly);
 	router.handleRequest(req, res);
 	const html = () @trusted { return cast(string) sink.data; }();
@@ -2328,7 +2340,7 @@ unittest  // CONSENT HARDENING: the consent screen sets no-store + no-referrer h
 	mountOAuthProxy(router, proxy);
 
 	auto sink = createMemoryOutputStream();
-	auto req = createTestHTTPServerRequest(URL("https://mcp.example.com/authorize?response_type=code&code_challenge_method=S256&code_challenge=CH&scope=read&redirect_uri=http%3A%2F%2Flocalhost%3A5000%2Fcb&state=cs"));
+	auto req = createTestHTTPServerRequest(URL("https://mcp.example.com/authorize?client_id=Iv1.upstream&response_type=code&code_challenge_method=S256&code_challenge=CH&scope=read&redirect_uri=http%3A%2F%2Flocalhost%3A5000%2Fcb&state=cs"));
 	auto res = createTestHTTPServerResponse(sink, null, TestHTTPResponseMode.bodyOnly);
 	router.handleRequest(req, res);
 
@@ -2359,7 +2371,7 @@ unittest  // UPSTREAM ERROR: /callback relays an upstream error to the client, n
 
 	// Drive /authorize to mint a proxy state and stash the pending authorization.
 	auto sink = createMemoryOutputStream();
-	auto req = createTestHTTPServerRequest(URL("https://mcp.example.com/authorize?response_type=code&code_challenge_method=S256&code_challenge=CH&scope=read&redirect_uri=http%3A%2F%2Flocalhost%3A5000%2Fcb&state=cs"));
+	auto req = createTestHTTPServerRequest(URL("https://mcp.example.com/authorize?client_id=Iv1.upstream&response_type=code&code_challenge_method=S256&code_challenge=CH&scope=read&redirect_uri=http%3A%2F%2Flocalhost%3A5000%2Fcb&state=cs"));
 	req.headers["Cookie"] = consentCookieName ~ "=browser-1";
 	auto res = createTestHTTPServerResponse(sink, null, TestHTTPResponseMode.bodyOnly);
 	router.handleRequest(req, res);
@@ -2592,7 +2604,7 @@ unittest  // OPEN REDIRECT: /authorize 400s an unregistered redirect_uri and doe
 	mountOAuthProxy(router, proxy);
 
 	auto sink = createMemoryOutputStream();
-	auto req = createTestHTTPServerRequest(URL("https://mcp.example.com/authorize?response_type=code&code_challenge_method=S256&code_challenge=CH&scope=read&redirect_uri=https%3A%2F%2Fattacker.example%2Fcb&state=cs"));
+	auto req = createTestHTTPServerRequest(URL("https://mcp.example.com/authorize?client_id=Iv1.upstream&response_type=code&code_challenge_method=S256&code_challenge=CH&scope=read&redirect_uri=https%3A%2F%2Fattacker.example%2Fcb&state=cs"));
 	auto res = createTestHTTPServerResponse(sink, null, TestHTTPResponseMode.bodyOnly);
 	router.handleRequest(req, res);
 
@@ -2628,7 +2640,7 @@ unittest  // OPEN REDIRECT: /authorize 400s an http non-loopback redirect_uri ev
 	mountOAuthProxy(router, proxy);
 
 	auto sink = createMemoryOutputStream();
-	auto req = createTestHTTPServerRequest(URL("https://mcp.example.com/authorize?response_type=code&code_challenge_method=S256&code_challenge=CH&scope=read&redirect_uri=http%3A%2F%2Fapp.example.com%2Fcb&state=cs"));
+	auto req = createTestHTTPServerRequest(URL("https://mcp.example.com/authorize?client_id=Iv1.upstream&response_type=code&code_challenge_method=S256&code_challenge=CH&scope=read&redirect_uri=http%3A%2F%2Fapp.example.com%2Fcb&state=cs"));
 	auto res = createTestHTTPServerResponse(sink, null, TestHTTPResponseMode.bodyOnly);
 	router.handleRequest(req, res);
 
@@ -2637,86 +2649,74 @@ unittest  // OPEN REDIRECT: /authorize 400s an http non-loopback redirect_uri ev
 	assert(body_.canFind("invalid_request"));
 }
 
-unittest  // PKCE: /authorize 400s a request with a missing code_challenge
+version (unittest)
 {
-	import std.algorithm : canFind;
-	import vibe.http.server : createTestHTTPServerRequest,
-		createTestHTTPServerResponse, TestHTTPResponseMode;
-	import vibe.inet.url : URL;
-	import vibe.stream.memory : createMemoryOutputStream;
+	/// Drive `/authorize` on a proxy with `http://localhost:5000/cb` registered,
+	/// appending `query` to a request that otherwise names that client.
+	private BrowserHit authorizeDcr(string query) @safe
+	{
+		auto proxy = mountSampleProxy();
+		proxy.register(["http://localhost:5000/cb"]);
+		auto router = new URLRouter;
+		mountOAuthProxy(router, proxy);
+		return browserGet(router, "https://mcp.example.com/authorize?client_id=Iv1.upstream"
+				~ "&redirect_uri=http%3A%2F%2Flocalhost%3A5000%2Fcb&state=cs" ~ query, "");
+	}
 
-	OAuthProxyConfig cfg;
-	cfg.upstreamAuthorizationEndpoint = "https://github.com/login/oauth/authorize";
-	cfg.upstreamTokenEndpoint = "https://github.com/login/oauth/access_token";
-	cfg.upstreamClientId = "Iv1.upstream";
-	cfg.baseUrl = "https://mcp.example.com";
-	cfg.resource = "https://mcp.example.com/mcp";
-
-	auto proxy = new OAuthProxy(cfg);
-	proxy.register(["http://localhost:5000/cb"]);
-	auto router = new URLRouter;
-	mountOAuthProxy(router, proxy);
-
-	auto sink = createMemoryOutputStream();
-	auto req = createTestHTTPServerRequest(URL("https://mcp.example.com/authorize?response_type=code&code_challenge_method=S256&scope=read&redirect_uri=http%3A%2F%2Flocalhost%3A5000%2Fcb&state=cs"));
-	auto res = createTestHTTPServerResponse(sink, null, TestHTTPResponseMode.bodyOnly);
-	router.handleRequest(req, res);
-
-	const body_ = () @trusted { return cast(string) sink.data; }();
-	assert(res.statusCode == 400);
-	assert(body_.canFind("invalid_request"));
-	assert(body_.canFind("code_challenge"));
-	// The client was never forwarded upstream / asked to consent.
-	assert(!body_.canFind("Authorize application"));
+	/// Whether `hit` redirects to the registered client with OAuth `error`.
+	private bool redirectsError(const BrowserHit hit, string error) @safe
+	{
+		return hit.status == 302 && hit.location.startsWith("http://localhost:5000/cb?")
+			&& hit.location.canFind("error=" ~ error) && hit.location.canFind("state=cs");
+	}
 }
 
-unittest  // PKCE: /authorize 400s a non-S256 code_challenge_method
+unittest  // PKCE: /authorize redirects a request with a missing code_challenge back with invalid_request
 {
-	import std.algorithm : canFind;
-	import vibe.http.server : createTestHTTPServerRequest,
-		createTestHTTPServerResponse, TestHTTPResponseMode;
-	import vibe.inet.url : URL;
-	import vibe.stream.memory : createMemoryOutputStream;
-
-	OAuthProxyConfig cfg;
-	cfg.upstreamAuthorizationEndpoint = "https://github.com/login/oauth/authorize";
-	cfg.upstreamTokenEndpoint = "https://github.com/login/oauth/access_token";
-	cfg.upstreamClientId = "Iv1.upstream";
-	cfg.baseUrl = "https://mcp.example.com";
-	cfg.resource = "https://mcp.example.com/mcp";
-
-	auto proxy = new OAuthProxy(cfg);
-	proxy.register(["http://localhost:5000/cb"]);
-	auto router = new URLRouter;
-	mountOAuthProxy(router, proxy);
-
-	auto sink = createMemoryOutputStream();
-	auto req = createTestHTTPServerRequest(URL("https://mcp.example.com/authorize?response_type=code&code_challenge=CH&code_challenge_method=plain&redirect_uri=http%3A%2F%2Flocalhost%3A5000%2Fcb&state=cs"));
-	auto res = createTestHTTPServerResponse(sink, null, TestHTTPResponseMode.bodyOnly);
-	router.handleRequest(req, res);
-
-	const body_ = () @trusted { return cast(string) sink.data; }();
-	assert(res.statusCode == 400);
-	assert(body_.canFind("invalid_request"));
-	assert(body_.canFind("S256"));
+	const res = authorizeDcr("&response_type=code&code_challenge_method=S256&scope=read");
+	assert(redirectsError(res, "invalid_request"));
+	assert(!res.body_.canFind("Authorize application"));
 }
 
-unittest  // PKCE: /authorize 400s a request with no code_challenge_method (RFC 7636 defaults it to plain)
+unittest  // PKCE: /authorize redirects a non-S256 code_challenge_method back with invalid_request
+{
+	assert(redirectsError(authorizeDcr(
+			"&response_type=code&code_challenge=CH&code_challenge_method=plain"), "invalid_request"));
+}
+
+unittest  // PKCE: /authorize redirects a request with no code_challenge_method back (RFC 7636 defaults it to plain)
+{
+	assert(redirectsError(authorizeDcr("&response_type=code&code_challenge=CH"), "invalid_request"));
+}
+
+unittest  // /authorize redirects a response_type other than code back with unsupported_response_type
+{
+	assert(redirectsError(authorizeDcr(
+			"&response_type=token&code_challenge=CH&code_challenge_method=S256"),
+			"unsupported_response_type"));
+}
+
+unittest  // /authorize redirects a request with no response_type back with invalid_request
+{
+	assert(redirectsError(authorizeDcr("&code_challenge=CH&code_challenge_method=S256"),
+			"invalid_request"));
+}
+
+unittest  // /authorize never redirects an error to a redirect_uri it has not validated
 {
 	import vibe.data.json : parseJsonString;
 
 	auto proxy = mountSampleProxy();
-	proxy.register(["http://localhost:5000/cb"]);
 	auto router = new URLRouter;
 	mountOAuthProxy(router, proxy);
-
-	const res = browserGet(router, "https://mcp.example.com/authorize?response_type=code"
-			~ "&code_challenge=CH&redirect_uri=http%3A%2F%2Flocalhost%3A5000%2Fcb&state=cs", "");
+	const res = browserGet(router, "https://mcp.example.com/authorize?client_id=Iv1.upstream"
+			~ "&response_type=token&redirect_uri=https%3A%2F%2Fattacker.example%2Fcb&state=cs", "");
 	assert(res.status == 400);
+	assert(res.location.length == 0);
 	assert(parseJsonString(res.body_)["error"].get!string == "invalid_request");
 }
 
-unittest  // /authorize 400s a response_type other than code with unsupported_response_type
+unittest  // /authorize refuses an unknown or missing client_id without redirecting
 {
 	import vibe.data.json : parseJsonString;
 
@@ -2724,31 +2724,33 @@ unittest  // /authorize 400s a response_type other than code with unsupported_re
 	proxy.register(["http://localhost:5000/cb"]);
 	auto router = new URLRouter;
 	mountOAuthProxy(router, proxy);
-
-	const res = browserGet(router, "https://mcp.example.com/authorize?response_type=token"
-			~ "&code_challenge=CH&code_challenge_method=S256"
-			~ "&redirect_uri=http%3A%2F%2Flocalhost%3A5000%2Fcb&state=cs", "");
-	assert(res.status == 400);
-	assert(parseJsonString(res.body_)["error"].get!string == "unsupported_response_type");
+	foreach (clientId; ["&client_id=someone-else", ""])
+	{
+		const res = browserGet(router, "https://mcp.example.com/authorize?response_type=code"
+				~ "&code_challenge=CH&code_challenge_method=S256" ~ clientId
+				~ "&redirect_uri=http%3A%2F%2Flocalhost%3A5000%2Fcb&state=cs", "");
+		assert(res.status == 400);
+		assert(res.location.length == 0);
+		assert(parseJsonString(res.body_)["error"].get!string == "invalid_request");
+	}
 }
 
-unittest  // /authorize 400s a request with no response_type with invalid_request
+unittest  // RFC 8707: /authorize redirects a resource other than the protected one back with invalid_target
 {
-	import vibe.data.json : parseJsonString;
-
-	auto proxy = mountSampleProxy();
-	proxy.register(["http://localhost:5000/cb"]);
-	auto router = new URLRouter;
-	mountOAuthProxy(router, proxy);
-
-	const res = browserGet(router,
-			"https://mcp.example.com/authorize?code_challenge=CH" ~ "&code_challenge_method=S256"
-			~ "&redirect_uri=http%3A%2F%2Flocalhost%3A5000%2Fcb&state=cs", "");
-	assert(res.status == 400);
-	assert(parseJsonString(res.body_)["error"].get!string == "invalid_request");
+	assert(redirectsError(authorizeDcr(
+			"&response_type=code&code_challenge=CH&code_challenge_method=S256"
+			~ "&resource=https%3A%2F%2Fother.example%2Fmcp"), "invalid_target"));
 }
 
-unittest  // SCOPE CAP: /authorize refuses a request naming too many scopes with invalid_scope
+unittest  // RFC 8707: /authorize accepts the protected resource in any canonical spelling
+{
+	const res = authorizeDcr("&response_type=code&code_challenge=CH&code_challenge_method=S256"
+			~ "&resource=https%3A%2F%2FMCP.example.com%2Fmcp%2F");
+	assert(res.status == 200);
+	assert(res.body_.canFind("Authorize application"));
+}
+
+unittest  // SCOPE CAP: /authorize redirects a request naming too many scopes back with invalid_scope
 {
 	import std.array : join;
 	import std.conv : to;
@@ -2756,17 +2758,10 @@ unittest  // SCOPE CAP: /authorize refuses a request naming too many scopes with
 	import std.algorithm : map;
 	import mcp.auth.oauth_proxy : maxScopesPerRequest;
 
-	auto proxy = mountSampleProxy();
-	proxy.register(["http://localhost:5000/cb"]);
-	auto router = new URLRouter;
-	mountOAuthProxy(router, proxy);
-
 	const scopes = iota(maxScopesPerRequest + 1).map!(i => "s" ~ i.to!string).join("+");
-	const res = browserGet(router, "https://mcp.example.com/authorize?response_type=code"
-			~ "&code_challenge=CH&code_challenge_method=S256&scope="
-			~ scopes ~ "&redirect_uri=http%3A%2F%2Flocalhost%3A5000%2Fcb&state=cs", "");
-	assert(res.status == 400);
-	assert(res.body_.canFind("invalid_scope"));
+	assert(redirectsError(authorizeDcr(
+			"&response_type=code&code_challenge=CH&code_challenge_method=S256&scope=" ~ scopes),
+			"invalid_scope"));
 }
 
 unittest  // CONSENT: evicted redirect_uri between /authorize and POST /consent yields 400 not 500
@@ -2800,7 +2795,7 @@ unittest  // CONSENT: evicted redirect_uri between /authorize and POST /consent 
 
 	// /authorize for the client's redirect_uri: returns the consent screen.
 	auto sink = createMemoryOutputStream();
-	auto req = createTestHTTPServerRequest(URL("https://mcp.example.com/authorize?response_type=code&code_challenge_method=S256&code_challenge=CH&scope=read&redirect_uri=http%3A%2F%2Flocalhost%3A5000%2Fcb&state=cs"));
+	auto req = createTestHTTPServerRequest(URL("https://mcp.example.com/authorize?client_id=Iv1.upstream&response_type=code&code_challenge_method=S256&code_challenge=CH&scope=read&redirect_uri=http%3A%2F%2Flocalhost%3A5000%2Fcb&state=cs"));
 	auto res = createTestHTTPServerResponse(sink, null, TestHTTPResponseMode.bodyOnly);
 	router.handleRequest(req, res);
 	const html = () @trusted { return cast(string) sink.data; }();
@@ -3221,7 +3216,7 @@ unittest  // COMPOSE: the authorize/consent/callback legs share a state store an
 
 	// /authorize renders the consent screen and stashes pending auth under a state.
 	auto sink = createMemoryOutputStream();
-	auto req = createTestHTTPServerRequest(URL("https://mcp.example.com/authorize?response_type=code&code_challenge_method=S256&code_challenge=CH&scope=read&redirect_uri=http%3A%2F%2Flocalhost%3A5000%2Fcb&state=cs"));
+	auto req = createTestHTTPServerRequest(URL("https://mcp.example.com/authorize?client_id=Iv1.upstream&response_type=code&code_challenge_method=S256&code_challenge=CH&scope=read&redirect_uri=http%3A%2F%2Flocalhost%3A5000%2Fcb&state=cs"));
 	auto res = createTestHTTPServerResponse(sink, null, TestHTTPResponseMode.bodyOnly);
 	router.handleRequest(req, res);
 	const html = () @trusted { return cast(string) sink.data; }();
@@ -3359,7 +3354,7 @@ version (unittest)
 		mountOAuthCallback(router, proxy, store);
 		mountOAuthToken(router, proxy, exchange);
 
-		const upstream = browserGet(router, "https://mcp.example.com/authorize?response_type=code&code_challenge_method=S256&code_challenge=" ~ codeChallenge ~ "&redirect_uri=http%3A%2F%2Flocalhost%3A5000%2Fcb&state=cs",
+		const upstream = browserGet(router, "https://mcp.example.com/authorize?client_id=Iv1.upstream&response_type=code&code_challenge_method=S256&code_challenge=" ~ codeChallenge ~ "&redirect_uri=http%3A%2F%2Flocalhost%3A5000%2Fcb&state=cs",
 				"browser-1");
 		assert(upstream.status == 302);
 		const proxyState = upstream.location[upstream.location.indexOf("state=") + 6 .. $];
@@ -3979,7 +3974,7 @@ unittest  // CALLBACK BINDING: a callback from a browser other than the consenti
 
 	// The attacker approves their own client in their own browser and captures
 	// the upstream authorize URL instead of following it.
-	const page = browserGet(router, "https://mcp.example.com/authorize?response_type=code&code_challenge_method=S256&code_challenge=ATTACKER" ~ "&redirect_uri=https%3A%2F%2Fevil.example%2Fcb&state=x",
+	const page = browserGet(router, "https://mcp.example.com/authorize?client_id=Iv1.upstream&response_type=code&code_challenge_method=S256&code_challenge=ATTACKER" ~ "&redirect_uri=https%3A%2F%2Fevil.example%2Fcb&state=x",
 			"");
 	const approved = browserPost(router, "https://mcp.example.com/consent",
 			consentForm(page.body_), page.setCookie);
@@ -4008,7 +4003,7 @@ unittest  // CALLBACK BINDING: the consenting browser's callback relays the code
 	auto router = new URLRouter;
 	mountOAuthProxy(router, proxy);
 
-	const page = browserGet(router, "https://mcp.example.com/authorize?response_type=code&code_challenge_method=S256&code_challenge=CH" ~ "&redirect_uri=http%3A%2F%2Flocalhost%3A5000%2Fcb&state=cs",
+	const page = browserGet(router, "https://mcp.example.com/authorize?client_id=Iv1.upstream&response_type=code&code_challenge_method=S256&code_challenge=CH" ~ "&redirect_uri=http%3A%2F%2Flocalhost%3A5000%2Fcb&state=cs",
 			"");
 	const approved = browserPost(router, "https://mcp.example.com/consent",
 			consentForm(page.body_), page.setCookie);
@@ -4028,7 +4023,7 @@ unittest  // CALLBACK BINDING: a pending authorization awaiting consent cannot b
 	auto router = new URLRouter;
 	mountOAuthProxy(router, proxy);
 
-	const page = browserGet(router, "https://mcp.example.com/authorize?response_type=code&code_challenge_method=S256&code_challenge=CH" ~ "&redirect_uri=http%3A%2F%2Flocalhost%3A5000%2Fcb&state=cs",
+	const page = browserGet(router, "https://mcp.example.com/authorize?client_id=Iv1.upstream&response_type=code&code_challenge_method=S256&code_challenge=CH" ~ "&redirect_uri=http%3A%2F%2Flocalhost%3A5000%2Fcb&state=cs",
 			"");
 	const proxyState = hiddenField(page.body_, "state");
 	assert(proxyState.length);
