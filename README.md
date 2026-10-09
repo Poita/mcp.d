@@ -1,10 +1,10 @@
 # mcp.d
 
-[![Dub version](https://img.shields.io/dub/v/mcp-d.svg)](https://code.dlang.org/packages/mcp-d)
+[![Latest release](https://img.shields.io/dub/v/mcp-d.svg?label=latest%20release)](https://code.dlang.org/packages/mcp-d)
 [![CI](https://github.com/Poita/mcp.d/actions/workflows/ci.yml/badge.svg)](https://github.com/Poita/mcp.d/actions/workflows/ci.yml)
 [![codecov](https://codecov.io/gh/Poita/mcp.d/branch/main/graph/badge.svg)](https://codecov.io/gh/Poita/mcp.d)
 [![License: Apache 2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
-[![API docs](https://img.shields.io/badge/docs-API%20reference-blue.svg)](https://poita.github.io/mcp.d/)
+[![API docs (main)](https://img.shields.io/badge/docs-API%20reference%20%28main%29-blue.svg)](https://poita.github.io/mcp.d/)
 
 A feature-complete [Model Context Protocol](https://modelcontextprotocol.io) (MCP) SDK for
 the D programming language — client and server, built on [vibe-d](https://vibed.org).
@@ -76,7 +76,7 @@ dub run --single client.d       # prints "2 + 3 = 5"
 ## Installation
 
 This README documents the `main` branch. Tagged releases on
-[code.dlang.org](https://code.dlang.org/packages/mcp-d) (see the Dub version
+[code.dlang.org](https://code.dlang.org/packages/mcp-d) (see the latest release
 badge above) can lag well behind it, so to build against the API described here,
 depend on `main` through git in your `dub.sdl`:
 
@@ -236,10 +236,12 @@ Open `docs/index.html` in a browser when it finishes. The generated `docs/`
 directory is a build artifact and is git-ignored.
 
 CI builds the docs on every push/PR (`.github/workflows/docs.yml`) so doc
-generation can never silently break, and publishes them to GitHub Pages on a
-published **release** (or a manual `workflow_dispatch`), not on every push to
-`main` (best-effort: the publish step is skipped if Pages is not enabled for the
-repository).
+generation can never silently break, and publishes them to
+[GitHub Pages](https://poita.github.io/mcp.d/) on every push to `main` (or a
+manual `workflow_dispatch`), so the published reference documents the same
+`main` API as this README (best-effort: the publish step is skipped if Pages is
+not enabled for the repository). For a tagged release, generate the docs locally
+from that tag with `scripts/gen-docs.sh`.
 
 ## Statefulness
 
