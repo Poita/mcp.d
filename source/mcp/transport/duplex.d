@@ -57,6 +57,8 @@ final class DuplexChannel
 	// keyed by request id, so `abort` can withdraw one.
 	private PendingWrite[long] pendingWrites_;
 	private bool closed_;
+	// How many lines are being written right now (0 or 1: writes are serialized).
+	private size_t writing_;
 	private Task readTask_;
 	// Set by `stopReadLoop`: the read loop exits at its next iteration and a read
 	// it was interrupted out of is not reported as a failure.
@@ -405,6 +407,31 @@ final class DuplexChannel
 		writeLine(text, null);
 	}
 
+	/// Write `message` on a task of its own and return at once, without waiting
+	/// for the line to be written or learning whether it was. For teardown
+	/// traffic (a `notifications/cancelled`) that must not park its caller
+	/// behind a peer that stopped reading. Nothing is written once the channel
+	/// has closed.
+	void post(Json message) @safe nothrow
+	{
+		if (closed_)
+			return;
+		runTask((Json msg) nothrow{
+			try
+				writeLine(msg.toString(), null);
+			catch (Exception)
+			{
+			}
+		}, message);
+	}
+
+	/// Whether a line is being written right now. A write the peer does not
+	/// drain stays in progress until the peer reads or goes away.
+	bool writing() const @safe nothrow
+	{
+		return writing_ != 0;
+	}
+
 	/// Write `text` under the writer lock, unless `write` was abandoned while it
 	/// waited for the lock.
 	private void writeLine(string text, PendingWrite write) @safe
@@ -414,6 +441,9 @@ final class DuplexChannel
 			writeMutex.unlock();
 		if (write !is null && write.abandoned)
 			return;
+		++writing_;
+		scope (exit)
+			--writing_;
 		writeLineDg(text);
 	}
 

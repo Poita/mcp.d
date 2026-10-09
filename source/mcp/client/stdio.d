@@ -62,8 +62,9 @@ final class StdioClientTransport : ClientTransport
 	// can run the MCP stdio shutdown sequence (close stdin -> SIGTERM -> SIGKILL).
 	// Windows has no eventcore pipe driver, so it owns a `WinChild` (std.process
 	// pid + blocking reader and writer threads) and shuts down via close-stdin -> terminate.
+	version (Posix) private ProcessPipes* pipes;
 	version (Posix)
-		private ProcessPipes* pipes;
+		private bool stdinClosed_;
 	else version (Windows)
 		private WinChild* winChild;
 	// The owned child's exit status, once it is known to have exited on its own.
@@ -184,7 +185,9 @@ final class StdioClientTransport : ClientTransport
 			{
 				Json params = Json.emptyObject;
 				params["requestId"] = listenId;
-				sendOneway(makeNotification("notifications/cancelled", params));
+				// Posted, not sent: cancelling (as `McpClient.close` does) must not
+				// park behind a server that has stopped reading its stdin.
+				ch.post(makeNotification("notifications/cancelled", params));
 				// Release the task awaiting the listen reply; the server sends none
 				// for a cancelled stream.
 				if (listenId.type == Json.Type.int_)
@@ -441,11 +444,34 @@ final class StdioClientTransport : ClientTransport
 	/// it is stopped first; closing the pipe under a pending read is unsafe.
 	version (Posix) private void releaseProcess() @safe
 	{
-		// The child is gone, so its stdout is at end-of-input and the loop exits
-		// promptly; the grace only bounds a grandchild still holding the pipe.
+		import vibe.core.core : sleep;
+
+		// The child is gone, so a write it left undrained fails promptly, after
+		// which its stdin can be closed.
+		if (!stdinClosed_)
+		{
+			foreach (_; 0 .. 100)
+			{
+				if (!writePending())
+					break;
+				sleep(10.msecs);
+			}
+			if (writePending())
+				return;
+			() @trusted { pipes.stdin.close(); }();
+			stdinClosed_ = true;
+		}
+		// Its stdout is at end-of-input too, so the loop exits promptly; the
+		// grace only bounds a grandchild still holding the pipe.
 		if (channel !is null && started && !channel.stopReadLoop(1.seconds))
 			return;
 		() @trusted { pipes.stdout.close(); destroy(*pipes); }();
+	}
+
+	/// Whether a line is being written to the child's stdin right now.
+	private bool writePending() const @safe nothrow
+	{
+		return channel !is null && channel.writing;
 	}
 
 	/// Run the stdio shutdown sequence on the owned child and return its exit
@@ -455,8 +481,15 @@ final class StdioClientTransport : ClientTransport
 		import core.sys.posix.signal : SIGTERM, SIGKILL;
 
 		auto p = pipes;
-		// Step 0: close the child's stdin so a well-behaved server sees EOF and exits.
-		() @trusted { p.stdin.close(); }();
+		// Step 0: close the child's stdin so a well-behaved server sees EOF and
+		// exits. A write still parked on it means the child has stopped reading;
+		// closing the pipe under that write would strand the writer, so stdin is
+		// left open (and closed by `releaseProcess` once the child is gone).
+		if (!writePending())
+		{
+			() @trusted { p.stdin.close(); }();
+			stdinClosed_ = true;
+		}
 
 		// Step 1: wait for a clean exit within the SIGTERM grace.
 		auto status = () @trusted { return p.process.wait(termGrace); }();
@@ -1938,4 +1971,91 @@ unittest  // cancel(id) on an in-flight stdio request wakes its caller at once
 	assert(failure.length == 0, failure);
 	assert(code == ErrorCode.requestCancelled);
 	assert(took < 5.seconds);
+}
+
+unittest  // McpClient.close() returns while a stdio write is stalled on a server that stopped reading
+{
+	import core.time : msecs, seconds;
+	import vibe.core.core : sleep;
+	import vibe.core.sync : createManualEvent;
+
+	auto toClient = new TestLines;
+	auto unstall = createManualEvent();
+	bool stall, closed, closedInTime;
+	const failure = inLoopCapturing(() @safe {
+		auto client = McpClient.stdio(() @safe => toClient.take(), (string s) @safe {
+			if (stall)
+			{
+				const ec = unstall.emitCount;
+				unstall.wait(ec);
+				return;
+			}
+			acknowledgeListen(toClient, s);
+		});
+		client.enableModern();
+		SubscriptionFilter filter = {toolsListChanged: true};
+		client.subscriptionsListen(filter);
+		// The server stops reading: the next write parks holding the writer.
+		stall = true;
+		runTask(() nothrow{
+			try
+				client.ping();
+			catch (Exception)
+			{
+			}
+		});
+		yield();
+		runTask(() nothrow{
+			try
+				client.close();
+			catch (Exception)
+			{
+			}
+			closed = true;
+		});
+		sleep(300.msecs);
+		closedInTime = closed;
+		unstall.emit();
+		toClient.closeEnd();
+		sleep(50.msecs);
+	});
+	assert(failure.length == 0, failure);
+	assert(closedInTime, "close() must not wait on a stalled write");
+}
+
+version (Posix) unittest  // closeProcess() with a write parked on a child that never reads stdin
+{
+	import core.time : msecs, seconds;
+	import std.array : replicate;
+	import std.datetime.stopwatch : StopWatch, AutoStart;
+	import core.sys.posix.signal : SIGTERM;
+	import vibe.core.core : sleep;
+
+	bool parked, writeEnded, timely;
+	int status;
+	inLoop(() @safe {
+		auto transport = spawnStdioTransport(["sh", "-c", "sleep 30"]);
+		Json big = Json.emptyObject;
+		big["jsonrpc"] = "2.0";
+		big["method"] = "notifications/x";
+		big["params"] = Json(["pad": Json("x".replicate(1 << 20))]);
+		runTask(() nothrow{
+			try
+				transport.sendOneway(big);
+			catch (Exception)
+			{
+			}
+			writeEnded = true;
+		});
+		sleep(50.msecs);
+		parked = !writeEnded;
+		auto sw = StopWatch(AutoStart.yes);
+		status = transport.closeProcess(200.msecs, 2.seconds);
+		timely = sw.peek < 5.seconds;
+		sleep(50.msecs);
+	});
+	assert(parked, "the write must be parked on the full pipe");
+	assert(timely);
+	assert(status == -SIGTERM);
+	assert(writeEnded, "the parked write must fail once the child is gone");
 }
