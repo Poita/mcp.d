@@ -1577,7 +1577,9 @@ final class McpServer : ServerCore
 
 	/// The attached server->client push channel, or null if none has been
 	/// attached (e.g. the server is not mounted on a Streamable HTTP transport).
-	PushChannel serverPushChannel() @safe
+	/// Internal: its raw delivery skips the `listChanged` and resource
+	/// subscription gates the public `notify*` APIs apply.
+	package(mcp) PushChannel serverPushChannel() @safe
 	{
 		return pushChannel;
 	}
@@ -12894,4 +12896,9 @@ unittest  // completion/complete for an unregistered resource or template is -32
 	]);
 	resp = s.handle(req(2, "completion/complete", p)).get;
 	assert("result" in resp);
+}
+
+unittest  // the attached push channel is internal: its raw delivery bypasses the server's gates
+{
+	static assert(__traits(getVisibility, McpServer.serverPushChannel) == "package");
 }

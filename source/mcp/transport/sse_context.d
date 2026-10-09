@@ -1564,8 +1564,9 @@ final class ServerPushChannel : PushChannel
 	}
 
 	/// Broadcast a JSON-RPC notification to every connected session and listen
-	/// stream (see `broadcast`).
-	size_t notify(string method, Json params = Json.undefined) @safe
+	/// stream (see `broadcast`), without the server's capability or subscription
+	/// gates.
+	package(mcp) size_t notify(string method, Json params = Json.undefined) @safe
 	{
 		return broadcast(method, params, listenFilterKey(method, params));
 	}

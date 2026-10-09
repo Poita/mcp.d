@@ -180,12 +180,6 @@ unittest  // a per-URI filter must reject a notification that carries no URI
 /// counts return the number of streams reached.
 interface PushChannel
 {
-	/// Deliver an unsolicited notification once per connected session and once
-	/// per independent listen stream (within a session it lands on exactly one
-	/// stream, per the transport's Multiple Connections rule), honouring each
-	/// stream's own opt-in filter.
-	size_t notify(string method, Json params = Json.undefined) @safe;
-
 	/// Fan a change notification out once per connected session and listen
 	/// stream, honouring each stream's own opt-in filter; `plainEligible` gates
 	/// delivery to plain (non-listen) streams.
@@ -210,4 +204,9 @@ interface PushChannel
 
 	/// The distinct owner (session) tokens of all currently-connected streams.
 	string[] connectedOwnerTokens() @safe;
+}
+
+unittest  // the push seam offers no ungated notify: delivery goes through the server's gated APIs
+{
+	static assert(!__traits(hasMember, PushChannel, "notify"));
 }
