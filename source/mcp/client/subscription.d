@@ -33,9 +33,9 @@ struct SubscriptionFilter
 final class SubscriptionStream
 {
 	private shared(bool)* cancelled_;
-	// Set by the transport when the server ends the stream (the stream's reader
-	// runs on the owning thread's event loop, so no synchronization is needed).
-	private bool finished_;
+	// Set by the transport when the server ends the stream. Atomic, like the
+	// cleanup guard, because a cancel() on another thread can race the end.
+	private shared bool finished_;
 	private McpException error_;
 	// Optional transport-supplied action run exactly once on the first cancel().
 	// The stdio transport uses it to emit `notifications/cancelled` referencing
@@ -48,7 +48,7 @@ final class SubscriptionStream
 	// it. `McpClient.streamEvents` uses it to deregister the stream's
 	// per-subscription event/control handlers.
 	private void delegate() @safe nothrow[] cleanups_;
-	private bool cleanedUp_;
+	private shared bool cleanedUp_;
 
 	/// Construct a handle wrapping a shared cancellation flag. Created by a
 	/// `ClientTransport` when it opens the listen stream. `onCancel`, when
@@ -78,9 +78,8 @@ final class SubscriptionStream
 
 	private void runCleanup() @safe nothrow
 	{
-		if (cleanedUp_)
+		if (!cas(&cleanedUp_, false, true))
 			return;
-		cleanedUp_ = true;
 		foreach (cleanup; cleanups_)
 			cleanup();
 	}
@@ -109,7 +108,7 @@ final class SubscriptionStream
 	/// Whether the stream is over: cancelled locally, or ended by the server.
 	bool ended() const @safe nothrow @nogc
 	{
-		return finished_ || cancelled;
+		return atomicLoad(finished_) || cancelled;
 	}
 
 	/// The error the server ended the stream with (an HTTP or JSON-RPC error
@@ -125,9 +124,8 @@ final class SubscriptionStream
 	/// cancel is ignored.
 	package void finish(McpException error = null) @safe nothrow
 	{
-		if (finished_ || cancelled)
+		if (cancelled || !cas(&finished_, false, true))
 			return;
-		finished_ = true;
 		error_ = error;
 		runCleanup();
 	}
@@ -250,6 +248,43 @@ unittest  // onCancel fires exactly once even when many threads call cancel() co
 			t.join();
 
 		assert(atomicLoad(closes) == 1, "onCancel must fire exactly once under concurrent cancel()");
+	}
+}
+
+unittest  // cleanups run exactly once when cancel() and finish() race across threads
+{
+	import core.thread : Thread;
+	import core.atomic : atomicLoad, atomicStore, atomicOp;
+
+	foreach (iteration; 0 .. 2000)
+	{
+		auto cancelled = () @trusted { return new shared bool(false); }();
+		shared int cleanups = 0;
+		auto s = new SubscriptionStream(cancelled);
+		s.addCleanup(() @safe nothrow{
+			foreach (_; 0 .. 50)
+				atomicOp!"+="(cleanups, 0);
+			atomicOp!"+="(cleanups, 1);
+		});
+		shared bool start = false;
+		auto canceller = new Thread({
+			while (!atomicLoad(start))
+			{
+			}
+			s.cancel();
+		});
+		auto finisher = new Thread({
+			while (!atomicLoad(start))
+			{
+			}
+			s.finish();
+		});
+		canceller.start();
+		finisher.start();
+		atomicStore(start, true);
+		canceller.join();
+		finisher.join();
+		assert(atomicLoad(cleanups) == 1, "cleanups must run exactly once");
 	}
 }
 
