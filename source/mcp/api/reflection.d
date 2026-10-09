@@ -11,7 +11,7 @@ import mcp.protocol.types;
 import mcp.protocol.capabilities : Icon;
 import mcp.protocol.modern : CacheHint, CacheScope;
 import mcp.server.server : McpServer, TaskToolOptions;
-import mcp.server.responses : ToolResponse;
+import mcp.server.responses : ToolResponse, PromptResponse;
 import mcp.server.context;
 import mcp.server.task_context : TaskContext;
 import mcp.server.task_runtime : TaskOptions;
@@ -1277,16 +1277,20 @@ private void registerEventMethod(string memberName, alias overload, alias parent
 				~ "' must return EventBatch!P (its payload type P derives the payloadSchema)");
 }
 
-/// Wrap a prompt method's return value into a `GetPromptResult`.
-private GetPromptResult toPromptResult(R)(R ret) @safe
+/// Wrap the value prompt method `memberName` returns into a `PromptResponse`. A
+/// `PromptResponse` passes through, so the method may answer `inputRequired`
+/// (stateless elicitation) as well as complete.
+private PromptResponse toPromptResponse(string memberName, R)(R ret) @safe
 {
-	static if (is(R == GetPromptResult))
+	static if (is(R == PromptResponse))
 		return ret;
+	else static if (is(R == GetPromptResult))
+		return PromptResponse.complete(ret);
 	else static if (is(R == PromptMessage[]))
 	{
 		GetPromptResult r;
 		r.messages = ret;
-		return r;
+		return PromptResponse.complete(r);
 	}
 	else static if (isSomeString!R)
 	{
@@ -1294,11 +1298,11 @@ private GetPromptResult toPromptResult(R)(R ret) @safe
 
 		GetPromptResult r;
 		r.messages = [PromptMessage("user", Content.makeText(ret.to!string))];
-		return r;
+		return PromptResponse.complete(r);
 	}
 	else
-		static assert(false,
-				"@prompt method must return GetPromptResult, PromptMessage[], or string");
+		static assert(false, "@prompt method '" ~ memberName ~ "' must return PromptResponse, "
+				~ "GetPromptResult, PromptMessage[], or string, not " ~ R.stringof);
 }
 
 /// Whether an empty string given for a prompt argument of type `P` stands for an
@@ -1413,7 +1417,6 @@ private void registerPromptMethod(string memberName, alias overload, alias paren
 
 	server.registerPrompt(descriptor, (Json rawArgs, RequestContext ctx) @safe {
 		import mcp.protocol.errors : McpException, invalidParams;
-		import mcp.server.responses : PromptResponse;
 
 		Json args = omitEmptyPromptArgs!overload(rawArgs);
 		Tuple!(BoundParameters!overload) argv;
@@ -1468,12 +1471,13 @@ private void registerPromptMethod(string memberName, alias overload, alias paren
 					throw invalidParams("argument '" ~ names[i] ~ "': " ~ e.msg);
 			}
 		}
-		return PromptResponse.complete(toPromptResult(__traits(getMember,
-			parent, memberName)(argv.expand)));
+		return toPromptResponse!memberName(__traits(getMember, parent, memberName)(argv.expand));
 	});
 }
 
-private ResourceContents toResourceContents(R)(R ret, string uri, string mimeType) @safe
+/// Wrap the value `handler` (e.g. "@resource method 'readme'") returns into a
+/// `ResourceContents`.
+private ResourceContents toResourceContents(string handler, R)(R ret, string uri, string mimeType) @safe
 {
 	static if (is(R == ResourceContents))
 		return ret;
@@ -1484,7 +1488,7 @@ private ResourceContents toResourceContents(R)(R ret, string uri, string mimeTyp
 		return ResourceContents.makeText(uri, mimeType, ret.to!string);
 	}
 	else
-		static assert(false, "@resource method must return ResourceContents or string");
+		static assert(false, handler ~ " must return ResourceContents or string, not " ~ R.stringof);
 }
 
 private void registerResourceMethod(string memberName, alias overload, alias parent)(
@@ -1513,7 +1517,8 @@ private void registerResourceMethod(string memberName, alias overload, alias par
 			auto ret = __traits(getMember, parent, memberName)(ctx);
 		else
 			auto ret = __traits(getMember, parent, memberName)();
-		return toResourceContents(ret, attr.uri, attr.mimeType);
+		return toResourceContents!("@resource method '" ~ memberName ~ "'")(ret,
+			attr.uri, attr.mimeType);
 	}, collectCache!overload());
 }
 
@@ -1623,7 +1628,8 @@ private void registerTemplateMethod(string memberName, alias overload,
 			}
 		}
 		auto ret = __traits(getMember, parent, memberName)(argv.expand);
-		return toResourceContents(ret, uri, attr.mimeType);
+		return toResourceContents!("@resourceTemplate method '" ~ memberName ~ "'")(ret,
+			uri, attr.mimeType);
 	}, collectCache!overload());
 }
 
@@ -2926,6 +2932,32 @@ unittest  // a dynamic tool's malformed arguments read via argsAs yield an isErr
 	auto r = callToolArgs(s, "dyn", `{"n":"not-a-number"}`);
 	assert(r["isError"].get!bool, r.toString);
 	assert(r["content"][0]["text"].get!string.canFind("arguments"), r.toString);
+}
+
+version (unittest) private final class PromptResponseApi
+{
+	import mcp.server.responses : PromptResponse;
+
+	@prompt("greet", "Greets")
+	PromptResponse greet(string who) @safe
+	{
+		GetPromptResult r;
+		r.messages = [PromptMessage("user", Content.makeText("hi " ~ who))];
+		return PromptResponse.complete(r);
+	}
+}
+
+unittest  // a @prompt method may return a PromptResponse, which is sent as is
+{
+	import mcp.protocol.jsonrpc : Message, makeRequest;
+
+	auto s = new McpServer("t", "1");
+	registerHandlers(s, new PromptResponseApi);
+	Json pp = Json.emptyObject;
+	pp["name"] = "greet";
+	pp["arguments"] = Json(["who": Json("Ann")]);
+	auto r = s.handle(Message(makeRequest(Json(1), "prompts/get", pp))).get;
+	assert(r["result"]["messages"][0]["content"]["text"].get!string == "hi Ann", r.toString);
 }
 
 unittest  // MRTR UDA tool: returning ToolResponse.complete produces a normal result

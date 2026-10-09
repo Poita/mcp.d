@@ -204,7 +204,9 @@ struct hintTitle
 }
 
 /// UDA marking a method as an MCP prompt. The method returns the prompt's
-/// messages (a `PromptMessage[]`, a `GetPromptResult`, or a `string`).
+/// messages (a `PromptMessage[]`, a `GetPromptResult`, or a `string`), or a
+/// `PromptResponse`, which may instead ask the client for input
+/// (`PromptResponse.inputRequired`).
 ///
 /// An optional human-readable `title` may be supplied for display purposes; it
 /// is independent of the programmatic `name`.
