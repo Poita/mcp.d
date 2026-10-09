@@ -92,8 +92,11 @@ final class TaskRuntime
 	/// error". Set by `McpServer.exposeInternalErrors`.
 	bool exposeInternalErrors;
 
+	/// Throws when `opts.defaultTtl` is not positive or
+	/// `opts.defaultPollInterval` is negative.
 	this(TaskOptions opts) @safe
 	{
+		validateTiming(opts.defaultTtl, opts.defaultPollInterval);
 		store_ = (opts.store is null) ? new InMemoryTaskStore() : opts.store;
 		opts_ = opts;
 		if (opts_.idGenerator is null)
@@ -156,13 +159,15 @@ final class TaskRuntime
 	/// on each dispatch. The returned `Task` seeds a `CreateTaskResult`. The
 	/// generated ID is guaranteed unique against the store. The TTL and poll
 	/// interval are serialized to integer milliseconds on the wire `Task`, except
-	/// `unlimitedTaskTtl`, which is `ttlMs: null`.
+	/// `unlimitedTaskTtl`, which is `ttlMs: null`. Throws when the TTL is not
+	/// positive or the poll interval is negative.
 	Task createFor(string toolName, Json executorInput,
 			TaskCreateOptions opts = TaskCreateOptions.init) @safe
 	{
 		const ttlDur = opts.ttl.isNull ? opts_.defaultTtl : opts.ttl.get;
 		const pollDur = opts.pollInterval.isNull ? opts_.defaultPollInterval : opts
 			.pollInterval.get;
+		validateTiming(ttlDur, pollDur);
 
 		TaskRecord r;
 		r.meta.status = TaskStatus.working;
@@ -186,6 +191,16 @@ final class TaskRuntime
 		}
 		throw new McpException(ErrorCode.internalError,
 				"task id generator failed to produce a unique id");
+	}
+
+	// A zero TTL would expire a task the moment it settles, before any client
+	// could collect its result; negative values have no wire meaning.
+	private static void validateTiming(Duration ttl, Duration pollInterval) @safe
+	{
+		import std.exception : enforce;
+
+		enforce(ttl > Duration.zero, "task ttl must be positive");
+		enforce(pollInterval >= Duration.zero, "task poll interval must not be negative");
 	}
 
 	/// Enforce the task's principal binding for a tasks/* request made by
@@ -1457,4 +1472,53 @@ unittest  // a repeated cancel of a running executor's task writes nothing
 	rt.cancel(t.taskId);
 	assert(store.get(t.taskId).get.revision == rev);
 	assert(rt.cancelRequested(t.taskId));
+}
+
+unittest  // createFor rejects a zero ttl, which would expire the task as it settles
+{
+	import std.exception : assertThrown;
+
+	auto rt = new TaskRuntime(TaskOptions.init);
+	assertThrown(rt.create(TaskCreateOptions(nullable(Duration.zero))));
+}
+
+unittest  // createFor rejects a negative ttl
+{
+	import std.exception : assertThrown;
+
+	auto rt = new TaskRuntime(TaskOptions.init);
+	assertThrown(rt.create(TaskCreateOptions(nullable(-1.seconds))));
+}
+
+unittest  // createFor rejects a negative poll interval
+{
+	import std.exception : assertThrown;
+
+	auto rt = new TaskRuntime(TaskOptions.init);
+	assertThrown(rt.create(TaskCreateOptions(Nullable!Duration.init, nullable(-1.seconds))));
+}
+
+unittest  // createFor accepts a zero poll interval
+{
+	auto rt = new TaskRuntime(TaskOptions.init);
+	auto t = rt.create(TaskCreateOptions(Nullable!Duration.init, nullable(Duration.zero)));
+	assert(t.pollIntervalMs.get == 0);
+}
+
+unittest  // the runtime rejects a non-positive default ttl
+{
+	import std.exception : assertThrown;
+
+	TaskOptions o;
+	o.defaultTtl = Duration.zero;
+	assertThrown(new TaskRuntime(o));
+}
+
+unittest  // the runtime rejects a negative default poll interval
+{
+	import std.exception : assertThrown;
+
+	TaskOptions o;
+	o.defaultPollInterval = -1.seconds;
+	assertThrown(new TaskRuntime(o));
 }
