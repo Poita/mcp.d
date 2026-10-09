@@ -244,6 +244,8 @@ alias TaskExecutor = Json delegate(TaskContext tc) @safe;
 /// by throwing); `TaskSuspended` leaves it `input_required`. Once the executor
 /// has suspended or detached, the dispatch ends there whatever it does
 /// afterwards. A task whose record was removed during the run is left gone.
+/// A task already cancelled or removed when the dispatch starts is settled
+/// without invoking the executor.
 /// Pure over the store, so it is correct whether invoked in-process or by a
 /// remote worker. Throws only when the outcome cannot be recorded (e.g. the
 /// store is unreachable).
@@ -286,6 +288,14 @@ private void drive(ref TaskContext tc, TaskExecutor executor) @safe
 	{
 		if (!rt.statusOf(taskId).isNull)
 			rt.markCancelled(taskId);
+	}
+
+	// A task cancelled (or removed) while its dispatch was queued must not run
+	// its side effects; `cancelRequested` is also true once the record is gone.
+	if (tc.cancelRequested())
+	{
+		settleCancelled();
+		return;
 	}
 
 	try
@@ -598,6 +608,35 @@ unittest  // a cancel observed during the run marks the task cancelled, not comp
 		return Json(["structuredContent": Json.emptyObject]);
 	});
 	assert(rt.getDetailed(t.taskId)["status"].get!string == "cancelled");
+}
+
+unittest  // a task cancelled before its dispatch runs is cancelled without invoking the executor
+{
+	import mcp.server.task_runtime : TaskOptions;
+
+	auto rt = new TaskRuntime(TaskOptions.init);
+	auto t = rt.createFor("slow", Json.undefined);
+	rt.cancel(t.taskId);
+	bool ran;
+	runTaskExecutor(rt, t.taskId, (TaskContext tc) @safe {
+		ran = true;
+		return Json.emptyObject;
+	});
+	assert(!ran);
+	assert(rt.getDetailed(t.taskId)["status"].get!string == "cancelled");
+}
+
+unittest  // a task whose record is gone before its dispatch runs never invokes the executor
+{
+	import mcp.server.task_runtime : TaskOptions;
+
+	auto rt = new TaskRuntime(TaskOptions.init);
+	bool ran;
+	runTaskExecutor(rt, "no-such-task", (TaskContext tc) @safe {
+		ran = true;
+		return Json.emptyObject;
+	});
+	assert(!ran);
 }
 
 unittest  // an executor that throws after a cancel was requested ends the task cancelled
