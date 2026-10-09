@@ -920,15 +920,21 @@ void emitInputRequired(ref Json j, const(InputRequest)[] requests, string reques
 /// guarded, so a `j` carrying neither field leaves the outputs untouched. A
 /// string `resultType` other than `"input_required"` declares the result
 /// complete, so any stray MRTR fields beside it are ignored; without a
-/// `resultType` the fields alone decide.
+/// `resultType` the fields alone decide. A `resultType: "input_required"`
+/// carrying neither input requests nor a `requestState` throws -32602, since it
+/// would otherwise read as an empty completed result.
 void parseInputRequired(Json j, ref InputRequest[] requests, ref string requestState) @safe
 {
-	if ("resultType" in j && j["resultType"].type == Json.Type.string
-			&& j["resultType"].get!string != "input_required")
+	import mcp.protocol.errors : invalidParams;
+
+	const declared = "resultType" in j && j["resultType"].type == Json.Type.string;
+	if (declared && j["resultType"].get!string != "input_required")
 		return;
 	if ("inputRequests" in j && j["inputRequests"].type == Json.Type.object)
 		requests = inputRequestsFromJson(j["inputRequests"]);
 	tryGet(j, "requestState", requestState);
+	if (declared && requests.length == 0 && requestState.length == 0)
+		throw invalidParams("an input_required result must carry inputRequests or a requestState");
 }
 
 /// Serialize a list of `InputRequest`s as a spec `InputRequests` object: a map
@@ -1060,6 +1066,44 @@ unittest  // emitInputRequired/parseInputRequired round-trip the shared MRTR glu
 	assert(outReqs.length == 1);
 	assert(outReqs[0].id == "date");
 	assert(outState == "opaque-state");
+}
+
+unittest  // an input_required result carrying neither inputRequests nor requestState is rejected
+{
+	import mcp.protocol.errors : ErrorCode, McpException;
+	import std.exception : collectException;
+
+	InputRequest[] reqs;
+	string state;
+	auto ex = cast(McpException) collectException(parseInputRequired(
+			Json(["resultType": Json("input_required")]), reqs, state));
+	assert(ex !is null && ex.code == ErrorCode.invalidParams);
+}
+
+unittest  // an input_required result with an empty inputRequests map and no requestState is rejected
+{
+	import mcp.protocol.errors : ErrorCode, McpException;
+	import std.exception : collectException;
+
+	InputRequest[] reqs;
+	string state;
+	auto ex = cast(McpException) collectException(
+			parseInputRequired(Json([
+		"resultType": Json("input_required"),
+		"inputRequests": Json.emptyObject
+	]), reqs, state));
+	assert(ex !is null && ex.code == ErrorCode.invalidParams);
+}
+
+unittest  // an input_required result carrying only a requestState parses
+{
+	InputRequest[] reqs;
+	string state;
+	parseInputRequired(Json([
+		"resultType": Json("input_required"),
+		"requestState": Json("s")
+	]), reqs, state);
+	assert(reqs.length == 0 && state == "s");
 }
 
 unittest  // emitInputRequired omits an empty requestState
