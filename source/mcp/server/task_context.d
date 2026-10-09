@@ -93,8 +93,11 @@ struct TaskContext
 	/// a `tools/call`, cancelling that request cancels the task.
 	bool cancelRequested() @safe
 	{
-		if (requestCancelled_ !is null && requestCancelled_())
+		if (requestCancelled_ !is null && !outcome_.cancelForwarded && requestCancelled_())
+		{
 			rt_.cancel(taskId_);
+			outcome_.cancelForwarded = true;
+		}
 		return rt_.cancelRequested(taskId_);
 	}
 
@@ -226,6 +229,8 @@ private final class DispatchOutcome
 {
 	bool unwound;
 	bool loaded;
+	// The inline request's cancellation has been recorded on the task.
+	bool cancelForwarded;
 	Json executorInput;
 	Json[string] inputs;
 	Json[string] checkpoints;
@@ -898,4 +903,26 @@ unittest  // an executor's input and checkpoint reads share one store read per d
 		return Json(["content": Json.emptyArray]);
 	});
 	assert(rt.getDetailed(t.taskId)["status"].get!string == "completed");
+}
+
+unittest  // an inline executor forwards its request's cancellation to the task only once
+{
+	import mcp.server.task_runtime : TaskOptions;
+
+	auto rt = new TaskRuntime(TaskOptions.init);
+	auto t = rt.createFor("slow", Json.undefined);
+	bool started;
+	int cancelledPolls;
+	runTaskExecutorInline(rt, t.taskId, delegate Json(TaskContext tc) @safe {
+		started = true;
+		foreach (_; 0 .. 3)
+			assert(tc.cancelRequested());
+		return Json.emptyObject;
+	}, () @safe {
+		if (started)
+			cancelledPolls++;
+		return started;
+	});
+	assert(cancelledPolls == 1);
+	assert(rt.getDetailed(t.taskId)["status"].get!string == "cancelled");
 }

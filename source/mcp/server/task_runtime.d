@@ -536,12 +536,14 @@ final class TaskRuntime
 	/// (`toolName` empty), one suspended in `input_required`, or one the executor
 	/// detached — transitions to `cancelled` immediately; for a running executor
 	/// the status is left untouched so it can observe the flag and decide its own
-	/// terminal state (cancellation is cooperative).
+	/// terminal state (cancellation is cooperative), and a repeated request for it
+	/// stores nothing.
 	void cancel(string id) @safe
 	{
 		modify(id, (ref TaskRecord r) @safe {
 			if (isTerminal(r.meta.status))
 				return Change.none;
+			const alreadyRequested = r.cancelRequested;
 			r.cancelRequested = true;
 			if (r.toolName.length == 0 || r.detached || r.meta.status == TaskStatus.inputRequired)
 			{
@@ -549,7 +551,7 @@ final class TaskRuntime
 				r.inputRequests = Json.emptyObject;
 				return Change.status;
 			}
-			return Change.state;
+			return alreadyRequested ? Change.none : Change.state;
 		});
 	}
 
@@ -1441,4 +1443,18 @@ unittest  // createFor retries a fresh id when the store already holds the gener
 	assert(first.taskId == "a");
 	assert(second.taskId == "b");
 	assert(store.inner.get("a").get.toolName == "one", "the first task must not be clobbered");
+}
+
+unittest  // a repeated cancel of a running executor's task writes nothing
+{
+	auto store = new InMemoryTaskStore();
+	TaskOptions o;
+	o.store = store;
+	auto rt = new TaskRuntime(o);
+	auto t = rt.createFor("tool", Json.emptyObject);
+	rt.cancel(t.taskId);
+	const rev = store.get(t.taskId).get.revision;
+	rt.cancel(t.taskId);
+	assert(store.get(t.taskId).get.revision == rev);
+	assert(rt.cancelRequested(t.taskId));
 }
