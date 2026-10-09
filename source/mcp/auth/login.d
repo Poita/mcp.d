@@ -171,13 +171,39 @@ interface TokenStore
 
 	/// Persist `token` for `resource`, replacing any previous value.
 	void save(string resource, StoredToken token) @safe;
+
+	/// Run `dg` holding the store's exclusive lock for `resource`, which other
+	/// sessions sharing the store (other processes, for a file-backed store)
+	/// also take. `OAuthSession` and `useOAuth` hold it from loading a token
+	/// through refreshing and saving it, so two sessions never present the same
+	/// rotating refresh token (which an authorization server may answer by
+	/// revoking the whole token family). `load` and `save` may be called
+	/// inside `dg`, and the lock is reentrant. It may cover more than
+	/// `resource`.
+	void withLock(string resource, scope void delegate() @safe dg) @safe;
 }
 
 /// An in-memory `TokenStore` (no persistence across processes). Useful for
 /// tests and ephemeral sessions.
 final class MemoryTokenStore : TokenStore
 {
+	import vibe.core.sync : RecursiveTaskMutex;
+
 	private StoredToken[string] tokens_;
+	private RecursiveTaskMutex lock_;
+
+	this() @safe
+	{
+		lock_ = new RecursiveTaskMutex;
+	}
+
+	override void withLock(string resource, scope void delegate() @safe dg) @safe
+	{
+		lock_.lock();
+		scope (exit)
+			lock_.unlock();
+		dg();
+	}
 
 	override StoredToken load(string resource) @safe
 	{
@@ -195,11 +221,57 @@ final class MemoryTokenStore : TokenStore
 version (Posix)
 {
 	// BSD `flock(2)`, available on Linux, macOS and the BSDs. Unlike `fcntl`
-	// record locks it belongs to the open file description, so it also excludes
-	// another thread of this process that opened the lock file separately.
+	// record locks it belongs to the open file description, so closing an
+	// unrelated descriptor for the same file does not release it.
 	private extern (C) int flock(int fd, int operation) nothrow @nogc @system;
 	private enum int LOCK_EX = 2;
 	private enum int LOCK_UN = 8;
+}
+
+/// The in-process side of one token lock file, shared by every `FileTokenStore`
+/// on that path: a reentrant task mutex serializes the process's tasks and
+/// threads, and the outermost holder keeps the OS file lock that excludes other
+/// processes.
+private final class TokenFileLock
+{
+	import vibe.core.sync : RecursiveTaskMutex;
+
+	RecursiveTaskMutex mutex;
+	size_t depth; /// nesting of the holder's lock calls; touched only by the holder
+	version (Posix)
+		int fd = -1;
+	else version (Windows)
+	{
+		import core.sys.windows.windows : HANDLE;
+
+		HANDLE handle;
+	}
+
+	this() @safe
+	{
+		mutex = new RecursiveTaskMutex;
+	}
+}
+
+private __gshared TokenFileLock[string] tokenFileLocks;
+private __gshared Object tokenFileLocksGuard;
+
+shared static this() @trusted
+{
+	tokenFileLocksGuard = new Object;
+}
+
+/// The process-wide lock state for the lock file at `lockPath`.
+private TokenFileLock tokenFileLockFor(string lockPath) @trusted
+{
+	synchronized (tokenFileLocksGuard)
+	{
+		if (auto p = lockPath in tokenFileLocks)
+			return *p;
+		auto l = new TokenFileLock;
+		tokenFileLocks[lockPath] = l;
+		return l;
+	}
 }
 
 /// A file-backed `TokenStore`. Tokens for all resources are stored as a single
@@ -210,10 +282,10 @@ version (Posix)
 /// implementation writes the file with owner-only (`0600`) permissions on
 /// POSIX.
 ///
-/// `save` holds an exclusive advisory lock on the sidecar file `path ~ ".lock"`
-/// across its read-modify-write, so several processes sharing one token file
-/// (for example two MCP clients refreshing at once) never drop each other's
-/// tokens.
+/// `save` and `withLock` hold an exclusive advisory lock on the sidecar file
+/// `path ~ ".lock"`, so several processes sharing one token file (for example
+/// two MCP clients refreshing at once) never drop each other's tokens or
+/// present the same refresh token.
 class FileTokenStore : TokenStore
 {
 	/// The on-disk path of the token file.
@@ -319,15 +391,37 @@ class FileTokenStore : TokenStore
 		});
 	}
 
-	/// Run `fn` holding an exclusive advisory lock on the sidecar file
-	/// `path ~ ".lock"`, so processes (and threads) sharing the token file
-	/// serialize their read-modify-write and none loses another's update. The
-	/// token file itself is replaced by rename, so it cannot carry the lock.
+	override void withLock(string resource, scope void delegate() @safe dg) @safe
+	{
+		withFileLock(dg);
+	}
+
+	/// Run `fn` holding an exclusive lock on the sidecar file `path ~ ".lock"`,
+	/// so processes, threads and tasks sharing the token file serialize their
+	/// read-modify-write and none loses another's update. The lock is reentrant
+	/// within a task. The token file itself is replaced by rename, so it cannot
+	/// carry the lock.
 	private void withFileLock(scope void delegate() @safe fn) @safe
 	{
 		if (!path.length)
 			return fn();
 		const lockPath = path ~ ".lock";
+		auto l = tokenFileLockFor(lockPath);
+		l.mutex.lock();
+		scope (exit)
+			l.mutex.unlock();
+		if (l.depth == 0)
+			acquireOsLock(l, lockPath);
+		++l.depth;
+		scope (exit)
+			if (--l.depth == 0)
+				releaseOsLock(l);
+		fn();
+	}
+
+	// Take the OS lock other processes contend on, keeping its handle in `l`.
+	private static void acquireOsLock(TokenFileLock l, string lockPath) @safe
+	{
 		version (Posix)
 		{
 			import core.stdc.errno : EINTR, errno;
@@ -340,23 +434,23 @@ class FileTokenStore : TokenStore
 			}();
 			if (fd < 0)
 				throw internalError("FileTokenStore: could not open lock file " ~ lockPath);
-			// Closing the descriptor releases the lock.
-			scope (exit)
-				() @trusted { close(fd); }();
 			int rc;
 			do
 				rc = () @trusted { return flock(fd, LOCK_EX); }();
 			while (rc != 0 && (()@trusted => errno)() == EINTR);
 			if (rc != 0)
+			{
+				() @trusted { close(fd); }();
 				throw internalError("FileTokenStore: could not lock " ~ lockPath);
-			fn();
+			}
+			l.fd = fd;
 		}
 		else version (Windows)
 		{
 			import core.sys.windows.windows : CloseHandle, CreateFileW,
 				FILE_ATTRIBUTE_NORMAL, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
 				GENERIC_READ, GENERIC_WRITE, INVALID_HANDLE_VALUE,
-				LOCKFILE_EXCLUSIVE_LOCK, LockFileEx, OPEN_ALWAYS, OVERLAPPED, UnlockFileEx;
+				LOCKFILE_EXCLUSIVE_LOCK, LockFileEx, OPEN_ALWAYS, OVERLAPPED;
 			import std.utf : toUTF16z;
 
 			auto h = () @trusted {
@@ -366,19 +460,40 @@ class FileTokenStore : TokenStore
 			}();
 			if (h == INVALID_HANDLE_VALUE)
 				throw internalError("FileTokenStore: could not open lock file " ~ lockPath);
-			scope (exit)
-				() @trusted { CloseHandle(h); }();
 			OVERLAPPED ov;
 			if (!()@trusted {
 					return LockFileEx(h, LOCKFILE_EXCLUSIVE_LOCK, 0, 1, 0, &ov);
 				}())
+			{
+				() @trusted { CloseHandle(h); }();
 				throw internalError("FileTokenStore: could not lock " ~ lockPath);
-			scope (exit)
-				() @trusted { UnlockFileEx(h, 0, 1, 0, &ov); }();
-			fn();
+			}
+			l.handle = h;
 		}
-		else
-			fn();
+	}
+
+	// Release the OS lock `acquireOsLock` took.
+	private static void releaseOsLock(TokenFileLock l) @safe nothrow
+	{
+		version (Posix)
+		{
+			import core.sys.posix.unistd : close;
+
+			// Closing the descriptor releases the lock.
+			() @trusted { close(l.fd); }();
+			l.fd = -1;
+		}
+		else version (Windows)
+		{
+			import core.sys.windows.windows : CloseHandle, OVERLAPPED, UnlockFileEx;
+
+			OVERLAPPED ov;
+			() @trusted {
+				UnlockFileEx(l.handle, 0, 1, 0, &ov);
+				CloseHandle(l.handle);
+			}();
+			l.handle = null;
+		}
 	}
 
 	/// Persist `bytes` to `path` such that the plaintext secrets they contain are
@@ -978,10 +1093,12 @@ final class OAuthSession
 	/// Refreshes are single-flighted: concurrent callers (fibers or threads) wait
 	/// for one in-flight refresh and share its result, so a rotating refresh token
 	/// is never presented twice (which an AS answers with `invalid_grant` and may
-	/// treat as token theft, revoking the whole token family). Before refreshing,
-	/// the session re-reads the `TokenStore`, so a token another process sharing
-	/// the store has already refreshed (and the refresh token it rotated to) is
-	/// adopted rather than refreshed again with a stale refresh token.
+	/// treat as token theft, revoking the whole token family). The refresh runs
+	/// holding the `TokenStore`'s lock (`TokenStore.withLock`), and before
+	/// refreshing the session re-reads the store, so a token another session or
+	/// process sharing the store has already refreshed (and the refresh token it
+	/// rotated to) is adopted rather than refreshed again with a stale refresh
+	/// token.
 	///
 	/// A refresh the AS answers with `invalid_grant` drops the refresh token here
 	/// and in the store, so later calls throw demanding re-authentication instead
@@ -993,6 +1110,17 @@ final class OAuthSession
 			refreshLock_.unlock();
 		if (!needsRefresh(token_, now, skew_))
 			return token_.accessToken;
+		if (store_ is null)
+			return refreshHoldingLocks(now);
+		string bearer;
+		store_.withLock(resource_, () @safe { bearer = refreshHoldingLocks(now); });
+		return bearer;
+	}
+
+	/// The body of `bearerForRequest` once the token needs refreshing, run
+	/// holding `refreshLock_` and the token store's lock.
+	private string refreshHoldingLocks(long now) @safe
+	{
 		if (adoptStoredToken() && !needsRefresh(token_, now, skew_))
 			return token_.accessToken;
 		if (token_.refreshToken.length == 0)
@@ -1214,51 +1342,62 @@ OAuthSession useOAuth(McpClient client, string mcpEndpoint, OAuthLogin opts) @sa
 	// authorization server (or one that never recorded its issuer) is ignored:
 	// its access token is not meant for this AS, and its refresh token and
 	// client credentials must never be sent to a server that did not issue them.
-	auto cached = store.load(oauth.resource);
-	if (cached.issuer.length == 0 || cached.issuer != as_.issuer)
-		cached = StoredToken.init;
-	// An expired client secret can no longer authenticate a refresh, so the
-	// registration (and the tokens bound to it) must be replaced.
-	if (cached.clientSecretExpired(now))
-		cached = StoredToken.init;
-	// A token lacking an explicitly required scope (a step-up after
-	// `insufficient_scope`) cannot be reused or refreshed into one that has it.
-	const scopesGranted = cached.grantsScopes(required);
-	if (scopesGranted && cached.hasToken && !needsRefresh(cached, now))
+	//
+	// The store lock is held from the load through any refresh and save, so a
+	// session or process sharing the store never presents the same rotating
+	// refresh token at the same time.
+	OAuthSession fromCache() @safe
 	{
-		return attachSession(client, new OAuthSession(oauth, as_,
-				cacheHitClient(cached, opts), store, oauth.resource, cached));
+		auto cached = store.load(oauth.resource);
+		if (cached.issuer.length == 0 || cached.issuer != as_.issuer)
+			cached = StoredToken.init;
+		// An expired client secret can no longer authenticate a refresh, so the
+		// registration (and the tokens bound to it) must be replaced.
+		if (cached.clientSecretExpired(now))
+			cached = StoredToken.init;
+		// A token lacking an explicitly required scope (a step-up after
+		// `insufficient_scope`) cannot be reused or refreshed into one that has it.
+		const scopesGranted = cached.grantsScopes(required);
+		if (scopesGranted && cached.hasToken && !needsRefresh(cached, now))
+		{
+			return new OAuthSession(oauth, as_, cacheHitClient(cached, opts),
+					store, oauth.resource, cached);
+		}
+
+		// A refresh token is bound to the client that obtained it (RFC 6749 §6), so
+		// try it under that client id — persisted from the first login, or the
+		// pre-registered one — before registering anything new.
+		auto prior = cacheHitClient(cached, opts);
+		if (scopesGranted && cached.refreshToken.length && prior.clientId.length)
+		{
+			try
+			{
+				auto ts = oauth.refresh(as_, prior, cached.refreshToken);
+				if (ts.accessToken.length)
+				{
+					auto refreshed = StoredToken.fromTokenSet(ts,
+							oauth.resource, now, cached.refreshToken);
+					if (refreshed.scope_.length == 0)
+						refreshed.scope_ = cached.scope_;
+					refreshed.setClient(persistedClient(prior, opts));
+					refreshed.issuer = as_.issuer;
+					store.save(oauth.resource, refreshed);
+					return new OAuthSession(oauth, as_, prior, store, oauth.resource, refreshed);
+				}
+				logWarn("OAuth refresh for %s returned no access token; "
+						~ "starting an interactive login", oauth.resource);
+			}
+			catch (Exception e)
+				logWarn("OAuth refresh for %s failed (%s); starting an interactive login",
+						oauth.resource, e.msg);
+		}
+		return null;
 	}
 
-	// A refresh token is bound to the client that obtained it (RFC 6749 §6), so
-	// try it under that client id — persisted from the first login, or the
-	// pre-registered one — before registering anything new.
-	auto prior = cacheHitClient(cached, opts);
-	if (scopesGranted && cached.refreshToken.length && prior.clientId.length)
-	{
-		try
-		{
-			auto ts = oauth.refresh(as_, prior, cached.refreshToken);
-			if (ts.accessToken.length)
-			{
-				auto refreshed = StoredToken.fromTokenSet(ts, oauth.resource,
-						now, cached.refreshToken);
-				if (refreshed.scope_.length == 0)
-					refreshed.scope_ = cached.scope_;
-				refreshed.setClient(persistedClient(prior, opts));
-				refreshed.issuer = as_.issuer;
-				store.save(oauth.resource, refreshed);
-				return attachSession(client, new OAuthSession(oauth, as_, prior,
-						store, oauth.resource, refreshed));
-			}
-			logWarn(
-					"OAuth refresh for %s returned no access token; " ~ "starting an interactive login",
-					oauth.resource);
-		}
-		catch (Exception e)
-			logWarn("OAuth refresh for %s failed (%s); starting an interactive login",
-					oauth.resource, e.msg);
-	}
+	OAuthSession cachedSession;
+	store.withLock(oauth.resource, () @safe { cachedSession = fromCache(); });
+	if (cachedSession !is null)
+		return attachSession(client, cachedSession);
 
 	// Select / obtain a client registration. Runs once the loopback listener
 	// is bound, so a dynamic registration names the real redirect URI.
@@ -2071,6 +2210,64 @@ unittest  // concurrent bearerForRequest calls share a single refresh (rotating 
 
 	assert(calls == 1);
 	assert(a == "new-access" && b == "new-access");
+}
+
+unittest  // sessions sharing a FileTokenStore refresh a rotating refresh token once between them
+{
+	import core.time : msecs;
+	import std.conv : to;
+	import std.file : exists, remove, tempDir;
+	import std.path : buildPath;
+	import std.process : thisProcessID;
+	import vibe.core.core : runTask, sleep;
+
+	const path = buildPath(tempDir, "mcp-d-lock-test-" ~ thisProcessID.to!string ~ ".json");
+	scope (exit)
+		foreach (p; [path, path ~ ".lock"])
+			if (p.exists)
+				remove(p);
+	StoredToken t;
+	t.accessToken = "old-access";
+	t.refreshToken = "single-use-refresh";
+	t.expiresAt = 1000;
+	new FileTokenStore(path).save("https://mcp.example.com", t);
+
+	int calls;
+	string[] presented;
+	TokenSet delegate(string) @safe refreshFn = (string rt) @safe {
+		++calls;
+		presented ~= rt;
+		sleep(30.msecs); // the token request yields to other tasks
+		TokenSet ts;
+		ts.accessToken = "new-access";
+		ts.expiresIn = 3600;
+		ts.refreshToken = "rotated-refresh";
+		return ts;
+	};
+	// Each session has its own store object, as two processes would.
+	auto a = new OAuthSession("https://mcp.example.com", t, new FileTokenStore(path), refreshFn);
+	auto b = new OAuthSession("https://mcp.example.com", t, new FileTokenStore(path), refreshFn);
+
+	string ra, rb;
+	auto ta = runTask(() nothrow{
+		try
+			ra = a.bearerForRequest(5000);
+		catch (Exception)
+		{
+		}
+	});
+	auto tb = runTask(() nothrow{
+		try
+			rb = b.bearerForRequest(5000);
+		catch (Exception)
+		{
+		}
+	});
+	ta.join();
+	tb.join();
+
+	assert(calls == 1, "refresh token presented " ~ presented.to!string);
+	assert(ra == "new-access" && rb == "new-access");
 }
 
 unittest  // OAuthSession does not refresh when the cached token is still valid
@@ -2963,6 +3160,68 @@ unittest  // a failed cached refresh is logged before useOAuth falls back to the
 	assert(srv.refreshCalls == 1);
 	auto lines = () @trusted { return (cast() logger).lines; }();
 	assert(lines.any!(l => l.canFind("refresh")), "a failed refresh must not be silent");
+}
+
+unittest  // useOAuth holds the token store lock from loading a cached token through its refresh and save
+{
+	import std.conv : to;
+	import mcp.auth.oauth : canonicalResourceUri;
+
+	// Records whether each load and save ran under the store lock.
+	static final class LockRecordingStore : TokenStore
+	{
+		MemoryTokenStore inner;
+		int depth;
+		string[] events;
+
+		this() @safe
+		{
+			inner = new MemoryTokenStore();
+		}
+
+		override StoredToken load(string resource) @safe
+		{
+			events ~= depth ? "load-locked" : "load";
+			return inner.load(resource);
+		}
+
+		override void save(string resource, StoredToken token) @safe
+		{
+			events ~= depth ? "save-locked" : "save";
+			inner.save(resource, token);
+		}
+
+		override void withLock(string resource, scope void delegate() @safe dg) @safe
+		{
+			++depth;
+			scope (exit)
+				--depth;
+			dg();
+		}
+	}
+
+	auto srv = startIssuerTestAuthServer();
+	scope (exit)
+		srv.stop();
+	const endpoint = srv.base ~ "/mcp";
+	const resource = canonicalResourceUri(endpoint);
+
+	auto store = new LockRecordingStore();
+	StoredToken t;
+	t.accessToken = "old";
+	t.refreshToken = "rt";
+	t.clientId = "abc123";
+	t.expiresAt = 1;
+	t.resource = resource;
+	t.issuer = srv.base;
+	store.inner.save(resource, t);
+
+	OAuthLogin opts;
+	opts.store = store;
+	opts.openBrowser = (string url) @safe {};
+	cast(void) useOAuth(McpClient.http(endpoint), endpoint, opts);
+	assert(srv.refreshCalls == 1);
+	assert(store.events == ["load-locked", "save-locked"], store.events.to!string);
 }
 
 unittest  // useOAuth does not refresh a cached token that lacks a requested scope
