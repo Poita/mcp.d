@@ -497,25 +497,63 @@ enum string upstreamRefreshTokenClaim = "upstream_refresh_token";
 // Redirect-URI registration + validation (RFC 6749 §3.1.2.2 / §10.6, RFC 8252)
 // ===========================================================================
 
-/// Whether a client `redirect_uri` uses a scheme the proxy is willing to relay an
+/// Whether a client `redirect_uri` is one the proxy is willing to relay an
 /// authorization code to. `https` is always allowed; plain `http` is allowed only
 /// for loopback hosts (`127.0.0.1`, `[::1]`, `localhost`) per RFC 8252 §7.3. All
 /// other schemes (including `http` to a non-loopback host, and custom/private-use
 /// schemes) are rejected so the upstream code can never be relayed over an
-/// open-redirect-prone or interceptable channel. A URI carrying a fragment is
-/// rejected too (RFC 6749 §3.1.2).
-bool isAllowedRedirectScheme(string redirectUri) @safe
+/// open-redirect-prone or interceptable channel. The URI must also parse
+/// strictly: printable ASCII only (no whitespace, control characters or
+/// backslash), a non-empty host, no userinfo, a numeric port if any, and no
+/// fragment (RFC 6749 §3.1.2).
+bool isAllowedRedirectUri(string redirectUri) @safe
 {
-	if (redirectUri.indexOf('#') >= 0)
+	import std.algorithm : all, any;
+	import std.ascii : isDigit;
+	import std.string : indexOfAny, representation;
+
+	if (redirectUri.representation.any!(c => c <= ' ' || c >= 0x7f || c == '\\' || c == '#'))
 		return false;
+	string rest;
+	bool https;
 	if (redirectUri.startsWith("https://"))
-		return true;
-	if (redirectUri.startsWith("http://"))
 	{
-		const host = hostOf(redirectUri["http://".length .. $]);
-		return host == "127.0.0.1" || host == "localhost" || host == "[::1]";
+		https = true;
+		rest = redirectUri["https://".length .. $];
 	}
-	return false;
+	else if (redirectUri.startsWith("http://"))
+		rest = redirectUri["http://".length .. $];
+	else
+		return false;
+	const end = rest.indexOfAny("/?");
+	const authority = end < 0 ? rest : rest[0 .. end];
+	if (authority.indexOf('@') >= 0)
+		return false;
+	string host = authority;
+	string port;
+	if (authority.startsWith("["))
+	{
+		const close = authority.indexOf(']');
+		if (close < 0)
+			return false;
+		host = authority[0 .. close + 1];
+		const after = authority[close + 1 .. $];
+		if (after.length && after[0] != ':')
+			return false;
+		port = after.length ? after[1 .. $] : "";
+	}
+	else
+	{
+		const colon = authority.indexOf(':');
+		if (colon >= 0)
+		{
+			host = authority[0 .. colon];
+			port = authority[colon + 1 .. $];
+		}
+	}
+	if (host.length == 0 || host == "[]" || !port.representation.all!isDigit)
+		return false;
+	return https || host == "127.0.0.1" || host == "localhost" || host == "[::1]";
 }
 
 /// The form of `redirectUri` that registration and validation compare. For an
@@ -967,9 +1005,9 @@ void validateClientIdMetadata(string clientIdUrl,
 	if (!doc.redirectUris.canFind!(u => redirectUriMatchKey(u) == key))
 		throw new InvalidClientIdMetadataException(clientIdUrl,
 				"redirect_uri is not listed in the metadata document");
-	if (!isAllowedRedirectScheme(redirectUri))
+	if (!isAllowedRedirectUri(redirectUri))
 		throw new InvalidClientIdMetadataException(clientIdUrl,
-				"redirect_uri scheme not allowed (https, or http for loopback only)");
+				"redirect_uri not allowed (https, or http for loopback only; no fragment or userinfo)");
 }
 
 /// Upper bound on the size of a fetched Client ID Metadata Document. A document
@@ -1448,7 +1486,7 @@ final class OAuthProxy
 	/// server-issued registration handle rather than that shared id.
 	///
 	/// Throws `InvalidRedirectUriException` (registering nothing) when any URI
-	/// uses a scheme `/authorize` would refuse (`isAllowedRedirectScheme`), so a
+	/// is one `/authorize` would refuse (`isAllowedRedirectUri`), so a
 	/// client learns at registration rather than mid-sign-in. Registered URIs
 	/// are stored by `redirectUriMatchKey`, so a loopback IP-literal URI later
 	/// matches on any port.
@@ -1462,9 +1500,8 @@ final class OAuthProxy
 		string[] keys;
 		foreach (uri; capped)
 		{
-			if (!isAllowedRedirectScheme(uri))
-				throw new InvalidRedirectUriException(uri,
-						"scheme not allowed (https, or http for loopback only; no fragment)");
+			if (!isAllowedRedirectUri(uri))
+				throw new InvalidRedirectUriException(uri, "not an acceptable redirect URI (https, or http for loopback only; no fragment or userinfo)");
 			keys ~= redirectUriMatchKey(uri);
 		}
 		redirectRegistry.register(handle, keys);
@@ -1482,9 +1519,8 @@ final class OAuthProxy
 	{
 		if (clientRedirectUri.length == 0)
 			throw new InvalidRedirectUriException(clientRedirectUri, "redirect_uri is required");
-		if (!isAllowedRedirectScheme(clientRedirectUri))
-			throw new InvalidRedirectUriException(clientRedirectUri,
-					"scheme not allowed (https, or http for loopback only)");
+		if (!isAllowedRedirectUri(clientRedirectUri))
+			throw new InvalidRedirectUriException(clientRedirectUri, "not an acceptable redirect URI (https, or http for loopback only; no fragment or userinfo)");
 		if (!redirectRegistry.isRegistered(redirectUriMatchKey(clientRedirectUri)))
 			throw new InvalidRedirectUriException(clientRedirectUri,
 					"redirect_uri is not registered for any client");
@@ -2952,53 +2988,80 @@ unittest  // REDIRECT VALIDATION: a near-miss of a registered redirect_uri is re
 
 unittest  // SCHEME ALLOWLIST: https is accepted
 {
-	assert(isAllowedRedirectScheme("https://app.example.com/cb"));
+	assert(isAllowedRedirectUri("https://app.example.com/cb"));
 }
 
 unittest  // SCHEME ALLOWLIST: http to loopback is accepted (RFC 8252)
 {
-	assert(isAllowedRedirectScheme("http://127.0.0.1:8765/cb"));
-	assert(isAllowedRedirectScheme("http://localhost:5000/callback"));
-	assert(isAllowedRedirectScheme("http://[::1]:9000/cb"));
+	assert(isAllowedRedirectUri("http://127.0.0.1:8765/cb"));
+	assert(isAllowedRedirectUri("http://localhost:5000/callback"));
+	assert(isAllowedRedirectUri("http://[::1]:9000/cb"));
 }
 
 unittest  // SCHEME ALLOWLIST: bare (unbracketed) IPv6 loopback is rejected; RFC 3986 §3.2.2 requires brackets
 {
-	assert(!isAllowedRedirectScheme("http://::1/cb"));
-	assert(!isAllowedRedirectScheme("http://::1:8080/cb"));
+	assert(!isAllowedRedirectUri("http://::1/cb"));
+	assert(!isAllowedRedirectUri("http://::1:8080/cb"));
 }
 
 unittest  // SCHEME ALLOWLIST: http to a non-loopback host is rejected
 {
-	assert(!isAllowedRedirectScheme("http://app.example.com/cb"));
-	assert(!isAllowedRedirectScheme("http://evil.test/cb"));
+	assert(!isAllowedRedirectUri("http://app.example.com/cb"));
+	assert(!isAllowedRedirectUri("http://evil.test/cb"));
 }
 
 unittest  // SCHEME ALLOWLIST: userinfo after a fragment, query or backslash does not make a host loopback
 {
-	assert(!isAllowedRedirectScheme("http://evil.example#@127.0.0.1/cb"));
-	assert(!isAllowedRedirectScheme("http://evil.example?@localhost/cb"));
-	assert(!isAllowedRedirectScheme("http://evil.example\\@localhost/cb"));
-	assert(!isAllowedRedirectScheme("http://evil.example?x=@[::1]"));
+	assert(!isAllowedRedirectUri("http://evil.example#@127.0.0.1/cb"));
+	assert(!isAllowedRedirectUri("http://evil.example?@localhost/cb"));
+	assert(!isAllowedRedirectUri("http://evil.example\\@localhost/cb"));
+	assert(!isAllowedRedirectUri("http://evil.example?x=@[::1]"));
 }
 
 unittest  // SCHEME ALLOWLIST: a redirect URI carrying a fragment is rejected (RFC 6749 §3.1.2)
 {
-	assert(!isAllowedRedirectScheme("https://app.example.com/cb#frag"));
-	assert(!isAllowedRedirectScheme("http://127.0.0.1:8765/cb#"));
+	assert(!isAllowedRedirectUri("https://app.example.com/cb#frag"));
+	assert(!isAllowedRedirectUri("http://127.0.0.1:8765/cb#"));
 }
 
-unittest  // SCHEME ALLOWLIST: genuine userinfo before a loopback host still parses to that host
+unittest  // REDIRECT URI: a URI carrying userinfo is rejected
 {
-	assert(isAllowedRedirectScheme("http://user@127.0.0.1:8765/cb?x=1"));
-	assert(!isAllowedRedirectScheme("http://127.0.0.1@evil.example/cb"));
+	assert(!isAllowedRedirectUri("http://user@127.0.0.1:8765/cb?x=1"));
+	assert(!isAllowedRedirectUri("http://127.0.0.1@evil.example/cb"));
+	assert(!isAllowedRedirectUri("https://user:pw@app.example.com/cb"));
+	assert(!isAllowedRedirectUri("https://@app.example.com/cb"));
+	// An '@' after the authority is not userinfo.
+	assert(isAllowedRedirectUri("https://app.example.com/cb?who=a@b"));
+}
+
+unittest  // REDIRECT URI: a URI with an empty host or a malformed port is rejected
+{
+	assert(!isAllowedRedirectUri("https://"));
+	assert(!isAllowedRedirectUri("https:///cb"));
+	assert(!isAllowedRedirectUri("https://:443/cb"));
+	assert(!isAllowedRedirectUri("https://?x=1"));
+	assert(!isAllowedRedirectUri("https://[]/cb"));
+	assert(!isAllowedRedirectUri("https://app.example.com:44x/cb"));
+	assert(!isAllowedRedirectUri("https://[::1]x/cb"));
+	assert(isAllowedRedirectUri("https://app.example.com:8443/cb"));
+	assert(isAllowedRedirectUri("https://app.example.com"));
+}
+
+unittest  // REDIRECT URI: whitespace, control characters, backslashes and non-ASCII are rejected
+{
+	assert(!isAllowedRedirectUri("https://app.example.com/c b"));
+	assert(!isAllowedRedirectUri("https://app.example.com/cb\r\nSet-Cookie: x=1"));
+	assert(!isAllowedRedirectUri("https://app.example.com/cb\t"));
+	assert(!isAllowedRedirectUri("https://app.example.com/cb\x7f"));
+	assert(!isAllowedRedirectUri("https://app.example.com\\cb"));
+	assert(!isAllowedRedirectUri("https://app.exämple.com/cb"));
 }
 
 unittest  // SCHEME ALLOWLIST: a custom/private-use scheme is rejected
 {
-	assert(!isAllowedRedirectScheme("com.example.app:/oauth/cb"));
-	assert(!isAllowedRedirectScheme("javascript:alert(1)"));
-	assert(!isAllowedRedirectScheme(""));
+	assert(!isAllowedRedirectUri("com.example.app:/oauth/cb"));
+	assert(!isAllowedRedirectUri("javascript:alert(1)"));
+	assert(!isAllowedRedirectUri(""));
 }
 
 unittest  // SCHEME ALLOWLIST: a registered scheme is still scheme-checked (registered http non-loopback rejected)
