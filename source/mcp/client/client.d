@@ -5546,7 +5546,7 @@ unittest  // a request timeout is a transient event failure, identified by type
 
 unittest  // callToolAwait validates the awaited task result against the listed outputSchema
 {
-	import mcp.protocol.schema : jsonSchemaOf;
+	import mcp.api.binding : jsonSchemaOf, SchemaUse;
 
 	struct AddResult
 	{
@@ -5556,7 +5556,9 @@ unittest  // callToolAwait validates the awaited task result against the listed 
 	auto c = McpClient.http("http://localhost");
 	c.enableOutputSchemaValidation();
 	c.onTaskSleepForTest = (Duration d) @safe {};
-	Tool t = {name: "add", outputSchema: jsonSchemaOf!AddResult};
+	Tool t = {
+		name: "add", outputSchema: jsonSchemaOf!(AddResult, SchemaUse.output)
+	};
 	c.onRpcForTest = (string method, Json params) @safe {
 		if (method == "tools/list")
 			return Json(["tools": Json([t.toJson()])]);
@@ -6302,14 +6304,16 @@ unittest  // discover applies RequestOptions progressToken and logLevel
 
 unittest  // validateOutput passes a conforming structured result
 {
-	import mcp.protocol.schema : jsonSchemaOf;
+	import mcp.api.binding : jsonSchemaOf, SchemaUse;
 
 	struct AddResult
 	{
 		int result;
 	}
 
-	Tool t = {name: "add", outputSchema: jsonSchemaOf!AddResult};
+	Tool t = {
+		name: "add", outputSchema: jsonSchemaOf!(AddResult, SchemaUse.output)
+	};
 	CallToolResult r;
 	r.structuredContent = Json(["result": Json(5)]);
 	assert(McpClient.validateOutput(t, r) == "");
@@ -6317,14 +6321,16 @@ unittest  // validateOutput passes a conforming structured result
 
 unittest  // validateOutput rejects a non-conforming structured result
 {
-	import mcp.protocol.schema : jsonSchemaOf;
+	import mcp.api.binding : jsonSchemaOf, SchemaUse;
 
 	struct AddResult
 	{
 		int result;
 	}
 
-	Tool t = {name: "add", outputSchema: jsonSchemaOf!AddResult};
+	Tool t = {
+		name: "add", outputSchema: jsonSchemaOf!(AddResult, SchemaUse.output)
+	};
 	CallToolResult r;
 	r.structuredContent = Json(["result": Json("oops")]);
 	assert(McpClient.validateOutput(t, r).length > 0);
@@ -6340,21 +6346,23 @@ unittest  // validateOutput is a no-op when the tool has no output schema
 
 unittest  // validateOutput is a no-op when there is no structured content
 {
-	import mcp.protocol.schema : jsonSchemaOf;
+	import mcp.api.binding : jsonSchemaOf, SchemaUse;
 
 	struct AddResult
 	{
 		int result;
 	}
 
-	Tool t = {name: "add", outputSchema: jsonSchemaOf!AddResult};
+	Tool t = {
+		name: "add", outputSchema: jsonSchemaOf!(AddResult, SchemaUse.output)
+	};
 	CallToolResult r; // structuredContent stays undefined
 	assert(McpClient.validateOutput(t, r) == "");
 }
 
 unittest  // string-name callTool validates against the listTools-cached outputSchema
 {
-	import mcp.protocol.schema : jsonSchemaOf;
+	import mcp.api.binding : jsonSchemaOf, SchemaUse;
 
 	struct AddResult
 	{
@@ -6363,7 +6371,9 @@ unittest  // string-name callTool validates against the listTools-cached outputS
 
 	auto c = McpClient.http("http://localhost");
 	c.enableOutputSchemaValidation();
-	Tool t = {name: "add", outputSchema: jsonSchemaOf!AddResult};
+	Tool t = {
+		name: "add", outputSchema: jsonSchemaOf!(AddResult, SchemaUse.output)
+	};
 	c.onRpcForTest = (string method, Json params) @safe {
 		if (method == "tools/list")
 		{
@@ -6391,7 +6401,7 @@ unittest  // string-name callTool validates against the listTools-cached outputS
 
 unittest  // string-name callTool accepts a conforming result against the cached outputSchema
 {
-	import mcp.protocol.schema : jsonSchemaOf;
+	import mcp.api.binding : jsonSchemaOf, SchemaUse;
 
 	struct AddResult
 	{
@@ -6400,7 +6410,9 @@ unittest  // string-name callTool accepts a conforming result against the cached
 
 	auto c = McpClient.http("http://localhost");
 	c.enableOutputSchemaValidation();
-	Tool t = {name: "add", outputSchema: jsonSchemaOf!AddResult};
+	Tool t = {
+		name: "add", outputSchema: jsonSchemaOf!(AddResult, SchemaUse.output)
+	};
 	c.onRpcForTest = (string method, Json params) @safe {
 		if (method == "tools/list")
 		{
@@ -6419,7 +6431,7 @@ unittest  // string-name callTool accepts a conforming result against the cached
 
 unittest  // string-name callTool skips output validation when it is not enabled
 {
-	import mcp.protocol.schema : jsonSchemaOf;
+	import mcp.api.binding : jsonSchemaOf, SchemaUse;
 
 	struct AddResult
 	{
@@ -6428,7 +6440,9 @@ unittest  // string-name callTool skips output validation when it is not enabled
 
 	auto c = McpClient.http("http://localhost");
 	// validation left disabled (the default)
-	Tool t = {name: "add", outputSchema: jsonSchemaOf!AddResult};
+	Tool t = {
+		name: "add", outputSchema: jsonSchemaOf!(AddResult, SchemaUse.output)
+	};
 	c.onRpcForTest = (string method, Json params) @safe {
 		if (method == "tools/list")
 		{
@@ -6447,7 +6461,7 @@ unittest  // string-name callTool skips output validation when it is not enabled
 
 unittest  // a pre-seeded tools/list cache drives output validation with no local listTools
 {
-	import mcp.protocol.schema : jsonSchemaOf;
+	import mcp.api.binding : jsonSchemaOf, SchemaUse;
 	import std.datetime : SysTime, DateTime;
 
 	struct AddResult
@@ -6457,7 +6471,9 @@ unittest  // a pre-seeded tools/list cache drives output validation with no loca
 
 	auto c = McpClient.http("http://localhost");
 	c.enableOutputSchemaValidation();
-	Tool t = {name: "add", outputSchema: jsonSchemaOf!AddResult};
+	Tool t = {
+		name: "add", outputSchema: jsonSchemaOf!(AddResult, SchemaUse.output)
+	};
 	ListToolsResult lr;
 	lr.tools = [t];
 	auto store = new InMemoryCacheStore();
@@ -6481,7 +6497,7 @@ unittest  // a pre-seeded tools/list cache drives output validation with no loca
 
 unittest  // a pre-seeded tools/list cache accepts a conforming result with no local listTools
 {
-	import mcp.protocol.schema : jsonSchemaOf;
+	import mcp.api.binding : jsonSchemaOf, SchemaUse;
 	import std.datetime : SysTime, DateTime;
 
 	struct AddResult
@@ -6491,7 +6507,9 @@ unittest  // a pre-seeded tools/list cache accepts a conforming result with no l
 
 	auto c = McpClient.http("http://localhost");
 	c.enableOutputSchemaValidation();
-	Tool t = {name: "add", outputSchema: jsonSchemaOf!AddResult};
+	Tool t = {
+		name: "add", outputSchema: jsonSchemaOf!(AddResult, SchemaUse.output)
+	};
 	ListToolsResult lr;
 	lr.tools = [t];
 	auto store = new InMemoryCacheStore();

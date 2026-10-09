@@ -69,6 +69,7 @@ public import mcp.client.event_subscription : EventSubscription;
 // --- Declarative UDA / reflection API ---
 public import mcp.api.attributes;
 public import mcp.api.reflection;
+public import mcp.api.binding : jsonSchemaOf, SchemaUse;
 
 // --- MCP Apps extension (interactive UI resources) ---
 public import mcp.api.apps;

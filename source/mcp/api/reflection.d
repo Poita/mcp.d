@@ -21,8 +21,8 @@ import mcp.api.attributes;
 import mcp.api.apps : UiToolMeta, setUiToolMeta, ensureApps;
 import mcp.api.skills : Skill, isValidSkillPath, registerSkill,
 	skillFieldProblem, unregisterSkill;
-import mcp.api.binding : bindJson, bindString, defaultAs, schemaNode, schemaOf,
-	SchemaUse, setBound, wireName;
+import mcp.api.binding : bindJson, bindString, defaultAs, schemaNode,
+	jsonSchemaOf, SchemaUse, setBound, wireName;
 import mcp.protocol.schema;
 import mcp.protocol.jsonhelpers : isFieldwiseStruct;
 
@@ -829,13 +829,13 @@ private Json outputSchemaOf(R)() @safe
 	static if (isUnstructuredReturn!R)
 		return Json.undefined;
 	else static if (isFieldwiseStruct!R)
-		return schemaOf!(R, SchemaUse.output);
+		return jsonSchemaOf!(R, SchemaUse.output);
 	else
 	{
 		Json s = Json.emptyObject;
 		s["type"] = "object";
 		Json props = Json.emptyObject;
-		props["result"] = schemaOf!(R, SchemaUse.output);
+		props["result"] = jsonSchemaOf!(R, SchemaUse.output);
 		s["properties"] = props;
 		s["required"] = Json([Json("result")]);
 		return s;

@@ -9,36 +9,6 @@ import jsonschema : Validator;
 
 @safe:
 
-/// Generate a JSON Schema (2020-12) fragment describing the D type `T`, rendered
-/// as a vibe `Json`.
-///
-/// Delegates to the `jsonschema` package's compile-time generator — the canonical
-/// home for D-type → JSON Schema mapping and the constraint UDAs (`@minimum`,
-/// `@pattern`, …) re-exported from `mcp.api.attributes`. `inlineSubschemas` is set
-/// so the schema is fully self-contained (no `$defs`/`$ref`): MCP embeds tool
-/// `inputSchema`/`outputSchema` and elicitation `requestedSchema` directly, and
-/// not every client resolves `$ref` within an embedded schema. The compile-time
-/// settings overload rejects a directly or mutually recursive `T` with a
-/// `static assert`, so recursive types fail at the instantiation site rather than
-/// silently producing an incomplete schema.
-Json jsonSchemaOf(T)()
-{
-	import jsonschema : generate = jsonSchemaOf, GeneratorSettings;
-	import jsonschema.vibejson : nodeToVibeJson;
-
-	// A `Json` member is arbitrary, unconstrained JSON (e.g. a pass-through event
-	// payload or tool field whose shape is the upstream system's, not ours). The
-	// generator can't reflect vibe's `Json`, so map it to the empty schema, which
-	// validates every JSON value.
-	static if (is(T == Json))
-		return Json.emptyObject;
-	else
-	{
-		enum GeneratorSettings settings = {inlineSubschemas: true};
-		return nodeToVibeJson(generate!(T, settings)());
-	}
-}
-
 /// vibe.data serialization policy that maps any `enum` leaf to / from its
 /// member *name* (string), rather than vibe's default numeric base value.
 ///
@@ -384,72 +354,14 @@ string validateAgainstSchema(Json value, Json schema)
 	return validationError(makeValidator(schema), value);
 }
 
-unittest  // jsonSchemaOf maps a scalar to its primitive type
-{
-	auto s = jsonSchemaOf!int;
-	assert(s["type"].get!string == "integer");
-}
-
-unittest  // jsonSchemaOf!Json is a permissive schema accepting any JSON value
-{
-	import vibe.data.json : parseJsonString;
-
-	auto s = jsonSchemaOf!Json;
-	// An empty schema imposes no constraint — any JSON value conforms.
-	assert(s.type == Json.Type.object);
-	assert(validateAgainstSchema(Json("anything"), s) == "");
-	assert(validateAgainstSchema(Json(42), s) == "");
-	assert(validateAgainstSchema(parseJsonString(`{"a": 1}`), s) == "");
-}
-
-unittest  // jsonSchemaOf maps a struct to an object with properties and required
-{
-	struct Args
-	{
-		string name;
-		Nullable!int count;
-	}
-
-	auto s = jsonSchemaOf!Args;
-	assert(s["type"].get!string == "object");
-	assert("name" in s["properties"]);
-	assert("count" in s["properties"]);
-	// `name` is required; the Nullable `count` is optional.
-	import std.algorithm : canFind;
-	import std.array : array;
-
-	auto req = s["required"][].array;
-	assert(req.canFind(Json("name")));
-	assert(!req.canFind(Json("count")));
-}
-
-unittest  // jsonSchemaOf inlines a shared nested struct rather than emitting $ref
-{
-	struct Inner
-	{
-		int a;
-	}
-
-	struct Outer
-	{
-		Inner first;
-		Inner second;
-	}
-
-	auto s = jsonSchemaOf!Outer;
-	// inlineSubschemas: the shared `Inner` is expanded at both use sites and the
-	// document carries no $defs/$ref that an MCP client would have to resolve.
-	assert("$defs" !in s);
-	assert(s["properties"]["first"]["type"].get!string == "object");
-	assert(s["properties"]["second"]["properties"]["a"]["type"].get!string == "integer");
-}
-
 unittest  // validateAgainstSchema accepts a conforming object, rejects a wrong type
 {
 	struct Args
 	{
 		string name;
 	}
+
+	import mcp.api.binding : jsonSchemaOf;
 
 	auto schema = jsonSchemaOf!Args;
 	assert(validateAgainstSchema(Json(["name": Json("ok")]), schema) == "");
@@ -462,6 +374,8 @@ unittest  // validateAgainstSchema reports a missing required property
 	{
 		string name;
 	}
+
+	import mcp.api.binding : jsonSchemaOf;
 
 	auto schema = jsonSchemaOf!Args;
 	assert(validateAgainstSchema(Json.emptyObject, schema).length > 0);
@@ -527,6 +441,8 @@ unittest  // a precompiled validator validates repeatedly with independent resul
 	{
 		int n;
 	}
+
+	import mcp.api.binding : jsonSchemaOf;
 
 	auto v = makeValidator(jsonSchemaOf!Args);
 	assert(validationError(v, Json(["n": Json(1)])) == "");

@@ -1,7 +1,7 @@
 /// JSON Schema derivation and JSON → D argument binding for the reflection
 /// layer, kept in one module so the two always agree.
 ///
-/// `schemaOf!T` describes `T` the way vibe serializes it, and `bindJson!T` converts
+/// `jsonSchemaOf!T` describes `T` the way vibe serializes it, and `bindJson!T` converts
 /// an inbound JSON value into `T` following the same optionality rules the
 /// reflected input schema advertises: a struct field is required unless it is
 /// `Nullable`, carries vibe's `@optional`, has a declared default (a
@@ -123,7 +123,7 @@ private enum hasCtInitializer(T, string field) = __traits(compiles,
 private enum ctValue(alias v) = v;
 
 /// Which side of a tool a derived schema describes.
-package(mcp) enum SchemaUse
+enum SchemaUse
 {
 	/// A tool's arguments, which `bindJson` reads.
 	input,
@@ -131,22 +131,32 @@ package(mcp) enum SchemaUse
 	output,
 }
 
-/// The JSON Schema for `T` as vibe (de)serializes it, fully inlined. Struct
-/// fields are keyed by `wireFieldName`, listed in `required` per
-/// `isRequiredField`, and carry their `@fieldDescription` and facet UDAs. For
-/// an input a `Nullable!U` is the schema of `U` widened in place to admit
-/// `null` (see `admitNull`), since `bindJson` reads `null` as an unset value;
-/// for an output it is `anyOf: [U, null]`. `TimeOfDay` and `DateTime` are
-/// strings constrained by a pattern. Other scalars, enums, and
-/// custom-serialized types come from the `jsonschema` generator.
-package(mcp) Json schemaOf(T, SchemaUse use)()
+/// The JSON Schema (2020-12) for the D type `T`, rendered as a vibe `Json`: by
+/// default the `inputSchema` of a value read with `argsAs!T` (or a `@tool`
+/// parameter of type `T`), or with `SchemaUse.output` the `outputSchema` of a
+/// value vibe serializes. The schema is fully inlined (no `$defs`/`$ref`),
+/// since MCP embeds it directly and not every client resolves references, and
+/// a recursive `T` is rejected at compile time.
+///
+/// Struct fields are keyed by their wire name (vibe's `@name`, else the field
+/// name with one trailing underscore stripped), skip `@ignore`d and non-public
+/// fields, are listed in `required` by the binding rules (see the module
+/// documentation), and carry their `@fieldDescription` and facet UDAs
+/// (`@minimum`, `@pattern`, ...). For an input a `Nullable!U` is the schema of
+/// `U` widened in place to admit `null`, since binding reads `null` as an unset
+/// value; for an output it is `anyOf: [U, null]`. A `Json` value is the empty
+/// schema, which admits any JSON. `TimeOfDay` and `DateTime` are strings
+/// constrained by a pattern, as they carry no UTC offset. Other scalars, enums
+/// (by member name), and custom-serialized types come from the `jsonschema`
+/// generator.
+Json jsonSchemaOf(T, SchemaUse use = SchemaUse.input)()
 {
 	import jsonschema.vibejson : nodeToVibeJson;
 
 	return nodeToVibeJson(schemaNode!(T, use)());
 }
 
-/// `schemaOf` in the `jsonschema` IR, so facet UDAs can be folded onto the
+/// `jsonSchemaOf` in the `jsonschema` IR, so facet UDAs can be folded onto the
 /// result before rendering. `Ancestors` are the enclosing struct types, used to
 /// reject recursive types, which an inlined schema cannot describe.
 package(mcp) JsonNode schemaNode(T, SchemaUse use, Ancestors...)()
@@ -270,7 +280,7 @@ package(mcp) JsonNode schemaNode(T, SchemaUse use, Ancestors...)()
 	}
 }
 
-/// Why `T` cannot be described by `schemaOf` and bound from JSON (`use` is
+/// Why `T` cannot be described by `jsonSchemaOf` and bound from JSON (`use` is
 /// `input`) or written as JSON (`output`), or `null` when it can. The reason
 /// starts with the offending type, which may be nested anywhere inside `T` (a
 /// struct field, an array element, a `Nullable` or `SumType` member), so a
@@ -944,16 +954,16 @@ unittest  // bindJson rejects an object missing an undefaulted floating-point fi
 
 unittest  // a bounded integer schema carries its type's minimum and maximum
 {
-	auto u8 = schemaOf!(ubyte, SchemaUse.input)();
+	auto u8 = jsonSchemaOf!(ubyte, SchemaUse.input)();
 	assert(u8["minimum"].get!long == 0 && u8["maximum"].get!long == 255, u8.toString);
-	auto u16 = schemaOf!(ushort, SchemaUse.input)();
+	auto u16 = jsonSchemaOf!(ushort, SchemaUse.input)();
 	assert(u16["maximum"].get!long == ushort.max, u16.toString);
-	auto i8 = schemaOf!(byte, SchemaUse.input)();
+	auto i8 = jsonSchemaOf!(byte, SchemaUse.input)();
 	assert(i8["minimum"].get!long == -128 && i8["maximum"].get!long == 127, i8.toString);
-	auto i16 = schemaOf!(short, SchemaUse.input)();
+	auto i16 = jsonSchemaOf!(short, SchemaUse.input)();
 	assert(i16["minimum"].get!long == short.min
 			&& i16["maximum"].get!long == short.max, i16.toString);
-	auto u32 = schemaOf!(uint, SchemaUse.input)();
+	auto u32 = jsonSchemaOf!(uint, SchemaUse.input)();
 	assert(u32["maximum"].get!long == uint.max, u32.toString);
 }
 
@@ -967,11 +977,11 @@ unittest  // a value outside a bounded integer type's range does not bind
 
 unittest  // a static array schema pins its length with minItems and maxItems
 {
-	auto s = schemaOf!(int[3], SchemaUse.input)();
+	auto s = jsonSchemaOf!(int[3], SchemaUse.input)();
 	assert(s["type"].get!string == "array");
 	assert(s["minItems"].get!long == 3, s.toString);
 	assert(s["maxItems"].get!long == 3, s.toString);
-	assert("minItems" !in schemaOf!(int[], SchemaUse.input)());
+	assert("minItems" !in jsonSchemaOf!(int[], SchemaUse.input)());
 }
 
 unittest  // an undefaulted struct field whose struct type has a defaulted member is required
@@ -1025,7 +1035,7 @@ unittest  // every field of an @allOptional struct is optional and keeps its def
 	static assert(!isRequiredField!(S, "depth"));
 	auto s = bindJson!S(parseJsonString(`{"depth":2}`));
 	assert(!s.verbose && s.depth == 2 && s.name == "x");
-	assert("required" !in schemaOf!(S, SchemaUse.input)());
+	assert("required" !in jsonSchemaOf!(S, SchemaUse.input)());
 }
 
 unittest  // bindJson binds a SumType to the member matching the JSON value's own type first
@@ -1061,7 +1071,7 @@ unittest  // a string-based enum field is described by member name
 		Shade shade;
 	}
 
-	auto s = schemaOf!(S, SchemaUse.input)();
+	auto s = jsonSchemaOf!(S, SchemaUse.input)();
 	auto p = s["properties"]["shade"];
 	assert(p["type"].get!string == "string", s.toString);
 	assert(p["enum"].length == 2 && p["enum"][0].get!string == "light", s.toString);
@@ -1278,7 +1288,7 @@ unittest  // a struct field with a non-default initializer advertises it as its 
 		int zero;
 	}
 
-	auto s = schemaOf!(S, SchemaUse.input)();
+	auto s = jsonSchemaOf!(S, SchemaUse.input)();
 	assert(s["properties"]["limit"]["default"] == Json(10), s.toString);
 	assert(s["properties"]["shade"]["default"] == Json("dark"), s.toString);
 	assert("default" !in s["properties"]["name"], s.toString);
@@ -1294,7 +1304,7 @@ unittest  // a @schemaDefault takes precedence over a field's initializer as its
 		@schemaDefault(3) int limit = 10;
 	}
 
-	auto s = schemaOf!(S, SchemaUse.input)();
+	auto s = jsonSchemaOf!(S, SchemaUse.input)();
 	assert(s["properties"]["limit"]["default"] == Json(3), s.toString);
 }
 
@@ -1313,4 +1323,93 @@ unittest  // an explicit null for a defaulted Nullable field binds as unset
 	assert(s.a.isNull && s.b.isNull);
 	auto d = bindJson!S(parseJsonString(`{}`));
 	assert(d.a.get == 5 && d.b.get == 7);
+}
+
+unittest  // jsonSchemaOf maps a scalar to its primitive type
+{
+	auto s = jsonSchemaOf!int;
+	assert(s["type"].get!string == "integer");
+}
+
+unittest  // jsonSchemaOf!Json is a permissive schema accepting any JSON value
+{
+	import mcp.protocol.schema : validateAgainstSchema;
+	import vibe.data.json : parseJsonString;
+
+	auto s = jsonSchemaOf!Json;
+	// An empty schema imposes no constraint — any JSON value conforms.
+	assert(s.type == Json.Type.object);
+	assert(validateAgainstSchema(Json("anything"), s) == "");
+	assert(validateAgainstSchema(Json(42), s) == "");
+	assert(validateAgainstSchema(parseJsonString(`{"a": 1}`), s) == "");
+}
+
+unittest  // jsonSchemaOf maps a struct to an object with properties and required
+{
+	struct Args
+	{
+		string name;
+		Nullable!int count;
+	}
+
+	auto s = jsonSchemaOf!Args;
+	assert(s["type"].get!string == "object");
+	assert("name" in s["properties"]);
+	assert("count" in s["properties"]);
+	// `name` is required; the Nullable `count` is optional.
+	import std.algorithm : canFind;
+	import std.array : array;
+
+	auto req = s["required"][].array;
+	assert(req.canFind(Json("name")));
+	assert(!req.canFind(Json("count")));
+}
+
+unittest  // jsonSchemaOf advertises the keys and required set that argument binding reads
+{
+	import std.algorithm : canFind;
+	import std.array : array;
+	import std.datetime.date : TimeOfDay;
+	import vibe.data.serialization : name, optional;
+
+	static struct Args
+	{
+		string version_;
+		@name("q") string query;
+		@optional string note;
+		int limit = 10;
+		Json extra;
+		TimeOfDay at;
+	}
+
+	auto s = jsonSchemaOf!Args;
+	const props = s["properties"];
+	assert("version" in props && "version_" !in props, s.toString);
+	assert("q" in props && "query" !in props, s.toString);
+	assert(props["extra"] == Json.emptyObject, s.toString);
+	assert("format" !in props["at"] && "pattern" in props["at"], s.toString);
+	auto req = s["required"][].array;
+	assert(req.canFind(Json("version")) && req.canFind(Json("q")), s.toString);
+	assert(!req.canFind(Json("note")) && !req.canFind(Json("limit")), s.toString);
+}
+
+unittest  // jsonSchemaOf inlines a shared nested struct rather than emitting $ref
+{
+	struct Inner
+	{
+		int a;
+	}
+
+	struct Outer
+	{
+		Inner first;
+		Inner second;
+	}
+
+	auto s = jsonSchemaOf!Outer;
+	// inlineSubschemas: the shared `Inner` is expanded at both use sites and the
+	// document carries no $defs/$ref that an MCP client would have to resolve.
+	assert("$defs" !in s);
+	assert(s["properties"]["first"]["type"].get!string == "object");
+	assert(s["properties"]["second"]["properties"]["a"]["type"].get!string == "integer");
 }

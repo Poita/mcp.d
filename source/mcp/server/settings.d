@@ -312,7 +312,7 @@ version (unittest)
 {
 	// outputSchemaValidation enforces a tool's declared outputSchema: a handler that
 	// omits structuredContent for an outputSchema'd tool surfaces an internal error.
-	import mcp.protocol.schema : jsonSchemaOf;
+	import mcp.api.binding : jsonSchemaOf, SchemaUse;
 	import mcp.protocol.types : Tool, CallToolResult, Content;
 	import std.typecons : nullable;
 	import vibe.data.json : Json;
@@ -327,7 +327,8 @@ version (unittest)
 	s.outputSchemaValidation = true;
 	auto server = s.newServer();
 	Tool t = {
-		name: "add", description: nullable("Add"), outputSchema: jsonSchemaOf!Out
+		name: "add", description: nullable("Add"), outputSchema: jsonSchemaOf!(Out,
+				SchemaUse.output)
 	};
 	// Handler returns plain text content, NO structuredContent — invalid under the
 	// declared outputSchema, so validation must reject it.
@@ -347,7 +348,7 @@ version (unittest)
 {
 	// inputSchemaValidation defaults to on, so a call with arguments missing a
 	// required field is rejected (isError content).
-	import mcp.protocol.schema : jsonSchemaOf;
+	import mcp.api.binding : jsonSchemaOf;
 	import mcp.protocol.types : Tool, CallToolResult, Content;
 	import std.typecons : nullable;
 	import vibe.data.json : Json;
@@ -380,7 +381,7 @@ version (unittest)
 @safe unittest
 {
 	// inputSchemaValidation = false disables validation: the same call now succeeds.
-	import mcp.protocol.schema : jsonSchemaOf;
+	import mcp.api.binding : jsonSchemaOf;
 	import mcp.protocol.types : Tool, CallToolResult, Content;
 	import std.typecons : nullable;
 	import vibe.data.json : Json;

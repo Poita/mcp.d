@@ -898,7 +898,7 @@ final class EventsRuntime
 	/// `description` or `title` is left unset.
 	EventHandle!(A, P) define(A, P)(string name, string description = "", string title = "") @safe
 	{
-		import mcp.api.binding : schemaOf, SchemaUse;
+		import mcp.api.binding : jsonSchemaOf, SchemaUse;
 
 		EventRegistration reg;
 		reg.descriptor.name = name;
@@ -911,10 +911,10 @@ final class EventsRuntime
 		// and the payloads `publish` writes. Subscription arguments are filters: an
 		// absent field means "no filter" and deserializes to the field's default, so
 		// the advertised schema declares every field optional.
-		reg.descriptor.inputSchema = schemaOf!(A, SchemaUse.input);
+		reg.descriptor.inputSchema = jsonSchemaOf!(A, SchemaUse.input);
 		if (reg.descriptor.inputSchema.type == Json.Type.object)
 			reg.descriptor.inputSchema.remove("required");
-		reg.descriptor.payloadSchema = schemaOf!(P, SchemaUse.output);
+		reg.descriptor.payloadSchema = jsonSchemaOf!(P, SchemaUse.output);
 		reg.emitOnly = true;
 		register(reg);
 		return new EventHandle!(A, P)(this, name);
