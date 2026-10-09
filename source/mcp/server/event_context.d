@@ -127,7 +127,7 @@ struct FetchContext
 {
 	Nullable!string cursor; /// resume position; null = from now
 	Nullable!long maxAgeMs; /// replay floor; null = unbounded
-	Nullable!long maxEvents; /// batch cap: the client's `maxEvents` clamped to `EventsOptions.pollMaxEvents`, else `pollDefaultMaxEvents`; null = uncapped
+	Nullable!long maxEvents; /// batch cap (see `EventContext.maxEvents`); null = uncapped
 	string principal; /// authenticated subject ("" if unauthenticated)
 
 	/// True when the client passed `cursor: null` (start from now).
@@ -220,8 +220,13 @@ final class EventContext
 		return maxAgeMs_;
 	}
 
-	/// The optional cap on events returned in one batch (`maxEvents`). Null when
-	/// the client did not bound the batch.
+	/// The cap on events to return in one batch. For `events/poll` it is the
+	/// client's `maxEvents`, or `EventsOptions.pollDefaultMaxEvents` when it set
+	/// none, clamped to `EventsOptions.pollMaxEvents`; push streams and webhook
+	/// fetches use that default, and a webhook fetch is lowered further to the
+	/// subscription's free pending-delivery slots. Null only when those options
+	/// leave the batch uncapped. A check returning more is cut at the last kept
+	/// event that carries its own cursor; report `hasMore` to be called again.
 	Nullable!long maxEvents() const @safe nothrow
 	{
 		return maxEvents_;

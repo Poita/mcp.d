@@ -155,7 +155,7 @@ final class EventHandle(A, P)
 	/// with `args` (e.g. redact a field the subscriber may not see), returning the
 	/// `EventOccurrence` to deliver. Mirrors `match` so payload shaping is typed —
 	/// no need to drop to the raw `register()` escape hatch. The shaper receives the
-	/// decoded `payload`; build the result from `EventOccurrence.fromPayload` (or
+	/// decoded `payload`; build the result with this handle's `fromPayload` (or
 	/// shape a copy of the emitted occurrence).
 	EventHandle transform(EventOccurrence delegate(A args, P payload) @safe shaper) @safe
 	{
