@@ -16,7 +16,7 @@ import mcp.protocol.mrtr : withListenSubscriptionId;
 import mcp.protocol.versions : ProtocolVersion, latestLegacy, supportsProgressMessage;
 import mcp.server.context;
 import mcp.server.connection : ConnectionState;
-import mcp.server.push : PushChannel, ListenFilter;
+import mcp.server.push : PushChannel, ListenFilter, listenFilterKey;
 import mcp.server.server : McpServer;
 import mcp.auth.resource_server : TokenInfo;
 
@@ -1058,7 +1058,7 @@ final class ServerPushChannel : PushChannel
 			return 0;
 		return fanOut(makeNotification(method, params),
 				(ref const Listener l) @safe => l.principal == principal
-				&& listenerEligible(l, method, notificationUri(method, params), true));
+				&& listenerEligible(l, method, listenFilterKey(method, params), true));
 	}
 
 	/// Deliver `msg` once per delivery group that has at least one eligible live
@@ -1567,17 +1567,7 @@ final class ServerPushChannel : PushChannel
 	/// stream (see `broadcast`).
 	size_t notify(string method, Json params = Json.undefined) @safe
 	{
-		return broadcast(method, params, notificationUri(method, params));
-	}
-
-	/// The resource URI a `notifications/resources/updated` carries in its params,
-	/// which per-URI listen filters and per-session gates match against.
-	private static string notificationUri(string method, Json params) @safe
-	{
-		if (method != "notifications/resources/updated" || params.type != Json.Type.object)
-			return "";
-		auto u = "uri" in params;
-		return (u !is null && u.type == Json.Type.string) ? u.get!string : "";
+		return broadcast(method, params, listenFilterKey(method, params));
 	}
 
 	/// MODE 3 — REQUEST ON SESSION. Send a server->client JSON-RPC *request*
@@ -2255,7 +2245,8 @@ unittest  // every independent listen stream receives its own copy
 	assert(ch.broadcast("notifications/tools/list_changed", Json.undefined) == 2);
 	assert(a.canFind("listen-A"));
 	assert(b.canFind("listen-B"));
-	assert(ch.notify("notifications/message") == 2);
+	assert(ch.notify("notifications/message") == 0,
+			"a listen stream must not receive a type it did not request");
 }
 
 unittest  // notifyPrincipal reaches only the streams authenticated as that principal
@@ -2267,6 +2258,7 @@ unittest  // notifyPrincipal reaches only the streams authenticated as that prin
 	string alice, bob, anon;
 	ListenFilter f;
 	f.active = true;
+	f.taskIds = ["t1"];
 	ch.addListener((string fr) @safe { alice = fr; }, Json("l-alice"), f, "", null, "", "alice");
 	ch.addListener((string fr) @safe { bob = fr; }, Json("l-bob"), f, "", null, "", "bob");
 	ch.addListener((string fr) @safe { anon = fr; }, Json("l-anon"), f);

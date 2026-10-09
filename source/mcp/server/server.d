@@ -25,7 +25,7 @@ import mcp.server.skill_index : SkillIndex;
 import mcp.protocol.tasks : TaskSupport;
 import mcp.server.task_context : TaskContext, TaskExecutor, TaskDispatcher, InProcessTaskDispatcher,
 	SyncTaskDispatcher, runTaskExecutor, runTaskExecutorInline, tasksExtensionRequired;
-import mcp.server.push : PushChannel, ListenFilter;
+import mcp.server.push : PushChannel, ListenFilter, listenFilterKey;
 import mcp.server.pagination : pageBounds;
 import mcp.server.transport : ServerCore;
 import mcp.protocol.events;
@@ -1598,7 +1598,7 @@ final class McpServer : ServerCore
 	/// session subscribed to the URI, exactly as `notifyResourceUpdated`.
 	size_t notify(string method, Json params = Json.undefined) @safe
 	{
-		return notifyChange(method, params, resourceUriOf(method, params));
+		return notifyChange(method, params, listenFilterKey(method, params));
 	}
 
 	/// Write `method` to the stdio `subscriptions/listen` stream, if one is open
@@ -1607,18 +1607,7 @@ final class McpServer : ServerCore
 	/// subscriptions). Returns the number of streams reached (0 or 1).
 	private size_t writeStdioListen(string method, Json params) @safe
 	{
-		return writeStdioListen(method, params, resourceUriOf(method, params));
-	}
-
-	/// The resource URI a `notifications/resources/updated` is about, or "" for
-	/// any other notification.
-	private static string resourceUriOf(string method, Json params) @safe
-	{
-		if (method == "notifications/resources/updated" && params.type == Json.Type.object)
-			if (auto u = "uri" in params)
-				if (u.type == Json.Type.string)
-					return u.get!string;
-		return "";
+		return writeStdioListen(method, params, listenFilterKey(method, params));
 	}
 
 	/// Install the stdio transport's write sink. Called by `serveStdio` before its
@@ -3147,8 +3136,10 @@ final class McpServer : ServerCore
 	/// `notifications/resources/updated` for. Those URIs are recorded as per-URI
 	/// subscriptions (so `notifyResourceUpdated` honours them) and
 	/// the `resourceSubscriptions` opt-in is flagged when the array is non-empty.
-	/// A flat top-level filter is also accepted when no `notifications` object is
-	/// present.
+	/// With the Tasks extension enabled, `taskIds` (SEP-2663) opts the stream into
+	/// `notifications/tasks` for those task ids; it requires the client to declare
+	/// the extension. A flat top-level filter is also accepted when no
+	/// `notifications` object is present.
 	private Json doSubscribeListen(Json params, ConnectionState conn) @safe
 	{
 		Json filter = Json.undefined;
@@ -3208,6 +3199,24 @@ final class McpServer : ServerCore
 						perStream.resourceSubscriptions = true;
 				}
 			}
+
+			if (auto ids = "taskIds" in filter)
+				if (tasksEnabled_ && ids.type == Json.Type.array && ids.length)
+				{
+					requireTasksDeclared(params);
+					bool[string] seen;
+					foreach (i; 0 .. ids.length)
+						if ((*ids)[i].type == Json.Type.string)
+						{
+							const id = (*ids)[i].get!string;
+							if (id in seen)
+								continue;
+							if (seen.length >= maxResourceSubscriptions)
+								throw invalidParams("Too many taskIds in one listen request");
+							seen[id] = true;
+							perStream.taskIds ~= id;
+						}
+				}
 		}
 		// Record the filter on THIS request's connection state (a fresh
 		// per-request state on the HTTP listen route, the single bound state on
@@ -3279,6 +3288,13 @@ final class McpServer : ServerCore
 			foreach (u; f.resourceUris)
 				uris ~= Json(u);
 			subset["resourceSubscriptions"] = uris;
+		}
+		if (f.taskIds.length)
+		{
+			Json ids = Json.emptyArray;
+			foreach (id; f.taskIds)
+				ids ~= Json(id);
+			subset["taskIds"] = ids;
 		}
 		return subset;
 	}
@@ -11463,14 +11479,15 @@ unittest  // notifications/tasks reaches only the task owner's streams
 	auto rt = s.enableTasks();
 	auto ch = ensurePushChannel(s, new StreamCoordinator);
 	string alice, bob;
-	ListenFilter f;
-	f.active = true;
-	ch.addListener((string fr) @safe { alice = fr; }, Json("l-a"), f, "", null, "", "alice");
-	ch.addListener((string fr) @safe { bob = fr; }, Json("l-b"), f, "", null, "", "bob");
-
 	TaskCreateOptions copts;
 	copts.owner = "alice";
 	auto t = rt.createFor("", Json.undefined, copts);
+	ListenFilter f;
+	f.active = true;
+	f.taskIds = [t.taskId];
+	ch.addListener((string fr) @safe { alice = fr; }, Json("l-a"), f, "", null, "", "alice");
+	ch.addListener((string fr) @safe { bob = fr; }, Json("l-b"), f, "", null, "", "bob");
+
 	rt.complete(t.taskId, Json(["secret": Json("s3cr3t")]));
 	assert(alice.canFind("notifications/tasks"));
 	assert(alice.canFind("s3cr3t"));
@@ -11483,11 +11500,12 @@ unittest  // notifications/tasks for an ownerless task reaches no anonymous HTTP
 	auto rt = s.enableTasks();
 	auto ch = ensurePushChannel(s, new StreamCoordinator);
 	string anon;
+	auto t = rt.createFor("", Json.undefined);
 	ListenFilter f;
 	f.active = true;
+	f.taskIds = [t.taskId];
 	ch.addListener((string fr) @safe { anon = fr; }, Json("l-x"), f, "", null, "", "");
 
-	auto t = rt.createFor("", Json.undefined);
 	rt.complete(t.taskId, Json(["secret": Json("s3cr3t")]));
 	assert(anon.length == 0, "an ownerless task's id must not reach other anonymous clients");
 }
@@ -11504,6 +11522,39 @@ unittest  // notifications/tasks for an ownerless task reaches the stdio listen 
 		frames ~= f;
 	}
 
+	auto t = rt.createFor("", Json.undefined);
+	auto other = rt.createFor("", Json.undefined);
+	Json meta = Json.emptyObject;
+	meta[MetaKey.protocolVersion] = "2026-07-28";
+	meta[MetaKey.clientCapabilities] = Json([
+		"extensions": Json([tasksExtensionKey: Json.emptyObject])
+	]);
+	Json params = Json.emptyObject;
+	params["notifications"] = Json(["taskIds": Json([Json(t.taskId)])]);
+	params["_meta"] = meta;
+	assert(s.tryServeStdioListen(Message(makeRequest(Json(1),
+			"subscriptions/listen", params)), &sink));
+	assert(frames.canFind!(fr => fr.canFind("acknowledged") && fr.canFind(t.taskId)));
+
+	rt.complete(other.taskId, Json(["v": Json("unrequested")]));
+	rt.complete(t.taskId, Json(["v": Json("done")]));
+	assert(frames.canFind!(fr => fr.canFind("notifications/tasks") && fr.canFind("done")));
+	assert(!frames.canFind!(fr => fr.canFind("unrequested")),
+			"a task the listen stream did not name must not reach it");
+}
+
+unittest  // a listen stream receives only the notification types its filter requested
+{
+	import std.algorithm : canFind;
+
+	auto s = new McpServer("t", "1");
+	s.enableToolsListChanged();
+	string[] frames;
+	void sink(string f) @safe
+	{
+		frames ~= f;
+	}
+
 	Json meta = Json.emptyObject;
 	meta[MetaKey.protocolVersion] = "2026-07-28";
 	meta[MetaKey.clientCapabilities] = Json.emptyObject;
@@ -11513,9 +11564,20 @@ unittest  // notifications/tasks for an ownerless task reaches the stdio listen 
 	assert(s.tryServeStdioListen(Message(makeRequest(Json(1),
 			"subscriptions/listen", params)), &sink));
 
-	auto t = rt.createFor("", Json.undefined);
-	rt.complete(t.taskId, Json(["v": Json("done")]));
-	assert(frames.canFind!(fr => fr.canFind("notifications/tasks") && fr.canFind("done")));
+	s.notify("notifications/message", Json([
+			"level": Json("info"),
+			"data": Json("x")
+	]));
+	s.notify("notifications/progress", Json([
+			"progressToken": Json(1),
+			"progress": Json(1)
+	]));
+	s.notify("notifications/events/list_changed");
+	assert(!frames.canFind!(fr => fr.canFind("notifications/message")));
+	assert(!frames.canFind!(fr => fr.canFind("notifications/progress")));
+	assert(!frames.canFind!(fr => fr.canFind("notifications/events/list_changed")));
+	s.notify("notifications/tools/list_changed");
+	assert(frames.canFind!(fr => fr.canFind("notifications/tools/list_changed")));
 }
 
 unittest  // tools listChanged is not advertised by default
