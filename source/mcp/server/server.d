@@ -3655,6 +3655,7 @@ final class McpServer : ServerCore
 			throw methodNotFound("completion/complete");
 		validateCompleteParams(params);
 		auto request = CompleteRequest.fromJson(params);
+		requireCompletionTarget(request.reference);
 		// The global handler takes precedence (advanced/dynamic routing); an empty
 		// result from it falls back to a per-argument completer registered via
 		// `setArgumentCompleter`.
@@ -3676,6 +3677,25 @@ final class McpServer : ServerCore
 		// A registered (reference, argument) surface exists but this request
 		// matched none of them: an empty completion is the spec-compliant answer.
 		return CompleteResult.init.toJson();
+	}
+
+	/// Reject a `completion/complete` whose `ref` names no registered prompt,
+	/// resource, or resource template (server/utilities/completion: invalid
+	/// prompt name -> -32602).
+	private void requireCompletionTarget(CompletionReference reference) @safe
+	{
+		if (reference.type == "ref/prompt")
+		{
+			if (reference.name !in prompts)
+				throw invalidParams("Unknown prompt: " ~ reference.name);
+			return;
+		}
+		if (reference.uri in resources)
+			return;
+		foreach (ref t; templates)
+			if (t.descriptor.uriTemplate == reference.uri)
+				return;
+		throw invalidParams("Unknown resource or resource template: " ~ reference.uri);
 	}
 
 	/// Reject a `completion/complete` whose params do not match
@@ -6584,6 +6604,12 @@ unittest  // prompts/get allows a missing optional argument
 	assert(resp["result"]["messages"][0]["content"]["text"].get!string == "Hi world");
 }
 
+version (unittest) private void registerCompletablePrompt(McpServer s, string name) @safe
+{
+	Prompt p = {name: name};
+	s.registerPrompt(p, (Json args) @safe => GetPromptResult.init);
+}
+
 unittest  // completion/complete returns -32601 when no completions capability is declared
 {
 	auto s = new McpServer("t", "1");
@@ -6597,6 +6623,7 @@ unittest  // completion/complete returns -32601 when no completions capability i
 unittest  // completion/complete uses the registered typed handler
 {
 	auto s = new McpServer("t", "1");
+	registerCompletablePrompt(s, "greet");
 	s.setCompletionRequestHandler((CompleteRequest) @safe {
 		CompleteResult r;
 		r.values = ["paris", "park"];
@@ -6643,6 +6670,7 @@ unittest  // completion/complete rejects params missing a valid ref or argument 
 unittest  // typed completion handler receives a parsed CompleteRequest
 {
 	auto s = new McpServer("t", "1");
+	registerCompletablePrompt(s, "greet");
 	string seenName;
 	string seenArg;
 	bool wasPrompt;
@@ -6670,6 +6698,7 @@ unittest  // typed completion handler receives a parsed CompleteRequest
 unittest  // typed completion handler receives the resolved context.arguments
 {
 	auto s = new McpServer("t", "1");
+	registerCompletablePrompt(s, "greet");
 	string[string] seenContext;
 	s.setCompletionRequestHandler((CompleteRequest r) @safe {
 		seenContext = r.context;
@@ -6698,6 +6727,7 @@ unittest  // typed completion handler receives the resolved context.arguments
 unittest  // a per-argument completer is dispatched on its (reference, argument) pair
 {
 	auto s = new McpServer("t", "1");
+	registerCompletablePrompt(s, "code_review");
 	immutable langs = ["c", "cpp", "d", "go", "java", "javascript"];
 	s.setArgumentCompleter(CompletionReference.forPrompt("code_review"), "language",
 			(string prefix) @safe => CompleteResult.prefixMatch(langs, prefix).values);
@@ -6718,6 +6748,7 @@ unittest  // a per-argument completer is dispatched on its (reference, argument)
 unittest  // an empty global completion result falls back to a per-argument completer
 {
 	auto s = new McpServer("t", "1");
+	registerCompletablePrompt(s, "code_review");
 	s.setCompletionRequestHandler((CompleteRequest r) @safe {
 		CompleteResult result;
 		if (r.argumentName == "owner")
@@ -6747,6 +6778,7 @@ unittest  // an empty global completion result falls back to a per-argument comp
 unittest  // a per-argument completer surface answers a non-matching request with empty
 {
 	auto s = new McpServer("t", "1");
+	registerCompletablePrompt(s, "code_review");
 	s.setArgumentCompleter(CompletionReference.forPrompt("code_review"),
 			"language", (string prefix) @safe => ["d"]);
 
@@ -12829,4 +12861,37 @@ unittest  // McpServer.exposeInternalErrors reaches the task runtime in either c
 	assert(!rt.exposeInternalErrors);
 	after.exposeInternalErrors();
 	assert(rt.exposeInternalErrors);
+}
+
+unittest  // completion/complete for an unregistered prompt is -32602
+{
+	auto s = new McpServer("t", "1");
+	s.setCompletionRequestHandler((CompleteRequest r) @safe => CompleteResult.init);
+	Json p = Json.emptyObject;
+	p["ref"] = Json(["type": Json("ref/prompt"), "name": Json("nope")]);
+	p["argument"] = Json(["name": Json("a"), "value": Json("")]);
+	auto resp = s.handle(req(1, "completion/complete", p)).get;
+	assert(resp["error"]["code"].get!int == ErrorCode.invalidParams);
+}
+
+unittest  // completion/complete for an unregistered resource or template is -32602
+{
+	auto s = new McpServer("t", "1");
+	s.setCompletionRequestHandler((CompleteRequest r) @safe => CompleteResult.init);
+	ResourceTemplate t = {uriTemplate: "file:///{path}", name: "files"};
+	s.registerResourceTemplate(t, (string uri, string[string] vars, RequestContext ctx) @safe {
+		return cast(ResourceContents[])[];
+	});
+	Json p = Json.emptyObject;
+	p["argument"] = Json(["name": Json("path"), "value": Json("")]);
+	p["ref"] = Json(["type": Json("ref/resource"), "uri": Json("db:///{table}")]);
+	auto resp = s.handle(req(1, "completion/complete", p)).get;
+	assert(resp["error"]["code"].get!int == ErrorCode.invalidParams);
+
+	p["ref"] = Json([
+		"type": Json("ref/resource"),
+		"uri": Json("file:///{path}")
+	]);
+	resp = s.handle(req(2, "completion/complete", p)).get;
+	assert("result" in resp);
 }
