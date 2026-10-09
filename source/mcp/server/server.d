@@ -1243,7 +1243,7 @@ final class McpServer : ServerCore
 				taskRuntime_.startSweeper(opts.sweepInterval);
 		}
 		tasksEnabled_ = true;
-		enableExtension(tasksExtensionKey, Json.emptyObject);
+		advertiseExtension(tasksExtensionKey, Json.emptyObject);
 		return taskRuntime_;
 	}
 
@@ -1480,7 +1480,7 @@ final class McpServer : ServerCore
 		eventsEnabled_ = true;
 		Json settings = Json.emptyObject;
 		settings["listChanged"] = true;
-		enableExtension(eventsExtensionKey, settings);
+		advertiseExtension(eventsExtensionKey, settings);
 		return eventsRuntime_;
 	}
 
@@ -1529,21 +1529,55 @@ final class McpServer : ServerCore
 		return eventsRuntime_;
 	}
 
-	/// Advertise a protocol extension (e.g. "io.modelcontextprotocol/tasks") with
-	/// an optional per-extension settings object. The identifier and its settings
-	/// appear in the `extensions` field of the server capabilities sent during
-	/// `initialize` / `server/discover`, per the Extension Negotiation rules, but
-	/// only once the negotiated version meets the extension's `extensionMinVersion`
-	/// floor (Apps/Skills from 2025-11-25, Tasks modern-only). `settings` defaults
-	/// to an empty object.
+	/// Advertise a third-party protocol extension (e.g. "com.example/feature")
+	/// with an optional per-extension settings object; the server only declares
+	/// it, so the application serves its methods. The identifier and its
+	/// settings appear in the `extensions` field of the server capabilities sent
+	/// during `initialize` / `server/discover`, per the Extension Negotiation
+	/// rules, once the negotiated version meets the extension's
+	/// `extensionMinVersion` floor (unknown identifiers are modern-only).
+	/// `settings` defaults to an empty object. Throws for an extension this SDK
+	/// serves itself — Tasks, Events, Apps and Skills — since advertising one
+	/// without its runtime would promise methods nobody answers; use
+	/// `enableTasks`, `enableEvents`, `enableApps` or `enableSkills` instead.
 	void enableExtension(string identifier, Json settings = Json.emptyObject) @safe
+	{
+		if (const remedy = builtInExtensionEnabler(identifier))
+			throw new Exception("enableExtension(\"" ~ identifier ~ "\") would only advertise"
+					~ " an extension this SDK serves; call " ~ remedy ~ " to enable it");
+		advertiseExtension(identifier, settings);
+	}
+
+	/// The call that enables a built-in extension, or null for any other
+	/// identifier. The Apps and Skills identifiers are spelled out because their
+	/// keys live in `mcp.api`, which builds on this module.
+	private static string builtInExtensionEnabler(string identifier) @safe
+	{
+		switch (identifier)
+		{
+		case tasksExtensionKey:
+			return "enableTasks()";
+		case eventsExtensionKey:
+			return "enableEvents()";
+		case "io.modelcontextprotocol/ui":
+			return "enableApps(server) from mcp.api.apps";
+		case "io.modelcontextprotocol/skills":
+			return "enableSkills(server) or registerSkill from mcp.api.skills";
+		default:
+			return null;
+		}
+	}
+
+	/// Record `identifier` and its settings in the advertised `extensions` map.
+	/// The built-in extensions' enable calls go through here.
+	package(mcp) void advertiseExtension(string identifier, Json settings = Json.emptyObject) @safe
 	{
 		if (extensions.type != Json.Type.object)
 			extensions = Json.emptyObject;
 		extensions[identifier] = settings;
 	}
 
-	/// Whether `enableExtension` (or an `enable*` call built on it) has
+	/// Whether `enableExtension` (or a built-in extension's `enable*` call) has
 	/// advertised the extension `identifier`.
 	bool extensionEnabled(string identifier) const @safe
 	{
@@ -7131,7 +7165,7 @@ unittest  // advertised extensions appear in server/discover capabilities under 
 	auto s = new McpServer("t", "1");
 	Json settings = Json.emptyObject;
 	settings["maxConcurrent"] = 4;
-	s.enableExtension("io.modelcontextprotocol/tasks", settings);
+	s.advertiseExtension("io.modelcontextprotocol/tasks", settings);
 
 	// The Tasks extension is modern-only; a modern client discovers it via
 	// `server/discover`, not the `initialize` handshake.
@@ -7144,7 +7178,7 @@ unittest  // advertised extensions appear in server/discover capabilities under 
 unittest  // the Tasks extension is NOT advertised for legacy negotiated versions
 {
 	auto s = new McpServer("t", "1");
-	s.enableExtension("io.modelcontextprotocol/tasks", Json.emptyObject);
+	s.advertiseExtension("io.modelcontextprotocol/tasks", Json.emptyObject);
 
 	foreach (ver; ["2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25"])
 	{
@@ -7159,8 +7193,8 @@ unittest  // the Tasks extension is NOT advertised for legacy negotiated version
 unittest  // Apps/Skills extensions are advertised when negotiating 2025-11-25
 {
 	auto s = new McpServer("t", "1");
-	s.enableExtension("io.modelcontextprotocol/ui", Json.emptyObject);
-	s.enableExtension("io.modelcontextprotocol/skills", Json.emptyObject);
+	s.advertiseExtension("io.modelcontextprotocol/ui", Json.emptyObject);
+	s.advertiseExtension("io.modelcontextprotocol/skills", Json.emptyObject);
 
 	Json params = Json.emptyObject;
 	params["protocolVersion"] = "2025-11-25";
@@ -7174,8 +7208,8 @@ unittest  // Apps/Skills extensions are advertised when negotiating 2025-11-25
 unittest  // a mixed extension set negotiated at 2025-11-25 advertises Apps/Skills but not Tasks
 {
 	auto s = new McpServer("t", "1");
-	s.enableExtension("io.modelcontextprotocol/tasks", Json.emptyObject);
-	s.enableExtension("io.modelcontextprotocol/skills", Json.emptyObject);
+	s.advertiseExtension("io.modelcontextprotocol/tasks", Json.emptyObject);
+	s.advertiseExtension("io.modelcontextprotocol/skills", Json.emptyObject);
 
 	Json params = Json.emptyObject;
 	params["protocolVersion"] = "2025-11-25";
@@ -12949,4 +12983,31 @@ unittest  // shutdown stops the background timers and is idempotent
 	events.startDeliveryWorker(10.msecs);
 	s.shutdown();
 	s.shutdown();
+}
+
+unittest  // enableExtension rejects the extensions the SDK serves itself, naming their enable call
+{
+	import std.algorithm.searching : canFind;
+
+	auto s = new McpServer("t", "1");
+	foreach (key, remedy; [
+		"io.modelcontextprotocol/tasks": "enableTasks",
+		"io.modelcontextprotocol/events": "enableEvents",
+		"io.modelcontextprotocol/ui": "enableApps",
+		"io.modelcontextprotocol/skills": "enableSkills"
+	])
+	{
+		bool threw;
+		try
+			s.enableExtension(key);
+		catch (Exception e)
+		{
+			threw = true;
+			assert(e.msg.canFind(remedy), e.msg);
+		}
+		assert(threw, key);
+		assert(!s.extensionEnabled(key), key);
+	}
+	s.enableExtension("com.example/custom");
+	assert(s.extensionEnabled("com.example/custom"));
 }

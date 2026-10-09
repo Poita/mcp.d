@@ -236,7 +236,7 @@ void enableApps(McpServer server, string[] mimeTypes = null) @safe
 			arr ~= Json(m);
 	Json settings = Json.emptyObject;
 	settings["mimeTypes"] = arr;
-	server.enableExtension(appsExtensionKey, settings);
+	server.advertiseExtension(appsExtensionKey, settings);
 }
 
 /// Enable the Apps extension with the default content types unless it is

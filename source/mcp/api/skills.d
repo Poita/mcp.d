@@ -376,7 +376,7 @@ void enableSkills(McpServer server) @safe
 	// `registerSkill` calls must not re-clobber the negotiated settings.
 	Json settings = Json.emptyObject;
 	settings["directoryRead"] = true;
-	server.enableExtension(skillsExtensionKey, settings);
+	server.advertiseExtension(skillsExtensionKey, settings);
 	server.enableDirectoryRead();
 }
 
