@@ -3384,9 +3384,11 @@ final class EventsRuntime
 /// Whether replacing JSON Schema `before` with `after` is additive: every property
 /// `before` declared is still present with an identical definition (so no field is
 /// removed, renamed, retyped, or narrowed), every other top-level keyword is
-/// unchanged, and — for an input schema, whose prior `arguments` must stay valid —
-/// no property became newly required. Any schema that is not an object schema
-/// with `properties` is treated as changed unless identical.
+/// unchanged, and the `required` list moves only in the compatible direction.
+/// For an input schema, whose prior `arguments` must stay valid, no property
+/// became newly required; for a payload schema, whose consumers rely on the
+/// fields it guarantees, no property stopped being required. Any schema that is
+/// not an object schema with `properties` is treated as changed unless identical.
 bool isAdditiveSchemaChange(Json before, Json after, bool inputSchema) @safe
 {
 	if (before.type != Json.Type.object || after.type != Json.Type.object)
@@ -3409,20 +3411,27 @@ bool isAdditiveSchemaChange(Json before, Json after, bool inputSchema) @safe
 		if (prop !in newProps
 				|| canonicalJsonString(newProps[prop]) != canonicalJsonString(oldProps[prop]))
 			return false;
-	if (!inputSchema)
-		return true;
-	bool[string] wasRequired;
-	Json oldReq = "required" in before ? before["required"] : Json.emptyArray;
-	if (oldReq.type == Json.Type.array)
-		foreach (i; 0 .. oldReq.length)
-			if (oldReq[i].type == Json.Type.string)
-				wasRequired[oldReq[i].get!string] = true;
-	Json newReq = "required" in after ? after["required"] : Json.emptyArray;
-	if (newReq.type == Json.Type.array)
-		foreach (i; 0 .. newReq.length)
-			if (newReq[i].type == Json.Type.string && (newReq[i].get!string in wasRequired) is null)
-				return false;
+	auto wasRequired = requiredNames(before);
+	auto isRequired = requiredNames(after);
+	// Input: the new list is a subset of the old; payload: a superset.
+	auto narrower = inputSchema ? isRequired : wasRequired;
+	auto wider = inputSchema ? wasRequired : isRequired;
+	foreach (name, _; narrower)
+		if ((name in wider) is null)
+			return false;
 	return true;
+}
+
+/// The property names a JSON Schema's `required` list names.
+private bool[string] requiredNames(Json schema) @safe
+{
+	bool[string] names;
+	Json req = "required" in schema ? schema["required"] : Json.emptyArray;
+	if (req.type == Json.Type.array)
+		foreach (i; 0 .. req.length)
+			if (req[i].type == Json.Type.string)
+				names[req[i].get!string] = true;
+	return names;
 }
 
 /// The keys of a JSON object (empty for a non-object).
@@ -5019,6 +5028,15 @@ unittest  // a newly required input property is breaking for inputSchema but not
 	auto nowRequired = parseJsonString(`{"type":"object","properties":{"a":{"type":"string"},"b":{"type":"string"}},"required":["b"]}`);
 	assert(!isAdditiveSchemaChange(before, nowRequired, true));
 	assert(isAdditiveSchemaChange(before, nowRequired, false));
+}
+
+unittest  // a payload property no longer required is breaking for payloadSchema but not inputSchema
+{
+	auto before = parseJsonString(
+			`{"type":"object","properties":{"a":{"type":"string"}},"required":["a"]}`);
+	auto optional = parseJsonString(`{"type":"object","properties":{"a":{"type":"string"}}}`);
+	assert(!isAdditiveSchemaChange(before, optional, false));
+	assert(isAdditiveSchemaChange(before, optional, true));
 }
 
 unittest  // unregister ends every subscription with NotFound{kind:event} and notifies list_changed
