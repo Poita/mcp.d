@@ -9,7 +9,7 @@ import mcp.protocol.errors;
 import mcp.client.transport : BearerProvider, ClientTransport, ClientProtocol, InboundOrigin;
 import mcp.client.subscription : SubscriptionStream, ListenGate;
 import mcp.transport.duplex : ChannelWriteException, DuplexChannel, defaultMaxLineBytes;
-import mcp.transport.lines : FrameHead, frameHeadScanBytes, scanFrameHead;
+import mcp.transport.lines : FrameHead, LineReader, frameHeadScanBytes, scanFrameHead;
 import mcp.protocol.mrtr : MetaKey;
 
 @safe:
@@ -637,53 +637,39 @@ version (Posix) StdioClientTransport spawnStdioTransport(string[] args,
 	() @trusted { *pipes = pipeProcess(args, Redirect.stdin | Redirect.stdout); }();
 	StdioClientTransport transport;
 
-	// Async, cooperative line read over the child's stdout: accumulate bytes until
-	// '\n' (stripping a trailing '\r'). (The byte source is already buffered by
-	// vibe's PipeInputStream, so single-byte reads here do not hit the OS per byte.)
-	// End-of-input returns null (ending the duplex read loop) once `empty` reports
-	// the child closed its stdout, after a final unterminated line, which is still
-	// a complete message, so only a genuine read failure surfaces as an
-	// exception. A line longer than `maxLineBytes` is reported (`noteOversized`)
-	// as soon as it passes the bound, and its remaining bytes are skipped up to
-	// the next newline rather than accumulated without limit.
+	// Async, cooperative line read over the child's stdout, in chunks through a
+	// `LineReader`. End-of-input returns null (ending the duplex read loop) once
+	// `empty` reports the child closed its stdout, after a final unterminated
+	// line, which is still a complete message, so only a genuine read failure
+	// surfaces as an exception. A line longer than `maxLineBytes` is reported
+	// (`noteOversized`) as soon as it passes the bound, and its remaining bytes
+	// are skipped up to the next newline rather than accumulated without limit.
+	auto reader = LineReader(maxLineBytes);
+	reader.onOversized = (FrameHead head) @safe {
+		transport.noteOversized(head, maxLineBytes);
+	};
+	bool stopping() @safe
+	{
+		return transport.channel !is null && transport.channel.stopping;
+	}
+
+	size_t readStdout(ubyte[] dst) @safe
+	{
+		// Checked before each read so `stopReadLoop` also ends a loop skipping a
+		// flood the pipe never runs dry of.
+		if (stopping() || ()@trusted { return pipes.stdout.empty; }())
+			return 0;
+		return () @trusted { return pipes.stdout.read(dst, IOMode.once); }();
+	}
+
 	string readLine() @safe
 	{
-		ubyte[1] one;
-		ubyte[] acc;
-		bool dropping;
-		for (;;)
-		{
-			if (transport.channel !is null && transport.channel.stopping)
-				return null;
-			if (()@trusted { return pipes.stdout.empty; }())
-			{
-				if (acc.length || dropping)
-					break;
-				transport.noteChildEndOfInput();
-				return null;
-			}
-			() @trusted { pipes.stdout.read(one[], IOMode.once); }();
-			if (one[0] == '\n')
-				break;
-			if (dropping)
-				continue;
-			acc ~= one[0];
-			if (acc.length > maxLineBytes)
-			{
-				transport.noteOversized(scanFrameHead(acc[0 .. $ < frameHeadScanBytes
-						? $ : frameHeadScanBytes]), maxLineBytes);
-				acc = null;
-				dropping = true;
-			}
-		}
-		if (dropping)
-			return "";
-		if (acc.length && acc[$ - 1] == '\r')
-			acc = acc[0 .. $ - 1];
-		// A blank line is "" rather than null, which the read loop takes as EOF.
-		if (!acc.length)
-			return "";
-		return () @trusted { return cast(string) acc.idup; }();
+		auto line = reader.next(&readStdout);
+		FrameHead ignored;
+		reader.takeOversized(ignored);
+		if (line is null && !stopping())
+			transport.noteChildEndOfInput();
+		return line;
 	}
 
 	void writeLine(string s) @safe

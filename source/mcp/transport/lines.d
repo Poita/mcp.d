@@ -26,6 +26,12 @@ package(mcp) struct LineReader
 	private bool oversized_; // an over-long line was dropped since the last takeOversized
 	private FrameHead oversizedHead_; // what the dropped line's first bytes reveal
 
+	/// Called with an over-long line's `FrameHead` as soon as the line passes
+	/// `maxLineBytes`, before its remaining bytes are skipped, so a caller can act
+	/// on it while a peer is still sending it. Optional; `takeOversized` reports
+	/// the same line once `next` returns.
+	void delegate(FrameHead) @safe onOversized;
+
 	this(size_t maxLineBytes) @safe
 	{
 		this.maxLineBytes = maxLineBytes;
@@ -76,6 +82,8 @@ package(mcp) struct LineReader
 	{
 		oversized_ = true;
 		oversizedHead_ = scanFrameHead(prefix);
+		if (onOversized !is null)
+			onOversized(oversizedHead_);
 	}
 
 	// The pure line-assembly state machine, parameterised on the buffer-refill
