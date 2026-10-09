@@ -4921,6 +4921,7 @@ unittest  // callToolAwait drives a server-created task to completion transparen
 			"resultType": Json("task"),
 			"taskId": Json("t1"),
 			"status": Json("working"),
+			"ttlMs": Json(null),
 			"pollIntervalMs": Json(5_000)
 		]);
 		assert(method == "tasks/get");
@@ -5440,7 +5441,8 @@ unittest  // callToolAwait drives a task reply to completion
 			return Json([
 			"resultType": Json("task"),
 			"taskId": Json("t9"),
-			"status": Json("working")
+			"status": Json("working"),
+			"ttlMs": Json(null)
 		]);
 		assert(method == "tasks/get" && params["taskId"].get!string == "t9");
 		return Json([
@@ -5479,7 +5481,8 @@ unittest  // callToolAwait routes progress to opts.onProgress while it polls the
 			return Json([
 				"resultType": Json("task"),
 				"taskId": Json("t1"),
-				"status": Json("working")
+				"status": Json("working"),
+				"ttlMs": Json(null)
 			]);
 		}
 		assert(method == "tasks/get");
@@ -5619,7 +5622,8 @@ unittest  // callToolAwait validates the awaited task result against the listed 
 			return Json([
 			"resultType": Json("task"),
 			"taskId": Json("t1"),
-			"status": Json("working")
+			"status": Json("working"),
+			"ttlMs": Json(null)
 		]);
 		return Json([
 			"taskId": Json("t1"),
@@ -5651,7 +5655,8 @@ unittest  // cancelling callToolAwait's token stops polling and cancels the task
 			return Json([
 			"resultType": Json("task"),
 			"taskId": Json("t1"),
-			"status": Json("working")
+			"status": Json("working"),
+			"ttlMs": Json(null)
 		]);
 		if (method == "tasks/cancel")
 			return Json.emptyObject;
