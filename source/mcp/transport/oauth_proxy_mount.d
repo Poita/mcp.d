@@ -59,6 +59,7 @@ import vibe.http.common : HTTPMethod;
 import mcp.auth.oauth : isValidClientIdMetadataUrl, TokenSet;
 import mcp.auth.oauth_proxy : BrokeredToken, ConsentRequiredException,
 	InvalidClientIdMetadataException,
+	InvalidScopeException,
 	InvalidRedirectUriException, OAuthProxy, OAuthProxyConfig, RelayedCodeBinding;
 import mcp.protocol.jsonrpc : parseUntrustedJson;
 import mcp.protocol.ssrf : SsrfPolicy;
@@ -594,6 +595,17 @@ void mountOAuthAuthorize(URLRouter router, OAuthProxy proxy, ProxyStateStore sto
 		{
 			res.statusCode = HTTPStatus.badRequest;
 			res.writeJsonBody(invalidRequestJson("code_challenge_method must be S256"));
+			return;
+		}
+		try
+			cast(void) proxy.forwardedScopes(scope_);
+		catch (InvalidScopeException e)
+		{
+			Json err = Json.emptyObject;
+			err["error"] = "invalid_scope";
+			err["error_description"] = e.msg;
+			res.statusCode = HTTPStatus.badRequest;
+			res.writeJsonBody(err);
 			return;
 		}
 
@@ -2511,6 +2523,27 @@ unittest  // /authorize 400s a request with no response_type with invalid_reques
 			~ "&redirect_uri=http%3A%2F%2Flocalhost%3A5000%2Fcb&state=cs", "");
 	assert(res.status == 400);
 	assert(parseJsonString(res.body_)["error"].get!string == "invalid_request");
+}
+
+unittest  // SCOPE CAP: /authorize refuses a request naming too many scopes with invalid_scope
+{
+	import std.array : join;
+	import std.conv : to;
+	import std.range : iota;
+	import std.algorithm : map;
+	import mcp.auth.oauth_proxy : maxScopesPerRequest;
+
+	auto proxy = mountSampleProxy();
+	proxy.register(["http://localhost:5000/cb"]);
+	auto router = new URLRouter;
+	mountOAuthProxy(router, proxy);
+
+	const scopes = iota(maxScopesPerRequest + 1).map!(i => "s" ~ i.to!string).join("+");
+	const res = browserGet(router, "https://mcp.example.com/authorize?response_type=code"
+			~ "&code_challenge=CH&code_challenge_method=S256&scope="
+			~ scopes ~ "&redirect_uri=http%3A%2F%2Flocalhost%3A5000%2Fcb&state=cs", "");
+	assert(res.status == 400);
+	assert(res.body_.canFind("invalid_scope"));
 }
 
 unittest  // CONSENT: evicted redirect_uri between /authorize and POST /consent yields 400 not 500

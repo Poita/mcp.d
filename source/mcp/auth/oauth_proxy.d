@@ -366,21 +366,47 @@ Json registrationResponseJson(const OAuthProxyConfig cfg, const string[] request
 // Authorize proxying
 // ===========================================================================
 
+/// Upper bound on the number of distinct scopes one authorization request may
+/// name. `/authorize` is unauthenticated, so this bounds the work and the
+/// consent state a single request can cause.
+enum size_t maxScopesPerRequest = 64;
+
+/// Thrown when an authorization request or consent approval names more scopes
+/// than the proxy accepts (`maxScopesPerRequest`,
+/// `ConsentStoreOptions.maxScopesPerApproval`). An HTTP mount maps this to the
+/// RFC 6749 §4.1.2.1 `invalid_scope` error.
+class InvalidScopeException : Exception
+{
+	this(string reason, string file = __FILE__, size_t line = __LINE__) @safe
+	{
+		super(reason, file, line);
+	}
+}
+
 /// The scopes from the space-delimited `scopeStr` that the proxy forwards
 /// upstream: each distinct requested scope, restricted to `cfg.scopesSupported`
 /// when that is set, so a client cannot reach upstream scopes the proxy does not
 /// advertise under the proxy's own upstream `client_id`. Dropping the rest is a
-/// partial grant RFC 6749 §3.3 permits.
+/// partial grant RFC 6749 §3.3 permits. Throws `InvalidScopeException` when
+/// `scopeStr` names more than `maxScopesPerRequest` distinct scopes, supported
+/// or not.
 string[] forwardedScopes(const OAuthProxyConfig cfg, string scopeStr) @safe
 {
-	import std.algorithm : canFind, splitter;
+	import std.algorithm : splitter;
 
+	bool[string] supported;
+	foreach (sc; cfg.scopesSupported)
+		supported[sc] = true;
+	bool[string] seen;
 	string[] scopes;
 	foreach (sc; scopeStr.splitter(' '))
 	{
-		if (sc.length == 0 || scopes.canFind(sc))
+		if (sc.length == 0 || sc in seen)
 			continue;
-		if (cfg.scopesSupported.length && !cfg.scopesSupported.canFind(sc))
+		if (seen.length == maxScopesPerRequest)
+			throw new InvalidScopeException("too many scopes requested");
+		seen[sc] = true;
+		if (supported.length && sc !in supported)
 			continue;
 		scopes ~= sc;
 	}
@@ -933,7 +959,8 @@ interface ConsentStore
 	bool hasConsent(string consentSession, string client, const(string)[] scopes) @safe;
 
 	/// Record the browser's approval of `client` for `scopes`, adding them to any
-	/// scopes it already approved for that client.
+	/// scopes it already approved for that client. An implementation bounding the
+	/// scopes it keeps may refuse an oversized set with `InvalidScopeException`.
 	void grantConsent(string consentSession, string client, const(string)[] scopes) @safe;
 }
 
@@ -952,6 +979,12 @@ struct ConsentStoreOptions
 	/// its least recent users for consent past this many; raise it for such a
 	/// deployment.
 	size_t maxApprovalsPerClient = 1_000;
+
+	/// Maximum number of scopes retained for one approval. `grantConsent` refuses
+	/// a grant of more than this with `InvalidScopeException`; a grant that would
+	/// grow an existing approval past it replaces that approval's scopes instead,
+	/// so a client cannot accumulate scopes without bound.
+	size_t maxScopesPerApproval = 4 * maxScopesPerRequest;
 }
 
 /// A simple in-memory `ConsentStore` bounded against unauthenticated growth: the
@@ -989,7 +1022,7 @@ final class InMemoryConsentStore : ConsentStore
 	}
 
 	private ulong[Key] approved; // key -> serial of its live grant
-	private string[][Key] approvedScopes; // key -> the scopes approved under it
+	private bool[string][Key] approvedScopes; // key -> the set of scopes approved under it
 	private SlotQueue order;
 	private SlotQueue[string] orderByClient;
 	private size_t[string] countByClient;
@@ -1009,31 +1042,42 @@ final class InMemoryConsentStore : ConsentStore
 
 	override bool hasConsent(string consentSession, string client, const(string)[] scopes) @safe
 	{
-		import std.algorithm : all, canFind;
+		import std.algorithm : all;
 
 		if (consentSession.length == 0)
 			return false;
 		auto granted = Key(consentSession, client) in approvedScopes;
-		return granted !is null && scopes.all!(sc => (*granted).canFind(sc));
+		return granted !is null && scopes.all!(sc => (sc in *granted) !is null);
 	}
 
+	/// Throws `InvalidScopeException` when `scopes` holds more than
+	/// `ConsentStoreOptions.maxScopesPerApproval` distinct scopes.
 	override void grantConsent(string consentSession, string client, const(string)[] scopes) @safe
 	{
-		import std.algorithm : canFind;
-
+		bool[string] grant;
+		foreach (sc; scopes)
+			grant[sc] = true;
+		if (grant.length > opts.maxScopesPerApproval)
+			throw new InvalidScopeException("too many scopes in one approval");
 		if (consentSession.length == 0)
 			return;
 		const k = Key(consentSession, client);
 		if (auto granted = k in approvedScopes)
 		{
-			foreach (sc; scopes)
-				if (!(*granted).canFind(sc))
-					*granted ~= sc;
+			size_t added;
+			foreach (sc; grant.byKey)
+				if (sc !in *granted)
+					++added;
+			if ((*granted).length + added > opts.maxScopesPerApproval)
+				*granted = grant;
+			else
+				foreach (sc; grant.byKey)
+					(*granted)[sc] = true;
 			return;
 		}
 		const slot = Slot(k, nextSerial++);
 		approved[k] = slot.serial;
-		approvedScopes[k] = scopes.dup;
+		approvedScopes[k] = grant;
 		order.slots ~= slot;
 		orderByClient.require(client).slots ~= slot;
 		const perClient = ++countByClient.require(client);
@@ -3039,6 +3083,48 @@ unittest  // CONSENT STORE: an approval evicted and granted again is not evicted
 	assert(store.hasConsent("b1", "http://a/cb", null));
 	assert(!store.hasConsent("b1", "http://c/cb", null));
 	assert(store.hasConsent("b1", "http://d/cb", null));
+}
+
+unittest  // SCOPE CAP: a request naming more than maxScopesPerRequest distinct scopes is refused
+{
+	import std.array : join;
+	import std.conv : to;
+	import std.exception : assertNotThrown, assertThrown;
+	import std.range : iota;
+	import std.algorithm : map;
+
+	auto cfg = sampleConfig();
+	cfg.scopesSupported = null;
+	const atCap = iota(maxScopesPerRequest).map!(i => "s" ~ i.to!string).join(" ");
+	assert(assertNotThrown(forwardedScopes(cfg, atCap ~ " s0")).length == maxScopesPerRequest);
+	assertThrown!InvalidScopeException(forwardedScopes(cfg, atCap ~ " extra"));
+	// Unsupported scopes count too: the cap bounds the work, not just the result.
+	assertThrown!InvalidScopeException(forwardedScopes(sampleConfig(), atCap ~ " extra"));
+}
+
+unittest  // SCOPE CAP: a consent store refuses an approval of more than maxScopesPerApproval scopes
+{
+	import std.exception : assertThrown;
+
+	ConsentStoreOptions opts;
+	opts.maxScopesPerApproval = 2;
+	auto store = new InMemoryConsentStore(opts);
+	assertThrown!InvalidScopeException(store.grantConsent("browser-1",
+			"http://a/cb", ["a", "b", "c"]));
+	assert(!store.hasConsent("browser-1", "http://a/cb", null));
+}
+
+unittest  // SCOPE CAP: an approval that would outgrow maxScopesPerApproval replaces the earlier scopes
+{
+	ConsentStoreOptions opts;
+	opts.maxScopesPerApproval = 3;
+	auto store = new InMemoryConsentStore(opts);
+	store.grantConsent("browser-1", "http://a/cb", ["a", "b"]);
+	store.grantConsent("browser-1", "http://a/cb", ["b", "c"]);
+	assert(store.hasConsent("browser-1", "http://a/cb", ["a", "b", "c"]));
+	store.grantConsent("browser-1", "http://a/cb", ["d", "e"]);
+	assert(store.hasConsent("browser-1", "http://a/cb", ["d", "e"]));
+	assert(!store.hasConsent("browser-1", "http://a/cb", ["a"]));
 }
 
 unittest  // CONSENT STORE: the consent store caps approvals, evicting the oldest first
