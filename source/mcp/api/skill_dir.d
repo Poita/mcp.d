@@ -94,7 +94,11 @@ string registerSkillDir(McpServer server, string dir, SkillDirOptions options = 
 				"registerSkillDir: SKILL.md must be a regular file, not a symlink: " ~ skillMdPath);
 
 	const skillMd = readTextFile(skillMdPath, options.maxTotalBytes);
-	Json frontmatter = parseSkillFrontmatter(skillMd);
+	Json frontmatter;
+	try
+		frontmatter = parseSkillFrontmatter(skillMd);
+	catch (Exception e)
+		throw new Exception("registerSkillDir: " ~ e.msg);
 	if (const problem = frontmatterNameProblem(frontmatter))
 		throw new Exception("registerSkillDir: SKILL.md frontmatter " ~ problem);
 	// The Agent Skills spec requires both name and description.
@@ -208,7 +212,11 @@ private Json[] buildNestedEntries(McpServer server, string path, RawFile[] raws)
 		if (!r.isText)
 			throw new Exception(
 					"registerSkillDir: nested SKILL.md is not valid UTF-8 text: " ~ r.path);
-		Json fm = parseSkillFrontmatter(cast(string) r.bytes);
+		Json fm;
+		try
+			fm = parseSkillFrontmatter(cast(string) r.bytes);
+		catch (Exception e)
+			throw new Exception("registerSkillDir: nested " ~ e.msg ~ ": " ~ r.path);
 		if (const problem = frontmatterNameProblem(fm))
 			throw new Exception(
 					"registerSkillDir: nested SKILL.md frontmatter " ~ problem ~ ": " ~ r.path);
@@ -305,7 +313,7 @@ private Json yamlToJson(string yaml) @safe
 		return nodeToJson(root, budget);
 	}
 	catch (Exception e)
-		throw new Exception("registerSkillDir: invalid SKILL.md frontmatter YAML: " ~ e.msg);
+		throw new Exception("invalid SKILL.md frontmatter YAML: " ~ e.msg);
 }
 
 /// Charge `cost` against the conversion `budget`, throwing once it runs out.
@@ -1665,6 +1673,36 @@ unittest  // verifySkillMarkdown still rejects a numerically different frontmatt
 	auto e = wireEntryFor(md);
 	e.frontmatter["version"] = Json(2);
 	assert(verifySkillMarkdown(e, md) !is null);
+}
+
+unittest  // parseSkillFrontmatter reports invalid YAML without naming registerSkillDir
+{
+	import std.algorithm.searching : canFind, startsWith;
+	import std.exception : collectException;
+
+	auto e = collectException(parseSkillFrontmatter("---\nname: [unclosed\n---\n"));
+	assert(e !is null && e.msg.startsWith("invalid SKILL.md frontmatter YAML: "), e.msg);
+	const reason = verifySkillMarkdown(verifyEntry(), "---\nname: [unclosed\n---\n");
+	assert(reason !is null && !reason.canFind("registerSkillDir"), reason);
+}
+
+unittest  // registerSkillDir prefixes a SKILL.md frontmatter parse error with its name
+{
+	import std.algorithm.searching : startsWith;
+	import std.file : write;
+
+	const root = tmpRoot("bad-yaml", "pdf-forms");
+	writeSkillFixture(root);
+	scope (exit)
+		removeTree(root);
+	write(root ~ "/SKILL.md", "---\nname: [unclosed\n---\n");
+	auto s = new McpServer("t", "1");
+	string msg;
+	try
+		registerSkillDir(s, root);
+	catch (Exception e)
+		msg = e.msg;
+	assert(msg.startsWith("registerSkillDir: invalid SKILL.md frontmatter YAML: "), msg);
 }
 
 unittest  // parseSkillFrontmatter accepts a SKILL.md opening with a UTF-8 byte order mark
