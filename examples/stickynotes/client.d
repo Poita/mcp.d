@@ -120,16 +120,13 @@ private int run(McpClient delegate() @safe makeClient) @safe
 	auto client = makeClient();
 	scope (exit)
 		client.close();
-	// Install an elicitation handler BEFORE initialize so the client advertises
+	// Install an elicitation handler BEFORE connecting so the client advertises
 	// the elicitation capability at negotiation time; the per-scenario handlers
-	// below reassign this delegate. Without a handler at init the server would
-	// (correctly) refuse to elicit later.
-	// NOTE: this example deliberately uses the stable initialize() handshake, not
-	// connect(): server->client elicitation needs a stateful session, and
-	// connect() against this SDK server would negotiate the modern protocol
-	// (where ctx.elicit is unavailable and tools surface inputRequired instead).
+	// below reassign this delegate. Without a handler at negotiation the server
+	// would (correctly) refuse to elicit later. The server is stateful, so
+	// connect() falls back to the 2025-11-25 initialize handshake.
 	client.onElicitation = (ElicitParams p) @safe { return ElicitResult.cancel(); };
-	client.initialize();
+	client.connect();
 	checkEq(client.serverInfo().name, "stickynotes-example", "server name");
 	auto serverCaps = client.serverCapabilities();
 	check(!serverCaps.resources.isNull && serverCaps.resources.get.listChanged,
@@ -217,7 +214,7 @@ private int run(McpClient delegate() @safe makeClient) @safe
 		auto plain = makeClient();
 		scope (exit)
 			plain.close();
-		plain.initialize(); // stateful session, as above: ctx.elicit needs one
+		plain.connect(); // stateful session, as above: ctx.elicit needs one
 		// Add a note so remove_all actually tries to elicit (an empty board would
 		// short-circuit to "empty" before any elicitation).
 		plain.callTool("add_note", addArgs("To be confirmed"));

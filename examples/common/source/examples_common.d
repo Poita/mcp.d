@@ -97,8 +97,7 @@ int runClient(scope int delegate() @safe scenario) @trusted
 /// Streamable HTTP via `McpClient.http(url)`; otherwise spawn the sibling server
 /// binary named `siblingServerName` (resolved next to this executable) over
 /// stdio via `McpClient.spawnSibling`. The returned client is NOT yet
-/// connected — call `connect()`, or `initialize()` when the example needs a
-/// stateful 2025-11-25 session.
+/// connected — call `connect()`.
 McpClient connectFromArgs(string[] args, string siblingServerName) @safe
 {
 	import std.getopt : getopt;
