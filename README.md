@@ -254,6 +254,11 @@ and LDC, macOS and Windows with LDC). The stdio transport, the OS CSPRNG, and th
 token store each have native Windows code paths; on Windows the token store
 tightens file permissions via ACLs rather than POSIX modes.
 
+On Windows, build executables that depend on mcp.d with `dub build --combined`
+(likewise `dub run --combined`). LDC on Windows can leave D template
+instantiations split across static-library objects unresolved at the final
+link; `--combined` compiles all dependency sources in one pass and avoids it.
+
 ## Build & test
 
 ```bash
