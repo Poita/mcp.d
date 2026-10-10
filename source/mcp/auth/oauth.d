@@ -1767,7 +1767,7 @@ package(mcp) void throwIfOAuthError(string endpoint, Json response) @safe
 	const desc = response["error_description"];
 	throw invalidRequest(endpoint ~ " returned error " ~ code ~ (desc.type == Json.Type.string
 			&& desc.get!string.length ? ": " ~ desc.get!string : ""), Json([
-			"error": Json(code)
+		"error": Json(code)
 	]));
 }
 

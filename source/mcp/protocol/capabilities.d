@@ -668,7 +668,7 @@ unittest  // missingFrom: a required elicitationForm is met by a parsed bare eli
 {
 	ClientCapabilities required = {elicitationForm: true};
 	auto declared = ClientCapabilities.fromJson(Json([
-			"elicitation": Json.emptyObject
+		"elicitation": Json.emptyObject
 	]));
 	assert(required.missingFrom(declared).isNull);
 }
