@@ -2001,7 +2001,7 @@ private void handleGet(McpServer server, ServerPushChannel push,
 /// heartbeats) until the client disconnects.
 private void handleListenStream(McpServer server, ServerPushChannel push, Message msg,
 		HTTPServerResponse res, string protoHeader, string connToken,
-		string principal, size_t maxQueued) @safe
+		TokenInfo token, size_t maxQueued) @safe
 {
 	// Record the opted-in filters (route -> doSubscribeListen). The one-shot JSON
 	// result is discarded on success: the acknowledgement is delivered as the
@@ -2012,7 +2012,7 @@ private void handleListenStream(McpServer server, ServerPushChannel push, Messag
 	// builds it (`freshStatelessState`: body `_meta`, then header, then
 	// 2025-03-26).
 	auto reqState = freshStatelessState(protoHeader, msg.params);
-	auto routed = routeListenRequest(server, msg, reqState, connToken);
+	auto routed = routeListenRequest(server, msg, reqState, connToken, token);
 	if (!routed.isNull)
 	{
 		res.statusCode = httpStatusForResponse(routed.get, true);
@@ -2044,7 +2044,7 @@ private void handleListenStream(McpServer server, ServerPushChannel push, Messag
 	// basic/utilities/subscriptions).
 	const listenerId = addListenStreamListener(push, (string frame) @safe {
 		writeFrame(frame);
-	}, msg.id, streamFilter, principal);
+	}, msg.id, streamFilter, principalOf(token));
 	// Drop the listener when the stream ends so the channel self-heals.
 	scope (exit)
 		push.removeListener(listenerId);
@@ -2344,11 +2344,12 @@ private final class HttpScopedContext : BaseRequestContext, ConnectionScoped
 /// `_meta.protocolVersion`). On success the server has recorded this request's
 /// per-stream filter on `reqState.listenFilter` and `null` is returned; when
 /// routing rejects the request the JSON-RPC error response is returned for the
-/// caller to surface instead of opening a stream with a stale filter.
+/// caller to surface instead of opening a stream with a stale filter. `token`
+/// is the POST's validated bearer token, reported as `ctx.auth()`.
 private Nullable!Json routeListenRequest(McpServer server, Message msg,
-		ConnectionState reqState, string connToken) @safe
+		ConnectionState reqState, string connToken, TokenInfo token = TokenInfo.invalid()) @safe
 {
-	auto resp = server.handle(msg, new HttpScopedContext(connToken, reqState));
+	auto resp = server.handle(msg, new HttpScopedContext(connToken, reqState, token));
 	if (!resp.isNull && "error" in resp.get && resp.get["error"].type == Json.Type.object)
 		return resp;
 	return Nullable!Json.init;
@@ -2713,7 +2714,7 @@ private void handlePost(McpServer server, ServerPushChannel push,
 			const principal = principalOf(token);
 			foreach (m; statelessCancels)
 				server.handle(m, new HttpScopedContext(statelessInFlight.cancelScopeFor(principal,
-						m.params["requestId"]), statelessInFlight.share(new ConnectionState)));
+						m.params["requestId"]), statelessInFlight.share(new ConnectionState), token));
 			foreach (m; input.messages)
 				if (m.kind == MessageKind.request)
 					statelessInFlight.track(principal, m.id, cancelScope);
@@ -2912,8 +2913,7 @@ private void handlePost(McpServer server, ServerPushChannel push,
 			scope (exit)
 				pushStreams.release(principal, address);
 			handleListenStream(server, push, msg, res,
-					req.headers.get(HttpHeader.protocolVersion, ""), connToken,
-					principal, maxQueued);
+					req.headers.get(HttpHeader.protocolVersion, ""), connToken, token, maxQueued);
 			return;
 		}
 		// Modern events/stream (push): like subscriptions/listen, this POST opens a
