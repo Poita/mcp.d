@@ -1088,8 +1088,8 @@ final class ServerPushChannel : PushChannel
 	}
 
 	/// MODE 2 — PUSH TO SESSION. Deliver a notification on exactly ONE connected
-	/// stream owned by `sessionToken` (the empty token makes every stream a
-	/// candidate, for a server without sessions). The chosen stream still applies
+	/// stream owned by `sessionToken` (the empty token selects only streams opened
+	/// without a session, as on a server without sessions). The chosen stream still applies
 	/// its own per-stream `ListenFilter` and per-session gate via the shared
 	/// `listenerEligible` decision. Returns 1 if delivered, else 0.
 	size_t pushToSession(string sessionToken, string method, Json params,
@@ -1097,7 +1097,7 @@ final class ServerPushChannel : PushChannel
 	{
 		auto msg = makeNotification(method, params);
 		return deliver(msg, (ref const Listener l) @safe {
-			if (sessionToken.length && l.ownerToken != sessionToken)
+			if (l.ownerToken != sessionToken)
 				return false;
 			return listenerEligible(l, method, uri, plainEligible);
 		}) >= 0 ? 1 : 0;
@@ -2366,6 +2366,18 @@ unittest  // pushToSession: no eligible stream means no delivery (returns 0)
 	// promptsListChanged was never requested by the only stream.
 	const delivered = ch.pushToSession("", "notifications/prompts/list_changed", Json.undefined);
 	assert(delivered == 0);
+	assert(frame.length == 0);
+}
+
+unittest  // pushToSession with an empty token reaches only streams opened without a session
+{
+	auto coord = new StreamCoordinator;
+	auto ch = new ServerPushChannel(coord);
+	string frame;
+	ch.addListener((string f) @safe { frame = f; }, Json.init,
+			ListenFilter.init, "", null, "sess-A");
+
+	assert(ch.pushToSession("", "notifications/tools/list_changed", Json.undefined) == 0);
 	assert(frame.length == 0);
 }
 

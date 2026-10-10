@@ -185,15 +185,16 @@ interface PushChannel
 	/// delivery to plain (non-listen) streams.
 	size_t broadcast(string method, Json params, string uri = "", bool plainEligible = true) @safe;
 
-	/// Like `notify`, but only to streams opened by `principal` (the authenticated
-	/// token subject). An empty `principal` reaches no stream.
+	/// Like `broadcast`, but only to streams opened by `principal` (the
+	/// authenticated token subject), each still honouring its own opt-in filter.
+	/// An empty `principal` reaches no stream: unauthenticated streams share no
+	/// identity.
 	size_t notifyPrincipal(string principal, string method, Json params) @safe;
 
 	/// Deliver a notification to a single stream of the session `sessionToken`,
 	/// honouring each stream's own opt-in filter; `plainEligible` gates delivery
-	/// to plain (non-listen) streams. An empty `sessionToken` makes every stream
-	/// a candidate (the newest eligible one receives it), which is only
-	/// meaningful on a server without sessions.
+	/// to plain (non-listen) streams. An empty `sessionToken` selects only streams
+	/// opened without a session (a server without sessions), as for `ping`.
 	size_t pushToSession(string sessionToken, string method, Json params,
 			string uri = "", bool plainEligible = true) @safe;
 
