@@ -62,6 +62,11 @@ struct StoredToken
 	/// RFC 7591 `client_secret_expires_at` for `clientSecret` (absolute unix
 	/// seconds); 0 means it does not expire.
 	long clientSecretExpiresAt;
+	/// The `token_endpoint_auth_method` the authorization server assigned the
+	/// dynamically registered `clientId` (RFC 7591 §3.2.1), persisted so a later
+	/// refresh authenticates the way that registration requires. Empty when the
+	/// configured `OAuthLogin.authMethod` applies.
+	string tokenEndpointAuthMethod;
 	/// The issuer of the authorization server that issued this token. `useOAuth`
 	/// reuses or refreshes the token only with that same server, so a record
 	/// with a different or empty issuer is treated as absent.
@@ -129,6 +134,8 @@ struct StoredToken
 		j["client_id"] = clientId;
 		j["client_secret"] = clientSecret;
 		j["client_secret_expires_at"] = Json(clientSecretExpiresAt);
+		if (tokenEndpointAuthMethod.length)
+			j["token_endpoint_auth_method"] = tokenEndpointAuthMethod;
 		j["issuer"] = issuer;
 		return j;
 	}
@@ -156,6 +163,8 @@ struct StoredToken
 			s.clientSecret = p.type == Json.Type.string ? p.get!string : "";
 		if (auto p = "client_secret_expires_at" in j)
 			s.clientSecretExpiresAt = p.type == Json.Type.int_ ? p.get!long : 0;
+		if (auto p = "token_endpoint_auth_method" in j)
+			s.tokenEndpointAuthMethod = p.type == Json.Type.string ? p.get!string : "";
 		if (auto p = "issuer" in j)
 			s.issuer = p.type == Json.Type.string ? p.get!string : "";
 		return s;
@@ -1164,6 +1173,7 @@ final class OAuthSession
 			token_.clientId = prev.clientId;
 			token_.clientSecret = prev.clientSecret;
 			token_.clientSecretExpiresAt = prev.clientSecretExpiresAt;
+			token_.tokenEndpointAuthMethod = prev.tokenEndpointAuthMethod;
 		}
 		else
 			token_.clientId = client_.clientId;
@@ -1285,6 +1295,17 @@ RegisteredClient cacheHitClient(StoredToken cached, OAuthLogin opts) @safe pure 
 	return RegisteredClient(cached.clientId, cached.clientSecret, cached.clientSecretExpiresAt);
 }
 
+/// Set `oauth.authMethod` to the persisted `method` when it names a known
+/// token-endpoint auth method; leave it unchanged otherwise.
+private void restoreAssignedAuthMethod(OAuthClient oauth, string method) @safe
+{
+	import std.traits : EnumMembers;
+
+	static foreach (m; EnumMembers!TokenEndpointAuthMethod)
+		if (method == m)
+			oauth.authMethod = m;
+}
+
 /// The client registration to persist with a token: the configured
 /// pre-registered secret stays in `opts` and is not written to the store.
 RegisteredClient persistedClient(RegisteredClient rc, OAuthLogin opts) @safe pure nothrow
@@ -1360,6 +1381,10 @@ OAuthSession useOAuth(McpClient client, string mcpEndpoint, OAuthLogin opts) @sa
 		// A token lacking an explicitly required scope (a step-up after
 		// `insufficient_scope`) cannot be reused or refreshed into one that has it.
 		const scopesGranted = cached.grantsScopes(required);
+		// A dynamically registered client authenticates the way the authorization
+		// server assigned at registration, not the configured method.
+		if (cached.clientId.length && cached.clientId != opts.clientId)
+			restoreAssignedAuthMethod(oauth, cached.tokenEndpointAuthMethod);
 		if (scopesGranted && cached.hasToken && !needsRefresh(cached, now))
 		{
 			return new OAuthSession(oauth, as_, cacheHitClient(cached, opts),
@@ -1382,6 +1407,7 @@ OAuthSession useOAuth(McpClient client, string mcpEndpoint, OAuthLogin opts) @sa
 					if (refreshed.scope_.length == 0)
 						refreshed.scope_ = cached.scope_;
 					refreshed.setClient(persistedClient(prior, opts));
+					refreshed.tokenEndpointAuthMethod = cached.tokenEndpointAuthMethod;
 					refreshed.issuer = as_.issuer;
 					store.save(oauth.resource, refreshed);
 					return new OAuthSession(oauth, as_, prior, store, oauth.resource, refreshed);
@@ -1441,6 +1467,8 @@ OAuthSession useOAuth(McpClient client, string mcpEndpoint, OAuthLogin opts) @sa
 	if (stored.scope_.length == 0)
 		stored.scope_ = opts.scopeString();
 	stored.setClient(persistedClient(rc, opts));
+	if (rc.clientId != opts.clientId)
+		stored.tokenEndpointAuthMethod = cast(string) oauth.authMethod;
 	stored.issuer = as_.issuer;
 	store.save(oauth.resource, stored);
 	return attachSession(client, new OAuthSession(oauth, as_, rc, store, oauth.resource, stored));
@@ -2818,6 +2846,21 @@ unittest  // StoredToken persists the DCR client_secret and its expiry across JS
 	assert(back.clientSecretExpiresAt == 1_900_000_000);
 }
 
+unittest  // StoredToken persists the assigned token_endpoint_auth_method across JSON round-trips
+{
+	StoredToken t;
+	t.accessToken = "tok";
+	t.tokenEndpointAuthMethod = "client_secret_post";
+	assert(StoredToken.fromJson(t.toJson()).tokenEndpointAuthMethod == "client_secret_post");
+}
+
+unittest  // a stored token without token_endpoint_auth_method loads with none recorded
+{
+	auto back = StoredToken.fromJson(parseJsonString(`{"access_token":"tok","client_id":"abc"}`));
+	assert(back.accessToken == "tok");
+	assert(back.tokenEndpointAuthMethod.length == 0);
+}
+
 unittest  // a stored client secret past its client_secret_expires_at is reported expired
 {
 	StoredToken t;
@@ -2858,6 +2901,8 @@ version (unittest)
 		string base;
 		int refreshCalls;
 		bool failRefresh;
+		/// The `client_secret` form field of the last refresh-token grant.
+		string lastRefreshFormSecret;
 		/// The PRM `resource`; empty selects `base ~ "/mcp"`.
 		string prmResource;
 		/// The PRM `scopes_supported`; empty omits it.
@@ -2912,6 +2957,7 @@ version (unittest)
 				if (req.form.get("grant_type", "") == "refresh_token")
 				{
 					srv.refreshCalls++;
+					srv.lastRefreshFormSecret = req.form.get("client_secret", "");
 					if (srv.failRefresh)
 					{
 						res.statusCode = 400;
@@ -3102,6 +3148,37 @@ unittest  // useOAuth re-authorizes instead of reusing a valid cached token that
 
 	assertThrown(useOAuth(McpClient.http(endpoint), endpoint, opts));
 	assert(browserOpened, "a step-up must run a new authorization");
+}
+
+unittest  // useOAuth refreshes a cached DCR token with the auth method the AS assigned
+{
+	import mcp.auth.oauth : canonicalResourceUri;
+
+	auto srv = startIssuerTestAuthServer();
+	scope (exit)
+		srv.stop();
+	const endpoint = srv.base ~ "/mcp";
+	const resource = canonicalResourceUri(endpoint);
+
+	auto store = new MemoryTokenStore();
+	StoredToken t;
+	t.accessToken = "old";
+	t.refreshToken = "rt";
+	t.setClient(RegisteredClient("abc123", "dcr-secret"));
+	t.tokenEndpointAuthMethod = "client_secret_post";
+	t.expiresAt = 1;
+	t.resource = resource;
+	t.issuer = srv.base;
+	store.save(resource, t);
+
+	OAuthLogin opts;
+	opts.store = store;
+	opts.openBrowser = (string url) @safe {};
+
+	auto sess = useOAuth(McpClient.http(endpoint), endpoint, opts);
+	assert(sess.token.accessToken == "new-access");
+	assert(srv.lastRefreshFormSecret == "dcr-secret");
+	assert(store.load(resource).tokenEndpointAuthMethod == "client_secret_post");
 }
 
 unittest  // a failed cached refresh is logged before useOAuth falls back to the browser
