@@ -1748,7 +1748,39 @@ private TokenSet parseTokenResponse(int status, string responseBody) @safe
 	if (status < 200 || status >= 300)
 		throw invalidRequest("token endpoint returned HTTP " ~ status.to!string ~ (
 				responseBody.length ? ": " ~ responseBody : ""), oauthErrorData(responseBody));
-	return requireBearer(TokenSet.fromJson(parseUntrustedJson(responseBody)));
+	auto j = parseUntrustedJson(responseBody);
+	throwIfOAuthError("token endpoint", j);
+	return requireBearer(TokenSet.fromJson(j));
+}
+
+/// Throw when a successful (2xx) token response nevertheless carries an RFC 6749
+/// §5.2 `error` member, as GitHub sends for a bad or expired code. The message
+/// names the `error` and any `error_description`, and the exception's `data`
+/// carries the code for `oauthErrorCode`.
+package(mcp) void throwIfOAuthError(string endpoint, Json response) @safe
+{
+	import mcp.protocol.errors : invalidRequest;
+
+	if (response.type != Json.Type.object || response["error"].type != Json.Type.string)
+		return;
+	const code = response["error"].get!string;
+	const desc = response["error_description"];
+	throw invalidRequest(endpoint ~ " returned error " ~ code ~ (desc.type == Json.Type.string
+			&& desc.get!string.length ? ": " ~ desc.get!string : ""), Json([
+			"error": Json(code)
+	]));
+}
+
+unittest  // parseTokenResponse surfaces an OAuth error carried in a 2xx response
+{
+	import std.algorithm : canFind;
+	import std.exception : collectException;
+
+	auto e = collectException(parseTokenResponse(200,
+			`{"error":"bad_verification_code","error_description":"expired"}`));
+	assert(e !is null);
+	assert(e.msg.canFind("bad_verification_code") && e.msg.canFind("expired"), e.msg);
+	assert(oauthErrorCode(e) == "bad_verification_code");
 }
 
 /// Return `ts` when its `token_type` is `Bearer` (compared case-insensitively,

@@ -904,8 +904,10 @@ final class OAuthClient
 			&& (authMethod == TokenEndpointAuthMethod.clientSecretBasic
 					|| authMethod == TokenEndpointAuthMethod.none);
 		const auth = useBasic ? basicAuthHeader(client.clientId, client.clientSecret) : "";
-		return postParse("Token endpoint", url,
+		auto j = postParse("Token endpoint", url,
 				"application/x-www-form-urlencoded", cast(const(ubyte)[]) form, auth);
+		throwIfOAuthError("Token endpoint", j);
+		return j;
 	}
 }
 
@@ -2330,6 +2332,30 @@ unittest  // token exchange requesting an access token rejects a non-Bearer toke
 	c.resource = "http://127.0.0.1:3000/mcp";
 	assertThrown(c.tokenExchange(srv.base ~ "/token", "subj", "urn:t:id_token",
 			"urn:ietf:params:oauth:token-type:access_token", "aud", RegisteredClient("cid", "")));
+}
+
+unittest  // a 2xx token response carrying an OAuth error surfaces that error
+{
+	import std.algorithm : canFind;
+	import std.exception : collectException;
+
+	auto srv = startLoopback((scope HTTPServerRequest req, scope HTTPServerResponse res) @safe {
+		res.writeBody(`{"error":"bad_verification_code",`
+			~ `"error_description":"The code passed is incorrect or expired."}`, "application/json");
+	});
+	scope (exit)
+		srv.stop();
+
+	auto c = new OAuthClient();
+	c.resource = "http://127.0.0.1:3000/mcp";
+	AuthorizationServerMetadata as_;
+	as_.tokenEndpoint = srv.base ~ "/token";
+	as_.codeChallengeMethodsSupported = ["S256"];
+	auto e = collectException(c.exchangeCode(as_, RegisteredClient("cid", ""), "code", "verifier"));
+	assert(e !is null);
+	assert(e.msg.canFind("bad_verification_code"), e.msg);
+	assert(e.msg.canFind("incorrect or expired"), e.msg);
+	assert(oauthErrorCode(e) == "bad_verification_code");
 }
 
 unittest  // client_secret_post: token exchange carries the client secret
