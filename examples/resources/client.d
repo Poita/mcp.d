@@ -10,7 +10,8 @@
  *   - http (`--http <url>` / `--url <url>`): `connectFromArgs` connects with
  *     `McpClient.http(url)`.
  *
- * It speaks the modern protocol protocol (`enableModern`) for two reasons: the
+ * It speaks the modern protocol (`connect()` negotiates 2026-07-28) for two
+ * reasons: the
  * `CacheableResult` freshness hint rides inline on every `resources/read`, and a
  * `subscriptions/listen` stream is the ONE push mechanism the SDK supports over
  * both transports (the standalone GET SSE stream is HTTP-only).
@@ -106,7 +107,7 @@ int run(string[] args) @safe
 
 	// Speak the modern protocol: cache hints ride inline on resources/read, and
 	// subscriptions/listen is the cross-transport push mechanism.
-	client.enableModern();
+	client.connect();
 	auto disc = client.discover();
 	checkEq(disc.serverInfo.name, "resources-example", "discover serverInfo.name");
 

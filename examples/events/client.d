@@ -20,8 +20,8 @@
  *      (The server uses a fixed "fake auth" principal so webhook subscribe is
  *      permitted; the spec forbids webhook on unauthenticated servers.)
  *
- * Events is modern-only, so the client switches to the modern protocol
- * (`enableModern`) before negotiation.
+ * Events is modern-only; `connect()` negotiates 2026-07-28 with this stateless
+ * server.
  */
 module events_client;
 
@@ -47,8 +47,8 @@ int main(string[] args) @safe
 		scope (exit)
 			client.close();
 
-		// Events is modern-only: switch to the modern protocol before negotiation.
-		client.enableModern();
+		// Events is modern-only; connect() negotiates 2026-07-28.
+		client.connect();
 
 		// --- 1. server/discover advertises the events extension --------------
 		auto disc = client.discover();

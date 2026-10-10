@@ -14,8 +14,8 @@ does **not** modify the root `dub.json`.
 Cache hints let a server tell clients and intermediaries how long a result may
 be reused and by whom (`public` shared cache vs `private` per-client cache).
 They are **modern-only** (protocol `2026-07-28`): the server only emits the
-fields when the negotiated protocol is the modern protocol, and the client must
-opt in with `client.enableModern()`.
+fields when the negotiated protocol is the modern protocol, which `connect()`
+selects against a server that supports it.
 
 - **Per-resource hint** — `server.d` declares it with the `@cacheable(ttl, scope)`
   UDA (a `core.time.Duration`) on a `@resource` method; `registerHandlers` plumbs
@@ -31,8 +31,8 @@ opt in with `client.enableModern()`.
   It rides on the `resources/list` result. (Valid methods: `tools/list`,
   `resources/list`, `resources/templates/list`, `prompts/list`,
   `server/discover`, and the Skills extension's `skills/list` and `skills/get`.)
-- **Consumer's-eye view** — `client.d` enables modern mode
-  (`client.enableModern()`), then reads `list.cache.ttl` / `cacheScope` and
+- **Consumer's-eye view** — `client.d` calls `client.connect()` (which
+  negotiates 2026-07-28), then reads `list.cache.ttl` / `cacheScope` and
   `readResource(uri).cache.ttl` / `cacheScope` (each `.ttl` a `Duration`).
 
 A third resource (`status://live`) is registered with **no** hint, and the

@@ -95,9 +95,9 @@ int main(string[] args) @safe
 /// function runs over stdio and HTTP.
 private int runE2E(McpClient client) @safe
 {
-	// Stateless 2026-07-28: MRTR is the input mechanism. Every request
-	// carries per-request `_meta`.
-	client.enableModern();
+	// connect() negotiates stateless 2026-07-28, where MRTR is the input
+	// mechanism and every request carries per-request `_meta`.
+	client.connect();
 
 	// Advertise the input capabilities this client can satisfy. The server only
 	// includes an InputRequest the client declared support for, so we must

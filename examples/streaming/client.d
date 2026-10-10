@@ -254,10 +254,9 @@ private void phaseErrorCode(McpClient client) @safe
 private int phaseCancellation(string url, int cancelledBefore) @safe
 {
 	auto client = McpClient.http(url);
-	// Modern mode: on Streamable HTTP the cancellation signal is the client
-	// closing its response stream (2026-07-28 basic/utilities/cancellation
-	// §Transport-Specific Cancellation). connect() negotiates the 2026-07-28 revision.
-	client.enableModern();
+	// connect() negotiates 2026-07-28, where on Streamable HTTP the cancellation
+	// signal is the client closing its response stream
+	// (basic/utilities/cancellation §Transport-Specific Cancellation).
 	client.connect();
 
 	bool sawFirstProgress = false;

@@ -35,7 +35,7 @@ that runs the same assertions over either transport.
   comment in `main` sketches a Redis-backed `TaskStore` and a queue-backed
   `TaskDispatcher` for that deployment.
 
-**Client side (`client.d`)** calls `enableModern()` and `enableTasks()`, declares
+**Client side (`client.d`)** calls `enableTasks()` then `connect()`, declares
 form elicitation, and asserts:
 
 1. `server/discover` advertises the tasks extension (`tasksExtensionKey`) and

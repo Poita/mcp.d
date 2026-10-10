@@ -58,10 +58,9 @@ int main(string[] args) @safe
 		scope (exit)
 			client.close();
 
-		// Cache hints are a modern-only feature: speak the modern protocol
-		// protocol (no initialize handshake). Transport-agnostic — the same call
-		// works over stdio and HTTP.
-		client.enableModern();
+		// Cache hints are modern-only; connect() negotiates 2026-07-28 with this
+		// stateless server over either transport.
+		client.connect();
 
 		// --- 1. resources/list carries the per-list cache hint ----------------
 		auto list = client.listResources();
