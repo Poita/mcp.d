@@ -504,6 +504,14 @@ void runStdio(McpServer server, ServerSettings settings)
 /// its first bytes (else null); a dropped notification gets no reply; a dropped
 /// response to a server->client request fails that request at once instead.
 /// At end-of-input, handlers still running get up to `opts.drainTimeout` to reply.
+///
+/// On POSIX, vibe-core's default signal handlers apply: SIGPIPE is caught (a write
+/// to a closed stdout fails instead of killing the process), and SIGINT/SIGTERM
+/// stop the event loop, so `runStdio` returns at once without the
+/// `opts.drainTimeout` drain and replies still being computed are lost. Call
+/// `vibe.core.core.disableDefaultSignalHandlers` before `runStdio` to handle
+/// these signals yourself; SIGPIPE must then be ignored or handled, since its
+/// default action terminates the process.
 void runStdio(McpServer server, StdioOptions opts = StdioOptions.init)
 {
 	const maxLineBytes = opts.maxLineBytes;
@@ -552,9 +560,9 @@ void runStdio(McpServer server, StdioOptions opts = StdioOptions.init)
 		// wouldBlock, or a short write, means the peer closed its read end (EPIPE /
 		// IOStatus.error) and the channel is broken. Throw so DuplexChannel.send
 		// observes the failure instead of producing replies that are silently lost.
-		// On POSIX a broken-pipe write may also raise SIGPIPE; a server using this
-		// transport should ignore SIGPIPE (signal(SIGPIPE, SIG_IGN)) so the failure
-		// surfaces here as IOStatus.error rather than terminating the process.
+		// On POSIX the SIGPIPE such a write raises is caught by the handler vibe-core
+		// installs on the first `runEventLoop`, so the failure surfaces here as
+		// IOStatus.error rather than terminating the process.
 		auto res = outFD.writeAll(bytes);
 		if (writeFailed(res.status, res.nbytes, bytes.length))
 			throw new Exception("runStdio: write to stdout failed (peer closed its read end?)");
