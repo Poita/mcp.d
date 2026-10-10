@@ -24,8 +24,10 @@ import mcp.server.event_context : EventContext, EventResult, Event, EventBatch,
 import mcp.server.event_store : EmitBuffer, EmitBufferOptions,
 	WebhookSubscription, WebhookSubscriptionStore,
 	InMemoryWebhookSubscriptionStore, Delivery, DeliveryQueue, InMemoryDeliveryQueue, nowUnixMs;
-import mcp.server.webhook_delivery : WebhookTransport, SecureWebhookTransport, WebhookHttpResult,
-	V1aSigner, DeliverySigning, signDeliveryHeaders, callbackHostAllowed, challengeEchoed;
+import mcp.server.webhook_delivery : WebhookTransport, SecureWebhookTransport,
+	WebhookHttpResult, V1aSigner,
+	DeliverySigning, signDeliveryHeaders, callbackHostAllowed,
+	challengeEchoed, logCallbackRefused;
 
 /// Grace window during which a rotated webhook secret is dual-signed alongside
 /// the new one (Standard Webhooks multi-signature), so a receiver still holding
@@ -2688,12 +2690,18 @@ final class EventsRuntime
 		import std.algorithm : startsWith;
 
 		if (!callbackHostAllowed(url, opts_.allowPrivateCallbackHosts))
+		{
+			logCallbackRefused(url, "host is not globally routable");
 			return WebhookHttpResult.failure(DeliveryErrorCategory.connectionRefused);
+		}
 		// Cleartext http is permitted only to a loopback/internal host (development);
 		// a public host over http would leak the signed payload in cleartext, so it is
 		// refused here even with the dev flag set — mirroring validateCallbackUrl.
 		if (url.startsWith("http://") && !isInternalHttpHost(url))
+		{
+			logCallbackRefused(url, "cleartext http to a public host");
 			return WebhookHttpResult.failure(DeliveryErrorCategory.connectionRefused);
+		}
 		return opts_.webhookTransport.post(url, headers, body, opts_.allowPrivateCallbackHosts);
 	}
 
@@ -3621,13 +3629,13 @@ version (unittest)
 
 	import vibe.core.log : LogLevel, Logger, LogLine;
 
-	// Records the text of every error-or-higher log line while registered.
+	// Records the text of every log line at or above its level while registered.
 	private final class CaptureLogger : Logger
 	{
 		string[] lines;
-		this() @safe
+		this(LogLevel level) @safe
 		{
-			minLevel = LogLevel.error;
+			minLevel = level;
 		}
 
 		override void log(ref LogLine line) @safe
@@ -3637,11 +3645,11 @@ version (unittest)
 	}
 
 	// Run `fn` with a `CaptureLogger` registered and return the lines it logged.
-	private string[] captureLogs(scope void delegate() @safe fn) @safe
+	private string[] captureLogs(scope void delegate() @safe fn, LogLevel level = LogLevel.error) @safe
 	{
 		import vibe.core.log : deregisterLogger, registerLogger;
 
-		auto logger = new CaptureLogger;
+		auto logger = new CaptureLogger(level);
 		auto shared_ = () @trusted { return cast(shared) logger; }();
 		() @trusted { registerLogger(shared_); }();
 		scope (exit)
@@ -3649,6 +3657,19 @@ version (unittest)
 		fn();
 		return (cast() logger).lines;
 	}
+}
+
+unittest  // a callback refused before any request is sent is logged as a warning
+{
+	import std.algorithm : any, canFind;
+
+	auto rt = testRuntime();
+	WebhookHttpResult r;
+	auto lines = captureLogs(() @safe {
+		r = rt.postToCallback("https://10.0.0.1/hook", null, "{}");
+	}, LogLevel.warn);
+	assert(!r.ok);
+	assert(lines.any!(l => l.canFind("refused") && l.canFind("not globally routable")));
 }
 
 unittest  // a contained events failure goes to the vibe.d log

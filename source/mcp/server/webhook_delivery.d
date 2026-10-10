@@ -12,6 +12,7 @@ import std.typecons : Nullable, nullable;
 import vibe.data.json : Json;
 
 import mcp.protocol.events : DeliveryErrorCategory;
+import mcp.protocol.errors : McpException, ErrorCode;
 
 @safe:
 
@@ -137,12 +138,40 @@ final class SecureWebhookTransport : WebhookTransport
 				answered = true;
 			}, FetchOptions(requestTimeout_));
 		}
+		catch (McpException e)
+		{
+			// The connector raises `-32600` only for a policy refusal (scheme,
+			// unresolvable host, or an internal address), before connecting.
+			if (!answered && e.code == ErrorCode.invalidRequest)
+			{
+				logCallbackRefused(url, e.msg);
+				result = WebhookHttpResult.failure(DeliveryErrorCategory.connectionRefused);
+			}
+			else if (!answered)
+				result = WebhookHttpResult.failure(categoryForException(e.msg));
+		}
 		catch (Exception e)
 		{
 			if (!answered)
 				result = WebhookHttpResult.failure(categoryForException(e.msg));
 		}
 		return result;
+	}
+}
+
+/// Log, at warning level, a callback request refused by the SSRF/callback
+/// policy before anything was sent. The wire reports such a refusal only as
+/// `connection_refused` (it has no policy or DNS category), so the log is
+/// where an operator learns the reason. The URL is redacted.
+package(mcp) void logCallbackRefused(string url, string reason) @safe nothrow
+{
+	import vibe.core.log : logWarn;
+	import mcp.protocol.ssrf : redactUrl;
+
+	try
+		logWarn("[mcp.events] webhook callback %s refused by policy: %s", redactUrl(url), reason);
+	catch (Exception)
+	{
 	}
 }
 
@@ -573,4 +602,53 @@ unittest  // constantTimeEquals matches std equality semantics
 	assert(constantTimeEquals("abc", "abc"));
 	assert(!constantTimeEquals("abc", "abd"));
 	assert(!constantTimeEquals("abc", "abcd"));
+}
+
+version (unittest)
+{
+	import vibe.core.log : LogLevel, Logger, LogLine;
+
+	// Records every warning-or-higher log line while registered.
+	private final class WarnCaptureLogger : Logger
+	{
+		string[] lines;
+		this() @safe
+		{
+			minLevel = LogLevel.warn;
+		}
+
+		override void log(ref LogLine line) @safe
+		{
+			lines ~= line.text;
+		}
+	}
+
+	private string[] captureWarnings(scope void delegate() @safe fn) @safe
+	{
+		import vibe.core.log : deregisterLogger, registerLogger;
+
+		auto logger = new WarnCaptureLogger;
+		auto shared_ = () @trusted { return cast(shared) logger; }();
+		() @trusted { registerLogger(shared_); }();
+		scope (exit)
+			() @trusted { deregisterLogger(shared_); }();
+		fn();
+		return (cast() logger).lines;
+	}
+}
+
+unittest  // a callback the SSRF policy refuses is logged as a warning with the reason
+{
+	import core.time : seconds;
+	import std.algorithm : any, canFind;
+
+	auto transport = new SecureWebhookTransport(1.seconds);
+	WebhookHttpResult r;
+	auto lines = captureWarnings(() @safe {
+		r = transport.post("http://127.0.0.1:1/hook?token=secret", null, "{}", false);
+	});
+	assert(!r.ok);
+	assert(r.error.get == DeliveryErrorCategory.connectionRefused);
+	assert(lines.any!(l => l.canFind("refused") && l.canFind("insecure")));
+	assert(!lines.any!(l => l.canFind("secret")));
 }
