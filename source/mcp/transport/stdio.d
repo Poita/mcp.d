@@ -524,7 +524,7 @@ void runStdio(McpServer server, ServerSettings settings)
 /// (its bytes are skipped up to the next newline) and the loop continues, so one
 /// misbehaving frame neither exhausts memory nor kills the server. A dropped
 /// request is answered with a -32600 error carrying its id when one is found in
-/// its first bytes (else null); a dropped notification gets no reply; a dropped
+/// the line (else null); a dropped notification gets no reply; a dropped
 /// response to a server->client request fails that request at once instead.
 /// At end-of-input, handlers still running get up to `opts.drainTimeout` to reply.
 ///
@@ -1264,7 +1264,7 @@ else version (Windows)
 	}
 }
 
-/// Respond to an over-long frame the reader dropped, from what its first bytes
+/// Respond to an over-long frame the reader dropped, from what its bytes
 /// reveal. A request (or an id-bearing frame with no `"result"`/`"error"`) is
 /// answered with a -32600 error carrying its id, and a frame of unknown kind
 /// with a null-id one. A notification gets no reply. A response is never

@@ -205,7 +205,7 @@ package(mcp) struct LineReader
 	}
 }
 
-/// What the first bytes of a JSON-RPC object reveal about it: its top-level
+/// What the text of a JSON-RPC object reveals about it: its top-level
 /// `"id"` and whether a top-level `"method"` or `"result"`/`"error"` key appears.
 package(mcp) struct FrameHead
 {
