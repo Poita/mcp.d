@@ -539,10 +539,7 @@ void runStdio(McpServer server, StdioOptions opts = StdioOptions.init)
 	auto reader = LineReader(maxLineBytes);
 	size_t readStdin(ubyte[] dst) @safe
 	{
-		import eventcore.driver : IOStatus;
-
-		auto res = inFD.readOnce(dst);
-		return res.status == IOStatus.ok || res.status == IOStatus.wouldBlock ? res.nbytes : 0;
+		return readAvailable(&inFD.readOnce, dst);
 	}
 
 	// Serializes whole-frame writes: the channel's writer and the read loop's
@@ -1260,6 +1257,35 @@ private string answerOversized(FrameHead head, size_t maxLineBytes,
 	return null;
 }
 
+/// Read what `readOnce` has available into `dst`, returning the byte count or 0
+/// at end-of-input. A read that would block with nothing read is retried; a
+/// failed read throws, so the read loop reports it rather than taking it for
+/// end-of-input.
+private size_t readAvailable(scope IoResult delegate(ubyte[]) @safe readOnce, ubyte[] dst) @safe
+{
+	import eventcore.driver : IOStatus;
+	import std.conv : to;
+	import vibe.core.core : yield;
+
+	for (;;)
+	{
+		const res = readOnce(dst);
+		switch (res.status)
+		{
+		case IOStatus.ok:
+		case IOStatus.disconnected:
+			return res.nbytes;
+		case IOStatus.wouldBlock:
+			if (res.nbytes)
+				return res.nbytes;
+			yield();
+			continue;
+		default:
+			throw new Exception("stdin read failed: " ~ res.status.to!string);
+		}
+	}
+}
+
 /// Decide whether a stdout write is a failure the channel must surface. A status
 /// that is neither `ok` nor `wouldBlock`, or a short write (fewer bytes than the
 /// frame), means the peer closed its read end (EPIPE / `IOStatus.error`); the
@@ -1282,6 +1308,41 @@ unittest  // writeFailed flags a non-ok status and a short write, accepts a full
 	assert(writeFailed(IOStatus.error, 10, 10));
 	assert(writeFailed(IOStatus.disconnected, 0, 10));
 	assert(writeFailed(IOStatus.ok, 4, 10));
+}
+
+version (unittest) private size_t readScripted(IoResult[] script, out size_t calls) @safe
+{
+	size_t next;
+	auto n = readAvailable((ubyte[] dst) @safe { ++calls; return script[next++]; }, new ubyte[16]);
+	return n;
+}
+
+unittest  // readAvailable throws on a read error instead of reporting end-of-input
+{
+	import eventcore.driver : IOStatus;
+	import std.exception : collectException;
+
+	size_t calls;
+	assert(collectException(readScripted([IoResult(IOStatus.error, 0)], calls)) !is null);
+}
+
+unittest  // readAvailable retries a read that would block with no bytes
+{
+	import eventcore.driver : IOStatus;
+
+	size_t calls;
+	const n = readScripted([
+		IoResult(IOStatus.wouldBlock, 0), IoResult(IOStatus.ok, 5)
+	], calls);
+	assert(n == 5 && calls == 2);
+}
+
+unittest  // readAvailable reports end-of-input when the peer disconnects
+{
+	import eventcore.driver : IOStatus;
+
+	size_t calls;
+	assert(readScripted([IoResult(IOStatus.disconnected, 0)], calls) == 0);
 }
 
 version (unittest) private string[] oversizedReplies(FrameHead head, out string substitute) @safe
