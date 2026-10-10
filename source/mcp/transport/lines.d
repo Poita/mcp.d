@@ -106,7 +106,7 @@ package(mcp) struct LineReader
 						return null;
 					if (acc.length && acc[$ - 1] == '\r')
 						acc = acc[0 .. $ - 1];
-					return acc.length ? (cast(string) acc.idup) : null;
+					return acc.length ? (() @trusted => cast(string) acc)() : null;
 				}
 			}
 
@@ -137,26 +137,38 @@ package(mcp) struct LineReader
 				continue;
 			}
 
-			// Found a newline at rest[nl]; consume through it.
+			// Found a newline at rest[nl]; consume through it. A line held whole in
+			// `buf` is sliced, not accumulated, so it is copied only once on return.
+			const(ubyte)[] line;
+			bool owned; // `line` is `acc`, which no one else references
 			if (!dropping)
-				acc ~= rest[0 .. nl];
+			{
+				if (acc.length)
+				{
+					acc ~= rest[0 .. nl];
+					line = acc;
+					owned = true;
+				}
+				else
+					line = rest[0 .. nl];
+			}
 			bufPos += nl + 1;
 			// Enforce the size cap here too: when the line and its newline land in the
 			// same chunk the no-newline accumulation path above never runs, so the cap
 			// must also be checked on the newline-found path. An over-long line (already
 			// dropping, or only now over the cap) is discarded and a fresh one started.
-			if (dropping || acc.length > maxLineBytes)
+			if (dropping || line.length > maxLineBytes)
 			{
 				if (!dropping)
-					markOversized(acc[0 .. $ < frameHeadScanBytes ? $ : frameHeadScanBytes]);
+					markOversized(line[0 .. $ < frameHeadScanBytes ? $ : frameHeadScanBytes]);
 				return "";
 			}
-			if (acc.length && acc[$ - 1] == '\r')
-				acc = acc[0 .. $ - 1];
+			if (line.length && line[$ - 1] == '\r')
+				line = line[0 .. $ - 1];
 			// A blank line is "" rather than null, which the read loop takes as EOF.
-			if (!acc.length)
+			if (!line.length)
 				return "";
-			return cast(string) acc.idup;
+			return owned ? (() @trusted => cast(string) line)() : cast(string) line.idup;
 		}
 	}
 }
@@ -315,6 +327,14 @@ version (unittest)
 		Json[] ignored;
 		return drainLineReader(maxLineBytes, chunks, ignored);
 	}
+
+	// Bytes the GC has allocated on this thread so far.
+	private ulong allocatedBytes() @trusted nothrow
+	{
+		import core.memory : GC;
+
+		return GC.allocatedInCurrentThread;
+	}
 }
 
 unittest  // LineReader refills into one fixed backing buffer across short reads
@@ -431,4 +451,56 @@ unittest  // scanFrameHead tells a request, a response and a notification apart 
 	auto note = scanFrameHead(
 			cast(const(ubyte)[]) `{"method":"notifications/progress","params":{"id":2,`);
 	assert(note.id.type == Json.Type.null_ && note.hasMethod && !note.hasResult);
+}
+
+unittest  // LineReader copies a line that arrives within one chunk only once
+{
+	enum size_t len = 1024 * 1024;
+	auto chunk = new ubyte[len + 1];
+	chunk[0 .. len] = 'x';
+	chunk[len] = '\n';
+	auto reader = LineReader(2 * len);
+	bool fed;
+	bool refill() @safe
+	{
+		if (fed)
+			return false;
+		fed = true;
+		reader.buf = chunk;
+		reader.bufPos = 0;
+		return true;
+	}
+
+	const before = allocatedBytes();
+	auto line = reader.nextWith(&refill);
+	const allocated = allocatedBytes() - before;
+	assert(line.length == len);
+	assert(allocated < len + len / 2, "the line must be copied out of the buffer once");
+}
+
+unittest  // LineReader does not re-copy a line assembled across chunks
+{
+	enum size_t half = 512 * 1024;
+	auto first = new ubyte[half];
+	first[] = 'x';
+	auto second = new ubyte[half + 1];
+	second[0 .. half] = 'y';
+	second[half] = '\n';
+	auto reader = LineReader(4 * half);
+	ubyte[][] chunks = [first, second];
+	bool refill() @safe
+	{
+		if (chunks.length == 0)
+			return false;
+		reader.buf = chunks[0];
+		chunks = chunks[1 .. $];
+		reader.bufPos = 0;
+		return true;
+	}
+
+	const before = allocatedBytes();
+	auto line = reader.nextWith(&refill);
+	const allocated = allocatedBytes() - before;
+	assert(line.length == 2 * half && line[0] == 'x' && line[$ - 1] == 'y');
+	assert(allocated < 5 * half, "the assembled line must not be duplicated again");
 }
