@@ -119,6 +119,11 @@ final class OAuthClient
 	/// RSA or EC (P-256) private key (PKCS#8 PEM) for `private_key_jwt` client
 	/// assertions. Required when `authMethod` is `privateKeyJwt`.
 	string privateKeyPem;
+	/// The URL at which this client publishes its public JWK Set. A
+	/// `private_key_jwt` Dynamic Client Registration names it as `jwks_uri`;
+	/// when empty, the registration carries the public key derived from
+	/// `privateKeyPem` as `jwks` instead.
+	string jwksUri;
 	/// The `aud` of `private_key_jwt` client assertions.
 	AssertionAudience assertionAudience = AssertionAudience.issuer;
 	/// SEP-991: this client's OAuth Client ID Metadata Document URL — an
@@ -425,6 +430,8 @@ final class OAuthClient
 		reg.clientName = clientName;
 		reg.scope_ = scopeStr;
 		reg.tokenEndpointAuthMethod = cast(string) authMethod;
+		if (authMethod == TokenEndpointAuthMethod.privateKeyJwt)
+			publishClientKeys(reg);
 		auto resp = postJson(as_.registrationEndpoint, reg.toJson());
 		auto rc = RegisteredClient.fromJson(resp);
 		if (rc.clientId.length == 0)
@@ -463,6 +470,27 @@ final class OAuthClient
 		}
 		authMethod = method;
 		return rc;
+	}
+
+	/// Name this client's public key in a `private_key_jwt` registration:
+	/// `jwksUri` when set, else the public JWK derived from `privateKeyPem`.
+	/// Throws when neither is configured, since the authorization server could
+	/// then never verify the client's assertions.
+	private void publishClientKeys(ref ClientRegistration reg) const @safe
+	{
+		import mcp.auth.jwt : publicJwkFromPrivateKeyPem;
+
+		if (jwksUri.length)
+		{
+			reg.jwksUri = jwksUri;
+			return;
+		}
+		if (privateKeyPem.length == 0)
+			throw invalidRequest("OAuthClient.privateKeyPem or jwksUri must be set to "
+					~ "register a private_key_jwt client");
+		auto keys = Json.emptyObject;
+		keys["keys"] = Json([publicJwkFromPrivateKeyPem(privateKeyPem)]);
+		reg.jwks = keys;
 	}
 
 	/// Select the client-registration approach for an authorization server,
@@ -2074,6 +2102,79 @@ version (unittest)
 		~ "hyL925dgd6gNWRcGOl5RPvIpye+hRANCAATSBYPkHq12VDW5un1kub6zkBc4ieZ9\n"
 		~ "nurGMu+tLzJ6+6syOZsQCGlazcSOGsopLyl1QZMIFh9atUYaDfUjJxMq\n"
 		~ "-----END PRIVATE KEY-----\n";
+}
+
+unittest  // a private_key_jwt registration publishes the public key derived from privateKeyPem
+{
+	import vibe.data.json : parseJsonString;
+
+	string captured;
+	auto srv = startLoopback((scope HTTPServerRequest req, scope HTTPServerResponse res) @safe {
+		captured = req.bodyReader.readAllUTF8();
+		res.writeBody(`{"client_id":"cid"}`, "application/json");
+	});
+	scope (exit)
+		srv.stop();
+
+	auto c = new OAuthClient();
+	c.resource = srv.base ~ "/mcp";
+	c.authMethod = TokenEndpointAuthMethod.privateKeyJwt;
+	c.privateKeyPem = testEcPem;
+	AuthorizationServerMetadata as_;
+	as_.registrationEndpoint = srv.base ~ "/register";
+	cast(void) c.register(as_, "dlang-mcp");
+	auto sent = parseJsonString(captured);
+	assert(sent["token_endpoint_auth_method"].get!string == "private_key_jwt");
+	auto keys = sent["jwks"]["keys"];
+	assert(keys.length == 1);
+	assert(keys[0]["kty"].get!string == "EC");
+	assert("d" !in keys[0]);
+}
+
+unittest  // a private_key_jwt registration names jwksUri instead of an inline key when set
+{
+	import vibe.data.json : parseJsonString;
+
+	string captured;
+	auto srv = startLoopback((scope HTTPServerRequest req, scope HTTPServerResponse res) @safe {
+		captured = req.bodyReader.readAllUTF8();
+		res.writeBody(`{"client_id":"cid"}`, "application/json");
+	});
+	scope (exit)
+		srv.stop();
+
+	auto c = new OAuthClient();
+	c.resource = srv.base ~ "/mcp";
+	c.authMethod = TokenEndpointAuthMethod.privateKeyJwt;
+	c.privateKeyPem = testEcPem;
+	c.jwksUri = "https://client.example.com/jwks.json";
+	AuthorizationServerMetadata as_;
+	as_.registrationEndpoint = srv.base ~ "/register";
+	cast(void) c.register(as_, "dlang-mcp");
+	auto sent = parseJsonString(captured);
+	assert(sent["jwks_uri"].get!string == "https://client.example.com/jwks.json");
+	assert("jwks" !in sent);
+}
+
+unittest  // a private_key_jwt registration without a key is refused before any request
+{
+	import std.exception : assertThrown;
+
+	int calls;
+	auto srv = startLoopback((scope HTTPServerRequest req, scope HTTPServerResponse res) @safe {
+		calls++;
+		res.writeBody(`{"client_id":"cid"}`, "application/json");
+	});
+	scope (exit)
+		srv.stop();
+
+	auto c = new OAuthClient();
+	c.resource = srv.base ~ "/mcp";
+	c.authMethod = TokenEndpointAuthMethod.privateKeyJwt;
+	AuthorizationServerMetadata as_;
+	as_.registrationEndpoint = srv.base ~ "/register";
+	assertThrown(c.register(as_, "dlang-mcp"));
+	assert(calls == 0);
 }
 
 unittest  // private_key_jwt without a configured key refuses instead of sending no client auth

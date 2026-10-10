@@ -169,6 +169,72 @@ private void bnToFixed(const(BIGNUM)* bn, ubyte[] dst) @trusted
 	dst[$ - n .. $] = tmp[0 .. n];
 }
 
+/// The public JWK (RFC 7517) of a PKCS#8 RSA or EC P-256 private key (PEM),
+/// as a `private_key_jwt` client publishes in its `jwks` so the authorization
+/// server can verify its assertions. Carries `alg` (`RS256` or `ES256`) and
+/// `use: "sig"`, and never any private component. Throws for any other key.
+Json publicJwkFromPrivateKeyPem(string privateKeyPem) @trusted
+{
+	import deimos.openssl.rsa : RSA_free, RSA_get0_key;
+
+	const alg = detectKeyAlg(privateKeyPem);
+	auto bio = BIO_new_mem_buf(cast(void*) privateKeyPem.ptr, cast(int) privateKeyPem.length);
+	if (bio is null)
+		throw new Exception("openssl: BIO_new_mem_buf failed");
+	scope (exit)
+		BIO_free(bio);
+	auto pkey = PEM_read_bio_PrivateKey(bio, null, null, null);
+	if (pkey is null)
+		throw new Exception("openssl: failed to parse private key");
+	scope (exit)
+		EVP_PKEY_free(pkey);
+
+	auto jwk = Json.emptyObject;
+	if (alg == "RS256")
+	{
+		auto rsa = EVP_PKEY_get1_RSA(pkey);
+		if (rsa is null)
+			throw new Exception("openssl: failed to read RSA private key");
+		scope (exit)
+			RSA_free(rsa);
+		BIGNUM* n, e;
+		RSA_get0_key(rsa, &n, &e, null);
+		jwk["kty"] = "RSA";
+		jwk["n"] = base64UrlNoPad(bnToBytes(n));
+		jwk["e"] = base64UrlNoPad(bnToBytes(e));
+	}
+	else
+	{
+		auto ec = EVP_PKEY_get1_EC_KEY(pkey);
+		if (ec is null)
+			throw new Exception("openssl: failed to read EC private key");
+		scope (exit)
+			EC_KEY_free(ec);
+		// The uncompressed point encoding is 0x04 || X || Y, 32 bytes each on P-256.
+		ubyte[65] point;
+		const len = EC_POINT_point2oct(EC_KEY_get0_group(ec), EC_KEY_get0_public_key(ec),
+				point_conversion_form_t.POINT_CONVERSION_UNCOMPRESSED,
+				point.ptr, point.length, null);
+		if (len != point.length || point[0] != 0x04)
+			throw new Exception("openssl: failed to encode EC public key");
+		jwk["kty"] = "EC";
+		jwk["crv"] = "P-256";
+		jwk["x"] = base64UrlNoPad(point[1 .. 33]);
+		jwk["y"] = base64UrlNoPad(point[33 .. 65]);
+	}
+	jwk["alg"] = alg;
+	jwk["use"] = "sig";
+	return jwk;
+}
+
+/// The unsigned big-endian bytes of `bn`.
+private ubyte[] bnToBytes(const(BIGNUM)* bn) @trusted
+{
+	auto buf = new ubyte[BN_num_bytes(bn)];
+	BN_bn2bin(bn, buf.ptr);
+	return buf;
+}
+
 /// Whether `s` contains any C0 control character (U+0000..U+001F) or DEL.
 private bool containsControlChar(string s) @safe pure nothrow
 {
@@ -619,4 +685,31 @@ unittest  // makeClientAssertion rejects an EC key on a curve other than P-256 w
 			"https://as.example.com/token", testEcP384Pem, 1_700_000_000));
 	assert(e !is null, "a P-384 key must be rejected");
 	assert(e.msg.canFind("unsupported curve"), e.msg);
+}
+
+unittest  // publicJwkFromPrivateKeyPem derives the P-256 public coordinates of an EC key
+{
+	const pem = "-----BEGIN PRIVATE KEY-----\n"
+		~ "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgy5nLkurotTseFLEh\n"
+		~ "TcetOpmlWQKsY10kx9Dcg6b7m02hRANCAARdpXuunF3oDfCSUKOtGkybZPpwLUPF\n"
+		~ "lCYgn/nxuirfH7L2jXQ/brpaEHPPPTMZgp6p33PDD6VGlbXVXCchEIe0\n"
+		~ "-----END PRIVATE KEY-----\n";
+	auto jwk = publicJwkFromPrivateKeyPem(pem);
+	assert(jwk["kty"].get!string == "EC");
+	assert(jwk["crv"].get!string == "P-256");
+	assert(jwk["alg"].get!string == "ES256");
+	assert(jwk["x"].get!string == "XaV7rpxd6A3wklCjrRpMm2T6cC1DxZQmIJ_58boq3x8");
+	assert(jwk["y"].get!string == "svaNdD9uuloQc889MxmCnqnfc8MPpUaVtdVcJyEQh7Q");
+	assert("d" !in jwk);
+}
+
+unittest  // publicJwkFromPrivateKeyPem derives the modulus and exponent of an RSA key
+{
+	const pem = "-----BEGIN PRIVATE KEY-----\n" ~ "MIICdwIBADANBgkqhkiG9w0BAQEFAASCAmEwggJdAgEAAoGBAMo2lXCzplosNMg6\n" ~ "vK9oDmpYfQlRVgrhYVQQ+dnHzGeG3kdfhcqYp6YHkkwsTYIcT07bqPycmf6X53cS\n" ~ "DQ2x7+sb5/DF24p1rX2qitb/I1N5XCRtSf/piB20mIuo0chotn9TPVsJbjlNSxmD\n" ~ "GwHPH1Iv69l3FHNYHVhzCIH1shpJAgMBAAECgYEArtE1rPODM53YG+q7ySE6pTHP\n" ~ "F0kcC9gBXr42YtLaof31GNs6PYZwGZeeIQCEGaID5nb8xzdT4sjMsSIH6vkUIjLT\n" ~ "UTRxqihpD+RVTNMFmA/kINoptKFSvC7cr1te9PKfVPzv8awv9nQ4FjvPfurhxR0E\n" ~ "8a4IyFDj9dmQM8W9dmkCQQDmun9mZsP+HPLehsm2IyeSjqsvcHWboojVZTopQKS5\n" ~ "Ve+RqFKMyHWfdTWFaaYa30GT63X73Q5SqjZ3uK22QmOnAkEA4FyIaI+qarfOH3bS\n" ~ "TSM4SL3DticLU0bIQZjO6weZiMVwkcPQMmURYnVJVnhn4kMMCIN/oprsSKLcclVq\n" ~ "sM4QjwJANpjjFMQ0lKkc/3M9wA/JiXChKXSfH9jyMCzn+mMFl6WyLvF5tz6oNrdx\n" ~ "lsRNPgaeafZJ0POaNA17HhFhacOD+QJBALysE+oaJm1n9GZxPZiwrXw+WH6thtCZ\n" ~ "DX5cSmVLFsn1fxyVVleKtnvdtbaJupKDX3MpYgQT0++hRVDAk9/q6fECQH695tXX\n" ~ "MNtm5zG7KTSiNHIqwkTYK3O/fJZca8I0SpoaWJrBegJZOg6Yj3kK420xq2XRUDIx\n" ~ "bAmjh6f1ntky/Wk=\n" ~ "-----END PRIVATE KEY-----\n";
+	auto jwk = publicJwkFromPrivateKeyPem(pem);
+	assert(jwk["kty"].get!string == "RSA");
+	assert(jwk["alg"].get!string == "RS256");
+	assert(jwk["e"].get!string == "AQAB");
+	assert(jwk["n"].get!string == "yjaVcLOmWiw0yDq8r2gOalh9CVFWCuFhVBD52cfMZ4beR1-FypinpgeSTCxNghxPTtuo_JyZ_pfndxINDbHv6xvn8MXbinWtfaqK1v8jU3lcJG1J_-mIHbSYi6jRyGi2f1M9WwluOU1LGYMbAc8fUi_r2XcUc1gdWHMIgfWyGkk");
+	assert("d" !in jwk);
 }

@@ -771,6 +771,12 @@ struct ClientRegistration
 	/// `"web"` and then rejects the loopback redirect URIs native clients use.
 	/// Empty infers it from the first redirect URI (`applicationTypeFor`).
 	string applicationType;
+	/// The client's public JWK Set (RFC 7591 §2), by value. A `private_key_jwt`
+	/// client sends this or `jwksUri` so the authorization server can verify
+	/// its assertions. Omitted when undefined.
+	Json jwks = Json.undefined;
+	/// The URL of the client's public JWK Set (RFC 7591 §2). Omitted when empty.
+	string jwksUri;
 
 	Json toJson() const @safe
 	{
@@ -794,6 +800,10 @@ struct ClientRegistration
 			j["client_name"] = clientName;
 		if (scope_.length)
 			j["scope"] = scope_;
+		if (jwks.type == Json.Type.object)
+			j["jwks"] = jwks.clone();
+		if (jwksUri.length)
+			j["jwks_uri"] = jwksUri;
 		return j;
 	}
 }
@@ -859,6 +869,36 @@ unittest  // RegisteredClient parses client_secret_expires_at from a registratio
 			`{"client_id":"cid","client_secret":"s","client_secret_expires_at":1900000000}`));
 	assert(rc.clientSecret == "s");
 	assert(rc.clientSecretExpiresAt == 1_900_000_000);
+}
+
+unittest  // a registration request carries jwks and jwks_uri when set
+{
+	import vibe.data.json : parseJsonString;
+
+	ClientRegistration reg;
+	reg.redirectUris = ["http://127.0.0.1:8765/callback"];
+	reg.jwksUri = "https://client.example.com/jwks.json";
+	reg.jwks = parseJsonString(`{"keys":[{"kty":"EC"}]}`);
+	auto j = reg.toJson();
+	assert(j["jwks_uri"].get!string == "https://client.example.com/jwks.json");
+	assert(j["jwks"]["keys"][0]["kty"].get!string == "EC");
+	ClientRegistration bare;
+	assert("jwks" !in bare.toJson() && "jwks_uri" !in bare.toJson());
+}
+
+unittest  // a Client ID Metadata Document round-trips jwks and jwks_uri
+{
+	import vibe.data.json : parseJsonString;
+
+	ClientIdMetadataDocument d;
+	d.clientId = "https://client.example.com/meta";
+	d.redirectUris = ["http://127.0.0.1:8765/callback"];
+	d.tokenEndpointAuthMethod = "private_key_jwt";
+	d.jwksUri = "https://client.example.com/jwks.json";
+	d.jwks = parseJsonString(`{"keys":[{"kty":"EC"}]}`);
+	auto back = ClientIdMetadataDocument.fromJson(d.toJson());
+	assert(back.jwksUri == "https://client.example.com/jwks.json");
+	assert(back.jwks["keys"][0]["kty"].get!string == "EC");
 }
 
 unittest  // a registration request always names its application_type
@@ -1333,6 +1373,12 @@ struct ClientIdMetadataDocument
 	string[] responseTypes = ["code"];
 	string tokenEndpointAuthMethod = "none";
 	string scope_;
+	/// The client's public JWK Set by value, for `private_key_jwt`. Omitted
+	/// when undefined.
+	Json jwks = Json.undefined;
+	/// The URL of the client's public JWK Set, for `private_key_jwt`. Omitted
+	/// when empty.
+	string jwksUri;
 
 	/// Serialize to the JSON document hosted at the `client_id` URL. `client_id`
 	/// and `redirect_uris` are always present (per SEP-991 minimum fields);
@@ -1360,6 +1406,10 @@ struct ClientIdMetadataDocument
 		j["token_endpoint_auth_method"] = tokenEndpointAuthMethod;
 		if (scope_.length)
 			j["scope"] = scope_;
+		if (jwks.type == Json.Type.object)
+			j["jwks"] = jwks.clone();
+		if (jwksUri.length)
+			j["jwks_uri"] = jwksUri;
 		return j;
 	}
 
@@ -1380,6 +1430,10 @@ struct ClientIdMetadataDocument
 		if (am.length)
 			d.tokenEndpointAuthMethod = am;
 		d.scope_ = strField(j, "scope");
+		if (auto p = "jwks" in j)
+			if (p.type == Json.Type.object)
+				d.jwks = p.clone();
+		d.jwksUri = strField(j, "jwks_uri");
 		return d;
 	}
 }
