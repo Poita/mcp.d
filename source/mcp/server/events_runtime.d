@@ -2610,14 +2610,22 @@ final class EventsRuntime
 		const 
 		body = job.gap ? gapEnvelope(occ.cursor).toString() : occ.toJson().toString();
 		const now = opts_.nowMs();
+		auto headers = signDeliveryHeaders(signingFor(sub, occ.eventId, now), body);
+		return postToCallback(sub.url, headers, body);
+	}
+
+	/// How a POST to `sub`'s callback is signed at `now`: under its current
+	/// secret, plus the rotated-out one while its grace window lasts, so every
+	/// envelope (event, gap, verification, terminated) verifies under either.
+	private DeliverySigning signingFor(const WebhookSubscription sub, string messageId, long now) @safe
+	{
 		DeliverySigning signing = {
 			secret: sub.secret, previousSecret: sub.previousSecret,
 			previousSecretGraceUntilMs: sub.previousSecretGraceUntilMs,
-			nowMs: now, messageId: occ.eventId, timestamp: now / 1000,
+			nowMs: now, messageId: messageId, timestamp: now / 1000,
 			subscriptionId: sub.id, v1aSigner: opts_.v1aSigner
 		};
-		auto headers = signDeliveryHeaders(signing, body);
-		return postToCallback(sub.url, headers, body);
+		return signing;
 	}
 
 	// Drop a job that will not be delivered (its subscription is suspended, its
@@ -2755,11 +2763,8 @@ final class EventsRuntime
 		const nonce = randomNonce();
 		const 
 		body = verificationEnvelope(nonce).toString();
-		DeliverySigning signing = {
-			secret: sub.secret, messageId: controlMessageId("verification"), timestamp: now / 1000,
-			subscriptionId: sub.id, v1aSigner: opts_.v1aSigner
-		};
-		auto headers = signDeliveryHeaders(signing, body);
+		auto headers = signDeliveryHeaders(signingFor(sub,
+				controlMessageId("verification"), now), body);
 		auto res = postToCallback(sub.url, headers, body);
 		if (res.ok && challengeEchoed(res.body, nonce))
 		{
@@ -2868,11 +2873,8 @@ final class EventsRuntime
 		const 
 		body = terminatedEnvelope(error).toString();
 		const now = opts_.nowMs();
-		DeliverySigning signing = {
-			secret: sub.secret, messageId: controlMessageId("terminated"), timestamp: now / 1000,
-			subscriptionId: sub.id, v1aSigner: opts_.v1aSigner
-		};
-		auto headers = signDeliveryHeaders(signing, body);
+		auto headers = signDeliveryHeaders(signingFor(sub,
+				controlMessageId("terminated"), now), body);
 		opts_.deliveryExecutor(() @safe {
 			postToCallback(sub.url, headers, body);
 		});
@@ -6427,6 +6429,40 @@ unittest  // end-to-end secret rotation: deliveries dual-sign within grace, sing
 			afterGrace.headers) == afterGrace.body);
 	assertThrown!WebhookException(Webhook(testSecret)
 			.verifyIgnoringTimestamp(afterGrace.body, afterGrace.headers));
+}
+
+unittest  // verification and terminated envelopes dual-sign within the rotation grace
+{
+	import standardwebhooks : Webhook;
+
+	enum secretB = "whsec_BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBA=";
+
+	auto ft = new FakeWebhookTransport();
+	auto rt = engineRuntime(ft);
+	auto p = webhookSub("n", "https://proxy/hooks");
+	auto r = rt.subscribeWebhook(p, "user-1");
+	auto rotate = p;
+	rotate.delivery = WebhookDelivery("https://proxy/hooks", secretB);
+	rt.subscribeWebhook(rotate, "user-1");
+
+	rt.emit(EventOccurrence("evt_1", "n", "t", Json(["x": Json(1)])));
+	auto verification = ft.posts[0];
+	assert(parseJsonString(verification.body)["type"].get!string == "verification");
+	assert(Webhook(testSecret).verifyIgnoringTimestamp(verification.body,
+			verification.headers) == verification.body);
+	assert(Webhook(secretB).verifyIgnoringTimestamp(verification.body,
+			verification.headers) == verification.body);
+
+	rt.terminateWebhook(r.id, Json([
+			"code": Json(-32001),
+			"message": Json("revoked")
+	]));
+	auto terminated = ft.posts[$ - 1];
+	assert(parseJsonString(terminated.body)["type"].get!string == "terminated");
+	assert(Webhook(testSecret).verifyIgnoringTimestamp(terminated.body,
+			terminated.headers) == terminated.body);
+	assert(Webhook(secretB).verifyIgnoringTimestamp(terminated.body,
+			terminated.headers) == terminated.body);
 }
 
 unittest  // emit verifies the endpoint, then delivers a signed, routable POST
