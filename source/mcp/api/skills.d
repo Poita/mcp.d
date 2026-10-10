@@ -1871,6 +1871,15 @@ version (unittest)
 			server_.handle(Message(message));
 		}
 
+		void postOneway(Json message) @safe nothrow
+		{
+			try
+				sendOneway(message);
+			catch (Exception)
+			{
+			}
+		}
+
 		void abort(long, McpException) @safe
 		{
 		}

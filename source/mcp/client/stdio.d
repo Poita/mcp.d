@@ -407,6 +407,15 @@ final class StdioClientTransport : ClientTransport
 		send(message);
 	}
 
+	void postOneway(Json message) @safe nothrow
+	{
+		try
+			chan().post(message);
+		catch (Exception)
+		{
+		}
+	}
+
 	/// Serialize a single message and write it as one newline-delimited line
 	/// through the channel's serialized writer. `Json.toString` never emits a raw
 	/// newline, so the line framing holds and only a valid MCP message is written
@@ -2179,4 +2188,55 @@ unittest  // a stdio write that fails because the server stopped reading surface
 	assert(failure.length == 0, failure);
 	assert(requestClosed, "a failed request write must raise TransportClosedException");
 	assert(notifyClosed, "a failed notification write must raise TransportClosedException");
+}
+
+unittest  // CancellationToken.cancel returns while the server has stopped reading stdin
+{
+	import core.time : msecs, Duration;
+	import vibe.core.core : sleep;
+	import vibe.core.sync : createManualEvent;
+	import mcp.client.client : ClientSettings, RequestOptions, CancellationToken;
+
+	auto toClient = new TestLines;
+	auto unstall = createManualEvent();
+	bool stall, cancelReturned, cancelledInTime;
+	const failure = inLoopCapturing(() @safe {
+		ClientSettings s;
+		s.requestTimeout = Duration.zero;
+		auto client = McpClient.stdio(() @safe => toClient.take(), (string l) @safe {
+			if (stall)
+			{
+				const ec = unstall.emitCount;
+				unstall.wait(ec);
+			}
+		}, s);
+		auto token = new CancellationToken;
+		RequestOptions opts;
+		opts.cancellation = token;
+		runTask(() nothrow{
+			try
+				client.callTool("slow", Json.emptyObject, opts);
+			catch (Exception)
+			{
+			}
+		});
+		sleep(50.msecs);
+		// The server stops reading: every further write parks.
+		stall = true;
+		runTask(() nothrow{
+			try
+				token.cancel("user aborted");
+			catch (Exception)
+			{
+			}
+			cancelReturned = true;
+		});
+		sleep(300.msecs);
+		cancelledInTime = cancelReturned;
+		unstall.emit();
+		toClient.closeEnd();
+		sleep(50.msecs);
+	});
+	assert(failure.length == 0, failure);
+	assert(cancelledInTime, "cancel() must not park behind a server that stopped reading");
 }

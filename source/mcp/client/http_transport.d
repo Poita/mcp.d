@@ -811,6 +811,23 @@ final class HttpClientTransport : ClientTransport
 		}
 	}
 
+	void postOneway(Json message) @safe nothrow
+	{
+		import vibe.core.core : runTask;
+
+		try
+			runTask((Json msg) nothrow{
+				try
+					sendOneway(msg);
+				catch (Exception)
+				{
+				}
+			}, message);
+		catch (Exception)
+		{
+		}
+	}
+
 	void abort(long expectId, McpException reason) @safe
 	{
 		if (auto w = expectId in legacyWaiters)

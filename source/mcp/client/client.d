@@ -4112,7 +4112,17 @@ final class McpClient : ClientProtocol
 		params["requestId"] = requestId;
 		if (reason.length)
 			params["reason"] = reason;
-		notify("notifications/cancelled", params);
+		ensureNotReleased();
+		auto message = makeNotification("notifications/cancelled", params);
+		version (unittest)
+			if (onNotifyForTest !is null)
+			{
+				onNotifyForTest(message);
+				return;
+			}
+		// Posted, not sent: a cancellation (from a CancellationToken or a request
+		// deadline) must not park behind a server that has stopped reading.
+		transport.postOneway(message);
 	}
 
 	/// Register the client's filesystem roots using the typed `Root` API,
@@ -9275,6 +9285,10 @@ version (unittest)
 				throw sendFailure;
 		}
 
+		void postOneway(Json message) @safe nothrow
+		{
+		}
+
 		long[] aborted; // every id passed to abort, in order
 
 		void abort(long expectId, McpException reason) @safe
@@ -9317,6 +9331,15 @@ version (unittest)
 		void sendOneway(Json message) @safe
 		{
 			server_.handle(Message(message));
+		}
+
+		void postOneway(Json message) @safe nothrow
+		{
+			try
+				sendOneway(message);
+			catch (Exception)
+			{
+			}
 		}
 
 		void abort(long, McpException) @safe

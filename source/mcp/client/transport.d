@@ -141,6 +141,12 @@ interface ClientTransport
 	/// response to a server->client request.
 	void sendOneway(Json message) @safe;
 
+	/// Send a one-way message on a task of its own and return at once, without
+	/// waiting for it to be written or learning whether it was. For
+	/// cancellation traffic (`notifications/cancelled`), which must not park
+	/// its caller behind a server that has stopped reading.
+	void postOneway(Json message) @safe nothrow;
+
 	/// Open the standalone server->client stream, if the transport has one
 	/// (HTTP GET SSE). A no-op on stdio.
 	void startServerStream() @safe;
