@@ -600,6 +600,35 @@ private void validateParamUdas(alias func)()
 					~ attr.parameter ~ "\", ...) names no schema parameter of this method "
 					~ "(an injected RequestContext/TaskContext has no schema property).");
 	}
+
+	// Header names compare ASCII case-insensitively on the wire, so two
+	// `@mcpHeader`s differing only in case would claim the same header.
+	alias attrs = AliasSeq!(__traits(getAttributes, func));
+	static foreach (i, a; attrs)
+		static if (is(typeof(a) == mcpHeader))
+			static foreach (b; attrs[0 .. i])
+				static if (is(typeof(b) == mcpHeader))
+					{
+					static assert(a.parameter != b.parameter,
+							"@mcpHeader on '" ~ __traits(identifier,
+								func) ~ "' mirrors parameter '" ~ a.parameter ~ "' twice");
+					static assert(!asciiEqualsIgnoreCase(a.name, b.name),
+							"@mcpHeader on '" ~ __traits(identifier, func) ~ "' uses the header name '"
+							~ a.name ~ "' twice (header names are case-insensitive)");
+				}
+}
+
+/// Whether `a` and `b` are equal ignoring ASCII case.
+private bool asciiEqualsIgnoreCase(string a, string b) @safe pure nothrow @nogc
+{
+	import std.ascii : toLower;
+
+	if (a.length != b.length)
+		return false;
+	foreach (i; 0 .. a.length)
+		if (toLower(a[i]) != toLower(b[i]))
+			return false;
+	return true;
 }
 
 /// Resolve the documentation string for the parameter named `pname` of `func`
@@ -2618,6 +2647,38 @@ unittest  // @mcpHeader: a non-primitive sibling of the header parameter is acce
 {
 	auto s = new McpServer("t", "1");
 	static assert(__traits(compiles, registerHandlers(s, new HeaderBesideArrayApi)));
+}
+
+version (unittest) private class DuplicateHeaderNameApi
+{
+	@tool("q", "Two parameters mirrored into one header")
+	@mcpHeader("region", "Region") @mcpHeader("zone", "region")
+	string q(string region, string zone) @safe
+	{
+		return region ~ zone;
+	}
+}
+
+version (unittest) private class TwoHeadersOneParamApi
+{
+	@tool("q", "One parameter mirrored into two headers")
+	@mcpHeader("region", "Region") @mcpHeader("region", "Zone")
+	string q(string region) @safe
+	{
+		return region;
+	}
+}
+
+unittest  // @mcpHeader: two headers differing only in ASCII case are rejected at compile time
+{
+	auto s = new McpServer("t", "1");
+	static assert(!__traits(compiles, registerHandlers(s, new DuplicateHeaderNameApi)));
+}
+
+unittest  // @mcpHeader: two headers on one parameter are rejected at compile time
+{
+	auto s = new McpServer("t", "1");
+	static assert(!__traits(compiles, registerHandlers(s, new TwoHeadersOneParamApi)));
 }
 
 unittest  // @mcpHeader: naming a non-existent parameter is rejected at compile time
