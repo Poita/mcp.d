@@ -452,3 +452,25 @@ bool tryGetWhole(N : Nullable!T, T)(Json j, string key, ref N val) @safe
 {
 	requireObject(Json.emptyObject, "x");
 }
+
+/// ASCII case-insensitive equality, for protocol tokens such as URL schemes,
+/// host names, and header names. Non-ASCII bytes compare exactly.
+package(mcp) bool asciiEqualsIgnoreCase(scope const(char)[] a, scope const(char)[] b) @safe pure nothrow @nogc
+{
+	import std.ascii : toLower;
+
+	if (a.length != b.length)
+		return false;
+	foreach (i, c; a)
+		if (toLower(c) != toLower(b[i]))
+			return false;
+	return true;
+}
+
+unittest  // asciiEqualsIgnoreCase folds ASCII case only
+{
+	assert(asciiEqualsIgnoreCase("HTTPS", "https"));
+	assert(asciiEqualsIgnoreCase("LocalHost", "localhost"));
+	assert(!asciiEqualsIgnoreCase("http", "https"));
+	assert(!asciiEqualsIgnoreCase("\xC3\x89", "\xC3\xA9"));
+}

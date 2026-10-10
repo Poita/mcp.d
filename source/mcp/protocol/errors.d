@@ -3,6 +3,7 @@ module mcp.protocol.errors;
 import vibe.data.json : Json;
 import mcp.protocol.capabilities : ClientCapabilities;
 import mcp.protocol.versions : ProtocolVersion, resourceNotFoundCode;
+import mcp.protocol.jsonhelpers : asciiEqualsIgnoreCase;
 
 @safe:
 
@@ -240,7 +241,7 @@ bool isValidElicitationUrl(string url) @safe pure nothrow @nogc
 	// Restrict to web schemes (case-insensitive). URL-mode elicitation drives
 	// browser navigation, so non-web schemes such as `file`, `ftp` or `ws` are
 	// rejected even though they carry a `//authority`. Only `http`/`https` pass.
-	if (!schemeEquals(scheme, "http") && !schemeEquals(scheme, "https"))
+	if (!asciiEqualsIgnoreCase(scheme, "http") && !asciiEqualsIgnoreCase(scheme, "https"))
 		return false;
 
 	// Require a hierarchical authority ("//host…"). URL-mode elicitation always
@@ -285,21 +286,6 @@ bool isValidElicitationUrl(string url) @safe pure nothrow @nogc
 	if (colon >= 0)
 		authority = authority[0 .. colon];
 	return authority.length > 0;
-}
-
-/// ASCII case-insensitive equality for an elicitation URL scheme. Avoids the
-/// allocation/`@nogc` cost of `std.uni.toLower` so `isValidElicitationUrl` can
-/// stay `pure nothrow @nogc`.
-private bool schemeEquals(scope const(char)[] scheme, scope string lower) @safe pure nothrow @nogc
-{
-	import std.ascii : toLower;
-
-	if (scheme.length != lower.length)
-		return false;
-	foreach (i, c; scheme)
-		if (toLower(c) != lower[i])
-			return false;
-	return true;
 }
 
 /// A single URL-mode elicitation entry carried by a `-32042`

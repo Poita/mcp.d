@@ -3,6 +3,7 @@ module mcp.protocol.ssrf;
 import core.time : Duration;
 import vibe.http.client : HTTPClientRequest, HTTPClientResponse;
 import vibe.stream.tls : TLSContext;
+import mcp.protocol.jsonhelpers : asciiEqualsIgnoreCase;
 
 @safe:
 
@@ -626,17 +627,11 @@ private AddressClass classifyIpv6Literal(string inner) @safe pure nothrow @nogc
 /// case-insensitively, and one trailing dot marks the same name fully qualified.
 private bool isLocalhostName(string name) @safe pure nothrow @nogc
 {
-	import std.ascii : toLower;
+	import mcp.protocol.jsonhelpers : asciiEqualsIgnoreCase;
 
-	enum lh = "localhost";
 	if (name.length && name[$ - 1] == '.')
 		name = name[0 .. $ - 1];
-	if (name.length != lh.length)
-		return false;
-	foreach (i, c; name)
-		if (toLower(c) != lh[i])
-			return false;
-	return true;
+	return asciiEqualsIgnoreCase(name, "localhost");
 }
 
 /// Classify a resolved address given as its numeric string form (as produced by
@@ -1132,8 +1127,8 @@ private void fetchPinned(string url, SsrfPolicy policy,
 	// Scheme gate: https to any host, plus (allowLoopback only) http to an
 	// explicit loopback host for dev. allowUserConfigured leaves the scheme to
 	// the caller (the transport already enforces its own scheme rules).
-	const isHttps = eqSchemeAscii(scheme, "https");
-	const isHttp = eqSchemeAscii(scheme, "http");
+	const isHttps = asciiEqualsIgnoreCase(scheme, "https");
+	const isHttp = asciiEqualsIgnoreCase(scheme, "http");
 	const tls = isHttps;
 
 	if (policy == SsrfPolicy.blockInternal && !isHttps)
@@ -1237,22 +1232,6 @@ private string buildHostHeader(string host, ushort port, ushort defaultPort) @sa
 	if (port && port != defaultPort)
 		return base ~ ":" ~ port.to!string;
 	return base;
-}
-
-/// Case-insensitive ASCII scheme compare without allocating.
-private bool eqSchemeAscii(string scheme, string sc) @safe pure nothrow @nogc
-{
-	if (scheme.length != sc.length)
-		return false;
-	foreach (k, ch; scheme)
-	{
-		char c = ch;
-		if (c >= 'A' && c <= 'Z')
-			c = cast(char)(c + 32);
-		if (c != sc[k])
-			return false;
-	}
-	return true;
 }
 
 // ===========================================================================

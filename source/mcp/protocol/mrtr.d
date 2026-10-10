@@ -6,6 +6,7 @@ import vibe.data.json : Json;
 import mcp.protocol.versions : ProtocolVersion;
 import mcp.protocol.sampling : CreateMessageRequest;
 import mcp.protocol.errors : isValidElicitationUrl;
+import std.ascii : isAlpha, isAlphaNum;
 import mcp.protocol.jsonhelpers : tryGet, requireObject;
 
 @safe:
@@ -130,16 +131,6 @@ private bool isValidMetaName(string name) @safe pure nothrow
 		if (!isAlphaNum(c) && c != '-' && c != '_' && c != '.')
 			return false;
 	return true;
-}
-
-private bool isAlpha(char c) @safe pure nothrow
-{
-	return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z');
-}
-
-private bool isAlphaNum(char c) @safe pure nothrow
-{
-	return isAlpha(c) || (c >= '0' && c <= '9');
 }
 
 /// Whether a `_meta` key's prefix is reserved for MCP use, applying the rule for
@@ -463,15 +454,6 @@ string validateHeaderName(string value) @safe pure nothrow
 	return null;
 }
 
-/// ASCII-lowercase a string for case-insensitive comparison of header names.
-private string asciiLowerName(string s) @safe pure nothrow
-{
-	char[] buf = new char[s.length];
-	foreach (i, char c; s)
-		buf[i] = (c >= 'A' && c <= 'Z') ? cast(char)(c + 32) : c;
-	return () @trusted { return cast(string) buf; }();
-}
-
 /// A single `x-mcp-header` annotation discovered in a tool `inputSchema`,
 /// together with the path of property keys to reach the annotated value.
 struct ParamHeader
@@ -614,7 +596,9 @@ string validateInputSchemaHeaders(Json inputSchema) @safe
 							~ " (integer/string/boolean); type '" ~ ptype ~ "' is not permitted";
 						break;
 					}
-					const lc = asciiLowerName(hv);
+					import std.uni : toLower;
+
+					const lc = hv.toLower;
 					if (lc in seen)
 					{
 						err = "x-mcp-header value '" ~ hv
