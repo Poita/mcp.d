@@ -63,6 +63,7 @@ import mcp.auth.oauth_proxy : BrokeredToken, ConsentRequiredException,
 	InvalidRedirectUriException, OAuthProxy, OAuthProxyConfig, RelayedCodeBinding;
 import mcp.protocol.jsonrpc : parseUntrustedJson;
 import mcp.protocol.ssrf : SsrfPolicy;
+import mcp.transport.client_bucket : clientBucket, defaultIpv6BucketPrefix;
 
 @safe:
 
@@ -470,10 +471,16 @@ struct OAuthProxyMountOptions
 	/// Maximum number of clients the rate limiter tracks at once.
 	size_t maxRateLimitedClients = 100_000;
 
-	/// The key a request is rate limited under. Null uses the peer address;
-	/// behind a reverse proxy, derive it from the forwarding header that proxy
-	/// sets, or every user shares one budget.
+	/// The key a request is rate limited under. Null uses the peer address,
+	/// with IPv6 peers grouped by `ipv6BucketPrefix`; behind a reverse proxy,
+	/// derive it from the forwarding header that proxy sets, or every user
+	/// shares one budget.
 	string delegate(scope HTTPServerRequest req) @safe clientKey;
+
+	/// The IPv6 prefix length, in bits, that the default `clientKey` groups
+	/// peers by, so a client cannot multiply its budget by rotating through its
+	/// own block. IPv4 peers are keyed per address.
+	uint ipv6BucketPrefix = defaultIpv6BucketPrefix;
 
 	/// Injectable monotonic clock for the rate limiter (tests). Null uses
 	/// `MonoTime.currTime`.
@@ -493,8 +500,9 @@ ProxyRequestLimit proxyRequestLimit(OAuthProxyMountOptions opts) @safe
 	auto limiter = new ClientRateLimiter(opts.maxRequestsPerClient,
 			opts.rateLimitWindow, opts.maxRateLimitedClients, opts.clock);
 	auto key = opts.clientKey;
+	const prefix = opts.ipv6BucketPrefix;
 	return (scope HTTPServerRequest req) @safe {
-		return limiter.allow(key !is null ? key(req) : req.clientAddress.toAddressString());
+		return limiter.allow(key !is null ? key(req) : clientBucket(req.clientAddress, prefix));
 	};
 }
 
@@ -1695,6 +1703,37 @@ unittest  // RATE LIMIT: /register and /authorize refuse a client past maxReques
 	assert(authorize.status == 429);
 	// Another client has its own budget.
 	assert(browserPost(router, "https://mcp.example.com/register?k=b", body_, "").status == 201);
+}
+
+version (unittest) private HTTPServerRequest requestFrom(string from) @safe
+{
+	import vibe.core.net : resolveHost;
+	import vibe.http.server : createTestHTTPServerRequest;
+	import vibe.inet.url : URL;
+
+	auto req = createTestHTTPServerRequest(URL("https://mcp.example.com/register"));
+	req.clientAddress = resolveHost(from);
+	return req;
+}
+
+unittest  // RATE LIMIT: callers in one IPv6 /64 share a budget
+{
+	OAuthProxyMountOptions opts;
+	opts.maxRequestsPerClient = 1;
+	auto limit = proxyRequestLimit(opts);
+	assert(limit(requestFrom("2001:db8:1:2::1")));
+	assert(!limit(requestFrom("2001:db8:1:2::2")));
+	assert(limit(requestFrom("2001:db8:1:3::1")), "another /64 has its own budget");
+}
+
+unittest  // RATE LIMIT: the IPv6 bucket prefix is configurable
+{
+	OAuthProxyMountOptions opts;
+	opts.maxRequestsPerClient = 1;
+	opts.ipv6BucketPrefix = 128;
+	auto limit = proxyRequestLimit(opts);
+	assert(limit(requestFrom("2001:db8:1:2::1")));
+	assert(limit(requestFrom("2001:db8:1:2::2")));
 }
 
 unittest  // the store caps live entries, evicting the oldest by insertion time

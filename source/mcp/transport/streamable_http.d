@@ -17,6 +17,7 @@ import mcp.protocol.events;
 import mcp.transport.coordinator : defaultServerRequestTimeout, cancelledNotification;
 import mcp.transport.sse_context;
 import mcp.transport.session;
+import mcp.transport.client_bucket : clientBucket, defaultIpv6BucketPrefix;
 import mcp.auth.resource_server;
 import mcp.server.context : RequestContext, BaseRequestContext, ConnectionScoped, StdioContext;
 import mcp.server.connection : ConnectionState;
@@ -281,6 +282,12 @@ struct StreamableHttpOptions
 
 	/// Caps on concurrent streams and legacy dispatches.
 	StreamLimits streamLimits;
+
+	/// The IPv6 prefix length, in bits, that the per-address caps in
+	/// `streamLimits` and `sessionLimits` group unauthenticated callers by, so
+	/// a client cannot multiply its share by rotating through its own block.
+	/// IPv4 callers are counted per address.
+	uint ipv6BucketPrefix = defaultIpv6BucketPrefix;
 }
 
 /// The well-known path prefix (RFC 9728 §3) under which a protected resource
@@ -463,7 +470,7 @@ void mountMcp(URLRouter router, McpServer server,
 		if (!readPostBody(req, res, opts.maxRequestBytes, payload))
 			return;
 		handlePost(server, push, sessions, statelessInFlight, pushStreams,
-			opts.streamLimits.maxQueuedStreamBytes, token, payload, req, res);
+			opts, token, payload, req, res);
 	});
 	if (sessions !is null)
 		sessions.onExpire = (string sid) @safe { push.closeSession(sid); };
@@ -577,7 +584,7 @@ void mountLegacyHttpSse(URLRouter router, McpServer server,
 			return;
 		}
 		const principal = principalOf(token);
-		const address = remoteAddressOf(req);
+		const address = remoteAddressOf(req, opts);
 		if (const why = streams.tryAcquire(principal, address))
 		{
 			refuseTooManyStreams(res, why);
@@ -1797,16 +1804,10 @@ private string principalOf(TokenInfo token) @safe
 	return token.valid ? token.subject : "";
 }
 
-/// The remote IP address a request came from, or "" when it did not arrive over
-/// IP (a test request, a Unix socket).
-private string remoteAddressOf(HTTPServerRequest req) @safe nothrow
+/// The key the per-address caps count `req`'s caller under; see `clientBucket`.
+private string remoteAddressOf(HTTPServerRequest req, StreamableHttpOptions opts) @safe nothrow
 {
-	import std.socket : AddressFamily;
-
-	const family = req.clientAddress.family;
-	if (family != AddressFamily.INET && family != AddressFamily.INET6)
-		return "";
-	return req.clientAddress.toAddressString();
+	return clientBucket(req.clientAddress, opts.ipv6BucketPrefix);
 }
 
 /// Answer a GET refused a stream slot: 503 when the mount-wide cap is reached,
@@ -1879,7 +1880,7 @@ private void handleGet(McpServer server, ServerPushChannel push,
 	// `notifications/resources/updated` delivery on this stream gates on THIS
 	// session's `resources/subscribe` set rather than the shared fallback state.
 	ConnectionState getConn;
-	const address = remoteAddressOf(req);
+	const address = remoteAddressOf(req, opts);
 	// The owning session's `Mcp-Session-Id`, used to scope Last-Event-ID resume to
 	// this session so one client cannot replay another session's buffered stream
 	// history by presenting its event id (cross-session disclosure).
@@ -2566,10 +2567,12 @@ unittest  // a stateful initialize is scoped by its minted session, never the he
 
 private void handlePost(McpServer server, ServerPushChannel push,
 		SessionManager sessions, StatelessInFlight statelessInFlight,
-		StreamGate pushStreams, size_t maxQueued,
+		StreamGate pushStreams,
+		StreamableHttpOptions opts,
 		TokenInfo token, string payload, HTTPServerRequest req, HTTPServerResponse res) @safe
 {
 	auto coord = push.coordinator;
+	const maxQueued = opts.streamLimits.maxQueuedStreamBytes;
 
 	ParsedInput input;
 	try
@@ -2812,7 +2815,7 @@ private void handlePost(McpServer server, ServerPushChannel push,
 		if (sessions !is null && msg.method == "initialize")
 		{
 			try
-				mintedSessionId = sessions.create(principalOf(token), remoteAddressOf(req));
+				mintedSessionId = sessions.create(principalOf(token), remoteAddressOf(req, opts));
 			catch (SessionCapacityException e)
 			{
 				res.statusCode = HTTPStatus.serviceUnavailable;
@@ -2890,7 +2893,7 @@ private void handlePost(McpServer server, ServerPushChannel push,
 				return;
 			}
 			const principal = principalOf(token);
-			const address = remoteAddressOf(req);
+			const address = remoteAddressOf(req, opts);
 			if (const why = pushStreams.tryAcquire(principal, address))
 			{
 				refuseTooManyPushStreams(res, msg.id, why);
@@ -2919,7 +2922,7 @@ private void handlePost(McpServer server, ServerPushChannel push,
 				return;
 			}
 			const principal = principalOf(token);
-			const address = remoteAddressOf(req);
+			const address = remoteAddressOf(req, opts);
 			if (const why = pushStreams.tryAcquire(principal, address))
 			{
 				refuseTooManyPushStreams(res, msg.id, why);
@@ -3165,6 +3168,68 @@ unittest  // with auth on, every member of a 2025-03-26 batch sees the caller's 
 	auto arr = parseJsonString(reply);
 	assert(arr[0]["result"]["content"][0]["text"].get!string == "alice",
 			"a batch member must run under the request's authenticated principal: " ~ reply);
+}
+
+version (unittest) private string initializeFrom(URLRouter router, string from) @safe
+{
+	import vibe.core.net : resolveHost;
+	import vibe.http.server : createTestHTTPServerResponse, TestHTTPResponseMode;
+	import vibe.stream.memory : createMemoryOutputStream;
+
+	auto req = makeInitPostReq(initializeBody(), [
+		"Accept": "application/json, text/event-stream"
+	]);
+	req.clientAddress = resolveHost(from);
+	auto res = createTestHTTPServerResponse(createMemoryOutputStream(), null,
+			TestHTTPResponseMode.bodyOnly);
+	router.handleRequest(req, res);
+	return res.headers.get(SessionHeader, "");
+}
+
+version (unittest) private int pingStatus(URLRouter router, string sid) @safe
+{
+	import vibe.http.server : createTestHTTPServerResponse, TestHTTPResponseMode;
+	import vibe.stream.memory : createMemoryOutputStream;
+
+	auto res = createTestHTTPServerResponse(createMemoryOutputStream(), null,
+			TestHTTPResponseMode.bodyOnly);
+	router.handleRequest(makeInitPostReq(`{"jsonrpc":"2.0","id":2,"method":"ping"}`,
+			[
+				"Accept": "application/json, text/event-stream",
+				"MCP-Protocol-Version": "2025-11-25",
+				SessionHeader: sid
+	]), res);
+	return res.statusCode;
+}
+
+unittest  // anonymous sessions from one IPv6 /64 share the per-address session cap
+{
+	auto server = McpServer.stateful("t", "1");
+	auto router = new URLRouter;
+	StreamableHttpOptions opts;
+	opts.sessionLimits.maxAnonymousPerAddress = 1;
+	mountMcp(router, server, opts);
+
+	const first = initializeFrom(router, "2001:db8:1:2::1");
+	const second = initializeFrom(router, "2001:db8:1:2::2");
+	assert(first.length && second.length);
+	assert(pingStatus(router, first) == 404, "the /64's older session is evicted");
+	assert(pingStatus(router, second) == 200);
+}
+
+unittest  // the IPv6 bucket prefix for per-address caps is configurable
+{
+	auto server = McpServer.stateful("t", "1");
+	auto router = new URLRouter;
+	StreamableHttpOptions opts;
+	opts.sessionLimits.maxAnonymousPerAddress = 1;
+	opts.ipv6BucketPrefix = 128;
+	mountMcp(router, server, opts);
+
+	const first = initializeFrom(router, "2001:db8:1:2::1");
+	const second = initializeFrom(router, "2001:db8:1:2::2");
+	assert(pingStatus(router, first) == 200);
+	assert(pingStatus(router, second) == 200);
 }
 
 unittest  // a 2025-03-26 batch whose Accept excludes both reply media types is refused with 406
