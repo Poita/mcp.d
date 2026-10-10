@@ -19,7 +19,7 @@ import mcp.protocol.modern;
 import mcp.protocol.mrtr;
 import mcp.client.transport : BearerProvider, ClientTransport, ClientProtocol, InboundOrigin;
 import mcp.client.http_transport : HttpClientTransport, HttpStatusException,
-	isLegacyFallbackStatus, defaultMaxMessageBytes;
+	SessionExpiredException, isLegacyFallbackStatus, defaultMaxMessageBytes;
 import mcp.client.stdio : StdioClientTransport, spawnStdioTransport;
 import mcp.client.subscription : SubscriptionStream, SubscriptionFilter;
 import mcp.client.cache : CacheStore, InMemoryCacheStore, CacheKey, CacheEntry, noCache;
@@ -381,6 +381,14 @@ struct ClientSettings
 	/// expected to run longer. `Duration.zero` imposes no cap beyond
 	/// `requestTimeout`.
 	Duration maxTotalTimeout = 30.minutes;
+
+	/// Whether a request the server rejects because its HTTP session expired
+	/// (`SessionExpiredException`) starts a new session, re-running `initialize`
+	/// with the protocol version last requested, and is then retried once. Off
+	/// by default, so the application decides when a new session begins; the
+	/// new session does not carry over server-side state such as resource
+	/// subscriptions.
+	bool reinitializeOnSessionExpiry;
 
 	/// How long `awaitTask` waits between `tasks/get` polls when the server gives
 	/// no `pollIntervalMs`.
@@ -834,6 +842,7 @@ final class McpClient : ClientProtocol
 		eventSettings_ = settings.events;
 		resetTimeoutOnProgress_ = settings.resetTimeoutOnProgress;
 		maxTotalTimeout_ = settings.maxTotalTimeout;
+		reinitializeOnSessionExpiry_ = settings.reinitializeOnSessionExpiry;
 		taskPollInterval_ = settings.taskPollInterval;
 		taskTimeout_ = settings.taskTimeout;
 		maxTaskPollInterval_ = settings.maxTaskPollInterval;
@@ -853,6 +862,10 @@ final class McpClient : ClientProtocol
 
 	private Duration requestTimeout_ = ClientSettings.init.requestTimeout;
 	private bool resetTimeoutOnProgress_ = ClientSettings.init.resetTimeoutOnProgress;
+	private bool reinitializeOnSessionExpiry_;
+	// The version the last `initialize` requested, which a session restarted
+	// after expiry requests again.
+	private string lastRequestedVersion_;
 	private Duration maxTotalTimeout_ = ClientSettings.init.maxTotalTimeout;
 
 	/// How long a request may wait for its response; see
@@ -1148,6 +1161,7 @@ final class McpClient : ClientProtocol
 		// (and the session continues) without modern per-request framing.
 		useModern = false;
 		transport.setModernProtocol(false);
+		lastRequestedVersion_ = requestedVersion;
 		InitializeParams params;
 		params.protocolVersion = requestedVersion;
 		// Advertise capabilities in the wire shape for the requested version:
@@ -3632,6 +3646,20 @@ final class McpClient : ClientProtocol
 	/// the session's own framing; null uses the session's.
 	private Json rpc(string method, Json params,
 			Nullable!ProtocolVersion framing = Nullable!ProtocolVersion.init) @safe
+	{
+		try
+			return rpcOnce(method, params, framing);
+		catch (SessionExpiredException e)
+		{
+			if (!reinitializeOnSessionExpiry_ || !didInitialize || method == "initialize")
+				throw e;
+			initialize(lastRequestedVersion_);
+			return rpcOnce(method, params, framing);
+		}
+	}
+
+	/// One attempt of `rpc`.
+	private Json rpcOnce(string method, Json params, Nullable!ProtocolVersion framing) @safe
 	{
 		ensureNotReleased();
 		try
@@ -9816,6 +9844,7 @@ unittest  // a client over a custom transport applies every ClientSettings knob
 	s.requestTimeout = 5.seconds;
 	s.resetTimeoutOnProgress = false;
 	s.maxTotalTimeout = 7.seconds;
+	s.reinitializeOnSessionExpiry = true;
 	s.taskPollInterval = 2.seconds;
 	s.taskTimeout = 3.seconds;
 	s.maxTaskPollInterval = 4.seconds;
@@ -9828,6 +9857,7 @@ unittest  // a client over a custom transport applies every ClientSettings knob
 	assert(c.requestTimeout == 5.seconds);
 	assert(!c.resetTimeoutOnProgress_);
 	assert(c.maxTotalTimeout_ == 7.seconds);
+	assert(c.reinitializeOnSessionExpiry_);
 	assert(c.taskPollInterval_ == 2.seconds);
 	assert(c.taskTimeout_ == 3.seconds);
 	assert(c.maxTaskPollInterval_ == 4.seconds);

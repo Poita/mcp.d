@@ -4399,6 +4399,28 @@ unittest  // a request on an expired session fails with SessionExpiredException
 	assert(expired == 2, "both the 404 and the request after it must report the expired session");
 }
 
+unittest  // ClientSettings.reinitializeOnSessionExpiry starts a new session and retries the request
+{
+	import mcp.client.client : McpClient, ClientSettings;
+
+	auto srv = new SessionFakeServer;
+	size_t tools = size_t.max;
+	const failure = runAgainstFakeServer(srv.router(), (string url) @safe {
+		ClientSettings s;
+		s.reinitializeOnSessionExpiry = true;
+		auto client = McpClient.http(url, s);
+		scope (exit)
+			client.close();
+		client.initialize("2025-11-25");
+		srv.expire();
+		tools = client.listTools().tools.length;
+	});
+	assert(failure.length == 0, "scenario failed: " ~ failure);
+	assert(tools == 0, "the request must succeed on the new session");
+	assert(srv.initializeSessionHeaders == ["", ""],
+			"the expiry must trigger one fresh initialize without a session id");
+}
+
 unittest  // the server stream an expired session ended is reopened once the client re-initializes
 {
 	import core.time : msecs;
