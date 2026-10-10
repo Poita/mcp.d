@@ -561,9 +561,10 @@ final class TaskRuntime
 	/// flag. A task with no executor running to honor it — a manual task
 	/// (`toolName` empty), one suspended in `input_required`, or one the executor
 	/// detached — transitions to `cancelled` immediately; for a running executor
-	/// the status is left untouched so it can observe the flag and decide its own
-	/// terminal state (cancellation is cooperative), and a repeated request for it
-	/// stores nothing.
+	/// the status is left untouched so it can observe the flag and stop at a safe
+	/// point, and a repeated request for it stores nothing. Once requested, the
+	/// cancel wins: when that executor returns or throws, its dispatcher records
+	/// the task `cancelled` rather than `completed` or `failed`.
 	void cancel(string id) @safe
 	{
 		modify(id, (ref TaskRecord r) @safe {
