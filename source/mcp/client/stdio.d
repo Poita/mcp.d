@@ -41,6 +41,8 @@ import mcp.protocol.mrtr : MetaKey;
 final class StdioClientTransport : ClientTransport
 {
 	version (Posix) import vibe.core.process : ProcessPipes;
+
+	version (Windows) import core.thread : Thread;
 	import core.time : Duration, seconds, msecs;
 
 	private string delegate() @safe readLine;
@@ -617,31 +619,75 @@ final class StdioClientTransport : ClientTransport
 		// reader never parks on a full buffer) plus a vibe `sleep` yield -- because
 		// the channel's wakeups are fiber-based: a blocking OS-level `join` here
 		// would stall the event loop the reader's channel-close notification needs.
-		// The trailing `join` runs only once the thread has already exited, so it
-		// returns immediately and just reclaims the thread.
+		// A grandchild that inherited a pipe end can keep a thread's blocking read
+		// or write from ever ending, so the wait is bounded: past `threadGrace` the
+		// thread's pending I/O is cancelled, and a thread still running after a
+		// second grace is abandoned rather than joined.
 		() @trusted {
 			if (c.reader !is null)
 			{
-				PumpedLine discard;
-				while (c.reader.isRunning)
-				{
-					while (c.lines.tryConsumeOne(discard, Duration.zero))
-					{
-					}
-					sleep(5.msecs);
-				}
-				c.reader.join(false);
+				if (awaitThread(c.reader, () { drainLines(c.lines); }))
+					c.reader.join(false);
 			}
 			// The writer thread ends once its queue is written or, for a child
 			// that stopped reading, once the child's exit fails its write.
-			while (c.writer.thread.isRunning)
-			{
-				c.writer.drain();
-				sleep(5.msecs);
-			}
-			c.writer.thread.join(false);
+			if (awaitThread(c.writer.thread, () { c.writer.drain(); }))
+				c.writer.thread.join(false);
 		}();
 		return status;
+	}
+
+	/// How long `closeWinChild` waits for a pipe thread to finish on its own,
+	/// and again after cancelling its pending I/O, before abandoning it.
+	version (Windows) private enum Duration threadGrace = 2.seconds;
+
+	/// Wait cooperatively for `t` to exit, running `drain` each pass. Past
+	/// `threadGrace` its pending synchronous I/O is cancelled; returns false
+	/// when it is still running a further `threadGrace` later.
+	version (Windows) private static bool awaitThread(Thread t, scope void delegate() @system drain) @system
+	{
+		import vibe.core.core : sleep;
+		import std.datetime.stopwatch : StopWatch, AutoStart;
+
+		auto sw = StopWatch(AutoStart.yes);
+		bool cancelled;
+		while (t.isRunning)
+		{
+			if (sw.peek >= threadGrace)
+			{
+				if (cancelled)
+					return false;
+				cancelThreadIo(t);
+				cancelled = true;
+				sw.reset();
+			}
+			drain();
+			sleep(5.msecs);
+		}
+		return true;
+	}
+
+	/// Cancel the blocking `ReadFile`/`WriteFile` thread `t` is parked in, which
+	/// then fails and lets the thread close its handle and exit.
+	version (Windows) private static void cancelThreadIo(Thread t) @system
+	{
+		import core.sys.windows.windef : DWORD, FALSE;
+		import core.sys.windows.winbase : CloseHandle;
+
+		enum DWORD threadTerminate = 0x0001;
+		auto h = OpenThread(threadTerminate, FALSE, cast(DWORD) t.id);
+		if (h is null)
+			return;
+		CancelSynchronousIo(h);
+		CloseHandle(h);
+	}
+
+	version (Windows) private static void drainLines(Channel!PumpedLine lines) @system
+	{
+		PumpedLine discard;
+		while (lines.tryConsumeOne(discard, Duration.zero))
+		{
+		}
 	}
 }
 
@@ -722,8 +768,11 @@ version (Posix) StdioClientTransport spawnStdioTransport(string[] args,
 
 version (Windows)
 {
-	import core.sys.windows.windef : HANDLE;
+	import core.sys.windows.windef : BOOL, DWORD, HANDLE;
 	import vibe.core.channel : Channel, createChannel;
+
+	private extern (Windows) HANDLE OpenThread(DWORD access, BOOL inherit, DWORD id) nothrow @nogc;
+	private extern (Windows) BOOL CancelSynchronousIo(HANDLE thread) nothrow @nogc;
 }
 
 /// Owned Windows child: the std.process pid, the thread writing its stdin, and
