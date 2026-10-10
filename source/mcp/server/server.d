@@ -2897,8 +2897,12 @@ final class McpServer : ServerCore
 		// by `cancellationKey` so a string and a numeric id never match. On a match, drop the delivery sink and clear the recorded per-stream
 		// filter so the listener-driven notify path matches nothing and any
 		// subsequent notify*/notifyResourceUpdated writes nothing.
+		// Both stdio streams belong to the single stdio peer, whose connection
+		// token is empty; a cancel from a connection-scoped (HTTP) peer only ever
+		// names that connection's own in-flight requests.
 		const cancelKey = cancellationKey(params["requestId"]);
-		if (stdioListenSink !is null && cancelKey.length
+		const fromStdioPeer = connToken.length == 0;
+		if (fromStdioPeer && stdioListenSink !is null && cancelKey.length
 				&& cancelKey == cancellationKey(stdioListenSubscriptionId))
 		{
 			// Graceful teardown: the long-lived listen request returns its single
@@ -2911,7 +2915,7 @@ final class McpServer : ServerCore
 		// Stdio `events/stream` teardown: a push stream returns no JSON-RPC response,
 		// so the client cancels it by `notifications/cancelled` referencing the
 		// stream's request id. Close the handle (fires on_unsubscribe) and drop it.
-		if (auto h = cancelKey in stdioEventStreams_)
+		if (auto h = fromStdioPeer ? cancelKey in stdioEventStreams_ : null)
 		{
 			h.close();
 			stdioEventStreams_.remove(cancelKey);
@@ -8294,6 +8298,56 @@ unittest  // cancelling string request id "9" leaves the stdio events/stream wit
 	]))));
 	rt.emit(EventOccurrence("evt_3", "incident.created", "t"));
 	assert(lines.length > before, "a different request id must not tear the stream down");
+}
+
+unittest  // an HTTP connection's cancel leaves the stdio events/stream with the same id open
+{
+	import mcp.protocol.events : EventOccurrence;
+	import mcp.server.connection : ConnectionState;
+
+	auto s = new McpServer("t", "1");
+	auto rt = s.enableEvents();
+	registerDemoEvent(s);
+	string[] lines;
+	void sink(string line) @safe
+	{
+		lines ~= line;
+	}
+
+	Json params = Json.emptyObject;
+	params["name"] = "incident.created";
+	s.tryServeStdioEventsStream(modernReq(9, "events/stream", params), &sink);
+	const before = lines.length;
+	s.handle(Message(makeNotification("notifications/cancelled",
+			Json(["requestId": Json(9)]))), new ConnCtx("http-session", new ConnectionState));
+	rt.emit(EventOccurrence("evt_4", "incident.created", "t"));
+	assert(lines.length > before, "an HTTP cancel must not tear down a stdio stream");
+}
+
+unittest  // an HTTP connection's cancel leaves the stdio subscriptions/listen with the same id open
+{
+	import mcp.server.connection : ConnectionState;
+
+	auto s = new McpServer("t", "1");
+	s.enableToolsListChanged();
+	string[] frames;
+	void sink(string line) @safe
+	{
+		frames ~= line;
+	}
+
+	Json meta = Json.emptyObject;
+	meta[MetaKey.protocolVersion] = "2026-07-28";
+	meta[MetaKey.clientCapabilities] = Json.emptyObject;
+	Json params = Json.emptyObject;
+	params["notifications"] = Json(["toolsListChanged": Json(true)]);
+	params["_meta"] = meta;
+	assert(s.tryServeStdioListen(Message(makeRequest(Json(1),
+			"subscriptions/listen", params)), &sink));
+
+	s.handle(Message(makeNotification("notifications/cancelled",
+			Json(["requestId": Json(1)]))), new ConnCtx("http-session", new ConnectionState));
+	assert(s.notifyToolsListChanged() == 1, "an HTTP cancel must not tear down a stdio listen");
 }
 
 unittest  // events/poll answers -32602 InvalidParams on the wire when arguments violate inputSchema
