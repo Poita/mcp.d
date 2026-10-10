@@ -376,9 +376,11 @@ struct ClientSettings
 	/// Absolute bound on how long a request may wait for its response, measured
 	/// from when it is sent and including time spent answering server requests
 	/// made on its behalf. Unlike `requestTimeout`, progress never extends it, so
-	/// a server that keeps reporting progress cannot hold a request open forever.
-	/// `Duration.zero` (the default) imposes no cap beyond `requestTimeout`.
-	Duration maxTotalTimeout = Duration.zero;
+	/// a server that keeps reporting progress cannot hold a request open forever
+	/// (basic/utilities/progress). Defaults to 30 minutes; raise it for requests
+	/// expected to run longer. `Duration.zero` imposes no cap beyond
+	/// `requestTimeout`.
+	Duration maxTotalTimeout = 30.minutes;
 
 	/// How long `awaitTask` waits between `tasks/get` polls when the server gives
 	/// no `pollIntervalMs`.
@@ -9736,6 +9738,14 @@ unittest  // a cacheable read that completes after a bearer switch is neither ca
 	assert(!c.haveListedTools_, "identity A's tool list must not be indexed for identity B");
 	c.listTools();
 	assert(calls == 2, "identity A's response must not be served to identity B");
+}
+
+unittest  // a default client caps every request with a finite maxTotalTimeout
+{
+	auto c = new McpClient(new RecordingClientTransport());
+	assert(ClientSettings.init.maxTotalTimeout == 30.minutes);
+	assert(c.maxTotalTimeout_ == 30.minutes,
+			"progress must not keep a default request alive forever");
 }
 
 unittest  // a client over a custom transport applies every ClientSettings knob
