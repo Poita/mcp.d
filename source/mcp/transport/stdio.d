@@ -160,15 +160,17 @@ void serveStdio(McpServer server, string delegate() @safe readLine,
 					~ " requests are in flight and " ~ backlog.length.to!string ~ " are queued");
 			if (item.batch is null)
 			{
-				channel.send(makeErrorResponse(item.request.id, err));
+				channel.post(makeErrorResponse(item.request.id, err));
 				return;
 			}
 			Json[] replies;
 			foreach (msg; parseAny(item.batch).messages)
 				if (msg.kind == MessageKind.request)
 					replies ~= makeErrorResponse(msg.id, err);
+			// Posted: a refused batch is refused on the read loop, which must not
+			// wait on a peer that is not draining stdout.
 			if (replies.length)
-				channel.send(Json(replies));
+				channel.post(Json(replies));
 		}
 		catch (Exception e)
 			channel.reportError("refusing a request: " ~ e.msg);
@@ -1236,9 +1238,10 @@ else version (Windows)
 /// answered: the returned error-response line stands in for it so the request it
 /// replies to fails at once. Returns null when nothing stands in for the frame.
 private string answerOversized(FrameHead head, size_t maxLineBytes,
-		scope void delegate(string) @safe writeLine) @safe
+		void delegate(string) @safe writeLine) @safe
 {
 	import std.conv : to;
+	import vibe.core.core : runTask;
 	import mcp.protocol.errors : internalError, invalidRequest;
 	import mcp.protocol.jsonrpc : makeErrorResponse;
 
@@ -1249,12 +1252,15 @@ private string answerOversized(FrameHead head, size_t maxLineBytes,
 				internalError("the peer's response exceeds the " ~ limit)).toString() : null;
 	if (head.hasMethod && !hasId)
 		return null;
-	try
-		writeLine(makeErrorResponse(head.id,
-				invalidRequest("message exceeds the " ~ limit)).toString());
-	catch (Exception)
-	{
-	}
+	// Written on a task of its own: the caller is the read loop, which must keep
+	// reading while a peer that is not draining stdout holds the write.
+	runTask((string line) nothrow{
+		try
+			writeLine(line);
+		catch (Exception)
+		{
+		}
+	}, makeErrorResponse(head.id, invalidRequest("message exceeds the " ~ limit)).toString());
 	return null;
 }
 
@@ -1348,8 +1354,24 @@ unittest  // readAvailable reports end-of-input when the peer disconnects
 
 version (unittest) private string[] oversizedReplies(FrameHead head, out string substitute) @safe
 {
+	import vibe.core.core : runTask, runEventLoop, exitEventLoop, yield;
+
 	string[] written;
-	substitute = answerOversized(head, 16, (string s) @safe { written ~= s; });
+	string sub;
+	runTask(() nothrow{
+		scope (exit)
+			exitEventLoop();
+		try
+		{
+			sub = answerOversized(head, 16, (string s) @safe { written ~= s; });
+			yield(); // let the posted reply's writer task run
+		}
+		catch (Exception)
+		{
+		}
+	});
+	runEventLoop();
+	substitute = sub;
 	return written;
 }
 
@@ -1396,6 +1418,31 @@ unittest  // an over-long frame of unknown kind is answered with a null-id error
 	assert(substitute is null);
 	assert(written.length == 1);
 	assert(parseJsonString(written[0])["id"].type == Json.Type.null_);
+}
+
+unittest  // answering an over-long request does not wait for a stdout the peer is not draining
+{
+	import vibe.core.core : runTask, runEventLoop, exitEventLoop;
+	import vibe.core.sync : createManualEvent;
+
+	auto never = createManualEvent();
+	bool returned;
+	runTask(() nothrow{
+		scope (exit)
+			exitEventLoop();
+		try
+		{
+			answerOversized(FrameHead(Json(5), true, false), 16, (string) @safe {
+				never.wait(never.emitCount);
+			});
+			returned = true;
+		}
+		catch (Exception)
+		{
+		}
+	});
+	runEventLoop();
+	assert(returned, "the read loop is not held by the error reply's write");
 }
 
 version (Posix) unittest  // runStdio's adopt/releaseRef cycle leaves the original fd open with its O_NONBLOCK bit unchanged

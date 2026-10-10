@@ -260,13 +260,14 @@ final class DuplexChannel
 	/// the id of a pending outbound request wakes that waiter with `error`, so
 	/// the caller fails fast instead of blocking until its timeout. Otherwise
 	/// the peer gets a null-id JSON-RPC error when `answersMalformed` is set, and
-	/// the line is reported to `onError` when it is not.
+	/// the line is reported to `onError` when it is not. Replies are posted, so
+	/// the read loop never waits on a peer that has stopped reading.
 	private void answerMalformed(Json item, McpException error) @safe
 	{
 		const replyId = errorReplyId(error);
 		if (replyId.type != Json.Type.null_)
 		{
-			send(makeErrorResponse(replyId, error));
+			post(makeErrorResponse(replyId, error));
 			return;
 		}
 		Json id = (item.type == Json.Type.object && "id" in item) ? item["id"] : Json(null);
@@ -274,7 +275,7 @@ final class DuplexChannel
 				&& coord.resolve(id, Json.undefined, toErrorJson(error)))
 			return;
 		if (answersMalformed)
-			send(makeErrorResponse(Json(null), error));
+			post(makeErrorResponse(Json(null), error));
 		else
 			reportError("malformed message from the peer: " ~ error.msg);
 	}
@@ -1013,6 +1014,40 @@ unittest  // a malformed inbound line is answered with a null-id JSON-RPC error 
 	assert(j["jsonrpc"].get!string == "2.0");
 	assert(j["id"].type == Json.Type.null_);
 	assert("error" in j);
+}
+
+unittest  // answering a malformed line does not stall the read loop behind a peer that stopped reading
+{
+	auto inbound = new LineLink;
+	auto never = createManualEvent();
+	int seen;
+	runTask(() nothrow{
+		scope (exit)
+			exitEventLoop();
+		try
+		{
+			auto channel = new DuplexChannel(() @safe { return inbound.take(); }, (string) @safe {
+				never.wait(never.emitCount); // the peer never drains its input
+			}, (Message m) @safe {
+				if (m.kind == MessageKind.notification)
+					seen++;
+			});
+			channel.answersMalformed = true;
+			channel.start();
+			inbound.put("this is not json");
+			inbound.put(`{"jsonrpc":"2.0","id":4,"method":"ping","params":[]}`);
+			inbound.put(`{"jsonrpc":"2.0","method":"notifications/a"}`);
+			foreach (_; 0 .. 16)
+				yield();
+			channel.close();
+			inbound.closeEnd();
+		}
+		catch (Exception)
+		{
+		}
+	});
+	runEventLoop();
+	assert(seen == 1, "lines after a malformed one are still read while its reply is unwritten");
 }
 
 unittest  // a channel not answering malformed lines reports an unparseable line without replying
