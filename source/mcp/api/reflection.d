@@ -497,6 +497,33 @@ private void checkUdaPlacement(string memberName, alias f)()
 						~ "' applies only to an @event method");
 		}
 	}
+	checkUdaRepeats!(memberName, f)();
+}
+
+/// Whether `A` is a method-level UDA that sets one value, so a second one on the
+/// same method would silently replace the first.
+private enum isSingleValuedUda(A) = is(A == hintTitle) || is(A == ui)
+	|| is(A == taskTtl) || is(A == taskPollInterval)
+	|| is(A == eventPollInterval) || is(A == audience) || is(A == priority)
+	|| is(A == lastModified) || is(A == cacheable) || is(A == meta);
+
+/// Reject a single-valued UDA repeated on `f`, and two `@describeParam`s for the
+/// same parameter, rather than let the last one silently win.
+private void checkUdaRepeats(string memberName, alias f)()
+{
+	alias attrs = AliasSeq!(__traits(getAttributes, f));
+	static foreach (i, a; attrs)
+		static if (!is(a))
+			static foreach (b; attrs[0 .. i])
+				static if (!is(b) && is(typeof(a) == typeof(b)))
+					{
+					static assert(!isSingleValuedUda!(typeof(a)), "@" ~ typeof(a)
+							.stringof ~ " appears more than once on '" ~ memberName ~ "'; keep one");
+					static if (is(typeof(a) == describeParam))
+						static assert(a.parameter != b.parameter, "@describeParam(\"" ~ a.parameter
+								~ "\", ...) appears more than once on '" ~ memberName
+								~ "'; keep one");
+				}
 }
 
 private enum toolNameRule = "a tool name must be 1..128 characters of "
@@ -5825,6 +5852,37 @@ unittest  // a @resourceTemplate with adjacent variables is rejected at compile 
 	auto s = new McpServer("t", "1");
 	static assert(!__traits(compiles, registerHandlers(s, new TemplateWithUdas!("test://{a}{b}"))));
 	static assert(__traits(compiles, registerHandlers(s, new TemplateWithUdas!("test://{a}{?b}"))));
+}
+
+unittest  // a single-valued UDA repeated on one handler is rejected at compile time
+{
+	import core.time : seconds;
+	import vibe.data.json : parseJsonString;
+
+	auto s = new McpServer("t", "1");
+	static assert(!__traits(compiles, registerHandlers(s,
+			new ToolWithUdas!(hintTitle("a"), hintTitle("b")))));
+	static assert(!__traits(compiles, registerHandlers(s,
+			new ToolWithUdas!(meta(parseJsonString(`{"a":1}`)), meta(parseJsonString(`{"b":1}`))))));
+	static assert(!__traits(compiles, registerHandlers(s,
+			new ToolWithUdas!(describeParam("a", "x"), describeParam("a", "y")))));
+	static assert(!__traits(compiles, registerHandlers(s,
+			new ToolWithUdas!(ui("ui://a"), ui("ui://b")))));
+	static assert(!__traits(compiles, registerHandlers(s,
+			new TaskWithUdas!(taskTtl(1.seconds), taskTtl(2.seconds)))));
+	static assert(!__traits(compiles, registerHandlers(s,
+			new TaskWithUdas!(taskPollInterval(1.seconds), taskPollInterval(2.seconds)))));
+	static assert(!__traits(compiles, registerHandlers(s,
+			new ResourceWithUdas!(cacheable(1.seconds), cacheable(2.seconds)))));
+	static assert(!__traits(compiles, registerHandlers(s,
+			new ResourceWithUdas!(priority(0.1), priority(0.2)))));
+	static assert(!__traits(compiles, registerHandlers(s,
+			new ResourceWithUdas!(audience("user"), audience("assistant")))));
+	static assert(!__traits(compiles, registerHandlers(s,
+			new ResourceWithUdas!(lastModified("a"), lastModified("b")))));
+	// @icon repeats by design, one entry per icon.
+	static assert(__traits(compiles, registerHandlers(s,
+			new ToolWithUdas!(icon("https://a/1.png"), icon("https://a/2.png")))));
 }
 
 unittest  // UDAs that fit their handler kind and parameter types still register
