@@ -28,6 +28,8 @@ import vibe.core.sync : TaskMutex;
 import vibe.data.json : Json, parseJsonString;
 
 import mcp.protocol.errors;
+import mcp.protocol.ssrf : SsrfPolicy;
+import std.typecons : Nullable;
 import mcp.auth.oauth;
 import mcp.auth.client;
 import mcp.client.client : McpClient;
@@ -827,6 +829,9 @@ struct OAuthLogin
 	/// How to authenticate at the token endpoint. Under `none`, a supplied
 	/// `clientSecret` is sent with `client_secret_basic`.
 	TokenEndpointAuthMethod authMethod = TokenEndpointAuthMethod.none;
+	/// The SSRF policy for discovery, registration and token requests (see
+	/// `OAuthClient.ssrfPolicy`). Null anchors it at the MCP endpoint.
+	Nullable!SsrfPolicy ssrfPolicy;
 	/// Maximum time to wait for the authorization-server redirect to arrive on
 	/// the loopback listener before aborting the interactive flow. Bounds the
 	/// wait so an abandoned browser or an absent redirect cannot block the
@@ -1317,6 +1322,7 @@ OAuthSession useOAuth(McpClient client, string mcpEndpoint, OAuthLogin opts) @sa
 	oauth.resource = canonicalResourceUri(mcpEndpoint);
 	oauth.authMethod = opts.authMethod;
 	oauth.clientIdMetadataUrl = opts.clientIdMetadataUrl;
+	oauth.ssrfPolicy = opts.ssrfPolicy;
 
 	const long now = Clock.currTime().toUnixTime();
 

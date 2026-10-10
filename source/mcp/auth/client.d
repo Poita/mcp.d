@@ -8,6 +8,7 @@ import vibe.stream.operations : readAllUTF8;
 import mcp.protocol.errors;
 import mcp.protocol.jsonrpc : parseUntrustedJson;
 import mcp.protocol.ssrf : SsrfPolicy;
+import std.typecons : Nullable;
 import mcp.auth.oauth;
 
 @safe:
@@ -127,24 +128,35 @@ final class OAuthClient
 	/// `client_id` (no Dynamic Client Registration needed).
 	string clientIdMetadataUrl;
 
+	/// The SSRF policy for every URL this client fetches or validates during
+	/// discovery, registration and the token flows. When null, the policy is
+	/// anchored at the MCP endpoint: `allowLoopback` when that endpoint is on
+	/// an explicit loopback host, else `blockInternal`. Set it to reach an
+	/// authorization server on a private network (`allowUserConfigured`), or to
+	/// forbid loopback even for a loopback endpoint (`blockInternal`).
+	Nullable!SsrfPolicy ssrfPolicy;
+
 	/// The SSRF policy for a URL the MCP server or its authorization server
 	/// names (discovered metadata, token, registration and authorization
-	/// endpoints). Plain-http loopback is permitted only when the MCP endpoint
-	/// the user configured (`resource`) is itself on loopback, so a remote server
-	/// can never steer the client — and its codes, tokens and secrets — to a
-	/// local service.
+	/// endpoints). Unless `ssrfPolicy` is set, plain-http loopback is permitted
+	/// only when the MCP endpoint the user configured (`resource`) is itself on
+	/// loopback, so a remote server can never steer the client — and its codes,
+	/// tokens and secrets — to a local service.
 	private SsrfPolicy namedUrlPolicy() const @safe
 	{
 		return policyAnchoredAt(resource);
 	}
 
-	/// `allowLoopback` when `userUrl` (a URL the user configured) targets an
-	/// explicit loopback host, else `blockInternal`.
-	private static SsrfPolicy policyAnchoredAt(string userUrl) @safe
+	/// `ssrfPolicy` when set; otherwise `allowLoopback` when `userUrl` (a URL
+	/// the user configured) targets an explicit loopback host, else
+	/// `blockInternal`.
+	private SsrfPolicy policyAnchoredAt(string userUrl) const @safe
 	{
 		import mcp.protocol.ssrf : AddressClass, classifyHostLexical;
 		import vibe.inet.url : URL;
 
+		if (!ssrfPolicy.isNull)
+			return ssrfPolicy.get;
 		try
 		{
 			if (classifyHostLexical(URL(userUrl).host) == AddressClass.loopback)
@@ -1218,6 +1230,45 @@ unittest  // discovered AS document advertising S256 -> proceeds
 	auto pkce = makePkce(new ubyte[32]);
 	auto url = c.authorizationUrl(as_, RegisteredClient("cid", ""), pkce, "mcp:read", "st");
 	assert(url.canFind("code_challenge_method=S256"));
+}
+
+unittest  // an explicit ssrfPolicy admits a private-network authorization endpoint
+{
+	auto c = new OAuthClient();
+	c.resource = "https://mcp.example.com/mcp";
+	c.ssrfPolicy = SsrfPolicy.allowUserConfigured;
+	AuthorizationServerMetadata as_;
+	as_.authorizationEndpoint = "http://10.0.0.5/authorize";
+	as_.codeChallengeMethodsSupported = ["S256"];
+	auto pkce = makePkce(new ubyte[32]);
+	cast(void) c.authorizationUrl(as_, RegisteredClient("cid", ""), pkce, "mcp:read", "st");
+}
+
+unittest  // an explicit ssrfPolicy overrides the loopback allowance of a loopback endpoint
+{
+	import std.exception : assertThrown;
+
+	auto c = new OAuthClient();
+	c.resource = "http://127.0.0.1:9000/mcp";
+	c.ssrfPolicy = SsrfPolicy.blockInternal;
+	AuthorizationServerMetadata as_;
+	as_.authorizationEndpoint = "http://127.0.0.1:9000/authorize";
+	as_.codeChallengeMethodsSupported = ["S256"];
+	auto pkce = makePkce(new ubyte[32]);
+	assertThrown(c.authorizationUrl(as_, RegisteredClient("cid", ""), pkce, "mcp:read", "st"));
+}
+
+unittest  // without an explicit ssrfPolicy a private-network authorization endpoint is refused
+{
+	import std.exception : assertThrown;
+
+	auto c = new OAuthClient();
+	c.resource = "https://mcp.example.com/mcp";
+	AuthorizationServerMetadata as_;
+	as_.authorizationEndpoint = "http://10.0.0.5/authorize";
+	as_.codeChallengeMethodsSupported = ["S256"];
+	auto pkce = makePkce(new ubyte[32]);
+	assertThrown(c.authorizationUrl(as_, RegisteredClient("cid", ""), pkce, "mcp:read", "st"));
 }
 
 unittest  // authorizationUrl refuses when the RFC 8707 resource indicator is unset
