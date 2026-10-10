@@ -137,15 +137,6 @@ final class DuplexCoordinator
 		return throwOrReturn(w.result, w.error, "peer error");
 	}
 
-	/// Drop a registered-but-unawaited request id (e.g. when sending the request
-	/// frame failed so a response will never arrive). Idempotent; unknown ids are
-	/// ignored. Keeps the waiter table from leaking when `register` is not followed
-	/// by `await`.
-	void cancel(long id) @safe
-	{
-		waiters.remove(id);
-	}
-
 	/// Deliver a peer response / errorResponse. Returns true if `idJson` matched a
 	/// pending outbound request (waking its awaiting task), false otherwise (an id
 	/// we are not awaiting — e.g. a stray response — is ignored). A request
@@ -409,16 +400,6 @@ unittest  // resolve ignores a non-integer id
 	auto coord = new DuplexCoordinator;
 	coord.register(1);
 	assert(!coord.resolve(Json("str-id"), Json.emptyObject, Json.undefined));
-	coord.cancel(1);
-}
-
-unittest  // cancel drops an unawaited registration without leaking
-{
-	auto coord = new DuplexCoordinator;
-	coord.register(5);
-	coord.cancel(5);
-	// A subsequent resolve for the cancelled id matches nothing.
-	assert(!coord.resolve(Json(5L), Json.emptyObject, Json.undefined));
 }
 
 unittest  // throwOrReturn yields McpException with internalError when "code" is not an integer
@@ -523,5 +504,4 @@ unittest  // resolve returns false for a fractional float id (e.g. 1.5) — no w
 	auto coord = new DuplexCoordinator;
 	coord.register(1);
 	assert(!coord.resolve(Json(1.5), Json.emptyObject, Json.undefined));
-	coord.cancel(1);
 }
