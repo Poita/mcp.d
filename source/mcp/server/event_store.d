@@ -558,6 +558,9 @@ struct Delivery
 	/// A `gap` control envelope rather than an event: `occ.cursor` is the position
 	/// the client should persist, `occ.eventId` the envelope's message id.
 	bool gap;
+	/// A gap owed for positions dropped undelivered, which settled when they
+	/// were dropped: it is sent no earlier than the subscription's watermark.
+	bool owed;
 
 	Json toJson() const @safe
 	{
@@ -568,6 +571,8 @@ struct Delivery
 		j["attempt"] = attempt;
 		if (gap)
 			j["gap"] = true;
+		if (owed)
+			j["owed"] = true;
 		return j;
 	}
 
@@ -580,6 +585,7 @@ struct Delivery
 			d.occ = EventOccurrence.fromJson(j["occ"]);
 		d.attempt = j.getOr("attempt", 0);
 		d.gap = j.getOr("gap", false);
+		d.owed = j.getOr("owed", false);
 		return d;
 	}
 }

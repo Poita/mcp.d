@@ -2688,10 +2688,16 @@ final class EventsRuntime
 			}
 			if (dropIfLapsed(job, sn.get))
 				return false;
-			auto res = attemptDelivery(sn.get, job);
+			Delivery sending = job;
+			if (job.gap)
+			{
+				sending.occ.cursor = gapCursorAtSend(sn.get, job.occ.cursor, job.owed);
+				retrackCursor(job.jobId, sending.occ.cursor);
+			}
+			auto res = attemptDelivery(sn.get, sending);
 			if (res.ok)
 			{
-				recordSuccess(subId, job.jobId, occ.cursor);
+				recordSuccess(subId, job.jobId, sending.occ.cursor);
 				ackJob(job.jobId);
 				// The endpoint is taking deliveries again: send any gap it is owed.
 				flushMissed(sn.get);
@@ -2831,7 +2837,7 @@ final class EventsRuntime
 		if (sn.isNull || !sn.get.owesGap)
 			return;
 		const cursor = sn.get.missedCursor;
-		if (enqueueGap(sn.get, cursor))
+		if (enqueueGap(sn.get, cursor, true))
 			kickDrain();
 		modifyWebhook(sub.id, (ref WebhookSubscription cur) @safe {
 			if (!cur.owesGap || !sameCursor(cur.missedCursor, cursor))
@@ -2847,12 +2853,56 @@ final class EventsRuntime
 		return a.isNull ? b.isNull : (!b.isNull && a.get == b.get);
 	}
 
+	// The cursor a gap envelope carries when it is sent: the later of its
+	// position and the subscription's watermark. An owed gap is often sent after
+	// later deliveries have settled, and its missed position settled when it was
+	// dropped, so carrying that position alone would move the client's cursor
+	// back. Ring-buffer positions are compared; an opaque check cursor cannot
+	// be, so an owed gap sends the watermark, the furthest position safe to
+	// resume from, and a truncation gap its own (forward) position.
+	private static Nullable!string gapCursorAtSend(const WebhookSubscription sub,
+			Nullable!string position, bool owed) @safe
+	{
+		import mcp.server.event_store : tryParseSeq;
+
+		if (position.isNull || sub.cursor.isNull)
+			return position;
+		long posSeq, markSeq;
+		if (tryParseSeq(position.get, posSeq) && tryParseSeq(sub.cursor.get, markSeq))
+			return posSeq >= markSeq ? position : sub.cursor;
+		return owed ? sub.cursor : position;
+	}
+
+	// Move tracked job `jobId` to `cursor`, keeping its place in its
+	// subscription's in-flight order, so it settles the watermark at the
+	// position it was actually sent with.
+	private void retrackCursor(string jobId, Nullable!string cursor) @safe
+	{
+		auto job = jobId in trackedJobs_;
+		if (job is null || cursor.isNull || job.cursor.isNull || job.cursor.get == cursor.get)
+			return;
+		job.cursor = cursor;
+		auto list = job.subscriptionId in outstanding_;
+		if (list is null)
+			return;
+		foreach (i, ref e; *list)
+			if (removeJobId(e, jobId))
+			{
+				auto moved = OutstandingCursor(cursor.get, [jobId]);
+				if (e.jobIds.length == 0)
+					(*list)[i] = moved;
+				else
+					*list = (*list)[0 .. i + 1] ~ moved ~ (*list)[i + 1 .. $];
+				break;
+			}
+	}
+
 	// Queue a `gap` job telling `sub`'s client to resume from `cursor` (or, when
 	// null, only that something was lost). It is tracked like an event, so the
 	// watermark reaches that position only once the gap is delivered, through
 	// the same verified, signed path as events. Returns false when an identical
 	// gap is already queued.
-	private bool enqueueGap(WebhookSubscription sub, Nullable!string cursor) @safe
+	private bool enqueueGap(WebhookSubscription sub, Nullable!string cursor, bool owed = false) @safe
 	{
 		EventOccurrence occ;
 		occ.eventId = controlMessageId("gap");
@@ -2861,6 +2911,7 @@ final class EventsRuntime
 		const key = cursor.isNull ? occ.eventId : cursor.get;
 		Delivery job = Delivery(sub.id ~ "/gap/" ~ key, sub.id, occ, 0);
 		job.gap = true;
+		job.owed = owed;
 		return enqueueTracked(job);
 	}
 
@@ -7626,8 +7677,12 @@ unittest  // a 413 response skips the event with a gap and does not count as a h
 	assert(sub.lastDeliveryAtMs == 0);
 	assert(sub.cursor.get == lost); // the position is settled
 	rt.emit(EventOccurrence("evt_2", "n", "t"));
+	// The gap follows evt_2, so it carries evt_2's position rather than move the
+	// client back to the lost one.
 	auto gaps = controlPostsOf(ft, "gap");
-	assert(gaps.length == 1 && parseJsonString(gaps[0].body)["cursor"].get!string == lost);
+	assert(gaps.length == 1);
+	assert(parseJsonString(gaps[0].body)["cursor"].get!string == rt.buffer_.headCursor());
+	assert(rt.buffer_.headCursor() != lost);
 }
 
 unittest  // a transient 503 is retried and then succeeds
@@ -8933,7 +8988,22 @@ unittest  // a gap owed after retries run out is delivered once the endpoint tak
 	ft.failGaps = false;
 	rt.emit(EventOccurrence("evt_2", "n", "t"));
 	assert(ft.acceptedGaps.length == 1);
-	assert(ft.acceptedGaps[0]["cursor"].get!string == lost);
+	assert(ft.acceptedGaps[0]["cursor"].get!string == rt.buffer_.headCursor());
+	assert(rt.buffer_.headCursor() != lost);
+}
+
+unittest  // a gap sent after a later delivery does not move the client's cursor back
+{
+	auto ft = new FakeWebhookTransport();
+	ft.eventStatuses = [503, 503, 503, 503, 503];
+	auto rt = engineRuntime(ft);
+	auto r = rt.subscribeWebhook(webhookSub("n", "https://proxy/hooks"), "user-1");
+	rt.emit(EventOccurrence("evt_1", "n", "t"));
+	rt.emit(EventOccurrence("evt_2", "n", "t"));
+	const delivered = parseJsonString(ft.eventPosts()[$ - 1].body)["cursor"].get!string;
+	assert(ft.acceptedGaps.length == 1);
+	assert(ft.acceptedGaps[0]["cursor"].get!string == delivered);
+	assert(rt.webhookStore().get(r.id).get.cursor.get == delivered);
 }
 
 unittest  // an owed gap survives a restart over the same subscription store
@@ -9283,7 +9353,7 @@ unittest  // a dead-lettered delivery is logged and owed a gap
 	assert(lines.any!(l => l.canFind("transport failure")));
 	rt.emit(EventOccurrence("evt_2", "n", "t"));
 	assert(ft.acceptedGaps.length == 1);
-	assert(ft.acceptedGaps[0]["cursor"].get!string == seqCursor(1));
+	assert(ft.acceptedGaps[0]["cursor"].get!string == seqCursor(2));
 }
 
 unittest  // multi-node: a quiet pass does not advance the watermark past another node's queued jobs
