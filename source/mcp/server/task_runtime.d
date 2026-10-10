@@ -37,7 +37,8 @@ enum Duration unlimitedTaskTtl = Duration.max;
 /// any settled task; zero disables the bound.
 /// `sweepInterval` is how often `enableTasks`'s background sweep removes expired
 /// tasks (zero disables it; expired tasks are still hidden on access). `nowIso` is an
-/// injectable clock returning an ISO-8601 timestamp; null uses the system clock.
+/// injectable clock returning an ISO-8601 extended timestamp (the runtime throws
+/// when it yields anything else); null uses the system clock.
 struct TaskOptions
 {
 	TaskStore store;
@@ -93,7 +94,8 @@ final class TaskRuntime
 	bool exposeInternalErrors;
 
 	/// Throws when `opts.defaultTtl` is not positive or
-	/// `opts.defaultPollInterval` is negative.
+	/// `opts.defaultPollInterval` is negative, or when `opts.nowIso` does not
+	/// yield an ISO-8601 extended timestamp.
 	this(TaskOptions opts) @safe
 	{
 		validateTiming(opts.defaultTtl, opts.defaultPollInterval);
@@ -103,6 +105,7 @@ final class TaskRuntime
 			opts_.idGenerator = () @safe => defaultTaskIdGenerator();
 		if (opts_.nowIso is null)
 			opts_.nowIso = () @safe => systemNowIso();
+		stamp();
 	}
 
 	/// The backing durable store.
@@ -171,7 +174,7 @@ final class TaskRuntime
 
 		TaskRecord r;
 		r.meta.status = TaskStatus.working;
-		const now = opts_.nowIso();
+		const now = stamp();
 		r.meta.createdAt = now;
 		r.meta.lastUpdatedAt = now;
 		r.meta.ttlMs = ttlDur == unlimitedTaskTtl ? Nullable!long.init
@@ -248,10 +251,11 @@ final class TaskRuntime
 	{
 		if (opts_.maxUnsettledAge <= Duration.zero || isTerminal(r.meta.status))
 			return false;
+		// An unparseable `createdAt` cannot be aged, so it counts as overdue.
 		try
 			return now >= SysTime.fromISOExtString(r.meta.createdAt) + opts_.maxUnsettledAge;
 		catch (Exception)
-			return false;
+			return true;
 	}
 
 	/// Settle an overdue task: `cancelled` when a cancel was requested (its
@@ -272,29 +276,42 @@ final class TaskRuntime
 		}
 		r.cancelRequested = true;
 		r.inputRequests = Json.emptyObject;
-		r.meta.lastUpdatedAt = opts_.nowIso();
+		r.meta.lastUpdatedAt = stamp();
 		if (store_.compareAndSwap(r, expected))
 			notifyStatusChange(r);
 		return store_.get(r.meta.taskId);
 	}
 
-	/// The injected clock as a `SysTime`, falling back to the system clock when
-	/// it does not yield an ISO-8601 extended timestamp.
+	/// The injected clock's current ISO-8601 timestamp. Throws `internalError`
+	/// when it is not an ISO-8601 extended timestamp: a record stamped with one
+	/// could never be aged, so it would neither expire nor be settled as overdue.
+	private string stamp() @safe
+	{
+		const now = opts_.nowIso();
+		parseStamp(now);
+		return now;
+	}
+
+	private static SysTime parseStamp(string iso) @safe
+	{
+		try
+			return SysTime.fromISOExtString(iso);
+		catch (Exception)
+			throw internalError("task clock returned '" ~ iso ~ "', not an ISO-8601 timestamp");
+	}
+
+	/// The injected clock as a `SysTime`.
 	private SysTime currentTime() @safe
 	{
-		import std.datetime.systime : Clock;
-
-		try
-			return SysTime.fromISOExtString(opts_.nowIso());
-		catch (Exception)
-			return Clock.currTime();
+		return parseStamp(opts_.nowIso());
 	}
 
 	/// Whether `r` has outlived its TTL at `now`. A task that has not settled
 	/// never expires, so work running longer than its TTL is never discarded. A
 	/// terminal task is retained for its TTL after it settled (`lastUpdatedAt`,
 	/// frozen once terminal), giving the client that long to collect the result.
-	/// A null TTL never expires.
+	/// A null TTL never expires; an unparseable `lastUpdatedAt` cannot be aged,
+	/// so it counts as expired.
 	private static bool isExpired(const TaskRecord r, SysTime now) @safe
 	{
 		if (r.meta.ttlMs.isNull || !isTerminal(r.meta.status))
@@ -302,7 +319,7 @@ final class TaskRuntime
 		try
 			return now >= SysTime.fromISOExtString(r.meta.lastUpdatedAt) + r.meta.ttlMs.get.msecs;
 		catch (Exception)
-			return false;
+			return true;
 	}
 
 	/// Remove every expired task from the store, returning how many were removed,
@@ -386,7 +403,7 @@ final class TaskRuntime
 			if (change == Change.none)
 				return false;
 			if (change == Change.status)
-				r.meta.lastUpdatedAt = opts_.nowIso();
+				r.meta.lastUpdatedAt = stamp();
 			if (!store_.compareAndSwap(r, expected))
 				continue;
 			if (change == Change.status)
@@ -1515,4 +1532,39 @@ unittest  // the runtime rejects a negative default poll interval
 	TaskOptions o;
 	o.defaultPollInterval = -1.seconds;
 	assertThrown(new TaskRuntime(o));
+}
+
+unittest  // the runtime rejects a clock that does not yield an ISO-8601 timestamp
+{
+	import std.exception : assertThrown;
+
+	TaskOptions o;
+	o.nowIso = () @safe => "t";
+	assertThrown(new TaskRuntime(o));
+}
+
+unittest  // a clock that stops yielding ISO-8601 timestamps fails task creation
+{
+	import std.exception : assertThrown;
+
+	string now = "2026-06-07T10:00:00Z";
+	TaskOptions o;
+	o.nowIso = () @safe => now;
+	auto rt = new TaskRuntime(o);
+	now = "junk";
+	assertThrown(rt.create());
+}
+
+unittest  // a settled record with an unparseable timestamp expires
+{
+	string now = "2026-06-07T10:00:00Z";
+	TaskOptions o;
+	o.nowIso = () @safe => now;
+	auto rt = new TaskRuntime(o);
+	auto t = rt.create();
+	rt.complete(t.taskId, Json.emptyObject);
+	auto r = rt.store.get(t.taskId).get;
+	r.meta.lastUpdatedAt = "junk";
+	assert(rt.store.compareAndSwap(r, r.revision));
+	assert(rt.statusOf(t.taskId).isNull);
 }
