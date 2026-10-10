@@ -2651,6 +2651,15 @@ private void handlePost(McpServer server, ServerPushChannel push,
 			res.writeBody(makeErrorResponse(Json(null), verErr).toString(), "application/json");
 			return;
 		}
+		const accept = req.headers.get("Accept", "");
+		if (carriesRequest(input) && !postAccepted(accept))
+		{
+			res.statusCode = HTTPStatus.notAcceptable;
+			res.writeBody(
+					"Not Acceptable: POST requests must accept application/json or text/event-stream",
+					"text/plain");
+			return;
+		}
 		// Resolve THIS request's connection state (the SessionManager-owned state
 		// for a stateful session, else a fresh/implicit-peer state) and gate the
 		// batch on its negotiated version — the SAME source the server core gates
@@ -2710,8 +2719,10 @@ private void handlePost(McpServer server, ServerPushChannel push,
 			res.statusCode = HTTPStatus.accepted;
 			res.writeBody("", "text/plain");
 		}
-		else
+		else if (acceptsJson(accept))
 			res.writeBody(txt, "application/json");
+		else
+			res.writeBody("data: " ~ txt ~ "\n\n", "text/event-stream");
 		return;
 	}
 
@@ -3158,6 +3169,44 @@ unittest  // with auth on, every member of a 2025-03-26 batch sees the caller's 
 	auto arr = parseJsonString(reply);
 	assert(arr[0]["result"]["content"][0]["text"].get!string == "alice",
 			"a batch member must run under the request's authenticated principal: " ~ reply);
+}
+
+unittest  // a 2025-03-26 batch whose Accept excludes both reply media types is refused with 406
+{
+	import vibe.http.server : createTestHTTPServerResponse, TestHTTPResponseMode;
+	import vibe.stream.memory : createMemoryOutputStream;
+
+	auto server = new McpServer("t", "1");
+	auto router = new URLRouter;
+	mountMcp(router, server);
+
+	auto res = createTestHTTPServerResponse(createMemoryOutputStream(), null,
+			TestHTTPResponseMode.bodyOnly);
+	router.handleRequest(makeInitPostReq(
+			`[{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}]`,
+			["Accept": "text/plain"]), res);
+	assert(res.statusCode == HTTPStatus.notAcceptable);
+}
+
+unittest  // a 2025-03-26 batch from a client accepting only text/event-stream is answered as SSE
+{
+	import std.algorithm : startsWith;
+	import vibe.http.server : createTestHTTPServerResponse, TestHTTPResponseMode;
+	import vibe.stream.memory : createMemoryOutputStream;
+
+	auto server = new McpServer("t", "1");
+	auto router = new URLRouter;
+	mountMcp(router, server);
+
+	auto sink = createMemoryOutputStream();
+	auto res = createTestHTTPServerResponse(sink, null, TestHTTPResponseMode.bodyOnly);
+	router.handleRequest(makeInitPostReq(
+			`[{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}]`,
+			["Accept": "text/event-stream"]), res);
+	const reply = cast(string) sink.data.idup;
+	assert(res.statusCode == HTTPStatus.ok, reply);
+	assert(res.headers.get("Content-Type", "").startsWith("text/event-stream"));
+	assert(reply.startsWith("data: ["), reply);
 }
 
 unittest  // a notification observer sees the POST's session and authenticated principal
@@ -7591,7 +7640,7 @@ unittest  // legacy POST with a non-JSON Content-Type is refused with 415
 	auto res = corsRequest(router, HTTPMethod.POST, [
 		"Content-Type": "text/plain"
 	], `{"jsonrpc":"2.0","method":"notifications/initialized"}`,
-			opts.legacyMessagePath ~ "?sessionId=x");
+		opts.legacyMessagePath ~ "?sessionId=x");
 	assert(res.statusCode == HTTPStatus.unsupportedMediaType);
 }
 
