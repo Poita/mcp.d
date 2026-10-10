@@ -187,17 +187,23 @@ unittest  // a SumType of structs prefers the member with no keys beyond the inp
 }
 
 /// Compile a vibe `Json` schema document into a reusable `Validator`, or `null`
-/// when `schema` is not a JSON object (and so imposes no constraint). Throws a
-/// `jsonschema.SchemaException` when the schema is a malformed object or declares
-/// an unsupported `$schema` dialect, surfacing a bad schema where the tool is
-/// registered rather than silently under-validating each request.
+/// when `schema` is not a JSON object (and so imposes no constraint). Throws
+/// -32602 (`McpException`) when the schema is a malformed object or declares an
+/// unsupported `$schema` dialect, surfacing a bad schema where the tool is
+/// registered rather than silently under-validating each request, and keeping a
+/// peer-supplied schema's failure inside the MCP error model.
 Validator makeValidator(Json schema)
 {
+	import jsonschema : SchemaException;
 	import jsonschema.vibejson : compileSchema;
+	import mcp.protocol.errors : invalidParams;
 
 	if (schema.type != Json.Type.object)
 		return null;
-	return compileSchema(schema);
+	try
+		return compileSchema(schema);
+	catch (SchemaException e)
+		throw invalidParams("invalid JSON Schema: " ~ e.msg);
 }
 
 /// Validate a vibe `Json` `value` against a pre-compiled `validator` (a `null`
@@ -271,15 +277,28 @@ unittest  // full 2020-12: a $ref/$defs schema is now resolved and enforced
 	assert(validateAgainstSchema(parseJsonString(`{}`), schema).length > 0);
 }
 
-unittest  // an unsupported $schema dialect is rejected (MCP "reject unknown dialects")
+unittest  // an unsupported $schema dialect is rejected with -32602 (MCP "reject unknown dialects")
 {
 	import vibe.data.json : parseJsonString;
-	import jsonschema : SchemaException;
-	import std.exception : assertThrown;
+	import mcp.protocol.errors : ErrorCode, McpException;
+	import std.exception : collectException;
 
 	auto schema = parseJsonString(
 			`{"$schema": "http://json-schema.org/draft-04/schema#", "type": "string"}`);
-	assertThrown!SchemaException(makeValidator(schema));
+	auto e = collectException!McpException(makeValidator(schema));
+	assert(e !is null && e.code == ErrorCode.invalidParams);
+}
+
+unittest  // validateAgainstSchema reports a malformed schema as -32602
+{
+	import vibe.data.json : parseJsonString;
+	import mcp.protocol.errors : ErrorCode, McpException;
+	import std.exception : collectException;
+
+	auto schema = parseJsonString(
+			`{"$schema": "http://json-schema.org/draft-04/schema#", "type": "string"}`);
+	auto e = collectException!McpException(validateAgainstSchema(Json("x"), schema));
+	assert(e !is null && e.code == ErrorCode.invalidParams);
 }
 
 unittest  // a draft-07 dialect schema is accepted and enforced (not rejected)

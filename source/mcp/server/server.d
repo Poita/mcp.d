@@ -464,7 +464,7 @@ final class McpServer : ServerCore
 	/// Compile a registered tool's input/output schema validators once, at
 	/// registration. A schema mcp.d generated is always valid 2020-12; a
 	/// hand-supplied schema that is a malformed object or declares an unsupported
-	/// `$schema` dialect throws here (a `jsonschema.SchemaException`) rather than
+	/// `$schema` dialect throws here (a -32602 `McpException`) rather than
 	/// silently under-validating each `tools/call`.
 	private static RegisteredTool withCompiledValidators(RegisteredTool rt) @safe
 	{
