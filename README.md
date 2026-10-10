@@ -867,7 +867,13 @@ process — with `awaitTask(taskId, opts, onInputRequired)`, which polls to comp
 (cancellable through `opts.cancellation`, and surfacing mid-task input requests
 to the optional callback).
 
+The client must declare the extension before connecting; otherwise the server
+runs an optional task tool inline (or rejects a required one with -32021):
+
 ```d
+client.enableTasks();                        // advertise io.modelcontextprotocol/tasks
+client.connect();
+
 auto r = client.callTool("deploy", args);   // sync or task — you needn't know
 if (r.isTask)
 {
