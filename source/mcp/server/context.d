@@ -119,6 +119,61 @@ private void requireServerChannel(RequestContext ctx, string what) @safe
 			throw internalError(statelessServerRequestError);
 }
 
+/// The client capabilities a `sampling/createMessage` request with `params`
+/// needs: `sampling`, plus `sampling.tools` when it carries `tools` or
+/// `toolChoice` (even `{mode:"none"}` exercises the tool-use surface), plus
+/// the soft-deprecated `sampling.context` when `includeContext` is
+/// `thisServer` or `allServers`. Shared by `RequestContext.sample` and the
+/// MRTR input-request filter so both apply the same rules.
+package(mcp) ClientCapabilities samplingRequirements(Json params) @safe
+{
+	ClientCapabilities need;
+	need.sampling = true;
+	if (params.type != Json.Type.object)
+		return need;
+	need.samplingTools = "tools" in params || "toolChoice" in params;
+	if (auto inc = "includeContext" in params)
+		if (inc.type == Json.Type.string)
+			need.samplingContext = inc.get!string == "thisServer" || inc.get!string == "allServers";
+	return need;
+}
+
+/// The client capabilities an `elicitation/create` request with `params` needs:
+/// `elicitation.url` for `mode: "url"`, otherwise `elicitation.form` (form is
+/// the default mode). Shared by the `RequestContext` elicitation calls and the
+/// MRTR input-request filter.
+package(mcp) ClientCapabilities elicitationRequirements(Json params) @safe
+{
+	ClientCapabilities need;
+	const isUrl = params.type == Json.Type.object && "mode" in params
+		&& params["mode"].type == Json.Type.string && params["mode"].get!string == "url";
+	if (isUrl)
+		need.elicitationUrl = true;
+	else
+		need.elicitationForm = true;
+	return need;
+}
+
+/// Throw the `missingClientCapability` error for the first capability in
+/// `need` that `ctx` does not support, in the order a request would hit them.
+private void requireClientCapabilities(RequestContext ctx, const ClientCapabilities need) @safe
+{
+	if (need.sampling && !ctx.clientSupports(ClientCapability.sampling))
+		throw missingClientCapability(ClientCapability.sampling, "Client does not support sampling");
+	if (need.samplingTools && !ctx.clientSupports(ClientCapability.samplingTools))
+		throw missingClientCapability(ClientCapability.samplingTools,
+				"Client does not support tool use in sampling (sampling.tools)");
+	if (need.samplingContext && !ctx.clientSupports(ClientCapability.samplingContext))
+		throw missingClientCapability(ClientCapability.samplingContext,
+				"Client does not support context-enabled sampling (sampling.context)");
+	if (need.elicitationForm && !ctx.clientSupports(ClientCapability.elicitationForm))
+		throw missingClientCapability(ClientCapability.elicitationForm,
+				"Client does not support form-mode elicitation");
+	if (need.elicitationUrl && !ctx.clientSupports(ClientCapability.elicitationUrl))
+		throw missingClientCapability(ClientCapability.elicitationUrl,
+				"Client does not support url-mode elicitation");
+}
+
 /// Per-request context handed to tool handlers. It is the channel through which
 /// a handler emits server->client traffic while a request is in flight:
 /// progress + logging notifications, and (blocking) sampling / elicitation
@@ -222,29 +277,7 @@ interface RequestContext
 	final Json sample(Json params) @safe
 	{
 		requireServerChannel(this, "sample");
-		if (!clientSupports(ClientCapability.sampling))
-			throw missingClientCapability(ClientCapability.sampling,
-					"Client does not support sampling");
-		// Per spec, servers MUST NOT send tool-enabled sampling requests to
-		// clients that have not declared the `sampling.tools` sub-capability.
-		// This covers both the `tools` list and a `toolChoice` directive, since
-		// a request that sets `toolChoice` (even `{mode:"none"}`) without any
-		// `tools` still exercises the tool-use sampling surface.
-		if (params.type == Json.Type.object && ("tools" in params
-				|| "toolChoice" in params) && !clientSupports(ClientCapability.samplingTools))
-			throw missingClientCapability(ClientCapability.samplingTools,
-					"Client does not support tool use in sampling (sampling.tools)");
-		// The soft-deprecated `sampling.context` sub-capability gates the
-		// `includeContext` values `thisServer`/`allServers`.
-		if (params.type == Json.Type.object && "includeContext" in params
-				&& params["includeContext"].type == Json.Type.string)
-		{
-			const inc = params["includeContext"].get!string;
-			if ((inc == "thisServer" || inc == "allServers")
-					&& !clientSupports(ClientCapability.samplingContext))
-				throw missingClientCapability(ClientCapability.samplingContext,
-						"Client does not support context-enabled sampling (sampling.context)");
-		}
+		requireClientCapabilities(this, samplingRequirements(params));
 		return sampleRaw(params);
 	}
 
@@ -270,15 +303,12 @@ interface RequestContext
 	final ElicitResult elicit(string message, Json requestedSchema) @safe
 	{
 		requireServerChannel(this, "elicit");
-		// Per client/elicitation: servers MUST NOT send elicitation requests
-		// with modes the client does not support. A bare `elicitation:{}` is
-		// form-only, so a generic declaration already sets the form submode.
-		if (!clientSupports(ClientCapability.elicitationForm))
-			throw missingClientCapability(ClientCapability.elicitationForm,
-					"Client does not support form-mode elicitation");
 		Json params = Json.emptyObject;
 		params["message"] = message;
 		params["requestedSchema"] = requestedSchema;
+		// Per client/elicitation: servers MUST NOT send elicitation requests
+		// with modes the client does not support.
+		requireClientCapabilities(this, elicitationRequirements(params));
 		return ElicitResult.fromJson(elicitRaw(params));
 	}
 
@@ -315,9 +345,9 @@ interface RequestContext
 		requireServerChannel(this, "elicitUrl");
 		// Per client/elicitation: servers MUST NOT send a url-mode request to a
 		// client that only declared form mode (e.g. a bare `elicitation:{}`).
-		if (!clientSupports(ClientCapability.elicitationUrl))
-			throw missingClientCapability(ClientCapability.elicitationUrl,
-					"Client does not support url-mode elicitation");
+		requireClientCapabilities(this, elicitationRequirements(Json([
+					"mode": Json("url")
+		])));
 		if (url.length == 0)
 			throw internalError("URL-mode elicitation requires a non-empty url");
 		if (!isValidElicitationUrl(url))

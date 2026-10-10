@@ -2570,34 +2570,13 @@ final class McpServer : ServerCore
 
 	/// Whether the client's `declared` capabilities can satisfy a single MRTR
 	/// `InputRequest`. The spec forbids emitting an `InputRequest` whose kind
-	/// the client never advertised: elicitation requires the matching elicitation
-	/// submode (url-mode -> `elicitation.url`, form-mode -> `elicitation.form`, the
-	/// latter implied by a bare `elicitation:{}`); sampling requires `sampling`
-	/// (plus `sampling.tools` when the request carries `tools`/`toolChoice`); roots
-	/// requires `roots`. An `InputRequest` of an unrecognised kind is left to the
-	/// caller (kept), since the SDK cannot map it to a capability.
+	/// the client never advertised; `requiredFor` names what each kind needs.
+	/// An `InputRequest` of an unrecognised kind is left to the caller (kept),
+	/// since the SDK cannot map it to a capability.
 	private static bool clientCanSatisfy(ref const InputRequest reqst,
 			ref const ClientCapabilities declared) @safe
 	{
-		const k = reqst.kind;
-		if (k.isNull)
-			return true; // unknown kind: do not second-guess
-		final switch (k.get)
-		{
-		case InputKind.elicitation:
-			const isUrl = reqst.params.type == Json.Type.object
-				&& "mode" in reqst.params && reqst.params["mode"].type == Json.Type.string
-				&& reqst.params["mode"].get!string == "url";
-			return isUrl ? declared.elicitationUrl : declared.elicitationForm;
-		case InputKind.sampling:
-			if (!declared.supports(ClientCapability.sampling))
-				return false;
-			const usesTools = reqst.params.type == Json.Type.object
-				&& ("tools" in reqst.params || "toolChoice" in reqst.params);
-			return usesTools ? declared.samplingTools : true;
-		case InputKind.roots:
-			return declared.roots;
-		}
+		return requiredFor(reqst).missingFrom(declared).isNull;
 	}
 
 	/// Filter an MRTR `inputRequests` list to those the client can satisfy,
@@ -2614,8 +2593,10 @@ final class McpServer : ServerCore
 		return kept;
 	}
 
-	/// The client capability an MRTR input request needs: url-mode elicitation
-	/// needs `elicitation.url`, tool-enabled sampling needs `sampling.tools`.
+	/// The client capabilities an MRTR input request needs, by the same rules
+	/// `ctx.sample` / `ctx.elicit` apply (`samplingRequirements`,
+	/// `elicitationRequirements`); `roots` for a roots request and nothing for
+	/// an unrecognised kind.
 	private static ClientCapabilities requiredFor(ref const InputRequest reqst) @safe
 	{
 		ClientCapabilities need;
@@ -2625,27 +2606,13 @@ final class McpServer : ServerCore
 		final switch (k.get)
 		{
 		case InputKind.elicitation:
-			const isUrl = reqst.params.type == Json.Type.object
-				&& "mode" in reqst.params && reqst.params["mode"].type == Json.Type.string
-				&& reqst.params["mode"].get!string == "url";
-			if (isUrl)
-				need.elicitationUrl = true;
-			else
-				need.elicitationForm = true;
-			break;
+			return elicitationRequirements(reqst.params);
 		case InputKind.sampling:
-			const usesTools = reqst.params.type == Json.Type.object
-				&& ("tools" in reqst.params || "toolChoice" in reqst.params);
-			if (usesTools)
-				need.samplingTools = true;
-			else
-				need.sampling = true;
-			break;
+			return samplingRequirements(reqst.params);
 		case InputKind.roots:
 			need.roots = true;
-			break;
+			return need;
 		}
-		return need;
 	}
 
 	/// MRTR: never ask the client for an input kind it did not declare. Drop any
@@ -2676,6 +2643,7 @@ final class McpServer : ServerCore
 				need.roots |= n.roots;
 				need.sampling |= n.sampling;
 				need.samplingTools |= n.samplingTools;
+				need.samplingContext |= n.samplingContext;
 				need.elicitationForm |= n.elicitationForm;
 				need.elicitationUrl |= n.elicitationUrl;
 				if (!kinds.canFind(r.type))
@@ -10303,6 +10271,66 @@ unittest  // modern: a raw CallToolResult's inputRequests are filtered against t
 	auto resp = s.handle(modernReq(1, "tools/call", p)).get;
 	assert("error" in resp);
 	assert(resp["error"]["code"].get!int == ErrorCode.missingRequiredClientCapability);
+}
+
+version (unittest) private Message modernReqWithCaps(long id, string method, Json params, Json caps) @safe
+{
+	Json meta = Json.emptyObject;
+	meta[MetaKey.protocolVersion] = "2026-07-28";
+	meta[MetaKey.clientCapabilities] = caps;
+	params["_meta"] = meta;
+	return Message(makeRequest(Json(id), method, params));
+}
+
+unittest  // modern: an MRTR sampling request with includeContext needs sampling.context
+{
+	import mcp.protocol.mrtr : InputRequest;
+
+	auto s = new McpServer("t", "1");
+	Tool t = {name: "raw"};
+	s.registerTool(t, (Json args) @safe {
+		CallToolResult r;
+		r.inputRequests = [
+			InputRequest("ask", "sampling", Json([
+				"messages": Json.emptyArray,
+				"maxTokens": Json(10),
+				"includeContext": Json("thisServer")
+			]))
+		];
+		return r;
+	});
+	Json p = Json(["name": Json("raw"), "arguments": Json.emptyObject]);
+	auto resp = s.handle(modernReqWithCaps(1, "tools/call", p,
+			Json(["sampling": Json.emptyObject]))).get;
+	assert(resp["error"]["code"].get!int == ErrorCode.missingRequiredClientCapability);
+	auto need = resp["error"]["data"]["requiredCapabilities"];
+	assert("context" in need["sampling"]);
+
+	auto ok = s.handle(modernReqWithCaps(2, "tools/call", p,
+			Json(["sampling": Json(["context": Json.emptyObject])]))).get;
+	assert("error" !in ok);
+}
+
+unittest  // modern: a dropped form elicitation reports form elicitation as required
+{
+	import mcp.protocol.mrtr : InputRequest;
+
+	auto s = new McpServer("t", "1");
+	Tool t = {name: "raw"};
+	s.registerTool(t, (Json args) @safe {
+		CallToolResult r;
+		r.inputRequests = [
+			InputRequest("date", "elicitation", Json(["message": Json("When?")]))
+		];
+		return r;
+	});
+	Json p = Json(["name": Json("raw"), "arguments": Json.emptyObject]);
+	auto resp = s.handle(modernReqWithCaps(1, "tools/call", p,
+			Json(["elicitation": Json(["url": Json.emptyObject])]))).get;
+	assert(resp["error"]["code"].get!int == ErrorCode.missingRequiredClientCapability);
+	// Form-only elicitation serializes as the bare `elicitation: {}` form.
+	auto elicit = resp["error"]["data"]["requiredCapabilities"]["elicitation"];
+	assert(elicit.type == Json.Type.object && "url" !in elicit);
 }
 
 unittest  // modern: a raw CallToolResult carrying a task handle bypasses output-schema validation
