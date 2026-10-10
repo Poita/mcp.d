@@ -1032,7 +1032,9 @@ skips the event with a gap) and a safe-to-persist watermark cursor; and
 **Termination.** `rt.unregister(name)` removes a type and ends every subscription
 to it with `NotFound {kind: "event"}`; re-registering a type whose schema changed
 non-additively ends them with `Unsupported {reason: "schema_changed"}` (additive
-changes keep them); both send `notifications/events/list_changed`.
+changes keep them). The extension is advertised without `listChanged`: no
+`subscriptions/listen` filter key carries `notifications/events/list_changed`,
+so clients re-call `events/list` to see type changes.
 `rt.terminatePrincipal(principal, name, error)` ends a principal's subscriptions
 once access is revoked. Push streams receive `notifications/events/terminated`
 followed by the final `StreamEventsResult`; webhook subscriptions a signed

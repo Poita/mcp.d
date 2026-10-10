@@ -1462,7 +1462,9 @@ final class McpServer : ServerCore
 	/// the extension requires. Registering an event type enables the extension
 	/// with default options, so call this first to choose them: once a type is
 	/// registered it throws rather than replace the runtime holding that type.
-	/// The periodic delivery worker runs until `shutdown`.
+	/// The periodic delivery worker runs until `shutdown`. The extension is
+	/// advertised without `listChanged`, so clients re-call `events/list` rather
+	/// than wait for `notifications/events/list_changed`.
 	EventsRuntime enableEvents(WebhookSubscriptionStore store = null,
 			EventsOptions opts = EventsOptions.init) @safe
 	{
@@ -1480,9 +1482,6 @@ final class McpServer : ServerCore
 		}
 		eventsRuntime_ = new EventsRuntime(store, opts);
 		eventsRuntime_.exposeInternalErrors = exposeInternalErrors_;
-		eventsRuntime_.onListChanged(() @safe {
-			notify(eventsListChangedNotification);
-		});
 		// The periodic worker expires poll leases, sweeps lapsed webhook
 		// subscriptions, runs poll-driven webhook delivery, and drains the outbox.
 		// Unit tests drive the runtime's passes directly.
@@ -1495,9 +1494,10 @@ final class McpServer : ServerCore
 				eventsRuntime_.startDeliveryWorker(opts.workerInterval);
 		}
 		eventsEnabled_ = true;
-		Json settings = Json.emptyObject;
-		settings["listChanged"] = true;
-		advertiseExtension(eventsExtensionKey, settings);
+		// No `listChanged`: a modern client receives list-changed notifications
+		// only through a `subscriptions/listen` filter key, and the extension
+		// defines none for `notifications/events/list_changed`.
+		advertiseExtension(eventsExtensionKey, Json.emptyObject);
 		return eventsRuntime_;
 	}
 
@@ -8121,14 +8121,22 @@ version (unittest)
 	}
 }
 
-unittest  // enableEvents advertises the events extension (with listChanged) under the modern protocol discover
+unittest  // enableEvents advertises the events extension under the modern protocol discover
 {
 	auto s = new McpServer("t", "1");
 	s.enableEvents();
 	auto resp = s.handle(modernReq(1, "server/discover")).get;
 	auto caps = resp["result"]["capabilities"];
 	assert("io.modelcontextprotocol/events" in caps["extensions"]);
-	assert(caps["extensions"]["io.modelcontextprotocol/events"]["listChanged"].get!bool);
+}
+
+unittest  // the events extension does not advertise listChanged, which no listen filter can carry
+{
+	auto s = new McpServer("t", "1");
+	s.enableEvents();
+	auto resp = s.handle(modernReq(1, "server/discover")).get;
+	auto settings = resp["result"]["capabilities"]["extensions"]["io.modelcontextprotocol/events"];
+	assert("listChanged" !in settings);
 }
 
 unittest  // events/* are -32601 when the server never enabled events
