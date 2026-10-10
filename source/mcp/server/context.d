@@ -411,12 +411,13 @@ interface RequestContext
 		return (id in inputResponses()) !is null;
 	}
 
-	/// Whether this is an MRTR resubmission carrying client answers
-	/// (`inputResponses` non-empty). False on the first round and on non-stateless
-	/// requests.
+	/// Whether this is an MRTR resubmission: it carries client answers
+	/// (`inputResponses` non-empty) or echoes a `requestState` (a handler may ask
+	/// for no input and only round-trip its state). False on the first round and
+	/// on non-stateless requests.
 	final bool isResubmit() @safe
 	{
-		return inputResponses().length > 0;
+		return inputResponses().length > 0 || requestState().length > 0;
 	}
 }
 
@@ -1633,11 +1634,18 @@ unittest  // hasInputResponse reports whether the resubmitted request carries an
 	assert(!probe.hasInputResponse("q2"));
 }
 
-unittest  // isResubmit is true exactly when inputResponses is non-empty
+unittest  // isResubmit is true when inputResponses is non-empty
 {
 	auto probe = new StateProbe;
 	assert(!probe.isResubmit);
 	probe.responses["q1"] = Json.emptyObject;
+	assert(probe.isResubmit);
+}
+
+unittest  // isResubmit is true for a state-only resubmission
+{
+	auto probe = new StateProbe;
+	probe.state = `{"step":2}`;
 	assert(probe.isResubmit);
 }
 
