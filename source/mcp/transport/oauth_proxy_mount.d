@@ -1011,7 +1011,7 @@ void mountOAuthConsent(URLRouter router, OAuthProxy proxy, ProxyStateStore store
 		if (!formDecodes(form))
 		{
 			res.statusCode = HTTPStatus.badRequest;
-			res.writeJsonBody(invalidRequestJson("malformed form encoding"));
+			res.writeJsonBody(invalidRequestJson("malformed form encoding or repeated parameter"));
 			return;
 		}
 		const proxyState = formField(form, "state");
@@ -1262,7 +1262,7 @@ in (exchange !is null)
 		if (!formDecodes(form))
 		{
 			res.statusCode = HTTPStatus.badRequest;
-			res.writeJsonBody(invalidRequestJson("malformed form encoding"));
+			res.writeJsonBody(invalidRequestJson("malformed form encoding or repeated parameter"));
 			return;
 		}
 		// Branch on the OAuth grant the client requests. The proxy advertises both
@@ -1522,18 +1522,31 @@ private Json parseJsonBody(string payload) @safe
 }
 
 /// Whether every name and value in an `application/x-www-form-urlencoded` body
-/// percent-decodes cleanly, so `formField` cannot throw on it.
+/// percent-decodes cleanly, so `formField` cannot throw on it, and no
+/// parameter name repeats (RFC 6749 §3.1: parameters MUST NOT be included more
+/// than once).
 private bool formDecodes(string form) @safe
 {
-	import std.array : split;
+	import std.array : replace, split;
 	import std.uri : decodeComponent;
 
+	bool[string] seen;
 	foreach (pair; form.split("&"))
 	{
+		if (pair.length == 0)
+			continue;
+		const eq = pair.indexOf('=');
+		string name;
 		try
+		{
 			decodeComponent(pair);
+			name = decodeComponent((eq < 0 ? pair : pair[0 .. eq]).replace("+", " "));
+		}
 		catch (Exception)
 			return false;
+		if (name in seen)
+			return false;
+		seen[name] = true;
 	}
 	return true;
 }
@@ -1873,6 +1886,32 @@ unittest  // the store caps live entries, evicting the oldest by insertion time
 	assert(found);
 	store.take("c", found);
 	assert(found);
+}
+
+unittest  // /token rejects a repeated parameter with invalid_request (RFC 6749 §3.1)
+{
+	auto proxy = new OAuthProxy(consentMountConfig());
+	auto router = new URLRouter;
+	mountOAuthProxy(router, proxy);
+	const hit = browserPost(router, "https://mcp.example.com/token",
+			"grant_type=refresh_token&refresh_token=A&refresh_token=B", "");
+	assert(hit.status == 400);
+	assert(hit.body_.canFind(`"invalid_request"`), hit.body_);
+}
+
+unittest  // /consent rejects a repeated parameter with invalid_request
+{
+	auto proxy = new OAuthProxy(consentMountConfig());
+	proxy.register(["http://localhost:5000/cb"]);
+	auto router = new URLRouter;
+	mountOAuthProxy(router, proxy);
+	const page = browserGet(router, "https://mcp.example.com/authorize?client_id=Iv1.upstream"
+			~ "&response_type=code&code_challenge_method=S256&code_challenge=CH"
+			~ "&scope=read&redirect_uri=http%3A%2F%2Flocalhost%3A5000%2Fcb&state=cs", "");
+	const hit = browserPost(router, "https://mcp.example.com/consent",
+			consentForm(page.body_) ~ "&state=other", page.setCookie);
+	assert(hit.status == 400);
+	assert(hit.body_.canFind(`"invalid_request"`), hit.body_);
 }
 
 unittest  // formField URL-decodes a value and returns "" for an absent field
