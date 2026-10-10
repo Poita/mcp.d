@@ -1101,32 +1101,6 @@ private void handleLegacyGet(McpServer server, LegacySseChannel channel,
 	holdSessionStream(&writeFrame.opCall, push, pushId, null, sessionId, 15.seconds);
 }
 
-/// Process a single JSON-RPC message (or 2024-11-05 batch) POSTed to the legacy
-/// message endpoint and route any response back onto the originating client's
-/// legacy GET SSE stream as a `message` event. `sessionId` is the per-stream token
-/// the client echoed from its `endpoint` event, so the response is delivered ONLY
-/// to the stream that issued this POST. Dispatch runs against that stream's own
-/// `ConnectionState`, so each legacy client initializes and negotiates
-/// independently. Returns false — dispatching nothing — when no open stream owns
-/// `sessionId`; otherwise true (a parse failure still yields a JSON-RPC error
-/// response delivered on the stream). A client response/errorResponse (the
-/// client's reply to a server->client request) is routed to the channel's
-/// coordinator so a handler blocked in ctx.sample/ctx.elicit/ctx.listRoots is
-/// unblocked. `token` is the request's validated bearer token, surfaced to
-/// handlers as `ctx.auth()`. Drives the legacy dispatch directly in tests,
-/// without an HTTP request.
-version (unittest) private bool handleLegacyPostBody(McpServer server, LegacySseChannel channel,
-		string sessionId, string payload, TokenInfo token = TokenInfo.invalid()) @safe
-{
-	auto conn = channel.connStateFor(sessionId, principalOf(token));
-	if (conn is null)
-		return false;
-	ParsedInput input;
-	if (parseLegacyPayload(channel, sessionId, payload, input))
-		handleLegacyInput(server, channel, sessionId, conn, input, token);
-	return true;
-}
-
 /// Parse a legacy POST body. A malformed one is answered with a JSON-RPC error
 /// on the stream `sessionId`, and false is returned.
 private bool parseLegacyPayload(LegacySseChannel channel, string sessionId,
@@ -3995,6 +3969,18 @@ unittest  // closing a legacy SSE stream cancels the requests in flight on it
 	assert(tok.cancelled, "a closed stream's in-flight request must be cancelled");
 }
 
+version (unittest) private void yieldUntil(scope bool delegate() @safe done) @safe
+{
+	import vibe.core.core : yield;
+
+	foreach (_; 0 .. 4096)
+	{
+		if (done())
+			return;
+		yield();
+	}
+}
+
 unittest  // legacy POST: a request is processed and its response pushed onto the SSE stream
 {
 	// The legacy two-endpoint transport: the client POSTs a JSON-RPC request to
@@ -4012,23 +3998,28 @@ unittest  // legacy POST: a request is processed and its response pushed onto th
 
 	// A request: the response is pushed onto the originating stream as a `message`
 	// event, routed by the per-stream session token.
-	const accepted = handleLegacyPostBody(server, ch, sid,
-			`{"jsonrpc":"2.0","id":1,"method":"ping"}`);
-	assert(accepted); // the server accepted the message
+	assert(dispatchLegacyPost(server, ch, sid,
+			`{"jsonrpc":"2.0","id":1,"method":"ping"}`) == LegacyPostOutcome.accepted);
+	yieldUntil(() => frames.length == 2);
 	assert(frames.length == 2);
 	assert(frames[1].canFind("\"id\":1"));
 
 	// A notification: accepted, but nothing is pushed back.
-	const accepted2 = handleLegacyPostBody(server, ch, sid,
-			`{"jsonrpc":"2.0","method":"notifications/initialized"}`);
-	assert(accepted2);
+	bool notified;
+	server.setClientNotificationHandler((string method, Json, RequestContext) @safe {
+		notified = true;
+	});
+	assert(dispatchLegacyPost(server, ch, sid,
+			`{"jsonrpc":"2.0","method":"notifications/ping"}`) == LegacyPostOutcome.accepted);
+	yieldUntil(() => notified);
+	assert(notified);
 	assert(frames.length == 2); // no new frame
 }
 
 unittest  // legacy POST: a handler that calls ctx.listRoots() sends the request on the SSE stream
 {
 	// A handler may issue a server->client request (roots/list, sampling, elicitation).
-	// On the legacy HTTP+SSE transport, handleLegacyPostBody must wire a serverRequest
+	// On the legacy HTTP+SSE transport, dispatchLegacyPost must wire a serverRequest
 	// delegate so the outbound request is pushed onto the originating GET SSE stream
 	// and the client's reply POST is correlated back to the blocked handler.
 	import std.algorithm : canFind;
@@ -4053,21 +4044,10 @@ unittest  // legacy POST: a handler that calls ctx.listRoots() sends the request
 	const sid = ch.sessionIdFor(id);
 	assert(frames.length == 1); // endpoint event only
 
-	// The tool call is dispatched in a task so it can block on the roots/list reply.
-	bool done;
-	runTask(() nothrow{
-		try
-		{
-			cast(void) handleLegacyPostBody(server, ch, sid, `{"jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":"roottool","arguments":{}}}`);
-		}
-		catch (Exception)
-		{
-		}
-		finally
-			done = true;
-	});
-	// Yield so the task runs and the handler blocks awaiting the roots/list reply.
-	yield();
+	// The tool call runs on its own task, so it can block on the roots/list reply.
+	assert(dispatchLegacyPost(server, ch, sid, `{"jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":"roottool","arguments":{}}}`) == LegacyPostOutcome
+			.accepted);
+	yieldUntil(() => frames.length == 2);
 	// The handler must have sent the roots/list request as an SSE message event.
 	assert(frames.length == 2, "expected roots/list request on SSE stream");
 	assert(frames[1].canFind("roots/list"), "SSE frame must contain roots/list");
@@ -4078,22 +4058,15 @@ unittest  // legacy POST: a handler that calls ctx.listRoots() sends the request
 	auto reqJson = parseJsonString(reqFrame);
 	const serverReqId = reqJson["id"];
 
-	// Client POSTs back a roots/list response; handleLegacyPostBody routes it to
+	// Client POSTs back a roots/list response; dispatchLegacyPost routes it to
 	// the coordinator, waking the blocked handler.
 	Json resp = Json.emptyObject;
 	resp["jsonrpc"] = "2.0";
 	resp["id"] = serverReqId;
 	resp["result"] = Json(["roots": Json.emptyArray]);
-	cast(void) handleLegacyPostBody(server, ch, sid, resp.toString());
+	assert(dispatchLegacyPost(server, ch, sid, resp.toString()) == LegacyPostOutcome.accepted);
 
-	// Drain until the handler task completes and delivers the tool result.
-	foreach (_; 0 .. 4096)
-	{
-		if (done)
-			break;
-		yield();
-	}
-	assert(done, "handler task must complete after receiving the roots/list reply");
+	yieldUntil(() => frames.length == 3);
 	// The tool-call response must now appear on the SSE stream.
 	assert(frames.length == 3, "expected tool-call response on SSE stream");
 	assert(frames[2].canFind("\"id\":10"), "tool response must echo the original request id");
@@ -4184,8 +4157,11 @@ unittest  // legacy POST: each stream initializes its own connection on a statef
 	const sidA = ch.sessionIdFor(ch.addListener((string f) @safe { framesA ~= f; }));
 	const sidB = ch.sessionIdFor(ch.addListener((string f) @safe { framesB ~= f; }));
 
-	assert(handleLegacyPostBody(server, ch, sidA, initializeBody("2024-11-05")));
-	assert(handleLegacyPostBody(server, ch, sidB, initializeBody("2025-03-26")));
+	assert(dispatchLegacyPost(server, ch, sidA,
+			initializeBody("2024-11-05")) == LegacyPostOutcome.accepted);
+	assert(dispatchLegacyPost(server, ch, sidB,
+			initializeBody("2025-03-26")) == LegacyPostOutcome.accepted);
+	yieldUntil(() => framesA.length == 2 && framesB.length == 2);
 	assert(framesA.length == 2 && framesA[1].canFind("\"result\""));
 	assert(framesB.length == 2 && framesB[1].canFind("\"result\""),
 			"a second legacy client must be able to initialize");
@@ -4197,8 +4173,10 @@ unittest  // legacy POST: an unknown sessionId is rejected and nothing is dispat
 {
 	auto server = McpServer.stateful("t", "1");
 	auto ch = new LegacySseChannel("/message");
-	assert(!handleLegacyPostBody(server, ch, "no-such-session", initializeBody("2024-11-05")));
-	assert(!handleLegacyPostBody(server, ch, "", initializeBody("2024-11-05")));
+	assert(dispatchLegacyPost(server, ch, "no-such-session",
+			initializeBody("2024-11-05")) == LegacyPostOutcome.unknownStream);
+	assert(dispatchLegacyPost(server, ch, "",
+			initializeBody("2024-11-05")) == LegacyPostOutcome.unknownStream);
 }
 
 unittest  // legacy POST: a stream opened under one principal rejects another principal's POSTs
@@ -4216,12 +4194,16 @@ unittest  // legacy POST: a stream opened under one principal rejects another pr
 		return t;
 	}
 
-	assert(!handleLegacyPostBody(server, ch, sid, initializeBody("2024-11-05"),
-			tokenFor("bob")), "another principal must not use alice's legacy stream");
-	assert(!handleLegacyPostBody(server, ch, sid, initializeBody("2024-11-05")),
+	assert(dispatchLegacyPost(server, ch, sid, initializeBody("2024-11-05"),
+			tokenFor("bob")) == LegacyPostOutcome.unknownStream,
+			"another principal must not use alice's legacy stream");
+	assert(dispatchLegacyPost(server, ch, sid,
+			initializeBody("2024-11-05")) == LegacyPostOutcome.unknownStream,
 			"an unauthenticated POST must not use alice's legacy stream");
 	assert(frames.length == 1, "nothing may be dispatched for a foreign principal");
-	assert(handleLegacyPostBody(server, ch, sid, initializeBody("2024-11-05"), tokenFor("alice")));
+	assert(dispatchLegacyPost(server, ch, sid, initializeBody("2024-11-05"),
+			tokenFor("alice")) == LegacyPostOutcome.accepted);
+	yieldUntil(() => frames.length == 2);
 	assert(frames.length == 2);
 }
 
@@ -7583,7 +7565,10 @@ unittest  // closing a legacy GET stream fails the server->client request awaiti
 	const started = MonoTime.currTime;
 	runTask(() nothrow{
 		try
-			cast(void) handleLegacyPostBody(server, ch, sid, `{"jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":"roottool","arguments":{}}}`);
+		{
+			cast(void) dispatchLegacyPost(server, ch, sid, `{"jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":"roottool","arguments":{}}}`);
+			yieldUntil(() => failed);
+		}
 		catch (Exception)
 		{
 		}
