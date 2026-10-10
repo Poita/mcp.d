@@ -211,7 +211,12 @@ struct UiResourceMeta
 /// FastMCP-style `@tool` API.
 void setUiToolMeta(ref Tool tool, UiToolMeta ui) @safe
 {
-	Json m = (tool.meta.type == Json.Type.object) ? tool.meta : Json.emptyObject;
+	// A Json object is a reference, so copy it rather than add `ui` to an
+	// object the caller may share with other descriptors.
+	Json m = Json.emptyObject;
+	if (tool.meta.type == Json.Type.object)
+		foreach (kv; tool.meta.byKeyValue)
+			m[kv.key] = kv.value;
 	m["ui"] = ui.toJson();
 	tool.meta = m;
 }
@@ -604,6 +609,18 @@ unittest  // setUiToolMeta preserves other _meta keys already on the tool
 	auto j = t.toJson();
 	assert(j["_meta"]["category"].get!string == "demo");
 	assert(j["_meta"]["ui"]["resourceUri"].get!string == "ui://demo/widget");
+}
+
+unittest  // setUiToolMeta leaves a _meta object shared with another tool untouched
+{
+	auto shared_ = Json(["category": Json("demo")]);
+	Tool a, b;
+	a.meta = shared_;
+	b.meta = shared_;
+	setUiToolMeta(a, UiToolMeta("ui://demo/widget"));
+	assert("ui" in a.meta);
+	assert("ui" !in b.meta);
+	assert("ui" !in shared_);
 }
 
 version (unittest) private final class UiToolApi
