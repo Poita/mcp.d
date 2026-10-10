@@ -877,7 +877,7 @@ final class HttpClientTransport : ClientTransport
 			secureRequestHTTP(target, SsrfPolicy.allowUserConfigured, (scope HTTPClientRequest req) {
 				setupRequest(req, message, bearer);
 			}, (scope HTTPClientResponse res) {
-				captureSession(res);
+				captureSession(res, message);
 				status = res.statusCode;
 				challenge = res.headers.get("WWW-Authenticate", "");
 				res.dropBody();
@@ -1151,8 +1151,7 @@ final class HttpClientTransport : ClientTransport
 				status = head.status;
 				const chunked = head.chunked;
 				const wwwAuthenticate = head.wwwAuthenticate;
-				if (head.sessionId.length)
-					sessionId = head.sessionId;
+				adoptSession(message, head.sessionId);
 
 				// A 400/404/405 is the legacy-fallback signal: read the (small) body
 				// and surface a recognised modern JSON-RPC error if present.
@@ -1500,10 +1499,32 @@ final class HttpClientTransport : ClientTransport
 		req.writeBody(cast(const(ubyte)[]) message.toString());
 	}
 
-	private void captureSession(scope HTTPClientResponse res) @safe
+	private void captureSession(scope HTTPClientResponse res, Json message) @safe
 	{
-		if ("Mcp-Session-Id" in res.headers)
-			sessionId = res.headers["Mcp-Session-Id"];
+		adoptSession(message, res.headers.get("Mcp-Session-Id", ""));
+	}
+
+	/// Adopt the `Mcp-Session-Id` value `id` from the response to `message`.
+	/// A server assigns its session on the response carrying the
+	/// `InitializeResult` (basic/transports §Session Management), so a value on
+	/// any other response is ignored, as is one with a byte outside visible
+	/// ASCII (0x21-0x7E), which the spec forbids and which could not be written
+	/// back safely as a header.
+	private void adoptSession(Json message, string id) @safe
+	{
+		import std.algorithm.searching : all;
+		import std.string : representation;
+
+		if (id.length == 0 || !isInitialize(message))
+			return;
+		if (!id.representation.all!(b => b >= 0x21 && b <= 0x7E))
+		{
+			import vibe.core.log : logWarn;
+
+			logWarn("MCP server assigned an invalid Mcp-Session-Id; ignoring it");
+			return;
+		}
+		sessionId = id;
 	}
 
 	private void dispatchSse(string data, long expectId, ref Json result,
@@ -6484,4 +6505,68 @@ unittest  // close() fails an outstanding legacy waiter with TransportClosedExce
 	t.legacyWaiters[1] = pending;
 	t.close();
 	assert(cast(TransportClosedException) pending.err !is null);
+}
+
+version (unittest)
+{
+	/// Run `initialize` then two `tools/list` against a server that assigns
+	/// `initSession` on initialize and `laterSession` on every later response.
+	/// Returns the `Mcp-Session-Id` each `tools/list` carried.
+	private string[] sessionsSentAfter(string initSession, string laterSession)
+	{
+		import mcp.client.client : McpClient;
+
+		string[] sent;
+		auto r = new URLRouter;
+		r.post("/mcp", (HTTPServerRequest req, HTTPServerResponse res) @safe {
+			auto j = requestJson(req);
+			const method = ("method" in j) ? j["method"].get!string : "";
+			if (method == "initialize")
+			{
+				res.headers["Mcp-Session-Id"] = initSession;
+				res.writeBody(initializeReply(j, "2025-11-25").toString(), "application/json");
+				return;
+			}
+			if (laterSession.length)
+				res.headers["Mcp-Session-Id"] = laterSession;
+			if ("id" !in j)
+			{
+				res.statusCode = 202;
+				res.writeBody("", "text/plain");
+				return;
+			}
+			sent ~= req.headers.get("Mcp-Session-Id", "");
+			auto reply = parseJsonString(`{"jsonrpc":"2.0","result":{"tools":[]}}`);
+			reply["id"] = j["id"];
+			res.writeBody(reply.toString(), "application/json");
+		});
+		r.get("/mcp", (HTTPServerRequest req, HTTPServerResponse res) @safe {
+			res.statusCode = 405;
+			res.writeBody("", "text/plain");
+		});
+		const failure = runAgainstFakeServer(r, (string url) @safe {
+			auto client = McpClient.http(url);
+			scope (exit)
+				client.close();
+			client.initialize("2025-11-25");
+			client.listTools();
+			client.listTools();
+		});
+		assert(failure.length == 0, "scenario failed: " ~ failure);
+		return sent;
+	}
+}
+
+unittest  // the session id is adopted from the initialize response only
+{
+	assert(sessionsSentAfter("s1", "s2") == ["s1", "s1"],
+			"a later response must not replace the session the initialize response set");
+}
+
+unittest  // a session id outside visible ASCII is rejected
+{
+	assert(sessionsSentAfter("bad id", "") == ["", ""],
+			"a session id with a space must not be adopted");
+	assert(sessionsSentAfter("café", "") == ["", ""],
+			"a session id with a non-ASCII byte must not be adopted");
 }
