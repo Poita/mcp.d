@@ -320,6 +320,21 @@ ParsedInput parseAny(string text) @safe
 /// or holds no reply, and `null` when it holds nothing but replies.
 string takeBatchReplies(string raw, scope void delegate(Message) @safe onReply) @safe
 {
+	return takeBatchMembers(raw, (Message m) @safe {
+		if (m.kind != MessageKind.response && m.kind != MessageKind.errorResponse)
+			return false;
+		onReply(m);
+		return true;
+	});
+}
+
+/// Split the members `take` claims out of the batch text `raw`: `take` sees
+/// each well-formed member in order and returns true to remove it. The text of
+/// a batch holding the remaining members, in their original order, is
+/// returned. Returns `raw` unchanged when it is not a parseable batch or `take`
+/// claims nothing, and `null` when it claims every member.
+string takeBatchMembers(string raw, scope bool delegate(Message) @safe take) @safe
+{
 	import std.string : strip, startsWith;
 
 	if (!raw.strip.startsWith("["))
@@ -332,7 +347,7 @@ string takeBatchReplies(string raw, scope void delegate(Message) @safe onReply) 
 	if (arr.type != Json.Type.array)
 		return raw;
 	Json[] rest;
-	bool tookReply;
+	bool tookAny;
 	foreach (i; 0 .. arr.length)
 	{
 		auto item = arr[i];
@@ -341,16 +356,12 @@ string takeBatchReplies(string raw, scope void delegate(Message) @safe onReply) 
 			validateEnvelope(item);
 		catch (McpException)
 			wellFormed = false;
-		const kind = wellFormed ? Message(item).kind : MessageKind.request;
-		if (kind == MessageKind.response || kind == MessageKind.errorResponse)
-		{
-			onReply(Message(item));
-			tookReply = true;
-		}
+		if (wellFormed && take(Message(item)))
+			tookAny = true;
 		else
 			rest ~= item;
 	}
-	if (!tookReply)
+	if (!tookAny)
 		return raw;
 	return rest.length ? Json(rest).toString() : null;
 }
@@ -859,6 +870,23 @@ unittest  // takeBatchReplies hands replies to onReply and keeps the other membe
 		replies ~= m.id;
 	});
 	assert(replies == [Json(7), Json(8)]);
+	auto arr = parseJsonString(rest);
+	assert(arr.length == 2 && arr[0]["method"].get!string == "ping"
+			&& arr[1]["method"].get!string == "n");
+}
+
+unittest  // takeBatchMembers removes exactly the well-formed members `take` claims
+{
+	string[] taken;
+	const rest = takeBatchMembers(`[{"jsonrpc":"2.0","id":1,"method":"ping"},`
+			~ `{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":1}},`
+			~ `{"jsonrpc":"2.0","method":"n"}]`, (Message m) @safe {
+		if (m.method != "notifications/cancelled")
+			return false;
+		taken ~= m.method;
+		return true;
+	});
+	assert(taken == ["notifications/cancelled"]);
 	auto arr = parseJsonString(rest);
 	assert(arr.length == 2 && arr[0]["method"].get!string == "ping"
 			&& arr[1]["method"].get!string == "n");

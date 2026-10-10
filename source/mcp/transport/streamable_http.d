@@ -2687,23 +2687,33 @@ private void handlePost(McpServer server, ServerPushChannel push,
 		// legacy path is actually reachable for a session that negotiated 2025-03-26.
 		// Client replies in the batch wake their server->client waiters (scoped to
 		// this POST's session, as for a single reply) and only the rest is
-		// dispatched.
-		const rest = takeBatchReplies(payload, (Message m) @safe {
-			coord.resolve(m.id, m.result, m.error, connToken);
+		// dispatched. On a stateless mount each `notifications/cancelled` member is
+		// taken out too and dispatched once under the scope of the request it
+		// names, which may be running on another POST of the same principal.
+		Message[] statelessCancels;
+		const rest = takeBatchMembers(payload, (Message m) @safe {
+			if (m.kind == MessageKind.response || m.kind == MessageKind.errorResponse)
+			{
+				coord.resolve(m.id, m.result, m.error, connToken);
+				return true;
+			}
+			if (statelessInFlight !is null && m.kind == MessageKind.notification
+				&& m.method == "notifications/cancelled"
+				&& m.params.type == Json.Type.object && "requestId" in m.params)
+			{
+				statelessCancels ~= m;
+				return true;
+			}
+			return false;
 		});
-		// On a stateless mount the batch runs under a scope of its own: a
-		// `notifications/cancelled` member is also routed to the principal's
-		// request on another POST, and the batch's requests are tracked so a later
-		// POST's cancel can reach them.
+		// The batch's own requests are tracked so a later POST's cancel can reach
+		// them.
 		if (statelessInFlight !is null)
 		{
 			const principal = principalOf(token);
-			foreach (m; input.messages)
-				if (m.kind == MessageKind.notification && m.method == "notifications/cancelled"
-						&& m.params.type == Json.Type.object && "requestId" in m.params)
-					server.handle(m,
-							new HttpScopedContext(statelessInFlight.cancelScopeFor(principal,
-								m.params["requestId"]), statelessInFlight.share(new ConnectionState)));
+			foreach (m; statelessCancels)
+				server.handle(m, new HttpScopedContext(statelessInFlight.cancelScopeFor(principal,
+						m.params["requestId"]), statelessInFlight.share(new ConnectionState)));
 			foreach (m; input.messages)
 				if (m.kind == MessageKind.request)
 					statelessInFlight.track(principal, m.id, cancelScope);
