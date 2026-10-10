@@ -55,7 +55,8 @@ class HttpStatusException : McpException
 
 /// A request rejected because the server no longer knows the client's session:
 /// it answered a request carrying an `Mcp-Session-Id` with HTTP 404, or a
-/// request followed such an answer (basic/transports §Session Management).
+/// request followed such an answer (basic/transports §Session Management), or
+/// the legacy HTTP+SSE stream the session was bound to dropped.
 /// Every request fails this way until the client starts a new session with
 /// `initialize`, which also reopens a standalone server stream the expiry
 /// ended.
@@ -426,6 +427,9 @@ final class HttpClientTransport : ClientTransport
 	// and reports why.
 	private bool legacyStreamEnded;
 	private McpException legacyStreamFailure;
+	// True while the legacy reader reopens a GET-SSE stream that dropped, so a
+	// `legacyRpc` waits for the new stream's `endpoint` instead of failing.
+	private bool legacyReconnecting;
 	// True while the standalone server->client SSE reader task is running. Makes
 	// `startServerStream()` idempotent: a second call while a reader is live is a
 	// no-op, so a second standalone stream is never spawned and the live socket
@@ -2259,7 +2263,7 @@ final class HttpClientTransport : ClientTransport
 		// so this method can return once the `endpoint` event has arrived.
 		runTask(() nothrow{
 			try
-				runLegacyStream();
+				runLegacyStreams();
 			catch (Exception)
 			{
 			}
@@ -2315,6 +2319,8 @@ final class HttpClientTransport : ClientTransport
 		// delivers immediately after cannot be missed.
 		auto ec = legacyCompletionEvent().emitCount;
 
+		awaitLegacyStream();
+
 		// POST to legacyEndpoint; the server replies on the GET stream, unless it
 		// rejects the POST outright, in which case no reply will ever come.
 		int status;
@@ -2335,10 +2341,10 @@ final class HttpClientTransport : ClientTransport
 			throw new HttpStatusException(status,
 					"legacy HTTP+SSE server rejected the request with HTTP " ~ idStr(status));
 
-		// If the reader has already exited, no response can arrive on the stream:
-		// fail fast rather than waiting out the timeout.
+		// If the stream has already ended, no response can arrive on it: fail
+		// fast rather than waiting out the timeout.
 		if (!legacyStreamAlive && !waiter.got && waiter.err is null)
-			throw internalError("legacy HTTP+SSE stream is not active");
+			throw new TransportClosedException("legacy HTTP+SSE stream is closed");
 
 		// Wait for the correlated response, woken by the reader's `notifyLegacy`,
 		// `close()`, or `abort` (through which `McpClient` enforces its deadline).
@@ -2351,11 +2357,76 @@ final class HttpClientTransport : ClientTransport
 		throw new TransportClosedException("HTTP transport closed");
 	}
 
+	/// Wait (bounded) for a legacy GET-SSE stream that is being reopened to
+	/// announce its endpoint. Throws `TransportClosedException` when no live
+	/// stream is available.
+	private void awaitLegacyStream() @safe
+	{
+		import core.time : msecs, MonoTime;
+		import mcp.client.client : TransportClosedException;
+
+		const deadline = MonoTime.currTime + 10_000.msecs;
+		auto ec = legacyCompletionEvent().emitCount;
+		while (legacyReconnecting && !closing && !(legacyStreamAlive && legacyEndpoint.length))
+		{
+			const now = MonoTime.currTime;
+			if (now >= deadline)
+				break;
+			ec = legacyCompletionEvent().waitUninterruptible(deadline - now, ec);
+		}
+		if (!legacyStreamAlive || legacyEndpoint.length == 0)
+			throw new TransportClosedException("legacy HTTP+SSE stream is closed");
+	}
+
+	/// Run the legacy GET-SSE stream, reopening it with a growing backoff when it
+	/// drops after announcing its endpoint, until the transport closes. The
+	/// server binds a legacy session to its GET stream, so a reopened stream is a
+	/// new, uninitialized session: the drop marks the session expired, and
+	/// requests fail with `SessionExpiredException` until an `initialize` runs on
+	/// the new stream.
+	private void runLegacyStreams() @safe
+	{
+		import core.time : msecs, MonoTime;
+		import std.algorithm.comparison : min;
+		import vibe.core.core : sleep;
+
+		enum initialBackoff = 250.msecs;
+		enum maxBackoff = 10.seconds;
+		scope (exit)
+		{
+			legacyReconnecting = false;
+			notifyLegacy();
+		}
+		auto backoff = initialBackoff;
+		bool everEstablished;
+		for (;;)
+		{
+			const established = runLegacyStream();
+			if (established)
+			{
+				everEstablished = true;
+				backoff = initialBackoff;
+				legacyEndpoint = null;
+				sessionExpired = true;
+			}
+			// A first stream that never announced an endpoint is reported by
+			// `startLegacyFallback` instead.
+			if (closing || !everEstablished)
+				return;
+			legacyReconnecting = true;
+			const until = MonoTime.currTime + backoff;
+			while (!closing && MonoTime.currTime < until)
+				sleep(min(50.msecs, until - MonoTime.currTime));
+			backoff = nextBackoff(backoff, maxBackoff);
+		}
+	}
+
 	/// Read the legacy GET SSE stream over a raw TCP connection, dispatching
 	/// each event by type: an `endpoint` event sets the message-POST URI; a
 	/// `message` (or default) event is a JSON-RPC message routed to the awaited
-	/// response slot or to the inbound dispatcher.
-	private void runLegacyStream() @safe
+	/// response slot or to the inbound dispatcher. Returns whether the stream
+	/// announced a usable endpoint.
+	private bool runLegacyStream() @safe
 	{
 		import std.string : strip;
 		import vibe.core.task : Task;
@@ -2363,6 +2434,7 @@ final class HttpClientTransport : ClientTransport
 		const ep = parseHttpEndpoint(url);
 		// Resolve + pin the user-configured endpoint host to a numeric address.
 		const pinnedHost = pinnedEndpointHost(ep);
+		bool established;
 
 		legacyStreamAlive = true;
 		scope (exit)
@@ -2420,8 +2492,12 @@ final class HttpClientTransport : ClientTransport
 						if (resolved is null)
 							legacyEndpointRejected = true; // cross-origin: SSRF guard rejected it
 						else
+						{
 							legacyEndpoint = resolved;
-						notifyLegacy(); // wake `startLegacyFallback`
+							established = true;
+							legacyReconnecting = false;
+						}
+						notifyLegacy(); // wake `startLegacyFallback` or `awaitLegacyStream`
 						return;
 					}
 					// `message` event (or untyped): a JSON-RPC message, resolved to its
@@ -2439,6 +2515,7 @@ final class HttpClientTransport : ClientTransport
 		// The stream closed: fail every still-outstanding waiter so its `legacyRpc`
 		// wait returns promptly with a clear error instead of waiting out the timeout.
 		failOutstandingLegacyWaiters("legacy HTTP+SSE stream closed before response");
+		return established;
 	}
 
 	/// Resolve one `message`-event frame from the legacy HTTP+SSE stream. A response
@@ -6768,4 +6845,134 @@ unittest  // a request POST stops following a redirect loop
 	int served;
 	assert(redirectedListTools(307, "/old", served) !is null);
 	assert(served == 0);
+}
+
+version (unittest)
+{
+	/// A 2024-11-05 HTTP+SSE fake server. Each GET `/sse` stream is its own
+	/// session: it announces `/messages?s=<n>` as its endpoint and carries the
+	/// replies to that session's POSTs. A session answers `tools/list` only once
+	/// it has been initialized. `drop()` ends the current stream.
+	private final class LegacyFakeServer
+	{
+		import std.conv : to;
+
+		int streams;
+		bool[int] initialized;
+		Json[][int] outbox;
+		bool[int] dropped;
+
+		void drop() @safe
+		{
+			dropped[streams] = true;
+		}
+
+		URLRouter router() @safe
+		{
+			auto r = new URLRouter;
+			r.get("/sse", (HTTPServerRequest req, HTTPServerResponse res) @safe {
+				import core.time : msecs;
+				import vibe.core.core : sleep;
+
+				const s = ++streams;
+				res.headers["Content-Type"] = "text/event-stream";
+				res.bodyWriter.write("event: endpoint\ndata: /messages?s=" ~ s.to!string ~ "\n\n");
+				res.bodyWriter.flush();
+				while (s !in dropped && res.connected)
+				{
+					if (auto box = s in outbox)
+					{
+						foreach (m; *box)
+							res.bodyWriter.write("event: message\ndata: " ~ m.toString() ~ "\n\n");
+						outbox.remove(s);
+						res.bodyWriter.flush();
+					}
+					sleep(5.msecs);
+				}
+			});
+			r.post("/messages", (HTTPServerRequest req, HTTPServerResponse res) @safe {
+				const s = req.query.get("s", "0").to!int;
+				auto j = requestJson(req);
+				const method = ("method" in j) ? j["method"].get!string : "";
+				res.statusCode = 202;
+				res.writeBody("", "text/plain");
+				if ("id" !in j)
+					return;
+				Json reply;
+				if (method == "initialize")
+				{
+					initialized[s] = true;
+					reply = initializeReply(j, "2024-11-05");
+				}
+				else if (s in initialized)
+				{
+					reply = parseJsonString(`{"jsonrpc":"2.0","result":{"tools":[]}}`);
+					reply["id"] = j["id"];
+				}
+				else
+				{
+					reply = parseJsonString(
+						`{"jsonrpc":"2.0","error":{"code":-32600,"message":"not initialized"}}`);
+					reply["id"] = j["id"];
+				}
+				outbox[s] ~= reply;
+			});
+			return r;
+		}
+	}
+}
+
+unittest  // a dropped legacy HTTP+SSE stream reconnects and reports the lost session
+{
+	import core.time : msecs;
+	import std.array : replace;
+	import vibe.core.core : sleep;
+	import mcp.client.client : McpClient;
+
+	auto srv = new LegacyFakeServer;
+	bool expired;
+	size_t tools = size_t.max;
+	const failure = runAgainstFakeServer(srv.router(), (string url) @safe {
+		auto client = McpClient.http(url.replace("/mcp", "/sse"));
+		scope (exit)
+			client.close();
+		client.connect();
+		client.listTools();
+		srv.drop();
+		sleep(1500.msecs);
+		try
+			client.listTools();
+		catch (SessionExpiredException)
+			expired = true;
+		client.initialize("2024-11-05");
+		tools = client.listTools().tools.length;
+	});
+	assert(failure.length == 0, "scenario failed: " ~ failure);
+	assert(srv.streams >= 2, "the client must reopen the dropped stream");
+	assert(expired, "a request after the drop must report the lost session");
+	assert(tools == 0, "a new session must work on the reopened stream");
+}
+
+unittest  // reinitializeOnSessionExpiry carries a request across a dropped legacy stream
+{
+	import core.time : msecs;
+	import std.array : replace;
+	import vibe.core.core : sleep;
+	import mcp.client.client : McpClient, ClientSettings;
+
+	auto srv = new LegacyFakeServer;
+	size_t tools = size_t.max;
+	const failure = runAgainstFakeServer(srv.router(), (string url) @safe {
+		ClientSettings s;
+		s.reinitializeOnSessionExpiry = true;
+		auto client = McpClient.http(url.replace("/mcp", "/sse"), s);
+		scope (exit)
+			client.close();
+		client.connect();
+		srv.drop();
+		sleep(100.msecs);
+		tools = client.listTools().tools.length;
+	});
+	assert(failure.length == 0, "scenario failed: " ~ failure);
+	assert(tools == 0, "the request must succeed on the reconnected session");
 }
