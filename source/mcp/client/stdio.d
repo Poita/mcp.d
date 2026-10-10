@@ -9,7 +9,7 @@ import mcp.protocol.errors;
 import mcp.client.transport : BearerProvider, ClientTransport, ClientProtocol, InboundOrigin;
 import mcp.client.subscription : SubscriptionStream, ListenGate;
 import mcp.transport.duplex : ChannelWriteException, DuplexChannel, defaultMaxLineBytes;
-import mcp.transport.lines : FrameHead, LineReader, frameHeadScanBytes, scanFrameHead;
+import mcp.transport.lines : FrameHead, LineReader;
 import mcp.protocol.mrtr : MetaKey;
 
 @safe:
@@ -747,11 +747,13 @@ version (Windows) private struct WinChild
 }
 
 /// What the Windows stdout reader thread hands the read loop: a complete line,
-/// or the first bytes of an over-long one it dropped.
+/// or notice of an over-long one it dropped.
 version (Windows) private struct PumpedLine
 {
-	string text;
+	string text; /// the line, or for an `oversized` one its id as JSON text
 	bool oversized;
+	bool hasMethod; /// for an `oversized` line, as `FrameHead.hasMethod`
+	bool hasResult; /// for an `oversized` line, as `FrameHead.hasResult`
 }
 
 /// The thread writing the Windows child's stdin. Each line is handed to it
@@ -929,7 +931,8 @@ version (Windows) StdioClientTransport spawnStdioTransport(string[] args,
 			}
 			if (!got.oversized)
 				return got.text;
-			transport.noteOversized(scanFrameHead(cast(const(ubyte)[]) got.text), maxLineBytes);
+			transport.noteOversized(FrameHead(parseJsonString(got.text),
+					got.hasMethod, got.hasResult), maxLineBytes);
 		}
 	}
 
@@ -943,13 +946,12 @@ version (Windows) StdioClientTransport spawnStdioTransport(string[] args,
 	return transport;
 }
 
-/// Reader-thread body (Windows client): blocking reads on the child's stdout,
-/// assembling newline-delimited lines with a trailing '\r' stripped. Each complete
-/// line is pushed to `chan`. A line longer than `maxLineBytes` is dropped: its
-/// first bytes are pushed marked `oversized` as soon as it passes the bound, and
-/// the rest is skipped up to the next newline. EOF closes the channel, which
-/// surfaces to the duplex read loop as end-of-input; a final unterminated line is
-/// still a complete message and is pushed first.
+/// Reader-thread body (Windows client): blocking `ReadFile`s on the child's
+/// stdout, assembled into lines by a `LineReader`. Each complete line is pushed
+/// to `chan`; a line longer than `maxLineBytes` is pushed as an `oversized`
+/// notice carrying what its first bytes reveal, as soon as it passes the bound.
+/// EOF closes the channel, which surfaces to the duplex read loop as
+/// end-of-input.
 version (Windows) private void pumpChildStdout(HANDLE h,
 		Channel!PumpedLine chan, size_t maxLineBytes) @system
 {
@@ -958,58 +960,28 @@ version (Windows) private void pumpChildStdout(HANDLE h,
 
 	scope (exit)
 		CloseHandle(h);
-	ubyte[32 * 1024] buf;
-	ubyte[] acc;
-	bool dropping;
-	for (;;)
+	size_t readChunk(ubyte[] dst) @trusted
 	{
 		DWORD n;
-		const ok = ReadFile(h, cast(void*) buf.ptr, cast(DWORD) buf.length, &n, null) != 0;
-		if (!ok || n == 0)
-		{
-			if (acc.length && acc[$ - 1] == '\r')
-				acc = acc[0 .. $ - 1];
-			if (acc.length && !dropping)
-				chan.put(PumpedLine(cast(string) acc.idup));
+		if (ReadFile(h, cast(void*) dst.ptr, cast(DWORD) dst.length, &n, null) == 0)
+			return 0;
+		return n;
+	}
+
+	auto reader = LineReader(maxLineBytes);
+	reader.onOversized = (FrameHead head) @trusted {
+		chan.put(PumpedLine(head.id.toString(), true, head.hasMethod, head.hasResult));
+	};
+	for (;;)
+	{
+		auto line = reader.next(&readChunk);
+		if (line is null)
 			break;
-		}
-		auto got = buf[0 .. n];
-		size_t i;
-		while (i < got.length)
-		{
-			size_t nl = size_t.max;
-			foreach (j; i .. got.length)
-				if (got[j] == '\n')
-				{
-					nl = j;
-					break;
-				}
-			const end = nl == size_t.max ? got.length : nl;
-			if (!dropping)
-			{
-				acc ~= got[i .. end];
-				if (acc.length > maxLineBytes)
-				{
-					const head = acc.length < frameHeadScanBytes ? acc.length : frameHeadScanBytes;
-					chan.put(PumpedLine(cast(string) acc[0 .. head].idup, true));
-					acc = null;
-					dropping = true;
-				}
-			}
-			if (nl == size_t.max)
-				break; // need more data
-			i = nl + 1;
-			if (dropping)
-			{
-				dropping = false;
-				continue;
-			}
-			if (acc.length && acc[$ - 1] == '\r')
-				acc = acc[0 .. $ - 1];
-			// A blank line is "" rather than null, which the read loop takes as EOF.
-			chan.put(PumpedLine(acc.length ? cast(string) acc.idup : ""));
-			acc = null;
-		}
+		// The dropped over-long line was already pushed by `onOversized`.
+		FrameHead dropped;
+		if (reader.takeOversized(dropped))
+			continue;
+		chan.put(PumpedLine(line));
 	}
 	chan.close();
 }
