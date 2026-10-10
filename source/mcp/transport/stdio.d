@@ -68,7 +68,8 @@ void serveStdio(McpServer server, string delegate() @safe readLine,
 	// through dispatch and reads back for the notify path. Binding it here (before
 	// the read loop starts) makes it the state for every request on this process;
 	// HTTP instead resolves per-session state per request.
-	server.bindConnection(new ConnectionState);
+	auto conn = new ConnectionState;
+	server.bindConnection(conn);
 
 	DuplexChannel channel;
 
@@ -90,6 +91,17 @@ void serveStdio(McpServer server, string delegate() @safe readLine,
 	Json serverRequest(string method, Json params) @safe
 	{
 		return channel.request(method, params, opts.serverRequestTimeout);
+	}
+
+	// A server->client request channel for the handler of inbound request `id`:
+	// cancelling that request also releases the server->client request it awaits.
+	Json delegate(string, Json) @safe cancellableServerRequest(Json id) @safe nothrow
+	{
+		return (string method, Json params) @safe {
+			auto token = McpServer.inFlightKey("", id) in conn.inFlight;
+			return channel.request(method, params, opts.serverRequestTimeout,
+					token is null ? null : *token);
+		};
 	}
 
 	// Background ticker for modern `events/stream` push: poll-driven event types and
@@ -134,7 +146,13 @@ void serveStdio(McpServer server, string delegate() @safe readLine,
 	{
 		if (item.batch is null)
 		{
-			replyToRequest(server, &sink, &serverRequest, item.request, channel);
+			Json delegate(string, Json) @safe requester = &serverRequest;
+			try
+				requester = cancellableServerRequest(item.request.id);
+			catch (Exception)
+			{
+			}
+			replyToRequest(server, &sink, requester, item.request, channel);
 			return;
 		}
 		try
@@ -1979,6 +1997,57 @@ unittest  // stdio: a tool calling ctx.elicit is answered over the same stdio ch
 		}
 	}
 	assert(sawResult, "tools/call reply with the elicited value was never produced");
+}
+
+unittest  // stdio: cancelling a request releases its pending ctx.elicit and cancels it toward the client
+{
+	import core.time : seconds;
+
+	auto s = McpServer.stateful("stdio-peer", "1.0");
+	Tool ask = {name: "ask"};
+	bool handlerReleased;
+	s.registerTool(ask, (Json args, RequestContext ctx) @safe {
+		scope (exit)
+			handlerReleased = true;
+		ctx.elicit("What is your name?", Json(["type": Json("object")]));
+		return CallToolResult.init;
+	});
+
+	StdioOptions opts;
+	opts.serverRequestTimeout = 60.seconds;
+	long elicitId = -1;
+	bool released;
+	string[] outputs;
+	withServer(s, (ServerLink link) @safe {
+		link.feed(`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{"elicitation":{}},"clientInfo":{"name":"t","version":"1"}}}`);
+		link.feed(`{"jsonrpc":"2.0","method":"notifications/initialized"}`);
+		link.feed(`{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"ask"}}`);
+		foreach (_; 0 .. 12)
+			yield();
+		foreach (o; link.outbound)
+		{
+			auto j = parseJsonString(o);
+			if ("method" in j && j["method"].get!string == "elicitation/create")
+				elicitId = j["id"].get!long;
+		}
+		link.feed(`{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":2}}`);
+		foreach (_; 0 .. 12)
+			yield();
+		released = handlerReleased;
+		outputs = link.outbound.dup;
+	}, opts);
+
+	assert(elicitId >= 0, "the handler's elicitation/create was never sent");
+	assert(released, "the cancelled request's handler is released from its pending elicit");
+	bool sawCancel;
+	foreach (o; outputs)
+	{
+		auto j = parseJsonString(o);
+		if ("method" in j && j["method"].get!string == "notifications/cancelled"
+				&& j["params"]["requestId"].get!long == elicitId)
+			sawCancel = true;
+	}
+	assert(sawCancel, "the client is told the elicitation was cancelled");
 }
 
 unittest  // stdio: a roots/list_changed observer can re-list roots on its own context

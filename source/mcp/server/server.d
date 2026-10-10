@@ -2539,7 +2539,7 @@ final class McpServer : ServerCore
 	/// an absent/null id (a notification has none and is never tracked); the empty
 	/// connection token (the default for non-multiplexing transports) yields an
 	/// id-only key, so every request on that transport shares one scope.
-	private static string inFlightKey(string connToken, Json id) @safe
+	package(mcp) static string inFlightKey(string connToken, Json id) @safe
 	{
 		const idKey = cancellationKey(id);
 		if (idKey.length == 0)

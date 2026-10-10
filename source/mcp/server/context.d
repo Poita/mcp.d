@@ -27,6 +27,7 @@ import mcp.server.connection : ConnectionState;
 final class CancellationToken
 {
 	private bool cancelled_;
+	private void delegate() @safe nothrow[] onCancel_;
 
 	/// Whether a cancellation has been requested for this token's request.
 	bool cancelled() const @safe nothrow @nogc
@@ -34,10 +35,28 @@ final class CancellationToken
 		return cancelled_;
 	}
 
-	/// Mark the request cancelled. Idempotent.
-	void cancel() @safe nothrow @nogc
+	/// Mark the request cancelled and run the callbacks given to `onCancel`.
+	/// Idempotent.
+	void cancel() @safe nothrow
 	{
+		if (cancelled_)
+			return;
 		cancelled_ = true;
+		auto callbacks = onCancel_;
+		onCancel_ = null;
+		foreach (dg; callbacks)
+			dg();
+	}
+
+	/// Run `dg` when the request is cancelled, or now if it already is, so work
+	/// parked on the request's behalf (a server->client request awaiting the
+	/// client's reply) is released at once.
+	void onCancel(void delegate() @safe nothrow dg) @safe nothrow
+	{
+		if (cancelled_)
+			dg();
+		else
+			onCancel_ ~= dg;
 	}
 }
 

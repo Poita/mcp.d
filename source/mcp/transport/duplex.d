@@ -9,6 +9,7 @@ import vibe.data.json : Json, parseJsonString;
 
 import mcp.protocol.jsonrpc;
 import mcp.protocol.errors;
+import mcp.server.context : CancellationToken;
 import mcp.transport.coordinator : DuplexCoordinator, cancelledNotification;
 
 @safe:
@@ -359,9 +360,7 @@ final class DuplexChannel
 			return coord.await(id, timeout);
 		catch (RequestTimeoutException e)
 		{
-			write.abandoned = true;
-			if (write.started)
-				post(cancelledNotification(id, "request timed out"));
+			abandon(id, write, "request timed out");
 			throw e;
 		}
 		catch (McpException e)
@@ -416,13 +415,52 @@ final class DuplexChannel
 	/// the timeout also bounds a write the peer does not drain: a line not yet
 	/// being written then is withdrawn, and one that was is followed by a posted
 	/// `notifications/cancelled`.
-	Json request(string method, Json params, Duration timeout) @safe
+	///
+	/// `cancellation` is the token of the inbound request this one is made on
+	/// behalf of (null: none). Cancelling it ends the wait at once with a
+	/// `requestCancelled` error, handled like a timeout: the line is withdrawn
+	/// or followed by a posted `notifications/cancelled`.
+	Json request(string method, Json params, Duration timeout, CancellationToken cancellation = null) @safe
 	{
 		if (closed_)
 			throw internalError("stdio channel closed");
 		const id = coord.alloc();
 		coord.register(id);
-		return awaitReply(id, startWrite(makeRequest(Json(id), method, params), id), timeout);
+		auto write = startWrite(makeRequest(Json(id), method, params), id);
+		bool settled;
+		scope (exit)
+			settled = true;
+		if (cancellation !is null)
+			cancellation.onCancel(() @safe nothrow{
+				if (settled)
+					return;
+				abandon(id, write, "the request it serves was cancelled");
+				try
+					coord.resolve(Json(id), Json.undefined,
+						toErrorJson(new McpException(ErrorCode.requestCancelled,
+						"request cancelled")));
+				catch (Exception)
+				{
+				}
+			});
+		return awaitReply(id, write, timeout);
+	}
+
+	/// Stop writing request `id`'s line: withdraw it if not yet being written,
+	/// else tell the peer with a posted `notifications/cancelled`.
+	private void abandon(long id, PendingWrite write, string reason) @safe nothrow
+	{
+		if (write.abandoned)
+			return;
+		write.abandoned = true;
+		if (write.started)
+		{
+			try
+				post(cancelledNotification(id, reason));
+			catch (Exception)
+			{
+			}
+		}
 	}
 
 	/// Write one JSON-RPC `message` as a single newline-delimited line, serialized
