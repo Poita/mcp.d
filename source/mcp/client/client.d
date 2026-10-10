@@ -6916,6 +6916,7 @@ unittest  // sampling dispatch forwards a valid request to the delegate
 	m["content"] = b;
 	Json params = Json.emptyObject;
 	params["messages"] = Json([m]);
+	params["maxTokens"] = 16;
 
 	c.dispatchServerMethod("sampling/createMessage", params);
 	assert(delegateCalled);
@@ -8019,7 +8020,8 @@ unittest  // MRTR: resolveInputRequest routes a sampling request to onSampling
 		return CreateMessageResult.text("test-model", "reply");
 	};
 	InputResponse answer;
-	const ok = c.resolveInputRequest(InputRequest("s1", "sampling", Json.emptyObject), answer);
+	const ok = c.resolveInputRequest(InputRequest("s1", "sampling",
+			Json(["messages": Json.emptyArray, "maxTokens": Json(16)])), answer);
 	assert(ok);
 	assert(answer.id == "s1");
 	assert(answer.result["role"].get!string == "assistant");

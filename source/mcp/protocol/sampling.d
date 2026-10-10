@@ -313,19 +313,17 @@ struct CreateMessageRequest
 		if ("temperature" in j && j["temperature"].type != Json.Type.undefined
 				&& j["temperature"].type != Json.Type.null_)
 			r.temperature = numberOrThrow(j["temperature"], "temperature");
-		// `maxTokens` is a spec `number` (schema.ts: `maxTokens: number;`), so accept
-		// any non-null numeric representation (int, bigInt, or float) and not just an
-		// integer literal: a conformant sender may emit e.g. 100.0 (Json.Type.float_).
-		if ("maxTokens" in j && j["maxTokens"].type != Json.Type.undefined
-				&& j["maxTokens"].type != Json.Type.null_)
-		{
-			const v = numberOrThrow(j["maxTokens"], "maxTokens");
-			// `!(v >= 0)` also rejects NaN; the upper bound keeps the cast defined.
-			if (!(v >= 0) || v >= 0x1p63)
-				throw invalidParams(
-						"'maxTokens' must be a non-negative number within the integer range");
-			r.maxTokens = cast(long) v;
-		}
+		// `maxTokens` is a required spec `number` (schema.ts: `maxTokens: number;`),
+		// so accept any numeric representation (int, bigInt, or float) and not just
+		// an integer literal: a conformant sender may emit e.g. 100.0.
+		if ("maxTokens" !in j || j["maxTokens"].type == Json.Type.null_)
+			throw invalidParams("'maxTokens' is required");
+		const v = numberOrThrow(j["maxTokens"], "maxTokens");
+		// `!(v >= 0)` also rejects NaN; the upper bound keeps the cast defined.
+		if (!(v >= 0) || v >= 0x1p63)
+			throw invalidParams(
+					"'maxTokens' must be a non-negative number within the integer range");
+		r.maxTokens = cast(long) v;
 		if ("stopSequences" in j && j["stopSequences"].type == Json.Type.array)
 			foreach (i; 0 .. j["stopSequences"].length)
 				r.stopSequences ~= stringOrThrow(j["stopSequences"][i], "stopSequences");
@@ -611,9 +609,9 @@ struct CreateMessageResult
 	{
 		requireObject(j, "CreateMessageResult");
 		CreateMessageResult r;
-		r.role = j.getOr("role", "");
+		r.role = stringOrThrow("role" in j ? j["role"] : Json.undefined, "role");
 		r.contentBlocks = requiredContentBlocks(j, "CreateMessageResult");
-		r.model = j.getOr("model", "");
+		r.model = stringOrThrow("model" in j ? j["model"] : Json.undefined, "model");
 		tryGet(j, "stopReason", r.stopReason);
 		if ("_meta" in j && j["_meta"].type == Json.Type.object)
 			r.meta = j["_meta"];
@@ -1445,5 +1443,39 @@ unittest  // every sampling fromJson rejects a non-object value with -32602
 			auto ex = cast(McpException) collectException(T.fromJson(Json(5)));
 			assert(ex !is null && ex.code == ErrorCode.invalidParams, T.stringof);
 		}
+	}
+}
+
+unittest  // CreateMessageRequest.fromJson rejects a missing or null maxTokens with -32602
+{
+	import mcp.protocol.errors : ErrorCode;
+	import std.exception : collectException;
+	import vibe.data.json : parseJsonString;
+
+	foreach (b; [`{"messages":[]}`, `{"messages":[],"maxTokens":null}`])
+	{
+		auto ex = cast(McpException) collectException(
+				CreateMessageRequest.fromJson(parseJsonString(b)));
+		assert(ex !is null && ex.code == ErrorCode.invalidParams, b);
+	}
+}
+
+unittest  // CreateMessageResult.fromJson rejects a missing or non-string model or role with -32602
+{
+	import mcp.protocol.errors : ErrorCode;
+	import std.exception : collectException;
+	import vibe.data.json : parseJsonString;
+
+	static immutable string[] bodies = [
+		`{"role":"assistant","content":{"type":"text","text":"x"}}`,
+		`{"role":"assistant","model":5,"content":{"type":"text","text":"x"}}`,
+		`{"model":"m","content":{"type":"text","text":"x"}}`,
+		`{"role":true,"model":"m","content":{"type":"text","text":"x"}}`,
+	];
+	foreach (b; bodies)
+	{
+		auto ex = cast(McpException) collectException(
+				CreateMessageResult.fromJson(parseJsonString(b)));
+		assert(ex !is null && ex.code == ErrorCode.invalidParams, b);
 	}
 }
