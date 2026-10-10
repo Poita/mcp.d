@@ -696,7 +696,7 @@ private Json parametersSchema(alias func)() @safe
 				// (floating point) is NOT permitted.
 				static foreach (attr; __traits(getAttributes, func))
 					static if (is(typeof(attr) == mcpHeader))
-						if (attr.parameter == names[i])
+						static if (attr.parameter == names[i])
 							{
 							static assert(validateHeaderName(attr.name) is null,
 									"@mcpHeader(\"" ~ attr.parameter ~ "\", \"" ~ attr.name
@@ -2602,6 +2602,22 @@ unittest  // @mcpHeader: a Nullable-of-primitive parameter is accepted at compil
 {
 	auto s = new McpServer("t", "1");
 	assert(__traits(compiles, registerHandlers(s, new NullableHeaderApi)));
+}
+
+version (unittest) private class HeaderBesideArrayApi
+{
+	@tool("q", "Primitive header beside a non-primitive parameter")
+	@mcpHeader("region", "Region")
+	string q(string region, string[] tags) @safe
+	{
+		return region;
+	}
+}
+
+unittest  // @mcpHeader: a non-primitive sibling of the header parameter is accepted
+{
+	auto s = new McpServer("t", "1");
+	static assert(__traits(compiles, registerHandlers(s, new HeaderBesideArrayApi)));
 }
 
 unittest  // @mcpHeader: naming a non-existent parameter is rejected at compile time
