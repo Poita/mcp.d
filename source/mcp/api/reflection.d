@@ -194,10 +194,15 @@ private void registerOverload(string memberName, alias overload, alias parent)(
 	static foreach (attr; __traits(getAttributes, overload))
 	{
 		static if (is(attr))
+		{
 			static assert(!isHandlerUda!attr,
 					"@" ~ attr.stringof ~ " on '" ~ memberName ~ "' is missing its argument list (e.g. "
 					~ handlerUdaExample!attr ~ "); a bare @" ~ attr.stringof
 					~ " attaches the type, not a value, and registers nothing");
+			static assert(!isValueUdaType!attr, "@" ~ attr.stringof ~ " on '"
+					~ memberName ~ "' is missing its argument list; a bare @"
+					~ attr.stringof ~ " attaches the type, not a value, and has no effect");
+		}
 		else static if (is(typeof(attr) == tool))
 		{
 			static assert(isValidToolName(attr.name),
@@ -410,6 +415,21 @@ private enum isMethodUdaType(A) = is(A == readOnly) || is(A == destructive)
 	|| is(A == taskPollInterval) || is(A == describeParam) || is(A == audience)
 	|| is(A == priority) || is(A == lastModified) || is(A == cacheable)
 	|| is(A == icon) || is(A == meta) || is(A == eventPollInterval);
+
+/// Whether `A` is a method-level MCP UDA that carries a value, and so must be
+/// applied with an argument list rather than attached bare like a marker.
+private enum isValueUdaType(A) = isMethodUdaType!A && !is(A == readOnly)
+	&& !is(A == destructive) && !is(A == idempotent) && !is(A == openWorld) && !is(A == strictArgs);
+
+/// Whether `f` carries an applied (valued) `U` UDA.
+private bool hasValueUda(alias f, U)()
+{
+	bool found;
+	static foreach (a; __traits(getAttributes, f))
+		static if (!is(a) && is(typeof(a) == U))
+			found = true;
+	return found;
+}
 
 /// The name of the attribute `attr`'s UDA type.
 private template udaName(alias attr)
@@ -977,8 +997,8 @@ private Json collectMeta(alias overload)() @safe
 		{
 			static assert(a.value.type == Json.Type.object, "@meta on '" ~ __traits(identifier,
 					overload) ~ "' must be a JSON object, as `_meta` is");
-			static assert(!hasUDA!(overload, ui) || ("ui" in a.value) is null,
-					"@meta on '" ~ __traits(identifier,
+			static assert(!hasValueUda!(overload, ui)()
+					|| ("ui" in a.value) is null, "@meta on '" ~ __traits(identifier,
 						overload)
 					~ "' sets the \"ui\" key, which its @ui UDA writes; drop one of them");
 			m = a.value;
@@ -1208,7 +1228,7 @@ private void registerToolMethod(string memberName, alias overload, alias parent)
 		else
 			return toToolResult(__traits(getMember, parent, memberName)(argv.expand));
 	});
-	static if (hasUDA!(overload, ui))
+	static if (hasValueUda!(overload, ui)())
 		ensureApps(server);
 }
 
@@ -1269,7 +1289,7 @@ private void registerTaskMethod(string memberName, alias overload, alias parent)
 		else
 			return toToolResult(__traits(getMember, parent, memberName)(argv.expand)).toJson();
 	}, opts);
-	static if (hasUDA!(overload, ui))
+	static if (hasValueUda!(overload, ui)())
 		ensureApps(server);
 }
 
@@ -5679,6 +5699,79 @@ unittest  // @eventPollInterval on a @tool is rejected at compile time
 {
 	auto s = new McpServer("t", "1");
 	static assert(!__traits(compiles, registerHandlers(s, new EventPollOnToolApi)));
+}
+
+version (unittest)
+{
+	private final class ToolWithUdas(udas...)
+	{
+		@tool("t", "t") @(udas) string t(string a) @safe
+		{
+			return a;
+		}
+	}
+
+	private final class TaskWithUdas(udas...)
+	{
+		@taskTool("t", "t") @(udas) string t(string a) @safe
+		{
+			return a;
+		}
+	}
+
+	private final class ResourceWithUdas(udas...)
+	{
+		@resource("test://r", "r") @(udas) string r() @safe
+		{
+			return "";
+		}
+	}
+
+	private final class ResourceUriApi(string uri, string name)
+	{
+		@resource(uri, name) string r() @safe
+		{
+			return "";
+		}
+	}
+
+	private final class TemplateWithUdas(string uriTemplate, udas...)
+	{
+		@resourceTemplate(uriTemplate, "t") @(udas) string t(string a, string b = "") @safe
+		{
+			return a ~ b;
+		}
+	}
+}
+
+unittest  // a value UDA attached bare (without its argument list) is rejected at compile time
+{
+	auto s = new McpServer("t", "1");
+	static assert(!__traits(compiles, registerHandlers(s, new ToolWithUdas!ui)));
+	static assert(!__traits(compiles, registerHandlers(s, new ToolWithUdas!hintTitle)));
+	static assert(!__traits(compiles, registerHandlers(s, new ToolWithUdas!icon)));
+	static assert(!__traits(compiles, registerHandlers(s, new ToolWithUdas!meta)));
+	static assert(!__traits(compiles, registerHandlers(s, new ToolWithUdas!describeParam)));
+	static assert(!__traits(compiles, registerHandlers(s, new ToolWithUdas!mcpHeader)));
+	static assert(!__traits(compiles, registerHandlers(s, new TaskWithUdas!taskTtl)));
+	static assert(!__traits(compiles, registerHandlers(s, new TaskWithUdas!taskPollInterval)));
+	static assert(!__traits(compiles, registerHandlers(s, new ResourceWithUdas!cacheable)));
+	static assert(!__traits(compiles, registerHandlers(s, new ResourceWithUdas!audience)));
+	static assert(!__traits(compiles, registerHandlers(s, new ResourceWithUdas!priority)));
+	static assert(!__traits(compiles, registerHandlers(s, new ResourceWithUdas!lastModified)));
+	static assert(!__traits(compiles, registerHandlers(s, new ToolWithUdas!eventPollInterval)));
+}
+
+unittest  // marker UDAs and applied value UDAs still register beside a handler
+{
+	import core.time : seconds;
+
+	auto s = new McpServer("t", "1");
+	static assert(__traits(compiles, registerHandlers(s, new ToolWithUdas!(readOnly,
+			hintTitle("h"), icon("https://example.com/i.png"), describeParam("a", "d")))));
+	static assert(__traits(compiles, registerHandlers(s, new TaskWithUdas!(taskTtl(1.seconds)))));
+	static assert(__traits(compiles, registerHandlers(s,
+			new ResourceWithUdas!(cacheable(1.seconds), audience("user")))));
 }
 
 unittest  // UDAs that fit their handler kind and parameter types still register
