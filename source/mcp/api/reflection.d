@@ -49,6 +49,10 @@ import mcp.protocol.jsonhelpers : isFieldwiseStruct;
 /// Extensions those handlers enabled stay enabled.
 void registerHandlers(T)(McpServer server, T obj) @safe
 {
+	static if (is(T == class) || is(T == interface) || is(T == U*, U))
+		if (obj is null)
+			throw new Exception("registerHandlers needs a " ~ T.stringof
+					~ " instance, not null; its handlers would dereference it on every call");
 	Rollback rollback;
 	scope (failure)
 		rollback.run();
@@ -5883,6 +5887,32 @@ unittest  // a single-valued UDA repeated on one handler is rejected at compile 
 	// @icon repeats by design, one entry per icon.
 	static assert(__traits(compiles, registerHandlers(s,
 			new ToolWithUdas!(icon("https://a/1.png"), icon("https://a/2.png")))));
+}
+
+version (unittest)
+{
+	private struct NullTargetStruct
+	{
+		@tool("t", "t") string t() @safe
+		{
+			return "";
+		}
+	}
+
+	private interface NullTargetIface
+	{
+		@tool("t", "t") string t() @safe;
+	}
+}
+
+unittest  // registerHandlers rejects a null object, interface, or struct pointer
+{
+	import std.exception : assertThrown;
+
+	auto s = new McpServer("t", "1");
+	assertThrown!Exception(registerHandlers(s, cast(ToolWithUdas!()) null));
+	assertThrown!Exception(registerHandlers(s, cast(NullTargetIface) null));
+	assertThrown!Exception(registerHandlers(s, cast(NullTargetStruct*) null));
 }
 
 unittest  // UDAs that fit their handler kind and parameter types still register
