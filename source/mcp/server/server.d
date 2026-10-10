@@ -988,17 +988,12 @@ final class McpServer : ServerCore
 	void registerResourceTemplate(ResourceTemplate descriptor,
 			TemplateReader reader, Nullable!CacheHint cache = Nullable!CacheHint.init) @safe
 	{
-		// Two adjacent expressions ("{a}{b}") can never be reverse-matched against a
-		// concrete URI (there is no boundary between them), so such a template would
-		// silently never match; reject it at registration rather than shadowing it.
-		// An expression whose operator emits its own prefix ("{id}{?q}") is bounded.
-		import std.string : indexOf;
-
+		// A template with adjacent variables would silently never match; reject
+		// it at registration rather than shadowing it.
 		const tmpl = descriptor.uriTemplate;
-		foreach (i; 2 .. tmpl.length)
-			if (tmpl[i - 2 .. i] == "}{" && uriTemplatePrefixOps.indexOf(tmpl[i]) < 0)
-				throw new Exception("resource template '" ~ descriptor.name
-						~ "' has adjacent variables that can never match: " ~ tmpl);
+		if (hasAdjacentUriVariables(tmpl))
+			throw new Exception("resource template '" ~ descriptor.name
+					~ "' has adjacent variables that can never match: " ~ tmpl);
 		foreach (ref t; templates)
 			if (t.descriptor.uriTemplate == tmpl)
 				throw alreadyRegistered("a resource template '" ~ tmpl ~ "'",
@@ -4192,6 +4187,25 @@ private struct UriTemplateMatcher
 
 /// RFC 6570 operators whose expansion begins with the operator character itself.
 private enum uriTemplatePrefixOps = "#./;?&";
+
+/// Whether the URI template `tmpl` has two adjacent expressions ("{a}{b}") that
+/// can never be reverse-matched against a concrete URI, as there is no boundary
+/// between them. An expression whose operator emits its own prefix ("{id}{?q}")
+/// is bounded.
+bool hasAdjacentUriVariables(string tmpl) @safe pure nothrow @nogc
+{
+	foreach (i; 2 .. tmpl.length)
+	{
+		if (tmpl[i - 2 .. i] != "}{")
+			continue;
+		bool prefixed;
+		foreach (op; uriTemplatePrefixOps)
+			prefixed |= tmpl[i] == op;
+		if (!prefixed)
+			return true;
+	}
+	return false;
+}
 
 /// Bind one template expression (`expr`, the text between the braces) against
 /// the URI substring `s` it spans; see `matchUriTemplate` for the rules.

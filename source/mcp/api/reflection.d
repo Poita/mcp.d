@@ -10,7 +10,7 @@ import vibe.data.serialization : serializeWithPolicy, deserializeWithPolicy;
 import mcp.protocol.types;
 import mcp.protocol.capabilities : Icon;
 import mcp.protocol.modern : CacheHint, CacheScope;
-import mcp.server.server : McpServer, TaskToolOptions;
+import mcp.server.server : McpServer, TaskToolOptions, hasAdjacentUriVariables;
 import mcp.server.responses : ToolResponse, PromptResponse;
 import mcp.server.context;
 import mcp.server.task_context : TaskContext;
@@ -233,11 +233,21 @@ private void registerOverload(string memberName, alias overload, alias parent)(
 		}
 		else static if (is(typeof(attr) == resource))
 		{
+			static assert(attr.uri.length, "@resource on '" ~ memberName ~ "' has an empty uri");
+			static assert(attr.name.length, "@resource on '" ~ memberName ~ "' has an empty name");
 			registerResourceMethod!(memberName, overload, parent)(server, attr);
 			rollback.add(() @safe { server.removeResource(attr.uri); });
 		}
 		else static if (is(typeof(attr) == resourceTemplate))
 		{
+			static assert(attr.uriTemplate.length,
+					"@resourceTemplate on '" ~ memberName ~ "' has an empty uriTemplate");
+			static assert(attr.name.length,
+					"@resourceTemplate on '" ~ memberName ~ "' has an empty name");
+			static assert(!hasAdjacentUriVariables(attr.uriTemplate),
+					"@resourceTemplate on '" ~ memberName
+					~ "' has adjacent variables that can never match: \"" ~ attr.uriTemplate
+					~ "\"; separate them with a literal or an operator such as {?q}");
 			registerTemplateMethod!(memberName, overload, parent, attr)(server);
 			rollback.add(() @safe {
 				server.removeResourceTemplate(attr.uriTemplate);
@@ -970,6 +980,10 @@ private Icon[] collectIcons(alias overload)() @safe
 	{
 		static if (is(typeof(a) == icon))
 		{
+			static assert(a.src.length, "@icon on '" ~ __traits(identifier,
+					overload) ~ "' has an empty src");
+			static assert(a.theme.length == 0 || a.theme == "light" || a.theme == "dark",
+					"@icon theme must be \"light\" or \"dark\", got: \"" ~ a.theme ~ "\"");
 			{
 				Icon ic;
 				ic.src = a.src;
@@ -1028,7 +1042,12 @@ private void applyResourceMetadata(alias overload, D)(ref D descriptor) @safe
 	static foreach (a; __traits(getAttributes, overload))
 	{
 		static if (is(typeof(a) == audience))
+		{
+			static foreach (role; a.roles)
+				static assert(role == "user" || role == "assistant",
+						"@audience role must be \"user\" or \"assistant\", got: \"" ~ role ~ "\"");
 			descriptor.annotations.audience = a.roles;
+		}
 		else static if (is(typeof(a) == priority))
 		{
 			static assert(a.value >= 0.0 && a.value <= 1.0,
@@ -5772,6 +5791,40 @@ unittest  // marker UDAs and applied value UDAs still register beside a handler
 	static assert(__traits(compiles, registerHandlers(s, new TaskWithUdas!(taskTtl(1.seconds)))));
 	static assert(__traits(compiles, registerHandlers(s,
 			new ResourceWithUdas!(cacheable(1.seconds), audience("user")))));
+}
+
+unittest  // a handler UDA with an empty required field is rejected at compile time
+{
+	auto s = new McpServer("t", "1");
+	static assert(!__traits(compiles, registerHandlers(s, new ResourceUriApi!("", "r"))));
+	static assert(!__traits(compiles, registerHandlers(s, new ResourceUriApi!("test://r", ""))));
+	static assert(__traits(compiles, registerHandlers(s, new ResourceUriApi!("test://r", "r"))));
+}
+
+unittest  // @audience accepts only the roles "user" and "assistant"
+{
+	auto s = new McpServer("t", "1");
+	static assert(!__traits(compiles, registerHandlers(s,
+			new ResourceWithUdas!(audience("user", "admin")))));
+	static assert(__traits(compiles, registerHandlers(s,
+			new ResourceWithUdas!(audience("user", "assistant")))));
+}
+
+unittest  // @icon needs a src and a theme of "light" or "dark"
+{
+	auto s = new McpServer("t", "1");
+	static assert(!__traits(compiles, registerHandlers(s, new ToolWithUdas!(icon("")))));
+	static assert(!__traits(compiles, registerHandlers(s,
+			new ToolWithUdas!(icon("https://example.com/i.png", "", null, "sepia")))));
+	static assert(__traits(compiles, registerHandlers(s,
+			new ToolWithUdas!(icon("https://example.com/i.png", "", null, "dark")))));
+}
+
+unittest  // a @resourceTemplate with adjacent variables is rejected at compile time
+{
+	auto s = new McpServer("t", "1");
+	static assert(!__traits(compiles, registerHandlers(s, new TemplateWithUdas!("test://{a}{b}"))));
+	static assert(__traits(compiles, registerHandlers(s, new TemplateWithUdas!("test://{a}{?b}"))));
 }
 
 unittest  // UDAs that fit their handler kind and parameter types still register
