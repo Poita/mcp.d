@@ -808,7 +808,7 @@ asynchronously, and its return value becomes the result; the injected `TaskConte
 reports progress, observes cancellation, and elicits input mid-task.
 
 ```d
-auto rt = server.enableTasks();   // keep the runtime; pass a TaskStore for durability
+auto rt = server.enableTasks();   // keep the runtime; set TaskOptions.store for durability
 
 struct Approval { bool deploy; }
 
