@@ -866,17 +866,31 @@ final class HttpClientTransport : ClientTransport
 		scope (exit)
 			if (permit !is null)
 				permit.release();
-		// Funnel the pooled-client oneway POST through the resolve-validate-pin
-		// connector with the user-configured policy: the user-chosen endpoint host
-		// is resolved and the connection pinned to that vetted address (preserving
-		// the Host header + TLS SNI), but internal/loopback targets stay permitted.
-		secureRequestHTTP(target, SsrfPolicy.allowUserConfigured, (scope HTTPClientRequest req) {
-			setupRequest(req, message);
-		}, (scope HTTPClientResponse res) {
-			captureSession(res);
-			status = res.statusCode;
-			res.dropBody();
-		}, FetchOptions(sendTimeout, tlsTrust));
+		string challenge;
+		void attempt(string bearer)
+		{
+			// Funnel the pooled-client oneway POST through the resolve-validate-pin
+			// connector with the user-configured policy: the user-chosen endpoint
+			// host is resolved and the connection pinned to that vetted address
+			// (preserving the Host header + TLS SNI), but internal/loopback targets
+			// stay permitted.
+			secureRequestHTTP(target, SsrfPolicy.allowUserConfigured, (scope HTTPClientRequest req) {
+				setupRequest(req, message, bearer);
+			}, (scope HTTPClientResponse res) {
+				captureSession(res);
+				status = res.statusCode;
+				challenge = res.headers.get("WWW-Authenticate", "");
+				res.dropBody();
+			}, FetchOptions(sendTimeout, tlsTrust));
+		}
+
+		// As in `deliver`: a rejected bearer is reported once, and the POST
+		// retried once with the refreshed token.
+		const sentBearer = currentBearer();
+		attempt(sentBearer);
+		if (bearerProvider.onRejected !is null && sentBearer.length
+				&& isRejectedBearer(status, challenge) && refreshBearer(sentBearer))
+			attempt(currentBearer());
 		// A oneway send carries no awaited reply, so a rejection would otherwise be
 		// invisible: 404/410 under a session means the session is gone (drop its id
 		// and mark it so the next non-initialize request surfaces a clear error);
@@ -1460,7 +1474,7 @@ final class HttpClientTransport : ClientTransport
 				~ "use https:// to avoid transmitting the credential in cleartext", ep.host);
 	}
 
-	private void setupRequest(scope HTTPClientRequest req, Json message) @safe
+	private void setupRequest(scope HTTPClientRequest req, Json message, string bearer) @safe
 	{
 		req.method = HTTPMethod.POST;
 		req.headers["Accept"] = "application/json, text/event-stream";
@@ -1472,7 +1486,6 @@ final class HttpClientTransport : ClientTransport
 		const target = legacyMode ? legacyEndpoint : url;
 		if (sameOrigin(url, target))
 		{
-			const bearer = currentBearer();
 			if (bearer.length)
 			{
 				warnIfInsecureBearer();
@@ -4574,6 +4587,53 @@ unittest  // a POST carries the bearer its rejection is reported for, read once 
 			"onRejected must get the token the rejected POST carried: sent "
 			~ authorizations.to!string ~ ", rejected " ~ rejected.to!string);
 	assert(issued == 2, "the provider runs once per attempt, ran " ~ issued.to!string);
+}
+
+unittest  // a one-way POST whose bearer is rejected refreshes it and is retried once
+{
+	import mcp.client.client : McpClient;
+
+	string[] notified, rejected;
+	string token = "old";
+	auto r = new URLRouter;
+	r.post("/mcp", (HTTPServerRequest req, HTTPServerResponse res) @safe {
+		auto j = requestJson(req);
+		const method = ("method" in j) ? j["method"].get!string : "";
+		if (method == "initialize")
+		{
+			res.writeBody(initializeReply(j, "2025-11-25").toString(), "application/json");
+			return;
+		}
+		if (method == "notifications/x")
+		{
+			const auth = req.headers.get("Authorization", "");
+			notified ~= auth;
+			if (auth != "Bearer new")
+			{
+				res.statusCode = 401;
+				res.headers["WWW-Authenticate"] = `Bearer error="invalid_token"`;
+				res.writeBody("", "text/plain");
+				return;
+			}
+		}
+		res.statusCode = 202;
+		res.writeBody("", "text/plain");
+	});
+	const failure = runAgainstFakeServer(r, (string url) @safe {
+		auto client = McpClient.http(url);
+		scope (exit)
+			client.close();
+		client.initialize("2025-11-25");
+		client.setBearerProvider(BearerProvider(() @safe => token, (string t) @safe {
+				rejected ~= t;
+				token = "new";
+				return true;
+			}));
+		client.sendNotification("notifications/x");
+	});
+	assert(failure.length == 0, "scenario failed: " ~ failure);
+	assert(rejected == ["old"], "the rejected one-way POST's bearer must be reported");
+	assert(notified == ["Bearer old", "Bearer new"], "the one-way POST must be retried once");
 }
 
 unittest  // a rejected bearer with no replacement surfaces the 401 without a retry
