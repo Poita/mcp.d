@@ -929,12 +929,33 @@ void parseInputRequired(Json j, ref InputRequest[] requests, ref string requestS
 /// Serialize a list of `InputRequest`s as a spec `InputRequests` object: a map
 /// keyed by each request's server-assigned `id`, with `{ method, params }`
 /// request objects as values (SEP-2322, 2026-07-28 basic/utilities/mrtr).
+/// Throws when two requests share an `id`, since the map would keep only one;
+/// that is a local builder mistake, so it is a plain Exception.
 Json inputRequestsToJson(const(InputRequest)[] requests) @safe
 {
+	import std.exception : enforce;
+
 	Json obj = Json.emptyObject;
 	foreach (r; requests)
+	{
+		enforce(r.id !in obj, "duplicate InputRequest id '" ~ r.id ~ "'");
 		obj[r.id] = r.toJson();
+	}
 	return obj;
+}
+
+unittest  // inputRequestsToJson rejects duplicate request ids
+{
+	import std.exception : assertThrown;
+
+	assertThrown(inputRequestsToJson([
+		InputRequest("a", "elicitation", Json.emptyObject),
+		InputRequest("a", "roots", Json.emptyObject)
+	]));
+	assert(inputRequestsToJson([
+		InputRequest("a", "elicitation", Json.emptyObject),
+		InputRequest("b", "roots", Json.emptyObject)
+	]).length == 2);
 }
 
 /// Parse a spec `InputRequests` object (map keyed by id) back into the internal
