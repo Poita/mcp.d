@@ -2445,21 +2445,17 @@ final class McpServer : ServerCore
 		// in-process) key as the bare id.
 		const idKey = inFlightKey(connectionTokenOf(ctx), msg.id);
 		const trackable = idKey.length && msg.method != "initialize";
+		// A client reusing the id of a request still in flight violates JSON-RPC
+		// and would make a cancellation ambiguous, so the duplicate is refused
+		// and the original keeps its registration.
+		if (trackable && idKey in conn.inFlight)
+			return nullable(makeErrorResponse(msg.id,
+					invalidRequest("Request id is already in flight")));
 		if (trackable)
 			conn.inFlight[idKey] = token;
 		scope (exit)
 			if (trackable)
-			{
-				// Only remove the key when it still maps to THIS request's token. Two
-				// requests that collide on one `idKey` (a client reusing an in-flight id
-				// — itself a JSON-RPC violation) would otherwise have the first
-				// request's teardown delete the second's registration, leaving the live
-				// duplicate uncancelable. Comparing identity keeps one request from
-				// evicting another's token.
-				if (auto t = idKey in conn.inFlight)
-					if (*t is token)
-						conn.inFlight.remove(idKey);
-			}
+				conn.inFlight.remove(idKey);
 
 		// When the secure codec is enabled, verify the echoed (untrusted) MRTR
 		// requestState here, before the handler sees it. The identity it must be
@@ -2532,7 +2528,7 @@ final class McpServer : ServerCore
 		const idKey = cancellationKey(id);
 		if (idKey.length == 0)
 			return "";
-		// `\x1f` (unit separator) cannot appear in the "s:"/"i:" prefixed id key,
+		// `\x1f` (unit separator) cannot appear in the "s:"/"i:"/"f:" prefixed id key,
 		// so the (token, id) pair is unambiguous.
 		return connToken ~ "\x1f" ~ idKey;
 	}
@@ -2554,6 +2550,15 @@ final class McpServer : ServerCore
 				.to!string;
 		case Json.Type.bigInt:
 			return "i:" ~ id.toString();
+		case Json.Type.float_:
+			import std.format : format;
+			import std.math : isFinite;
+
+			// An integral float names the same request as the equal integer.
+			const d = id.get!double;
+			if (d.isFinite && d >= -0x1p63 && d < 0x1p63 && d == cast(double)(cast(long) d))
+				return "i:" ~ (cast(long) d).to!string;
+			return "f:" ~ format("%.17g", d);
 		default:
 			return "";
 		}
@@ -4949,27 +4954,39 @@ unittest  // a connection-scoped batch context reports the connection's declared
 	assert(!ctx.clientSupports(ClientCapability.sampling));
 }
 
-unittest  // duplicate in-flight id: the first request's teardown does not evict the second's token
+unittest  // a request reusing an in-flight id is rejected and leaves the first registration intact
 {
 	import mcp.server.context : CancellationToken;
 
-	auto conn = new ConnectionState;
-	auto tokA = new CancellationToken;
-	auto tokB = new CancellationToken;
+	auto s = makeTestServer();
+	auto first = new CancellationToken;
+	const key = McpServer.inFlightKey("", Json(1));
+	s.activeConnection.inFlight[key] = first;
 
-	// Both colliding requests share the bare id key (empty connection token).
-	conn.inFlight["i:1"] = tokA;
-	conn.inFlight["i:1"] = tokB; // B overwrites A's registration.
+	auto resp = s.handle(req(1, "tools/list")).get;
+	assert(resp["error"]["code"].get!int == ErrorCode.invalidRequest);
+	assert((key in s.activeConnection.inFlight) !is null);
+	assert(s.activeConnection.inFlight[key] is first);
+}
 
-	// A's teardown must only remove the key when it still maps to A's token; since
-	// B now owns it, the key (and B's token) must survive so a later cancellation
-	// can still reach B.
-	if (auto t = "i:1" in conn.inFlight)
-		if (*t is tokA)
-			conn.inFlight.remove("i:1");
+unittest  // a request with a fractional id is tracked in flight and cancellable
+{
+	import vibe.data.json : parseJsonString;
 
-	assert(("i:1" in conn.inFlight) !is null, "B's live token must not be evicted by A's teardown");
-	assert(conn.inFlight["i:1"] is tokB);
+	auto s = new McpServer("t", "1");
+	string[] keys;
+	Tool t = {name: "probe"};
+	s.registerTool(t, (Json args, RequestContext ctx) @safe {
+		keys = s.activeConnection.inFlight.keys;
+		CallToolResult r;
+		r.content = [Content.makeText("ok")];
+		return r;
+	});
+	s.handle(Message(parseJsonString(
+			`{"jsonrpc":"2.0","id":1.5,"method":"tools/call","params":{"name":"probe"}}`)));
+	assert(keys.length == 1);
+	assert(keys[0] == McpServer.inFlightKey("", Json(1.5)));
+	assert(McpServer.inFlightKey("", Json(1.5)) != McpServer.inFlightKey("", Json(2.5)));
 }
 
 unittest  // Implementation constructor advertises full serverInfo on 2025-11-25
