@@ -90,7 +90,7 @@ struct JwtVerifierConfig
 	/// whose `typ` does not match the expected type, defeating type-confusion
 	/// attacks (e.g. an OIDC `id_token` signed with the same key replayed as an
 	/// access token). The default also accepts the bare `JWT` that many issuers
-	/// (including this SDK's own token signer) emit. A token whose `typ` is
+	/// emit. A token whose `typ` is
 	/// absent or not listed here is rejected; set this empty to disable the
 	/// check for legacy issuers.
 	///

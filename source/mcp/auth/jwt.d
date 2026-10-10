@@ -333,7 +333,12 @@ struct JwtClaims
 	long iat; /// `iat` — issued-at (seconds since epoch; omitted if 0).
 	long nbf; /// `nbf` — not-before (seconds since epoch; omitted if 0).
 	long exp; /// `exp` — expiry (seconds since epoch; required, must be positive).
+	string jti; /// `jti` — unique token identifier (omitted if empty).
+	string clientId; /// `client_id` — the OAuth client the token was issued to (omitted if empty).
 	string kid; /// JWS `kid` header parameter (omitted if empty).
+	/// JWS `typ` header parameter. Defaults to `at+jwt`, the RFC 9068 type
+	/// that lets a resource server tell an access token from an OIDC id_token.
+	string typ = "at+jwt";
 }
 
 /// Build a signed ES256 JWT carrying the given `claims`, using the supplied
@@ -347,13 +352,17 @@ string mintJwtEs256(string privateKeyPem, JwtClaims claims) @safe
 {
 	if (claims.exp <= 0)
 		throw new Exception("mintJwtEs256: exp must be set to a positive expiry time");
-	foreach (s; [claims.iss, claims.aud, claims.sub, claims.scope_, claims.kid])
+	foreach (s; [
+		claims.iss, claims.aud, claims.sub, claims.scope_, claims.jti,
+		claims.clientId, claims.kid, claims.typ
+	])
 		if (containsControlChar(s))
 			throw new Exception("mintJwtEs256: claim contains control characters");
 
 	auto headerJson = Json.emptyObject;
 	headerJson["alg"] = "ES256";
-	headerJson["typ"] = "JWT";
+	if (claims.typ.length)
+		headerJson["typ"] = claims.typ;
 	if (claims.kid.length)
 		headerJson["kid"] = claims.kid;
 
@@ -371,6 +380,10 @@ string mintJwtEs256(string privateKeyPem, JwtClaims claims) @safe
 	if (claims.nbf != 0)
 		payloadJson["nbf"] = claims.nbf;
 	payloadJson["exp"] = claims.exp;
+	if (claims.jti.length)
+		payloadJson["jti"] = claims.jti;
+	if (claims.clientId.length)
+		payloadJson["client_id"] = claims.clientId;
 
 	const header = headerJson.toString();
 	const payload = payloadJson.toString();
@@ -481,6 +494,37 @@ version (unittest) private enum testEcPem = "-----BEGIN PRIVATE KEY-----\n"
 	~ "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQg7K6+stITLYsQjC9o\n"
 	~ "hyL925dgd6gNWRcGOl5RPvIpye+hRANCAATSBYPkHq12VDW5un1kub6zkBc4ieZ9\n"
 	~ "nurGMu+tLzJ6+6syOZsQCGlazcSOGsopLyl1QZMIFh9atUYaDfUjJxMq\n" ~ "-----END PRIVATE KEY-----\n";
+
+version (unittest) private Json jwtSegment(string jwt, size_t index) @safe
+{
+	import std.array : split;
+	import std.base64 : Base64URLNoPadding;
+	import vibe.data.json : parseJsonString;
+
+	return parseJsonString((cast(char[]) Base64URLNoPadding.decode(jwt.split('.')[index])).idup);
+}
+
+unittest  // mintJwtEs256 types the token as an RFC 9068 at+jwt access token by default
+{
+	JwtClaims claims;
+	claims.exp = 1_700_003_600;
+	assert(jwtSegment(mintJwtEs256(testEcPem, claims), 0)["typ"].get!string == "at+jwt");
+	claims.typ = "JWT";
+	assert(jwtSegment(mintJwtEs256(testEcPem, claims), 0)["typ"].get!string == "JWT");
+}
+
+unittest  // mintJwtEs256 emits jti and client_id when set and omits them otherwise
+{
+	JwtClaims claims;
+	claims.exp = 1_700_003_600;
+	auto bare = jwtSegment(mintJwtEs256(testEcPem, claims), 1);
+	assert("jti" !in bare && "client_id" !in bare);
+	claims.jti = "token-1";
+	claims.clientId = "client-1";
+	auto j = jwtSegment(mintJwtEs256(testEcPem, claims), 1);
+	assert(j["jti"].get!string == "token-1");
+	assert(j["client_id"].get!string == "client-1");
+}
 
 unittest  // mintJwtEs256 emits the supplied claims with iss/sub/aud varying independently
 {
