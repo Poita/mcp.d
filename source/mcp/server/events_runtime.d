@@ -1427,9 +1427,7 @@ final class EventsRuntime
 	private void endPollLease(PollLease lease) @safe
 	{
 		pollLeases_.remove(leaseKey(lease.name, lease.arguments, lease.principal));
-		if (auto n = lease.principal in pollLeaseCount_)
-			if (--*n <= 0)
-				pollLeaseCount_.remove(lease.principal);
+		releasePollLeaseSlot(lease.principal);
 		releaseLifecycle(lease.name, lease.arguments, lease.principal);
 	}
 
@@ -1499,11 +1497,8 @@ final class EventsRuntime
 		// so an authenticated caller cannot exhaust server memory (and the outbound
 		// delivery budget) by subscribing without bound. A refresh of an existing
 		// subscription reuses its slot and is never rejected.
-		if (isNew && opts_.webhookMaxSubscriptionsPerPrincipal > 0
-				&& webhookStore_.countByPrincipal(principal,
-					now) >= opts_.webhookMaxSubscriptionsPerPrincipal)
-			throw resourceExhausted("Too many webhook subscriptions for this principal",
-					"webhookSubscriptions", opts_.webhookMaxSubscriptionsPerPrincipal);
+		if (isNew)
+			enforceWebhookCap(principal, now);
 
 		WebhookSubscription sub = isNew ? WebhookSubscription.init : existing.get;
 		sub.id = id;
@@ -1561,6 +1556,15 @@ final class EventsRuntime
 				releaseLifecycle(p.name, p.arguments, principal);
 				return subscribeWebhookAttempt(p, principal, attempt + 1);
 			}
+			// Subscriptions stored while the hook ran count too: check again
+			// right before storing this one.
+			try
+				enforceWebhookCap(principal, now);
+			catch (McpException e)
+			{
+				releaseLifecycle(p.name, p.arguments, principal);
+				throw e;
+			}
 			webhookStore_.put(sub);
 		}
 		else if (!webhookStore_.compareAndSwap(sub, existing.get.revision))
@@ -1597,6 +1601,17 @@ final class EventsRuntime
 		if (!isNew)
 			r.deliveryStatus = priorStatus;
 		return r;
+	}
+
+	// Throw `-32013` when `principal` already holds its cap of live webhook
+	// subscriptions.
+	private void enforceWebhookCap(string principal, long now) @safe
+	{
+		if (opts_.webhookMaxSubscriptionsPerPrincipal > 0
+				&& webhookStore_.countByPrincipal(principal,
+					now) >= opts_.webhookMaxSubscriptionsPerPrincipal)
+			throw resourceExhausted("Too many webhook subscriptions for this principal",
+					"webhookSubscriptions", opts_.webhookMaxSubscriptionsPerPrincipal);
 	}
 
 	/// Build the optional `deliveryStatus` from a subscription's recorded health.
@@ -3323,15 +3338,22 @@ final class EventsRuntime
 						? "anonymousPollSubscriptions" : "pollSubscriptions", cap);
 		}
 		// on_subscribe runs before the lease is recorded, so a throwing hook is
-		// retried by the next poll rather than never firing again.
+		// retried by the next poll rather than never firing again. The slot is
+		// reserved before the hook, which may yield, so polls admitted meanwhile
+		// count against the cap.
 		if (fresh)
 		{
+			pollLeaseCount_[principal] = pollLeaseCount_.get(principal, 0) + 1;
+			scope (failure)
+				releasePollLeaseSlot(principal);
 			acquireLifecycle(reg, name, arguments, principal, subId);
 			// on_subscribe may yield, letting a concurrent poll of the same key
-			// record the lease first; that lease already holds a reference.
+			// record the lease first; that lease already holds a reference and
+			// a slot.
 			if ((key in pollLeases_) !is null)
 			{
 				releaseLifecycle(name, arguments, principal);
+				releasePollLeaseSlot(principal);
 				fresh = false;
 			}
 		}
@@ -3340,8 +3362,13 @@ final class EventsRuntime
 		// its subscription torn down and re-provisioned between polls.
 		const window = max(opts_.pollLeaseTtl.total!"msecs", 2 * nextPollMsFor(reg));
 		pollLeases_[key] = PollLease(name, principal, arguments, subId, now + window);
-		if (fresh)
-			pollLeaseCount_[principal] = pollLeaseCount_.get(principal, 0) + 1;
+	}
+
+	private void releasePollLeaseSlot(string principal) @safe nothrow
+	{
+		if (auto n = principal in pollLeaseCount_)
+			if (--*n <= 0)
+				pollLeaseCount_.remove(principal);
 	}
 
 	// Acquire a lifecycle reference for `(principal, name, arguments)`. `onSubscribe`
@@ -5094,6 +5121,95 @@ unittest  // unauthenticated poll leases share their own cap, not one principal'
 	auto e = collectException!McpException(poll(3, ""));
 	assert(e !is null && e.code == ErrorCode.resourceExhausted);
 	assertNotThrown!McpException(poll(0, "user-1")); // principals keep their own budget
+}
+
+unittest  // a poll admitted while another's on_subscribe runs cannot overshoot the lease cap
+{
+	import std.exception : collectException;
+	import mcp.protocol.errors : McpException, ErrorCode;
+
+	EventsOptions o;
+	o.nowMs = () @safe => 1_000_000L;
+	o.nowIso = () @safe => "t";
+	o.pollMaxLeasesPerPrincipal = 1;
+	auto rt = new EventsRuntime(null, o);
+	PollResult poll(int i) @safe
+	{
+		return rt.poll("n", Json(["i": Json(i)]), "user-1",
+				Nullable!string.init, Nullable!long.init, Nullable!long.init);
+	}
+
+	McpException inner;
+	EventRegistration reg;
+	reg.descriptor.name = "n";
+	reg.check = (EventContext ctx) @safe => EventResult.empty("c");
+	// The first subscriber's hook stands in for a yield during which a second
+	// poll of another key arrives.
+	reg.onSubscribe = (EventContext ctx, string id) @safe {
+		if (ctx.arguments["i"].get!int == 1)
+			inner = collectException!McpException(poll(2));
+	};
+	rt.register(reg);
+	poll(1);
+	assert(inner !is null && inner.code == ErrorCode.resourceExhausted);
+	assert(rt.pollLeaseCount_.get("user-1", 0) == 1);
+}
+
+unittest  // a hook that throws releases the poll lease slot it reserved
+{
+	import std.exception : collectException;
+	import mcp.protocol.errors : McpException;
+
+	EventsOptions o;
+	o.nowMs = () @safe => 1_000_000L;
+	o.nowIso = () @safe => "t";
+	o.pollMaxLeasesPerPrincipal = 1;
+	auto rt = new EventsRuntime(null, o);
+	bool fail = true;
+	EventRegistration reg;
+	reg.descriptor.name = "n";
+	reg.check = (EventContext ctx) @safe => EventResult.empty("c");
+	reg.onSubscribe = (EventContext ctx, string id) @safe {
+		if (fail)
+			throw new Exception("upstream down");
+	};
+	rt.register(reg);
+	assert(collectException(rt.poll("n", Json.emptyObject, "user-1",
+			Nullable!string.init, Nullable!long.init, Nullable!long.init)) !is null);
+	fail = false;
+	rt.poll("n", Json(["i": Json(2)]), "user-1", Nullable!string.init,
+			Nullable!long.init, Nullable!long.init);
+}
+
+unittest  // a webhook subscribe admitted while another's on_subscribe runs cannot overshoot the cap
+{
+	import std.exception : collectException;
+	import mcp.protocol.errors : McpException, ErrorCode;
+
+	auto ft = new FakeWebhookTransport();
+	EventsOptions o;
+	o.nowMs = () @safe => 1_000_000L;
+	o.nowIso = () @safe => "t";
+	o.allowPrivateCallbackHosts = true;
+	o.webhookTransport = ft;
+	o.deliveryExecutor = (void delegate() @safe job) @safe { job(); };
+	o.deliverySleep = (Duration d) @safe {};
+	o.webhookMaxSubscriptionsPerPrincipal = 1;
+	auto rt = new EventsRuntime(null, o);
+	bool nested;
+	EventRegistration reg = {descriptor: EventType("n"), emitOnly: true};
+	reg.onSubscribe = (EventContext ctx, string id) @safe {
+		if (nested)
+			return;
+		nested = true;
+		rt.subscribeWebhook(webhookSub("n", "https://proxy/other",
+				Json(["other": Json(true)])), "user-1");
+	};
+	rt.register(reg);
+	auto e = collectException!McpException(rt.subscribeWebhook(webhookSub("n",
+			"https://proxy/hooks"), "user-1"));
+	assert(e !is null && e.code == ErrorCode.resourceExhausted);
+	assert(rt.webhookStore().countByPrincipal("user-1", 1_000_000L) == 1);
 }
 
 unittest  // lifecycle is refcounted across modes: fires once per (principal,name,args)
