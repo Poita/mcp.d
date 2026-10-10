@@ -491,7 +491,7 @@ final class StdioClientTransport : ClientTransport
 	/// it is stopped first; closing the pipe under a pending read is unsafe.
 	version (Posix) private void releaseProcess() @safe
 	{
-		import vibe.core.core : sleep;
+		import vibe.core.core : runTask, sleep;
 
 		// The child is gone, so a write it left undrained can never complete. Not
 		// every event loop reports the dead reader (epoll does not), so the write
@@ -506,15 +506,26 @@ final class StdioClientTransport : ClientTransport
 					break;
 				sleep(10.msecs);
 			}
-			if (writePending())
-				return;
+			// A write still pending targets a pipe whose reader is gone and can
+			// never complete, so it is abandoned and the pipe closed regardless.
 			pipes.stdin.close();
 			stdinClosed_ = true;
 		}
 		// Its stdout is at end-of-input too, so the loop exits promptly; the
 		// grace only bounds a grandchild still holding the pipe.
 		if (channel !is null && started && !channel.stopReadLoop(1.seconds))
+		{
+			// Called from the read loop, which cannot wait for its own exit: a
+			// task of its own finishes the release once the loop has returned.
+			runTask(() nothrow{
+				try
+					releaseProcess();
+				catch (Exception)
+				{
+				}
+			});
 			return;
+		}
 		pipes.stdout.close();
 		destroy(*pipes);
 	}
@@ -522,8 +533,15 @@ final class StdioClientTransport : ClientTransport
 	/// Whether a line is being written to the child's stdin right now.
 	private bool writePending() const @safe nothrow
 	{
+		version (unittest)
+			if (writeStuckForTest)
+				return true;
 		return channel !is null && channel.writing;
 	}
+
+	/// Makes `writePending` report a write that never ends, so tests can drive
+	/// the shutdown paths for a child whose stdin write cannot be interrupted.
+	version (unittest) package bool writeStuckForTest;
 
 	/// Run the stdio shutdown sequence on the owned child and return its exit
 	/// status.
@@ -1376,6 +1394,25 @@ version (Posix) unittest  // close() releases the child's stdout pipe and proces
 		assert(eventDriver.pipes.isValid(stdoutFd) && eventDriver.processes.isValid(pid));
 		transport.close();
 		assert(!transport.channel.readLoopRunning, "the read loop must have stopped");
+		assert(!eventDriver.pipes.isValid(stdoutFd), "the stdout pipe must be released");
+		assert(!eventDriver.processes.isValid(pid), "the process handle must be released");
+	});
+}
+
+version (Posix) unittest  // closeProcess() releases the pipes even when a write never ends
+{
+	import core.time : msecs, seconds;
+	import eventcore.core : eventDriver;
+
+	inLoop(() @safe {
+		auto transport = spawnStdioTransport(["cat"]);
+		transport.sendOneway(parseJsonString(`{"jsonrpc":"2.0","method":"notifications/x"}`));
+		auto stdinFd = transport.pipes.stdin.tupleof[0];
+		auto stdoutFd = transport.pipes.stdout.tupleof[0];
+		auto pid = transport.pipes.process.tupleof[0];
+		transport.writeStuckForTest = true;
+		transport.closeProcess(100.msecs, 2.seconds);
+		assert(!eventDriver.pipes.isValid(stdinFd), "the stdin pipe must be released");
 		assert(!eventDriver.pipes.isValid(stdoutFd), "the stdout pipe must be released");
 		assert(!eventDriver.processes.isValid(pid), "the process handle must be released");
 	});
