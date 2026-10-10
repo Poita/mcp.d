@@ -276,8 +276,8 @@ struct UiResource
 /// `text/html;profile=mcp-app` MIME type and, when `resource.meta` carries any
 /// field, a `_meta.ui` object on both the listing and the read contents.
 /// Enables the Apps extension (see `enableApps`) when it is not yet enabled.
-/// Throws if `resource.uri` is not in the `ui://` scheme, or if both `html` and
-/// `htmlProvider` are set.
+/// Throws if `resource.uri` is not in the `ui://` scheme, or unless exactly one
+/// of `html` and `htmlProvider` is set.
 void registerUiResource(McpServer server, UiResource resource) @safe
 {
 	import std.algorithm.searching : startsWith;
@@ -287,6 +287,8 @@ void registerUiResource(McpServer server, UiResource resource) @safe
 		throw new Exception("a UI resource uri must start with \"ui://\", got: " ~ uri);
 	if (resource.html.length && resource.htmlProvider !is null)
 		throw new Exception("UI resource " ~ uri ~ " sets both html and htmlProvider; set only one");
+	if (!resource.html.length && resource.htmlProvider is null)
+		throw new Exception("UI resource " ~ uri ~ " sets neither html nor htmlProvider; set one");
 
 	const uiMeta = resource.meta.toJson();
 	Json wrapped = Json.undefined;
@@ -753,4 +755,12 @@ unittest  // a UiResource setting both html and htmlProvider is rejected
 	UiResource res = {uri: "ui://demo/both", name: "both", html: "<p>x</p>"};
 	res.htmlProvider = () @safe => "<p>y</p>";
 	assertThrown(registerUiResource(s, res));
+}
+
+unittest  // a UiResource setting neither html nor htmlProvider is rejected
+{
+	import std.exception : assertThrown;
+
+	auto s = new McpServer("t", "1");
+	assertThrown(registerUiResource(s, UiResource("ui://demo/empty", "empty")));
 }
