@@ -3016,11 +3016,14 @@ final class McpClient : ClientProtocol
 				c.cursor = res.cursor;
 				onControl(c);
 			}
+			const progressed = res.events.length > 0 || res.cursor != cur.cursor;
 			sub.advanceCursor(res.cursor);
 			if (sub.isCancelled())
 				return;
-			if (res.hasMore)
-				continue; // more buffered now — re-poll without sleeping
+			// Re-poll at once only while the server's backlog is draining; a
+			// hasMore poll that returned nothing new would otherwise spin.
+			if (res.hasMore && progressed)
+				continue;
 			eventPollSleep(sub, res.nextPollMs);
 		}
 	}
@@ -10251,6 +10254,33 @@ unittest  // subscribePoll's loop: delivers events, advances the cursor, drains 
 	assert(got.length == 2 && got[0].eventId == "e1" && got[1].eventId == "e2");
 	assert(ctrls.length == 1 && ctrls[0].kind == EventControlKind.gap);
 	assert(sub.cursor.get == "c2");
+}
+
+unittest  // the poll loop sleeps on a hasMore poll that made no progress
+{
+	auto c = new McpClient(new RecordingClientTransport());
+	c.enableModern();
+	int polls;
+	auto sub = new EventSubscription();
+	c.onRpcForTest = (string method, Json params) @safe {
+		polls++;
+		if (polls > 5)
+			sub.cancel();
+		PollResult r;
+		r.cursor = "c";
+		r.hasMore = true;
+		return r.toJson();
+	};
+	int sleeps;
+	sub.advanceCursor(Nullable!string("c"));
+	c.onEventPollSleepForTest = (Duration d) @safe {
+		sleeps++;
+		if (sleeps == 2)
+			sub.cancel();
+	};
+	c.runPollLoop(sub, PollParams("incident.created"), null, null);
+	assert(polls == 2, "a hasMore poll with no events and the same cursor must not re-poll at once");
+	assert(sleeps == 2);
 }
 
 unittest  // the poll loop clamps a tiny nextPollMs up to the default 1000 ms floor
