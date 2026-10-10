@@ -274,6 +274,21 @@ private void readNonNegative(Json j, string key, ref Nullable!long val) @safe
 	}
 }
 
+/// Read the optional `arguments` object of an events request into `val`:
+/// absent or null leaves `val` untouched, an object sets it, and any other
+/// value throws -32602 InvalidParams.
+private void readArguments(Json j, ref Json val) @safe
+{
+	import mcp.protocol.errors : invalidParams;
+
+	auto v = "arguments" in j;
+	if (v is null || v.type == Json.Type.null_ || v.type == Json.Type.undefined)
+		return;
+	if (v.type != Json.Type.object)
+		throw invalidParams("'arguments' must be an object");
+	val = *v;
+}
+
 /// Parameters of an `events/poll` request. `cursor: null` means "from now".
 struct PollParams
 {
@@ -301,8 +316,7 @@ struct PollParams
 		requireObject(j, "PollParams");
 		PollParams p;
 		p.name = j.getOr("name", "");
-		if ("arguments" in j && j["arguments"].type == Json.Type.object)
-			p.arguments = j["arguments"];
+		readArguments(j, p.arguments);
 		readCursor(j, p.cursor);
 		readNonNegative(j, "maxAgeMs", p.maxAgeMs);
 		readNonNegative(j, "maxEvents", p.maxEvents);
@@ -376,8 +390,7 @@ struct StreamParams
 		requireObject(j, "StreamParams");
 		StreamParams p;
 		p.name = j.getOr("name", "");
-		if ("arguments" in j && j["arguments"].type == Json.Type.object)
-			p.arguments = j["arguments"];
+		readArguments(j, p.arguments);
 		readCursor(j, p.cursor);
 		readNonNegative(j, "maxAgeMs", p.maxAgeMs);
 		return p;
@@ -445,8 +458,7 @@ struct SubscribeParams
 		requireObject(j, "SubscribeParams");
 		SubscribeParams p;
 		p.name = j.getOr("name", "");
-		if ("arguments" in j && j["arguments"].type == Json.Type.object)
-			p.arguments = j["arguments"];
+		readArguments(j, p.arguments);
 		if ("delivery" in j && j["delivery"].type == Json.Type.object)
 			p.delivery = WebhookDelivery.fromJson(j["delivery"]);
 		readCursor(j, p.cursor);
@@ -522,8 +534,7 @@ struct UnsubscribeParams
 		requireObject(j, "UnsubscribeParams");
 		UnsubscribeParams p;
 		p.name = j.getOr("name", "");
-		if ("arguments" in j && j["arguments"].type == Json.Type.object)
-			p.arguments = j["arguments"];
+		readArguments(j, p.arguments);
 		if ("delivery" in j && j["delivery"].type == Json.Type.object)
 			p.url = j["delivery"].getOr("url", "");
 		return p;
@@ -1121,6 +1132,35 @@ unittest  // StreamParams rejects a fractional maxAgeMs with InvalidParams
 	auto e = collectException!McpException(
 			StreamParams.fromJson(parseJsonString(`{"name":"n","maxAgeMs":1.5}`)));
 	assert(e !is null && e.code == ErrorCode.invalidParams);
+}
+
+unittest  // Poll/Stream/Subscribe/Unsubscribe params reject a non-object arguments with InvalidParams
+{
+	import std.exception : collectException;
+	import vibe.data.json : parseJsonString;
+	import mcp.protocol.errors : McpException, ErrorCode;
+
+	foreach (args; [`"x"`, `[1]`, `3`])
+	{
+		auto j = parseJsonString(
+				`{"name":"n","arguments":` ~ args
+				~ `,"delivery":{"mode":"webhook","url":"https://h/x"}}`);
+		foreach (e; [
+			collectException!McpException(PollParams.fromJson(j)),
+			collectException!McpException(StreamParams.fromJson(j)),
+			collectException!McpException(SubscribeParams.fromJson(j)),
+			collectException!McpException(UnsubscribeParams.fromJson(j))
+		])
+			assert(e !is null && e.code == ErrorCode.invalidParams, args);
+	}
+}
+
+unittest  // Poll params treat a null arguments as absent
+{
+	import vibe.data.json : parseJsonString;
+
+	auto p = PollParams.fromJson(parseJsonString(`{"name":"n","arguments":null}`));
+	assert(p.arguments.type == Json.Type.object && p.arguments.length == 0);
 }
 
 unittest  // SubscribeParams rejects a non-integer ttlMs rather than treating it as no expiry
