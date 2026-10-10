@@ -65,9 +65,17 @@ struct JwtVerifierConfig
 	/// issuers) or whose pinned keys belong to exactly one issuer.
 	bool allowAnyIssuer;
 
-	/// The required audience (`aud`, the RFC 8707 resource). When set, a token
-	/// that does not list it among its audiences is rejected.
+	/// The required audience (`aud`, the RFC 8707 resource). A token that does
+	/// not list it among its audiences is rejected. Required unless
+	/// `allowAnyAudience` is set: with neither, every token is rejected and
+	/// `jwtVerifier` refuses the config.
 	string audience;
+
+	/// Accept a token for any audience, skipping the `aud` check. Only for a
+	/// verifier whose caller binds the audience itself (e.g. `authorize`'s
+	/// RFC 8707 resource check); otherwise a token the same issuer minted for
+	/// another service would be accepted.
+	bool allowAnyAudience;
 
 	/// Scopes the token must carry (from `scope` or `scp`). All must be present.
 	/// A token missing one is rejected as invalid (401 `invalid_token`); to answer
@@ -138,6 +146,8 @@ TokenValidator jwtVerifier(JwtVerifierConfig cfg) @safe
 
 	enforce(cfg.issuer.length || cfg.allowAnyIssuer,
 			"jwtVerifier: set JwtVerifierConfig.issuer (or allowAnyIssuer to skip the iss check)");
+	enforce(cfg.audience.length || cfg.allowAnyAudience,
+			"jwtVerifier: set JwtVerifierConfig.audience (or allowAnyAudience to skip the aud check)");
 	enforce(cfg.jwksUri.length || cfg.staticPublicKeysPem.length, "jwtVerifier: set JwtVerifierConfig.jwksUri or staticPublicKeysPem; with neither, no token can verify");
 	enforce(cfg.jwksMaxStaleness >= cfg.jwksCacheTtl,
 			"jwtVerifier: JwtVerifierConfig.jwksMaxStaleness must be at least jwksCacheTtl");
@@ -334,7 +344,7 @@ package TokenInfo validateClaims(JwtVerifierConfig cfg, Json payload, long now) 
 		return reject("iss does not match the configured issuer");
 
 	auto auds = audiences(payload);
-	if (cfg.audience.length && !includesAudience(auds, cfg.audience))
+	if (!cfg.allowAnyAudience && (cfg.audience.length == 0 || !includesAudience(auds, cfg.audience)))
 		return reject("aud does not include the configured audience");
 
 	auto scopes = tokenScopes(payload);
@@ -1215,6 +1225,7 @@ unittest  // a valid RS256 token with good sig/iss/aud/scope is accepted
 unittest  // a config with no issuer rejects every token rather than skipping the iss check
 {
 	JwtVerifierConfig cfg;
+	cfg.allowAnyAudience = true;
 	auto payload = parseJsonString(`{"iss":"https://evil.example","sub":"u","exp":1700003600}`);
 	assert(!validateClaims(cfg, payload, 1_700_001_000).valid);
 	assert(!validateClaims(cfg,
@@ -1226,8 +1237,32 @@ unittest  // jwtVerifier refuses a config that pins no issuer
 	import std.exception : assertThrown;
 
 	JwtVerifierConfig cfg;
+	cfg.allowAnyAudience = true;
 	cfg.staticPublicKeysPem = ["unused"];
 	assertThrown(jwtVerifier(cfg));
+}
+
+unittest  // jwtVerifier refuses a config that pins no audience
+{
+	import std.exception : assertThrown;
+
+	JwtVerifierConfig cfg;
+	cfg.issuer = "https://as.example.com";
+	cfg.staticPublicKeysPem = ["unused"];
+	assertThrown(jwtVerifier(cfg));
+	cfg.allowAnyAudience = true;
+	cast(void) jwtVerifier(cfg);
+}
+
+unittest  // a config with no audience rejects every token rather than skipping the aud check
+{
+	JwtVerifierConfig cfg;
+	cfg.issuer = "https://as.example.com";
+	auto payload = parseJsonString(
+			`{"iss":"https://as.example.com","aud":"https://other.example","exp":1700003600}`);
+	assert(!validateClaims(cfg, payload, 1_700_001_000).valid);
+	cfg.allowAnyAudience = true;
+	assert(validateClaims(cfg, payload, 1_700_001_000).valid);
 }
 
 unittest  // jwtVerifier refuses a config with neither a jwksUri nor a pinned key
@@ -1235,6 +1270,7 @@ unittest  // jwtVerifier refuses a config with neither a jwksUri nor a pinned ke
 	import std.exception : assertThrown;
 
 	JwtVerifierConfig cfg;
+	cfg.allowAnyAudience = true;
 	cfg.issuer = "https://as.example.com";
 	assertThrown(jwtVerifier(cfg));
 }
@@ -1303,6 +1339,7 @@ unittest  // a `typ` rejection is logged with its reason
 		() @trusted { deregisterLogger(shared_); }();
 
 	JwtVerifierConfig cfg;
+	cfg.allowAnyAudience = true;
 	cfg.allowAnyIssuer = true;
 	cfg.acceptedTokenTypes = ["at+jwt"];
 	cfg.staticPublicKeysPem = [testEcPubPem];
@@ -1316,6 +1353,7 @@ unittest  // a `typ` rejection is logged with its reason
 unittest  // allowAnyIssuer explicitly accepts a token from any issuer
 {
 	JwtVerifierConfig cfg;
+	cfg.allowAnyAudience = true;
 	cfg.allowAnyIssuer = true;
 	cfg.staticPublicKeysPem = [testEcPubPem];
 	auto payload = parseJsonString(`{"iss":"https://any.example","sub":"u","exp":1700003600}`);
@@ -1326,6 +1364,7 @@ unittest  // allowAnyIssuer explicitly accepts a token from any issuer
 unittest  // a tampered RS256 signature is rejected
 {
 	JwtVerifierConfig cfg;
+	cfg.allowAnyAudience = true;
 	cfg.allowAnyIssuer = true;
 	auto cache = new JwksCache("", cfg.jwksCacheTtl);
 	cache.load(`{"keys":[{"kty":"RSA","kid":"rsa-1","n":"` ~ testRsaN ~ `","e":"` ~ testRsaE
@@ -1340,6 +1379,7 @@ unittest  // a tampered RS256 signature is rejected
 unittest  // an expired token is rejected (beyond clock skew)
 {
 	JwtVerifierConfig cfg;
+	cfg.allowAnyAudience = true;
 	cfg.allowAnyIssuer = true;
 	auto cache = new JwksCache("", cfg.jwksCacheTtl);
 	cache.load(`{"keys":[{"kty":"RSA","kid":"rsa-1","n":"` ~ testRsaN ~ `","e":"` ~ testRsaE
@@ -1353,6 +1393,7 @@ unittest  // an expired token is rejected (beyond clock skew)
 unittest  // a token with no exp claim is rejected (cannot be validated as unexpired)
 {
 	JwtVerifierConfig cfg;
+	cfg.allowAnyAudience = true;
 	cfg.allowAnyIssuer = true;
 	// A signature-verified payload with every other claim present but no exp.
 	auto payload = parseJsonString(`{"iss":"https://as.example.com","sub":"ec-user","scope":"mcp:read","iat":1700000000,"nbf":1700000000}`);
@@ -1363,6 +1404,7 @@ unittest  // a token with no exp claim is rejected (cannot be validated as unexp
 unittest  // a token with a present integer exp claim validates
 {
 	JwtVerifierConfig cfg;
+	cfg.allowAnyAudience = true;
 	cfg.allowAnyIssuer = true;
 	auto payload = parseJsonString(
 			`{"sub":"ec-user","iat":1700000000,"exp":1700003600,"nbf":1700000000}`);
@@ -1374,6 +1416,7 @@ unittest  // a token with a present integer exp claim validates
 unittest  // a non-integer exp claim is rejected (cannot be validated as unexpired)
 {
 	JwtVerifierConfig cfg;
+	cfg.allowAnyAudience = true;
 	cfg.allowAnyIssuer = true;
 	auto payload = parseJsonString(`{"sub":"ec-user","exp":"not-a-number"}`);
 	auto ti = validateClaims(cfg, payload, 1_700_001_000);
@@ -1383,6 +1426,7 @@ unittest  // a non-integer exp claim is rejected (cannot be validated as unexpir
 unittest  // a token is rejected at the exact exp+skew boundary (RFC 7519 4.1.4)
 {
 	JwtVerifierConfig cfg; // default clockSkew is 60s
+	cfg.allowAnyAudience = true;
 	cfg.allowAnyIssuer = true;
 	auto payload = parseJsonString(`{"sub":"ec-user","exp":1700003600,"nbf":1700000000}`);
 	// now == exp + skew: the token is no longer before its expiry, so reject.
@@ -1393,6 +1437,7 @@ unittest  // a token is rejected at the exact exp+skew boundary (RFC 7519 4.1.4)
 unittest  // a token one second before the exp+skew boundary is still valid
 {
 	JwtVerifierConfig cfg;
+	cfg.allowAnyAudience = true;
 	cfg.allowAnyIssuer = true;
 	auto payload = parseJsonString(`{"sub":"ec-user","exp":1700003600,"nbf":1700000000}`);
 	auto ti = validateClaims(cfg, payload, 1_700_003_659);
@@ -1402,6 +1447,7 @@ unittest  // a token one second before the exp+skew boundary is still valid
 unittest  // the wrong issuer is rejected
 {
 	JwtVerifierConfig cfg;
+	cfg.allowAnyAudience = true;
 	cfg.issuer = "https://evil.example.com";
 	auto cache = new JwksCache("", cfg.jwksCacheTtl);
 	cache.load(`{"keys":[{"kty":"RSA","kid":"rsa-1","n":"` ~ testRsaN ~ `","e":"` ~ testRsaE
@@ -1439,6 +1485,7 @@ unittest  // the audience is compared in canonical form (case of scheme+host, tr
 unittest  // a missing required scope is rejected
 {
 	JwtVerifierConfig cfg;
+	cfg.allowAnyAudience = true;
 	cfg.allowAnyIssuer = true;
 	cfg.requiredScopes = ["mcp:admin"];
 	auto cache = new JwksCache("", cfg.jwksCacheTtl);
@@ -1452,6 +1499,7 @@ unittest  // a missing required scope is rejected
 unittest  // a token whose only candidate key is the wrong key is rejected
 {
 	JwtVerifierConfig cfg;
+	cfg.allowAnyAudience = true;
 	cfg.allowAnyIssuer = true;
 	auto cache = new JwksCache("", cfg.jwksCacheTtl);
 	// The JWKS holds a single, unrelated RSA key; the RS256 token was signed by
@@ -1481,6 +1529,7 @@ unittest  // ES256: a token verified with a pinned PEM public key is accepted
 unittest  // ES256: verification via an EC JWK (crv/x/y) from a JWKS document
 {
 	JwtVerifierConfig cfg;
+	cfg.allowAnyAudience = true;
 	cfg.allowAnyIssuer = true;
 	auto cache = new JwksCache("", cfg.jwksCacheTtl);
 	cache.load(`{"keys":[{"kty":"EC","kid":"ec-1","crv":"P-256","x":"`
@@ -1497,6 +1546,7 @@ unittest  // ES256: verification via an EC JWK (crv/x/y) from a JWKS document
 unittest  // a bad-signature ES256 token (verified against the wrong EC key) fails
 {
 	JwtVerifierConfig cfg;
+	cfg.allowAnyAudience = true;
 	cfg.allowAnyIssuer = true;
 	cfg.staticPublicKeysPem = [testEcPubPem];
 
@@ -1520,6 +1570,7 @@ unittest  // a pinned RSA public key shorter than 2048 bits is not used to verif
 	enum weakToken = "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJ3ZWFrIiwiZXhwIjoxNzAwMDAzNjAwfQ." ~ "Mpded0h9CGy8Ro-2N5OEpJCCMd1E9FLE0XxqEtNXi4D3bxDW1shcbyKNfRNeOMZCOPSdAi3z8etblLoiCDrr3a_" ~ "wfnC_cfHQ9rK2Uq541N77MF1fmvptAdE6VnsRmjh5Kzqu8VaGVP4_q2Gra7OEFciZQ6kXpFMO3w-1_gMMzRs";
 
 	JwtVerifierConfig cfg;
+	cfg.allowAnyAudience = true;
 	cfg.allowAnyIssuer = true;
 	cfg.staticPublicKeysPem = [weakPem];
 	assert(!verifyToken(cfg, weakToken, new NoKeys, 1_700_001_000).valid);
@@ -1531,6 +1582,7 @@ unittest  // a malformed signature segment is invalid without raising (no per-re
 	import std.string : lastIndexOf;
 
 	JwtVerifierConfig cfg;
+	cfg.allowAnyAudience = true;
 	cfg.allowAnyIssuer = true;
 	cfg.staticPublicKeysPem = [testEcPubPem];
 	auto jwt = makeEs256(`{"sub":"ec-user","exp":1700003600}`);
@@ -1547,6 +1599,7 @@ unittest  // an unsupported alg (e.g. none) is rejected outright
 	import mcp.auth.oauth : base64UrlNoPad;
 
 	JwtVerifierConfig cfg;
+	cfg.allowAnyAudience = true;
 	cfg.allowAnyIssuer = true;
 	cfg.staticPublicKeysPem = [testEcPubPem];
 
@@ -1564,6 +1617,7 @@ unittest  // a token carrying a `crit` header is rejected even with a valid sign
 	import mcp.auth.oauth : base64UrlNoPad;
 
 	JwtVerifierConfig cfg;
+	cfg.allowAnyAudience = true;
 	cfg.allowAnyIssuer = true;
 	cfg.staticPublicKeysPem = [testEcPubPem];
 
@@ -1584,6 +1638,7 @@ unittest  // a token whose `typ` is an OIDC id_token is rejected (RFC 9068 §4.1
 	import mcp.auth.oauth : base64UrlNoPad;
 
 	JwtVerifierConfig cfg;
+	cfg.allowAnyAudience = true;
 	cfg.allowAnyIssuer = true;
 	cfg.staticPublicKeysPem = [testEcPubPem];
 
@@ -1606,6 +1661,7 @@ unittest  // an RFC 9068 `at+jwt` typ is accepted (case-insensitive, RFC 7515 §
 	import mcp.auth.oauth : base64UrlNoPad;
 
 	JwtVerifierConfig cfg;
+	cfg.allowAnyAudience = true;
 	cfg.allowAnyIssuer = true;
 	cfg.staticPublicKeysPem = [testEcPubPem];
 
@@ -1627,6 +1683,7 @@ unittest  // a token with no `typ` header is rejected by default (RFC 9068 §4.1
 	import mcp.auth.oauth : base64UrlNoPad;
 
 	JwtVerifierConfig cfg;
+	cfg.allowAnyAudience = true;
 	cfg.allowAnyIssuer = true;
 	cfg.staticPublicKeysPem = [testEcPubPem];
 
@@ -1647,6 +1704,7 @@ unittest  // emptying acceptedTokenTypes disables the `typ` check (escape hatch 
 	import mcp.auth.oauth : base64UrlNoPad;
 
 	JwtVerifierConfig cfg;
+	cfg.allowAnyAudience = true;
 	cfg.allowAnyIssuer = true;
 	cfg.staticPublicKeysPem = [testEcPubPem];
 	cfg.acceptedTokenTypes = [];
@@ -1723,6 +1781,7 @@ unittest  // JwksCache.keysFor selects by kid, then refreshes from a new documen
 unittest  // JWKs of different key types sharing a kid are all kept and selected by the token's alg
 {
 	JwtVerifierConfig cfg;
+	cfg.allowAnyAudience = true;
 	cfg.allowAnyIssuer = true;
 	const rsa = `{"kty":"RSA","kid":"rsa-1","n":"` ~ testRsaN ~ `","e":"` ~ testRsaE ~ `"}`;
 	const ec = `{"kty":"EC","kid":"rsa-1","crv":"P-256","x":"` ~ testEcX ~ `","y":"` ~ testEcY
@@ -1769,6 +1828,7 @@ unittest  // a JWK with use=="sig" and key_ops including "verify" is retained
 unittest  // an RS256 token offered only an EC key is rejected (kty<->alg binding)
 {
 	JwtVerifierConfig cfg;
+	cfg.allowAnyAudience = true;
 	cfg.allowAnyIssuer = true;
 	auto cache = new JwksCache("", cfg.jwksCacheTtl);
 	// Only an EC key is available; the token's header alg is RS256, so the
@@ -1782,6 +1842,7 @@ unittest  // an RS256 token offered only an EC key is rejected (kty<->alg bindin
 unittest  // an ES256 token offered only an RSA key is rejected (kty<->alg binding)
 {
 	JwtVerifierConfig cfg;
+	cfg.allowAnyAudience = true;
 	cfg.allowAnyIssuer = true;
 	cfg.staticPublicKeysPem = []; // none pinned
 	auto cache = new JwksCache("", cfg.jwksCacheTtl);
@@ -1809,6 +1870,7 @@ unittest  // tokenScopes() reads space-delimited scope and array/string scp
 unittest  // jwtVerifier returns a usable TokenValidator that rejects garbage
 {
 	JwtVerifierConfig cfg;
+	cfg.allowAnyAudience = true;
 	cfg.allowAnyIssuer = true;
 	cfg.staticPublicKeysPem = [testEcPubPem];
 	TokenValidator v = jwtVerifier(cfg);
@@ -2192,6 +2254,7 @@ unittest  // JwksCache spaces fetch attempts from when the last one finished, no
 unittest  // a token is answered as temporarily unavailable, not invalid, while the JWKS cannot be fetched
 {
 	JwtVerifierConfig cfg;
+	cfg.allowAnyAudience = true;
 	cfg.issuer = "https://as.example.com";
 	auto s = new ScriptedJwks(null);
 	auto ti = verifyToken(cfg, testRs256Jwt, s.cache, 1_700_001_000);
@@ -2210,6 +2273,7 @@ unittest  // a token is answered as temporarily unavailable, not invalid, while 
 unittest  // a pinned-key-only verifier never reports itself unavailable
 {
 	JwtVerifierConfig cfg;
+	cfg.allowAnyAudience = true;
 	cfg.issuer = "https://as.example.com";
 	cfg.staticPublicKeysPem = [testEcPubPem];
 	auto ti = verifyToken(cfg, testRs256Jwt, new NoKeys, 1_700_001_000);
@@ -2323,6 +2387,7 @@ unittest  // jwtVerifier refuses a JWKS max staleness shorter than the cache TTL
 	import std.exception : assertThrown;
 
 	JwtVerifierConfig cfg;
+	cfg.allowAnyAudience = true;
 	cfg.issuer = "https://as.example.com";
 	cfg.jwksUri = "https://as.example.com/jwks";
 	cfg.jwksMaxStaleness = cfg.jwksCacheTtl - 1.seconds;
@@ -2430,6 +2495,7 @@ unittest  // verifyOrInvalid returns the verifier's result when no exception is 
 unittest  // a token whose nbf is in the future is rejected (not-yet-valid)
 {
 	JwtVerifierConfig cfg;
+	cfg.allowAnyAudience = true;
 	cfg.allowAnyIssuer = true;
 	// Valid exp, but nbf is well beyond now + skew: the token is not yet valid.
 	auto payload = parseJsonString(`{"sub":"ec-user","exp":1700100000,"nbf":1700090000}`);
@@ -2457,6 +2523,7 @@ unittest  // a token carrying OIDC id_token-only claims is rejected even when ty
 unittest  // a non-numeric nbf is rejected rather than skipping the not-before check
 {
 	JwtVerifierConfig cfg;
+	cfg.allowAnyAudience = true;
 	cfg.allowAnyIssuer = true;
 	foreach (nbf; [`"1700090000"`, `true`, `null`, `{}`, `[1700000000]`])
 	{
@@ -2468,6 +2535,7 @@ unittest  // a non-numeric nbf is rejected rather than skipping the not-before c
 unittest  // a fractional nbf is honoured: rejected while in the future, accepted once past
 {
 	JwtVerifierConfig cfg;
+	cfg.allowAnyAudience = true;
 	cfg.allowAnyIssuer = true;
 	auto future = parseJsonString(`{"exp":1700100000,"nbf":1700090000.5}`);
 	assert(!validateClaims(cfg, future, 1_700_001_000).valid);
@@ -2478,6 +2546,7 @@ unittest  // a fractional nbf is honoured: rejected while in the future, accepte
 unittest  // a fractional exp is honoured: accepted while in the future, rejected once past
 {
 	JwtVerifierConfig cfg;
+	cfg.allowAnyAudience = true;
 	cfg.allowAnyIssuer = true;
 	auto live = parseJsonString(`{"sub":"x","exp":1700003600.25}`);
 	assert(validateClaims(cfg, live, 1_700_001_000).valid);
@@ -2488,6 +2557,7 @@ unittest  // a fractional exp is honoured: accepted while in the future, rejecte
 unittest  // a non-finite exp or nbf is rejected
 {
 	JwtVerifierConfig cfg;
+	cfg.allowAnyAudience = true;
 	cfg.allowAnyIssuer = true;
 	foreach (bad; [double.infinity, -double.infinity, double.nan])
 	{
@@ -2504,6 +2574,7 @@ unittest  // a non-finite exp or nbf is rejected
 unittest  // verifyToken rejects a well-formed token when no candidate key exists
 {
 	JwtVerifierConfig cfg;
+	cfg.allowAnyAudience = true;
 	cfg.allowAnyIssuer = true;
 	// A structurally valid ES256 token carrying a kid, but the key source offers
 	// nothing and no static PEM is pinned, so there are zero candidate keys.

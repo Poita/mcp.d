@@ -87,16 +87,19 @@ ResourceServerConfig jwtResourceServer(string issuer, string jwksUri, JwtPresetO
 /// token missing one is answered with 403 `insufficient_scope` (prompting the
 /// client to step up) rather than being rejected by the verifier as invalid.
 ///
-/// When `vc.audience` is set the verifier enforces it, so a token that passes is
-/// also bound to `resource` (see `bindResourceAudience`); this lets an IdP whose
-/// `aud` is an API identifier rather than the MCP URL pass `authorize`'s RFC 8707
-/// resource check. With no `vc.audience`, tokens must name `resource` itself.
+/// The verifier enforces `vc.audience`, which defaults to `resource` (unless
+/// `vc.allowAnyAudience` is set), so a token that passes is also bound to
+/// `resource` (see `bindResourceAudience`); this lets an IdP whose `aud` is an
+/// API identifier rather than the MCP URL pass `authorize`'s RFC 8707 resource
+/// check. Under `vc.allowAnyAudience`, tokens must name `resource` itself.
 ResourceServerConfig resourceServer(JwtVerifierConfig vc, string resource) @safe
 {
 	import mcp.auth.resource_server : bindResourceAudience;
 
 	enforce(resource.length > 0,
 			"resourceServer: resource (the canonical MCP server URL) must be set.");
+	if (vc.audience.length == 0 && !vc.allowAnyAudience)
+		vc.audience = resource;
 	ResourceServerConfig cfg;
 	cfg.requiredScopes = vc.requiredScopes.dup;
 	cfg.scopesSupported = vc.requiredScopes.dup;
@@ -883,6 +886,16 @@ unittest  // resourceServer(JwtVerifierConfig) bundles validator + metadata in o
 	assert(cfg.scopesSupported == ["mcp:read", "mcp:write"]);
 	// validator is live and fails closed on junk.
 	assert(!cfg.validator("not-a-jwt").valid);
+}
+
+unittest  // resourceServer requires tokens to name the resource when no audience is set
+{
+	JwtVerifierConfig vc;
+	vc.issuer = entraIssuer;
+	vc.staticPublicKeysPem = [presetEcPubPem];
+	auto cfg = resourceServer(vc, mcpUrl);
+	assert(cfg.validator(presetToken(mcpUrl)).valid);
+	assert(!cfg.validator(presetToken("https://other.example")).valid);
 }
 
 unittest  // resourceServer omits authorizationServers when no issuer is pinned
