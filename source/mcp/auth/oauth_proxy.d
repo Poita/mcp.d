@@ -688,8 +688,8 @@ struct RedirectUriRegistryOptions
 /// sticky; it marks the registration pending instead, which shields it for
 /// `pendingTtl` (after which it counts as freshly registered). Unused
 /// registrations expire after `unusedTtl`, and eviction prefers the oldest
-/// unused registration that has no authorization pending, falling back to the
-/// oldest registration only when there is none. A flood of anonymous
+/// unused registration that has no authorization pending, then the oldest
+/// pending one, evicting a used registration only when no other remains. A flood of anonymous
 /// registrations therefore displaces other idle registrations before a client
 /// whose user is mid-sign-in or that is actually signing users in.
 ///
@@ -905,11 +905,17 @@ final class InMemoryRedirectUriRegistry : RedirectUriRegistry
 	{
 		while (byHandle.length > opts.maxRegistrations)
 		{
-			// Evict the oldest idle registration. The newest registration is
-			// exempt, so a registry full of in-use or pending clients still admits
-			// a new one (evicting the oldest).
-			removeRegistration(unused.head !is null && unused.head !is allTail ? unused.head
-					: allHead);
+			// Evict the oldest idle registration, then the oldest pending one, and
+			// a used one only when nothing else is left. Anonymous `/authorize`
+			// requests can mark registrations pending, so pending ones must not
+			// shield a used one from eviction. The newest registration is exempt,
+			// so a full registry still admits a new one.
+			if (unused.head !is null && unused.head !is allTail)
+				removeRegistration(unused.head);
+			else if (pending.head !is null && pending.head !is allTail)
+				removeRegistration(pending.head);
+			else
+				removeRegistration(allHead);
 		}
 	}
 
@@ -3211,6 +3217,20 @@ unittest  // REDIRECT REGISTRY: a /register flood evicts never-used registration
 	assert(reg.isRegistered("https://app.example/cb"));
 	assert(reg.isRegistered("https://flood.example/cb4"));
 	assert(!reg.isRegistered("https://flood.example/cb0"));
+}
+
+unittest  // REDIRECT REGISTRY: pending registrations are evicted before a used one
+{
+	auto reg = new InMemoryRedirectUriRegistry(RedirectUriRegistryOptions(2));
+	reg.register("legit", ["https://app.example/cb"]);
+	reg.markUsed("https://app.example/cb");
+	reg.register("anon", ["https://anon.example/cb"]);
+	// An anonymous /authorize marks the attacker's registration pending.
+	reg.markPending("https://anon.example/cb");
+	reg.register("anon2", ["https://anon2.example/cb"]);
+	assert(reg.isRegistered("https://app.example/cb"));
+	assert(!reg.isRegistered("https://anon.example/cb"));
+	assert(reg.isRegistered("https://anon2.example/cb"));
 }
 
 unittest  // REDIRECT REGISTRY: when every registration is in use the oldest is evicted
