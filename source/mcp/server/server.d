@@ -2423,13 +2423,14 @@ final class McpServer : ServerCore
 		}
 
 		// basic/lifecycle: a stateful server SHOULD NOT serve a non-`ping` request
-		// before the client has sent `notifications/initialized`. Enforced only when
+		// before the client has completed `initialize` and then sent
+		// `notifications/initialized`. Enforced only when
 		// opted in via requireInitialized(); the stateless path has no per-session
 		// initialized handshake and is exempt, and `initialize`/`ping` are always
 		// allowed (the former establishes the session, the latter is a liveness
 		// probe permitted at any time).
-		if (requireInitialized_ && mode_ == ServerMode.stateful
-				&& !conn.initialized && msg.method != "initialize" && msg.method != "ping")
+		if (requireInitialized_ && mode_ == ServerMode.stateful && !(conn.initializeProcessed
+				&& conn.initialized) && msg.method != "initialize" && msg.method != "ping")
 			return nullable(makeErrorResponse(msg.id, invalidRequest("Server not initialized")));
 
 		// Register a cancellation token for this request keyed by its id, so an
@@ -2834,7 +2835,10 @@ final class McpServer : ServerCore
 		switch (msg.method)
 		{
 		case "notifications/initialized":
-			conn.initialized = true;
+			// Only an `initialize` already processed on this connection can be
+			// acknowledged; a stray notification must not open the lifecycle gate.
+			if (conn.initializeProcessed)
+				conn.initialized = true;
 			break;
 		case "notifications/cancelled":
 			// Resolve the cancellation against the connection it arrived on:
@@ -4898,6 +4902,20 @@ unittest  // requireInitialized: after notifications/initialized requests are se
 	auto resp = s.handle(req(2, "tools/list")).get;
 	assert("error" !in resp);
 	assert(resp["result"]["tools"].type == Json.Type.array);
+}
+
+unittest  // requireInitialized: notifications/initialized without initialize does not open the gate
+{
+	import mcp.protocol.jsonrpc : makeNotification;
+
+	auto s = McpServer.stateful("init-gate-srv", "0.1.0");
+	registerAddTool(s);
+	s.requireInitialized();
+
+	s.handle(Message(makeNotification("notifications/initialized", Json.emptyObject)));
+
+	auto resp = s.handle(req(1, "tools/list")).get;
+	assert(resp["error"]["code"].get!int == ErrorCode.invalidRequest);
 }
 
 unittest  // requireInitialized is OFF by default: a pre-initialized request is still served
@@ -12668,6 +12686,8 @@ unittest  // notifications/initialized flips only the carried state
 
 	auto s = new McpServer("t", "1");
 	auto state = new ConnectionState;
+	state.initializeProcessed = true;
+	s.activeConnection.initializeProcessed = true;
 	auto note = parseJsonString(`{"jsonrpc":"2.0","method":"notifications/initialized"}`);
 	s.handle(Message(note), new ConnCtx("sess", state));
 	assert(state.initialized, "initialized must be recorded on the carried state");

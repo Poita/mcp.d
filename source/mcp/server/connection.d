@@ -62,8 +62,8 @@ final class ConnectionState
 	/// identically-numbered request.
 	CancellationToken[string] inFlight;
 
-	/// Whether the client has sent `notifications/initialized` for this connection
-	/// (stateful). The lifecycle gate (opt-in via `requireInitialized`) serves
+	/// Whether the client has sent `notifications/initialized` after an
+	/// `initialize` was processed on this connection (stateful). The lifecycle gate (opt-in via `requireInitialized`) serves
 	/// non-`ping` requests only once this is set.
 	bool initialized;
 
