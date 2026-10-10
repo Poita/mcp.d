@@ -2484,11 +2484,11 @@ final class McpServer : ServerCore
 			if (token.cancelled)
 				return Nullable!Json.init;
 			// When the secure codec is enabled, wrap the outgoing MRTR requestState
-			// (tool/prompt/task input-required results all share the top-level
-			// `requestState` field) before serialisation, so the client only ever
-			// sees an integrity-protected (and optionally encrypted), expiry-stamped,
-			// user-bound blob. A no-op for results that carry no requestState and
-			// when no codec is configured.
+			// (tool and prompt input-required results share the top-level
+			// `requestState` field; task results carry none) before serialisation,
+			// so the client only ever sees an integrity-protected (and optionally
+			// encrypted), expiry-stamped, user-bound blob. A no-op for results that
+			// carry no requestState and when no codec is configured.
 			result = secureOutgoingRequestState(requestStateCodec_, result,
 					msg.method, msg.params, ctx);
 			return nullable(makeResponse(msg.id,
