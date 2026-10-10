@@ -28,8 +28,9 @@ opt in with `client.enableModern()`.
   ```
 - **Per-list hint** — `server.d` calls
   `server.setListCacheHint("resources/list", CacheHint(5.seconds, CacheScope.public_))`.
-  It rides on the `resources/list` result. (Valid list methods: `tools/list`,
-  `resources/list`, `resources/templates/list`, `prompts/list`.)
+  It rides on the `resources/list` result. (Valid methods: `tools/list`,
+  `resources/list`, `resources/templates/list`, `prompts/list`,
+  `server/discover`, and the Skills extension's `skills/list` and `skills/get`.)
 - **Consumer's-eye view** — `client.d` enables modern mode
   (`client.enableModern()`), then reads `list.cache.ttl` / `cacheScope` and
   `readResource(uri).cache.ttl` / `cacheScope` (each `.ttl` a `Duration`).
