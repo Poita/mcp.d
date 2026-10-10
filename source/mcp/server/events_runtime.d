@@ -794,7 +794,9 @@ final class EventsRuntime
 				|| existing.emitOnly != reg.emitOnly || canonicalJsonString(
 						existing.descriptor.meta) != canonicalJsonString(reg.descriptor.meta);
 		}
+		const offeredBefore = existing is null ? null : effectiveDelivery(name);
 		types_[name] = reg;
+		endDisabledModes(name, offeredBefore);
 		if (reg.onSubscribe !is null)
 			adoptStoredWebhooks(name);
 		if (descriptorChanged)
@@ -885,6 +887,39 @@ final class EventsRuntime
 		buffer_.drop(name);
 		notifyListChanged();
 		return true;
+	}
+
+	// End the subscriptions of every delivery mode `name` offered (`before`) but
+	// no longer offers: push streams and webhook subscriptions are terminated
+	// with `-32014 Unsupported` naming the mode, and poll leases are dropped.
+	private void endDisabledModes(string name, const DeliveryMode[] before) @safe
+	{
+		import std.algorithm : canFind;
+
+		const after = effectiveDelivery(name);
+		foreach (m; before)
+		{
+			if (after.canFind(m))
+				continue;
+			const wire = deliveryModeToWire(m);
+			const error = toErrorJson(unsupported(
+					"Event type " ~ name ~ " no longer offers " ~ wire ~ " delivery",
+					"deliveryMode", wire));
+			final switch (m)
+			{
+			case DeliveryMode.poll:
+				dropPollLeases(name);
+				break;
+			case DeliveryMode.push:
+				terminateMatching((PushStream s) @safe => s.name == name,
+						(WebhookSubscription w) @safe => false, error, name);
+				break;
+			case DeliveryMode.webhook:
+				terminateMatching((PushStream s) @safe => false,
+						(WebhookSubscription w) @safe => w.name == name, error, name);
+				break;
+			}
+		}
 	}
 
 	// The `-32014 Unsupported` a subscription ends with when its event type's
@@ -1783,7 +1818,7 @@ final class EventsRuntime
 		bool any;
 		string[] checkBacked;
 		foreach (name; types_.byKey)
-			if (!regIsEmitOnly(name in types_))
+			if (!regIsEmitOnly(name in types_) && offersWebhook(name))
 				checkBacked ~= name;
 		foreach (name; checkBacked)
 			foreach (sub; webhookStore_.byName(name))
@@ -2266,7 +2301,7 @@ final class EventsRuntime
 	/// job is re-leased — the multi-node path.
 	private void routeToWebhooks(EventRegistration* reg, EventOccurrence occ) @safe
 	{
-		if (!opts_.webhookEnabled)
+		if (!offersWebhook(occ.name))
 			return;
 		const now = opts_.nowMs();
 		bool any;
@@ -7199,6 +7234,49 @@ unittest  // events sharing a batch cursor settle the watermark together
 	ft.duringPost = null;
 	assert(duringSecond == "h0"); // m1 acked, m2 in flight: still h0
 	assert(rt.webhookStore().get(r.id).get.cursor.get == "h1");
+}
+
+unittest  // disabling push on a registered type terminates its open push streams
+{
+	auto rt = testRuntime();
+	EventRegistration reg = {descriptor: EventType("n"), emitOnly: true};
+	rt.register(reg);
+	string[] frames;
+	auto h = openLive(rt, "n", Json.emptyObject, "u", Json(1), (string m, Json p) @safe {
+		frames ~= m;
+	});
+	reg.disabledModes = [DeliveryMode.push];
+	rt.register(reg);
+	assert(h.stream.terminated);
+	assert(frames[$ - 1] == eventsTerminatedNotification);
+}
+
+unittest  // disabling webhook on a registered type ends its webhook subscriptions
+{
+	auto ft = new FakeWebhookTransport();
+	auto rt = engineRuntime(ft);
+	auto r = rt.subscribeWebhook(webhookSub("n", "https://proxy/hooks"), "user-1");
+	rt.emit(EventOccurrence("evt_1", "n", "t"));
+	assert(ft.eventPosts().length == 1);
+	EventRegistration reg = {descriptor: EventType("n"), emitOnly: true};
+	reg.disabledModes = [DeliveryMode.webhook];
+	rt.register(reg);
+	assert(rt.webhookStore().get(r.id).isNull);
+	rt.emit(EventOccurrence("evt_2", "n", "t"));
+	assert(ft.eventPosts().length == 1);
+}
+
+unittest  // a webhook subscription to a type that stops offering webhook gets no deliveries
+{
+	auto ft = new FakeWebhookTransport();
+	auto rt = engineRuntime(ft);
+	auto r = rt.subscribeWebhook(webhookSub("n", "https://proxy/hooks"), "user-1");
+	// The type's opt-out is set behind the runtime's back, as a stale record
+	// left in a shared store by another node would be.
+	rt.types_["n"].disabledModes = [DeliveryMode.webhook];
+	rt.emit(EventOccurrence("evt_1", "n", "t"));
+	assert(ft.eventPosts().length == 0);
+	assert(!rt.webhookStore().get(r.id).isNull);
 }
 
 unittest  // a refresh refuses a stored record at its id that belongs to another key
