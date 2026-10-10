@@ -173,7 +173,7 @@ string[] redirectUrisFrom(Json body_) @safe
 /// `state` value sent upstream. The client's PKCE `code_challenge` and `scope`
 /// are also retained so the upstream authorize redirect can be (re)built after a
 /// consent-approval round-trip (confused-deputy mitigation).
-struct ProxyAuthState
+package struct ProxyAuthState
 {
 	string clientRedirectUri; /// the client's dynamic redirect URI (RFC 7591)
 	string clientState; /// the client's original OAuth `state`, relayed back verbatim
@@ -323,7 +323,7 @@ struct ProxyStateStoreOptions
 /// is reached. One browser's and one client's pending authorizations are capped
 /// separately (`ProxyStateStoreOptions.maxPerConsentSession` and
 /// `maxPerClient`). The clock is injectable so the bounds are unit-testable.
-final class ProxyStateStore
+package final class ProxyStateStore
 {
 	import mcp.transport.session : BoundedExpiringMap;
 
@@ -460,7 +460,7 @@ private struct StatesByKey
 /// `/authorize` and `/register` endpoints in fixed windows, refusing them past
 /// a per-window budget. Clients are told apart by a caller-supplied key (by
 /// default the peer address).
-final class ClientRateLimiter
+package final class ClientRateLimiter
 {
 	import core.time : Duration, MonoTime;
 	import mcp.transport.session : BoundedExpiringMap;
@@ -809,8 +809,9 @@ private void mountPostPreflight(URLRouter router, string path) @safe
 /// Like `/token`, it is CORS-enabled for any origin (with a preflight answered)
 /// so a browser-based MCP client can register cross-origin.
 ///
-/// A request `limit` refuses is answered 429; a null `limit` admits all.
-void mountOAuthRegister(URLRouter router, OAuthProxy proxy, ProxyRequestLimit limit = null) @safe
+/// A request `limit` refuses is answered 429; pass `proxyRequestLimit(opts)`, or
+/// null to admit every request.
+void mountOAuthRegister(URLRouter router, OAuthProxy proxy, ProxyRequestLimit limit) @safe
 {
 	const registerPath = pathOf(proxy.config().registrationEndpoint());
 	mountPostPreflight(router, registerPath);
@@ -882,7 +883,7 @@ void mountOAuthRegister(URLRouter router, OAuthProxy proxy, ProxyRequestLimit li
 /// null `limit` admits all. Each pending authorization records the `clientKey`
 /// of the request that started it, which `store` caps per client; a null
 /// `clientKey` records none.
-void mountOAuthAuthorize(URLRouter router, OAuthProxy proxy, ProxyStateStore store,
+package void mountOAuthAuthorize(URLRouter router, OAuthProxy proxy, ProxyStateStore store,
 		ConsentCookie cookie, ProxyRequestLimit limit = null, ProxyClientKey clientKey = null) @safe
 {
 	auto cfg = proxy.config();
@@ -1074,7 +1075,7 @@ void mountOAuthAuthorize(URLRouter router, OAuthProxy proxy, ProxyStateStore sto
 /// proxy state out of the URL (no Referer/history/log leakage).
 ///
 /// The `store` MUST be the one `mountOAuthAuthorize` writes to.
-void mountOAuthConsent(URLRouter router, OAuthProxy proxy,
+package void mountOAuthConsent(URLRouter router, OAuthProxy proxy,
 		ProxyStateStore store, ConsentCookie cookie) @safe
 {
 	import mcp.auth.oauth : constantTimeEquals;
@@ -1188,7 +1189,7 @@ void mountOAuthConsent(URLRouter router, OAuthProxy proxy,
 /// redirect_uri. A refused callback leaves the pending authorization in place.
 ///
 /// The `store` MUST be the one `mountOAuthAuthorize` writes to.
-void mountOAuthCallback(URLRouter router, OAuthProxy proxy,
+package void mountOAuthCallback(URLRouter router, OAuthProxy proxy,
 		ProxyStateStore store, ConsentCookie cookie) @safe
 {
 	import mcp.auth.oauth : constantTimeEquals;
@@ -2138,7 +2139,7 @@ unittest  // /register refuses an oversized request body with 400
 
 	auto proxy = mountSampleProxy();
 	auto router = new URLRouter;
-	mountOAuthRegister(router, proxy);
+	mountOAuthRegister(router, proxy, null);
 
 	const res = browserPost(router, "https://mcp.example.com/register",
 			`{"redirect_uris":["http://localhost:5000/cb"],"pad":"` ~ "x".replicate(
@@ -3365,7 +3366,7 @@ unittest  // CORS: /register and /token responses are readable cross-origin
 
 	auto proxy = mountSampleProxy();
 	auto router = new URLRouter;
-	mountOAuthRegister(router, proxy);
+	mountOAuthRegister(router, proxy, null);
 	mountOAuthToken(router, proxy);
 
 	foreach (leg; [
@@ -3394,7 +3395,7 @@ unittest  // CORS: a preflight to /register or /token is answered
 
 	auto proxy = mountSampleProxy();
 	auto router = new URLRouter;
-	mountOAuthRegister(router, proxy);
+	mountOAuthRegister(router, proxy, null);
 	mountOAuthToken(router, proxy);
 
 	foreach (path; ["/register", "/token"])
@@ -3424,7 +3425,7 @@ unittest  // COMPOSE: the per-route helpers reproduce the /register leg
 
 	auto proxy = mountSampleProxy();
 	auto router = new URLRouter;
-	mountOAuthRegister(router, proxy);
+	mountOAuthRegister(router, proxy, null);
 
 	auto formBody = cast(ubyte[]) `{"redirect_uris":["http://localhost:5000/cb"]}`.dup;
 	auto req = createTestHTTPServerRequest(URL("https://mcp.example.com/register"),
@@ -3451,7 +3452,7 @@ unittest  // /register rejects a malformed JSON body with 400 invalid_client_met
 
 	auto proxy = mountSampleProxy();
 	auto router = new URLRouter;
-	mountOAuthRegister(router, proxy);
+	mountOAuthRegister(router, proxy, null);
 
 	auto formBody = cast(ubyte[]) `{ not valid json`.dup;
 	auto req = createTestHTTPServerRequest(URL("https://mcp.example.com/register"),
@@ -3477,7 +3478,7 @@ unittest  // /register rejects a body nested past the depth cap with 400 invalid
 
 	auto proxy = mountSampleProxy();
 	auto router = new URLRouter;
-	mountOAuthRegister(router, proxy);
+	mountOAuthRegister(router, proxy, null);
 
 	const json = `{"redirect_uris":["http://localhost:5000/cb"],"x":` ~ "[".replicate(
 			1000) ~ "]".replicate(1000) ~ `}`;
@@ -3513,7 +3514,7 @@ unittest  // /register rejects a redirect_uri /authorize would never accept with
 
 	auto proxy = mountSampleProxy();
 	auto router = new URLRouter;
-	mountOAuthRegister(router, proxy);
+	mountOAuthRegister(router, proxy, null);
 
 	foreach (uri; ["com.example.app:/oauth/cb", "http://app.example.com/cb"])
 	{
@@ -3541,7 +3542,7 @@ unittest  // /register rejects a body with no usable redirect_uris with 400
 
 	auto proxy = mountSampleProxy();
 	auto router = new URLRouter;
-	mountOAuthRegister(router, proxy);
+	mountOAuthRegister(router, proxy, null);
 
 	auto formBody = cast(ubyte[]) `{"client_name":"x"}`.dup;
 	auto req = createTestHTTPServerRequest(URL("https://mcp.example.com/register"),
@@ -3612,7 +3613,7 @@ unittest  // COMPOSE: an integrator's own /token wins without route-ordering sha
 	// The integrator mounts the proxy's non-token legs plus their OWN /token, with
 	// no proxy /token registered at all — so there is no shadowing to rely on.
 	mountOAuthMetadata(router, proxy);
-	mountOAuthRegister(router, proxy);
+	mountOAuthRegister(router, proxy, null);
 	router.post("/token", (HTTPServerRequest req, HTTPServerResponse res) @safe {
 		res.statusCode = HTTPStatus.ok;
 		res.writeBody(`{"custom_broker":true}`, "application/json");

@@ -381,3 +381,43 @@ unittest  // the unlimited task TTL sentinel is reachable from `import mcp;`
 {
 	static assert(visibleFromMcp!"unlimitedTaskTtl");
 }
+
+// Streamable HTTP's legacy-transport and content-negotiation helpers are
+// internal to their module.
+unittest
+{
+	static foreach (sym; [
+		"LegacySseChannel", "dispatchLegacyPost", "LegacyPostOutcome",
+		"endpointWithSession", "formatLegacyEndpointEvent",
+		"formatLegacyMessageEventRaw", "acceptsEventStream", "acceptsJson",
+		"postAccepted", "opensEventsStream", "eventStreamNotAcceptable",
+		"EventStreamTick", "eventStreamSleepMs", "eventStreamTick",
+		"eventStreamHeartbeatIntervalMs", "httpStatusForResponse",
+		"initializeSucceeded", "suppressOnDisconnect", "sessionStatus"
+	])
+		static assert(!reachableHere!("mcp.transport.streamable_http." ~ sym), sym);
+}
+
+// The OAuth proxy's per-route mounts share state only `mountOAuthProxy` wires
+// up, so they and that state are internal.
+unittest
+{
+	static foreach (sym; [
+		"mountOAuthAuthorize", "mountOAuthConsent", "mountOAuthCallback",
+		"ProxyStateStore", "ProxyAuthState", "ClientRateLimiter", "ConsentCookie"
+	])
+		static assert(!reachableHere!("mcp.transport.oauth_proxy_mount." ~ sym), sym);
+}
+
+// A route mounted on its own takes its rate limit explicitly, so leaving one
+// out cannot silently disable it.
+unittest
+{
+	static assert(!__traits(compiles, {
+			import mcp.transport.oauth_proxy_mount : mountOAuthRegister;
+			import mcp.auth.oauth_proxy : OAuthProxy;
+			import vibe.http.router : URLRouter;
+
+			mountOAuthRegister(URLRouter.init, OAuthProxy.init);
+		}));
+}

@@ -657,7 +657,7 @@ void mountLegacyHttpSse(URLRouter router, McpServer server,
 /// Each registered listener owns a fresh `ConnectionState` so concurrent clients
 /// do not interfere with each other's negotiated version, client capabilities,
 /// subscriptions, or in-flight cancellation registry.
-final class LegacySseChannel
+private final class LegacySseChannel
 {
 	import vibe.core.sync : LocalManualEvent, createManualEvent;
 
@@ -683,7 +683,7 @@ final class LegacySseChannel
 	/// Correlates server->client requests with the client's reply POSTs, keyed by
 	/// (sessionId, requestId). A handler that blocks in ctx.sample/ctx.elicit/
 	/// ctx.listRoots registers here; the client's reply POST resolves the waiter.
-	StreamCoordinator coord;
+	private StreamCoordinator coord;
 
 	/// `coord` correlates server->client requests; pass the server's push channel
 	/// coordinator so requests the server issues through its push channel are
@@ -859,7 +859,7 @@ final class LegacySseChannel
 /// `endpoint` event tells a client where to POST AND which stream its replies
 /// belong to. The token is added as a `sessionId` query parameter, preserving any
 /// existing query string already present on the path.
-string endpointWithSession(string endpointPath, string sessionId) @safe
+private string endpointWithSession(string endpointPath, string sessionId) @safe
 {
 	import std.string : indexOf;
 
@@ -1245,7 +1245,7 @@ private void handleLegacyInput(McpServer server, LegacySseChannel channel,
 }
 
 /// What became of a message POSTed to the legacy message endpoint.
-enum LegacyPostOutcome
+private enum LegacyPostOutcome
 {
 	accepted, /// dispatched (or answered on the stream with a parse error)
 	unknownStream, /// no open stream owned by the caller has the session token
@@ -1265,7 +1265,7 @@ enum LegacyPostOutcome
 /// and any other notification payload waits for one of the stream's separate
 /// pool of `maxLegacyInFlight` notification slots, so a client cannot park an
 /// unbounded number of notification handlers.
-LegacyPostOutcome dispatchLegacyPost(McpServer server, LegacySseChannel channel,
+private LegacyPostOutcome dispatchLegacyPost(McpServer server, LegacySseChannel channel,
 		string sessionId, string payload, TokenInfo token = TokenInfo.invalid()) @safe
 {
 	import vibe.core.core : runTask;
@@ -1396,7 +1396,7 @@ private final class LegacySseContext : RequestContext, ConnectionScoped
 /// Frame the legacy `endpoint` SSE event (2024-11-05 basic/transports §HTTP with
 /// SSE): a typed `endpoint` event whose data is the URI the client must POST
 /// subsequent messages to.
-string formatLegacyEndpointEvent(string uri) @safe
+private string formatLegacyEndpointEvent(string uri) @safe
 {
 	return "event: endpoint\ndata: " ~ uri ~ "\n\n";
 }
@@ -1404,7 +1404,7 @@ string formatLegacyEndpointEvent(string uri) @safe
 /// Frame a legacy server `message` SSE event from already-serialised JSON text
 /// (2024-11-05 basic/transports §HTTP with SSE: "Server messages are sent as SSE
 /// `message` events, with the message content encoded as JSON in the event data").
-string formatLegacyMessageEventRaw(string jsonText) @safe
+private string formatLegacyMessageEventRaw(string jsonText) @safe
 {
 	return "event: message\ndata: " ~ jsonText ~ "\n\n";
 }
@@ -1664,7 +1664,7 @@ unittest  // resourceOrigin strips the path from a configured resource identifie
 /// value (no `Accept` header) is treated permissively as acceptable, since the
 /// transport never required clients to send one. Only a header that names media
 /// types and omits any matching one returns false.
-bool acceptsEventStream(string accept) @safe
+private bool acceptsEventStream(string accept) @safe
 {
 	return acceptsMediaType(accept, "text", "event-stream");
 }
@@ -1704,7 +1704,7 @@ unittest  // matching is case-insensitive and tolerant of surrounding whitespace
 /// `application/*` subtype wildcard, or the `*/*` full wildcard, unless the
 /// most specific matching range carries `q=0`. An empty value (no `Accept`) is
 /// permissive.
-bool acceptsJson(string accept) @safe
+private bool acceptsJson(string accept) @safe
 {
 	return acceptsMediaType(accept, "application", "json");
 }
@@ -1780,7 +1780,7 @@ unittest  // an Accept that names media types but omits application/json is reje
 /// provably excludes BOTH could not consume any response the server may produce,
 /// so it is rejected up front with 406 Not Acceptable. A missing/blank Accept is
 /// permissive (both helpers admit it), matching the GET path's tolerance.
-bool postAccepted(string accept) @safe
+private bool postAccepted(string accept) @safe
 {
 	return acceptsJson(accept) || acceptsEventStream(accept);
 }
@@ -2061,7 +2061,7 @@ private long addListenStreamListener(ServerPushChannel push, void delegate(
 }
 
 /// Whether `method` opens a modern `events/stream` push response.
-bool opensEventsStream(string method, bool modern) @safe
+private bool opensEventsStream(string method, bool modern) @safe
 {
 	return modern && method == "events/stream";
 }
@@ -2069,7 +2069,7 @@ bool opensEventsStream(string method, bool modern) @safe
 /// The JSON-RPC error surfaced (under a 406 Not Acceptable) when a POST that would
 /// open a `text/event-stream` response (`subscriptions/listen` or `events/stream`)
 /// carries an `Accept` that provably excludes that media type.
-McpException eventStreamNotAcceptable() @safe
+private McpException eventStreamNotAcceptable() @safe
 {
 	return invalidRequest(
 			"this request opens a text/event-stream response; Accept must admit text/event-stream");
@@ -2078,11 +2078,11 @@ McpException eventStreamNotAcceptable() @safe
 /// The heartbeat cadence: a `notifications/events/heartbeat` carries the cursor at
 /// least this often so a quiet stream still advances the client cursor and the
 /// periodic write doubles as the client-disconnect detector.
-enum long eventStreamHeartbeatIntervalMs = 15_000;
+private enum long eventStreamHeartbeatIntervalMs = 15_000;
 
 /// One iteration's decision for the SSE hold-open loop, computed purely from the
 /// timing inputs so it is unit-testable without a network or a real clock.
-struct EventStreamTick
+private struct EventStreamTick
 {
 	bool poll; /// pull check-function events this iteration (false for emit-only streams)
 	bool heartbeat; /// write a cursor-carrying heartbeat this iteration
@@ -2093,7 +2093,7 @@ struct EventStreamTick
 /// stream wakes on its poll cadence, clamped to `[1s, heartbeat interval]` so a
 /// fast poll never starves the disconnect-detecting heartbeat and a slow one never
 /// outlives it.
-long eventStreamSleepMs(bool emitOnly, long pollMs) @safe pure nothrow @nogc
+private long eventStreamSleepMs(bool emitOnly, long pollMs) @safe pure nothrow @nogc
 {
 	import std.algorithm : min, max;
 
@@ -2105,7 +2105,7 @@ long eventStreamSleepMs(bool emitOnly, long pollMs) @safe pure nothrow @nogc
 /// and how long it has been since the last heartbeat. A poll-driven stream always
 /// polls; either kind heartbeats only once the cadence has elapsed (so a sub-15s
 /// poll loop does not heartbeat on every wake-up).
-EventStreamTick eventStreamTick(bool emitOnly, long sinceHeartbeatMs) @safe pure nothrow @nogc
+private EventStreamTick eventStreamTick(bool emitOnly, long sinceHeartbeatMs) @safe pure nothrow @nogc
 {
 	EventStreamTick t;
 	t.poll = !emitOnly;
@@ -3052,7 +3052,7 @@ private void handlePost(McpServer server, ServerPushChannel push,
 ///   - `404` — the id names an unknown or already-terminated session ("after
 ///             [termination] it MUST respond ... with HTTP 404 Not Found"), or a
 ///             session created under a different authenticated `principal`.
-int sessionStatus(SessionManager sessions, string sessionId, string principal = "") @safe
+private int sessionStatus(SessionManager sessions, string sessionId, string principal = "") @safe
 {
 	if (sessionId.length == 0)
 		return 400;
@@ -3376,7 +3376,7 @@ unittest  // the standalone GET SSE stream uses the same session gate as POST/DE
 ///   - `Method not found` (-32601) -> `404` on modern requests, which lets a client
 ///     tell a modern MCP endpoint apart from a legacy HTTP+SSE `404`. Legacy
 ///     versions keep the legacy JSON-RPC-error-over-`200` shape.
-int httpStatusForResponse(Json resp, bool modern) @safe
+private int httpStatusForResponse(Json resp, bool modern) @safe
 {
 	if ("error" !in resp || resp["error"].type != Json.Type.object)
 		return 200;
@@ -3403,7 +3403,7 @@ int httpStatusForResponse(Json resp, bool modern) @safe
 /// set, the session kept) only when this is true; an error response (e.g. a
 /// second initialize rejected with `invalidRequest`) rolls the minted session
 /// back instead.
-bool initializeSucceeded(Json resp) @safe
+private bool initializeSucceeded(Json resp) @safe
 {
 	return ("result" in resp) !is null && ("error" in resp) is null;
 }
@@ -3432,7 +3432,7 @@ unittest  // a successful InitializeResult commits; an error response does not
 /// So when the connection has dropped on a modern request, the response is
 /// suppressed. Released versions (2025-*) never suppress on this basis: that MUST
 /// is modern-only, so their wire behaviour is unchanged.
-bool suppressOnDisconnect(bool modern, bool connected) @safe pure nothrow @nogc
+private bool suppressOnDisconnect(bool modern, bool connected) @safe pure nothrow @nogc
 {
 	return modern && !connected;
 }
