@@ -441,7 +441,7 @@ void mountMcp(URLRouter router, McpServer server,
 		});
 	}
 
-	mountCorsPreflight(router, opts.path, "POST, GET, DELETE", opts);
+	mountCorsPreflight(router, opts.path, sessions !is null ? "POST, GET, DELETE" : "POST", opts);
 	router.post(opts.path, (HTTPServerRequest req, HTTPServerResponse res) @safe {
 		if (!guardOrigin(req, res, opts))
 			return;
@@ -7565,6 +7565,23 @@ unittest  // CORS: a preflight from an allowed origin is answered with the MCP m
 	])
 		assert(allowed.canFind(h), allowed);
 	assert(res.headers.get("Vary", "").canFind("Origin"));
+}
+
+unittest  // CORS: a stateless mount's preflight advertises only POST
+{
+	auto server = McpServer.stateless("t", "1");
+	auto router = new URLRouter;
+	StreamableHttpOptions opts;
+	opts.allowedOrigins = ["https://app.example.com"];
+	mountMcp(router, server, opts);
+
+	auto res = corsRequest(router, HTTPMethod.OPTIONS,
+			[
+				"Origin": "https://app.example.com",
+				"Access-Control-Request-Method": "POST",
+	]);
+	assert(res.statusCode == 204);
+	assert(res.headers.get("Access-Control-Allow-Methods", "") == "POST");
 }
 
 unittest  // CORS: a response to an allowed origin exposes Mcp-Session-Id and WWW-Authenticate
