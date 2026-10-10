@@ -37,9 +37,10 @@ dub build              # build the library; downloads deps on first run
 Always run `ulimit -n 65536` before `dub` in a shell. Some terminals (notably
 **ghostty**) set `ulimit -n unlimited`, under which the D toolchain — which
 opens many files at once — misbehaves and builds/tests fail in confusing ways.
-Setting an explicit, finite descriptor limit fixes it. The conformance and
-lint scripts already raise the limit internally, but interactive `dub build` /
-`dub test` invocations do not, so set it yourself.
+Setting an explicit, finite descriptor limit fixes it. Every `just` recipe, plus
+`scripts/run-examples.sh` and `scripts/dscanner-lint.sh`, already raises the
+limit, but interactive `dub build` / `dub test` invocations do not, so set it
+yourself.
 
 ## Build, test, and lint commands
 
