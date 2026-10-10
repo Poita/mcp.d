@@ -66,6 +66,7 @@ package(mcp) struct BoundedExpiringMap(V)
 	}
 
 	private Node[string] nodes;
+	private bool[string] busySeen; // keys last seen busy, restamped each sweep
 	private Order unusedOrder, usedOrder;
 	private MonoTime lastSweep;
 	private Duration ttl;
@@ -78,8 +79,9 @@ package(mcp) struct BoundedExpiringMap(V)
 	void delegate(string key, V value) @safe onEvict;
 
 	/// When set, an entry for which this returns true is busy: the TTL never
-	/// expires it, and its idle clock restarts whenever it is seen busy, which is
-	/// on a lookup of its key or when a sweep finds it past its TTL.
+	/// expires it. An entry seen busy (on a lookup of its key or when a sweep
+	/// finds it past its TTL) is restamped on every later sweep until it is idle,
+	/// so its full idle TTL starts once its work ends.
 	bool delegate(ref V value) @safe busy;
 
 	this(Duration ttl, size_t maxEntries, MonoTime delegate() @safe clock) @safe
@@ -208,6 +210,7 @@ package(mcp) struct BoundedExpiringMap(V)
 	private void drop(Node n) @safe
 	{
 		nodes.remove(n.key);
+		busySeen.remove(n.key);
 		if (n.used)
 			usedOrder.unlink(n);
 		else
@@ -250,6 +253,12 @@ package(mcp) struct BoundedExpiringMap(V)
 		if (busy !is null && busy(n.value))
 		{
 			restamp(n, t);
+			busySeen[n.key] = true;
+			return false;
+		}
+		if (busySeen.remove(n.key))
+		{
+			restamp(n, t);
 			return false;
 		}
 		return t - n.stamp >= ttl;
@@ -263,19 +272,35 @@ package(mcp) struct BoundedExpiringMap(V)
 		sweep(t);
 	}
 
-	/// Evict the entries past their TTL. Each list is in stamp order, so it is
-	/// walked from its oldest entry and the walk stops at the first one within
-	/// its TTL. A busy entry is restamped, which moves it to the tail; the walk
-	/// restarts from the head after each entry, since `onEvict` may unlink others.
+	/// Restamp the entries last seen busy, then evict the entries past their
+	/// TTL. Each list is in stamp order, so it is walked from its oldest entry
+	/// and the walk stops at the first one within its TTL. A busy entry is
+	/// restamped, which moves it to the tail; the walk restarts from the head
+	/// after each entry, since `onEvict` may unlink others.
 	private void sweep(MonoTime t) @safe
 	{
 		if (ttl <= Duration.zero)
 			return;
+		foreach (key; busySeen.keys)
+		{
+			auto p = key in nodes;
+			if (p is null)
+			{
+				busySeen.remove(key);
+				continue;
+			}
+			restamp(*p, t);
+			if (busy is null || !busy((*p).value))
+				busySeen.remove(key);
+		}
 		foreach (order; [&unusedOrder, &usedOrder])
 			for (auto n = order.head; n !is null && t - n.stamp >= ttl; n = order.head)
 			{
 				if (busy !is null && busy(n.value))
+				{
 					restamp(n, t);
+					busySeen[n.key] = true;
+				}
 				else
 					evict(n);
 			}
@@ -472,4 +497,23 @@ unittest  // BoundedExpiringMap's sweep visits only the entries past their TTL
 	assert(checked == ["0", "1"], "only expired entries are checked for busy");
 	assert(!m.contains("a") && m.contains("b"), "the expired idle entry goes, the busy one stays");
 	assert(m.length == 50);
+}
+
+unittest  // BoundedExpiringMap gives an entry a fresh TTL once it stops being busy
+{
+	import core.time : MonoTime, minutes;
+
+	auto clk = MonoTime.currTime;
+	auto m = BoundedExpiringMap!int(10.minutes, 0, () @safe => clk);
+	bool working = true;
+	m.busy = (ref int v) @safe => v == 1 && working;
+	m.put("s", 1);
+	clk += 11.minutes;
+	m.put("tick1", 0); // the sweep finds "s" past its TTL while busy
+	clk += 9.minutes;
+	working = false; // the long request ends just before "s" would expire again
+	clk += 3.minutes;
+	m.put("tick2", 0);
+	clk += 3.minutes;
+	assert(m.contains("s"), "a session must keep its idle TTL after its work ends");
 }
