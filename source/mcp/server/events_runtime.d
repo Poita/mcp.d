@@ -566,6 +566,14 @@ final class PushStream
 	private Nullable!string openHead_; // emit buffer head when an emit-only stream opened
 }
 
+/// What `EventsRuntime.startPushStream` reports to the transport driving the
+/// stream.
+struct PushStart
+{
+	long nextPollMs; /// suggested poll cadence in milliseconds (0 when the stream did not start)
+	bool hasMore; /// the check reported more backlog than one batch carried: call `advancePushStream` now
+}
+
 /// Handle returned by `openPushStream`. `close()` unregisters the stream and fires
 /// `on_unsubscribe`; it is idempotent.
 final class PushHandle
@@ -1178,12 +1186,15 @@ final class EventsRuntime
 	/// lifecycle reference covers it — and the stream's cursor only moves forward.
 	/// A backlog that cannot be read (a throwing check) still sends `active` at
 	/// the client's cursor, followed by a recoverable `notifications/events/error`.
-	/// Returns the suggested poll cadence in milliseconds.
-	long startPushStream(PushStream s, Nullable!string cursor, Nullable!long maxAgeMs) @safe
+	/// The backlog is read in batches of the server's poll batch cap: an emit-only
+	/// type's is paged through whole here, while a check-backed type sends one
+	/// batch and reports `hasMore` so the transport advances again at once.
+	PushStart startPushStream(PushStream s, Nullable!string cursor, Nullable!long maxAgeMs) @safe
 	{
 		auto reg = s.name in types_;
 		if (s.terminated || reg is null)
-			return 0;
+			return PushStart.init;
+		const cap = pollBatchCap(Nullable!long.init);
 		// A bootstrap on an emit-only type starts from the buffer head as it was
 		// when the stream opened, so events emitted before `start` are delivered.
 		if (cursor.isNull && !s.openHead_.isNull)
@@ -1193,8 +1204,7 @@ final class EventsRuntime
 		Exception readError;
 		try
 		{
-			first = runPoll(*reg, s.name, s.arguments, s.principal, cursor,
-					maxAgeMs, Nullable!long.init);
+			first = runPoll(*reg, s.name, s.arguments, s.principal, cursor, maxAgeMs, cap);
 			read = true;
 		}
 		catch (Exception e)
@@ -1211,6 +1221,27 @@ final class EventsRuntime
 				s.deliver(eventsEventNotification,
 						withSubscriptionId(ev.toJson(), s.subscriptionId));
 		s.cursor = read && !first.cursor.isNull ? first.cursor : cursor;
+		bool hasMore = read && first.hasMore;
+		if (regIsEmitOnly(reg))
+		{
+			// The ring buffer is bounded, so its backlog is drained before the held
+			// live events are released behind it.
+			while (hasMore && !s.terminated)
+			{
+				auto page = runPoll(*reg, s.name, s.arguments, s.principal,
+						s.cursor, maxAgeMs, cap);
+				if (page.truncated)
+					s.deliver(eventsActiveNotification,
+							withSubscriptionId(activeParams(page.cursor, true), s.subscriptionId));
+				foreach (ev; page.events)
+					s.deliver(eventsEventNotification,
+							withSubscriptionId(ev.toJson(), s.subscriptionId));
+				if (!page.cursor.isNull)
+					s.cursor = page.cursor;
+				hasMore = page.hasMore && page.events.length > 0;
+			}
+			hasMore = false;
+		}
 		// Release held live events in arrival order, dropping those the backlog
 		// already carried. This task is the stream's writer until they are out:
 		// each write can yield, and an emit landing meanwhile queues behind them.
@@ -1225,7 +1256,7 @@ final class EventsRuntime
 		s.writerScheduled_ = true;
 		s.started_ = true;
 		writePending(s);
-		return read ? first.nextPollMs : nextPollMsFor(*reg);
+		return PushStart(read ? first.nextPollMs : nextPollMsFor(*reg), hasMore);
 	}
 
 	// Write a push stream's queued events in order until none remain. A write
@@ -4306,6 +4337,67 @@ unittest  // a push stream whose backlog check throws reports a recoverable erro
 	assert(!h.stream.terminated);
 }
 
+unittest  // a check-backed push stream's backlog is capped and reports that more remain
+{
+	EventsOptions o;
+	o.nowMs = () @safe => 1_000_000L;
+	o.nowIso = () @safe => "2026-02-19T15:30:00Z";
+	o.pushExecutor = (void delegate() @safe job) @safe { job(); };
+	o.pollDefaultMaxEvents = 2;
+	auto rt = new EventsRuntime(null, o);
+	Nullable!long seenCap;
+	EventRegistration reg;
+	reg.descriptor.name = "n";
+	reg.check = (EventContext ctx) @safe {
+		seenCap = ctx.maxEvents;
+		EventOccurrence[] evs;
+		foreach (i; 1 .. 4)
+		{
+			auto ev = EventOccurrence("e" ~ i.to!string, "n", "t");
+			ev.cursor = "c" ~ i.to!string;
+			evs ~= ev;
+		}
+		return EventResult.of(evs, "c3");
+	};
+	rt.register(reg);
+	string[] frames;
+	auto h = rt.openPushStream("n", Json.emptyObject, "u", Json(1), (string m, Json p) @safe {
+		frames ~= m;
+	});
+	auto start = rt.startPushStream(h.stream, nullable("c0"), Nullable!long.init);
+	assert(!seenCap.isNull && seenCap.get == 2);
+	assert(frames == [
+		eventsActiveNotification, eventsEventNotification, eventsEventNotification
+	]);
+	assert(start.hasMore);
+	assert(h.stream.cursor.get == "c2");
+	h.close();
+}
+
+unittest  // an emit-only push stream's backlog pages through the whole buffer
+{
+	EventsOptions o;
+	o.nowMs = () @safe => 1_000_000L;
+	o.nowIso = () @safe => "2026-02-19T15:30:00Z";
+	o.pushExecutor = (void delegate() @safe job) @safe { job(); };
+	o.pollDefaultMaxEvents = 2;
+	auto rt = new EventsRuntime(null, o);
+	EventRegistration reg = {descriptor: EventType("n"), emitOnly: true};
+	rt.register(reg);
+	const from = rt.buffer_.headCursor();
+	foreach (i; 0 .. 5)
+		rt.emit(EventOccurrence("e" ~ i.to!string, "n", "t"));
+	int events;
+	auto h = rt.openPushStream("n", Json.emptyObject, "u", Json(1), (string m, Json p) @safe {
+		if (m == eventsEventNotification)
+			events++;
+	});
+	auto start = rt.startPushStream(h.stream, nullable(from), Nullable!long.init);
+	assert(events == 5);
+	assert(!start.hasMore);
+	h.close();
+}
+
 unittest  // advancePushStream re-sends active{truncated:true} with the fresh cursor on a gap
 {
 	auto rt = testRuntime();
@@ -6454,8 +6546,8 @@ unittest  // verification and terminated envelopes dual-sign within the rotation
 			verification.headers) == verification.body);
 
 	rt.terminateWebhook(r.id, Json([
-			"code": Json(-32001),
-			"message": Json("revoked")
+		"code": Json(-32001),
+		"message": Json("revoked")
 	]));
 	auto terminated = ft.posts[$ - 1];
 	assert(parseJsonString(terminated.body)["type"].get!string == "terminated");

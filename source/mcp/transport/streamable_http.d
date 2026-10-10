@@ -2207,13 +2207,18 @@ private void handleEventsStream(McpServer server, Message msg,
 
 	const emitOnly = rt.isEmitOnly(p.name);
 	long pollMs = 15_000;
+	// Set when the check reported more events than one batch carried: the next
+	// batch is fetched without waiting out the poll cadence (yielding only, so a
+	// check that always reports more cannot monopolise the thread).
+	bool more;
 
 	// Leading active frame + any backlog, then the live events held since open.
 	try
 	{
-		const next = rt.startPushStream(handle.stream, p.cursor, p.maxAgeMs);
-		if (next > 0)
-			pollMs = next;
+		const start = rt.startPushStream(handle.stream, p.cursor, p.maxAgeMs);
+		if (start.nextPollMs > 0)
+			pollMs = start.nextPollMs;
+		more = start.hasMore;
 	}
 	catch (Exception)
 		return; // client disconnected
@@ -2229,10 +2234,6 @@ private void handleEventsStream(McpServer server, Message msg,
 
 	const sleepMs = eventStreamSleepMs(emitOnly, pollMs);
 	auto lastHeartbeat = MonoTime.currTime;
-	// Set when the check reported more events than one batch carried: the next
-	// batch is fetched without waiting out the poll cadence (yielding only, so a
-	// check that always reports more cannot monopolise the thread).
-	bool more;
 	while (!handle.stream.terminated)
 	{
 		try
