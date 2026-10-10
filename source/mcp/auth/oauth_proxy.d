@@ -288,6 +288,9 @@ AuthorizationServerMetadata authorizationServerMetadata(const OAuthProxyConfig c
 	m.tokenEndpointAuthMethodsSupported = ["none"];
 	m.responseTypesSupported = ["code"];
 	m.clientIdMetadataDocumentSupported = cfg.clientIdMetadataDocumentSupported;
+	// The HTTP mount adds the RFC 9207 `iss` parameter to every authorization
+	// response it relays to a client.
+	m.authorizationResponseIssParameterSupported = true;
 	return m;
 }
 
@@ -314,9 +317,8 @@ Json authorizationServerMetadataJson(const OAuthProxyConfig cfg) @safe
 		j["scopes_supported"] = strArray(m.scopesSupported);
 	if (m.clientIdMetadataDocumentSupported)
 		j["client_id_metadata_document_supported"] = true;
-	// The HTTP mount adds the RFC 9207 `iss` parameter to every authorization
-	// response it relays to a client.
-	j["authorization_response_iss_parameter_supported"] = true;
+	if (m.authorizationResponseIssParameterSupported)
+		j["authorization_response_iss_parameter_supported"] = true;
 	return j;
 }
 
@@ -2012,6 +2014,14 @@ unittest  // CIMD ADVERTISE: AS metadata sets client_id_metadata_document_suppor
 	assert(j["client_id_metadata_document_supported"].get!bool == true);
 	// DCR stays advertised as the deprecated fallback (spec retains it).
 	assert(j["registration_endpoint"].get!string == "https://mcp.example.com/register");
+}
+
+unittest  // the AS metadata struct and its JSON both advertise the RFC 9207 iss parameter
+{
+	auto cfg = sampleConfig();
+	assert(authorizationServerMetadata(cfg).authorizationResponseIssParameterSupported);
+	assert(authorizationServerMetadataJson(
+			cfg)["authorization_response_iss_parameter_supported"].get!bool);
 }
 
 unittest  // CIMD ADVERTISE: AS metadata omits client_id_metadata_document_supported by default
