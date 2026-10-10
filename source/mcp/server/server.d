@@ -1676,16 +1676,14 @@ final class McpServer : ServerCore
 	}
 
 	/// Drop every piece of stdio stream state once `serveStdio` returns: the write
-	/// sink, the `subscriptions/listen` stream and the per-URI subscriptions it
-	/// recorded, and every open `events/stream` (closing each releases its
-	/// subscription). The client has gone, so no closing frames are written.
+	/// sink, the `subscriptions/listen` stream, and every open `events/stream`
+	/// (closing each releases its subscription). The client has gone, so no
+	/// closing frames are written.
 	package(mcp) void detachStdio() @safe
 	{
 		stdioSink_ = null;
 		stdioListenSink = null;
 		stdioListenSubscriptionId = Json.init;
-		foreach (u; stdioListenFilter_.resourceUris)
-			activeConnection.subscriptions.remove(u);
 		stdioListenFilter_ = ListenFilter.init;
 		auto streams = stdioEventStreams_;
 		stdioEventStreams_ = null;
@@ -1815,9 +1813,7 @@ final class McpServer : ServerCore
 
 		// Stdio carries one listen stream: a new listen replaces the open one,
 		// which is answered with its result so the client's request completes.
-		closeStdioListen(cs());
-		foreach (u; parsed.listenFilter.resourceUris)
-			cs().subscriptions[u] = true;
+		closeStdioListen();
 		cs().listenFilter = parsed.listenFilter;
 
 		// The listen request's id is the stream's subscriptionId; every
@@ -1860,12 +1856,11 @@ final class McpServer : ServerCore
 	}
 
 	/// Close the open stdio `subscriptions/listen` stream, if any: drop the sink,
-	/// the per-stream filter, and the per-URI subscriptions it recorded on `conn`,
-	/// then answer the listen request with its `SubscriptionsListenResult`. The
+	/// and the per-stream filter, then answer the listen request with its `SubscriptionsListenResult`. The
 	/// stream is detached before the (possibly yielding) write, so a notify racing
 	/// it can never land after the final response. Returns whether a stream was
 	/// open.
-	private bool closeStdioListen(ConnectionState conn) @safe
+	private bool closeStdioListen() @safe
 	{
 		auto sink = stdioListenSink;
 		if (sink is null)
@@ -1873,8 +1868,6 @@ final class McpServer : ServerCore
 		const id = stdioListenSubscriptionId;
 		stdioListenSink = null;
 		stdioListenSubscriptionId = Json.init;
-		foreach (u; stdioListenFilter_.resourceUris)
-			conn.subscriptions.remove(u);
 		stdioListenFilter_ = ListenFilter.init;
 		sink(subscriptionsListenResult(id).toString());
 		return true;
@@ -2913,7 +2906,7 @@ final class McpServer : ServerCore
 			// Graceful teardown: the long-lived listen request returns its single
 			// response now — the `SubscriptionsListenResult` (modern
 			// basic/utilities/subscriptions) — before the stream closes.
-			closeStdioListen(conn);
+			closeStdioListen();
 			return;
 		}
 
@@ -3204,9 +3197,9 @@ final class McpServer : ServerCore
 	/// `params.notifications` (a `ListenFilter`): the `toolsListChanged`,
 	/// `promptsListChanged` and `resourcesListChanged` flags are booleans, while
 	/// `resourceSubscriptions` is a `string[]` of resource URIs the client wants
-	/// `notifications/resources/updated` for. Those URIs are recorded as per-URI
-	/// subscriptions (so `notifyResourceUpdated` honours them) and
-	/// the `resourceSubscriptions` opt-in is flagged when the array is non-empty.
+	/// `notifications/resources/updated` for. Those URIs are kept on the stream's
+	/// filter (so `notifyResourceUpdated` honours them) and the
+	/// `resourceSubscriptions` opt-in is flagged when the array is non-empty.
 	/// With the Tasks extension enabled, `taskIds` (SEP-2663) opts the stream into
 	/// `notifications/tasks` for those task ids; it requires the client to declare
 	/// the extension. A flat top-level filter is also accepted when no
@@ -3248,9 +3241,7 @@ final class McpServer : ServerCore
 				{
 					// Preserve the agreed URI list so the acknowledgement can
 					// echo `resourceSubscriptions` as the spec's string[]
-					// (deduplicated, request order kept). The whole list is
-					// validated before any URI is recorded so an over-cap
-					// request leaves the connection untouched.
+					// (deduplicated, request order kept).
 					bool[string] seen;
 					foreach (i; 0 .. rs.length)
 						if (rs[i].type == Json.Type.string)
@@ -3264,8 +3255,6 @@ final class McpServer : ServerCore
 							seen[u] = true;
 							perStream.resourceUris ~= u;
 						}
-					foreach (u; perStream.resourceUris)
-						conn.subscriptions[u] = true;
 					if (perStream.resourceUris.length)
 						perStream.resourceSubscriptions = true;
 				}
@@ -10316,8 +10305,32 @@ unittest  // subscriptions/listen reads the spec-shaped filter nested under para
 	assert(f.toolsListChanged);
 	assert(f.resourceSubscriptions);
 	assert(!f.promptsListChanged);
-	// resourceSubscriptions URIs are tracked as per-URI subscriptions.
-	assert(("file:///project/config.json" in s.activeConnection.subscriptions));
+	// The stream's own filter carries the URIs; the connection's
+	// resources/subscribe set is left alone.
+	assert(f.resourceUris == ["file:///project/config.json"]);
+	assert(s.activeConnection.subscriptions.length == 0);
+}
+
+unittest  // a stdio subscriptions/listen leaves the connection's resources/subscribe set alone
+{
+	auto s = makeTestServer();
+	registerStubResources(s, "test://stub");
+	void sink(string line) @safe
+	{
+	}
+
+	Json meta = Json.emptyObject;
+	meta[MetaKey.protocolVersion] = "2026-07-28";
+	meta[MetaKey.clientCapabilities] = Json.emptyObject;
+	Json params = Json.emptyObject;
+	params["notifications"] = Json([
+		"resourceSubscriptions": Json([Json("test://stub")])
+	]);
+	params["_meta"] = meta;
+	assert(s.tryServeStdioListen(Message(makeRequest(Json(3),
+			"subscriptions/listen", params)), &sink));
+	assert(s.activeConnection.subscriptions.length == 0);
+	assert(s.notifyResourceUpdated("test://stub") == 1);
 }
 
 unittest  // a modern stateless server with resources advertises resources.subscribe on discover
