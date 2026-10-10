@@ -991,6 +991,23 @@ package ubyte[] base64UrlDecode(string seg) @safe
 	return Base64URLNoPadding.decode(seg);
 }
 
+/// The `iss` claim of a compact JWS, read WITHOUT verifying it; "" when the
+/// token is malformed or names no string issuer. Only for choosing which
+/// verifier to run, never for trusting the claim.
+package string unverifiedIssuer(string token) @safe
+{
+	import std.algorithm : splitter;
+	import std.array : array;
+
+	auto parts = token.splitter('.').array;
+	if (parts.length != 3)
+		return "";
+	auto payload = decodeSegmentJson(parts[1]);
+	if (payload.type != Json.Type.object)
+		return "";
+	return jsonStr(payload, "iss");
+}
+
 private Json decodeSegmentJson(string seg) @safe
 {
 	try

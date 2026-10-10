@@ -183,8 +183,9 @@ private bool hasEntraAccessTokenClaim(Json claims) @safe
 
 /// Microsoft Entra ID for a multi-tenant app: accepts tokens from any of the
 /// allowed `tenants` (GUIDs or registered domain names) and no other. Each
-/// tenant's v2.0 issuer is pinned as in `entraId`, and a token is valid when it
-/// verifies against one of them, so the `iss` check is never dropped — with
+/// tenant's v2.0 issuer is pinned as in `entraId`, and a token is verified only
+/// by the tenant its `iss` names (so that tenant's JWKS outage answers 503), so
+/// the `iss` check is never dropped — with
 /// audience binding alone, a token minted by any Entra tenant for the same
 /// audience would be accepted.
 ResourceServerConfig entraIdTenants(string[] tenants, JwtPresetOptions opts) @safe
@@ -193,25 +194,18 @@ ResourceServerConfig entraIdTenants(string[] tenants, JwtPresetOptions opts) @sa
 
 	enforce(tenants.length > 0, "entraIdTenants: list at least one allowed tenant.");
 	requireEntraAudience(opts, "entraIdTenants");
-	TokenValidator[] validators;
+	TokenValidator[string] byIssuer;
 	string[] issuers;
 	foreach (tenant; tenants)
 	{
 		requireConcreteEntraTenant(tenant, "entraIdTenants");
 		auto one = entraId(tenant, opts);
-		validators ~= one.validator;
+		foreach (iss; one.authorizationServers)
+			byIssuer[iss] = one.validator;
 		issuers ~= one.authorizationServers;
 	}
 	ResourceServerConfig cfg;
-	cfg.validator = (string token) @safe {
-		foreach (v; validators)
-		{
-			auto info = v(token);
-			if (info.valid)
-				return info;
-		}
-		return TokenInfo.invalid();
-	};
+	cfg.validator = issuerRoutedValidator(byIssuer);
 	enforce(opts.resource.length > 0,
 			"entraIdTenants: resource (the canonical MCP server URL) must be set.");
 	cfg.resource = opts.resource;
@@ -219,6 +213,22 @@ ResourceServerConfig entraIdTenants(string[] tenants, JwtPresetOptions opts) @sa
 	cfg.scopesSupported = opts.scopes.dup;
 	cfg.requiredScopes = opts.scopes.dup;
 	return cfg;
+}
+
+/// A validator that hands a token to the validator registered for its
+/// (unverified) `iss` claim and rejects a token naming any other issuer. That
+/// validator still verifies `iss` along with the signature; routing only picks
+/// which one runs, so a verifier outage for that issuer surfaces as
+/// unavailable instead of being masked by the other issuers' rejections.
+package TokenValidator issuerRoutedValidator(TokenValidator[string] byIssuer) @safe
+{
+	import mcp.auth.jwt_verifier : unverifiedIssuer;
+
+	return (string token) @safe {
+		if (auto v = unverifiedIssuer(token) in byIssuer)
+			return (*v)(token);
+		return TokenInfo.invalid();
+	};
 }
 
 private void requireEntraAudience(JwtPresetOptions opts, string fn) @safe
@@ -757,6 +767,48 @@ unittest  // entraIdTenants pins one v2.0 issuer per allowed tenant
 	]);
 	assert(cfg.scopesSupported == ["mcp.read"]);
 	assert(!cfg.validator("not-a-jwt").valid);
+}
+
+version (unittest) private string unsignedJwtWithIssuer(string iss) @safe
+{
+	import std.base64 : Base64URLNoPadding;
+
+	return (Base64URLNoPadding.encode(cast(const(ubyte)[]) `{"alg":"RS256"}`)
+			~ "." ~ Base64URLNoPadding.encode(cast(const(ubyte)[])(`{"iss":"` ~ iss ~ `"}`))
+			~ ".sig").idup;
+}
+
+unittest  // an issuer-routed validator reports its tenant's verifier outage as unavailable
+{
+	import core.time : seconds;
+
+	int otherCalls;
+	TokenValidator[string] byIssuer;
+	byIssuer["https://a/v2.0"] = (string t) @safe => TokenInfo.temporarilyUnavailable(7.seconds);
+	byIssuer["https://b/v2.0"] = (string t) @safe {
+		otherCalls++;
+		return TokenInfo.invalid();
+	};
+	auto v = issuerRoutedValidator(byIssuer);
+	auto info = v(unsignedJwtWithIssuer("https://a/v2.0"));
+	assert(info.unavailable);
+	assert(info.retryAfter == 7.seconds);
+	assert(otherCalls == 0);
+}
+
+unittest  // an issuer-routed validator rejects a token from an unlisted issuer without verifying it
+{
+	int calls;
+	TokenValidator[string] byIssuer;
+	byIssuer["https://a/v2.0"] = (string t) @safe {
+		calls++;
+		return TokenInfo.temporarilyUnavailable();
+	};
+	auto v = issuerRoutedValidator(byIssuer);
+	auto info = v(unsignedJwtWithIssuer("https://evil/v2.0"));
+	assert(!info.valid && !info.unavailable);
+	assert(!v("not-a-jwt").valid);
+	assert(calls == 0);
 }
 
 unittest  // entraIdTenants rejects an empty allowlist and pseudo-tenants
