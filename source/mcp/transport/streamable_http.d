@@ -564,6 +564,13 @@ void mountLegacyHttpSse(URLRouter router, McpServer server,
 		TokenInfo token;
 		if (!guardAuth(req, res, opts, token))
 			return;
+		if (!acceptsEventStream(req.headers.get("Accept", "")))
+		{
+			res.statusCode = HTTPStatus.notAcceptable;
+			res.writeBody("The legacy SSE stream is text/event-stream;"
+				~ " Accept must admit text/event-stream", "text/plain");
+			return;
+		}
 		const principal = principalOf(token);
 		const address = remoteAddressOf(req);
 		if (const why = streams.tryAcquire(principal, address))
@@ -583,6 +590,12 @@ void mountLegacyHttpSse(URLRouter router, McpServer server,
 		TokenInfo token;
 		if (!guardAuth(req, res, opts, token))
 			return;
+		if (!isJsonContentType(req.headers.get("Content-Type", "")))
+		{
+			writeJsonRpcError(res, HTTPStatus.unsupportedMediaType,
+				invalidRequest("POST Content-Type must be application/json"));
+			return;
+		}
 		string payload;
 		if (!readPostBody(req, res, opts.maxRequestBytes, payload))
 			return;
@@ -7565,6 +7578,34 @@ unittest  // CORS: a preflight from an allowed origin is answered with the MCP m
 	])
 		assert(allowed.canFind(h), allowed);
 	assert(res.headers.get("Vary", "").canFind("Origin"));
+}
+
+unittest  // legacy POST with a non-JSON Content-Type is refused with 415
+{
+	auto server = McpServer.stateful("t", "1");
+	auto router = new URLRouter;
+	StreamableHttpOptions opts;
+	opts.legacyHttpSse = true;
+	mountMcp(router, server, opts);
+
+	auto res = corsRequest(router, HTTPMethod.POST, [
+		"Content-Type": "text/plain"
+	], `{"jsonrpc":"2.0","method":"notifications/initialized"}`,
+			opts.legacyMessagePath ~ "?sessionId=x");
+	assert(res.statusCode == HTTPStatus.unsupportedMediaType);
+}
+
+unittest  // legacy GET whose Accept excludes text/event-stream is refused with 406
+{
+	auto server = McpServer.stateful("t", "1");
+	auto router = new URLRouter;
+	StreamableHttpOptions opts;
+	opts.legacyHttpSse = true;
+	mountMcp(router, server, opts);
+
+	auto res = corsRequest(router, HTTPMethod.GET,
+			["Accept": "application/json"], "", opts.legacySsePath);
+	assert(res.statusCode == HTTPStatus.notAcceptable);
 }
 
 unittest  // CORS: a stateless mount's preflight advertises only POST
