@@ -430,8 +430,8 @@ struct ClientCapabilities
 	/// stripping any field newer than `v`. `roots`/`rootsListChanged`, a bare
 	/// `sampling`, and `experimental` exist in every supported version and pass
 	/// through unchanged. `elicitation` applies from 2025-06-18, so it is gated
-	/// to `>= 2025-06-18` (a client that set only an elicitation submode still
-	/// projects a bare `elicitation` there). The sampling/elicitation sub-objects
+	/// to `>= 2025-06-18`, where it projects only for a form-capable client
+	/// (a url-only client has no 2025-06-18 equivalent). The sampling/elicitation sub-objects
 	/// (`sampling.tools`/`sampling.context`, `elicitation.form`/`elicitation.url`)
 	/// apply from 2025-11-25 and are stripped below that. Each entry in the
 	/// `extensions` negotiation map is gated by its own `extensionMinVersion`
@@ -443,16 +443,15 @@ struct ClientCapabilities
 		projected.rootsListChanged = rootsListChanged;
 		projected.sampling = sampling || samplingTools || samplingContext;
 		projected.experimental = experimental.clone();
-		// elicitation applies from 2025-06-18. `toJson` treats a set
-		// `elicitationForm`/`elicitationUrl` as implying elicitation presence, so a
-		// client that set only a submode must still project a bare `elicitation`
-		// here; the sub-flags themselves are gated to 2025-11-25 below.
-		// From 2025-11-25 the flag passes through unchanged so a url-only client
-		// is not widened to form mode.
+		// elicitation applies from 2025-06-18, where a bare `elicitation: {}`
+		// means form mode, so only a form-capable client projects it there; the
+		// sub-flags themselves are gated to 2025-11-25 below. From 2025-11-25
+		// the flag passes through unchanged so a url-only client is not widened
+		// to form mode.
 		if (v >= ProtocolVersion.v2025_11_25)
 			projected.elicitation = elicitation;
 		else if (v >= ProtocolVersion.v2025_06_18)
-			projected.elicitation = elicitation || elicitationForm || elicitationUrl;
+			projected.elicitation = elicitation || elicitationForm;
 		// sampling/elicitation sub-objects apply from 2025-11-25.
 		if (v >= ProtocolVersion.v2025_11_25)
 		{
@@ -1148,12 +1147,14 @@ unittest  // ClientCapabilities url-only elicitation round-trips without gaining
 	assert(projected["elicitation"] == `{"url":{}}`.parseJsonString);
 }
 
-unittest  // ClientCapabilities url-only elicitation projects to a bare declaration on 2025-06-18
+unittest  // ClientCapabilities url-only elicitation omits elicitation on 2025-06-18
 {
+	// 2025-06-18 has no submodes and a bare `elicitation: {}` means form mode,
+	// which a url-only client does not support.
 	ClientCapabilities caps;
 	caps.elicitationUrl = true;
 	auto j = caps.forVersion(ProtocolVersion.v2025_06_18).toJson();
-	assert(j["elicitation"] == Json.emptyObject);
+	assert("elicitation" !in j);
 }
 
 unittest  // ClientCapabilities round-trips elicitation submodes
@@ -1297,13 +1298,10 @@ unittest  // ClientCapabilities.forVersion: 2025-06-18 emits bare sampling and b
 	assert("url" !in j["elicitation"]);
 }
 
-unittest  // ClientCapabilities.forVersion: 2025-06-18 projects bare elicitation when only a submode was set
+unittest  // ClientCapabilities.forVersion: 2025-06-18 projects bare elicitation when only form was set
 {
-	// toJson treats elicitationForm/elicitationUrl as implying elicitation
-	// presence. A client that set only a submode must still project a bare
-	// `elicitation: {}` for 2025-06-18 (the era with elicitation but no submodes).
 	ClientCapabilities caps;
-	caps.elicitationUrl = true; // submode only, no explicit `elicitation`
+	caps.elicitationForm = true;
 	auto j = caps.forVersion(ProtocolVersion.v2025_06_18).toJson();
 	assert("elicitation" in j);
 	assert(j["elicitation"].type == Json.Type.object && j["elicitation"].length == 0);
