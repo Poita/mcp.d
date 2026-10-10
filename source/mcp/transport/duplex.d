@@ -68,6 +68,10 @@ final class DuplexChannel
 	// Set by `stopReadLoop` and `close`: the read loop exits at its next
 	// iteration and a read it was interrupted out of is not reported as a failure.
 	private bool stopping_;
+	// Tasks running inbound notification handlers, and the notifications waiting
+	// for one (see `maxNotificationTasks`).
+	private size_t notificationTasks_;
+	private Message[] notificationBacklog_;
 
 	/// Receives a description of each failure the read loop survives or ends on
 	/// (an unreadable input, a line whose handling threw). Defaults to stderr, the
@@ -81,6 +85,14 @@ final class DuplexChannel
 	/// reported to `onError` instead, since writing an error into the server's
 	/// stdin would only add a second malformed exchange.
 	bool answersMalformed;
+
+	/// The most inbound notifications handled at once (`0`: unbounded), so a
+	/// peer cannot spawn handler tasks without bound. Up to this many more wait,
+	/// in arrival order, for a running one to finish; a `list_changed`
+	/// notification already waiting absorbs a later one of the same kind, and
+	/// one arriving while the wait list is full is dropped and reported to
+	/// `onError`. `notifications/cancelled` is never held back.
+	size_t maxNotificationTasks = 64;
 
 	/// Report `msg` to `onError`, or to stderr when it is null.
 	void reportError(string msg) @safe nothrow
@@ -321,12 +333,60 @@ final class DuplexChannel
 	/// `notifications/initialized` is handled before the request that follows it).
 	private void dispatchInbound(Message m) @safe
 	{
-		runTask((Message msg) nothrow{
-			try
-				onInbound(msg);
-			catch (Exception e)
-				reportError("inbound handler: " ~ e.msg);
-		}, m);
+		if (m.kind == MessageKind.notification && m.method != "notifications/cancelled")
+		{
+			dispatchNotification(m);
+			return;
+		}
+		runTask((Message msg) nothrow{ runInbound(msg); }, m);
+	}
+
+	private void runInbound(Message m) @safe nothrow
+	{
+		try
+			onInbound(m);
+		catch (Exception e)
+			reportError("inbound handler: " ~ e.msg);
+	}
+
+	/// Run notification `m` on a task of its own when fewer than
+	/// `maxNotificationTasks` are running, else queue, coalesce or drop it.
+	private void dispatchNotification(Message m) @safe
+	{
+		import std.algorithm : any, endsWith;
+
+		const method = m.method;
+		if (maxNotificationTasks == 0 || notificationTasks_ < maxNotificationTasks)
+		{
+			++notificationTasks_;
+			runTask((Message first) nothrow{ runNotifications(first); }, m);
+			return;
+		}
+		if (method.endsWith("/list_changed")
+				&& notificationBacklog_.any!((ref Message q) => q.method == method))
+			return;
+		if (notificationBacklog_.length >= maxNotificationTasks)
+		{
+			reportError("dropped inbound " ~ method ~ ": too many notifications in progress");
+			return;
+		}
+		notificationBacklog_ ~= m;
+	}
+
+	/// Handle `first`, then whatever notifications are waiting, on the current
+	/// task, which holds one notification slot until it returns.
+	private void runNotifications(Message first) @safe nothrow
+	{
+		scope (exit)
+			--notificationTasks_;
+		for (auto m = first;;)
+		{
+			runInbound(m);
+			if (notificationBacklog_.length == 0)
+				break;
+			m = notificationBacklog_[0];
+			notificationBacklog_ = notificationBacklog_[1 .. $];
+		}
 	}
 
 	/// Send a request whose id was already chosen by the caller (the CLIENT path:
@@ -736,6 +796,98 @@ unittest  // two concurrent deliver() calls get their correct, distinct results 
 	// Each deliver got its OWN id's result despite the out-of-order reply.
 	assert(got1 == 1, "deliver(id=1) must return id 1's result");
 	assert(got2 == 2, "deliver(id=2) must return id 2's result");
+}
+
+unittest  // inbound notifications run on at most maxNotificationTasks tasks, cancellations always
+{
+	import std.conv : to;
+
+	auto inbound = new LineLink;
+	auto release = createManualEvent();
+	size_t running, peak, handled;
+	bool cancelSeen;
+	runTask(() nothrow{
+		scope (exit)
+			exitEventLoop();
+		try
+		{
+			auto channel = new DuplexChannel(() @safe { return inbound.take(); }, (string) @safe {
+			}, (Message m) @safe {
+				if (m.method == "notifications/cancelled")
+				{
+					cancelSeen = true;
+					return;
+				}
+				++running;
+				if (running > peak)
+					peak = running;
+				release.wait(release.emitCount);
+				--running;
+				++handled;
+			});
+			channel.maxNotificationTasks = 4;
+			channel.onError = (string) @safe nothrow{};
+			channel.start();
+			foreach (i; 0 .. 6)
+				inbound.put(`{"jsonrpc":"2.0","method":"notifications/n` ~ i.to!string ~ `"}`);
+			inbound.put(
+				`{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":1}}`);
+			foreach (_; 0 .. 16)
+				yield();
+			assert(peak == 4, "no more than maxNotificationTasks notifications run at once ");
+			assert(cancelSeen, "a cancellation is handled while the notification slots are full");
+			foreach (_; 0 .. 4)
+			{
+				release.emit();
+				foreach (__; 0 .. 8)
+					yield();
+			}
+			inbound.closeEnd();
+		}
+		catch (Exception)
+		{
+		}
+	});
+	runEventLoop();
+	assert(handled == 6, "queued notifications run once a slot frees up");
+}
+
+unittest  // queued list_changed notifications of one kind are coalesced
+{
+	auto inbound = new LineLink;
+	auto release = createManualEvent();
+	string[] handled;
+	runTask(() nothrow{
+		scope (exit)
+			exitEventLoop();
+		try
+		{
+			auto channel = new DuplexChannel(() @safe { return inbound.take(); }, (string) @safe {
+			}, (Message m) @safe {
+				if (m.method == "notifications/block")
+					release.wait(release.emitCount);
+				handled ~= m.method;
+			});
+			channel.maxNotificationTasks = 1;
+			channel.start();
+			inbound.put(`{"jsonrpc":"2.0","method":"notifications/block"}`);
+			foreach (_; 0 .. 5)
+				inbound.put(`{"jsonrpc":"2.0","method":"notifications/tools/list_changed"}`);
+			foreach (_; 0 .. 16)
+				yield();
+			release.emit();
+			foreach (_; 0 .. 16)
+				yield();
+			inbound.closeEnd();
+		}
+		catch (Exception)
+		{
+		}
+	});
+	runEventLoop();
+	assert(handled == [
+		"notifications/block", "notifications/tools/list_changed"
+	], "waiting list_changed notifications of one kind collapse into one");
 }
 
 unittest  // an inbound notification line is routed to onInbound (not the coordinator)

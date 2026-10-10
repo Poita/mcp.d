@@ -284,6 +284,7 @@ void serveStdio(McpServer server, string delegate() @safe readLine,
 			// an observer that blocks (e.g. re-listing roots) does not stall the loop.
 			// Notifications bypass `maxInFlight`: a cancellation must reach a running
 			// handler, and one for a request still waiting for a slot withdraws it.
+			// The channel bounds them itself (`DuplexChannel.maxNotificationTasks`).
 			if (m.method == "notifications/cancelled")
 				withdrawQueued(m.params);
 			inflight.start();
@@ -467,7 +468,8 @@ struct StdioOptions
 	/// stdin is always read, so replies to server->client requests,
 	/// `notifications/cancelled` (which also withdraws a queued request) and
 	/// end-of-input are seen however many handlers run. Notifications are not
-	/// counted.
+	/// counted; the channel runs at most 64 notification handlers at once
+	/// (`notifications/cancelled` always runs).
 	size_t maxInFlight = 64;
 
 	/// How long a server->client request (elicitation, sampling, roots) waits for
