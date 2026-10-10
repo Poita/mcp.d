@@ -2374,7 +2374,7 @@ final class McpClient : ClientProtocol
 				.get!int : ErrorCode.internalError;
 			const msg = ("message" in e && e["message"].type == Json.Type.string) ? e["message"]
 				.get!string : "Task failed";
-			return new McpException(cast(ErrorCode) code, msg);
+			return new McpException(code, msg, "data" in e ? e["data"] : Json.undefined);
 		}
 		return new McpException(ErrorCode.internalError, "Task failed: " ~ taskId);
 	}
@@ -5174,6 +5174,30 @@ unittest  // awaitTask throws on a failed task carrying a JSON-RPC error
 	};
 	auto ex = cast(McpException) collectException(c.awaitTask("t1"));
 	assert(ex !is null && ex.msg == "boom");
+}
+
+unittest  // a failed task's error keeps its code and data
+{
+	import std.exception : collectException;
+
+	auto c = McpClient.http("http://localhost");
+	c.onTaskSleepForTest = (Duration d) @safe {};
+	c.onRpcForTest = (string method, Json params) @safe {
+		return Json([
+			"resultType": Json("complete"),
+			"taskId": Json("t1"),
+			"status": Json("failed"),
+			"error": Json([
+				"code": Json(-31999),
+				"message": Json("boom"),
+				"data": Json(["detail": Json("disk full")])
+			])
+		]);
+	};
+	auto ex = cast(McpException) collectException(c.awaitTask("t1"));
+	assert(ex !is null && ex.code == -31999);
+	assert(ex.data.type == Json.Type.object && ex.data["detail"].get!string == "disk full",
+			"the task error's data must reach the caller");
 }
 
 unittest  // a finished request releases its deadline timer
