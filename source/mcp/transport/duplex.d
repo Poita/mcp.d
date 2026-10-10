@@ -73,6 +73,14 @@ final class DuplexChannel
 	/// stdio transport's logging channel, when null.
 	void delegate(string) @safe nothrow onError;
 
+	/// Whether an inbound line that is not a valid JSON-RPC message, and carries
+	/// no id to answer under, is answered with a null-id JSON-RPC error. The
+	/// server's inbound path sets this, as JSON-RPC asks of a server. A client
+	/// leaves it unset: such a line (a banner a server prints on stdout, say) is
+	/// reported to `onError` instead, since writing an error into the server's
+	/// stdin would only add a second malformed exchange.
+	bool answersMalformed;
+
 	/// Report `msg` to `onError`, or to stderr when it is null.
 	void reportError(string msg) @safe nothrow
 	{
@@ -251,7 +259,8 @@ final class DuplexChannel
 	/// malformed request is answered under its own id. Anything else carrying
 	/// the id of a pending outbound request wakes that waiter with `error`, so
 	/// the caller fails fast instead of blocking until its timeout. Otherwise
-	/// the peer gets a null-id JSON-RPC error rather than silence.
+	/// the peer gets a null-id JSON-RPC error when `answersMalformed` is set, and
+	/// the line is reported to `onError` when it is not.
 	private void answerMalformed(Json item, McpException error) @safe
 	{
 		const replyId = errorReplyId(error);
@@ -261,9 +270,13 @@ final class DuplexChannel
 			return;
 		}
 		Json id = (item.type == Json.Type.object && "id" in item) ? item["id"] : Json(null);
-		if (id.type == Json.Type.null_ || id.type == Json.Type.undefined
-				|| !coord.resolve(id, Json.undefined, toErrorJson(error)))
+		if (id.type != Json.Type.null_ && id.type != Json.Type.undefined
+				&& coord.resolve(id, Json.undefined, toErrorJson(error)))
+			return;
+		if (answersMalformed)
 			send(makeErrorResponse(Json(null), error));
+		else
+			reportError("malformed message from the peer: " ~ error.msg);
 	}
 
 	/// Wake the outbound request that `reply` (a response or error response)
@@ -981,6 +994,7 @@ unittest  // a malformed inbound line is answered with a null-id JSON-RPC error 
 			auto channel = new DuplexChannel(() @safe { return inbound.take(); }, (string s) @safe {
 				written = s;
 			}, (Message) @safe {});
+			channel.answersMalformed = true;
 			channel.start();
 			inbound.put("this is not json");
 			inbound.closeEnd();
@@ -999,6 +1013,35 @@ unittest  // a malformed inbound line is answered with a null-id JSON-RPC error 
 	assert(j["jsonrpc"].get!string == "2.0");
 	assert(j["id"].type == Json.Type.null_);
 	assert("error" in j);
+}
+
+unittest  // a channel not answering malformed lines reports an unparseable line without replying
+{
+	auto inbound = new LineLink;
+	string[] written;
+	string[] errors;
+	runTask(() nothrow{
+		scope (exit)
+			exitEventLoop();
+		try
+		{
+			auto channel = new DuplexChannel(() @safe { return inbound.take(); }, (string s) @safe {
+				written ~= s;
+			}, (Message) @safe {});
+			channel.onError = (string msg) @safe nothrow{ errors ~= msg; };
+			channel.start();
+			inbound.put("server v1.2 starting up");
+			inbound.closeEnd();
+			foreach (_; 0 .. 8)
+				yield();
+		}
+		catch (Exception)
+		{
+		}
+	});
+	runEventLoop();
+	assert(written.length == 0, "nothing is written back for an unparseable line");
+	assert(errors.length == 1, "the unparseable line is reported");
 }
 
 unittest  // a failing writeLine propagates out of request() instead of being swallowed
@@ -1242,6 +1285,7 @@ unittest  // a malformed batch member with a non-integer (string) id sends a nul
 			auto channel = new DuplexChannel(() @safe { return inbound.take(); }, (string s) @safe {
 				written = s;
 			}, (Message) @safe {});
+			channel.answersMalformed = true;
 			channel.start();
 			// A batch where member 0 has a string id and is malformed (both result and error).
 			inbound.put(
