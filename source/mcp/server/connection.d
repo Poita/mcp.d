@@ -45,8 +45,11 @@ final class ConnectionState
 	/// (stateful) or the per-request `_meta` log level (modern).
 	string logLevel = "info";
 
-	/// The resource URIs this connection has subscribed to (stateful only).
-	bool[string] subscriptions;
+	/// The resource URIs this connection has subscribed to via
+	/// `resources/subscribe` (stateful only), each mapped to the server's
+	/// subscription epoch when it was made; an entry older than its resource's
+	/// removal is stale.
+	ulong[string] subscriptions;
 
 	/// The per-stream opt-in parsed from a `subscriptions/listen` request
 	/// dispatched with this state (2026-07-28 basic/utilities/subscriptions

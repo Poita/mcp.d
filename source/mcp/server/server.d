@@ -233,6 +233,11 @@ final class McpServer : ServerCore
 	// an empty list) after the registry empties.
 	private bool toolsDeclared_;
 	private bool resourcesDeclared_;
+	// Monotonic stamp for `resources/subscribe` entries and resource removals:
+	// a session's subscription to a URI is live only while it is newer than that
+	// URI's removal, which drops it from sessions the server cannot enumerate.
+	private ulong subscriptionEpoch_;
+	private ulong[string] resourceRemovedAt_;
 	private bool promptsDeclared_;
 	private CompleteResult delegate(CompleteRequest request) @safe typedCompletionHandler;
 	/// Per-argument completers keyed by "<ref-key>\0<argumentName>", so a consumer
@@ -618,13 +623,16 @@ final class McpServer : ServerCore
 	/// if a resource was removed, `false` if no resource with that URI was
 	/// registered. The mirror of `registerResource`; pair with
 	/// `notifyResourcesListChanged` to inform connected clients that the available
-	/// resource set changed.
+	/// resource set changed. Every session's `resources/subscribe` entry for `uri`
+	/// is dropped; a client must subscribe again if the resource returns.
 	bool removeResource(string uri) @safe
 	{
 		if ((uri in resources) is null)
 			return false;
 		resources.remove(uri);
 		resourcesDeclared_ = true;
+		resourceRemovedAt_[uri] = ++subscriptionEpoch_;
+		activeConnection.subscriptions.remove(uri);
 		return true;
 	}
 
@@ -1004,7 +1012,10 @@ final class McpServer : ServerCore
 	/// Unregister a previously registered resource template by its `uriTemplate`.
 	/// Returns `true` if a template was removed, `false` if none was registered
 	/// under that template. The mirror of `registerResourceTemplate`; pair with
-	/// `notifyResourcesListChanged` to inform connected clients.
+	/// `notifyResourcesListChanged` to inform connected clients. Existing
+	/// `resources/subscribe` entries for URIs the template matched are kept, since
+	/// such a URI may still be served by another template; unsubscribe them, or
+	/// stop notifying them, as the application requires.
 	bool removeResourceTemplate(string uriTemplate) @safe
 	{
 		import std.algorithm : countUntil, remove;
@@ -2084,10 +2095,10 @@ final class McpServer : ServerCore
 	/// subscription set, so a standalone GET stream opened for a specific session
 	/// gates `notifications/resources/updated` on that session's own
 	/// `resources/subscribe` set rather than the shared fallback `activeConnection`.
-	private static bool plainGetEligibleFor(ConnectionState conn, string method, string uri) @safe
+	private bool plainGetEligibleFor(ConnectionState conn, string method, string uri) @safe
 	{
 		if (method == "notifications/resources/updated")
-			return conn !is null && (uri in conn.subscriptions) !is null;
+			return conn !is null && hasLiveSubscription(conn, uri);
 		if (method == "notifications/elicitation/complete")
 			return conn is null || !conn.negotiated.isModern;
 		return true;
@@ -3584,11 +3595,34 @@ final class McpServer : ServerCore
 			data["uri"] = uri;
 			throw resourceNotFound(uri, ver, data);
 		}
+		pruneStaleSubscriptions(conn);
 		if ((uri in conn.subscriptions) is null
 				&& conn.subscriptions.length >= maxResourceSubscriptions)
 			throw invalidParams("Too many resource subscriptions on this connection");
-		conn.subscriptions[uri] = true;
+		conn.subscriptions[uri] = ++subscriptionEpoch_;
 		return Json.emptyObject;
+	}
+
+	/// Whether `conn` holds a `resources/subscribe` entry for `uri` made after
+	/// the resource was last removed.
+	private bool hasLiveSubscription(ConnectionState conn, string uri) const @safe
+	{
+		auto at = uri in conn.subscriptions;
+		if (at is null)
+			return false;
+		auto removed = uri in resourceRemovedAt_;
+		return removed is null || *at > *removed;
+	}
+
+	/// Drop `conn`'s subscriptions to resources removed since they were made.
+	private void pruneStaleSubscriptions(ConnectionState conn) @safe
+	{
+		string[] stale;
+		foreach (uri, at; conn.subscriptions)
+			if (!hasLiveSubscription(conn, uri))
+				stale ~= uri;
+		foreach (uri; stale)
+			conn.subscriptions.remove(uri);
 	}
 
 	/// Whether `uri` names a registered resource or matches a resource template.
@@ -7436,6 +7470,54 @@ unittest  // resources/subscribe accepts a uri matching a resource template
 	auto resp = s.handle(req(1, "resources/subscribe", p)).get;
 	assert("error" !in resp);
 	assert(("file:///a" in s.activeConnection.subscriptions));
+}
+
+unittest  // removeResource drops resources/subscribe entries for that URI on every session
+{
+	import mcp.server.connection : ConnectionState;
+
+	auto s = McpServer.stateful("t", "1");
+	s.enableResourceSubscriptions();
+	registerStubResources(s, "res://gone");
+	auto a = new ConnectionState;
+	auto b = new ConnectionState;
+	Json p = Json.emptyObject;
+	p["uri"] = "res://gone";
+	assert("error" !in s.handle(req(1, "resources/subscribe", p)).get);
+	assert("error" !in s.handle(req(1, "resources/subscribe", p), new ConnCtx("A", a)).get);
+	assert("error" !in s.handle(req(1, "resources/subscribe", p), new ConnCtx("B", b)).get);
+
+	assert(s.removeResource("res://gone"));
+	assert("res://gone" !in s.activeConnection.subscriptions);
+	enum m = "notifications/resources/updated";
+	assert(!s.plainGetEligibleFor(a, m, "res://gone"));
+	assert(!s.plainGetEligibleFor(b, m, "res://gone"));
+
+	// A fresh subscription after re-registration is honoured again.
+	registerStubResources(s, "res://gone");
+	assert("error" !in s.handle(req(2, "resources/subscribe", p), new ConnCtx("A", a)).get);
+	assert(s.plainGetEligibleFor(a, m, "res://gone"));
+	assert(!s.plainGetEligibleFor(b, m, "res://gone"));
+}
+
+unittest  // a subscription to a removed resource does not count toward the per-connection cap
+{
+	import std.conv : to;
+
+	auto s = McpServer.stateful("t", "1");
+	s.enableResourceSubscriptions();
+	foreach (i; 0 .. maxResourceSubscriptions)
+		registerStubResources(s, "res://" ~ i.to!string);
+	registerStubResources(s, "res://extra");
+	Json p = Json.emptyObject;
+	foreach (i; 0 .. maxResourceSubscriptions)
+	{
+		p["uri"] = "res://" ~ i.to!string;
+		assert("error" !in s.handle(req(i, "resources/subscribe", p)).get);
+	}
+	assert(s.removeResource("res://0"));
+	p["uri"] = "res://extra";
+	assert("error" !in s.handle(req(-1, "resources/subscribe", p)).get);
 }
 
 unittest  // resources/subscribe caps the number of subscriptions per connection
