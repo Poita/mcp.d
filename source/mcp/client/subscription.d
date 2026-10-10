@@ -1,6 +1,6 @@
 module mcp.client.subscription;
 
-import core.atomic : atomicLoad, cas;
+import core.atomic : atomicLoad, atomicStore, cas;
 
 import mcp.protocol.errors : McpException;
 
@@ -50,8 +50,11 @@ final class SubscriptionStream
 	// first cancel() (after the transport's own teardown) or when the server ends
 	// it. `McpClient.streamEvents` uses it to deregister the stream's
 	// per-subscription event/control handlers.
+	// Both guarded by `cleanupLock_`, since a cancel() on another thread can
+	// race an addCleanup or the server's end.
 	private void delegate() @safe nothrow[] cleanups_;
-	private shared bool cleanedUp_;
+	private bool cleanedUp_;
+	private shared bool cleanupLock_;
 
 	/// Construct a handle wrapping a shared cancellation flag. Created by a
 	/// `ClientTransport` when it opens the listen stream. `onCancel`, when
@@ -81,19 +84,46 @@ final class SubscriptionStream
 
 	private void runCleanup() @safe nothrow
 	{
-		if (!cas(&cleanedUp_, false, true))
+		void delegate() @safe nothrow[] due;
+		lockCleanups();
+		const already = cleanedUp_;
+		cleanedUp_ = true;
+		due = cleanups_;
+		cleanups_ = null;
+		unlockCleanups();
+		if (already)
 			return;
-		foreach (cleanup; cleanups_)
+		foreach (cleanup; due)
 			cleanup();
 	}
 
 	/// Add a cleanup run exactly once when the stream ends: on the first
 	/// `cancel()`/`close()` (after the transport's own teardown) or when the server
-	/// ends it. Set immediately after the stream is opened (before any end can
-	/// race), so client state is always deregistered.
+	/// ends it. On a stream that has already ended it runs at once, so client
+	/// state is always deregistered.
 	void addCleanup(void delegate() @safe nothrow cleanup) @safe nothrow
 	{
-		cleanups_ ~= cleanup;
+		lockCleanups();
+		const ended = cleanedUp_;
+		if (!ended)
+			cleanups_ ~= cleanup;
+		unlockCleanups();
+		if (ended)
+			cleanup();
+	}
+
+	// A spin lock: the guarded sections are a few assignments, and the object's
+	// monitor is not usable from nothrow code.
+	private void lockCleanups() @safe nothrow @nogc
+	{
+		while (!cas(&cleanupLock_, false, true))
+		{
+		}
+	}
+
+	private void unlockCleanups() @safe nothrow @nogc
+	{
+		atomicStore(cleanupLock_, false);
 	}
 
 	/// Alias for `cancel()`.
@@ -143,6 +173,26 @@ unittest  // finish records the server's end and its error once
 	assert(s.ended && s.error is e && !s.cancelled);
 	s.finish(null);
 	assert(s.error is e, "only the first end is kept");
+}
+
+unittest  // a cleanup added after the stream ended runs at once
+{
+	auto s = new SubscriptionStream(new shared bool(false));
+	s.finish();
+	bool ran;
+	s.addCleanup(() @safe nothrow{ ran = true; });
+	assert(ran, "a cleanup added to an ended stream must still run");
+}
+
+unittest  // a cleanup added after a local cancel runs at once, exactly once
+{
+	auto s = new SubscriptionStream(new shared bool(false));
+	s.cancel();
+	int runs;
+	s.addCleanup(() @safe nothrow{ runs++; });
+	s.cancel();
+	s.finish();
+	assert(runs == 1);
 }
 
 unittest  // an end reported after a local cancel is ignored
