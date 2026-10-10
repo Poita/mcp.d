@@ -4034,15 +4034,17 @@ unittest  // closing a legacy SSE stream cancels the requests in flight on it
 	assert(tok.cancelled, "a closed stream's in-flight request must be cancelled");
 }
 
+// Let other tasks run until `done` holds, or for at most about five seconds.
 version (unittest) private void yieldUntil(scope bool delegate() @safe done) @safe
 {
-	import vibe.core.core : yield;
+	import core.time : msecs;
+	import vibe.core.core : sleep;
 
-	foreach (_; 0 .. 4096)
+	foreach (_; 0 .. 500)
 	{
 		if (done())
 			return;
-		yield();
+		sleep(10.msecs);
 	}
 }
 
@@ -7624,7 +7626,12 @@ unittest  // closing a legacy GET stream fails the server->client request awaiti
 	});
 
 	auto ch = new LegacySseChannel("/message");
-	const lid = ch.addListener((string) @safe {});
+	bool asked;
+	const lid = ch.addListener((string frame) @safe {
+		import std.algorithm : canFind;
+
+		asked = asked || frame.canFind("roots/list");
+	});
 	const sid = ch.sessionIdFor(lid);
 
 	const started = MonoTime.currTime;
@@ -7641,7 +7648,10 @@ unittest  // closing a legacy GET stream fails the server->client request awaiti
 	});
 	runTask(() nothrow{
 		try
+		{
+			yieldUntil(() => asked);
 			ch.removeListener(lid);
+		}
 		catch (Exception)
 		{
 		}
