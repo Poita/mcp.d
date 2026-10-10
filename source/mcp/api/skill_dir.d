@@ -93,11 +93,7 @@ string registerSkillDir(McpServer server, string dir, SkillDirOptions options = 
 		throw new Exception(
 				"registerSkillDir: SKILL.md must be a regular file, not a symlink: " ~ skillMdPath);
 
-	// Checked before reading, so an oversized SKILL.md is never slurped into
-	// memory just to be rejected.
-	if (fileSize(skillMdPath) > options.maxTotalBytes)
-		throw new Exception("registerSkillDir: skill directory exceeds maxTotalBytes");
-	const skillMd = readTextFile(skillMdPath);
+	const skillMd = readTextFile(skillMdPath, options.maxTotalBytes);
 	Json frontmatter = parseSkillFrontmatter(skillMd);
 	if (const problem = frontmatterNameProblem(frontmatter))
 		throw new Exception("registerSkillDir: SKILL.md frontmatter " ~ problem);
@@ -528,12 +524,7 @@ private void walkInto(string base, string rel, ref RawFile[] files, ref size_t t
 		// `files` excludes the root SKILL.md, which counts as a resource too.
 		if (files.length + 2 > maxFiles)
 			throw new Exception("registerSkillDir: skill directory exceeds maxFiles");
-		const fullPath = joinPath(base, childRel);
-		// Check the size against the cap BEFORE reading, so a single oversized
-		// file cannot be slurped into memory just to be rejected afterward.
-		if (total + fileSize(fullPath) > maxTotalBytes)
-			throw new Exception("registerSkillDir: skill directory exceeds maxTotalBytes");
-		const bytes = readBytes(fullPath);
+		const bytes = readWithinBudget(joinPath(base, childRel), maxTotalBytes - total);
 		total += bytes.length;
 
 		RawFile r;
@@ -682,13 +673,14 @@ private bool pathIsDir(string p) @safe
 	return exists(p) && isDir(p);
 }
 
-/// The contents of the file `p` as UTF-8 text. Throws, naming `p`, when they
-/// are not valid UTF-8.
-private string readTextFile(string p) @safe
+/// The contents of the file `p`, at most `budget` bytes (see
+/// `readWithinBudget`), as UTF-8 text. Throws, naming `p`, when they are not
+/// valid UTF-8.
+private string readTextFile(string p, size_t budget) @safe
 {
 	import std.utf : UTFException, validate;
 
-	auto text = cast(string) readBytes(p);
+	auto text = cast(string) readWithinBudget(p, budget);
 	try
 		validate(text);
 	catch (UTFException)
@@ -696,11 +688,33 @@ private string readTextFile(string p) @safe
 	return text;
 }
 
-private immutable(ubyte)[] readBytes(string p) @trusted
+/// Called with each path just before it is read, so a test can change the file
+/// between its size check and its read.
+version (unittest) private void delegate(string path) @safe beforeReadHook;
+
+/// The contents of the file `p`, reading at most `upTo` bytes.
+private immutable(ubyte)[] readBytes(string p, size_t upTo = size_t.max) @trusted
 {
 	import std.file : read;
 
-	return cast(immutable(ubyte)[]) read(p);
+	version (unittest)
+		if (beforeReadHook !is null)
+			beforeReadHook(p);
+	return cast(immutable(ubyte)[]) read(p, upTo);
+}
+
+/// The contents of the file `p`, which may add at most `budget` bytes to a
+/// skill's total. The size is checked before the read, so an oversized file is
+/// never slurped into memory, and again after it, since the file may have grown
+/// in between; the read stops one byte past the budget.
+private immutable(ubyte)[] readWithinBudget(string p, size_t budget) @safe
+{
+	if (fileSize(p) > budget)
+		throw new Exception("registerSkillDir: skill directory exceeds maxTotalBytes");
+	auto bytes = readBytes(p, budget == size_t.max ? budget : budget + 1);
+	if (bytes.length > budget)
+		throw new Exception("registerSkillDir: skill directory exceeds maxTotalBytes");
+	return bytes;
 }
 
 private ulong fileSize(string p) @safe
@@ -1478,6 +1492,64 @@ unittest  // registerSkillDir rejects a directory whose files exceed maxTotalByt
 	SkillDirOptions opts;
 	opts.maxTotalBytes = 4; // smaller than the fixture's FORMS.md
 	assertThrown!Exception(registerSkillDir(s, root, opts));
+}
+
+version (unittest) private void growBeforeRead(string root, string name) @safe
+{
+	import std.algorithm.searching : endsWith;
+	import std.array : replicate;
+	import std.file : append;
+
+	beforeReadHook = (string p) @safe {
+		if (p.endsWith(name))
+			append(p, "x".replicate(4096));
+	};
+}
+
+unittest  // a file that grows past maxTotalBytes between its size check and its read is rejected
+{
+	import std.algorithm.searching : canFind;
+
+	const root = tmpRoot("grows", "pdf-forms");
+	writeSkillFixture(root);
+	scope (exit)
+	{
+		beforeReadHook = null;
+		removeTree(root);
+	}
+	growBeforeRead(root, "FORMS.md");
+	auto s = new McpServer("t", "1");
+	SkillDirOptions opts;
+	opts.maxTotalBytes = 1024;
+	string msg;
+	try
+		registerSkillDir(s, root, opts);
+	catch (Exception e)
+		msg = e.msg;
+	assert(msg.canFind("maxTotalBytes"), msg);
+}
+
+unittest  // a SKILL.md that grows past maxTotalBytes before its read is rejected by size
+{
+	import std.algorithm.searching : canFind;
+
+	const root = tmpRoot("grows-md", "pdf-forms");
+	writeSkillFixture(root);
+	scope (exit)
+	{
+		beforeReadHook = null;
+		removeTree(root);
+	}
+	growBeforeRead(root, "SKILL.md");
+	auto s = new McpServer("t", "1");
+	SkillDirOptions opts;
+	opts.maxTotalBytes = 1024;
+	string msg;
+	try
+		registerSkillDir(s, root, opts);
+	catch (Exception e)
+		msg = e.msg;
+	assert(msg.canFind("maxTotalBytes"), msg);
 }
 
 version (unittest) private string skillDigestOf(string s) @safe
