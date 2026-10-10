@@ -290,6 +290,8 @@ private struct ResponseHead
 	string sessionId;
 	/// The `WWW-Authenticate` challenge, empty when absent.
 	string wwwAuthenticate;
+	/// The `Content-Length`, -1 when absent or unparseable.
+	long contentLength = -1;
 
 	/// Record one header line (`Name: value`, CR stripped).
 	void addHeader(string line) @safe
@@ -309,6 +311,17 @@ private struct ResponseHead
 			sessionId = value;
 		else if (name == "www-authenticate")
 			wwwAuthenticate = value;
+		else if (name == "content-length")
+		{
+			import std.conv : to;
+
+			try
+				contentLength = value.to!long;
+			catch (Exception)
+				contentLength = -1;
+			if (contentLength < 0)
+				contentLength = -1;
+		}
 	}
 }
 
@@ -1157,7 +1170,7 @@ final class HttpClientTransport : ClientTransport
 				// and surface a recognised modern JSON-RPC error if present.
 				if (isLegacyFallbackStatus(status))
 				{
-					const b = readRemaining(conn, chunked, maxMessageBytes);
+					const b = readRemaining(conn, chunked, maxMessageBytes, head.contentLength);
 					McpException modernErr;
 					if (modernErrorFromBody(b, modernErr))
 						err = modernErr;
@@ -1169,7 +1182,7 @@ final class HttpClientTransport : ClientTransport
 				if (status < 200 || status >= 300)
 				{
 					err = httpStatusError(status, readRemaining(conn, chunked,
-							maxMessageBytes), wwwAuthenticate);
+							maxMessageBytes, head.contentLength), wwwAuthenticate);
 					return;
 				}
 
@@ -1177,7 +1190,7 @@ final class HttpClientTransport : ClientTransport
 				{
 					// A single JSON body (the common non-streaming response): it must be
 					// the response to this request.
-					const b = readRemaining(conn, chunked, maxMessageBytes);
+					const b = readRemaining(conn, chunked, maxMessageBytes, head.contentLength);
 					Message m;
 					try
 						m = parseMessage(b);
@@ -1316,11 +1329,13 @@ final class HttpClientTransport : ClientTransport
 		}
 	}
 
-	/// Read the remaining response body from `conn` to end-of-stream, decoding
-	/// chunked transfer-encoding when `chunked` is true. Used for the small
-	/// non-streaming JSON body and the 4xx legacy-fallback body. A body longer than
-	/// `maxBytes` fails with an `McpException`.
-	private static string readRemaining(Conn)(Conn conn, bool chunked, size_t maxBytes) @safe
+	/// Read the remaining response body from `conn`: decoding chunked
+	/// transfer-encoding when `chunked` is true, else exactly `contentLength`
+	/// bytes when it is known (non-negative), else to end-of-stream. Used for the
+	/// small non-streaming JSON body and the 4xx legacy-fallback body. A body
+	/// longer than `maxBytes` fails with an `McpException`.
+	private static string readRemaining(Conn)(Conn conn, bool chunked,
+			size_t maxBytes, long contentLength = -1) @safe
 	{
 		import vibe.core.stream : IOMode;
 
@@ -1330,6 +1345,15 @@ final class HttpClientTransport : ClientTransport
 			string chunk;
 			while (readChunk(conn, maxBytes - acc.length, chunk))
 				acc ~= chunk;
+		}
+		else if (contentLength >= 0)
+		{
+			if (cast(ulong) contentLength > maxBytes)
+				throw messageTooLarge(maxBytes);
+			auto body = new ubyte[cast(size_t) contentLength];
+			conn.read(body, IOMode.all);
+			acc = cast(string)
+			body.idup;
 		}
 		else
 		{
@@ -2102,7 +2126,8 @@ final class HttpClientTransport : ClientTransport
 					const wwwAuthenticate = head.wwwAuthenticate;
 					if (status < 200 || status >= 300)
 					{
-						const b = readRemaining(conn, chunked, maxMessageBytes);
+						const b = readRemaining(conn, chunked,
+								maxMessageBytes, head.contentLength);
 						if (sentBearer.length && isRejectedBearer(status,
 								wwwAuthenticate) && refreshBearer(sentBearer))
 							continue;
@@ -2113,7 +2138,8 @@ final class HttpClientTransport : ClientTransport
 					{
 						// A plain JSON answer: the server answered the request outright
 						// instead of opening a stream.
-						const b = readRemaining(conn, chunked, maxMessageBytes);
+						const b = readRemaining(conn, chunked,
+								maxMessageBytes, head.contentLength);
 						try
 						{
 							if (!endsStream(parseMessage(b)))
@@ -6569,4 +6595,34 @@ unittest  // a session id outside visible ASCII is rejected
 			"a session id with a space must not be adopted");
 	assert(sessionsSentAfter("café", "") == ["", ""],
 			"a session id with a non-ASCII byte must not be adopted");
+}
+
+unittest  // ResponseHead.addHeader records Content-Length
+{
+	ResponseHead h;
+	assert(h.contentLength == -1, "an absent Content-Length must read as unknown");
+	h.addHeader("Content-Length: 42");
+	assert(h.contentLength == 42);
+	ResponseHead bad;
+	bad.addHeader("Content-Length: nope");
+	assert(bad.contentLength == -1);
+}
+
+unittest  // readRemaining reads exactly Content-Length bytes and leaves the rest
+{
+	import vibe.stream.memory : createMemoryStream;
+
+	auto stream = createMemoryStream(cast(ubyte[]) `{"a":1}HTTP/1.1 200 OK`.dup, false);
+	auto got = HttpClientTransport.readRemaining(stream, false, defaultMaxMessageBytes, 7);
+	assert(got == `{"a":1}`, "the body must end at Content-Length, not at end-of-stream");
+}
+
+unittest  // readRemaining rejects a Content-Length past the message limit before reading
+{
+	import std.exception : collectException;
+	import vibe.stream.memory : createMemoryStream;
+
+	auto stream = createMemoryStream(cast(ubyte[]) "x".dup, false);
+	auto e = collectException(HttpClientTransport.readRemaining(stream, false, 1024, 4096));
+	assert(cast(McpException) e !is null);
 }
