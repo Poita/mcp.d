@@ -21,6 +21,7 @@ the real cost of a synchronous tool call today.
 ## Build
 
 ```bash
+cd bench
 export PKG_CONFIG_PATH="$(brew --prefix openssl@3)/lib/pkgconfig"   # macOS
 ulimit -n 65536
 dub build -c server -b release
