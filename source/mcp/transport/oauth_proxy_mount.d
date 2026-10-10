@@ -182,6 +182,7 @@ struct ProxyAuthState
 	string clientId; /// the SEP-991 CIMD `client_id` URL (empty for DCR clients); the consent identity for CIMD
 	string consentSession; /// the consent-cookie value of the browser that started this authorization
 	string csrfToken; /// the anti-CSRF token the consent form must echo back
+	string client; /// the rate-limit key of the caller that started this authorization
 }
 
 /// What the consent screen shows and posts back. `clientName` is the
@@ -298,6 +299,13 @@ struct ProxyStateStoreOptions
 	/// browser's oldest pending authorization is dropped.
 	size_t maxPerConsentSession = 10;
 
+	/// Maximum number of live pending authorizations started by one client
+	/// (`ProxyAuthState.client`, the key `/authorize` is rate limited under);
+	/// 0 means unlimited. Past it, that client's oldest pending authorization
+	/// is dropped, so a client that sends no consent cookie cannot push out
+	/// other users' pending sign-ins.
+	size_t maxPerClient = 20;
+
 	/// Injectable monotonic clock (tests drive expiry with it). Null uses
 	/// `MonoTime.currTime`.
 	MonoTime delegate() @safe clock;
@@ -312,17 +320,16 @@ struct ProxyStateStoreOptions
 /// process memory without limit: each entry carries an insertion timestamp, and
 /// every `put`/`take` sweeps entries older than the authorization-flow TTL and
 /// caps the live entry count, evicting the oldest by insertion time when the cap
-/// is reached. One browser's pending authorizations are capped separately
-/// (`ProxyStateStoreOptions.maxPerConsentSession`). The clock is injectable so
-/// the bounds are unit-testable.
+/// is reached. One browser's and one client's pending authorizations are capped
+/// separately (`ProxyStateStoreOptions.maxPerConsentSession` and
+/// `maxPerClient`). The clock is injectable so the bounds are unit-testable.
 final class ProxyStateStore
 {
 	import mcp.transport.session : BoundedExpiringMap;
 
 	private BoundedExpiringMap!ProxyAuthState entries;
-	// Live proxy states per consent session, oldest first.
-	private string[][string] statesBySession;
-	private size_t maxPerConsentSession;
+	private StatesByKey bySession;
+	private StatesByKey byClient;
 
 	this() @safe
 	{
@@ -334,33 +341,20 @@ final class ProxyStateStore
 	{
 		entries = BoundedExpiringMap!ProxyAuthState(opts.ttl, opts.maxEntries, opts.clock);
 		entries.onEvict = (string key, ProxyAuthState st) @safe {
-			forget(st.consentSession, key);
+			forget(key, st);
 		};
-		maxPerConsentSession = opts.maxPerConsentSession;
+		bySession.cap = opts.maxPerConsentSession;
+		byClient.cap = opts.maxPerClient;
 	}
 
 	/// Record the client's authorization details under the proxy `state`.
 	void put(string proxyState, ProxyAuthState st) @safe
 	{
-		import std.algorithm : canFind;
-
-		const session = st.consentSession;
-		auto states = session in statesBySession;
-		const known = states !is null && (*states).canFind(proxyState);
-		if (session.length && maxPerConsentSession && !known)
-		{
-			while (states !is null && (*states).length >= maxPerConsentSession)
-			{
-				bool found;
-				const oldest = (*states)[0];
-				entries.take(oldest, found);
-				forget(session, oldest);
-				states = session in statesBySession;
-			}
-		}
+		makeRoom(bySession, st.consentSession, proxyState);
+		makeRoom(byClient, st.client, proxyState);
 		entries.put(proxyState, st);
-		if (session.length && !known)
-			statesBySession[session] ~= proxyState;
+		bySession.add(st.consentSession, proxyState);
+		byClient.add(st.client, proxyState);
 	}
 
 	/// Consume and return the details for `proxyState`, setting `found`.
@@ -368,7 +362,7 @@ final class ProxyStateStore
 	{
 		auto st = entries.take(proxyState, found);
 		if (found)
-			forget(st.consentSession, proxyState);
+			forget(proxyState, st);
 		return st;
 	}
 
@@ -387,19 +381,78 @@ final class ProxyStateStore
 		return entries.length;
 	}
 
-	private void forget(string session, string proxyState) @safe
+	// Drop `key`'s oldest pending authorizations in `index` until `proxyState`
+	// fits under its cap.
+	private void makeRoom(ref StatesByKey index, string key, string proxyState) @safe
+	{
+		while (index.full(key, proxyState))
+		{
+			bool found;
+			const oldest = index.oldest(key);
+			auto st = entries.take(oldest, found);
+			if (found)
+				forget(oldest, st);
+			else
+				index.remove(key, oldest);
+		}
+	}
+
+	private void forget(string proxyState, ProxyAuthState st) @safe
+	{
+		bySession.remove(st.consentSession, proxyState);
+		byClient.remove(st.client, proxyState);
+	}
+}
+
+// The live proxy states recorded under each key, oldest first, capped per key
+// (0: unlimited). An empty key is never tracked.
+private struct StatesByKey
+{
+	size_t cap;
+	private string[][string] states;
+
+	// Whether adding `proxyState` under `key` would exceed the cap.
+	bool full(string key, string proxyState) @safe
+	{
+		import std.algorithm : canFind;
+
+		if (key.length == 0 || cap == 0)
+			return false;
+		auto list = key in states;
+		return list !is null && !(*list).canFind(proxyState) && (*list).length >= cap;
+	}
+
+	string oldest(string key) @safe
+	{
+		return states[key][0];
+	}
+
+	void add(string key, string proxyState) @safe
+	{
+		import std.algorithm : canFind;
+
+		if (key.length == 0)
+			return;
+		auto list = key in states;
+		if (list is null)
+			states[key] = [proxyState];
+		else if (!(*list).canFind(proxyState))
+			*list ~= proxyState;
+	}
+
+	void remove(string key, string proxyState) @safe
 	{
 		import std.algorithm : countUntil, remove;
 
-		auto states = session in statesBySession;
-		if (states is null)
+		auto list = key in states;
+		if (list is null)
 			return;
-		const i = (*states).countUntil(proxyState);
+		const i = (*list).countUntil(proxyState);
 		if (i < 0)
 			return;
-		*states = (*states).remove(i);
-		if ((*states).length == 0)
-			statesBySession.remove(session);
+		*list = (*list).remove(i);
+		if ((*list).length == 0)
+			states.remove(key);
 	}
 }
 
@@ -492,6 +545,19 @@ struct OAuthProxyMountOptions
 /// between `/authorize` and `/register`.
 alias ProxyRequestLimit = bool delegate(scope HTTPServerRequest req) @safe;
 
+/// The key a request's client is told apart by: `OAuthProxyMountOptions.clientKey`.
+alias ProxyClientKey = string delegate(scope HTTPServerRequest req) @safe;
+
+/// The `ProxyClientKey` `opts` describes: its `clientKey`, else the peer
+/// address bucketed by `clientBucket`.
+ProxyClientKey proxyClientKey(OAuthProxyMountOptions opts) @safe
+{
+	if (opts.clientKey !is null)
+		return opts.clientKey;
+	const prefix = opts.ipv6BucketPrefix;
+	return (scope HTTPServerRequest req) @safe => clientBucket(req.clientAddress, prefix);
+}
+
 /// The `ProxyRequestLimit` `opts` describes, or null when rate limiting is off.
 ProxyRequestLimit proxyRequestLimit(OAuthProxyMountOptions opts) @safe
 {
@@ -499,11 +565,8 @@ ProxyRequestLimit proxyRequestLimit(OAuthProxyMountOptions opts) @safe
 		return null;
 	auto limiter = new ClientRateLimiter(opts.maxRequestsPerClient,
 			opts.rateLimitWindow, opts.maxRateLimitedClients, opts.clock);
-	auto key = opts.clientKey;
-	const prefix = opts.ipv6BucketPrefix;
-	return (scope HTTPServerRequest req) @safe {
-		return limiter.allow(key !is null ? key(req) : clientBucket(req.clientAddress, prefix));
-	};
+	auto key = proxyClientKey(opts);
+	return (scope HTTPServerRequest req) @safe => limiter.allow(key(req));
 }
 
 // Answer a request refused by a `ProxyRequestLimit` with 429.
@@ -596,7 +659,7 @@ void mountOAuthProxy(URLRouter router, OAuthProxy proxy,
 	auto limit = proxyRequestLimit(opts);
 	mountOAuthMetadata(router, proxy);
 	mountOAuthRegister(router, proxy, limit);
-	mountOAuthAuthorize(router, proxy, store, limit);
+	mountOAuthAuthorize(router, proxy, store, limit, proxyClientKey(opts));
 	mountOAuthConsent(router, proxy, store);
 	mountOAuthCallback(router, proxy, store);
 	mountOAuthToken(router, proxy);
@@ -741,9 +804,11 @@ void mountOAuthRegister(URLRouter router, OAuthProxy proxy, ProxyRequestLimit li
 /// The `store` MUST be shared with `mountOAuthConsent` and `mountOAuthCallback`
 /// so the consent approval and the upstream callback can read back the pending
 /// authorization this leg wrote. A request `limit` refuses is answered 429; a
-/// null `limit` admits all.
-void mountOAuthAuthorize(URLRouter router, OAuthProxy proxy,
-		ProxyStateStore store, ProxyRequestLimit limit = null) @safe
+/// null `limit` admits all. Each pending authorization records the `clientKey`
+/// of the request that started it, which `store` caps per client; a null
+/// `clientKey` records none.
+void mountOAuthAuthorize(URLRouter router, OAuthProxy proxy, ProxyStateStore store,
+		ProxyRequestLimit limit = null, ProxyClientKey clientKey = null) @safe
 {
 	auto cfg = proxy.config();
 	const authorizePath = pathOf(cfg.authorizeEndpoint());
@@ -857,6 +922,7 @@ void mountOAuthAuthorize(URLRouter router, OAuthProxy proxy,
 		if (newConsentSession)
 			consentSession = mintState();
 		const csrfToken = mintState();
+		const client = clientKey !is null ? clientKey(req) : "";
 
 		void renderConsent(string clientNameForDisplay,
 			string clientIdForDisplay, string redirectForDisplay, string proxyState) @safe
@@ -881,7 +947,7 @@ void mountOAuthAuthorize(URLRouter router, OAuthProxy proxy,
 		{
 			const proxyState = mintState();
 			store.put(proxyState, ProxyAuthState(clientRedirect, clientState,
-				codeChallenge, scope_, clientId, consentSession, csrfToken));
+				codeChallenge, scope_, clientId, consentSession, csrfToken, client));
 			try
 			{
 				const location = proxy.authorizeWithClientIdMetadata(consentSession,
@@ -902,7 +968,7 @@ void mountOAuthAuthorize(URLRouter router, OAuthProxy proxy,
 
 		const proxyState = mintState();
 		store.put(proxyState, ProxyAuthState(clientRedirect, clientState,
-			codeChallenge, scope_, "", consentSession, csrfToken));
+			codeChallenge, scope_, "", consentSession, csrfToken, client));
 
 		try
 		{
@@ -1645,7 +1711,8 @@ unittest  // the store sweeps entries older than the TTL on the next put/take
 	import core.time : MonoTime, minutes;
 
 	auto clk = MonoTime.currTime;
-	auto store = new ProxyStateStore(ProxyStateStoreOptions(10.minutes, 10_000, 0, () @safe => clk));
+	auto store = new ProxyStateStore(ProxyStateStoreOptions(10.minutes, 10_000,
+			0, 0, () @safe => clk));
 	store.put("old", ProxyAuthState("http://localhost/cb", "s"));
 	assert(store.length == 1);
 
@@ -1705,6 +1772,56 @@ unittest  // RATE LIMIT: /register and /authorize refuse a client past maxReques
 	assert(browserPost(router, "https://mcp.example.com/register?k=b", body_, "").status == 201);
 }
 
+unittest  // the store caps pending authorizations per client, dropping that client's oldest
+{
+	ProxyStateStoreOptions opts;
+	opts.maxPerClient = 2;
+	auto store = new ProxyStateStore(opts);
+	ProxyAuthState st;
+	st.clientRedirectUri = "http://localhost/cb";
+	st.client = "c1";
+	foreach (k; ["a", "b", "c"])
+	{
+		st.consentSession = k;
+		store.put(k, st);
+	}
+	st.client = "c2";
+	store.put("d", st);
+	bool found;
+	store.take("a", found);
+	assert(!found);
+	foreach (k; ["b", "c", "d"])
+	{
+		store.take(k, found);
+		assert(found);
+	}
+}
+
+unittest  // an anonymous /authorize flood from one client does not evict another client's sign-in
+{
+	OAuthProxyMountOptions opts;
+	opts.maxRequestsPerClient = 0;
+	opts.pendingAuthorizations.maxEntries = 3;
+	opts.pendingAuthorizations.maxPerClient = 2;
+	opts.clientKey = (scope HTTPServerRequest req) @safe => req.query.get("k", "");
+	auto proxy = new OAuthProxy(consentMountConfig());
+	proxy.register(["http://localhost:5000/cb"]);
+	auto router = new URLRouter;
+	mountOAuthProxy(router, proxy, opts);
+
+	const authorize = "https://mcp.example.com/authorize?client_id=Iv1.upstream"
+		~ "&response_type=code&code_challenge_method=S256&code_challenge=CH"
+		~ "&scope=read&redirect_uri=http%3A%2F%2Flocalhost%3A5000%2Fcb&state=cs&k=";
+	const victim = browserGet(router, authorize ~ "b", "");
+	assert(hiddenField(victim.body_, "state").length > 0);
+	foreach (_; 0 .. 5)
+		assert(browserGet(router, authorize ~ "a", "").status == 200);
+
+	const approved = browserPost(router, "https://mcp.example.com/consent",
+			consentForm(victim.body_), victim.setCookie);
+	assert(approved.status == 302, approved.body_);
+}
+
 version (unittest) private HTTPServerRequest requestFrom(string from) @safe
 {
 	import vibe.core.net : resolveHost;
@@ -1741,7 +1858,7 @@ unittest  // the store caps live entries, evicting the oldest by insertion time
 	import core.time : MonoTime, minutes, seconds;
 
 	auto clk = MonoTime.currTime;
-	auto store = new ProxyStateStore(ProxyStateStoreOptions(10.minutes, 2, 0, () @safe => clk));
+	auto store = new ProxyStateStore(ProxyStateStoreOptions(10.minutes, 2, 0, 0, () @safe => clk));
 	store.put("a", ProxyAuthState("http://localhost/a", ""));
 	clk += 1.seconds;
 	store.put("b", ProxyAuthState("http://localhost/b", ""));
