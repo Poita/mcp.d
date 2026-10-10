@@ -535,11 +535,19 @@ void runStdio(McpServer server, ServerSettings settings)
 /// `vibe.core.core.disableDefaultSignalHandlers` before `runStdio` to handle
 /// these signals yourself; SIGPIPE must then be ignored or handled, since its
 /// default action terminates the process.
+///
+/// Called outside any vibe task (typically straight from `main`), `runStdio`
+/// runs the event loop itself (`runEventLoop`) and exits it once the server
+/// stops, so other tasks the program started end with it; a failure that ends
+/// the server is reported on stderr. Called from within a task, it serves on
+/// that task inside the already-running event loop, leaves the loop running
+/// when it returns, and lets such a failure propagate to the caller.
 void runStdio(McpServer server, StdioOptions opts = StdioOptions.init)
 {
 	const maxLineBytes = opts.maxLineBytes;
 	import vibe.core.core : runTask, runEventLoop, exitEventLoop;
 	import vibe.core.sync : TaskMutex;
+	import vibe.core.task : Task;
 
 	// Enforce the documented "at most once per process" invariant explicitly, so it
 	// holds for both a concurrent second call and a sequential one and does not
@@ -604,6 +612,11 @@ void runStdio(McpServer server, StdioOptions opts = StdioOptions.init)
 		}
 	}
 
+	if (Task.getThis() != Task.init)
+	{
+		serveStdio(server, &readLine, &writeLine, opts);
+		return;
+	}
 	() @trusted {
 		runTask(() nothrow{
 			scope (exit)
@@ -1737,6 +1750,60 @@ unittest  // runStdio enforces its "at most once per process" invariant via the 
 	catch (Exception e)
 		threw = true;
 	assert(threw, "a second runStdio call must throw the at-most-once guard");
+}
+
+version (Posix) unittest  // runStdio called from a task serves on that task within the running event loop
+{
+	import core.sys.posix.unistd : close, dup, dup2, pipe;
+	import core.time : msecs;
+	import vibe.core.core : runTask, runEventLoop, exitEventLoop, sleep;
+
+	const saved = () @trusted { return _ranStdio; }();
+	scope (exit)
+		() @trusted { _ranStdio = saved; }();
+	() @trusted { _ranStdio = false; }();
+
+	// Point fd 0 at a pipe already at end-of-input and fd 1 at a pipe nobody
+	// reads, so runStdio returns at once without touching the real stdio.
+	int[2] inPipe, outPipe;
+	const savedIn = () @trusted { return dup(0); }();
+	const savedOut = () @trusted { return dup(1); }();
+	() @trusted {
+		pipe(inPipe);
+		pipe(outPipe);
+		close(inPipe[1]);
+		dup2(inPipe[0], 0);
+		dup2(outPipe[1], 1);
+		close(inPipe[0]);
+		close(outPipe[1]);
+	}();
+	scope (exit)
+		() @trusted {
+		dup2(savedIn, 0);
+		dup2(savedOut, 1);
+		close(savedIn);
+		close(savedOut);
+		close(outPipe[0]);
+	}();
+
+	bool returned, loopKeptRunning;
+	runTask(() nothrow{
+		scope (exit)
+			exitEventLoop();
+		try
+		{
+			runStdio(new McpServer("in-task", "1.0"));
+			returned = true;
+			sleep(5.msecs); // needs the outer event loop to still be running
+			loopKeptRunning = true;
+		}
+		catch (Exception)
+		{
+		}
+	});
+	runEventLoop();
+	assert(returned, "runStdio returns at end-of-input when called from a task");
+	assert(loopKeptRunning, "runStdio does not stop the event loop it was called within");
 }
 
 version (unittest)
