@@ -1546,11 +1546,14 @@ final class OAuthProxy
 	/// Whether the browser identified by `consentSession` has already approved
 	/// `client` (a DCR client's `redirect_uri`, or a CIMD `client_id` URL) to be
 	/// forwarded to the upstream identity provider with every scope in `scopes`.
-	/// A client is identified by its `redirectUriMatchKey`, so an approval of a
-	/// loopback IP-literal redirect_uri holds for any port, as registration does.
+	/// A client is identified by its exact `redirect_uri`, port included.
+	/// Registration ignores a loopback IP literal's port, so every native client
+	/// on the same loopback path shares one registration key; the port is what
+	/// distinguishes the running client, and an approval does not carry over to
+	/// another one.
 	bool hasConsent(string consentSession, string client, const(string)[] scopes) @safe
 	{
-		return consentStore.hasConsent(consentSession, redirectUriMatchKey(client), scopes);
+		return consentStore.hasConsent(consentSession, client, scopes);
 	}
 
 	/// The scopes of the space-delimited `scopeStr` this proxy forwards upstream
@@ -1568,10 +1571,10 @@ final class OAuthProxy
 	/// `authorize` calls from that browser for that client are then forwarded to
 	/// the upstream IdP for `scopes` (as `forwardedScopes` yields them). Other
 	/// browsers, and requests for scopes not yet approved, still see the consent
-	/// screen. The approval is recorded under `redirectUriMatchKey(client)`.
+	/// screen. The approval is recorded under the exact `client` string.
 	void grantConsent(string consentSession, string client, const(string)[] scopes) @safe
 	{
-		consentStore.grantConsent(consentSession, redirectUriMatchKey(client), scopes);
+		consentStore.grantConsent(consentSession, client, scopes);
 		// A CIMD client a user approved keeps its cached document ahead of ones
 		// only ever fetched by anonymous requests.
 		cimdCache.markUsed(client);
@@ -2823,18 +2826,26 @@ unittest  // CONFUSED DEPUTY: consent is per-client (one approval does not cover
 			"http://localhost:6000/callback", "CH", "read:user", "S"));
 }
 
-unittest  // CONSENT: approval of a loopback IP-literal redirect_uri covers the same client on another port
+unittest  // CONSENT: approval of a loopback IP-literal redirect_uri does not cover another port
 {
+	import std.exception : assertThrown;
+
+	// Every native client registering the same loopback path shares one
+	// registration key, so the port is what tells a running client apart.
 	auto proxy = new OAuthProxy(sampleConfig());
 	proxy.register(["http://127.0.0.1:5000/callback"]);
+	proxy.register(["http://127.0.0.1/callback"]);
 	proxy.grantConsent("browser-1", "http://127.0.0.1:5000/callback", [
 		"read:user"
 	]);
-	assert(proxy.hasConsent("browser-1", "http://127.0.0.1:61234/callback", [
+	assert(proxy.hasConsent("browser-1", "http://127.0.0.1:5000/callback", [
 		"read:user"
 	]));
-	cast(void) proxy.authorize("browser-1", "http://127.0.0.1:61234/callback",
-			"CH", "read:user", "S");
+	assert(!proxy.hasConsent("browser-1", "http://127.0.0.1:61234/callback", [
+		"read:user"
+	]));
+	assertThrown!ConsentRequiredException(proxy.authorize("browser-1",
+			"http://127.0.0.1:61234/callback", "CH", "read:user", "S"));
 }
 
 unittest  // CONSENT: approval of a loopback redirect_uri does not cover a different path
