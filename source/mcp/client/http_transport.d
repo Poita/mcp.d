@@ -1649,17 +1649,26 @@ final class HttpClientTransport : ClientTransport
 		return req;
 	}
 
-	/// Read the status line and header block of a raw HTTP response from `conn`.
-	/// Must run inside a `@trusted` block (raw socket I/O).
+	/// Read the status line and header block of the final raw HTTP response
+	/// from `conn`, skipping any interim 1xx responses (RFC 9110 §15.2) ahead of
+	/// it, up to `maxInterimResponses` of them. Must run inside a `@trusted`
+	/// block (raw socket I/O).
 	private static ResponseHead readResponseHead(Conn)(Conn conn) @safe
 	{
 		import vibe.stream.operations : readLine;
 
-		ResponseHead head;
-		head.status = parseHttpStatus(cast(string) readLine(conn, maxHeaderLineBytes).idup);
-		foreach (h; readHeaderLines(conn))
-			head.addHeader(h);
-		return head;
+		enum maxInterimResponses = 16;
+		foreach (_; 0 .. maxInterimResponses + 1)
+		{
+			ResponseHead head;
+			head.status = parseHttpStatus(cast(string) readLine(conn, maxHeaderLineBytes).idup);
+			foreach (h; readHeaderLines(conn))
+				head.addHeader(h);
+			// 101 Switching Protocols ends the HTTP exchange, so it is final.
+			if (head.status < 100 || head.status >= 200 || head.status == 101)
+				return head;
+		}
+		throw internalError("HTTP response sent too many interim 1xx responses");
 	}
 
 	/// Read and decode an SSE response body from `conn`, the single tested state
@@ -6625,4 +6634,16 @@ unittest  // readRemaining rejects a Content-Length past the message limit befor
 	auto stream = createMemoryStream(cast(ubyte[]) "x".dup, false);
 	auto e = collectException(HttpClientTransport.readRemaining(stream, false, 1024, 4096));
 	assert(cast(McpException) e !is null);
+}
+
+unittest  // readResponseHead skips interim 1xx responses to the final head
+{
+	import vibe.stream.memory : createMemoryStream;
+
+	auto stream = createMemoryStream(cast(ubyte[])("HTTP/1.1 100 Continue\r\n\r\n"
+			~ "HTTP/1.1 103 Early Hints\r\nLink: </a>; rel=preload\r\n\r\n"
+			~ "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n").dup, false);
+	const head = HttpClientTransport.readResponseHead(stream);
+	assert(head.status == 200, "an interim 1xx head must not be taken as the final response");
+	assert(head.sse);
 }
