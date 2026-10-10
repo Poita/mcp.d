@@ -172,14 +172,19 @@ struct ResourceLink
 }
 
 /// `resource` content block (`EmbeddedResource`): wraps a resource contents
-/// object under `resource`.
+/// object under `resource`, which the wire format requires.
 struct EmbeddedResource
 {
 	Json resource = Json.undefined;
 	mixin ContentMetaFields;
 
+	/// Throws when `resource` is not an object: the block is malformed without it.
 	Json toJson() const @safe
 	{
+		import std.exception : enforce;
+
+		enforce(resource.type == Json.Type.object,
+				"EmbeddedResource.resource must be a resource contents object");
 		Json j = Json.emptyObject;
 		j["type"] = "resource";
 		j["resource"] = resource;
@@ -1924,6 +1929,14 @@ unittest  // embedded resource emits and parses _meta (spec: EmbeddedResource._m
 	assert(j["_meta"]["x.example/k"].get!string == "v");
 	auto back = Content.fromJson(j);
 	assert(back.meta["x.example/k"].get!string == "v");
+}
+
+unittest  // EmbeddedResource.toJson rejects an unset resource
+{
+	import std.exception : assertThrown;
+
+	assertThrown(Content(EmbeddedResource()).toJson());
+	assertThrown(EmbeddedResource(Json("x")).toJson());
 }
 
 unittest  // content omits _meta when none is set
