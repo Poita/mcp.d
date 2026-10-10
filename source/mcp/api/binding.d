@@ -893,8 +893,20 @@ private T bindLeaf(T)(Json v, string path)
 	}
 	else static if (isFloatingPoint!T)
 	{
+		import std.math : isFinite;
+
 		if (v.type != Json.Type.int_ && v.type != Json.Type.bigInt && v.type != Json.Type.float_)
 			throw new BindException(located(path, "expected a number, got " ~ jsonTypeName(v)));
+		// A finite JSON number beyond `T`'s range would otherwise bind as infinity.
+		T f;
+		try
+			f = deserializeWithPolicy!(JsonSerializer, EnumByNamePolicy, T)(v);
+		catch (Exception e)
+			throw new BindException(located(path, e.msg));
+		if (!isFinite(f))
+			throw new BindException(located(path,
+					"expected a number in the range of " ~ T.stringof ~ ", got " ~ v.toString));
+		return f;
 	}
 	else static if (isIntegral!T)
 	{
@@ -1392,6 +1404,22 @@ unittest  // an integer rejects a fractional or out-of-range JSON number, in JSO
 	assert(big !is null && big.msg == "expected an integer from 0 to 255, got 256", big.msg);
 	auto over = collectException!BindException(bindJson!ubyte(Json(256)));
 	assert(over !is null && over.msg == "expected an integer from 0 to 255, got 256", over.msg);
+}
+
+unittest  // a floating-point parameter rejects a JSON number outside its range
+{
+	import std.algorithm.searching : startsWith;
+	import std.array : replicate;
+	import std.bigint : BigInt;
+	import std.exception : collectException;
+
+	auto big = collectException!BindException(bindJson!float(Json(1e300)));
+	assert(big !is null
+			&& big.msg.startsWith("expected a number in the range of float, got "),
+			big ? big.msg : "");
+	assert(collectException!BindException(bindJson!double(Json(BigInt("1" ~ "0".replicate(400))))));
+	assert(bindJson!double(Json(1e300)) == 1e300);
+	assert(bindJson!float(Json(-3.5)) == -3.5f);
 }
 
 unittest  // a scalar of the wrong JSON type is reported in JSON terms
