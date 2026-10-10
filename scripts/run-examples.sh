@@ -97,16 +97,24 @@ for d in "${dirs[@]}"; do
     clientflag="--http"
   fi
   srvpid=$!
-  # Poll until the server is ready (up to 30 s) instead of sleeping a fixed
-  # amount, which is a CI-flake source on slow or loaded runners.
+  # Poll until the server is listening (up to 30 s) instead of sleeping a
+  # fixed amount, which is a CI-flake source on slow or loaded runners. Any
+  # HTTP status (even 400/401 for the empty probe) means it is up; curl
+  # reports 000 when the connection is refused.
+  up=0
   for i in $(seq 1 30); do
-    if curl -sf -o /dev/null "$url" \
+    code=$(curl -s -o /dev/null -w '%{http_code}' "$url" \
         -H 'Accept: application/json, text/event-stream' \
         -H 'Content-Type: application/json' \
-        -X POST -d '{}'; then break; fi
+        -X POST -d '{}' || true)
+    if [ "$code" != "000" ]; then up=1; break; fi
+    if ! kill -0 "$srvpid" 2>/dev/null; then break; fi
     sleep 1
   done
-  if ! ( cd "$d" && dub run -c client --quiet -- "$clientflag" "$url" ); then
+  if [ "$up" -ne 1 ]; then
+    echo "E2E FAILED (http): ${n} server did not start on ${url}"
+    echo "--- server log ---"; tail -20 "/tmp/ex-${n}-srv.log"; fail=1
+  elif ! ( cd "$d" && dub run -c client --quiet -- "$clientflag" "$url" ); then
     echo "E2E FAILED (http): ${n}"; echo "--- server log ---"; tail -20 "/tmp/ex-${n}-srv.log"; fail=1
   fi
   kill "$srvpid" 2>/dev/null || true
