@@ -182,6 +182,11 @@ struct StreamableHttpOptions
 	/// `resource_metadata` URL comes from `auth.resource` rather than the
 	/// client-supplied `Host`.
 	bool validateHost = true;
+	/// Honour the `X-Forwarded-Proto` request header (`http` or `https` only)
+	/// as the scheme of the 401 challenge's `resource_metadata` URL. Off by
+	/// default, since any client can send the header; enable only behind a
+	/// reverse proxy that sets it.
+	bool trustProxyHeaders = false;
 	/// DNS-rebinding protection, part 2: reject a request carrying an `Origin`
 	/// that is not a localhost origin or in `allowedOrigins` (MCP transport
 	/// security: servers MUST validate `Origin`). On by default and independent
@@ -1591,8 +1596,15 @@ private string resourceMetadataUrl(scope HTTPServerRequest req, StreamableHttpOp
 			opts.allowedHosts) : isAllowedHostGrammar(host));
 	if (hostUsable)
 	{
-		const scheme = req.headers.get("X-Forwarded-Proto",
-				isLoopbackHostname(stripPort(host)) ? "http" : "https");
+		import std.string : strip, toLower;
+
+		string scheme = isLoopbackHostname(stripPort(host)) ? "http" : "https";
+		if (opts.trustProxyHeaders)
+		{
+			const forwarded = req.headers.get("X-Forwarded-Proto", "").strip.toLower;
+			if (forwarded == "http" || forwarded == "https")
+				scheme = forwarded;
+		}
 		return scheme ~ "://" ~ host ~ prmPath;
 	}
 	// No usable Host header: derive the origin from the configured resource identifier.
@@ -7811,6 +7823,49 @@ unittest  // the Protected Resource Metadata is served at the RFC 9728 path-inse
 	const www = challenge.headers.get("WWW-Authenticate", "");
 	assert(www.canFind(`resource_metadata="https://mcp.example.com/.well-known/oauth-protected-resource/tenant-a/mcp"`),
 			www);
+}
+
+version (unittest) private string challengeWith(bool trustProxyHeaders, string forwardedProto) @safe
+{
+	StreamableHttpOptions opts;
+	opts.auth.validator = (string t) @safe => TokenInfo.invalid();
+	opts.auth.authorizationServers = ["https://auth.example.com"];
+	opts.allowedHosts = ["mcp.example.com"];
+	opts.trustProxyHeaders = trustProxyHeaders;
+	auto router = new URLRouter;
+	mountMcp(router, McpServer.stateless("t", "1"), opts);
+	auto res = corsRequest(router, HTTPMethod.POST, [
+		"Host": "mcp.example.com",
+		"X-Forwarded-Proto": forwardedProto,
+		"Content-Type": "application/json",
+		"Accept": "application/json, text/event-stream",
+	], initializeBody());
+	assert(res.statusCode == 401);
+	return res.headers.get("WWW-Authenticate", "");
+}
+
+unittest  // X-Forwarded-Proto is ignored unless proxy headers are trusted
+{
+	import std.algorithm : canFind;
+
+	const www = challengeWith(false, "http");
+	assert(www.canFind(`resource_metadata="https://mcp.example.com/`), www);
+}
+
+unittest  // a trusted X-Forwarded-Proto sets the resource_metadata scheme
+{
+	import std.algorithm : canFind;
+
+	const www = challengeWith(true, "http");
+	assert(www.canFind(`resource_metadata="http://mcp.example.com/`), www);
+}
+
+unittest  // a trusted X-Forwarded-Proto other than http or https is ignored
+{
+	import std.algorithm : canFind;
+
+	const www = challengeWith(true, "javascript");
+	assert(www.canFind(`resource_metadata="https://mcp.example.com/`), www);
 }
 
 unittest  // an unavailable token verifier answers 503 with Retry-After, not a 401 challenge
