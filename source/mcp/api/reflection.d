@@ -21,7 +21,7 @@ import mcp.server.events_runtime : EventRegistration, EventCheck;
 import mcp.api.attributes;
 import mcp.api.apps : UiToolMeta, setUiToolMeta, ensureApps;
 import mcp.api.skills : Skill, isValidSkillPath, registerSkill,
-	skillFieldProblem, unregisterSkill;
+	skillFieldProblem, skillPathRule, unregisterSkill;
 import mcp.api.binding : bindJson, bindString, defaultAs, schemaNode,
 	jsonSchemaOf, SchemaUse, setBound, wireName;
 import mcp.protocol.schema;
@@ -264,11 +264,8 @@ private void registerOverload(string memberName, alias overload, alias parent)(
 		}
 		else static if (is(typeof(attr) == skill))
 		{
-			static assert(isValidSkillPath(attr.path),
-					"@skill on '" ~ memberName ~ "' has the invalid skill path \""
-					~ attr.path ~ "\"; its final segment must be lowercase alphanumeric "
-					~ "with single hyphens (1..64 chars), after optional "
-					~ "non-empty prefix segments");
+			static assert(isValidSkillPath(attr.path), "@skill on '" ~ memberName
+					~ "' has the invalid skill path \"" ~ attr.path ~ "\"; " ~ skillPathRule);
 			static assert(skillFieldProblem(attr.description, attr.compatibility) is null,
 					"@skill on '" ~ memberName ~ "': " ~ skillFieldProblem(attr.description,
 						attr.compatibility));
@@ -279,9 +276,7 @@ private void registerOverload(string memberName, alias overload, alias parent)(
 		{
 			static assert(attr.path.length == 0 || isValidSkillPath(attr.path),
 					"@skillDir on '" ~ memberName ~ "' has the invalid skill path \""
-					~ attr.path ~ "\"; its final segment must be lowercase alphanumeric "
-					~ "with single hyphens (1..64 chars), after optional "
-					~ "non-empty prefix segments");
+					~ attr.path ~ "\"; " ~ skillPathRule);
 			const dirSkillPath = registerSkillDirMethod!(memberName, overload, parent)(server, attr);
 			rollback.add(() @safe { unregisterSkill(server, dirSkillPath); });
 		}
@@ -366,6 +361,16 @@ void registerModules(mods...)(McpServer server) @safe
 /// `const`, or `immutable` parameter's argument can be bound into a mutable slot
 /// before the call.
 private alias BoundParameters(alias func) = staticMap!(Unqual, Parameters!func);
+
+/// Whether a parameter of type `P` is injected by the SDK (a `RequestContext`
+/// or `TaskContext`) rather than bound from a client-supplied argument.
+private enum isInjected(P) = is(P : RequestContext) || is(P == TaskContext);
+
+/// Whether parameter `i` of `func` is a required argument: not `Nullable`, and
+/// with neither a D default value nor a `@schemaDefault`.
+private enum isRequiredParam(alias func, size_t i) = !isInstanceOf!(Nullable,
+			BoundParameters!func[i]) && is(ParameterDefaultValueTuple!func[i] == void)
+	&& !ParamSchemaDefaults!(func, i).length;
 
 /// The UDAs attached to parameter `i` of `func`. The compiler reports the
 /// attributes of a parameter that carries any prefixed by those of `func`
@@ -569,7 +574,7 @@ private void checkParamNames(alias func)()
 	alias ids = ParameterIdentifierTuple!func;
 	alias names = ParamWireNames!func;
 	alias types = BoundParameters!func;
-	enum isArgument(size_t i) = !is(types[i] : RequestContext) && !is(types[i] == TaskContext);
+	enum isArgument(size_t i) = !isInjected!(types[i]);
 	static foreach (i, P; types)
 	{
 		static if (isArgument!i)
@@ -598,7 +603,7 @@ private void checkParamTypes(alias func)()
 	alias ids = ParameterIdentifierTuple!func;
 	static foreach (i, P; BoundParameters!func)
 	{
-		static if (!is(P : RequestContext) && !is(P == TaskContext))
+		static if (!isInjected!P)
 		{
 			static assert(unsupportedTypeReason!(P, SchemaUse.input)() is null,
 					"parameter '" ~ ids[i] ~ "' of '" ~ __traits(identifier,
@@ -649,7 +654,7 @@ private void validateParamUdas(alias func)()
 	{
 		bool found;
 		static foreach (i, P; types)
-			static if (!is(P : RequestContext) && !is(P == TaskContext))
+			static if (!isInjected!P)
 				if (names[i] == pname)
 					found = true;
 		return found;
@@ -757,7 +762,7 @@ private Json parametersSchema(alias func)() @safe
 	Json required = Json.emptyArray;
 	static foreach (i, P; types)
 	{
-		static if (!is(P : RequestContext) && !is(P == TaskContext))
+		static if (!isInjected!P)
 		{
 			{
 				// Generate the parameter's schema and fold in the facet UDAs
@@ -836,8 +841,7 @@ private Json parametersSchema(alias func)() @safe
 			// A parameter is required only when it is not Nullable and has neither
 			// a declared D-level default value nor a @schemaDefault.
 			// ParameterDefaultValueTuple gives `void` for params without a default.
-			static if (!isInstanceOf!(Nullable, P) && is(defs[i] == void)
-					&& !ParamSchemaDefaults!(func, i).length)
+			static if (isRequiredParam!(func, i))
 				required ~= Json(names[i]);
 		}
 	}
@@ -883,18 +887,11 @@ private bool isExplicitNull(P)(Json args, string name) @safe
 /// `def` is the value from `ParameterDefaultValueTuple` for this slot.
 private P marshalArgDefault(P, alias def, bool stringArgs = false)(Json args, string name) @safe
 {
-	static if (is(P : RequestContext))
-	{
-		assert(false, "context parameters are injected, not marshalled");
-	}
-	else
-	{
-		if (isExplicitNull!P(args, name))
-			return P.init;
-		if (!argPresent!P(args, name))
-			return def;
-		return marshalArg!(P, stringArgs)(args, name);
-	}
+	if (isExplicitNull!P(args, name))
+		return P.init;
+	if (!argPresent!P(args, name))
+		return def;
+	return marshalArg!(P, stringArgs)(args, name);
 }
 
 /// Convert one JSON argument value into the parameter type `P`; an absent
@@ -902,19 +899,12 @@ private P marshalArgDefault(P, alias def, bool stringArgs = false)(Json args, st
 /// protocol types as strings) a JSON string is parsed into `P` from its text.
 private P marshalArg(P, bool stringArgs = false)(Json args, string name) @safe
 {
-	static if (is(P : RequestContext))
-	{
-		assert(false, "context parameters are injected, not marshalled");
-	}
-	else
-	{
-		if (!argPresent!P(args, name))
-			return P.init;
-		static if (stringArgs)
-			if (args[name].type == Json.Type.string)
-				return bindString!P(args[name].get!string);
-		return bindJson!P(args[name]);
-	}
+	if (!argPresent!P(args, name))
+		return P.init;
+	static if (stringArgs)
+		if (args[name].type == Json.Type.string)
+			return bindString!P(args[name].get!string);
+	return bindJson!P(args[name]);
 }
 
 /// Deserialize a dynamic handler's raw wire `arguments` into a typed value `T`.
@@ -1137,7 +1127,7 @@ private string bindToolArgs(alias overload)(Json args, ref Tuple!(BoundParameter
 			{
 				bool declared;
 				static foreach (i, P; BoundParameters!overload)
-					static if (!is(P : RequestContext) && !is(P == TaskContext))
+					static if (!isInjected!P)
 						declared |= kv.key == names[i];
 				if (!declared)
 					return "argument '" ~ kv.key ~ "': unknown argument";
@@ -1145,10 +1135,9 @@ private string bindToolArgs(alias overload)(Json args, ref Tuple!(BoundParameter
 	}
 	static foreach (i, P; BoundParameters!overload)
 	{
-		static if (!is(P : RequestContext) && !is(P == TaskContext))
+		static if (!isInjected!P)
 		{
-			static if (is(defs[i] == void) && !isInstanceOf!(Nullable, P)
-					&& !ParamSchemaDefaults!(overload, i).length)
+			static if (isRequiredParam!(overload, i))
 				if (!argPresent!P(args, names[i]))
 					return "argument '" ~ names[i] ~ "': required argument is missing";
 			try
@@ -1500,8 +1489,7 @@ private void registerPromptMethod(string memberName, alias overload, alias paren
 				// the tool path.
 				PromptArgument arg;
 				arg.name = names[i];
-				arg.required = !isInstanceOf!(Nullable, P) && is(defs[i] == void)
-					&& !ParamSchemaDefaults!(overload, i).length;
+				arg.required = isRequiredParam!(overload, i);
 				// The parameter's @fieldDescription and @title describe the
 				// argument; the method's @describeParam takes precedence.
 				static foreach (a; ParamAttributes!(overload, i))

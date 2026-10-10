@@ -444,6 +444,12 @@ void registerSkill(McpServer server, Skill skill) @safe
 			skill.instructions), fm.toJson(), skill.files);
 }
 
+/// What makes a skill path valid (see `isValidSkillPath`), for error messages.
+package(mcp) enum skillPathRule = "each '/'-separated segment must be non-empty and "
+	~ "not '.' or '..', and the final segment must be a valid skill name (1..64 chars "
+	~ "of lowercase letters, digits, and single hyphens, no leading/trailing/consecutive "
+	~ "hyphens)";
+
 /// The shared registration core both `registerSkill` (which synthesizes the
 /// `SKILL.md` and frontmatter from a `Skill`) and `registerSkillDir` (which
 /// reads them from a local directory) funnel into: serve `skillMd` verbatim at
@@ -465,7 +471,7 @@ package(mcp) void registerSkillResources(McpServer server, string path,
 	import std.conv : to;
 
 	if (!isValidSkillPath(path))
-		throw new Exception("invalid skill path '" ~ path ~ "': each '/'-separated segment must be non-empty and not '.' or '..', and the final segment " ~ "must be a valid skill name (1..64 chars of lowercase letters, digits, " ~ "and single hyphens, no leading/trailing/consecutive hyphens)");
+		throw new Exception("invalid skill path '" ~ path ~ "': " ~ skillPathRule);
 
 	const name = skillName(path);
 	const uri = skillUri(path);
@@ -616,7 +622,7 @@ struct DynamicSkill
 void registerDynamicSkill(McpServer server, DynamicSkill skill) @safe
 {
 	if (!isValidSkillPath(skill.path))
-		throw new Exception("invalid skill path '" ~ skill.path ~ "': each '/'-separated segment must be non-empty and not '.' or '..', and the final segment " ~ "must be a valid skill name (1..64 chars of lowercase letters, digits, " ~ "and single hyphens, no leading/trailing/consecutive hyphens)");
+		throw new Exception("invalid skill path '" ~ skill.path ~ "': " ~ skillPathRule);
 	if (skill.instructions is null)
 		throw new Exception("registerDynamicSkill: '" ~ skill.path
 				~ "' has no instructions delegate");
