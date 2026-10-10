@@ -770,9 +770,7 @@ struct Content
 			tryGet(j, "title", c.title);
 			tryGet(j, "description", c.description);
 			tryGetWhole(j, "size", c.size);
-			if ("icons" in j && j["icons"].type == Json.Type.array)
-				foreach (i; 0 .. j["icons"].length)
-					c.icons ~= Icon.fromJson(j["icons"][i]);
+			c.icons = readIcons(j);
 			c.parseMeta(j);
 			return Content(c);
 		case "resource":
@@ -1005,9 +1003,7 @@ struct Tool
 			t.outputSchema = j["outputSchema"];
 		if ("annotations" in j)
 			t.annotations = j["annotations"];
-		if ("icons" in j && j["icons"].type == Json.Type.array)
-			foreach (i; 0 .. j["icons"].length)
-				t.icons ~= Icon.fromJson(j["icons"][i]);
+		t.icons = readIcons(j);
 		t.parseMetaField(j);
 		return t;
 	}
@@ -2939,6 +2935,27 @@ unittest  // a task-handle CallToolResult round-trips through toJson
 	assert(back.isTask() && back.task.taskId == "t9");
 }
 
+unittest  // ListToolsResult.fromJson skips malformed icons instead of failing the list
+{
+	auto j = parseJsonString(`{"tools":[{"name":"a","inputSchema":{"type":"object"},
+		"icons":[7,{"src":"ok"},{"src":"b","sizes":[false]}]}]}`);
+	auto r = ListToolsResult.fromJson(j);
+	assert(r.tools.length == 1);
+	assert(r.tools[0].icons.length == 1 && r.tools[0].icons[0].src == "ok");
+}
+
+unittest  // Resource, ResourceTemplate, Prompt and resource_link skip malformed icons
+{
+	enum icons = `"icons":["x",{"src":"ok"}]`;
+	assert(Resource.fromJson(parseJsonString(`{"uri":"u","name":"n",` ~ icons ~ `}`))
+			.icons.length == 1);
+	assert(ResourceTemplate.fromJson(parseJsonString(
+			`{"uriTemplate":"u{x}","name":"n",` ~ icons ~ `}`)).icons.length == 1);
+	assert(Prompt.fromJson(parseJsonString(`{"name":"n",` ~ icons ~ `}`)).icons.length == 1);
+	assert(Content.fromJson(parseJsonString(
+			`{"type":"resource_link","uri":"u","name":"n",` ~ icons ~ `}`)).icons.length == 1);
+}
+
 unittest  // ListToolsResult carries tools and optional cursor
 {
 	ListToolsResult r;
@@ -3032,9 +3049,7 @@ struct Resource
 		if ("annotations" in j && j["annotations"].type == Json.Type.object)
 			r.annotations = Annotations.fromJson(j["annotations"]);
 		tryGetWhole(j, "size", r.size);
-		if ("icons" in j && j["icons"].type == Json.Type.array)
-			foreach (i; 0 .. j["icons"].length)
-				r.icons ~= Icon.fromJson(j["icons"][i]);
+		r.icons = readIcons(j);
 		r.parseMetaField(j);
 		return r;
 	}
@@ -3127,9 +3142,7 @@ struct ResourceTemplate
 		tryGet(j, "mimeType", t.mimeType);
 		if ("annotations" in j && j["annotations"].type == Json.Type.object)
 			t.annotations = Annotations.fromJson(j["annotations"]);
-		if ("icons" in j && j["icons"].type == Json.Type.array)
-			foreach (i; 0 .. j["icons"].length)
-				t.icons ~= Icon.fromJson(j["icons"][i]);
+		t.icons = readIcons(j);
 		t.parseMetaField(j);
 		return t;
 	}
@@ -4834,9 +4847,7 @@ struct Prompt
 			foreach (i; 0 .. arr.length)
 				p.arguments ~= PromptArgument.fromJson(arr[i]);
 		}
-		if ("icons" in j && j["icons"].type == Json.Type.array)
-			foreach (i; 0 .. j["icons"].length)
-				p.icons ~= Icon.fromJson(j["icons"][i]);
+		p.icons = readIcons(j);
 		p.parseMetaField(j);
 		return p;
 	}

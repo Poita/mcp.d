@@ -115,6 +115,36 @@ struct Icon
 	}
 }
 
+/// Read the optional `icons` array of `obj`, skipping any entry `Icon.fromJson`
+/// rejects. Icons are display hints, so one malformed entry must not fail the
+/// enclosing implementation, tool, resource, or prompt.
+Icon[] readIcons(Json obj) @safe
+{
+	import mcp.protocol.errors : McpException;
+
+	Icon[] icons;
+	if (obj.type != Json.Type.object || "icons" !in obj || obj["icons"].type != Json.Type.array)
+		return icons;
+	foreach (i; 0 .. obj["icons"].length)
+	{
+		try
+			icons ~= Icon.fromJson(obj["icons"][i]);
+		catch (McpException)
+		{
+		}
+	}
+	return icons;
+}
+
+@safe unittest  // readIcons keeps well-formed icons and skips malformed ones
+{
+	import vibe.data.json : parseJsonString;
+
+	auto icons = readIcons(parseJsonString(`{"icons":[1,{"src":"a"},{"src":"b","sizes":[2]}]}`));
+	assert(icons.length == 1 && icons[0].src == "a");
+	assert(readIcons(parseJsonString(`{"icons":"x"}`)).length == 0);
+}
+
 @safe unittest  // Icon.dup deep-copies sizes so the copy does not alias the original
 {
 	Icon icon;
@@ -171,9 +201,7 @@ struct Implementation
 		tryGet(j, "title", impl.title);
 		tryGet(j, "description", impl.description);
 		tryGet(j, "websiteUrl", impl.websiteUrl);
-		if ("icons" in j && j["icons"].type == Json.Type.array)
-			foreach (i; 0 .. j["icons"].length)
-				impl.icons ~= Icon.fromJson(j["icons"][i]);
+		impl.icons = readIcons(j);
 		return impl;
 	}
 
