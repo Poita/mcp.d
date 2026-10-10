@@ -153,8 +153,10 @@ TokenValidator jwtVerifier(JwtVerifierConfig cfg) @safe
 			"jwtVerifier: JwtVerifierConfig.jwksMaxStaleness must be at least jwksCacheTtl");
 	auto cache = new JwksCache(cfg.jwksUri, cfg.jwksCacheTtl, cfg.ssrfPolicy);
 	cache.maxStaleness = cfg.jwksMaxStaleness;
+	auto pinned = parsePinnedKeys(cfg.staticPublicKeysPem);
 	return (string token) @safe {
-		return verifyOrInvalid(() @safe => verifyToken(cfg, token, cache, currentUnixTime()));
+		return verifyOrInvalid(() @safe => verifyToken(cfg, token, cache,
+				currentUnixTime(), pinned));
 	};
 }
 
@@ -190,13 +192,13 @@ package TokenInfo verifyOrInvalid(scope TokenInfo delegate() @safe verify) @safe
 // Verification core (pure of HTTP / clock; unit-testable)
 // ===========================================================================
 
-/// A source of candidate verification keys. `keysFor(kid, alg)` returns the PEM
-/// public keys to try for a token bearing the given `kid` (empty `kid` means the
-/// header had none), restricted to the key family `alg` verifies with (empty
-/// `alg` means any family).
+/// A source of candidate verification keys. `keysFor(kid, alg)` returns the
+/// parsed public keys to try for a token bearing the given `kid` (empty `kid`
+/// means the header had none), restricted to the key family `alg` verifies with
+/// (empty `alg` means any family).
 package interface KeySource
 {
-	string[] keysFor(string kid, string alg = null) @safe;
+	PublicKey[] keysFor(string kid, string alg = null) @safe;
 
 	/// Whether the source holds no keys because fetching them failed, so a
 	/// token it cannot verify may still be good. `retryAfter` is set to when
@@ -227,8 +229,16 @@ private TokenInfo keysOutage(Duration retryAfter) @safe
 
 /// Verify `token` against `cfg` at wall-clock time `now` (unix seconds), drawing
 /// JWKS keys from `keys`. Separated from clock/HTTP so tests can drive it
-/// deterministically.
+/// deterministically. This overload parses `cfg.staticPublicKeysPem` on every
+/// call; `jwtVerifier` parses them once and passes them as `pinned`.
 package TokenInfo verifyToken(JwtVerifierConfig cfg, string token, KeySource keys, long now) @safe
+{
+	return verifyToken(cfg, token, keys, now, parsePinnedKeys(cfg.staticPublicKeysPem));
+}
+
+/// As above, with the pinned keys already parsed.
+package TokenInfo verifyToken(JwtVerifierConfig cfg, string token, KeySource keys,
+		long now, PublicKey[] pinned) @safe
 {
 	auto parts = token.split('.');
 	if (parts.length != 3)
@@ -256,9 +266,9 @@ package TokenInfo verifyToken(JwtVerifierConfig cfg, string token, KeySource key
 	if (!typAccepted(cfg.acceptedTokenTypes, jsonStr(headerJson, "typ")))
 		return reject("typ header is absent or not an accepted token type");
 
-	// Gather candidate keys: pinned PEM keys plus any JWKS keys for this kid.
-	string[] candidates = cfg.staticPublicKeysPem.dup;
-	candidates ~= keys.keysFor(kid, alg);
+	// Gather candidate keys: the JWKS keys for this kid (every JWKS key when it
+	// names none or an unknown one), then the pinned keys.
+	PublicKey[] candidates = keys.keysFor(kid, alg) ~ pinned;
 	Duration retryAfter;
 	const keysUnavailable = keys.unavailable(retryAfter);
 	if (candidates.length == 0)
@@ -274,9 +284,9 @@ package TokenInfo verifyToken(JwtVerifierConfig cfg, string token, KeySource key
 		return reject("malformed signature segment");
 
 	bool sigOk = false;
-	foreach (pem; candidates)
+	foreach (key; candidates)
 	{
-		if (verifyJws(alg, cast(const(ubyte)[]) signingInput, sig, pem))
+		if (key.verify(alg, cast(const(ubyte)[]) signingInput, sig))
 		{
 			sigOk = true;
 			break;
@@ -372,14 +382,69 @@ private enum int minRsaKeyBits = 2048;
 /// public key. For ES256 the signature is the raw 64-byte R||S form (RFC 7518
 /// §3.4), converted to DER before handing to OpenSSL.
 package bool verifyJws(string alg, const(ubyte)[] signingInput,
-		const(ubyte)[] sig, string publicKeyPem) @trusted
+		const(ubyte)[] sig, string publicKeyPem) @safe
 {
-	auto pkey = parsePublicKeyPem(publicKeyPem);
-	if (pkey is null)
-		return false;
-	scope (exit)
-		EVP_PKEY_free(pkey);
+	auto key = PublicKey.fromPem(publicKeyPem);
+	return key !is null && key.verify(alg, signingInput, sig);
+}
 
+/// A public key parsed once into an OpenSSL `EVP_PKEY` and reused for every
+/// verification, rather than re-parsing its PEM per token.
+package final class PublicKey
+{
+	/// "RSA" or "EC".
+	immutable string kty;
+	private EVP_PKEY* pkey;
+
+	private this(EVP_PKEY* pkey, string kty) @safe
+	{
+		this.pkey = pkey;
+		this.kty = kty;
+	}
+
+	~this() @trusted nothrow
+	{
+		if (pkey !is null)
+			EVP_PKEY_free(pkey);
+	}
+
+	/// Parse a PEM SubjectPublicKeyInfo, or null when it is not an RSA or EC
+	/// public key.
+	static PublicKey fromPem(string pem) @trusted
+	{
+		auto pkey = parsePublicKeyPem(pem);
+		if (pkey is null)
+			return null;
+		const baseId = EVP_PKEY_base_id(pkey);
+		if (baseId != EVP_PKEY_RSA && baseId != EVP_PKEY_EC)
+		{
+			EVP_PKEY_free(pkey);
+			return null;
+		}
+		return new PublicKey(pkey, baseId == EVP_PKEY_RSA ? "RSA" : "EC");
+	}
+
+	/// Verify a JWS signature over `signingInput` for `alg` (see `verifyJws`).
+	bool verify(string alg, const(ubyte)[] signingInput, const(ubyte)[] sig) @safe
+	{
+		return verifyWithPkey(alg, signingInput, sig, pkey);
+	}
+}
+
+/// Parse each pinned PEM key, skipping any that do not parse (they can never
+/// verify a token).
+package PublicKey[] parsePinnedKeys(const string[] pems) @safe
+{
+	PublicKey[] keys;
+	foreach (pem; pems)
+		if (auto k = PublicKey.fromPem(pem))
+			keys ~= k;
+	return keys;
+}
+
+private bool verifyWithPkey(string alg, const(ubyte)[] signingInput,
+		const(ubyte)[] sig, EVP_PKEY* pkey) @trusted
+{
 	// Bind the token-header `alg` to the key type rather than relying on OpenSSL
 	// to reject a cross-type attempt: RS256 requires an RSA key, ES256 an EC key.
 	// This keeps a future symmetric/other alg from introducing an alg-confusion
@@ -744,7 +809,7 @@ package final class JwksCache : KeySource
 	private static struct Key
 	{
 		string kty;
-		string pem;
+		PublicKey key;
 	}
 
 	// RFC 7517 4.5 lets keys of different types share a kid, so each kid maps
@@ -780,7 +845,7 @@ package final class JwksCache : KeySource
 	/// Candidate PEM keys for a `kid`. Blocks on a (rate-limited) fetch when no
 	/// usable keys are held or `kid` is unknown; when the keys are merely past
 	/// their TTL, returns them and refreshes in the background.
-	string[] keysFor(string kid, string alg = null) @safe
+	PublicKey[] keysFor(string kid, string alg = null) @safe
 	{
 		if (uri.length == 0)
 		{
@@ -832,20 +897,20 @@ package final class JwksCache : KeySource
 		return lastAttemptAt >= 0 && now() - lastAttemptAt < minRefetchInterval.total!"seconds";
 	}
 
-	/// The PEMs of the keys under `kid` (every key when `kid` is absent or
-	/// unknown) whose type `alg` verifies with.
-	private string[] kidKeys(string kid, string alg) @safe
+	/// The keys under `kid` (every key when `kid` is absent or unknown) whose
+	/// type `alg` verifies with.
+	private PublicKey[] kidKeys(string kid, string alg) @safe
 	{
-		const(Key)[] pool = allKeys;
+		Key[] pool = allKeys;
 		if (kid.length)
 			if (auto p = kid in keysByKid)
 				pool = *p;
 		const kty = alg == "RS256" ? "RSA" : alg == "ES256" ? "EC" : null;
-		string[] pems;
+		PublicKey[] keys;
 		foreach (k; pool)
 			if (kty.length == 0 || k.kty == kty)
-				pems ~= k.pem;
-		return pems;
+				keys ~= k.key;
+		return keys;
 	}
 
 	/// Queue one background `refetch` unless one is already queued or an
@@ -920,7 +985,10 @@ package final class JwksCache : KeySource
 			const pem = jwkToPem(jwk);
 			if (pem.length == 0)
 				continue;
-			const key = Key(jwk.kty, pem);
+			auto parsed = PublicKey.fromPem(pem);
+			if (parsed is null)
+				continue;
+			auto key = Key(jwk.kty, parsed);
 			newAllKeys ~= key;
 			if (jwk.kid.length)
 				newKeysByKid[jwk.kid] ~= key;
@@ -1191,7 +1259,7 @@ version (unittest)
 	// A KeySource that returns no JWKS keys (pinned-PEM-only tests).
 	private final class NoKeys : KeySource
 	{
-		string[] keysFor(string kid, string alg = null) @safe
+		PublicKey[] keysFor(string kid, string alg = null) @safe
 		{
 			return null;
 		}
@@ -1761,6 +1829,30 @@ unittest  // jwkToPem produces a parseable PEM for an RSA JWK
 	import std.string : indexOf;
 
 	assert(pem.indexOf("BEGIN PUBLIC KEY") >= 0);
+}
+
+unittest  // JwksCache parses each JWK once per load and hands out the parsed key
+{
+	auto cache = new JwksCache("", 300.seconds);
+	cache.load(`{"keys":[{"kty":"RSA","kid":"rsa-1","n":"` ~ testRsaN ~ `","e":"AQAB"},`
+			~ `{"kty":"EC","kid":"ec-9","crv":"P-256","x":"` ~ testEcX ~ `","y":"` ~ testEcY
+			~ `"}]}`);
+	PublicKey[] first = cache.keysFor("rsa-1");
+	assert(first.length == 1);
+	assert(first[0].kty == "RSA");
+	assert(cache.keysFor("rsa-1")[0] is first[0]);
+}
+
+unittest  // a token naming a JWKS kid verifies against that key ahead of pinned keys
+{
+	JwtVerifierConfig cfg;
+	cfg.issuer = "https://as.example.com";
+	cfg.audience = "https://mcp.example.com/mcp";
+	cfg.staticPublicKeysPem = ["not a pem", testEcPubPem];
+	auto cache = new JwksCache("", cfg.jwksCacheTtl);
+	cache.load(`{"keys":[{"kty":"RSA","kid":"rsa-1","n":"` ~ testRsaN ~ `","e":"` ~ testRsaE
+			~ `"}]}`);
+	assert(verifyToken(cfg, testRs256Jwt, cache, 1_700_001_000).valid);
 }
 
 unittest  // JwksCache.keysFor selects by kid, then refreshes from a new document
