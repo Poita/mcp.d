@@ -330,23 +330,40 @@ final class DuplexChannel
 
 	/// Send a request whose id was already chosen by the caller (the CLIENT path:
 	/// `McpClient` pre-allocates the id), and block the current task until the
-	/// correlated reply arrives. Returns its result, or throws `McpException` on an
-	/// error reply / timeout / channel close, or what writing the line threw.
+	/// correlated reply arrives or `timeout` elapses (`Duration.max`: no limit).
+	/// Returns its result, or throws `McpException` on an error reply / channel
+	/// close, what writing the line threw, or `RequestTimeoutException`.
 	///
 	/// The line is written on a task of its own while the caller awaits the reply,
 	/// so a peer that stops reading parks only that writer: `abort` (a timeout or
 	/// cancellation) still releases the caller. Interrupting the write instead
 	/// would leave a partial line on the wire and break the framing of every
 	/// later message. A line still queued behind another writer when its request
-	/// is aborted is never written.
-	Json deliver(Json message, long expectId, Duration timeout = 60.seconds) @safe
+	/// is aborted or times out is never written; one already being written when
+	/// it times out is followed by a posted `notifications/cancelled`.
+	Json deliver(Json message, long expectId, Duration timeout) @safe
 	{
 		if (closed_)
 			throw internalError("stdio channel closed");
 		coord.register(expectId);
-		auto write = startWrite(message, expectId);
+		return awaitReply(expectId, startWrite(message, expectId), timeout);
+	}
+
+	/// Wait up to `timeout` for the reply to request `id`, whose line `write` is
+	/// writing. On a timeout the line is withdrawn if not yet being written, and
+	/// otherwise followed by a posted `notifications/cancelled`. A failure is
+	/// reported as what writing the line threw, when it threw.
+	private Json awaitReply(long id, PendingWrite write, Duration timeout) @safe
+	{
 		try
-			return coord.await(expectId, timeout);
+			return coord.await(id, timeout);
+		catch (RequestTimeoutException e)
+		{
+			write.abandoned = true;
+			if (write.started)
+				post(cancelledNotification(id, "request timed out"));
+			throw e;
+		}
 		catch (McpException e)
 		{
 			if (write.failure !is null)
@@ -405,22 +422,7 @@ final class DuplexChannel
 			throw internalError("stdio channel closed");
 		const id = coord.alloc();
 		coord.register(id);
-		auto write = startWrite(makeRequest(Json(id), method, params), id);
-		try
-			return coord.await(id, timeout);
-		catch (RequestTimeoutException e)
-		{
-			write.abandoned = true;
-			if (write.started)
-				post(cancelledNotification(id, "request timed out"));
-			throw e;
-		}
-		catch (McpException e)
-		{
-			if (write.failure !is null)
-				throw write.failure;
-			throw e;
-		}
+		return awaitReply(id, startWrite(makeRequest(Json(id), method, params), id), timeout);
 	}
 
 	/// Write one JSON-RPC `message` as a single newline-delimited line, serialized
@@ -660,7 +662,8 @@ unittest  // two concurrent deliver() calls get their correct, distinct results 
 			runTask(() nothrow{
 				try
 				{
-					auto r = channel.deliver(makeRequest(Json(1L), "ping", Json.emptyObject), 1);
+					auto r = channel.deliver(makeRequest(Json(1L), "ping",
+					Json.emptyObject), 1, 60.seconds);
 					got1 = r["v"].get!long;
 				}
 				catch (Exception)
@@ -672,7 +675,8 @@ unittest  // two concurrent deliver() calls get their correct, distinct results 
 			runTask(() nothrow{
 				try
 				{
-					auto r = channel.deliver(makeRequest(Json(2L), "ping", Json.emptyObject), 2);
+					auto r = channel.deliver(makeRequest(Json(2L), "ping",
+					Json.emptyObject), 2, 60.seconds);
 					got2 = r["v"].get!long;
 				}
 				catch (Exception)
@@ -750,7 +754,7 @@ unittest  // deliver() throws when the channel reaches EOF before the response (
 				}
 			});
 			try
-				channel.deliver(makeRequest(Json(1L), "ping", Json.emptyObject), 1);
+				channel.deliver(makeRequest(Json(1L), "ping", Json.emptyObject), 1, 60.seconds);
 			catch (McpException)
 				threw = true;
 		}
@@ -776,6 +780,7 @@ unittest  // a malformed inbound line does not kill the read loop
 				if (m.kind == MessageKind.notification)
 					seen++;
 			});
+			channel.onError = (string) @safe nothrow{};
 			channel.start();
 			inbound.put("this is not json");
 			inbound.put(`{"jsonrpc":"2.0","method":"notifications/a"}`);
@@ -1340,6 +1345,95 @@ unittest  // a malformed batch member with a non-integer (string) id sends a nul
 	auto j = parseJsonString(written);
 	assert(j["id"].type == Json.Type.null_, "the fallback error reply must carry a null id");
 	assert("error" in j, "the fallback reply must be an error response");
+}
+
+unittest  // deliver() that times out withdraws its line still queued behind another write
+{
+	import core.time : msecs;
+
+	auto inbound = new LineLink;
+	auto release = createManualEvent();
+	string[] written;
+	bool timedOut;
+	runTask(() nothrow{
+		scope (exit)
+			exitEventLoop();
+		try
+		{
+			auto channel = new DuplexChannel(() @safe { return inbound.take(); }, (string s) @safe {
+				if (s == `"block"`)
+					release.wait(release.emitCount);
+				written ~= s;
+			}, (Message) @safe {});
+			channel.start();
+			runTask(() nothrow{
+				try
+					channel.sendRaw(`"block"`);
+				catch (Exception)
+				{
+				}
+			});
+			try
+				channel.deliver(makeRequest(Json(1L), "ping", Json.emptyObject), 1, 20.msecs);
+			catch (RequestTimeoutException)
+				timedOut = true;
+			release.emit();
+			foreach (_; 0 .. 8)
+				yield();
+			channel.close();
+			inbound.closeEnd();
+		}
+		catch (Exception)
+		{
+		}
+	});
+	runEventLoop();
+	assert(timedOut);
+	assert(written == [`"block"`], "a timed-out request's queued line is never written");
+}
+
+unittest  // deliver() that times out mid-write posts notifications/cancelled for its request
+{
+	import core.time : msecs;
+	import std.algorithm : canFind;
+
+	auto inbound = new LineLink;
+	auto release = createManualEvent();
+	string[] written;
+	bool timedOut;
+	runTask(() nothrow{
+		scope (exit)
+			exitEventLoop();
+		try
+		{
+			bool first = true;
+			auto channel = new DuplexChannel(() @safe { return inbound.take(); }, (string s) @safe {
+				if (first)
+				{
+					first = false;
+					release.wait(release.emitCount);
+				}
+				written ~= s;
+			}, (Message) @safe {});
+			channel.start();
+			try
+				channel.deliver(makeRequest(Json(1L), "ping", Json.emptyObject), 1, 20.msecs);
+			catch (RequestTimeoutException)
+				timedOut = true;
+			release.emit();
+			foreach (_; 0 .. 8)
+				yield();
+			channel.close();
+			inbound.closeEnd();
+		}
+		catch (Exception)
+		{
+		}
+	});
+	runEventLoop();
+	assert(timedOut);
+	assert(written.length == 2 && written[1].canFind(`"notifications/cancelled"`),
+			"the peer is told the request it is receiving was abandoned");
 }
 
 unittest  // deliver() after close() fails fast
