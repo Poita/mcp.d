@@ -48,6 +48,7 @@ ulimit -n 65536                          # required (see gotcha above)
 
 dub build                                # build the library
 dub test                                 # run all unit tests (every module must pass)
+MCP_TEST_MODULES=mcp.server,mcp.protocol dub test   # macOS: only modules with these name prefixes
 
 just fmt                                 # format every D tree in place (matches CI)
 dub run dscanner -- --styleCheck source/ # static analysis / style lint

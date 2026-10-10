@@ -38,13 +38,18 @@ version (unittest)
 		{
 			import core.exception : AssertError;
 
+			import core.stdc.stdlib : getenv;
+			import std.string : fromStringz;
+
+			// MCP_TEST_MODULES narrows a local run to the listed modules.
+			const filter = getenv("MCP_TEST_MODULES").fromStringz.idup;
 			UnitTestResult result;
 			foreach (m; ModuleInfo)
 			{
 				if (!m)
 					continue;
 				auto fp = m.unitTest;
-				if (!fp)
+				if (!fp || !moduleSelected(m.name, filter))
 					continue;
 
 				++result.executed;
@@ -80,6 +85,29 @@ version (unittest)
 			// return.
 			result.runMain = false;
 			return result;
+		}
+
+		/// Whether module `name` runs under `filter`, a comma-separated list of
+		/// module-name prefixes; an empty filter selects every module.
+		private bool moduleSelected(string name, string filter) @safe pure
+		{
+			import std.algorithm : any, splitter, startsWith;
+			import std.string : strip;
+
+			if (filter.strip.length == 0)
+				return true;
+			return filter.splitter(',').any!(p => p.strip.length && name.startsWith(p.strip));
+		}
+
+		@safe unittest
+		{
+			assert(moduleSelected("mcp.server.server", ""));
+		}
+
+		@safe unittest
+		{
+			assert(moduleSelected("mcp.server.server", "mcp.client, mcp.server"));
+			assert(!moduleSelected("mcp.client.client", "mcp.server"));
 		}
 
 		/// Treat an assert as in-module when the failing file is the module's
