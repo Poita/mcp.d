@@ -127,7 +127,12 @@ private void registerAnnotatedMembers(alias root, alias parent)(McpServer server
 			// schema, are unknown until it is instantiated.
 			static foreach (overload; __traits(getOverloads, root, memberName, true))
 			{
-				static if (__traits(isTemplate, overload))
+				// An alias member (`alias g = f;`) reports the overloads of the
+				// symbol it names, which that symbol's own member visit registers.
+				static if (__traits(identifier, overload) != memberName)
+				{
+				}
+				else static if (__traits(isTemplate, overload))
 				{
 					static foreach (attr; __traits(getAttributes, overload))
 						static assert(!isHandlerAttribute!attr, "handler '" ~ memberName
@@ -5903,6 +5908,27 @@ version (unittest)
 	{
 		@tool("t", "t") string t() @safe;
 	}
+
+	private final class AliasedToolApi
+	{
+		@tool("f", "f") string f() @safe
+		{
+			return "";
+		}
+
+		alias g = f;
+	}
+}
+
+unittest  // an alias of an annotated method does not register the handler twice
+{
+	import mcp.protocol.jsonrpc : Message, makeRequest;
+
+	auto s = new McpServer("t", "1");
+	registerHandlers(s, new AliasedToolApi);
+	auto tools = s.handle(Message(makeRequest(Json(1), "tools/list",
+			Json.emptyObject))).get["result"]["tools"];
+	assert(tools.length == 1);
 }
 
 unittest  // registerHandlers rejects a null object, interface, or struct pointer
