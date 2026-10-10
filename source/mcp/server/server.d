@@ -2253,11 +2253,16 @@ final class McpServer : ServerCore
 		return dispatchRaw(text, cs, (Message m) @safe {
 			if (sink is null)
 				return handle(m);
-			if (serverRequest is null)
-				return handle(m, new StdioContext(sink,
-					readProgressToken(m.params), cs.negotiated));
-			return handle(m, new StdioContext(sink, serverRequest, cs.clientCaps,
-				readProgressToken(m.params), cs.negotiated, mode_ == ServerMode.stateless));
+			StdioContextOptions opts;
+			opts.progressToken = readProgressToken(m.params);
+			opts.negotiated = cs.negotiated;
+			if (serverRequest !is null)
+			{
+				opts.serverRequest = serverRequest;
+				opts.clientCaps = cs.clientCaps;
+				opts.serverStateless = mode_ == ServerMode.stateless;
+			}
+			return handle(m, new StdioContext(sink, opts));
 		});
 	}
 
@@ -2483,10 +2488,17 @@ final class McpServer : ServerCore
 		// (MRTR vs blocking), the input responses carried on a retried modern
 		// request, and the cancellation token, regardless of which transport
 		// supplied the base context.
-		auto scoped = new RequestScope(ctx, mrtr, inputResponses,
-				requestLogLevel, loggingRequested, token, incomingState,
-				effective, effective.isModern
-				? meta.clientCapabilities : conn.clientCaps, mode_ == ServerMode.stateless);
+		RequestScopeOptions scopeOpts;
+		scopeOpts.inputRequired = mrtr;
+		scopeOpts.inputResponses = inputResponses;
+		scopeOpts.requestState = incomingState;
+		scopeOpts.minLogLevel = requestLogLevel;
+		scopeOpts.loggingRequested = loggingRequested;
+		scopeOpts.cancellation = token;
+		scopeOpts.effectiveVersion = effective;
+		scopeOpts.clientCaps = effective.isModern ? meta.clientCapabilities : conn.clientCaps;
+		scopeOpts.serverStateless = mode_ == ServerMode.stateless;
+		auto scoped = new RequestScope(ctx, scopeOpts);
 
 		try
 		{

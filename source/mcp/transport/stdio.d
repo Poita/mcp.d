@@ -61,7 +61,7 @@ void serveStdio(McpServer server, string delegate() @safe readLine,
 	import vibe.data.json : Json;
 	import mcp.protocol.jsonrpc : Message, MessageKind;
 	import mcp.server.connection : ConnectionState;
-	import mcp.server.context : StdioContext;
+	import mcp.server.context : StdioContext, StdioContextOptions;
 
 	// stdio is single-connection (one implicit peer per process), so this
 	// transport owns exactly one `ConnectionState`, which the server core threads
@@ -271,8 +271,9 @@ void serveStdio(McpServer server, string delegate() @safe readLine,
 				inflight.finish();
 			// Dispatched with the channel-bound context so an observer can issue
 			// server->client requests (e.g. `ctx.listRoots()`) directly.
-			server.handle(m, new StdioContext(&sink, &serverRequest, server.clientCapabilities,
-					Json.undefined, server.negotiatedVersion, server.mode == ServerMode.stateless));
+			server.handle(m, new StdioContext(&sink, StdioContextOptions(&serverRequest,
+					server.clientCapabilities, Json.undefined,
+					server.negotiatedVersion, server.mode == ServerMode.stateless)));
 			break;
 		case MessageKind.response:
 		case MessageKind.errorResponse:
@@ -384,7 +385,7 @@ private void replyToRequest(McpServer server, void delegate(string) @safe sink,
 	import std.typecons : Nullable;
 	import mcp.protocol.errors : internalError;
 	import mcp.protocol.jsonrpc : makeErrorResponse;
-	import mcp.server.context : StdioContext;
+	import mcp.server.context : StdioContext, StdioContextOptions;
 	import mcp.transport.sse_context : extractProgressToken;
 
 	string idText() @safe nothrow
@@ -401,9 +402,10 @@ private void replyToRequest(McpServer server, void delegate(string) @safe sink,
 		// The channel has already parsed and classified `msg`, so it is dispatched
 		// directly against the bound connection rather than re-serialised for
 		// `handleRaw` to parse again.
-		auto ctx = new StdioContext(sink, serverRequest, server.clientCapabilities,
+		auto ctx = new StdioContext(sink, StdioContextOptions(serverRequest,
+				server.clientCapabilities,
 				extractProgressToken(msg.params),
-				server.negotiatedVersion, server.mode == ServerMode.stateless);
+				server.negotiatedVersion, server.mode == ServerMode.stateless));
 		reply = server.handle(msg, ctx);
 	}
 	catch (Exception e)

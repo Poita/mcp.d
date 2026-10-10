@@ -19,7 +19,8 @@ import mcp.transport.sse_context;
 import mcp.transport.session;
 import mcp.transport.client_bucket : clientBucket, defaultIpv6BucketPrefix;
 import mcp.auth.resource_server;
-import mcp.server.context : RequestContext, BaseRequestContext, ConnectionScoped, StdioContext;
+import mcp.server.context : RequestContext, BaseRequestContext,
+	ConnectionScoped, StdioContext, StdioContextOptions;
 import mcp.server.connection : ConnectionState;
 import mcp.server.push : ListenFilter;
 import mcp.protocol.capabilities : ClientCapabilities, ClientCapability;
@@ -1211,9 +1212,9 @@ private void handleLegacyInput(McpServer server, LegacySseChannel channel,
 			channel.coord.resolve(msg.id, msg.result, msg.error, sessionId);
 			return Nullable!Json.init;
 		}
-		auto inner = new StdioContext(&sink, &serverRequest, conn.clientCaps,
+		auto inner = new StdioContext(&sink, StdioContextOptions(&serverRequest, conn.clientCaps,
 				extractProgressToken(msg.params), conn.negotiated,
-				server.mode == ServerMode.stateless);
+				server.mode == ServerMode.stateless));
 		return server.handle(msg, new LegacySseContext(inner, sessionId, conn, token));
 	}
 

@@ -346,7 +346,7 @@ interface RequestContext
 		// Per client/elicitation: servers MUST NOT send a url-mode request to a
 		// client that only declared form mode (e.g. a bare `elicitation:{}`).
 		requireClientCapabilities(this, elicitationRequirements(Json([
-					"mode": Json("url")
+			"mode": Json("url")
 		])));
 		if (url.length == 0)
 			throw internalError("URL-mode elicitation requires a non-empty url");
@@ -543,6 +543,31 @@ final class NullContext : BaseRequestContext
 /// out-of-band `notifications/cancelled` is dispatched (flipping the matching
 /// in-flight `CancellationToken`) *concurrently* with a running handler — the
 /// handler's `ctx.isCancelled()` simply observes the flipped token.
+/// The per-request settings of a `StdioContext`.
+struct StdioContextOptions
+{
+	/// Writes a server->client request and blocks the current task until the
+	/// client's reply (the `DuplexChannel` correlates it on its read loop),
+	/// returning the `result` or throwing on error. Null wires no channel:
+	/// `sampleRaw`/`elicitRaw`/`listRootsRaw` throw and `clientSupports` is false.
+	Json delegate(string, Json) @safe serverRequest;
+	/// The capabilities the client declared at `initialize`, so `clientSupports`
+	/// can gate `sample`/`elicit`.
+	ClientCapabilities clientCaps;
+	/// The originating request's `_meta.progressToken`; undefined when it
+	/// carried none.
+	Json progressToken;
+	/// The protocol version agreed for this connection; it gates
+	/// version-specific wire fields on the notifications this context emits
+	/// (e.g. the `message` field on `notifications/progress`, which only exists
+	/// from 2025-03-26 onward).
+	ProtocolVersion negotiated = latestLegacy;
+	/// Mirrors `server.mode == ServerMode.stateless`: when true, server-initiated
+	/// requests are refused (a stateless server has no per-peer connection to
+	/// carry the round-trip), exactly as on the HTTP transport.
+	bool serverStateless;
+}
+
 final class StdioContext : RequestContext
 {
 	private void delegate(string) @safe sink;
@@ -553,39 +578,16 @@ final class StdioContext : RequestContext
 	private bool serverStateless_;
 
 	/// `sink` receives one serialised JSON-RPC frame per call (the transport
-	/// adds the newline terminator). `progressToken` is the originating request's
-	/// `_meta.progressToken`, or `Json.undefined` when it carried none.
-	/// `negotiated` is the protocol version agreed for this connection; it gates
-	/// version-specific wire fields on the notifications this context emits (e.g.
-	/// the `message` field on `notifications/progress`, which only exists from
-	/// 2025-03-26 onward). This overload wires no server->client request channel
-	/// (`sampleRaw`/`elicitRaw`/`listRootsRaw` throw, `clientSupports` is false).
-	this(void delegate(string) @safe sink, Json progressToken = Json.undefined,
-			ProtocolVersion negotiated = latestLegacy) @safe
+	/// adds the newline terminator); `opts` carries the request's progress
+	/// token, protocol version, and optional server->client request channel.
+	this(void delegate(string) @safe sink, StdioContextOptions opts = StdioContextOptions.init) @safe
 	{
 		this.sink = sink;
-		this.progressTok = progressToken;
-		this.version_ = negotiated;
-	}
-
-	/// As above, plus a server->client request channel: `serverRequest(method,
-	/// params)` writes the request and blocks the current task until the client's
-	/// reply (the `DuplexChannel` correlates it on its read loop), returning the
-	/// `result` or throwing on error. `clientCaps` are the capabilities the client
-	/// declared at `initialize`, so `clientSupports` can gate `sample`/`elicit`.
-	/// `serverStateless` mirrors `server.mode == ServerMode.stateless`: when true,
-	/// server-initiated requests are refused (a stateless server has no per-peer
-	/// connection to carry the round-trip), exactly as on the HTTP transport.
-	this(void delegate(string) @safe sink, Json delegate(string, Json) @safe serverRequest,
-			ClientCapabilities clientCaps, Json progressToken = Json.undefined,
-			ProtocolVersion negotiated = latestLegacy, bool serverStateless = false) @safe
-	{
-		this.sink = sink;
-		this.serverRequestFn = serverRequest;
-		this.clientCaps = clientCaps;
-		this.progressTok = progressToken;
-		this.version_ = negotiated;
-		this.serverStateless_ = serverStateless;
+		this.serverRequestFn = opts.serverRequest;
+		this.clientCaps = opts.clientCaps;
+		this.progressTok = opts.progressToken;
+		this.version_ = opts.negotiated;
+		this.serverStateless_ = opts.serverStateless;
 	}
 
 	bool isCancelled() @safe
@@ -727,6 +729,32 @@ private McpException missingClientCapability(ClientCapability cap, string messag
 /// dispatching, so handlers observe correct `usesInputRequired`/`inputResponses`
 /// and `elicit`/`sample` fail fast on MRTR requests. Notifications and server->client requests
 /// delegate to the wrapped context unchanged.
+/// The per-request state the server installs on a `RequestScope`.
+package(mcp) struct RequestScopeOptions
+{
+	/// Whether the request gathers input through MRTR (`usesInputRequired`).
+	bool inputRequired;
+	/// The MRTR input responses the client attached.
+	Json[string] inputResponses;
+	/// The (verified) MRTR `requestState` the client echoed.
+	string requestState;
+	/// The minimum log level; lower-severity logs are dropped.
+	string minLogLevel = "info";
+	/// False when the request did not ask for logging, dropping every log.
+	bool loggingRequested = true;
+	/// The shared token `notifications/cancelled` flips; null delegates
+	/// `isCancelled` to the wrapped context.
+	CancellationToken cancellation;
+	/// The protocol version in effect for this request.
+	ProtocolVersion effectiveVersion = latestLegacy;
+	/// The client capabilities in effect for this request.
+	ClientCapabilities clientCaps;
+	/// Mirrors `server.mode == ServerMode.stateless`: such a server has no
+	/// per-peer channel, so `sample`/`elicit`/`listRoots` refuse before
+	/// consulting the client's capabilities.
+	bool serverStateless;
+}
+
 final class RequestScope : RequestContext, ConnectionScoped
 {
 	private RequestContext inner;
@@ -740,25 +768,18 @@ final class RequestScope : RequestContext, ConnectionScoped
 	private ClientCapabilities clientCaps_;
 	private bool serverStateless_;
 
-	/// `serverStateless` mirrors `server.mode == ServerMode.stateless`: such a
-	/// server has no per-peer channel, so `sample`/`elicit`/`listRoots` refuse
-	/// before consulting the client's capabilities.
-	this(RequestContext inner, bool inputRequired, Json[string] responses, string minLevel = "info",
-			bool loggingRequested = true, CancellationToken cancellation = null,
-			string requestState = "",
-			ProtocolVersion effectiveVersion = latestLegacy,
-			ClientCapabilities clientCaps = ClientCapabilities.init, bool serverStateless = false) @safe
+	package(mcp) this(RequestContext inner, RequestScopeOptions opts) @safe
 	{
-		this.serverStateless_ = serverStateless;
-		this.clientCaps_ = clientCaps;
 		this.inner = inner;
-		this.inputRequired = inputRequired;
-		this.responses = responses;
-		this.requestState_ = requestState;
-		this.minLevel = minLevel;
-		this.loggingRequested = loggingRequested;
-		this.cancellation = cancellation;
-		this.effectiveVersion_ = effectiveVersion;
+		this.inputRequired = opts.inputRequired;
+		this.responses = opts.inputResponses;
+		this.requestState_ = opts.requestState;
+		this.minLevel = opts.minLogLevel;
+		this.loggingRequested = opts.loggingRequested;
+		this.cancellation = opts.cancellation;
+		this.effectiveVersion_ = opts.effectiveVersion;
+		this.clientCaps_ = opts.clientCaps;
+		this.serverStateless_ = opts.serverStateless;
 	}
 
 	/// The protocol version in effect for THIS request (negotiated version on the
@@ -1241,9 +1262,10 @@ version (unittest) private final class LogProbe : BaseRequestContext
 
 unittest  // RequestScope drops log messages below the configured minimum level
 {
-	Json[string] empty;
 	auto probe = new LogProbe;
-	auto scope_ = new RequestScope(probe, false, empty, "error");
+	RequestScopeOptions opts;
+	opts.minLogLevel = "error";
+	auto scope_ = new RequestScope(probe, opts);
 
 	scope_.log("debug", Json("d"));
 	scope_.log("warning", Json("w"));
@@ -1256,9 +1278,8 @@ unittest  // RequestScope drops log messages below the configured minimum level
 
 unittest  // RequestScope with the default "info" minimum drops only debug
 {
-	Json[string] empty;
 	auto probe = new LogProbe;
-	auto scope_ = new RequestScope(probe, false, empty);
+	auto scope_ = new RequestScope(probe, RequestScopeOptions.init);
 
 	scope_.log("debug", Json("d"));
 	scope_.log("info", Json("i"));
@@ -1269,9 +1290,10 @@ unittest  // RequestScope with the default "info" minimum drops only debug
 
 unittest  // RequestScope rejects a log level outside the RFC 5424 set as an internalError
 {
-	Json[string] empty;
 	auto probe = new LogProbe;
-	auto scope_ = new RequestScope(probe, false, empty, "error");
+	RequestScopeOptions opts;
+	opts.minLogLevel = "error";
+	auto scope_ = new RequestScope(probe, opts);
 
 	assertInternalError(scope_.log("warn", Json("w")));
 	assertInternalError(scope_.log("Info", Json("i")));
@@ -1280,18 +1302,21 @@ unittest  // RequestScope rejects a log level outside the RFC 5424 set as an int
 
 unittest  // RequestScope rejects an unknown log level even when logging was not requested
 {
-	Json[string] empty;
-	auto scope_ = new RequestScope(new LogProbe, true, empty, "info", false);
+	RequestScopeOptions opts;
+	opts.inputRequired = true;
+	opts.loggingRequested = false;
+	auto scope_ = new RequestScope(new LogProbe, opts);
 
 	assertInternalError(scope_.log("verbose", Json("v")));
 }
 
 unittest  // RequestScope exposes the shared cancellation token via isCancelled
 {
-	Json[string] empty;
 	auto probe = new LogProbe;
 	auto token = new CancellationToken;
-	auto scope_ = new RequestScope(probe, false, empty, "info", true, token);
+	RequestScopeOptions opts;
+	opts.cancellation = token;
+	auto scope_ = new RequestScope(probe, opts);
 
 	assert(!scope_.isCancelled);
 	token.cancel();
@@ -1331,13 +1356,20 @@ unittest  // a stateless RequestScope answers clientSupports from the request's 
 {
 	import mcp.protocol.versions : latestStable;
 
-	Json[string] empty;
 	ClientCapabilities caps;
 	caps.elicitationForm = true;
-	auto scope_ = new RequestScope(new LogProbe, true, empty, "info", true,
-			null, "", latestStable, caps);
+	RequestScopeOptions opts;
+	opts.inputRequired = true;
+	opts.effectiveVersion = latestStable;
+	opts.clientCaps = caps;
+	auto scope_ = new RequestScope(new LogProbe, opts);
 	assert(scope_.clientSupports(ClientCapability.elicitation));
 	assert(!scope_.clientSupports(ClientCapability.sampling));
+}
+
+unittest  // only the server constructs a RequestScope
+{
+	static assert(__traits(getVisibility, RequestScope.__ctor) == "package");
 }
 
 unittest  // a CancellationToken starts uncancelled and cancel() is idempotent
@@ -1362,8 +1394,10 @@ unittest  // a stateless server's StdioContext refuses server->client requests o
 	// channel is physically bidirectional, a stateless server has no per-peer
 	// connection to carry the round-trip, so elicit/sample/roots are refused —
 	// matching the HTTP transport rather than special-casing stdio.
-	auto ctx = new StdioContext((string) @safe {}, (string m, Json p) @safe => Json.emptyObject,
-			ClientCapabilities.init, Json.undefined, latestLegacy, true);
+	StdioContextOptions opts;
+	opts.serverRequest = (string m, Json p) @safe => Json.emptyObject;
+	opts.serverStateless = true;
+	auto ctx = new StdioContext((string) @safe {}, opts);
 	assertInternalError(ctx.sampleRaw(Json.emptyObject));
 	assertInternalError(ctx.elicitRaw(Json.emptyObject));
 	assertInternalError(ctx.listRootsRaw());
@@ -1372,10 +1406,12 @@ unittest  // a stateless server's StdioContext refuses server->client requests o
 unittest  // a stateful StdioContext issues server->client requests through the channel
 {
 	bool called;
-	auto ctx = new StdioContext((string) @safe {}, (string m, Json p) @safe {
+	StdioContextOptions opts;
+	opts.serverRequest = (string m, Json p) @safe {
 		called = true;
 		return Json.emptyObject;
-	}, ClientCapabilities.init, Json.undefined, latestLegacy, false);
+	};
+	auto ctx = new StdioContext((string) @safe {}, opts);
 	ctx.listRootsRaw();
 	assert(called);
 }
@@ -1427,7 +1463,8 @@ unittest  // StdioContext.reportProgress emits a frame only with a progress toke
 	import vibe.data.json : parseJsonString;
 
 	string[] frames;
-	auto withTok = new StdioContext((string s) @safe { frames ~= s; }, Json("tok"));
+	auto withTok = new StdioContext((string s) @safe { frames ~= s; },
+			StdioContextOptions(null, ClientCapabilities.init, Json("tok")));
 	withTok.reportProgress(0.25, nullableProgress(0.5), "quarter");
 	assert(frames.length == 1);
 	auto j = parseJsonString(frames[0]);
@@ -1443,8 +1480,8 @@ unittest  // StdioContext.reportProgress omits `message` on a 2024-11-05 peer
 	import vibe.data.json : parseJsonString;
 
 	string[] frames;
-	auto ctx = new StdioContext((string s) @safe { frames ~= s; }, Json("tok"),
-			ProtocolVersion.v2024_11_05);
+	auto ctx = new StdioContext((string s) @safe { frames ~= s; }, StdioContextOptions(null,
+			ClientCapabilities.init, Json("tok"), ProtocolVersion.v2024_11_05));
 	ctx.reportProgress(0.25, nullableProgress(0.5), "quarter");
 	assert(frames.length == 1);
 	auto j = parseJsonString(frames[0]);
@@ -1461,8 +1498,8 @@ unittest  // StdioContext.reportProgress keeps `message` from 2025-03-26 onward
 	import vibe.data.json : parseJsonString;
 
 	string[] frames;
-	auto ctx = new StdioContext((string s) @safe { frames ~= s; }, Json("tok"),
-			ProtocolVersion.v2025_03_26);
+	auto ctx = new StdioContext((string s) @safe { frames ~= s; }, StdioContextOptions(null,
+			ClientCapabilities.init, Json("tok"), ProtocolVersion.v2025_03_26));
 	ctx.reportProgress(0.25, Nullable!double.init, "quarter");
 	assert(frames.length == 1);
 	auto j = parseJsonString(frames[0]);
@@ -1646,7 +1683,8 @@ unittest  // reportProgress(long, long) forwards integer steps to the double/Nul
 	import vibe.data.json : parseJsonString;
 
 	string[] frames;
-	RequestContext ctx = new StdioContext((string str) @safe { frames ~= str; }, Json("tok"));
+	RequestContext ctx = new StdioContext((string str) @safe { frames ~= str; },
+			StdioContextOptions(null, ClientCapabilities.init, Json("tok")));
 	ctx.reportProgress(3L, 10L, "step 3 of 10");
 	assert(frames.length == 1);
 	auto j = parseJsonString(frames[0]);
@@ -1791,17 +1829,17 @@ version (unittest) private void assertStatefulRequired(void delegate() @safe cal
 
 unittest  // sample() on a stateless server's legacy request names McpServer.stateful(), not a missing capability
 {
-	Json[string] empty;
-	auto scope_ = new RequestScope(new LogProbe, false, empty, "info", true,
-			null, "", latestLegacy, ClientCapabilities.init, true);
+	RequestScopeOptions opts;
+	opts.serverStateless = true;
+	auto scope_ = new RequestScope(new LogProbe, opts);
 	assertStatefulRequired(() @safe { scope_.sample(Json.emptyObject); });
 }
 
 unittest  // elicit() and elicitUrl() on a stateless server's legacy request name McpServer.stateful()
 {
-	Json[string] empty;
-	auto scope_ = new RequestScope(new LogProbe, false, empty, "info", true,
-			null, "", latestLegacy, ClientCapabilities.init, true);
+	RequestScopeOptions opts;
+	opts.serverStateless = true;
+	auto scope_ = new RequestScope(new LogProbe, opts);
 	assertStatefulRequired(() @safe { scope_.elicit("m", Json.emptyObject); });
 	assertStatefulRequired(() @safe {
 		scope_.elicitUrl("m", "https://example.com", "e-1");
@@ -1810,8 +1848,8 @@ unittest  // elicit() and elicitUrl() on a stateless server's legacy request nam
 
 unittest  // listRoots() on a stateless server's legacy request names McpServer.stateful()
 {
-	Json[string] empty;
-	auto scope_ = new RequestScope(new LogProbe, false, empty, "info", true,
-			null, "", latestLegacy, ClientCapabilities.init, true);
+	RequestScopeOptions opts;
+	opts.serverStateless = true;
+	auto scope_ = new RequestScope(new LogProbe, opts);
 	assertStatefulRequired(() @safe { scope_.listRoots(); });
 }
