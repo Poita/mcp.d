@@ -47,14 +47,15 @@ final class BackgroundLoop
 unittest  // stop during a pass lets the pass finish its I/O uninterrupted
 {
 	import core.time : msecs;
-	import vibe.core.core : runTask, exitEventLoop, runEventLoop, sleep;
+	import vibe.core.core : runTask, exitEventLoop, runEventLoop, sleep, yield;
 
 	auto loop = new BackgroundLoop;
-	bool passFinished, loopEnded;
+	bool inPass, passFinished, loopEnded;
 	loop.task = runTask(() nothrow @safe {
 		try
 		{
-			sleep(20.msecs); // I/O inside a pass
+			inPass = true;
+			sleep(30.msecs); // I/O inside a pass
 			passFinished = true;
 		}
 		catch (Exception)
@@ -65,9 +66,10 @@ unittest  // stop during a pass lets the pass finish its I/O uninterrupted
 	runTask(() nothrow @safe {
 		try
 		{
-			sleep(5.msecs);
+			while (!inPass)
+				yield();
 			loop.stop();
-			sleep(40.msecs);
+			loop.task.join();
 		}
 		catch (Exception)
 		{
