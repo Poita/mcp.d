@@ -4,8 +4,8 @@ import vibe.data.json : Json;
 
 @safe:
 
-/// How many leading bytes of a dropped over-long line are scanned for its
-/// `FrameHead`.
+/// How many leading bytes of a dropped over-long line a reader that does not
+/// stream it through a `FrameHeadScanner` keeps for `scanFrameHead`.
 package(mcp) enum size_t frameHeadScanBytes = 4096;
 
 /// Newline-delimited line assembly over a byte source, shared by both ends of the
@@ -24,12 +24,14 @@ package(mcp) struct LineReader
 	private ubyte[] buf; // the filled prefix of `storage` from the latest read
 	private size_t bufPos; // index of the next unconsumed byte in `buf`
 	private bool oversized_; // an over-long line was dropped since the last takeOversized
-	private FrameHead oversizedHead_; // what the dropped line's first bytes reveal
+	private FrameHead oversizedHead_; // what the dropped line reveals
+	private FrameHeadScanner scanner_; // scans the line being dropped
+	private bool reported_; // onOversized already ran for the line being dropped
 
-	/// Called with an over-long line's `FrameHead` as soon as the line passes
-	/// `maxLineBytes`, before its remaining bytes are skipped, so a caller can act
-	/// on it while a peer is still sending it. Optional; `takeOversized` reports
-	/// the same line once `next` returns.
+	/// Called once per over-long line with its `FrameHead`: as soon as the bytes
+	/// read so far reveal both its id and its kind, so a caller can act on it while
+	/// a peer is still sending it, else when the line ends. Optional;
+	/// `takeOversized` reports the line once `next` returns.
 	void delegate(FrameHead) @safe onOversized;
 
 	this(size_t maxLineBytes) @safe
@@ -68,7 +70,7 @@ package(mcp) struct LineReader
 	}
 
 	// Whether an over-long line was dropped since the last call; if so `head` is
-	// what its first bytes reveal (its id is null when not found there).
+	// what the line reveals (its id is null when it has none).
 	bool takeOversized(out FrameHead head) @safe
 	{
 		if (!oversized_)
@@ -78,12 +80,34 @@ package(mcp) struct LineReader
 		return true;
 	}
 
-	private void markOversized(const(ubyte)[] prefix) @safe
+	// Start dropping an over-long line whose bytes so far are `seen`.
+	private void beginOversized(const(ubyte)[] seen) @safe
+	{
+		scanner_ = FrameHeadScanner.init;
+		reported_ = false;
+		scanOversized(seen);
+	}
+
+	// Scan more of the line being dropped, reporting it once its head is decided.
+	private void scanOversized(const(ubyte)[] bytes) @safe
+	{
+		scanner_.feed(bytes);
+		if (!reported_ && scanner_.decided)
+		{
+			reported_ = true;
+			if (onOversized !is null)
+				onOversized(scanner_.head);
+		}
+	}
+
+	// The line being dropped has ended.
+	private void endOversized() @safe
 	{
 		oversized_ = true;
-		oversizedHead_ = scanFrameHead(prefix);
-		if (onOversized !is null)
+		oversizedHead_ = scanner_.head;
+		if (!reported_ && onOversized !is null)
 			onOversized(oversizedHead_);
+		reported_ = true;
 	}
 
 	// The pure line-assembly state machine, parameterised on the buffer-refill
@@ -103,7 +127,10 @@ package(mcp) struct LineReader
 				if (!refillFn())
 				{
 					if (dropping)
+					{
+						endOversized();
 						return null;
+					}
 					if (acc.length && acc[$ - 1] == '\r')
 						acc = acc[0 .. $ - 1];
 					return acc.length ? (() @trusted => cast(string) acc)() : null;
@@ -123,12 +150,14 @@ package(mcp) struct LineReader
 			if (nl == size_t.max)
 			{
 				// No newline yet: accumulate (unless dropping) and refill.
-				if (!dropping)
+				if (dropping)
+					scanOversized(rest);
+				else
 				{
 					acc ~= rest;
 					if (acc.length > maxLineBytes)
 					{
-						markOversized(acc[0 .. $ < frameHeadScanBytes ? $ : frameHeadScanBytes]);
+						beginOversized(acc);
 						acc = null;
 						dropping = true;
 					}
@@ -159,8 +188,11 @@ package(mcp) struct LineReader
 			// dropping, or only now over the cap) is discarded and a fresh one started.
 			if (dropping || line.length > maxLineBytes)
 			{
-				if (!dropping)
-					markOversized(line[0 .. $ < frameHeadScanBytes ? $ : frameHeadScanBytes]);
+				if (dropping)
+					scanOversized(rest[0 .. nl]);
+				else
+					beginOversized(line);
+				endOversized();
 				return "";
 			}
 			if (line.length && line[$ - 1] == '\r')
@@ -186,86 +218,114 @@ package(mcp) struct FrameHead
 /// top-level keys, skipping nested objects/arrays and string contents.
 package(mcp) FrameHead scanFrameHead(const(ubyte)[] text) @safe
 {
-	import std.conv : to, ConvException;
-	import vibe.data.json : parseJsonString, JSONException;
+	FrameHeadScanner scanner;
+	scanner.feed(text);
+	return scanner.head;
+}
 
-	FrameHead head;
-	head.id = Json(null);
-	size_t i;
-	int depth;
-	bool expectValueForId;
-	bool afterKey; // the last depth-1 string was a key whose ':' is pending
-	string lastKey;
+/// Incremental form of `scanFrameHead`: `feed` takes a JSON-RPC object's text in
+/// any number of pieces, so the whole of an over-long line can be scanned as its
+/// bytes stream past without being kept. Only nesting depth, string/number state
+/// and the last top-level key are carried between pieces.
+package(mcp) struct FrameHeadScanner
+{
+	// Longest top-level key or string id kept; anything longer matches no key
+	// and is not taken as an id.
+	private enum size_t maxCapture = 256;
 
-	// Scan one JSON string starting at text[i] == '"'; returns its raw contents
-	// (escapes left as-is) and leaves i after the closing quote, or null if cut off.
-	string scanString() @safe
+	private FrameHead head_;
+	private int depth;
+	private bool inString, escaped, capturing, captureOverflow, stringIsId;
+	private ubyte[] captured;
+	private bool inNumber;
+	private ubyte[] number;
+	private bool expectValueForId;
+	private bool afterKey; // the last depth-1 string was a key whose ':' is pending
+	private string lastKey;
+
+	/// Scan the next piece of the object's text.
+	void feed(const(ubyte)[] text) @safe
 	{
-		const start = ++i;
-		while (i < text.length)
-		{
-			if (text[i] == '\\')
-				i += 2;
-			else if (text[i] == '"')
-				return () @trusted { return cast(string) text[start .. i++]; }();
-			else
-				i++;
-		}
-		return null;
+		foreach (c; text)
+			step(c);
 	}
 
-	while (i < text.length)
+	/// What the text fed so far reveals. A number or string still open at the
+	/// end of it may be cut off, so it is not taken as the id.
+	FrameHead head() const @safe
 	{
-		const c = text[i];
+		FrameHead h;
+		h.id = head_.id.type == Json.Type.undefined ? Json(null) : head_.id;
+		h.hasMethod = head_.hasMethod;
+		h.hasResult = head_.hasResult;
+		return h;
+	}
+
+	/// Whether both the id and the kind (request or response) are known, so
+	/// the rest of the text cannot change what matters about the frame.
+	bool decided() const @safe
+	{
+		return head_.id.type != Json.Type.undefined && (head_.hasMethod || head_.hasResult);
+	}
+
+	private void step(ubyte c) @safe
+	{
+		if (inString)
+		{
+			if (escaped)
+				escaped = false;
+			else if (c == '\\')
+				escaped = true;
+			else if (c == '"')
+			{
+				inString = false;
+				endString();
+				return;
+			}
+			if (capturing)
+			{
+				if (captured.length < maxCapture)
+					captured ~= c;
+				else
+					captureOverflow = true;
+			}
+			return;
+		}
+		if (inNumber)
+		{
+			if (c == '-' || c == '+' || c == '.' || c == 'e' || c == 'E' || (c >= '0' && c <= '9'))
+			{
+				if (number.length < maxCapture)
+					number ~= c;
+				return;
+			}
+			inNumber = false;
+			endNumber();
+		}
 		if (c == '"')
 		{
-			const startQuote = i;
-			auto str = scanString();
-			if (str is null)
-				break;
-			if (expectValueForId)
-			{
-				expectValueForId = false;
-				try
-					head.id = parseJsonString(() @trusted {
-						return cast(string) text[startQuote .. i];
-					}());
-				catch (JSONException)
-				{
-				}
-				continue;
-			}
-			if (depth == 1)
-			{
-				lastKey = str;
-				afterKey = true;
-			}
-			continue;
+			inString = true;
+			stringIsId = expectValueForId;
+			expectValueForId = false;
+			capturing = stringIsId || depth == 1;
+			captured = null;
+			captureOverflow = false;
+			return;
 		}
 		if (expectValueForId && (c == '-' || (c >= '0' && c <= '9')))
 		{
 			expectValueForId = false;
-			const start = i;
-			while (i < text.length && (text[i] == '-' || text[i] == '+'
-					|| text[i] == '.' || text[i] == 'e' || text[i] == 'E'
-					|| (text[i] >= '0' && text[i] <= '9')))
-				i++;
-			if (i >= text.length)
-				break; // cut off mid-number
-			try
-				head.id = Json(() @trusted { return cast(string) text[start .. i]; }().to!long);
-			catch (ConvException)
-			{
-			}
-			continue;
+			inNumber = true;
+			number = [c];
+			return;
 		}
 		if (c == ':' && depth == 1 && afterKey)
 		{
 			expectValueForId = lastKey == "id";
 			if (lastKey == "method")
-				head.hasMethod = true;
+				head_.hasMethod = true;
 			else if (lastKey == "result" || lastKey == "error")
-				head.hasResult = true;
+				head_.hasResult = true;
 			afterKey = false;
 		}
 		else if (c == '{' || c == '[')
@@ -279,9 +339,40 @@ package(mcp) FrameHead scanFrameHead(const(ubyte)[] text) @safe
 			expectValueForId = false;
 		else if (expectValueForId && c > ' ')
 			expectValueForId = false; // true/false/null are not valid ids
-		i++;
 	}
-	return head;
+
+	private void endString() @safe
+	{
+		import vibe.data.json : parseJsonString, JSONException;
+
+		if (stringIsId)
+		{
+			if (captureOverflow)
+				return;
+			try
+				head_.id = parseJsonString(`"` ~ (() @trusted => cast(string) captured)() ~ `"`);
+			catch (JSONException)
+			{
+			}
+			return;
+		}
+		if (depth == 1)
+		{
+			lastKey = captureOverflow ? null : cast(string) captured.idup;
+			afterKey = true;
+		}
+	}
+
+	private void endNumber() @safe
+	{
+		import std.conv : to, ConvException;
+
+		try
+			head_.id = Json((() @trusted => cast(string) number)().to!long);
+		catch (ConvException)
+		{
+		}
+	}
 }
 
 version (unittest)
@@ -503,4 +594,80 @@ unittest  // LineReader does not re-copy a line assembled across chunks
 	const allocated = allocatedBytes() - before;
 	assert(line.length == 2 * half && line[0] == 'x' && line[$ - 1] == 'y');
 	assert(allocated < 5 * half, "the assembled line must not be duplicated again");
+}
+
+unittest  // LineReader finds the id of an over-long request that follows its large params
+{
+	import std.array : replicate;
+
+	Json[] ids;
+	const big = "a".replicate(3 * frameHeadScanBytes);
+	auto text = `{"jsonrpc":"2.0","method":"tools/call","params":{"x":"` ~ big ~ `"},"id":7}`;
+	auto lines = drainLineReader(64, [
+		cast(ubyte[]) text[0 .. 100].dup, cast(ubyte[]) text[100 .. 5000].dup,
+		cast(ubyte[]) text[5000 .. $ - 3].dup,
+		cast(ubyte[])(text[$ - 3 .. $] ~ "\ntail\n").dup
+	], ids);
+	assert(lines == ["tail"]);
+	assert(ids.length == 1);
+	assert(ids[0].type == Json.Type.int_ && ids[0].get!long == 7,
+			"the id after the params is found in the dropped bytes");
+}
+
+unittest  // LineReader finds a late id when the over-long line and its newline share a chunk
+{
+	import std.array : replicate;
+
+	Json[] ids;
+	const big = "b".replicate(2 * frameHeadScanBytes);
+	auto text = `{"method":"m","params":{"x":"` ~ big ~ `"},"id":"req-9"}` ~ "\n";
+	drainLineReader(64, [cast(ubyte[]) text.dup], ids);
+	assert(ids.length == 1 && ids[0].get!string == "req-9");
+}
+
+unittest  // FrameHeadScanner resumes across a split key, string and number
+{
+	FrameHeadScanner s;
+	s.feed(cast(const(ubyte)[]) `{"me`);
+	s.feed(cast(const(ubyte)[]) `thod":"x","params":{"id":1,"s":"a\`);
+	s.feed(cast(const(ubyte)[]) `"b"},"i`);
+	s.feed(cast(const(ubyte)[]) `d":12`);
+	s.feed(cast(const(ubyte)[]) `34}`);
+	auto head = s.head;
+	assert(head.hasMethod && !head.hasResult);
+	assert(head.id.get!long == 1234);
+}
+
+unittest  // FrameHeadScanner ignores a number cut off by the end of the input
+{
+	FrameHeadScanner s;
+	s.feed(cast(const(ubyte)[]) `{"result":{},"id":12`);
+	assert(s.head.id.type == Json.Type.null_);
+}
+
+unittest  // LineReader reports an over-long line early once its id and kind are known
+{
+	import std.array : replicate;
+
+	auto reader = LineReader(16);
+	FrameHead early;
+	bool fired;
+	reader.onOversized = (FrameHead h) @safe { fired = true; early = h; };
+	auto first = cast(ubyte[])(`{"id":3,"result":{"x":"` ~ "c".replicate(64)).dup;
+	bool firstFed;
+	bool refill() @safe
+	{
+		if (firstFed)
+		{
+			assert(fired, "reported before the rest of the line is read");
+			return false;
+		}
+		firstFed = true;
+		reader.buf = first;
+		reader.bufPos = 0;
+		return true;
+	}
+
+	reader.nextWith(&refill);
+	assert(fired && early.id.get!long == 3 && early.hasResult);
 }
