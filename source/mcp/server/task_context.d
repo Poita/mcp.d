@@ -879,6 +879,11 @@ unittest  // an executor's input and checkpoint reads share one store read per d
 		{
 			return inner.removeIf(pred);
 		}
+
+		size_t countUnsettled(string owner) @safe
+		{
+			return inner.countUnsettled(owner);
+		}
 	}
 
 	auto store = new CountingStore();

@@ -176,6 +176,11 @@ interface TaskStore
 	/// removed. The runtime's TTL sweep uses it to expire settled tasks; a store
 	/// with native key expiry may apply the same rule itself.
 	size_t removeIf(scope bool delegate(const TaskRecord) @safe pred) @safe;
+
+	/// How many records owned by `owner` ("" for unbound tasks) are not yet
+	/// terminal. The runtime enforces its per-principal task caps with it; a
+	/// shared store answers from an index on `(owner, status)`.
+	size_t countUnsettled(string owner) @safe;
 }
 
 /// In-memory `TaskStore` backed by an associative array. The default store; it
@@ -226,6 +231,17 @@ final class InMemoryTaskStore : TaskStore
 		foreach (id; doomed)
 			records.remove(id);
 		return doomed.length;
+	}
+
+	size_t countUnsettled(string owner) @safe
+	{
+		import mcp.protocol.tasks : isTerminal;
+
+		size_t n;
+		foreach (ref r; records)
+			if (r.owner == owner && !isTerminal(r.meta.status))
+				n++;
+		return n;
 	}
 }
 

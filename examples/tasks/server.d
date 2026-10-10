@@ -151,6 +151,7 @@ void main(string[] args) @safe
 	//       bool compareAndSwap(TaskRecord r, ulong expected) { /* WATCH id; check revision; MULTI; SET */ }
 	//       void remove(string id)               { redis.del(id); }
 	//       size_t removeIf(scope bool delegate(const TaskRecord) @safe pred) { /* SCAN + DEL */ }
+	//       size_t countUnsettled(string owner)  { /* per-owner set of unsettled ids */ }
 	//   }
 	//   // A dispatcher that enqueues the task ID; a worker process running the same
 	//   // server + @taskTool registration picks it up and runs the executor.

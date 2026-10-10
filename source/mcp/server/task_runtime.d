@@ -48,6 +48,12 @@ struct TaskOptions
 	Duration defaultPollInterval = 5.seconds;
 	Duration sweepInterval = 30.seconds;
 	Duration maxUnsettledAge = 24.hours;
+	/// Most unsettled (working or input_required) tasks one authenticated
+	/// principal may hold; creating another fails with `-32013` (0 = unlimited).
+	size_t maxUnsettledPerPrincipal = 100;
+	/// Most unsettled tasks all unbound (unauthenticated) creators may hold
+	/// together, since they cannot be told apart (0 = unlimited).
+	size_t maxUnsettledAnonymous = 1000;
 	string delegate() @safe nowIso;
 }
 
@@ -171,6 +177,7 @@ final class TaskRuntime
 		const pollDur = opts.pollInterval.isNull ? opts_.defaultPollInterval : opts
 			.pollInterval.get;
 		validateTiming(ttlDur, pollDur);
+		enforceUnsettledCap(opts.owner);
 
 		TaskRecord r;
 		r.meta.status = TaskStatus.working;
@@ -194,6 +201,20 @@ final class TaskRuntime
 		}
 		throw new McpException(ErrorCode.internalError,
 				"task id generator failed to produce a unique id");
+	}
+
+	// Bounds the work and storage one principal can pin with tasks that never
+	// settle. The count and the insert are not atomic across nodes, so on a
+	// shared store concurrent creates may overshoot the cap slightly.
+	private void enforceUnsettledCap(string owner) @safe
+	{
+		import mcp.protocol.errors : resourceExhausted;
+
+		const cap = owner.length ? opts_.maxUnsettledPerPrincipal : opts_.maxUnsettledAnonymous;
+		if (cap == 0 || store_.countUnsettled(owner) < cap)
+			return;
+		throw resourceExhausted("too many unsettled tasks", owner.length
+				? "maxUnsettledPerPrincipal" : "maxUnsettledAnonymous", cast(long) cap);
 	}
 
 	// A zero TTL would expire a task the moment it settles, before any client
@@ -1328,6 +1349,11 @@ version (unittest) private final class RacingTaskStore : TaskStore
 	{
 		return inner.removeIf(pred);
 	}
+
+	size_t countUnsettled(string owner) @safe
+	{
+		return inner.countUnsettled(owner);
+	}
 }
 
 unittest  // a cancel racing a completion does not overwrite the stored result
@@ -1455,6 +1481,11 @@ version (unittest) private final class StaleReadTaskStore : TaskStore
 	{
 		return inner.removeIf(pred);
 	}
+
+	size_t countUnsettled(string owner) @safe
+	{
+		return inner.countUnsettled(owner);
+	}
 }
 
 unittest  // createFor retries a fresh id when the store already holds the generated one
@@ -1533,6 +1564,55 @@ unittest  // the runtime rejects a negative default poll interval
 	TaskOptions o;
 	o.defaultPollInterval = -1.seconds;
 	assertThrown(new TaskRuntime(o));
+}
+
+unittest  // createFor refuses a principal past its unsettled-task cap
+{
+	import std.exception : collectException;
+
+	TaskOptions o;
+	o.maxUnsettledPerPrincipal = 2;
+	auto rt = new TaskRuntime(o);
+	TaskCreateOptions alice;
+	alice.owner = "alice";
+	auto first = rt.create(alice);
+	rt.create(alice);
+	auto e = collectException!McpException(rt.create(alice));
+	assert(e !is null && e.code == ErrorCode.resourceExhausted);
+
+	TaskCreateOptions bob;
+	bob.owner = "bob";
+	rt.create(bob);
+
+	rt.complete(first.taskId, Json.emptyObject);
+	rt.create(alice);
+}
+
+unittest  // unauthenticated tasks share the anonymous unsettled-task cap
+{
+	import std.exception : collectException;
+
+	TaskOptions o;
+	o.maxUnsettledAnonymous = 1;
+	auto rt = new TaskRuntime(o);
+	rt.create();
+	auto e = collectException!McpException(rt.create());
+	assert(e !is null && e.code == ErrorCode.resourceExhausted);
+}
+
+unittest  // a zero unsettled-task cap is unlimited
+{
+	TaskOptions o;
+	o.maxUnsettledPerPrincipal = 0;
+	o.maxUnsettledAnonymous = 0;
+	auto rt = new TaskRuntime(o);
+	TaskCreateOptions alice;
+	alice.owner = "alice";
+	foreach (_; 0 .. 2000)
+	{
+		rt.create(alice);
+		rt.create();
+	}
 }
 
 unittest  // the runtime rejects a clock that does not yield an ISO-8601 timestamp
