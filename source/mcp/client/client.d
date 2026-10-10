@@ -1284,12 +1284,24 @@ final class McpClient : ClientProtocol
 	/// Whether `e`, raised by the `server/discover` probe, is the peer's JSON-RPC
 	/// rejection of the method rather than a failure to get any answer: not a
 	/// timeout, a closed transport, a cancellation, or an internal error (the code
-	/// local transport failures carry).
+	/// local transport failures carry). Nor is it a modern-only error
+	/// (`HeaderMismatch`, `MissingRequiredClientCapability`): only a server that
+	/// speaks the modern protocol emits those, so they are no sign of an older
+	/// peer.
 	private static bool isDiscoverRejection(McpException e) @safe
 	{
 		if (cast(RequestTimeoutException) e || cast(TransportClosedException) e)
 			return false;
-		return e.code != ErrorCode.internalError && e.code != ErrorCode.requestCancelled;
+		switch (e.code)
+		{
+		case ErrorCode.internalError:
+		case ErrorCode.requestCancelled:
+		case ErrorCode.headerMismatch:
+		case ErrorCode.missingRequiredClientCapability:
+			return false;
+		default:
+			return true;
+		}
 	}
 
 	/// Connect using a `server/discover` result obtained earlier, performing the
@@ -9456,6 +9468,30 @@ unittest  // connect() rethrows a probe timeout, transport failure or internal e
 		auto thrown = collectException!McpException(c.connect());
 		assert(thrown is failure, "connect() must surface the probe failure");
 		assert(!initialized, "a failed probe must not fall back to initialize");
+	}
+}
+
+unittest  // connect() rethrows a modern-only probe rejection instead of assuming a legacy server
+{
+	import std.exception : collectException;
+
+	foreach (code; [
+		ErrorCode.headerMismatch, ErrorCode.missingRequiredClientCapability
+	])
+	{
+		auto transport = new RecordingClientTransport();
+		auto c = new McpClient(transport);
+		bool initialized;
+		auto failure = new McpException(code, "rejected");
+		transport.responder = (Json message, long expectId) @safe {
+			if (message["method"].get!string == "server/discover")
+				throw failure;
+			initialized = true;
+			return Json.emptyObject;
+		};
+		auto thrown = collectException!McpException(c.connect());
+		assert(thrown is failure, "connect() must surface a modern-only rejection");
+		assert(!initialized, "a modern-only rejection must not fall back to initialize");
 	}
 }
 
