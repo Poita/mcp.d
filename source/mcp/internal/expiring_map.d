@@ -78,8 +78,8 @@ package(mcp) struct BoundedExpiringMap(V)
 	void delegate(string key, V value) @safe onEvict;
 
 	/// When set, an entry for which this returns true is busy: the TTL never
-	/// expires it, and its idle clock restarts whenever it is seen busy, so it
-	/// stays live for a full TTL after its work ends.
+	/// expires it, and its idle clock restarts whenever it is seen busy, which is
+	/// on a lookup of its key or when a sweep finds it past its TTL.
 	bool delegate(ref V value) @safe busy;
 
 	this(Duration ttl, size_t maxEntries, MonoTime delegate() @safe clock) @safe
@@ -263,16 +263,22 @@ package(mcp) struct BoundedExpiringMap(V)
 		sweep(t);
 	}
 
+	/// Evict the entries past their TTL. Each list is in stamp order, so it is
+	/// walked from its oldest entry and the walk stops at the first one within
+	/// its TTL. A busy entry is restamped, which moves it to the tail; the walk
+	/// restarts from the head after each entry, since `onEvict` may unlink others.
 	private void sweep(MonoTime t) @safe
 	{
-		if (ttl <= Duration.zero || nodes.length == 0)
+		if (ttl <= Duration.zero)
 			return;
-		Node[] stale;
-		foreach (n; nodes.values)
-			if (expired(n, t))
-				stale ~= n;
-		foreach (n; stale)
-			evict(n);
+		foreach (order; [&unusedOrder, &usedOrder])
+			for (auto n = order.head; n !is null && t - n.stamp >= ttl; n = order.head)
+			{
+				if (busy !is null && busy(n.value))
+					restamp(n, t);
+				else
+					evict(n);
+			}
 	}
 
 	/// Evict the least-recently-active never-used entry, or the
@@ -444,4 +450,26 @@ unittest  // BoundedExpiringMap survives an onEvict that removes another expirin
 	m.put("e", 5);
 	assert(m.evictOldest());
 	assert(!m.contains("d") && m.contains("e"), "the activity list stays intact");
+}
+
+unittest  // BoundedExpiringMap's sweep visits only the entries past their TTL
+{
+	import core.time : MonoTime, minutes;
+	import std.conv : to;
+
+	auto clk = MonoTime.currTime;
+	auto m = BoundedExpiringMap!int(10.minutes, 0, () @safe => clk);
+	string[] checked;
+	m.busy = (ref int v) @safe { checked ~= v.to!string; return v == 1; };
+	m.put("a", 0);
+	m.put("b", 1);
+	clk += 5.minutes;
+	foreach (i; 2 .. 50)
+		m.put("k" ~ i.to!string, i);
+	clk += 6.minutes; // only a and b are past their TTL
+	checked = null;
+	m.put("z", 99);
+	assert(checked == ["0", "1"], "only expired entries are checked for busy");
+	assert(!m.contains("a") && m.contains("b"), "the expired idle entry goes, the busy one stays");
+	assert(m.length == 50);
 }
