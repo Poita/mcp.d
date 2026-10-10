@@ -1484,6 +1484,8 @@ final class EventsRuntime
 		const id = webhookId(principal, p.delivery.url, p.name, p.arguments);
 		const now = opts_.nowMs();
 		auto existing = webhookStore_.get(id);
+		if (!existing.isNull)
+			requireSameKey(existing.get, principal, p.delivery.url, p.name, p.arguments);
 		// A lapsed subscription no longer holds state the client can refresh: it is
 		// torn down and the call creates a fresh one from the supplied cursor.
 		if (!existing.isNull && existing.get.isExpired(now))
@@ -1622,6 +1624,7 @@ final class EventsRuntime
 		auto existing = webhookStore_.get(id);
 		if (existing.isNull)
 			throw notFound("No matching subscription", "subscription");
+		requireSameKey(existing.get, principal, p.url, p.name, p.arguments);
 		removeWebhookState(existing.get);
 	}
 
@@ -1953,6 +1956,19 @@ final class EventsRuntime
 		return "sub_" ~ sha256Hex(
 				principal ~ "\0" ~ url ~ "\0" ~ name ~ "\0" ~ canonicalJsonString(arguments))[0
 			.. 16];
+	}
+
+	// The subscription id is a truncated hash of its key, so the record stored
+	// at an id is trusted only once its own key is confirmed to match; a
+	// collision (or a corrupted store) must never let one caller overwrite or
+	// remove another principal's subscription.
+	private static void requireSameKey(const WebhookSubscription sub,
+			string principal, string url, string name, Json arguments) @safe
+	{
+		if (sub.principal != principal || sub.url != url || sub.name != name
+				|| canonicalJsonString(sub.arguments) != canonicalJsonString(arguments))
+			throw internalError(
+					"webhook subscription id " ~ sub.id ~ " is held by a different subscription");
 	}
 
 	private bool offersWebhook(string name) @safe
@@ -7067,6 +7083,40 @@ unittest  // events sharing a batch cursor settle the watermark together
 	ft.duringPost = null;
 	assert(duringSecond == "h0"); // m1 acked, m2 in flight: still h0
 	assert(rt.webhookStore().get(r.id).get.cursor.get == "h1");
+}
+
+unittest  // a refresh refuses a stored record at its id that belongs to another key
+{
+	import std.exception : collectException;
+	import mcp.protocol.errors : ErrorCode;
+
+	auto ft = new FakeWebhookTransport();
+	auto rt = engineRuntime(ft);
+	auto p = webhookSub("n", "https://proxy/hooks");
+	const id = rt.webhookId("user-1", p.delivery.url, p.name, p.arguments);
+	WebhookSubscription other;
+	other.id = id;
+	other.principal = "user-2";
+	other.name = "n";
+	other.arguments = Json.emptyObject;
+	other.url = "https://elsewhere/hooks";
+	other.secret = testSecret;
+	other.expiresAtMs = 2_000_000_000L;
+	other.active = true;
+	rt.webhookStore().put(other);
+
+	auto e = collectException!McpException(rt.subscribeWebhook(p, "user-1"));
+	assert(e !is null && e.code == ErrorCode.internalError);
+	auto stored = rt.webhookStore().get(id).get;
+	assert(stored.principal == "user-2" && stored.url == "https://elsewhere/hooks");
+
+	UnsubscribeParams u;
+	u.name = p.name;
+	u.arguments = p.arguments;
+	u.url = p.delivery.url;
+	e = collectException!McpException(rt.unsubscribeWebhook(u, "user-1"));
+	assert(e !is null && e.code == ErrorCode.internalError);
+	assert(!rt.webhookStore().get(id).isNull);
 }
 
 unittest  // a deferred drain delivers every leased job
