@@ -408,7 +408,7 @@ is resolved.
 | `resources/subscribe` / `unsubscribe` | forbidden (-32601) | forbidden (-32601) | yes |
 | `subscriptions/listen` (2026-07-28) | yes (self-contained stream) | n/a (modern-only) | no (2026-07-28 refused with -32022) |
 | Server->client `elicit`/`sample`/`roots` | forbidden (error; MRTR instead) | forbidden (error) | yes |
-| `logging/setLevel` | n/a (per-request `_meta`) | forbidden (-32601) | yes (session-scoped) |
+| `logging/setLevel` | n/a (per-request `_meta`) | forbidden (-32601); the `logging` capability stays advertised because `ctx.log` still reaches the request's own response stream at the default `info` level | yes (session-scoped) |
 | `listChanged` in capabilities | yes (via `subscriptions/listen`) | never advertised (no channel to notify on) | yes |
 | Session id minted | never | never | yes |
 
