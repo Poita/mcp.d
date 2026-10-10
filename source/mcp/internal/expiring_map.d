@@ -48,8 +48,11 @@ package(mcp) struct BoundedExpiringMap(V)
 			tail = n;
 		}
 
+		/// Unlink `n`; a no-op when it is not linked here.
 		void unlink(Node n) @safe
 		{
+			if (n.prev is null && head !is n)
+				return;
 			if (n.prev !is null)
 				n.prev.next = n.next;
 			else
@@ -211,9 +214,13 @@ package(mcp) struct BoundedExpiringMap(V)
 			unusedOrder.unlink(n);
 	}
 
-	/// Drop `n` as expired or evicted and report it to `onEvict`.
+	/// Drop `n` as expired or evicted and report it to `onEvict`. A no-op when
+	/// `n` is no longer stored, as when an earlier `onEvict` removed it.
 	private void evict(Node n) @safe
 	{
+		auto p = n.key in nodes;
+		if (p is null || *p !is n)
+			return;
 		drop(n);
 		if (onEvict !is null)
 			onEvict(n.key, n.value);
@@ -409,4 +416,32 @@ unittest  // BoundedExpiringMap lookups check only their own key between sweeps
 	assert(m.length == 2, "a lookup of one key must not sweep the whole table");
 	assert(!m.contains("a"), "an expired key is never reported present");
 	assert(m.length == 1);
+}
+
+unittest  // BoundedExpiringMap survives an onEvict that removes another expiring entry
+{
+	import core.time : MonoTime, minutes;
+
+	auto clk = MonoTime.currTime;
+	auto m = BoundedExpiringMap!int(10.minutes, 0, () @safe => clk);
+	string[] evicted;
+	m.onEvict = (string key, int) @safe {
+		evicted ~= key;
+		if (evicted.length == 1)
+			foreach (other; ["a", "b", "c"])
+				if (other != key)
+					m.remove(other);
+	};
+	m.put("a", 1);
+	m.put("b", 2);
+	m.put("c", 3);
+	clk += 5.minutes;
+	m.put("d", 4);
+	clk += 6.minutes; // a, b and c are past their TTL; d is not
+	assert(m.contains("d"));
+	assert(evicted.length == 1, "an entry removed by onEvict is not evicted again");
+	assert(m.length == 1);
+	m.put("e", 5);
+	assert(m.evictOldest());
+	assert(!m.contains("d") && m.contains("e"), "the activity list stays intact");
 }
