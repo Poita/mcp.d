@@ -19,7 +19,7 @@ import mcp.auth.resource_server : TokenInfo;
 import mcp.server.request_state : RequestStateSecurity, RequestStateMode,
 	RequestStateBinding, RequestStateCodec,
 	generateEphemeralKey, verifyIncomingRequestState, secureOutgoingRequestState;
-import mcp.server.task_store : TaskStore, InMemoryTaskStore;
+import mcp.server.task_store : TaskStore, InMemoryTaskStore, TaskRecord;
 import mcp.server.task_runtime : TaskRuntime, TaskOptions, TaskCreateOptions;
 import mcp.server.skill_index : SkillIndex;
 import mcp.protocol.tasks : TaskSupport;
@@ -1212,7 +1212,8 @@ final class McpServer : ServerCore
 	/// a task created without an authenticated principal, only over stdio; HTTP
 	/// clients poll `tasks/get`). Returns the `TaskRuntime` so tools can create and resolve tasks.
 	/// Throws on a `stateful` server, which never negotiates the modern protocol
-	/// the extension requires.
+	/// the extension requires, and when the current runtime already holds tasks,
+	/// which replacing it would drop.
 	TaskRuntime enableTasks(TaskOptions opts = TaskOptions.init) @safe
 	{
 		if (mode_ == ServerMode.stateful)
@@ -1220,7 +1221,17 @@ final class McpServer : ServerCore
 					~ " Tasks extension is modern-only and a stateful server never speaks"
 					~ " 2026-07-28. Construct the server with McpServer.stateless() instead.");
 		if (taskRuntime_ !is null)
+		{
+			bool holdsTasks;
+			taskRuntime_.store.removeIf((const TaskRecord) @safe {
+				holdsTasks = true;
+				return false;
+			});
+			if (holdsTasks)
+				throw new Exception("enableTasks() must come before any task is created:"
+						~ " a new runtime would drop the tasks the current one holds");
 			taskRuntime_.stopSweeper();
+		}
 		taskRuntime_ = new TaskRuntime(opts);
 		taskRuntime_.exposeInternalErrors = exposeInternalErrors_;
 		taskDispatcher_ = (opts.dispatcher is null) ? new InProcessTaskDispatcher()
@@ -7519,6 +7530,27 @@ unittest  // enableTasks throws on a stateful server (Tasks is modern-only)
 	auto s = McpServer.stateful("t", "1");
 	assertThrown(s.enableTasks());
 	assert(s.tasks() is null);
+}
+
+unittest  // enableTasks throws rather than replace a runtime that holds tasks
+{
+	import std.exception : assertThrown;
+
+	auto s = new McpServer("t", "1");
+	auto rt = s.enableTasks();
+	const id = rt.create().taskId;
+	assertThrown(s.enableTasks());
+	assert(s.tasks() is rt);
+	assert(!rt.statusOf(id).isNull);
+}
+
+unittest  // enableTasks may replace a runtime that holds no tasks
+{
+	auto s = new McpServer("t", "1");
+	auto first = s.enableTasks();
+	auto second = s.enableTasks();
+	assert(second !is first);
+	assert(s.tasks() is second);
 }
 
 unittest  // enableEvents throws on a stateful server (Events is modern-only)
