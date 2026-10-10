@@ -122,7 +122,10 @@ struct Task
 	{
 		requireObject(j, "Task");
 		Task t;
-		t.taskId = j.getOr("taskId", "");
+		auto id = "taskId" in j;
+		if (id is null || id.type != Json.Type.string || id.get!string.length == 0)
+			throw invalidParams("'Task.taskId' must be a non-empty string");
+		t.taskId = id.get!string;
 		// A missing or non-string status parses as `unknown` (terminal), so a
 		// poller stops instead of waiting forever on a state it cannot read.
 		t.status = taskStatusFromWire(j.getOr("status", ""));
@@ -464,4 +467,19 @@ unittest  // Task.fromJson reads a null ttlMs as unlimited and a missing pollInt
 	auto t = Task.fromJson(Json(["taskId": Json("x"), "ttlMs": Json(null)]));
 	assert(t.ttlMs.isNull);
 	assert(t.pollIntervalMs.isNull);
+}
+
+unittest  // Task.fromJson rejects a missing taskId with -32602
+{
+	assert(rejectsTask(Json(["ttlMs": Json(null)])));
+}
+
+unittest  // Task.fromJson rejects an empty taskId with -32602
+{
+	assert(rejectsTask(Json(["taskId": Json(""), "ttlMs": Json(null)])));
+}
+
+unittest  // Task.fromJson rejects a non-string taskId with -32602
+{
+	assert(rejectsTask(Json(["taskId": Json(7), "ttlMs": Json(null)])));
 }
