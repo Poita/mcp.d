@@ -1162,6 +1162,7 @@ struct CallToolResult
 		{
 			j["resultType"] = "input_required";
 			emitInputRequired(j, inputRequests, requestState);
+			emitMetaField(j);
 			return j;
 		}
 		Json arr = Json.emptyArray;
@@ -2829,6 +2830,25 @@ unittest  // CallToolResult.fromJson detects an MRTR InputRequiredResult
 	assert(r.inputRequests[0].id == "date");
 	assert(r.inputRequests[0].type == "elicitation");
 	assert(r.inputRequests[0].params["message"].get!string == "When?");
+}
+
+unittest  // input-required tool, resource and prompt results carry _meta both ways
+{
+	import std.meta : AliasSeq;
+
+	static foreach (T; AliasSeq!(CallToolResult, ReadResourceResult, GetPromptResult))
+	{
+		{
+			T r;
+			r.requestState = "s";
+			r.meta = Json(["x.example/k": Json("v")]);
+			auto j = r.toJson();
+			assert(j["_meta"]["x.example/k"].get!string == "v", T.stringof);
+			auto back = T.fromJson(j);
+			assert(back.isInputRequired(), T.stringof);
+			assert(back.meta["x.example/k"].get!string == "v", T.stringof);
+		}
+	}
 }
 
 unittest  // CallToolResult.toJson serializes inputRequests as a map keyed by id
@@ -4613,6 +4633,7 @@ struct ReadResourceResult
 			Json j = Json.emptyObject;
 			j["resultType"] = "input_required";
 			emitInputRequired(j, inputRequests, requestState);
+			emitMetaField(j);
 			return j;
 		}
 		Json j = Json.emptyObject;
@@ -4632,6 +4653,7 @@ struct ReadResourceResult
 		ReadResourceResult r;
 		// An InputRequiredResult carries `inputRequests` instead of `contents`.
 		parseInputRequired(j, r.inputRequests, r.requestState);
+		r.parseMetaField(j);
 		if (r.isInputRequired)
 			return r;
 		if ("contents" in j && j["contents"].type == Json.Type.array)
@@ -4640,7 +4662,6 @@ struct ReadResourceResult
 			foreach (i; 0 .. arr.length)
 				r.contents ~= ResourceContents.fromJson(arr[i]);
 		}
-		r.parseMetaField(j);
 		r.cache = parseCacheHint(j);
 		return r;
 	}
@@ -5155,6 +5176,7 @@ struct GetPromptResult
 			Json j = Json.emptyObject;
 			j["resultType"] = "input_required";
 			emitInputRequired(j, inputRequests, requestState);
+			emitMetaField(j);
 			return j;
 		}
 		Json j = Json.emptyObject;
@@ -5174,6 +5196,7 @@ struct GetPromptResult
 		GetPromptResult r;
 		// An InputRequiredResult carries `inputRequests` instead of `messages`.
 		parseInputRequired(j, r.inputRequests, r.requestState);
+		r.parseMetaField(j);
 		if (r.isInputRequired)
 			return r;
 		tryGet(j, "description", r.description);
@@ -5183,7 +5206,6 @@ struct GetPromptResult
 			foreach (i; 0 .. arr.length)
 				r.messages ~= PromptMessage.fromJson(arr[i]);
 		}
-		r.parseMetaField(j);
 		return r;
 	}
 
