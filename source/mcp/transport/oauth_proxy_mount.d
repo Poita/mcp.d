@@ -535,6 +535,12 @@ struct OAuthProxyMountOptions
 	/// own block. IPv4 peers are keyed per address.
 	uint ipv6BucketPrefix = defaultIpv6BucketPrefix;
 
+	/// The secret that signs consent cookies, so the proxy honours only cookie
+	/// values it minted. Empty uses a random key per mount: browsers are then
+	/// shown the consent screen again after a restart, and every instance
+	/// behind a load balancer needs the same configured key.
+	immutable(ubyte)[] consentCookieKey;
+
 	/// Injectable monotonic clock for the rate limiter (tests). Null uses
 	/// `MonoTime.currTime`.
 	MonoTime delegate() @safe clock;
@@ -594,22 +600,89 @@ enum string insecureConsentCookieName = "mcp_proxy_consent";
 /// is shown the consent screen again.
 private enum long consentCookieMaxAgeSeconds = 30L * 24 * 60 * 60;
 
+/// Mints, sets and reads back the consent cookie. A value is a random handle
+/// followed by its HMAC-SHA256 under `key`, and a request's cookie is honoured
+/// only when that MAC verifies, so a cookie planted with a value of someone
+/// else's choosing (possible over plain http, which has no `__Host-` prefix)
+/// is ignored.
+package struct ConsentCookie
+{
+	private immutable(ubyte)[] key;
+	private bool secure;
+
+	/// A cookie signed with `key` (a fresh random key when empty), served
+	/// under the https name when `secure`.
+	this(immutable(ubyte)[] key, bool secure) @safe
+	{
+		if (key.length == 0)
+		{
+			import mcp.auth.csprng : cryptoRandomFill;
+
+			auto fresh = new ubyte[32];
+			cryptoRandomFill(fresh);
+			key = (() @trusted => cast(immutable(ubyte)[]) fresh)();
+		}
+		this.key = key;
+		this.secure = secure;
+	}
+
+	/// A fresh signed cookie value.
+	string mint() @safe
+	{
+		return sign(mintState());
+	}
+
+	/// The signed cookie value for the handle `id`.
+	string sign(string id) @safe
+	{
+		return id ~ "." ~ mac(id);
+	}
+
+	/// The request's consent cookie value when it carries a valid signature,
+	/// else "".
+	string of(scope HTTPServerRequest req) @safe
+	{
+		import std.string : lastIndexOf;
+		import mcp.auth.oauth : constantTimeEquals;
+
+		const value = req.cookies.get(consentCookieNameFor(secure), "");
+		const dot = value.lastIndexOf('.');
+		if (dot <= 0)
+			return "";
+		return constantTimeEquals(value[dot + 1 .. $], mac(value[0 .. dot])) ? value : "";
+	}
+
+	/// Set the cookie to `value` on `res`.
+	void set(scope HTTPServerResponse res, string value) @safe
+	{
+		import vibe.http.common : Cookie;
+
+		auto c = res.setCookie(consentCookieNameFor(secure), value, "/");
+		c.httpOnly = true;
+		c.secure = secure;
+		// Lax: the cookie must accompany the top-level GET /authorize navigation a
+		// client starts from another site; the consent POST itself is same-site.
+		c.sameSite = Cookie.SameSite.lax;
+		c.maxAge = consentCookieMaxAgeSeconds;
+	}
+
+	private string mac(string id) @safe
+	{
+		import std.digest.hmac : hmac;
+		import std.digest.sha : SHA256;
+		import std.string : representation;
+		import mcp.auth.oauth : base64UrlNoPad;
+
+		auto h = hmac!SHA256(key);
+		h.put(id.representation);
+		const digest = h.finish();
+		return base64UrlNoPad(digest[]);
+	}
+}
+
 private string consentCookieNameFor(bool secure) @safe
 {
 	return secure ? consentCookieName : insecureConsentCookieName;
-}
-
-private void setConsentCookie(scope HTTPServerResponse res, string value, bool secure) @safe
-{
-	import vibe.http.common : Cookie;
-
-	auto c = res.setCookie(consentCookieNameFor(secure), value, "/");
-	c.httpOnly = true;
-	c.secure = secure;
-	// Lax: the cookie must accompany the top-level GET /authorize navigation a
-	// client starts from another site; the consent POST itself is same-site.
-	c.sameSite = Cookie.SameSite.lax;
-	c.maxAge = consentCookieMaxAgeSeconds;
 }
 
 /// Headers that keep the consent screen from being cached, leaking the proxy
@@ -659,9 +732,11 @@ void mountOAuthProxy(URLRouter router, OAuthProxy proxy,
 	auto limit = proxyRequestLimit(opts);
 	mountOAuthMetadata(router, proxy);
 	mountOAuthRegister(router, proxy, limit);
-	mountOAuthAuthorize(router, proxy, store, limit, proxyClientKey(opts));
-	mountOAuthConsent(router, proxy, store);
-	mountOAuthCallback(router, proxy, store);
+	auto cookie = ConsentCookie(opts.consentCookieKey, proxy.config()
+			.baseUrl.startsWith("https://"));
+	mountOAuthAuthorize(router, proxy, store, cookie, limit, proxyClientKey(opts));
+	mountOAuthConsent(router, proxy, store, cookie);
+	mountOAuthCallback(router, proxy, store, cookie);
 	mountOAuthToken(router, proxy);
 }
 
@@ -808,13 +883,12 @@ void mountOAuthRegister(URLRouter router, OAuthProxy proxy, ProxyRequestLimit li
 /// of the request that started it, which `store` caps per client; a null
 /// `clientKey` records none.
 void mountOAuthAuthorize(URLRouter router, OAuthProxy proxy, ProxyStateStore store,
-		ProxyRequestLimit limit = null, ProxyClientKey clientKey = null) @safe
+		ConsentCookie cookie, ProxyRequestLimit limit = null, ProxyClientKey clientKey = null) @safe
 {
 	auto cfg = proxy.config();
 	const authorizePath = pathOf(cfg.authorizeEndpoint());
 	const issuer = proxyIssuer(proxy);
 	const consentPath = pathOf(cfg.consentEndpoint());
-	const secureCookie = cfg.baseUrl.startsWith("https://");
 
 	router.get(authorizePath, (HTTPServerRequest req, HTTPServerResponse res) @safe {
 		if (limit !is null && !limit(req))
@@ -917,10 +991,10 @@ void mountOAuthAuthorize(URLRouter router, OAuthProxy proxy, ProxyStateStore sto
 		// Consent is recorded per browser: the consent cookie names this browser,
 		// and a browser without one is given a fresh, unguessable handle (set only
 		// if the consent screen is shown).
-		string consentSession = req.cookies.get(consentCookieNameFor(secureCookie), "");
+		string consentSession = cookie.of(req);
 		const newConsentSession = consentSession.length == 0;
 		if (newConsentSession)
-			consentSession = mintState();
+			consentSession = cookie.mint();
 		const csrfToken = mintState();
 		const client = clientKey !is null ? clientKey(req) : "";
 
@@ -935,7 +1009,7 @@ void mountOAuthAuthorize(URLRouter router, OAuthProxy proxy, ProxyStateStore sto
 			// client_name (empty for a DCR client, which has no attested name).
 			setConsentPageHeaders(res);
 			if (newConsentSession)
-				setConsentCookie(res, consentSession, secureCookie);
+				cookie.set(res, consentSession);
 			res.statusCode = HTTPStatus.ok;
 			res.writeBody(consentScreenHtml(ConsentScreen(clientNameForDisplay,
 				clientIdForDisplay, redirectForDisplay,
@@ -1000,12 +1074,12 @@ void mountOAuthAuthorize(URLRouter router, OAuthProxy proxy, ProxyStateStore sto
 /// proxy state out of the URL (no Referer/history/log leakage).
 ///
 /// The `store` MUST be the one `mountOAuthAuthorize` writes to.
-void mountOAuthConsent(URLRouter router, OAuthProxy proxy, ProxyStateStore store) @safe
+void mountOAuthConsent(URLRouter router, OAuthProxy proxy,
+		ProxyStateStore store, ConsentCookie cookie) @safe
 {
 	import mcp.auth.oauth : constantTimeEquals;
 
 	const consentPath = pathOf(proxy.config().consentEndpoint());
-	const secureCookie = proxy.config().baseUrl.startsWith("https://");
 	router.post(consentPath, (HTTPServerRequest req, HTTPServerResponse res) @safe {
 		const form = readFormString(req);
 		if (!formDecodes(form))
@@ -1025,7 +1099,7 @@ void mountOAuthConsent(URLRouter router, OAuthProxy proxy, ProxyStateStore store
 			res.writeBody("Unknown or expired authorization state", "text/plain");
 			return;
 		}
-		const browserSession = req.cookies.get(consentCookieNameFor(secureCookie), "");
+		const browserSession = cookie.of(req);
 		const fromSameBrowser = st.consentSession.length
 			&& constantTimeEquals(browserSession, st.consentSession);
 		const csrfOk = st.csrfToken.length && constantTimeEquals(formField(form,
@@ -1114,14 +1188,14 @@ void mountOAuthConsent(URLRouter router, OAuthProxy proxy, ProxyStateStore store
 /// redirect_uri. A refused callback leaves the pending authorization in place.
 ///
 /// The `store` MUST be the one `mountOAuthAuthorize` writes to.
-void mountOAuthCallback(URLRouter router, OAuthProxy proxy, ProxyStateStore store) @safe
+void mountOAuthCallback(URLRouter router, OAuthProxy proxy,
+		ProxyStateStore store, ConsentCookie cookie) @safe
 {
 	import mcp.auth.oauth : constantTimeEquals;
 
 	const callbackPath = pathOf(proxy.config().callbackUrl());
 	const issuer = proxyIssuer(proxy);
 	const upstreamIssuer = proxy.config().upstreamIssuer;
-	const secureCookie = proxy.config().baseUrl.startsWith("https://");
 	router.get(callbackPath, (HTTPServerRequest req, HTTPServerResponse res) @safe {
 		const code = req.query.get("code", "");
 		const upstreamError = req.query.get("error", "");
@@ -1134,7 +1208,7 @@ void mountOAuthCallback(URLRouter router, OAuthProxy proxy, ProxyStateStore stor
 			res.writeBody("Unknown or expired authorization state", "text/plain");
 			return;
 		}
-		const browserSession = req.cookies.get(consentCookieNameFor(secureCookie), "");
+		const browserSession = cookie.of(req);
 		const consentIdentity = pending.clientId.length ? pending.clientId
 			: pending.clientRedirectUri;
 		if (pending.consentSession.length == 0 || !constantTimeEquals(browserSession,
@@ -2195,15 +2269,15 @@ unittest  // CONSENT: a consented browser asking for broader scopes sees the con
 
 	auto proxy = new OAuthProxy(cfg);
 	proxy.register(["http://localhost:5000/cb"]);
-	proxy.grantConsent("browser-1", "http://localhost:5000/cb", ["read"]);
+	proxy.grantConsent(browser1, "http://localhost:5000/cb", ["read"]);
 	auto router = new URLRouter;
-	mountOAuthProxy(router, proxy);
+	mountOAuthProxy(router, proxy, testMountOptions());
 
 	int statusFor(string scope_) @safe
 	{
 		auto sink = createMemoryOutputStream();
 		auto req = createTestHTTPServerRequest(URL("https://mcp.example.com/authorize?client_id=Iv1.upstream&response_type=code&code_challenge_method=S256&code_challenge=CH&scope=" ~ scope_ ~ "&redirect_uri=http%3A%2F%2Flocalhost%3A5000%2Fcb&state=cs"));
-		req.headers["Cookie"] = consentCookieName ~ "=browser-1";
+		req.headers["Cookie"] = consentCookieName ~ "=" ~ browser1;
 		auto res = createTestHTTPServerResponse(sink, null, TestHTTPResponseMode.bodyOnly);
 		router.handleRequest(req, res);
 		return res.statusCode;
@@ -2404,6 +2478,69 @@ unittest  // CONSENT BINDING: one browser's approval does not let another browse
 	assert(other.status != 302);
 }
 
+version (unittest)
+{
+	private immutable(ubyte)[] testCookieKey() @safe
+	{
+		return cast(immutable(ubyte)[]) "test consent cookie key";
+	}
+
+	// The consent cookie the test mounts sign with.
+	private ConsentCookie testCookie() @safe
+	{
+		return ConsentCookie(testCookieKey, true);
+	}
+
+	private OAuthProxyMountOptions testMountOptions() @safe
+	{
+		OAuthProxyMountOptions opts;
+		opts.consentCookieKey = testCookieKey;
+		return opts;
+	}
+
+	// A browser's consent cookie value, valid under the test mounts.
+	private string browser1() @safe
+	{
+		return testCookie.sign("browser-1");
+	}
+}
+
+unittest  // CONSENT COOKIE: a planted cookie value the proxy never minted is ignored
+{
+	auto proxy = new OAuthProxy(consentMountConfig());
+	proxy.register(["http://localhost:5000/cb"]);
+	proxy.grantConsent("planted", "http://localhost:5000/cb", ["read"]);
+	auto router = new URLRouter;
+	mountOAuthProxy(router, proxy);
+
+	const hit = browserGet(router, "https://mcp.example.com/authorize?client_id=Iv1.upstream"
+			~ "&response_type=code&code_challenge_method=S256&code_challenge=CH"
+			~ "&scope=read&redirect_uri=http%3A%2F%2Flocalhost%3A5000%2Fcb&state=cs", "planted");
+	assert(hit.status == 200, "consent recorded under a planted value must not be honoured");
+	assert(hit.setCookie.length && hit.setCookie != "planted");
+}
+
+unittest  // CONSENT COOKIE: a configured signing key keeps consent cookies valid across mounts
+{
+	OAuthProxyMountOptions opts;
+	opts.consentCookieKey = cast(immutable(ubyte)[]) "a stable consent cookie key";
+	auto proxy = new OAuthProxy(consentMountConfig());
+	proxy.register(["http://localhost:5000/cb"]);
+	const authorizeUrl = "https://mcp.example.com/authorize?client_id=Iv1.upstream"
+		~ "&response_type=code&code_challenge_method=S256&code_challenge=CH"
+		~ "&scope=read&redirect_uri=http%3A%2F%2Flocalhost%3A5000%2Fcb&state=cs";
+
+	auto first = new URLRouter;
+	mountOAuthProxy(first, proxy, opts);
+	const page = browserGet(first, authorizeUrl, "");
+	assert(browserPost(first, "https://mcp.example.com/consent",
+			consentForm(page.body_), page.setCookie).status == 302);
+
+	auto restarted = new URLRouter;
+	mountOAuthProxy(restarted, proxy, opts);
+	assert(browserGet(restarted, authorizeUrl, page.setCookie).status == 302);
+}
+
 unittest  // CONSENT BINDING: the approving browser skips the consent screen on its next authorization
 {
 	auto proxy = new OAuthProxy(consentMountConfig());
@@ -2594,14 +2731,14 @@ unittest  // UPSTREAM ERROR: /callback relays an upstream error to the client, n
 
 	auto proxy = new OAuthProxy(cfg);
 	proxy.register(["http://localhost:5000/cb"]);
-	proxy.grantConsent("browser-1", "http://localhost:5000/cb", ["read"]);
+	proxy.grantConsent(browser1, "http://localhost:5000/cb", ["read"]);
 	auto router = new URLRouter;
-	mountOAuthProxy(router, proxy);
+	mountOAuthProxy(router, proxy, testMountOptions());
 
 	// Drive /authorize to mint a proxy state and stash the pending authorization.
 	auto sink = createMemoryOutputStream();
 	auto req = createTestHTTPServerRequest(URL("https://mcp.example.com/authorize?client_id=Iv1.upstream&response_type=code&code_challenge_method=S256&code_challenge=CH&scope=read&redirect_uri=http%3A%2F%2Flocalhost%3A5000%2Fcb&state=cs"));
-	req.headers["Cookie"] = consentCookieName ~ "=browser-1";
+	req.headers["Cookie"] = consentCookieName ~ "=" ~ browser1;
 	auto res = createTestHTTPServerResponse(sink, null, TestHTTPResponseMode.bodyOnly);
 	router.handleRequest(req, res);
 	assert(res.statusCode == 302);
@@ -2618,7 +2755,7 @@ unittest  // UPSTREAM ERROR: /callback relays an upstream error to the client, n
 	// The upstream redirects back with an error and no code.
 	auto res2 = createTestHTTPServerResponse(null, null, TestHTTPResponseMode.bodyOnly);
 	auto req2 = createTestHTTPServerRequest(URL("https://mcp.example.com/auth/callback?error=access_denied&error_description=denied&state=" ~ proxyState));
-	req2.headers["Cookie"] = consentCookieName ~ "=browser-1";
+	req2.headers["Cookie"] = consentCookieName ~ "=" ~ browser1;
 	router.handleRequest(req2, res2);
 
 	assert(res2.statusCode == 302);
@@ -2675,18 +2812,18 @@ unittest  // CIMD MOUNT: /authorize with a URL client_id + prior consent 302s up
 
 	auto proxy = cimdProxyWithStubDoc(cimdMountConfig(), cimdMountDoc());
 	// Consent is keyed on the stable client_id URL for CIMD clients.
-	proxy.grantConsent("browser-1", "https://app.example.com/oauth/client.json", [
+	proxy.grantConsent(browser1, "https://app.example.com/oauth/client.json", [
 		"read"
 	]);
 	auto router = new URLRouter;
-	mountOAuthProxy(router, proxy);
+	mountOAuthProxy(router, proxy, testMountOptions());
 
 	auto sink = createMemoryOutputStream();
 	auto req = createTestHTTPServerRequest(
 			URL("https://mcp.example.com/authorize?response_type=code&code_challenge_method=S256&"
 			~ "client_id=https%3A%2F%2Fapp.example.com%2Foauth%2Fclient.json"
 			~ "&code_challenge=CH&scope=read&redirect_uri=http%3A%2F%2F127.0.0.1%3A8765%2Fcb&state=cs"));
-	req.headers["Cookie"] = consentCookieName ~ "=browser-1";
+	req.headers["Cookie"] = consentCookieName ~ "=" ~ browser1;
 	auto res = createTestHTTPServerResponse(sink, null, TestHTTPResponseMode.bodyOnly);
 	router.handleRequest(req, res);
 
@@ -2756,11 +2893,11 @@ unittest  // CIMD MOUNT: a document whose client_id does not match the URL yield
 	auto badDoc = cimdMountDoc();
 	badDoc.clientId = "https://app.example.com/oauth/DIFFERENT.json"; // mismatch
 	auto proxy = cimdProxyWithStubDoc(cimdMountConfig(), badDoc);
-	proxy.grantConsent("browser-1", "https://app.example.com/oauth/client.json", [
+	proxy.grantConsent(browser1, "https://app.example.com/oauth/client.json", [
 		"read"
 	]);
 	auto router = new URLRouter;
-	mountOAuthProxy(router, proxy);
+	mountOAuthProxy(router, proxy, testMountOptions());
 
 	auto sink = createMemoryOutputStream();
 	auto req = createTestHTTPServerRequest(
@@ -2785,11 +2922,11 @@ unittest  // CIMD MOUNT: a redirect_uri not listed in the document yields 400 in
 	import vibe.stream.memory : createMemoryOutputStream;
 
 	auto proxy = cimdProxyWithStubDoc(cimdMountConfig(), cimdMountDoc());
-	proxy.grantConsent("browser-1", "https://app.example.com/oauth/client.json", [
+	proxy.grantConsent(browser1, "https://app.example.com/oauth/client.json", [
 		"read"
 	]);
 	auto router = new URLRouter;
-	mountOAuthProxy(router, proxy);
+	mountOAuthProxy(router, proxy, testMountOptions());
 
 	auto sink = createMemoryOutputStream();
 	// redirect_uri is not the one listed in the document.
@@ -3435,9 +3572,9 @@ unittest  // COMPOSE: the authorize/consent/callback legs share a state store an
 	// threading a single shared store between them (no monolithic mount).
 	auto router = new URLRouter;
 	auto store = new ProxyStateStore;
-	mountOAuthAuthorize(router, proxy, store);
-	mountOAuthConsent(router, proxy, store);
-	mountOAuthCallback(router, proxy, store);
+	mountOAuthAuthorize(router, proxy, store, testCookie);
+	mountOAuthConsent(router, proxy, store, testCookie);
+	mountOAuthCallback(router, proxy, store, testCookie);
 
 	// /authorize renders the consent screen and stashes pending auth under a state.
 	auto sink = createMemoryOutputStream();
@@ -3570,20 +3707,20 @@ version (unittest)
 			string codeChallenge, UpstreamExchange exchange) @safe
 	{
 		proxy.register(["http://localhost:5000/cb"]);
-		proxy.grantConsent("browser-1", "http://localhost:5000/cb", ["read"]);
+		proxy.grantConsent(browser1, "http://localhost:5000/cb", ["read"]);
 		auto router = new URLRouter;
 		auto store = new ProxyStateStore;
-		mountOAuthAuthorize(router, proxy, store);
-		mountOAuthCallback(router, proxy, store);
+		mountOAuthAuthorize(router, proxy, store, testCookie);
+		mountOAuthCallback(router, proxy, store, testCookie);
 		mountOAuthToken(router, proxy, exchange);
 
 		const upstream = browserGet(router, "https://mcp.example.com/authorize?client_id=Iv1.upstream&response_type=code&code_challenge_method=S256&code_challenge=" ~ codeChallenge ~ "&redirect_uri=http%3A%2F%2Flocalhost%3A5000%2Fcb&state=cs",
-				"browser-1");
+				browser1);
 		assert(upstream.status == 302);
 		const proxyState = upstream.location[upstream.location.indexOf("state=") + 6 .. $];
 		const relayed = browserGet(router,
 				"https://mcp.example.com/auth/callback?code=" ~ code ~ "&state=" ~ proxyState,
-				"browser-1");
+				browser1);
 		assert(relayed.location.startsWith("http://localhost:5000/cb?code=" ~ code));
 		return router;
 	}
@@ -4340,19 +4477,19 @@ unittest  // CIMD MOUNT: a rejected CIMD authorization leaves no pending state b
 	import vibe.stream.memory : createMemoryOutputStream;
 
 	auto proxy = cimdProxyWithStubDoc(cimdMountConfig(), cimdMountDoc());
-	proxy.grantConsent("browser-1", "https://app.example.com/oauth/client.json", [
+	proxy.grantConsent(browser1, "https://app.example.com/oauth/client.json", [
 		"read"
 	]);
 	auto router = new URLRouter;
 	auto store = new ProxyStateStore;
-	mountOAuthAuthorize(router, proxy, store);
+	mountOAuthAuthorize(router, proxy, store, testCookie);
 
 	auto sink = createMemoryOutputStream();
 	auto req = createTestHTTPServerRequest(
 			URL("https://mcp.example.com/authorize?response_type=code&code_challenge_method=S256&"
 			~ "client_id=https%3A%2F%2Fapp.example.com%2Foauth%2Fclient.json"
 			~ "&code_challenge=CH&redirect_uri=http%3A%2F%2F127.0.0.1%3A9999%2Fother&state=cs"));
-	req.headers["Cookie"] = consentCookieName ~ "=browser-1";
+	req.headers["Cookie"] = consentCookieName ~ "=" ~ browser1;
 	auto res = createTestHTTPServerResponse(sink, null, TestHTTPResponseMode.bodyOnly);
 	router.handleRequest(req, res);
 
