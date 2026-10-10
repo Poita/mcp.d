@@ -292,6 +292,8 @@ private struct ResponseHead
 	string wwwAuthenticate;
 	/// The `Content-Length`, -1 when absent or unparseable.
 	long contentLength = -1;
+	/// The `Location` header, empty when absent.
+	string location;
 
 	/// Record one header line (`Name: value`, CR stripped).
 	void addHeader(string line) @safe
@@ -311,6 +313,8 @@ private struct ResponseHead
 			sessionId = value;
 		else if (name == "www-authenticate")
 			wwwAuthenticate = value;
+		else if (name == "location")
+			location = value;
 		else if (name == "content-length")
 		{
 			import std.conv : to;
@@ -966,9 +970,24 @@ final class HttpClientTransport : ClientTransport
 		const sentSession = sessionId.length > 0;
 		int status;
 		string failure;
-		postAndAwaitRaw(message, expectId, bearer, cursor, result, got, err, status, failure, req);
-		if (req.aborted !is null)
-			throw req.aborted;
+		// A same-origin 307/308 is followed with the same method and body
+		// (RFC 9110 §15.4.8-9), a bounded number of times.
+		enum maxRedirects = 5;
+		string target = url;
+		foreach (redirects; 0 .. maxRedirects + 1)
+		{
+			string next;
+			postAndAwaitRaw(message, expectId, bearer, target, next, cursor,
+					result, got, err, status, failure, req);
+			if (req.aborted !is null)
+				throw req.aborted;
+			if (next.length == 0)
+				break;
+			if (redirects == maxRedirects)
+				throw new HttpStatusException(status,
+						"MCP endpoint redirected more than " ~ idStr(maxRedirects) ~ " times");
+			target = next;
+		}
 
 		// A 404 under a session means the session is gone: drop the id and mark it
 		// so later requests fail until an `initialize` starts a new session.
@@ -1106,12 +1125,14 @@ final class HttpClientTransport : ClientTransport
 	/// dispatched (via `dispatchSse`) as soon as each complete event is received —
 	/// the key property the pooled `requestHTTP` reader does not provide (see
 	/// `postAndAwait`). Mirrors the chunked-decode SSE parser of
-	/// `runServerStream`/`resumeViaGet`.
-	private void postAndAwaitRaw(Json message, long expectId, string bearer, ref SseCursor cursor,
-			ref Json result, ref bool got, ref McpException err, out int status,
-			out string dropped, PostRequest req = null) @safe
+	/// `runServerStream`/`resumeViaGet`. The POST goes to `target`; a 307/308
+	/// redirect to a same-origin URL leaves that URL in `redirect` for the
+	/// caller to repeat the POST at, and reads nothing more.
+	private void postAndAwaitRaw(Json message, long expectId, string bearer, string target,
+			out string redirect, ref SseCursor cursor, ref Json result, ref bool got,
+			ref McpException err, out int status, out string dropped, PostRequest req = null) @safe
 	{
-		const ep = parseHttpEndpoint(url);
+		const ep = parseHttpEndpoint(target);
 		// Resolve + pin the user-configured endpoint host to a numeric address; the
 		// connect targets the pinned IP while `ep.host` is still used for SNI/Host.
 		const pinnedHost = pinnedEndpointHost(ep);
@@ -1165,6 +1186,16 @@ final class HttpClientTransport : ClientTransport
 				const chunked = head.chunked;
 				const wwwAuthenticate = head.wwwAuthenticate;
 				adoptSession(message, head.sessionId);
+
+				if ((status == 307 || status == 308) && head.location.length)
+				{
+					// `resolveEndpointUri` yields null for a cross-origin URL, whose
+					// redirect is surfaced as the HTTP error below instead, so the
+					// bearer never leaves the configured origin.
+					redirect = resolveEndpointUri(target, head.location);
+					if (redirect.length)
+						return;
+				}
 
 				// A 400/404/405 is the legacy-fallback signal: read the (small) body
 				// and surface a recognised modern JSON-RPC error if present.
@@ -6646,4 +6677,73 @@ unittest  // readResponseHead skips interim 1xx responses to the final head
 	const head = HttpClientTransport.readResponseHead(stream);
 	assert(head.status == 200, "an interim 1xx head must not be taken as the final response");
 	assert(head.sse);
+}
+
+version (unittest)
+{
+	/// Run `initialize` + `tools/list` against a client pointed at `/old`,
+	/// which the server answers with `status` redirecting to `location`.
+	/// Returns what the scenario threw (null when it succeeded) and counts the
+	/// POSTs `/mcp` served.
+	private string redirectedListTools(int status, string location, out int served)
+	{
+		import std.array : replace;
+		import mcp.client.client : McpClient;
+
+		int count;
+		auto r = answeringRouter((Json req, HTTPServerResponse res) @safe {
+			auto reply = parseJsonString(`{"jsonrpc":"2.0","result":{"tools":[]}}`);
+			reply["id"] = req["id"];
+			res.writeBody(reply.toString(), "application/json");
+		});
+		auto outer = new URLRouter;
+		outer.post("/old", (HTTPServerRequest req, HTTPServerResponse res) @safe {
+			res.statusCode = status;
+			res.headers["Location"] = location;
+			res.writeBody("", "text/plain");
+		});
+		outer.post("/mcp", (HTTPServerRequest req, HTTPServerResponse res) @safe {
+			count++;
+		});
+		outer.any("*", r);
+		string thrown;
+		const failure = runAgainstFakeServer(outer, (string url) @safe {
+			auto client = McpClient.http(url.replace("/mcp", "/old"));
+			scope (exit)
+				client.close();
+			try
+			{
+				client.initialize("2025-11-25");
+				client.listTools();
+			}
+			catch (Exception e)
+				thrown = e.msg.length ? e.msg : "exception";
+		});
+		assert(failure.length == 0, "scenario failed: " ~ failure);
+		served = count;
+		return thrown;
+	}
+}
+
+unittest  // a request POST follows a same-origin 307 or 308 redirect
+{
+	int served;
+	assert(redirectedListTools(307, "/mcp", served) is null);
+	assert(served == 2, "initialize and tools/list must both reach the redirect target");
+	assert(redirectedListTools(308, "/mcp", served) is null);
+	assert(served == 2);
+}
+
+unittest  // a request POST does not follow a cross-origin redirect
+{
+	int served;
+	assert(redirectedListTools(307, "http://example.invalid/mcp", served) !is null);
+	assert(served == 0);
+}
+
+unittest  // a request POST stops following a redirect loop
+{
+	int served;
+	assert(redirectedListTools(307, "/old", served) !is null);
+	assert(served == 0);
 }
