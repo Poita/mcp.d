@@ -2399,23 +2399,20 @@ final class EventsRuntime
 	/// per-delivery hooks may be synchronous without blocking or spinning it.
 	void startDeliveryWorker(Duration interval) @safe
 	{
-		import vibe.core.core : runTask, sleep;
+		import vibe.core.core : runTask;
 
 		stopDeliveryWorker();
 		auto loop = new BackgroundLoop;
 		worker_ = loop;
 		loop.task = runTask(() nothrow @safe {
-			while (!loop.stopped)
+			do
 			{
 				try
 					tick();
 				catch (Exception e)
 					logEventsError("worker pass threw", e);
-				try
-					sleep(interval);
-				catch (Exception)
-					return; // interrupted: stopped, or the event loop is shutting down
 			}
+			while (loop.pause(interval));
 		});
 	}
 

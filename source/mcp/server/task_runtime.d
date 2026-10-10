@@ -329,21 +329,15 @@ final class TaskRuntime
 	/// (and stops) a sweeper already running.
 	void startSweeper(Duration interval) @safe
 	{
-		import vibe.core.core : runTask, sleep;
+		import vibe.core.core : runTask;
 		import vibe.core.log : logError;
 
 		stopSweeper();
 		auto loop = new BackgroundLoop;
 		sweeper_ = loop;
 		loop.task = runTask(() nothrow @safe {
-			while (!loop.stopped)
+			while (loop.pause(interval))
 			{
-				try
-					sleep(interval);
-				catch (Exception)
-					return; // interrupted: stopped, or the event loop is shutting down
-				if (loop.stopped)
-					return;
 				try
 					sweepExpired();
 				catch (Exception e)
