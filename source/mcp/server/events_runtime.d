@@ -635,7 +635,6 @@ final class EventsRuntime
 	private TrackedJob[string] trackedJobs_; // job id -> its subscription and position, while this node tracks it
 	private bool[string] enqueuing_; // job ids tracked whose enqueue call has not yet returned
 	private WebhookRef[string] heldWebhookRefs_; // subscription id -> lifecycle key acquired on this node
-	private Nullable!string[string] missed_; // subscription id -> furthest position dropped undelivered (null: none known), owed a gap
 	private Nullable!string[string] emitBackfill_; // emit-only subscription id -> ring-buffer position its paged backfill has reached
 	private BackgroundLoop worker_; // the periodic worker `startDeliveryWorker` runs
 	private bool backlogged_; // the last drain claimed a full batch, so more may be ready
@@ -1738,7 +1737,6 @@ final class EventsRuntime
 		foreach (jobId, job; trackedJobs_.dup)
 			if (job.subscriptionId == subId)
 				trackedJobs_.remove(jobId);
-		missed_.remove(subId);
 		emitBackfill_.remove(subId);
 		nextFetchAt_.remove(subId);
 		if (auto held = subId in heldWebhookRefs_)
@@ -1940,7 +1938,7 @@ final class EventsRuntime
 			// shared queue, on any other — and no dropped position is still
 			// owed a gap, which would otherwise be skipped past unreported.
 			if (!gap && er.events.length == 0 && (s.id in outstanding_) is null
-				&& (s.id in missed_) is null && !deliveryQueue_.hasPendingFor(s.id))
+				&& !s.owesGap && !deliveryQueue_.hasPendingFor(s.id))
 				s.cursor = er.cursor;
 			return true;
 		}, cur);
@@ -2797,36 +2795,56 @@ final class EventsRuntime
 		ackJob(job.jobId);
 	}
 
-	// Record `cursor` as a position `subId` missed. Only the furthest one is kept:
-	// the gap it produces tells the client to resume from there. A miss with no
-	// cursor is still owed a gap, which carries a null cursor unless a position
-	// is also missed.
+	// Record on the stored subscription that `cursor` was missed and a gap is
+	// owed. It is written before the missed position settles, so the watermark
+	// never advances past a loss the store does not also record. Only the
+	// furthest position is kept: the gap it produces tells the client to resume
+	// from there. A miss with no cursor is still owed a gap, which carries a
+	// null cursor unless a position is also missed.
 	private void noteMissed(string subId, Nullable!string cursor) @safe
 	{
 		import mcp.server.event_store : tryParseSeq;
 
-		if (auto prev = subId in missed_)
-		{
-			if (cursor.isNull)
-				return;
-			long prevSeq, candSeq;
-			if (!prev.isNull && tryParseSeq(prev.get, prevSeq)
+		modifyWebhook(subId, (ref WebhookSubscription sub) @safe {
+			if (sub.owesGap)
+			{
+				if (cursor.isNull)
+					return false;
+				long prevSeq, candSeq;
+				const prev = sub.missedCursor;
+				if (!prev.isNull && tryParseSeq(prev.get, prevSeq)
 					&& tryParseSeq(cursor.get, candSeq) && candSeq <= prevSeq)
-				return;
-		}
-		missed_[subId] = cursor;
+					return false;
+			}
+			sub.owesGap = true;
+			sub.missedCursor = cursor;
+			return true;
+		});
 	}
 
-	// Queue a `gap` job for the furthest position `sub` missed, if any.
+	// Queue a `gap` job for the furthest position `sub` missed, if one is owed,
+	// then clear the debt unless a further miss was recorded meanwhile. The gap
+	// is queued first, so a crash in between re-sends it rather than losing it.
 	private void flushMissed(WebhookSubscription sub) @safe
 	{
-		auto p = sub.id in missed_;
-		if (p is null)
+		auto sn = webhookStore_.get(sub.id);
+		if (sn.isNull || !sn.get.owesGap)
 			return;
-		const cursor = *p;
-		missed_.remove(sub.id);
-		if (enqueueGap(sub, cursor))
+		const cursor = sn.get.missedCursor;
+		if (enqueueGap(sn.get, cursor))
 			kickDrain();
+		modifyWebhook(sub.id, (ref WebhookSubscription cur) @safe {
+			if (!cur.owesGap || !sameCursor(cur.missedCursor, cursor))
+				return false;
+			cur.owesGap = false;
+			cur.missedCursor = Nullable!string.init;
+			return true;
+		});
+	}
+
+	private static bool sameCursor(const Nullable!string a, const Nullable!string b) @safe pure nothrow
+	{
+		return a.isNull ? b.isNull : (!b.isNull && a.get == b.get);
 	}
 
 	// Queue a `gap` job telling `sub`'s client to resume from `cursor` (or, when
@@ -3251,8 +3269,6 @@ final class EventsRuntime
 			known[subId] = true;
 		foreach (_, job; trackedJobs_)
 			known[job.subscriptionId] = true;
-		foreach (subId; missed_.byKey)
-			known[subId] = true;
 		foreach (subId; nextFetchAt_.byKey)
 			known[subId] = true;
 		foreach (subId; heldWebhookRefs_.byKey)
@@ -8798,7 +8814,7 @@ unittest  // multi-node: a subscription removed by another node leaves no state 
 	t.b.unsubscribeWebhook(u, "user-1");
 	t.a.tick();
 	assert(t.a.nextFetchAt_.length == 0 && t.a.outstanding_.length == 0);
-	assert(t.a.pendingCount_.length == 0 && t.a.missed_.length == 0);
+	assert(t.a.pendingCount_.length == 0);
 	assert(t.unsubscribedOnA == 1, "the node that provisioned the upstream tears it down");
 }
 
@@ -8855,7 +8871,8 @@ unittest  // attempt persistence: a job re-leased mid-retry does not restart att
 	assert(ft.eventPosts().length == 1);
 	// The job is settled (acked) and owes a gap, not retried forever.
 	assert(queue.lease(2_000_000, 1000, 0).length == 0);
-	assert(rt.missed_[r.id].get == "5");
+	auto owed = rt.webhookStore().get(r.id).get;
+	assert(owed.owesGap && owed.missedCursor.get == "5");
 }
 
 unittest  // the default retry schedule is 3-5 attempts spread over at most 15 minutes
@@ -8917,6 +8934,41 @@ unittest  // a gap owed after retries run out is delivered once the endpoint tak
 	rt.emit(EventOccurrence("evt_2", "n", "t"));
 	assert(ft.acceptedGaps.length == 1);
 	assert(ft.acceptedGaps[0]["cursor"].get!string == lost);
+}
+
+unittest  // an owed gap survives a restart over the same subscription store
+{
+	auto store = new InMemoryWebhookSubscriptionStore();
+	EventsRuntime nodeOver(FakeWebhookTransport ft) @safe
+	{
+		EventsOptions o;
+		o.nowMs = () @safe => 1_000_000L;
+		o.nowIso = () @safe => "t";
+		o.allowPrivateCallbackHosts = true;
+		o.webhookTransport = ft;
+		o.deliveryExecutor = (void delegate() @safe job) @safe { job(); };
+		o.deliverySleep = (Duration d) @safe {};
+		auto rt = new EventsRuntime(store, o);
+		EventRegistration reg = {descriptor: EventType("n"), emitOnly: true};
+		rt.register(reg);
+		return rt;
+	}
+
+	auto ft1 = new FakeWebhookTransport();
+	ft1.eventStatuses = [503, 503, 503, 503, 503];
+	ft1.failGaps = true;
+	auto rt1 = nodeOver(ft1);
+	auto r = rt1.subscribeWebhook(webhookSub("n", "https://proxy/hooks"), "user-1");
+	rt1.emit(EventOccurrence("evt_1", "n", "t"));
+	assert(ft1.acceptedGaps.length == 0);
+	assert(store.get(r.id).get.owesGap);
+
+	// A fresh runtime over the same store, as after a restart, still owes it.
+	auto ft2 = new FakeWebhookTransport();
+	auto rt2 = nodeOver(ft2);
+	rt2.emit(EventOccurrence("evt_2", "n", "t"));
+	assert(ft2.acceptedGaps.length == 1);
+	assert(!store.get(r.id).get.owesGap);
 }
 
 unittest  // monotonic watermark: an out-of-order older ack does not regress the cursor

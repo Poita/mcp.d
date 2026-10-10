@@ -281,6 +281,11 @@ struct WebhookSubscription
 	long previousSecretGraceUntilMs; /// rotation grace deadline (0 if none)
 	Nullable!string cursor; /// last safe-to-persist watermark the server computed
 	Nullable!string fetchCursor; /// position the poll-driven loop has fetched up to (check-backed types)
+	/// Whether events were dropped undelivered and the client is still owed a
+	/// `gap`. Persisted with the watermark it lets advance past them, so a restart
+	/// or another node still sends the gap.
+	bool owesGap;
+	Nullable!string missedCursor; /// furthest position dropped undelivered while `owesGap` (null: none known)
 	bool noExpiry; /// true => never lapses (server-managed lifetime)
 	long expiresAtMs; /// expiry (ms since epoch) when !noExpiry
 	bool active = true; /// false => delivery suspended after repeated failures
@@ -320,6 +325,12 @@ struct WebhookSubscription
 			j["cursor"] = cursor.get;
 		if (!fetchCursor.isNull)
 			j["fetchCursor"] = fetchCursor.get;
+		if (owesGap)
+		{
+			j["owesGap"] = true;
+			if (!missedCursor.isNull)
+				j["missedCursor"] = missedCursor.get;
+		}
 		j["noExpiry"] = noExpiry;
 		j["expiresAtMs"] = expiresAtMs;
 		j["active"] = active;
@@ -356,6 +367,9 @@ struct WebhookSubscription
 			s.cursor = j["cursor"].get!string;
 		if ("fetchCursor" in j && j["fetchCursor"].type == Json.Type.string)
 			s.fetchCursor = j["fetchCursor"].get!string;
+		s.owesGap = j.getOr("owesGap", false);
+		if (s.owesGap && "missedCursor" in j && j["missedCursor"].type == Json.Type.string)
+			s.missedCursor = j["missedCursor"].get!string;
 		s.noExpiry = j.getOr("noExpiry", false);
 		s.expiresAtMs = j.getOr("expiresAtMs", 0L);
 		s.active = j.getOr("active", true);
@@ -1248,6 +1262,19 @@ unittest  // WebhookSubscription round-trips through JSON
 	assert(back.arguments["severity"].get!string == "P1");
 	assert(back.secret == "whsec_abc" && back.cursor.get == "cursor_1");
 	assert(back.expiresAtMs == 5_000 && back.verified);
+}
+
+unittest  // WebhookSubscription round-trips an owed gap through JSON
+{
+	WebhookSubscription s;
+	s.id = "s";
+	assert("owesGap" !in s.toJson());
+	s.owesGap = true;
+	auto back = WebhookSubscription.fromJson(s.toJson());
+	assert(back.owesGap && back.missedCursor.isNull);
+	s.missedCursor = "c7";
+	back = WebhookSubscription.fromJson(s.toJson());
+	assert(back.owesGap && back.missedCursor.get == "c7");
 }
 
 unittest  // WebhookSubscription.isExpired honours noExpiry
