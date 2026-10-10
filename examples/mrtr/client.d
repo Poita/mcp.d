@@ -105,7 +105,6 @@ private int runE2E(McpClient client) @safe
 	// deliberately installs NO handlers). The no-handler call still surfaces the
 	// InputRequiredResult verbatim — advertising a capability is distinct from
 	// installing a handler to auto-resolve it.
-	client.capabilities.elicitation = true;
 	client.capabilities.elicitationForm = true;
 	client.capabilities.sampling = true;
 

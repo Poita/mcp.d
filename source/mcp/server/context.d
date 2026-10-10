@@ -675,9 +675,8 @@ private McpException missingClientCapability(ClientCapability cap, string messag
 		c.samplingContext = true;
 		break;
 	case ClientCapability.elicitation:
-		c.elicitation = true;
-		break;
 	case ClientCapability.elicitationForm:
+		// Any-mode elicitation is named as a bare `elicitation: {}`, i.e. form.
 		c.elicitationForm = true;
 		break;
 	case ClientCapability.elicitationUrl:
@@ -1303,7 +1302,7 @@ unittest  // a stateless RequestScope answers clientSupports from the request's 
 
 	Json[string] empty;
 	ClientCapabilities caps;
-	caps.elicitation = true;
+	caps.elicitationForm = true;
 	auto scope_ = new RequestScope(new LogProbe, true, empty, "info", true,
 			null, "", latestStable, caps);
 	assert(scope_.clientSupports(ClientCapability.elicitation));

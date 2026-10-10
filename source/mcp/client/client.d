@@ -2004,16 +2004,15 @@ final class McpClient : ClientProtocol
 	/// Whether `advertised` client capabilities declare support for elicitation
 	/// `mode`, per client/elicitation §Error Handling (2025-11-25): a request
 	/// whose `mode` was not declared in client capabilities must be rejected.
-	/// `elicitation` declares form mode (a bare `{}` parses as
-	/// elicitation=true, elicitationForm=true). An explicit url-only declaration
-	/// (`{"url":{}}` => elicitationUrl=true only) does NOT declare form mode, so
-	/// it must not satisfy the form case.
+	/// A bare `{}` parses as elicitationForm=true. An explicit url-only
+	/// declaration (`{"url":{}}` => elicitationUrl=true only) does NOT declare
+	/// form mode, so it must not satisfy the form case.
 	private static bool supportsElicitationMode(ClientCapabilities advertised, string mode) @safe
 	{
 		switch (mode)
 		{
 		case "form":
-			return advertised.elicitationForm || advertised.elicitation;
+			return advertised.elicitationForm;
 		case "url":
 			return advertised.elicitationUrl;
 		default:
@@ -3925,7 +3924,6 @@ final class McpClient : ClientProtocol
 		// caller has already advertised a submode explicitly.
 		if (onElicitation !is null && !caps.elicitationForm && !caps.elicitationUrl)
 		{
-			caps.elicitation = true;
 			caps.elicitationForm = true;
 		}
 		if (onListRoots !is null)
@@ -6703,14 +6701,13 @@ unittest  // installing onSampling auto-advertises the sampling capability
 unittest  // installing onElicitation auto-advertises elicitation (form submode)
 {
 	auto c = McpClient.http("http://localhost");
-	assert(!c.effectiveCapabilities().elicitation);
+	assert(!c.effectiveCapabilities().elicitationForm);
 	c.onElicitation = (ElicitParams params) @safe { return ElicitResult.init; };
 	auto caps = c.effectiveCapabilities();
-	assert(caps.elicitation);
 	assert(caps.elicitationForm); // a bare handler means form mode only
+	assert(!caps.elicitationUrl);
 	auto j = caps.toJson();
-	assert(j["elicitation"].type == Json.Type.object);
-	assert("form" in j["elicitation"]);
+	assert(j["elicitation"] == Json.emptyObject);
 }
 
 unittest  // installing onListRoots auto-advertises the roots capability
@@ -6927,7 +6924,6 @@ unittest  // elicitation/create rejects a mode the client did not advertise (-32
 {
 	auto c = McpClient.http("http://localhost");
 	// Advertise form mode only (the default bare elicitation declaration).
-	c.capabilities.elicitation = true;
 	c.capabilities.elicitationForm = true;
 
 	bool delegateCalled;
@@ -6956,7 +6952,6 @@ unittest  // elicitation/create rejects a mode the client did not advertise (-32
 unittest  // elicitation/create rejects an unknown mode (-32602)
 {
 	auto c = McpClient.http("http://localhost");
-	c.capabilities.elicitation = true;
 	c.capabilities.elicitationForm = true;
 
 	bool delegateCalled;
@@ -6983,7 +6978,6 @@ unittest  // elicitation/create rejects an unknown mode (-32602)
 unittest  // elicitation/create forwards an advertised mode to the delegate
 {
 	auto c = McpClient.http("http://localhost");
-	c.capabilities.elicitation = true;
 	c.capabilities.elicitationForm = true;
 	c.capabilities.elicitationUrl = true;
 
@@ -7063,7 +7057,6 @@ unittest  // bare elicitation declaration still accepts form-mode requests
 	auto c = McpClient.http("http://localhost");
 	// A bare `{}` declaration is parsed as elicitationForm=true; ensure the
 	// tightened check does not regress that case.
-	c.capabilities.elicitation = true;
 	c.capabilities.elicitationForm = true;
 
 	bool delegateCalled;
@@ -7085,7 +7078,6 @@ unittest  // installing onElicitation alone accepts an inbound form elicitation/
 	// Install ONLY the handler; set NO manual capability flags. The documented
 	// auto-advertise contract sends the form submode via effectiveCapabilities()
 	// at the handshake, so an inbound form request must be accepted (not -32602).
-	assert(!c.capabilities.elicitation);
 	assert(!c.capabilities.elicitationForm);
 
 	bool delegateCalled;
@@ -7104,7 +7096,6 @@ unittest  // installing onElicitation alone accepts an inbound form elicitation/
 unittest  // elicitation/complete for a known id is forwarded once, then ignored
 {
 	auto c = McpClient.http("http://localhost");
-	c.capabilities.elicitation = true;
 	c.capabilities.elicitationForm = true;
 	c.capabilities.elicitationUrl = true;
 	c.onElicitation = (ElicitParams) @safe { return ElicitResult.init; };
@@ -7389,7 +7380,6 @@ unittest  // a log message is still forwarded to the generic onNotification obse
 unittest  // elicitation/create defaults to form mode when mode is absent
 {
 	auto c = McpClient.http("http://localhost");
-	c.capabilities.elicitation = true;
 	c.capabilities.elicitationForm = true;
 
 	bool delegateCalled;
@@ -8061,7 +8051,6 @@ unittest  // MRTR: resolveInputRequest rejects url-mode elicitation when only fo
 {
 	auto c = McpClient.http("http://localhost/mcp");
 	// Install only form-mode elicitation capability; url mode is not advertised.
-	c.capabilities.elicitation = true;
 	c.capabilities.elicitationForm = true;
 	bool delegateCalled;
 	c.onElicitation = (ElicitParams) @safe {
@@ -8081,7 +8070,6 @@ unittest  // MRTR: resolveInputRequest rejects url-mode elicitation when only fo
 unittest  // MRTR: resolveInputRequest accepts form-mode elicitation when form capability advertised (#934)
 {
 	auto c = McpClient.http("http://localhost/mcp");
-	c.capabilities.elicitation = true;
 	c.capabilities.elicitationForm = true;
 	bool delegateCalled;
 	c.onElicitation = (ElicitParams) @safe {
@@ -8601,7 +8589,7 @@ unittest  // a cancelled-request id is evicted once its late response has been d
 unittest  // a completed URL-elicitation id is evicted from the in-flight tracking set
 {
 	auto c = McpClient.http("http://localhost");
-	c.capabilities.elicitation = true;
+	c.capabilities.elicitationForm = true;
 	c.capabilities.elicitationUrl = true;
 	c.onElicitation = (ElicitParams) @safe { return ElicitResult.init; };
 

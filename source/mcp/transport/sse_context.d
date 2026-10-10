@@ -4018,7 +4018,7 @@ unittest  // a stateless HttpStreamContext FORBIDS server->client requests
 	auto res = createTestHTTPServerResponse(sink, null, TestHTTPResponseMode.bodyOnly);
 	auto coord = new StreamCoordinator;
 	ClientCapabilities caps;
-	caps.elicitation = true;
+	caps.elicitationForm = true;
 	caps.elicitationForm = true; // client supports form-mode (so the gate is the only block)
 
 	auto s = McpServer.stateless("t", "1");

@@ -78,7 +78,6 @@ int main(string[] args) @safe
 		// Declare the tasks extension (plus elicitation, which labeled_count
 		// needs to answer its mid-task input request) before version negotiation.
 		client.enableTasks();
-		client.capabilities.elicitation = true;
 		client.capabilities.elicitationForm = true;
 		auto negotiated = client.connect();
 		checkEq(negotiated, ProtocolVersion.v2026_07_28, "connect() should negotiate 2026-07-28");

@@ -5175,7 +5175,7 @@ unittest  // a legacy stateless request gets a fresh state versioned by its head
 	assert(conn !is null, "a legacy stateless request must not share mutable server state");
 	assert(conn.negotiated == ProtocolVersion.v2025_06_18);
 	assert(!conn.clientCaps.sampling && !conn.clientCaps.roots
-			&& !conn.clientCaps.elicitation, "stateless legacy requests carry no capabilities");
+			&& !conn.clientCaps.elicitationForm, "stateless legacy requests carry no capabilities");
 }
 
 unittest  // a legacy stateless request without a version header assumes 2025-03-26
@@ -5243,8 +5243,8 @@ unittest  // two modern-stateless requests resolve to INDEPENDENT states
 	auto a = freshStatelessState("2026-07-28", pA);
 	auto b = freshStatelessState("2026-07-28", pB);
 	assert(a !is b, "each stateless request must get its own ConnectionState");
-	assert(a.clientCaps.sampling && !a.clientCaps.elicitation);
-	assert(b.clientCaps.elicitation && !b.clientCaps.sampling,
+	assert(a.clientCaps.sampling && !a.clientCaps.elicitationForm);
+	assert(b.clientCaps.elicitationForm && !b.clientCaps.sampling,
 			"request B must not observe request A's capabilities");
 }
 

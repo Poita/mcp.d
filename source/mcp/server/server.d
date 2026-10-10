@@ -2610,7 +2610,7 @@ final class McpServer : ServerCore
 			if (isUrl)
 				need.elicitationUrl = true;
 			else
-				need.elicitation = true;
+				need.elicitationForm = true;
 			break;
 		case InputKind.sampling:
 			const usesTools = reqst.params.type == Json.Type.object
@@ -2655,7 +2655,7 @@ final class McpServer : ServerCore
 				need.roots |= n.roots;
 				need.sampling |= n.sampling;
 				need.samplingTools |= n.samplingTools;
-				need.elicitation |= n.elicitation;
+				need.elicitationForm |= n.elicitationForm;
 				need.elicitationUrl |= n.elicitationUrl;
 				if (!kinds.canFind(r.type))
 					kinds ~= r.type;

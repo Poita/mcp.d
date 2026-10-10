@@ -538,7 +538,7 @@ unittest  // missingRequiredClientCapability carries data.requiredCapabilities
 unittest  // missingRequiredClientCapability requiredCapabilities matches ClientCapabilities.toJson
 {
 	ClientCapabilities req;
-	req.elicitation = true;
+	req.elicitationForm = true;
 	req.elicitationUrl = true;
 	auto e = missingRequiredClientCapability(req);
 	auto j = e.toErrorJson();

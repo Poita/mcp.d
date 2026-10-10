@@ -75,7 +75,7 @@ private int runScenario(string url, string scenario) @safe
 
 	auto client = McpClient.http(url);
 	client.capabilities.sampling = true;
-	client.capabilities.elicitation = true;
+	client.capabilities.elicitationForm = true;
 	client.capabilities.roots = true;
 	// The same handlers answer blocking server->client requests on a legacy
 	// session and MRTR input requests on a modern one.
