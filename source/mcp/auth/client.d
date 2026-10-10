@@ -92,7 +92,8 @@ enum AssertionAudience
 ///
 /// Access tokens are presented as `Bearer`, so the access-token grants reject a
 /// response whose `token_type` is anything else (such as `DPoP`);
-/// `tokenExchange`, which may issue a non-access token (`N_A`), does not.
+/// `tokenExchange` does so only when it requests an access token, since it may
+/// issue a non-access token (`N_A`).
 ///
 /// The interactive authorization-code redirect (opening a browser / running a
 /// loopback listener) is supplied by the host application via an
@@ -566,6 +567,8 @@ final class OAuthClient
 	/// a requested token type (e.g. an ID-JAG assertion) at `tokenEndpoint`.
 	/// Rejects an empty `resource` — see the class docstring for the rationale.
 	/// The request authenticates as `client` under the configured `authMethod`.
+	/// A requested access token must come back as `Bearer`; any other requested
+	/// type (such as an ID-JAG, issued with `token_type` `N_A`) is returned as is.
 	TokenSet tokenExchange(string tokenEndpoint, string subjectToken, string subjectTokenType,
 			string requestedTokenType, string audience, RegisteredClient client) @safe
 	{
@@ -573,7 +576,9 @@ final class OAuthClient
 		auto form = buildTokenExchangeForm(subjectToken, subjectTokenType,
 				requestedTokenType, audience, resource, client.clientId) ~ clientAuthParams(client,
 				[tokenEndpoint]);
-		return TokenSet.fromJson(postForm(tokenEndpoint, form, client));
+		auto ts = TokenSet.fromJson(postForm(tokenEndpoint, form, client));
+		return requestedTokenType == "urn:ietf:params:oauth:token-type:access_token" ? requireBearer(
+				ts) : ts;
 	}
 
 	/// RFC 7523 JWT-bearer grant: exchange an assertion JWT for an access token.
@@ -2309,6 +2314,22 @@ unittest  // token exchange accepts an N_A token_type for a non-access token
 	c.resource = "http://127.0.0.1:3000/mcp";
 	assert(c.tokenExchange(srv.base ~ "/token", "subj", "urn:t:id_token",
 			"urn:t:id-jag", "aud", RegisteredClient("cid", "")).accessToken == "jag");
+}
+
+unittest  // token exchange requesting an access token rejects a non-Bearer token_type
+{
+	import std.exception : assertThrown;
+
+	auto srv = startLoopback((scope HTTPServerRequest req, scope HTTPServerResponse res) @safe {
+		res.writeBody(`{"access_token":"at","token_type":"DPoP"}`, "application/json");
+	});
+	scope (exit)
+		srv.stop();
+
+	auto c = new OAuthClient();
+	c.resource = "http://127.0.0.1:3000/mcp";
+	assertThrown(c.tokenExchange(srv.base ~ "/token", "subj", "urn:t:id_token",
+			"urn:ietf:params:oauth:token-type:access_token", "aud", RegisteredClient("cid", "")));
 }
 
 unittest  // client_secret_post: token exchange carries the client secret
