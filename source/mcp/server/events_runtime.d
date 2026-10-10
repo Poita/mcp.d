@@ -636,6 +636,7 @@ final class EventsRuntime
 	private bool[string] enqueuing_; // job ids tracked whose enqueue call has not yet returned
 	private WebhookRef[string] heldWebhookRefs_; // subscription id -> lifecycle key acquired on this node
 	private Nullable!string[string] missed_; // subscription id -> furthest position dropped undelivered (null: none known), owed a gap
+	private Nullable!string[string] emitBackfill_; // emit-only subscription id -> ring-buffer position its paged backfill has reached
 	private BackgroundLoop worker_; // the periodic worker `startDeliveryWorker` runs
 	private bool backlogged_; // the last drain claimed a full batch, so more may be ready
 
@@ -1738,6 +1739,7 @@ final class EventsRuntime
 			if (job.subscriptionId == subId)
 				trackedJobs_.remove(jobId);
 		missed_.remove(subId);
+		emitBackfill_.remove(subId);
 		nextFetchAt_.remove(subId);
 		if (auto held = subId in heldWebhookRefs_)
 		{
@@ -1747,9 +1749,10 @@ final class EventsRuntime
 		}
 	}
 
-	/// Replay for a fresh webhook subscription: enqueue every event since its
-	/// cursor (from the ring buffer for an emit-only type, from the check function
-	/// otherwise), bounded by `maxAgeMs`, and settle the subscription's cursors. A
+	/// Replay for a fresh webhook subscription: enqueue the first batch of events
+	/// since its cursor (from the ring buffer for an emit-only type, from the check
+	/// function otherwise), bounded by `maxAgeMs`, and settle the subscription's
+	/// cursors; the poll-driven pass pages the rest. A
 	/// null cursor bootstraps: nothing is replayed and the subscription starts from
 	/// the current position. Returns whether delivery starts later than the
 	/// supplied cursor (the response's `truncated`).
@@ -1758,7 +1761,16 @@ final class EventsRuntime
 	{
 		EventResult er;
 		if (regIsEmitOnly(reg))
-			er = buffer_.readSince(sub.name, sub.cursor, maxAgeMs, Nullable!long.init);
+		{
+			// Replay one batch the subscription's pending bound can take; the
+			// rest is paged from the ring buffer by the poll-driven pass, and
+			// live emits wait in the buffer behind it until it catches up.
+			Nullable!long cap;
+			webhookFetchCap(sub.id, cap);
+			er = buffer_.readSince(sub.name, sub.cursor, maxAgeMs, cap);
+			if (er.hasMore)
+				emitBackfill_[sub.id] = er.cursor;
+		}
 		else
 		{
 			// Replay one capped batch; the poll-driven pass fetches the rest.
@@ -1815,7 +1827,7 @@ final class EventsRuntime
 		if (!opts_.webhookEnabled)
 			return;
 		const now = opts_.nowMs();
-		bool any;
+		bool any = pageEmitBackfills(now);
 		string[] checkBacked;
 		foreach (name; types_.byKey)
 			if (!regIsEmitOnly(name in types_) && offersWebhook(name))
@@ -1842,6 +1854,50 @@ final class EventsRuntime
 			}
 		if (any)
 			kickDrain();
+	}
+
+	// Page the emit-only backfills still catching up: read each from the ring
+	// buffer position it reached, as far as its free pending slots allow, until
+	// it reaches the head, after which live emits route to it directly. A
+	// position the buffer has already evicted is reported with a gap.
+	private bool pageEmitBackfills(long now) @safe
+	{
+		bool any;
+		foreach (id; emitBackfill_.keys)
+		{
+			auto sn = webhookStore_.get(id);
+			auto reg = sn.isNull ? null : sn.get.name in types_;
+			if (sn.isNull || sn.get.isExpired(now) || !regIsEmitOnly(reg)
+					|| !offersWebhook(sn.get.name))
+			{
+				emitBackfill_.remove(id);
+				continue;
+			}
+			auto sub = sn.get;
+			if (!sub.active)
+				continue;
+			foreach (_; 0 .. maxWebhookFetchesPerPass)
+			{
+				auto pos = id in emitBackfill_;
+				Nullable!long cap;
+				if (pos is null || !webhookFetchCap(id, cap))
+					break;
+				auto er = buffer_.readSince(sub.name, *pos, Nullable!long.init, cap);
+				// Reaching the head hands the subscription to live routing before
+				// anything below can yield, so no emit falls between the two.
+				if (er.hasMore)
+					*pos = er.cursor;
+				else
+					emitBackfill_.remove(id);
+				foreach (occ; er.events)
+					any |= enqueueForWebhook(sub, reg, occ, true);
+				if (er.truncated)
+					any |= enqueueGap(sub, er.cursor);
+				if (!er.hasMore)
+					break;
+			}
+		}
+		return any;
 	}
 
 	// Fetch one batch for `sub` from its fetch position and enqueue it. `more` is
@@ -2322,6 +2378,9 @@ final class EventsRuntime
 					noteMissed(sub.id, occ.cursor);
 				continue;
 			}
+			// A backfill still paging reaches this event in the ring buffer.
+			if ((sub.id in emitBackfill_) !is null)
+				continue;
 			any |= enqueueForWebhook(sub, reg, occ, true);
 		}
 		// Kick a drain on this node so the just-enqueued jobs deliver promptly
@@ -7234,6 +7293,36 @@ unittest  // events sharing a batch cursor settle the watermark together
 	ft.duringPost = null;
 	assert(duringSecond == "h0"); // m1 acked, m2 in flight: still h0
 	assert(rt.webhookStore().get(r.id).get.cursor.get == "h1");
+}
+
+unittest  // an emit-only webhook backfill larger than the pending bound pages instead of gapping
+{
+	auto ft = new FakeWebhookTransport();
+	EventsOptions o;
+	o.nowMs = () @safe => 1_000_000L;
+	o.nowIso = () @safe => "t";
+	o.allowPrivateCallbackHosts = true;
+	o.webhookTransport = ft;
+	o.deliveryExecutor = (void delegate() @safe job) @safe { job(); };
+	o.deliverySleep = (Duration d) @safe {};
+	o.webhookMaxPendingPerSubscription = 3;
+	auto rt = new EventsRuntime(null, o);
+	EventRegistration reg = {descriptor: EventType("n"), emitOnly: true};
+	rt.register(reg);
+	const from = rt.buffer_.headCursor();
+	foreach (i; 0 .. 7)
+		rt.emit(EventOccurrence("e" ~ i.to!string, "n", "t"));
+	auto p = webhookSub("n", "https://proxy/hooks");
+	p.cursor = from;
+	rt.subscribeWebhook(p, "user-1");
+	rt.emit(EventOccurrence("live", "n", "t"));
+	foreach (_; 0 .. 4)
+		rt.pollWebhookSubscriptions();
+	assert(ft.acceptedGaps.length == 0);
+	string[] ids;
+	foreach (post; ft.eventPosts())
+		ids ~= parseJsonString(post.body)["eventId"].get!string;
+	assert(ids == ["e0", "e1", "e2", "e3", "e4", "e5", "e6", "live"]);
 }
 
 unittest  // disabling push on a registered type terminates its open push streams
