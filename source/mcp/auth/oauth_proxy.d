@@ -44,7 +44,7 @@ import mcp.auth.reference_token : IssuedToken, ReferenceTokenStore, referenceTok
 import mcp.protocol.ssrf : SsrfPolicy;
 import mcp.auth.resource_server : ResourceServerConfig, TokenInfo,
 	TokenValidator, bindResourceAudience;
-import mcp.transport.session : BoundedExpiringMap;
+import mcp.internal.expiring_map : BoundedExpiringMap;
 
 @safe:
 

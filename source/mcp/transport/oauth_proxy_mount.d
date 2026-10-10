@@ -325,7 +325,7 @@ struct ProxyStateStoreOptions
 /// `maxPerClient`). The clock is injectable so the bounds are unit-testable.
 package final class ProxyStateStore
 {
-	import mcp.transport.session : BoundedExpiringMap;
+	import mcp.internal.expiring_map : BoundedExpiringMap;
 
 	private BoundedExpiringMap!ProxyAuthState entries;
 	private StatesByKey bySession;
@@ -463,7 +463,7 @@ private struct StatesByKey
 package final class ClientRateLimiter
 {
 	import core.time : Duration, MonoTime;
-	import mcp.transport.session : BoundedExpiringMap;
+	import mcp.internal.expiring_map : BoundedExpiringMap;
 
 	private static struct Window
 	{
