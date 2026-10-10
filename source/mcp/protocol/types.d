@@ -5737,11 +5737,10 @@ struct ProgressNotification
 
 	Json toJson() const @safe
 	{
-		import mcp.protocol.errors : invalidParams;
-
 		// `progressToken` is REQUIRED by the schema and is a string or number;
 		// an unset or otherwise-typed token cannot correlate the update with
-		// any request, so it is refused rather than emitted.
+		// any request, so it is refused rather than emitted. This is a local
+		// builder mistake, so it is a plain Exception rather than a -32602.
 		switch (progressToken.type)
 		{
 		case Json.Type.string:
@@ -5750,7 +5749,7 @@ struct ProgressNotification
 		case Json.Type.float_:
 			break;
 		default:
-			throw invalidParams("progress notification requires a string or number progressToken");
+			throw new Exception("progress notification requires a string or number progressToken");
 		}
 		Json j = Json.emptyObject;
 		j["progressToken"] = progressToken;
@@ -5867,7 +5866,7 @@ unittest  // ProgressNotification.matches an integer ProgressToken
 	assert(!n.matches(ProgressToken("42")));
 }
 
-unittest  // ProgressNotification.toJson throws -32602 when the REQUIRED progressToken is unset or not a string/number
+unittest  // ProgressNotification.toJson throws a plain Exception when the REQUIRED progressToken is unset or not a string/number
 {
 	import std.exception : collectException;
 
@@ -5875,8 +5874,8 @@ unittest  // ProgressNotification.toJson throws -32602 when the REQUIRED progres
 	{
 		ProgressNotification n;
 		n.progressToken = tok;
-		auto ex = collectException!McpException(n.toJson());
-		assert(ex !is null && ex.code == ErrorCode.invalidParams);
+		auto ex = collectException(n.toJson());
+		assert(ex !is null && cast(McpException) ex is null);
 	}
 }
 
