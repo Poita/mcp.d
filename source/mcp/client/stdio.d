@@ -1017,9 +1017,12 @@ version (Windows) private void pumpChildStdout(HANDLE h,
 		return n;
 	}
 
+	// `Channel` has a destructor, so the closure holds a pointer to it; the
+	// reader and its callback never outlive this frame.
+	auto sink = &chan;
 	auto reader = LineReader(maxLineBytes);
 	reader.onOversized = (FrameHead head) @trusted {
-		chan.put(PumpedLine(head.id.toString(), true, head.hasMethod, head.hasResult));
+		sink.put(PumpedLine(head.id.toString(), true, head.hasMethod, head.hasResult));
 	};
 	for (;;)
 	{
