@@ -32,6 +32,20 @@ class ToolError : Exception
 	}
 }
 
+/// A prompt failure whose message is written for the client. Thrown from a
+/// prompt handler, it becomes a JSON-RPC Internal error (-32603) carrying the
+/// message unmasked. Any other non-`McpException` a prompt handler throws is
+/// logged server-side and reported as a generic "Internal error" (its message
+/// is shown only after `McpServer.exposeInternalErrors`). Throw an
+/// `McpException` such as `invalidParams` for a different error code.
+class PromptError : Exception
+{
+	this(string msg, string file = __FILE__, size_t line = __LINE__) pure nothrow @safe
+	{
+		super(msg, file, line);
+	}
+}
+
 /// A tool handler receiving the parsed arguments and the per-request context.
 alias ToolHandler = CallToolResult delegate(Json arguments, RequestContext ctx) @safe;
 

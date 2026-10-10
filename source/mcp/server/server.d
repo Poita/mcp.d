@@ -34,7 +34,7 @@ import mcp.server.events_runtime : EventsRuntime, EventsOptions,
 	EventRegistration, PushHandle, PushStream;
 
 import mcp.server.responses : ToolHandler, MrtrToolHandler, ToolResponse, PromptResponse,
-	PromptHandler, MrtrPromptHandler, ResourceReader, TemplateReader, ToolError;
+	PromptHandler, MrtrPromptHandler, ResourceReader, TemplateReader, ToolError, PromptError;
 
 // The push-integration unittests below exercise the server seam against the
 // real Streamable HTTP channel; the library build itself has no transport
@@ -3726,7 +3726,11 @@ final class McpServer : ServerCore
 		// client attached to this (retried) request. The `resultType`
 		// discriminator (and statelessness) is modern-gated by the dispatch path,
 		// so the 2025-era protocols never see it.
-		auto response = entry.handler(args, ctx);
+		PromptResponse response;
+		try
+			response = entry.handler(args, ctx);
+		catch (PromptError e)
+			throw internalError(e.msg);
 		// MRTR: mirror doCallTool — never ask the client for an input kind
 		// it did not declare. MRTR is modern-only (`usesMRTR`); reuse the
 		// `declared` set already resolved above for capability gating.
@@ -5881,6 +5885,31 @@ unittest  // a ToolError's message always reaches the client as isError content
 	assert("error" !in resp);
 	assert(resp["result"]["isError"].get!bool);
 	assert(resp["result"]["content"][0]["text"].get!string == "no such city");
+}
+
+unittest  // a PromptError's message always reaches the client as a JSON-RPC error
+{
+	import mcp.server.responses : PromptError;
+
+	auto s = new McpServer("t", "1");
+	GetPromptResult delegate(Json) @safe handler = (Json) {
+		throw new PromptError("no such template");
+	};
+	s.registerPrompt(Prompt("p"), handler);
+	auto resp = s.handle(req(6, "prompts/get", Json(["name": Json("p")]))).get;
+	assert(resp["error"]["code"].get!int == ErrorCode.internalError);
+	assert(resp["error"]["message"].get!string == "no such template");
+}
+
+unittest  // any other prompt handler exception is masked as Internal error
+{
+	auto s = new McpServer("t", "1");
+	GetPromptResult delegate(Json) @safe handler = (Json) {
+		throw new Exception("open /srv/prompts.db failed");
+	};
+	s.registerPrompt(Prompt("p"), handler);
+	auto resp = s.handle(req(6, "prompts/get", Json(["name": Json("p")]))).get;
+	assert(resp["error"]["message"].get!string == "Internal error");
 }
 
 unittest  // an unknown method yields method-not-found

@@ -703,6 +703,12 @@ other internals; `server.exposeInternalErrors()` (or
 `ServerSettings.exposeInternalErrors`) sends the real message instead, which is
 useful in development. An `McpException` becomes a JSON-RPC error.
 
+A prompt has no `isError` result, so its failures are JSON-RPC errors: throwing
+`PromptError` from a prompt handler sends an Internal error (-32603) carrying
+that message, while any other non-`McpException` is logged and masked as
+`Internal error` in the same way (throw an `McpException` such as
+`invalidParams` for a different code).
+
 ```d
 @tool("weather", "Current weather for a city")
 string weather(string city) @safe
