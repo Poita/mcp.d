@@ -24,7 +24,7 @@ they wrap:
 | `runServerFromArgs(server, args, port)` | `runStdio(server)`, or `runStreamableHttp(server, opts)` with a `StreamableHttpOptions opts` (`import mcp.transport;`) |
 | `runHttpServerFromArgs(server, args, port, opts, ...)` | `runStreamableHttp(server, opts)` after setting `opts.port` / `opts.bindAddresses` |
 | `runClient(() @safe { ...; return 0; })` | `runWithEventLoop(() @safe { ... })` (`import mcp;`); it rethrows a failure instead of returning 1 |
-| `connectFromArgs(args, "x-server")` | `McpClient.spawn(["./x-server"])` (stdio) or `McpClient.http(url)` |
+| `connectFromArgs(args, "x-server")` | `McpClient.spawnSibling("x-server")` (stdio; resolves the binary next to the running executable) or `McpClient.http(url)` |
 | `check(cond, msg)` / `checkEq(a, b, label)` | your own assertions or error handling |
 
 The examples also use fine-grained imports (`mcp.server.server`,
