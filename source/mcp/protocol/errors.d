@@ -671,8 +671,10 @@ unittest  // the Events codes sit in the spec-allocated range, after the core co
 {
 	// [-32000,-32019] is left to implementations and never defined by the spec;
 	// specification codes are allocated sequentially from -32020.
-	foreach (c; [ErrorCode.notFound, ErrorCode.forbidden, ErrorCode.resourceExhausted,
-			ErrorCode.unsupported, ErrorCode.callbackEndpointError])
+	foreach (c; [
+		ErrorCode.notFound, ErrorCode.forbidden, ErrorCode.resourceExhausted,
+		ErrorCode.unsupported, ErrorCode.callbackEndpointError
+	])
 		assert(c <= -32020 && c >= -32099 && c < ErrorCode.unsupportedProtocolVersion);
 }
 
