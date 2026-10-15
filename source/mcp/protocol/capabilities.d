@@ -3,7 +3,7 @@ module mcp.protocol.capabilities;
 import std.typecons : Nullable, nullable;
 import vibe.data.json : Json;
 import mcp.protocol.versions : ProtocolVersion;
-import mcp.protocol.jsonhelpers : getOr, tryGet;
+import mcp.protocol.jsonhelpers : getOr, tryGet, stringOrThrow, requireObject;
 
 @safe:
 
@@ -49,14 +49,11 @@ private Json projectExtensions(const Json extensions, ProtocolVersion v) @safe
 	if (extensions.type != Json.Type.object)
 		return Json.undefined;
 	Json kept = Json.emptyObject;
-	// `Json.opApply` is `@system` and non-`const`; we only read, so cast away
-	// `const` inside the trusted block to iterate the object (mirrors
-	// `diffMissingKeys`).
-	() @trusted {
-		foreach (string key, Json settings; cast() extensions)
-			if (v >= extensionMinVersion(key))
-				kept[key] = settings;
-	}();
+	// Each value is cloned so the projection never aliases the caller's
+	// (const) settings.
+	foreach (key, settings; extensions.byKeyValue)
+		if (v >= extensionMinVersion(key))
+			kept[key] = settings.clone();
 	return kept.length > 0 ? kept : Json.undefined;
 }
 
@@ -88,14 +85,19 @@ struct Icon
 		return j;
 	}
 
+	/// Throws -32602 when `j` is not an object or a `sizes` entry is not a string.
 	static Icon fromJson(Json j) @safe
 	{
+		import mcp.protocol.errors : invalidParams;
+
+		if (j.type != Json.Type.object)
+			throw invalidParams("an icon must be an object");
 		Icon icon;
 		icon.src = j.getOr("src", "");
 		tryGet(j, "mimeType", icon.mimeType);
 		if ("sizes" in j && j["sizes"].type == Json.Type.array)
 			foreach (i; 0 .. j["sizes"].length)
-				icon.sizes ~= j["sizes"][i].get!string;
+				icon.sizes ~= stringOrThrow(j["sizes"][i], "sizes");
 		tryGet(j, "theme", icon.theme);
 		return icon;
 	}
@@ -111,6 +113,36 @@ struct Icon
 		c.theme = theme;
 		return c;
 	}
+}
+
+/// Read the optional `icons` array of `obj`, skipping any entry `Icon.fromJson`
+/// rejects. Icons are display hints, so one malformed entry must not fail the
+/// enclosing implementation, tool, resource, or prompt.
+Icon[] readIcons(Json obj) @safe
+{
+	import mcp.protocol.errors : McpException;
+
+	Icon[] icons;
+	if (obj.type != Json.Type.object || "icons" !in obj || obj["icons"].type != Json.Type.array)
+		return icons;
+	foreach (i; 0 .. obj["icons"].length)
+	{
+		try
+			icons ~= Icon.fromJson(obj["icons"][i]);
+		catch (McpException)
+		{
+		}
+	}
+	return icons;
+}
+
+@safe unittest  // readIcons keeps well-formed icons and skips malformed ones
+{
+	import vibe.data.json : parseJsonString;
+
+	auto icons = readIcons(parseJsonString(`{"icons":[1,{"src":"a"},{"src":"b","sizes":[2]}]}`));
+	assert(icons.length == 1 && icons[0].src == "a");
+	assert(readIcons(parseJsonString(`{"icons":"x"}`)).length == 0);
 }
 
 @safe unittest  // Icon.dup deep-copies sizes so the copy does not alias the original
@@ -162,15 +194,14 @@ struct Implementation
 
 	static Implementation fromJson(Json j) @safe
 	{
+		requireObject(j, "Implementation");
 		Implementation impl;
 		impl.name = j.getOr("name", "");
 		impl.version_ = j.getOr("version", "");
 		tryGet(j, "title", impl.title);
 		tryGet(j, "description", impl.description);
 		tryGet(j, "websiteUrl", impl.websiteUrl);
-		if ("icons" in j && j["icons"].type == Json.Type.array)
-			foreach (i; 0 .. j["icons"].length)
-				impl.icons ~= Icon.fromJson(j["icons"][i]);
+		impl.icons = readIcons(j);
 		return impl;
 	}
 
@@ -213,6 +244,7 @@ struct ListChangedCapability
 
 	static ListChangedCapability fromJson(Json j) @safe
 	{
+		requireObject(j, "ListChangedCapability");
 		ListChangedCapability c;
 		if ("listChanged" in j && j["listChanged"].type == Json.Type.bool_)
 			c.listChanged = j["listChanged"].get!bool;
@@ -238,6 +270,7 @@ struct ResourcesCapability
 
 	static ResourcesCapability fromJson(Json j) @safe
 	{
+		requireObject(j, "ResourcesCapability");
 		ResourcesCapability c;
 		if ("subscribe" in j && j["subscribe"].type == Json.Type.bool_)
 			c.subscribe = j["subscribe"].get!bool;
@@ -297,7 +330,7 @@ struct ServerCapabilities
 		projected.resources = resources;
 		projected.prompts = prompts;
 		projected.logging = logging;
-		projected.experimental = experimental;
+		projected.experimental = experimental.clone();
 		if (v >= ProtocolVersion.v2025_03_26)
 			projected.completions = completions;
 		// Each extension carries its own version floor (see extensionMinVersion):
@@ -308,6 +341,7 @@ struct ServerCapabilities
 
 	static ServerCapabilities fromJson(Json j) @safe
 	{
+		requireObject(j, "ServerCapabilities");
 		ServerCapabilities c;
 		if ("tools" in j && j["tools"].type == Json.Type.object)
 			c.tools = ListChangedCapability.fromJson(j["tools"]);
@@ -315,10 +349,8 @@ struct ServerCapabilities
 			c.resources = ResourcesCapability.fromJson(j["resources"]);
 		if ("prompts" in j && j["prompts"].type == Json.Type.object)
 			c.prompts = ListChangedCapability.fromJson(j["prompts"]);
-		if ("logging" in j)
-			c.logging = true;
-		if ("completions" in j)
-			c.completions = true;
+		c.logging = declaresObject(j, "logging");
+		c.completions = declaresObject(j, "completions");
 		if ("experimental" in j)
 			c.experimental = j["experimental"];
 		if ("extensions" in j)
@@ -336,10 +368,19 @@ enum ClientCapability
 	sampling,
 	samplingTools,
 	samplingContext,
+	/// Any elicitation mode (form or url).
 	elicitation,
 	elicitationForm,
 	elicitationUrl,
 	roots,
+}
+
+/// Whether `j` declares the capability `key`: the schema models every
+/// capability as an object, so a `null`, boolean, or other scalar value does not
+/// count as a declaration.
+private bool declaresObject(Json j, string key) @safe
+{
+	return j.type == Json.Type.object && key in j && j[key].type == Json.Type.object;
 }
 
 /// Capabilities a client advertises during initialization.
@@ -355,15 +396,16 @@ struct ClientCapabilities
 	/// sampling.context sub-capability (soft-deprecated): gates the
 	/// `includeContext` values `thisServer`/`allServers`. Implies `sampling`.
 	bool samplingContext;
-	bool elicitation; /// presence (>= 2025-06-18); empty object => form mode only
-	/// elicitation.form submode (2025-11-25): declares support for schema-driven
-	/// form elicitation. Implies `elicitation`. An empty `elicitation` object is
-	/// equivalent to declaring form mode only, so this is treated as set when a
-	/// peer advertises a bare `{}`.
+	/// Form-mode elicitation (>= 2025-06-18): schema-driven `elicitation/create`.
+	/// On its own it serializes as a bare `elicitation: {}`, which the spec reads
+	/// as form mode in every version; alongside `elicitationUrl` it serializes
+	/// as `{"form":{},"url":{}}`. `fromJson` sets it for a bare `{}` or an
+	/// explicit `form`.
 	bool elicitationForm;
 	/// elicitation.url submode (2025-11-25): declares support for URL-mode
-	/// elicitation (`elicitUrl`). Implies `elicitation`. Servers MUST NOT send
-	/// URL-mode elicitation requests unless this is advertised.
+	/// elicitation (`elicitUrl`). On its own it serializes as `{"url":{}}`.
+	/// Servers MUST NOT send URL-mode elicitation requests unless this is
+	/// advertised.
 	bool elicitationUrl;
 	Json experimental = Json.undefined;
 	/// modern Extension Negotiation: map of extension identifiers (e.g.
@@ -390,15 +432,17 @@ struct ClientCapabilities
 				s["context"] = Json.emptyObject;
 			j["sampling"] = s;
 		}
-		if (elicitation || elicitationForm || elicitationUrl)
+		if (elicitationForm || elicitationUrl)
 		{
+			// Form mode alone is the bare `{}` every version understands; the
+			// submodes are spelled out only when url mode is declared.
 			Json e = Json.emptyObject;
-			// Emit explicit submodes only when set; a bare `{}` is equivalent to
-			// declaring form mode only (backwards compatible with 2025-06-18).
-			if (elicitationForm)
-				e["form"] = Json.emptyObject;
 			if (elicitationUrl)
+			{
+				if (elicitationForm)
+					e["form"] = Json.emptyObject;
 				e["url"] = Json.emptyObject;
+			}
 			j["elicitation"] = e;
 		}
 		if (experimental.type == Json.Type.object)
@@ -411,11 +455,11 @@ struct ClientCapabilities
 	/// Project these capabilities to the wire shape for protocol version `v`,
 	/// stripping any field newer than `v`. `roots`/`rootsListChanged`, a bare
 	/// `sampling`, and `experimental` exist in every supported version and pass
-	/// through unchanged. `elicitation` applies from 2025-06-18, so it is gated
-	/// to `>= 2025-06-18` (a client that set only an elicitation submode still
-	/// projects a bare `elicitation` there). The sampling/elicitation sub-objects
-	/// (`sampling.tools`/`sampling.context`, `elicitation.form`/`elicitation.url`)
-	/// apply from 2025-11-25 and are stripped below that. Each entry in the
+	/// through unchanged. Form-mode elicitation applies from 2025-06-18, so it
+	/// is gated to `>= 2025-06-18`. URL-mode elicitation and the sampling
+	/// sub-objects (`sampling.tools`/`sampling.context`) apply from 2025-11-25
+	/// and are stripped below that, so a url-only client declares no
+	/// elicitation to an older peer. Each entry in the
 	/// `extensions` negotiation map is gated by its own `extensionMinVersion`
 	/// floor.
 	ClientCapabilities forVersion(ProtocolVersion v) const @safe
@@ -424,19 +468,15 @@ struct ClientCapabilities
 		projected.roots = roots;
 		projected.rootsListChanged = rootsListChanged;
 		projected.sampling = sampling || samplingTools || samplingContext;
-		projected.experimental = experimental;
-		// elicitation applies from 2025-06-18. `toJson` treats a set
-		// `elicitationForm`/`elicitationUrl` as implying elicitation presence, so a
-		// client that set only a submode must still project a bare `elicitation`
-		// here; the sub-flags themselves are gated to 2025-11-25 below.
+		projected.experimental = experimental.clone();
+		// Form-mode elicitation applies from 2025-06-18 (as a bare `{}`); url mode
+		// and the sampling sub-objects apply from 2025-11-25.
 		if (v >= ProtocolVersion.v2025_06_18)
-			projected.elicitation = elicitation || elicitationForm || elicitationUrl;
-		// sampling/elicitation sub-objects apply from 2025-11-25.
+			projected.elicitationForm = elicitationForm;
 		if (v >= ProtocolVersion.v2025_11_25)
 		{
 			projected.samplingTools = samplingTools;
 			projected.samplingContext = samplingContext;
-			projected.elicitationForm = elicitationForm;
 			projected.elicitationUrl = elicitationUrl;
 		}
 		// Each extension carries its own version floor (see extensionMinVersion):
@@ -447,6 +487,7 @@ struct ClientCapabilities
 
 	static ClientCapabilities fromJson(Json j) @safe
 	{
+		requireObject(j, "ClientCapabilities");
 		ClientCapabilities c;
 		if ("roots" in j && j["roots"].type == Json.Type.object)
 		{
@@ -455,33 +496,18 @@ struct ClientCapabilities
 			if ("listChanged" in r && r["listChanged"].type == Json.Type.bool_)
 				c.rootsListChanged = r["listChanged"].get!bool;
 		}
-		if ("sampling" in j)
+		if (declaresObject(j, "sampling"))
 		{
 			c.sampling = true;
-			if (j["sampling"].type == Json.Type.object)
-			{
-				if ("tools" in j["sampling"])
-					c.samplingTools = true;
-				if ("context" in j["sampling"])
-					c.samplingContext = true;
-			}
+			c.samplingTools = declaresObject(j["sampling"], "tools");
+			c.samplingContext = declaresObject(j["sampling"], "context");
 		}
-		if ("elicitation" in j)
+		if (declaresObject(j, "elicitation"))
 		{
-			c.elicitation = true;
-			if (j["elicitation"].type == Json.Type.object && j["elicitation"].length > 0)
-			{
-				if ("form" in j["elicitation"])
-					c.elicitationForm = true;
-				if ("url" in j["elicitation"])
-					c.elicitationUrl = true;
-			}
-			else
-			{
-				// An empty (or non-object) elicitation declaration is equivalent
-				// to declaring form mode only.
-				c.elicitationForm = true;
-			}
+			// Any declaration that does not name url mode (a bare `{}` included)
+			// declares form mode.
+			c.elicitationUrl = declaresObject(j["elicitation"], "url");
+			c.elicitationForm = declaresObject(j["elicitation"], "form") || !c.elicitationUrl;
 		}
 		if ("experimental" in j)
 			c.experimental = j["experimental"];
@@ -497,7 +523,8 @@ struct ClientCapabilities
 	/// and the result is a `ClientCapabilities` containing exactly the missing
 	/// ones. A capability is satisfied when the client declared at least the same
 	/// presence flag (sub-capability flags imply their parent presence here, in
-	/// line with `toJson`). The result is null iff every requirement is met; a
+	/// line with `toJson`). The result is null iff every
+	/// requirement is met; a
 	/// non-null value carries exactly the unmet ones. The `experimental` and
 	/// `extensions` Json maps are compared by required-key presence: any required
 	/// key absent from `declared` is reported.
@@ -507,8 +534,6 @@ struct ClientCapabilities
 		bool anyMissing;
 		const declSampling = declared.sampling || declared.samplingTools || declared
 			.samplingContext;
-		const declElicit = declared.elicitation || declared.elicitationForm
-			|| declared.elicitationUrl;
 
 		if (roots && !declared.roots)
 		{
@@ -534,11 +559,6 @@ struct ClientCapabilities
 		if (samplingContext && !declared.samplingContext)
 		{
 			missing.samplingContext = true;
-			anyMissing = true;
-		}
-		if (elicitation && !declElicit)
-		{
-			missing.elicitation = true;
 			anyMissing = true;
 		}
 		if (elicitationForm && !declared.elicitationForm)
@@ -576,13 +596,11 @@ struct ClientCapabilities
 		if (required.type != Json.Type.object)
 			return Json(null);
 		Json missing = Json.emptyObject;
-		// `Json.opApply` is `@system` and non-`const`; we only read, so cast
-		// away `const` inside the trusted block to iterate the object.
-		() @trusted {
-			foreach (string k, Json v; cast() required)
-				if (declared.type != Json.Type.object || k !in declared)
-					missing[k] = v;
-		}();
+		// Each value is cloned so the result never aliases the (const)
+		// `required` map.
+		foreach (k, v; required.byKeyValue)
+			if (declared.type != Json.Type.object || k !in declared)
+				missing[k] = v.clone();
 		return missing;
 	}
 
@@ -600,7 +618,7 @@ struct ClientCapabilities
 		case ClientCapability.samplingContext:
 			return samplingContext;
 		case ClientCapability.elicitation:
-			return elicitation || elicitationForm || elicitationUrl;
+			return elicitationForm || elicitationUrl;
 		case ClientCapability.elicitationForm:
 			return elicitationForm;
 		case ClientCapability.elicitationUrl:
@@ -631,6 +649,28 @@ unittest  // supports(.elicitation) implies elicitationForm and elicitationUrl s
 	assert(e.supports(ClientCapability.sampling)); // implied by samplingTools
 	ClientCapabilities f = {samplingContext: true};
 	assert(f.supports(ClientCapability.sampling)); // implied by samplingContext
+}
+
+unittest  // ClientCapabilities has a single form-mode elicitation flag
+{
+	static assert(!__traits(hasMember, ClientCapabilities, "elicitation"));
+	ClientCapabilities c = {elicitationForm: true};
+	assert(c.toJson()["elicitation"] == Json.emptyObject);
+}
+
+unittest  // supports(.elicitationForm) holds for a parsed bare `elicitation: {}`
+{
+	auto c = ClientCapabilities.fromJson(Json(["elicitation": Json.emptyObject]));
+	assert(c.supports(ClientCapability.elicitationForm));
+}
+
+unittest  // missingFrom: a required elicitationForm is met by a parsed bare elicitation declaration
+{
+	ClientCapabilities required = {elicitationForm: true};
+	auto declared = ClientCapabilities.fromJson(Json([
+		"elicitation": Json.emptyObject
+	]));
+	assert(required.missingFrom(declared).isNull);
 }
 
 unittest  // missingFrom: an unmet sampling requirement is reported
@@ -952,7 +992,7 @@ unittest  // ClientCapabilities nests roots.listChanged and presence flags
 	assert(j["sampling"].type == Json.Type.object);
 	assert("elicitation" !in j);
 	auto back = ClientCapabilities.fromJson(j);
-	assert(back.roots && back.rootsListChanged && back.sampling && !back.elicitation);
+	assert(back.roots && back.rootsListChanged && back.sampling && !back.elicitationForm);
 }
 
 unittest  // ServerCapabilities advertises and round-trips the modern `extensions` map
@@ -1062,7 +1102,6 @@ unittest  // ClientCapabilities sub-caps imply sampling presence on serializatio
 unittest  // ClientCapabilities advertises elicitation form/url submodes (2025-11-25)
 {
 	ClientCapabilities caps;
-	caps.elicitation = true;
 	caps.elicitationForm = true;
 	caps.elicitationUrl = true;
 	auto j = caps.toJson();
@@ -1074,33 +1113,52 @@ unittest  // ClientCapabilities advertises elicitation form/url submodes (2025-1
 unittest  // ClientCapabilities advertises URL-only elicitation mode
 {
 	ClientCapabilities caps;
-	caps.elicitation = true;
 	caps.elicitationUrl = true;
 	auto j = caps.toJson();
 	assert(j["elicitation"]["url"].type == Json.Type.object);
 	assert("form" !in j["elicitation"]);
 }
 
+unittest  // ClientCapabilities url-only elicitation round-trips without gaining form
+{
+	import vibe.data.json : parseJsonString;
+
+	auto j = `{"elicitation":{"url":{}}}`.parseJsonString;
+	auto back = ClientCapabilities.fromJson(j);
+	assert(back.toJson()["elicitation"] == `{"url":{}}`.parseJsonString);
+	auto projected = back.forVersion(ProtocolVersion.v2025_11_25).toJson();
+	assert(projected["elicitation"] == `{"url":{}}`.parseJsonString);
+}
+
+unittest  // ClientCapabilities url-only elicitation omits elicitation on 2025-06-18
+{
+	// 2025-06-18 has no submodes and a bare `elicitation: {}` means form mode,
+	// which a url-only client does not support.
+	ClientCapabilities caps;
+	caps.elicitationUrl = true;
+	auto j = caps.forVersion(ProtocolVersion.v2025_06_18).toJson();
+	assert("elicitation" !in j);
+}
+
 unittest  // ClientCapabilities round-trips elicitation submodes
 {
 	ClientCapabilities caps;
-	caps.elicitation = true;
 	caps.elicitationForm = true;
 	caps.elicitationUrl = true;
 	auto back = ClientCapabilities.fromJson(caps.toJson());
-	assert(back.elicitation && back.elicitationForm && back.elicitationUrl);
+	assert(back.elicitationForm && back.elicitationUrl);
 }
 
 unittest  // ClientCapabilities elicitation empty object => form-only (backwards compat)
 {
 	ClientCapabilities caps;
-	caps.elicitation = true;
+	caps.elicitationForm = true;
 	auto j = caps.toJson();
 	// Backwards-compatible empty-object emission.
 	assert(j["elicitation"].type == Json.Type.object && j["elicitation"].length == 0);
 	auto back = ClientCapabilities.fromJson(j);
 	// Empty object is equivalent to declaring form mode only.
-	assert(back.elicitation && back.elicitationForm && !back.elicitationUrl);
+	assert(back.elicitationForm && !back.elicitationUrl);
 }
 
 unittest  // ClientCapabilities parses explicit elicitation submodes from peer payload
@@ -1111,7 +1169,7 @@ unittest  // ClientCapabilities parses explicit elicitation submodes from peer p
 	e["url"] = Json.emptyObject;
 	j["elicitation"] = e;
 	auto back = ClientCapabilities.fromJson(j);
-	assert(back.elicitation && back.elicitationForm && back.elicitationUrl);
+	assert(back.elicitationForm && back.elicitationUrl);
 }
 
 unittest  // ClientCapabilities parses url-only elicitation from peer payload
@@ -1121,7 +1179,8 @@ unittest  // ClientCapabilities parses url-only elicitation from peer payload
 	e["url"] = Json.emptyObject;
 	j["elicitation"] = e;
 	auto back = ClientCapabilities.fromJson(j);
-	assert(back.elicitation && !back.elicitationForm && back.elicitationUrl);
+	assert(!back.elicitationForm && back.elicitationUrl);
+	assert(back.supports(ClientCapability.elicitation));
 }
 
 unittest  // ClientCapabilities elicitation submodes imply elicitation presence
@@ -1193,7 +1252,6 @@ unittest  // ClientCapabilities.forVersion: 2025-03-26 emits a bare sampling and
 	caps.sampling = true;
 	caps.samplingTools = true;
 	caps.samplingContext = true;
-	caps.elicitation = true;
 	caps.elicitationForm = true;
 	caps.elicitationUrl = true;
 	auto j = caps.forVersion(ProtocolVersion.v2025_03_26).toJson();
@@ -1209,7 +1267,6 @@ unittest  // ClientCapabilities.forVersion: 2025-06-18 emits bare sampling and b
 	caps.sampling = true;
 	caps.samplingTools = true;
 	caps.samplingContext = true;
-	caps.elicitation = true;
 	caps.elicitationForm = true;
 	caps.elicitationUrl = true;
 	auto j = caps.forVersion(ProtocolVersion.v2025_06_18).toJson();
@@ -1221,13 +1278,10 @@ unittest  // ClientCapabilities.forVersion: 2025-06-18 emits bare sampling and b
 	assert("url" !in j["elicitation"]);
 }
 
-unittest  // ClientCapabilities.forVersion: 2025-06-18 projects bare elicitation when only a submode was set
+unittest  // ClientCapabilities.forVersion: 2025-06-18 projects bare elicitation when only form was set
 {
-	// toJson treats elicitationForm/elicitationUrl as implying elicitation
-	// presence. A client that set only a submode must still project a bare
-	// `elicitation: {}` for 2025-06-18 (the era with elicitation but no submodes).
 	ClientCapabilities caps;
-	caps.elicitationUrl = true; // submode only, no explicit `elicitation`
+	caps.elicitationForm = true;
 	auto j = caps.forVersion(ProtocolVersion.v2025_06_18).toJson();
 	assert("elicitation" in j);
 	assert(j["elicitation"].type == Json.Type.object && j["elicitation"].length == 0);
@@ -1239,7 +1293,6 @@ unittest  // ClientCapabilities.forVersion: 2025-11-25 preserves all sampling/el
 	caps.sampling = true;
 	caps.samplingTools = true;
 	caps.samplingContext = true;
-	caps.elicitation = true;
 	caps.elicitationForm = true;
 	caps.elicitationUrl = true;
 	auto j = caps.forVersion(ProtocolVersion.v2025_11_25).toJson();
@@ -1280,4 +1333,114 @@ unittest  // ClientCapabilities.forVersion: sampling sub-cap only still projects
 		assert(j["sampling"].type == Json.Type.object && j["sampling"].length == 0);
 		assert("tools" !in j["sampling"]);
 	}
+}
+
+unittest  // Icon.fromJson rejects a non-string size with -32602
+{
+	import std.exception : collectException;
+	import mcp.protocol.errors : McpException, ErrorCode;
+
+	Json j = Json(["src": Json("https://x/i.png"), "sizes": Json([Json(48)])]);
+	auto ex = cast(McpException) collectException(Icon.fromJson(j));
+	assert(ex !is null && ex.code == ErrorCode.invalidParams);
+}
+
+unittest  // Icon.fromJson rejects a non-object icon with -32602
+{
+	import std.exception : collectException;
+	import mcp.protocol.errors : McpException, ErrorCode;
+
+	auto ex = cast(McpException) collectException(Icon.fromJson(Json(5)));
+	assert(ex !is null && ex.code == ErrorCode.invalidParams);
+}
+
+unittest  // ClientCapabilities.fromJson ignores null and non-object capability values
+{
+	auto c = ClientCapabilities.fromJson(Json([
+		"sampling": Json(null),
+		"elicitation": Json(null),
+		"roots": Json(true)
+	]));
+	assert(!c.sampling && !c.elicitationForm && !c.roots);
+
+	auto d = ClientCapabilities.fromJson(Json([
+			"sampling": Json(["tools": Json(null), "context": Json.emptyObject]),
+			"elicitation": Json(["form": Json(false), "url": Json.emptyObject])
+	]));
+	assert(d.sampling && !d.samplingTools && d.samplingContext);
+	assert(!d.elicitationForm && d.elicitationUrl);
+	assert(d.supports(ClientCapability.elicitation));
+}
+
+unittest  // ServerCapabilities.fromJson ignores null and non-object logging/completions
+{
+	auto c = ServerCapabilities.fromJson(Json([
+		"logging": Json(null),
+		"completions": Json(false)
+	]));
+	assert(!c.logging && !c.completions);
+	auto d = ServerCapabilities.fromJson(Json([
+		"logging": Json.emptyObject,
+		"completions": Json.emptyObject
+	]));
+	assert(d.logging && d.completions);
+}
+
+unittest  // every capabilities fromJson rejects a non-object value with -32602
+{
+	import mcp.protocol.errors : ErrorCode, McpException;
+	import std.exception : collectException;
+	import std.meta : AliasSeq;
+
+	static foreach (T; AliasSeq!(Implementation, ListChangedCapability,
+			ResourcesCapability, ServerCapabilities, ClientCapabilities))
+	{
+		{
+			auto ex = cast(McpException) collectException(T.fromJson(Json(5)));
+			assert(ex !is null && ex.code == ErrorCode.invalidParams, T.stringof);
+		}
+	}
+}
+
+unittest  // mutating ServerCapabilities.forVersion output leaves the stored extensions intact
+{
+	ServerCapabilities caps;
+	caps.extensions = Json(["io.modelcontextprotocol/ui": Json(["a": Json(1)])]);
+	auto projected = caps.forVersion(ProtocolVersion.v2026_07_28);
+	projected.extensions["io.modelcontextprotocol/ui"]["a"] = 2;
+	assert(caps.extensions["io.modelcontextprotocol/ui"]["a"].get!int == 1);
+}
+
+unittest  // mutating ServerCapabilities.forVersion output leaves the stored experimental intact
+{
+	ServerCapabilities caps;
+	caps.experimental = Json(["feat": Json(["a": Json(1)])]);
+	auto projected = caps.forVersion(ProtocolVersion.v2026_07_28);
+	projected.experimental["feat"]["a"] = 2;
+	assert(caps.experimental["feat"]["a"].get!int == 1);
+}
+
+unittest  // mutating ClientCapabilities.forVersion output leaves the stored extensions intact
+{
+	ClientCapabilities caps;
+	caps.extensions = Json(["io.modelcontextprotocol/ui": Json(["a": Json(1)])]);
+	auto projected = caps.forVersion(ProtocolVersion.v2026_07_28);
+	projected.extensions["io.modelcontextprotocol/ui"]["a"] = 2;
+	assert(caps.extensions["io.modelcontextprotocol/ui"]["a"].get!int == 1);
+}
+
+unittest  // mutating missingFrom output leaves the required capabilities intact
+{
+	ClientCapabilities required;
+	required.extensions = Json([
+		"io.modelcontextprotocol/ui": Json(["a": Json(1)])
+	]);
+	required.experimental = Json(["feat": Json(["a": Json(1)])]);
+	auto missing = required.missingFrom(ClientCapabilities.init);
+	assert(!missing.isNull);
+	auto m = missing.get;
+	m.extensions["io.modelcontextprotocol/ui"]["a"] = 2;
+	m.experimental["feat"]["a"] = 2;
+	assert(required.extensions["io.modelcontextprotocol/ui"]["a"].get!int == 1);
+	assert(required.experimental["feat"]["a"].get!int == 1);
 }

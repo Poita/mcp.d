@@ -5,7 +5,10 @@
 /// watermark, liveness, and to tear the subscription down.
 module mcp.client.event_subscription;
 
+import core.time : Duration;
 import std.typecons : Nullable;
+
+import vibe.core.sync : LocalManualEvent, createManualEvent;
 
 import mcp.protocol.events : DeliveryMode;
 
@@ -22,12 +25,16 @@ final class EventSubscription
 	private DeliveryMode mode_;
 	private Nullable!string cursor_;
 	private void delegate() @safe nothrow teardown_;
+	private void delegate() @safe nothrow onEnd_;
 	// Bounded `eventId` memory for deduplication: a fixed ring of the most recent
 	// ids plus a set for O(1) lookup. When the ring wraps, the id it overwrites is
 	// forgotten. A zero capacity disables deduplication.
 	private bool[string] seen_;
 	private string[] seenRing_;
 	private size_t seenHead_;
+	// Emitted when the subscription stops, waking a loop parked in `sleepWhileActive`.
+	private LocalManualEvent stopped_;
+	private bool stoppedInit_;
 
 	/// The latest safe-to-persist watermark seen on this subscription — from a poll
 	/// result, a delivered occurrence, or an `active`/`heartbeat`/`gap` control.
@@ -58,8 +65,31 @@ final class EventSubscription
 		if (cancelled_)
 			return;
 		cancelled_ = true;
+		wakeSleepers();
 		if (teardown_ !is null)
 			teardown_();
+	}
+
+	/// Park the calling task for up to `d`, returning early once the subscription
+	/// is cancelled or terminated, so a delivery loop never sleeps out a long
+	/// server-chosen interval after it has been stopped.
+	package void sleepWhileActive(Duration d) @safe
+	{
+		if (!active || d <= Duration.zero)
+			return;
+		if (!stoppedInit_)
+		{
+			stopped_ = createManualEvent();
+			stoppedInit_ = true;
+		}
+		const ec = stopped_.emitCount;
+		stopped_.wait(d, ec);
+	}
+
+	private void wakeSleepers() @safe nothrow
+	{
+		if (stoppedInit_)
+			stopped_.emit();
 	}
 
 	// --- factory/loop seams (package-visible) ------------------------------
@@ -73,22 +103,25 @@ final class EventSubscription
 		seen_ = null;
 	}
 
-	/// Whether `eventId` was already delivered on this subscription. A new id is
-	/// recorded (evicting the oldest once the window is full). An empty id is never
-	/// a duplicate — there is nothing to match on.
-	package bool alreadySeen(string eventId) @safe
+	/// Whether `eventId` is in the dedup window, without recording it. An empty
+	/// id is never a duplicate — there is nothing to match on.
+	package bool isSeen(string eventId) @safe
 	{
-		if (eventId.length == 0 || seenRing_.length == 0)
-			return false;
-		if ((eventId in seen_) !is null)
-			return true;
+		return eventId.length && (eventId in seen_) !is null;
+	}
+
+	/// Record `eventId` as delivered (evicting the oldest once the window is
+	/// full). A no-op for an empty id, a disabled window, or an id already held.
+	package void markSeen(string eventId) @safe
+	{
+		if (eventId.length == 0 || seenRing_.length == 0 || isSeen(eventId))
+			return;
 		const evicted = seenRing_[seenHead_];
 		if (evicted.length)
 			seen_.remove(evicted);
 		seenRing_[seenHead_] = eventId;
 		seenHead_ = (seenHead_ + 1) % seenRing_.length;
 		seen_[eventId] = true;
-		return false;
 	}
 
 	/// Record the delivery mode the factory chose.
@@ -97,17 +130,32 @@ final class EventSubscription
 		mode_ = m;
 	}
 
-	/// Advance the watermark, ignoring a null (a null cursor never regresses it).
+	/// Advance the watermark, ignoring a null or empty cursor (neither names a
+	/// position, so neither regresses it).
 	package void advanceCursor(Nullable!string c) @safe
 	{
-		if (!c.isNull)
+		if (!c.isNull && c.get.length)
 			cursor_ = c;
 	}
 
-	/// Mark the subscription ended by a `terminated` control (no more occurrences).
+	/// Mark the subscription ended by the server (a `terminated` control, or a
+	/// failure that ends it): no more occurrences. Runs the `onEnd` release once.
 	package void markTerminated() @safe
 	{
+		if (terminated_)
+			return;
 		terminated_ = true;
+		wakeSleepers();
+		if (!cancelled_ && onEnd_ !is null)
+			onEnd_();
+	}
+
+	/// Wire the release of delivery resources (stream, receiver registration) run
+	/// once when the server ends the subscription; `cancel()` runs the teardown
+	/// instead.
+	package void onEnd(void delegate() @safe nothrow e) @safe
+	{
+		onEnd_ = e;
 	}
 
 	/// Whether `cancel()` has been called — the loop/refresh task polls this to exit.
@@ -135,6 +183,14 @@ unittest  // cursor advances only on a non-null value
 	assert(s.cursor.get == "c1"); // null never regresses the watermark
 }
 
+unittest  // an empty cursor is never adopted as the watermark
+{
+	auto s = new EventSubscription();
+	s.advanceCursor(Nullable!string("c1"));
+	s.advanceCursor(Nullable!string(""));
+	assert(s.cursor.get == "c1");
+}
+
 unittest  // cancel is idempotent and runs the teardown exactly once
 {
 	auto s = new EventSubscription();
@@ -147,32 +203,34 @@ unittest  // cancel is idempotent and runs the teardown exactly once
 	assert(n == 1);
 }
 
-unittest  // alreadySeen reports a repeated eventId and ignores empty ids
+unittest  // isSeen reports a marked eventId and ignores empty ids
 {
 	auto s = new EventSubscription();
 	s.dedupCapacity(8);
-	assert(!s.alreadySeen("e1"));
-	assert(s.alreadySeen("e1"));
-	assert(!s.alreadySeen(""));
-	assert(!s.alreadySeen(""));
+	assert(!s.isSeen("e1"));
+	s.markSeen("e1");
+	assert(s.isSeen("e1"));
+	s.markSeen("");
+	assert(!s.isSeen(""));
 }
 
 unittest  // the dedup window forgets the oldest id once it wraps
 {
 	auto s = new EventSubscription();
 	s.dedupCapacity(2);
-	assert(!s.alreadySeen("a"));
-	assert(!s.alreadySeen("b"));
-	assert(!s.alreadySeen("c")); // evicts "a"
-	assert(!s.alreadySeen("a")); // forgotten, so delivered again
-	assert(s.alreadySeen("c"));
+	s.markSeen("a");
+	s.markSeen("b");
+	s.markSeen("c"); // evicts "a"
+	assert(!s.isSeen("a")); // forgotten, so delivered again
+	assert(s.isSeen("b"));
+	assert(s.isSeen("c"));
 }
 
 unittest  // a zero dedup capacity disables deduplication
 {
 	auto s = new EventSubscription();
-	assert(!s.alreadySeen("e1"));
-	assert(!s.alreadySeen("e1"));
+	s.markSeen("e1");
+	assert(!s.isSeen("e1"));
 }
 
 unittest  // a terminated control ends the subscription without a cancel

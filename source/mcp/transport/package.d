@@ -9,7 +9,7 @@
  */
 module mcp.transport;
 
-// The named server-side transport seam (`ServerCore` / `ServerTransport`),
+// The named server-side transport seam (`ServerCore`),
 // symmetric to the client's `ClientTransport`. A custom server transport drives
 // its `McpServer` through this interface; it lives here so it is reachable from
 // the same import a transport author already pulls in.

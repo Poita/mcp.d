@@ -1,5 +1,6 @@
 module mcp.auth.resource_server;
 
+import core.time : Duration;
 import std.typecons : Nullable, nullable;
 import vibe.data.json : Json;
 
@@ -20,6 +21,16 @@ struct TokenInfo
 	string[] audience; /// the audiences the token was issued for (RFC 8707)
 	Json claims = Json.undefined; /// the full claim set, for handler inspection
 
+	/// true when the validator could not judge the token because its verifier
+	/// is temporarily out of reach (an IdP outage, a rate limit, a JWKS that
+	/// could not be fetched). The transport answers 503 rather than 401, so a
+	/// client keeps a token that may well be good. Always false when `valid`.
+	bool unavailable;
+
+	/// With `unavailable`, how long the client should wait before retrying;
+	/// zero when unknown. Sent as `Retry-After`.
+	Duration retryAfter;
+
 	/// Whether the token grants the named scope.
 	bool hasScope(string scope_) const @safe
 	{
@@ -32,12 +43,28 @@ struct TokenInfo
 	/// The spec (basic/authorization §Access Token Privilege Restriction) requires
 	/// servers to "reject tokens that do not include them in the audience claim",
 	/// so an empty audience does NOT satisfy the binding: a token must explicitly
-	/// name `resource` to be treated as issued for this server.
+	/// name `resource` to be treated as issued for this server. Both sides are
+	/// compared in canonical form (`canonicalResourceUri`: lowercase scheme and
+	/// host, no fragment or trailing slash), the form clients send as their
+	/// resource indicator.
 	bool hasAudience(string resource) const @safe
 	{
-		import std.algorithm : canFind;
+		import std.algorithm : any;
+		import mcp.auth.oauth : canonicalResourceUri;
 
-		return audience.canFind(resource);
+		const want = canonicalResourceUri(resource);
+		return audience.any!(a => canonicalResourceUri(a) == want);
+	}
+
+	/// A deep copy sharing no `claims`, `scopes` or `audience` storage with
+	/// this one, so a holder mutating either cannot affect the other.
+	TokenInfo dup() @safe
+	{
+		TokenInfo c = this;
+		c.claims = claims.clone();
+		c.scopes = scopes.dup;
+		c.audience = audience.dup;
+		return c;
 	}
 
 	/// A convenience constructor for a rejected token.
@@ -47,13 +74,125 @@ struct TokenInfo
 		t.valid = false;
 		return t;
 	}
+
+	/// A convenience constructor for a token that could not be judged because
+	/// the verifier is temporarily unavailable; see `unavailable`.
+	static TokenInfo temporarilyUnavailable(Duration retryAfter = Duration.zero) @safe
+	{
+		TokenInfo t;
+		t.unavailable = true;
+		t.retryAfter = retryAfter;
+		return t;
+	}
+}
+
+/// Thrown by a token verifier's upstream call (an introspection endpoint, a
+/// provider token API) when the verifier is temporarily unavailable rather than
+/// the token being bad: a 429 or 5xx answer, or an unreachable endpoint. A
+/// `TokenValidator` may throw it directly; `authorize` maps it to
+/// `AuthFailure.temporarilyUnavailable` just like a returned
+/// `TokenInfo.temporarilyUnavailable`.
+class TokenVerifierUnavailableException : Exception
+{
+	/// How long to wait before retrying; zero when unknown.
+	Duration retryAfter;
+
+	this(string msg, Duration retryAfter = Duration.zero, string file = __FILE__,
+			size_t line = __LINE__) @safe pure nothrow
+	{
+		super(msg, file, line);
+		this.retryAfter = retryAfter;
+	}
+}
+
+/// Whether `e` is the SSRF guard refusing a URL (a configuration fault, not an
+/// outage), as opposed to a failed connection or a timeout.
+package bool isSsrfRefusal(Exception e) @safe
+{
+	import mcp.protocol.errors : ErrorCode, McpException;
+
+	auto m = cast(McpException) e;
+	return m !is null && m.code == ErrorCode.invalidRequest;
+}
+
+/// Whether an upstream verifier's HTTP status means it is temporarily
+/// unavailable (429 Too Many Requests or any 5xx) rather than that the token is
+/// bad.
+package bool isUnavailableStatus(int status) @safe pure nothrow @nogc
+{
+	return status == 429 || status >= 500;
+}
+
+/// Parse a `Retry-After` header given in delta-seconds (RFC 9110 §10.2.3).
+/// Zero for an absent, HTTP-date, or malformed value.
+package Duration parseRetryAfter(string value) @safe
+{
+	import core.time : seconds;
+	import std.conv : to;
+	import std.string : strip;
+
+	try
+	{
+		const n = value.strip.to!uint;
+		return (cast(long) n).seconds;
+	}
+	catch (Exception)
+		return Duration.zero;
+}
+
+unittest  // parseRetryAfter reads delta-seconds and ignores anything else
+{
+	import core.time : seconds;
+
+	assert(parseRetryAfter("120") == 120.seconds);
+	assert(parseRetryAfter(" 5 ") == 5.seconds);
+	assert(parseRetryAfter("") == Duration.zero);
+	assert(parseRetryAfter("Wed, 21 Oct 2015 07:28:00 GMT") == Duration.zero);
+	assert(parseRetryAfter("-3") == Duration.zero);
+}
+
+unittest  // isUnavailableStatus flags 429 and 5xx only
+{
+	assert(isUnavailableStatus(429) && isUnavailableStatus(500) && isUnavailableStatus(503));
+	assert(!isUnavailableStatus(400) && !isUnavailableStatus(401) && !isUnavailableStatus(404));
 }
 
 /// A delegate the server calls to validate a presented bearer token. It receives
 /// the raw token string (the value after `Bearer `) and returns a `TokenInfo`.
 /// Returning `TokenInfo` with `valid == false` (or throwing) rejects the request
-/// with HTTP 401.
+/// with HTTP 401; returning `TokenInfo.temporarilyUnavailable` (or throwing
+/// `TokenVerifierUnavailableException`) answers HTTP 503 instead.
 alias TokenValidator = TokenInfo delegate(string token) @safe;
+
+/// Wrap `validator` so every token it accepts also lists `resource` among its
+/// audiences, satisfying `authorize`'s RFC 8707 resource check. Use it only when
+/// `validator` itself establishes that the token was issued for this server:
+/// a JWT verifier pinned to an IdP-specific audience (an App ID URI or API
+/// identifier rather than the MCP URL), or an upstream lookup that ties an
+/// opaque token to this server's OAuth client.
+TokenValidator bindResourceAudience(TokenValidator validator, string resource) @safe
+in (validator !is null)
+{
+	return (string token) @safe {
+		auto info = validator(token);
+		if (info.valid && resource.length && !info.hasAudience(resource))
+			info.audience ~= resource;
+		return info;
+	};
+}
+
+unittest  // bindResourceAudience adds the resource to an accepted token only
+{
+	TokenValidator v = (string t) @safe {
+		TokenInfo ti;
+		ti.valid = t == "good";
+		ti.audience = ["api://x"];
+		return ti;
+	};
+	auto bound = bindResourceAudience(v, "https://mcp.example.com/mcp");
+	assert(bound("good").audience == ["api://x", "https://mcp.example.com/mcp"]);
+	assert(!bound("bad").hasAudience("https://mcp.example.com/mcp"));
+}
 
 /// The kind of authorization failure, mapped to an HTTP status + WWW-Authenticate
 /// `error` parameter by the transport (RFC 6750 §3.1).
@@ -63,23 +202,25 @@ enum AuthFailure
 	missingToken, /// no Authorization: Bearer header -> 401 (no error code)
 	invalidToken, /// token rejected / wrong audience -> 401 invalid_token
 	insufficientScope, /// token lacks a required scope -> 403 insufficient_scope
+	temporarilyUnavailable, /// the verifier is out of reach -> 503 (with Retry-After when known)
 }
 
 /// Server-side OAuth 2.1 Resource Server configuration (RFC 6750 / 8707 / 9728).
 /// When `validator` is set on the Streamable HTTP transport, every MCP request
 /// must carry a valid `Authorization: Bearer` token; otherwise the transport
 /// replies 401 with a `WWW-Authenticate` header pointing at the Protected
-/// Resource Metadata document, which it serves at
-/// `/.well-known/oauth-protected-resource`.
+/// Resource Metadata document, which it serves at the RFC 9728 path-inserted
+/// `/.well-known/oauth-protected-resource<resource path>`.
 struct ResourceServerConfig
 {
 	/// Validates a presented bearer token. Required to enable auth; when null the
-	/// transport performs no token checks (back-compatible default).
+	/// transport performs no token checks (the default).
 	TokenValidator validator;
 
 	/// The canonical resource identifier for this server (RFC 8707). When set,
-	/// the transport enforces that a validated token's audience includes it, and
-	/// publishes it as `resource` in the metadata document.
+	/// the transport enforces that a validated token's audience includes it
+	/// (compared in canonical form, so a trailing slash or host case does not
+	/// matter), and publishes it as `resource` in the metadata document.
 	///
 	/// REQUIRED for spec compliance: basic/authorization §Access Token Privilege
 	/// Restriction says MCP servers MUST reject tokens that do not name them in the
@@ -94,17 +235,18 @@ struct ResourceServerConfig
 	/// it disables the SDK's audience check and is NOT spec compliant on its own.
 	bool allowAnyAudience;
 
-	/// The authorization server issuer URLs advertised in the metadata document
-	/// and (first entry) ignored by validation — they are informational for
-	/// clients discovering where to obtain a token.
+	/// The authorization server issuer URLs advertised in the metadata document.
+	/// Validation does not consult them; they tell clients where to obtain a
+	/// token.
 	string[] authorizationServers;
 
 	/// The scopes advertised in the metadata document.
 	string[] scopesSupported;
 
-	/// A scope every request must carry, enforced after token validation. Empty
-	/// means no scope requirement.
-	string requiredScope;
+	/// Scopes every request must carry, enforced after token validation: a
+	/// valid token missing any of them gets 403 `insufficient_scope`, so the
+	/// client can step up its authorization. Empty means no scope requirement.
+	string[] requiredScopes;
 
 	/// The server's scope hierarchy: returns true when a token that was granted
 	/// `granted` thereby also holds `required` (for example an `admin` scope that
@@ -138,14 +280,14 @@ struct ResourceServerConfig
 	/// The scope hint to surface in a `WWW-Authenticate` challenge so clients know
 	/// which scopes to request (basic/authorization §Protected Resource Metadata
 	/// Discovery Requirements / §Scope Selection Strategy). Prefers the concrete
-	/// `requiredScope`; otherwise falls back to the space-joined `scopesSupported`.
+	/// `requiredScopes`; otherwise falls back to the space-joined `scopesSupported`.
 	/// Empty when the operator configured neither.
 	string scopeHint() const @safe
 	{
 		import std.array : join;
 
-		if (requiredScope.length)
-			return requiredScope;
+		if (requiredScopes.length)
+			return requiredScopes.join(" ");
 		return scopesSupported.join(" ");
 	}
 
@@ -191,8 +333,9 @@ unittest  // bearerToken rejects non-Bearer / absent headers
 
 /// Decide whether a request bearing `authHeader` is authorized under `cfg`,
 /// returning the failure kind (`AuthFailure.none` on success) and, on success,
-/// the validated `TokenInfo`. Pure of HTTP concerns so it can be unit-tested and
-/// reused by any transport.
+/// the validated `TokenInfo`. For `AuthFailure.temporarilyUnavailable`, `info`
+/// carries the `retryAfter` hint. Pure of HTTP concerns so it can be unit-tested
+/// and reused by any transport.
 AuthFailure authorize(ResourceServerConfig cfg, string authHeader, out TokenInfo info) @safe
 {
 	if (!cfg.enabled)
@@ -205,9 +348,19 @@ AuthFailure authorize(ResourceServerConfig cfg, string authHeader, out TokenInfo
 	TokenInfo ti;
 	try
 		ti = cfg.validator(tok);
+	catch (TokenVerifierUnavailableException e)
+	{
+		info = TokenInfo.temporarilyUnavailable(e.retryAfter);
+		return AuthFailure.temporarilyUnavailable;
+	}
 	catch (Exception)
 		return AuthFailure.invalidToken;
 
+	if (!ti.valid && ti.unavailable)
+	{
+		info = TokenInfo.temporarilyUnavailable(ti.retryAfter);
+		return AuthFailure.temporarilyUnavailable;
+	}
 	if (!ti.valid)
 		return AuthFailure.invalidToken;
 
@@ -229,10 +382,13 @@ AuthFailure authorize(ResourceServerConfig cfg, string authHeader, out TokenInfo
 	// Scope enforcement comes after authentication (RFC 6750 §3.1), honouring
 	// the server's scope hierarchy: a broader granted scope may imply the
 	// required one.
-	if (cfg.requiredScope.length && !cfg.satisfiesScope(ti, cfg.requiredScope))
+	foreach (required; cfg.requiredScopes)
 	{
-		info = ti;
-		return AuthFailure.insufficientScope;
+		if (!cfg.satisfiesScope(ti, required))
+		{
+			info = ti;
+			return AuthFailure.insufficientScope;
+		}
 	}
 
 	info = ti;
@@ -312,6 +468,8 @@ string wwwAuthenticate(AuthFailure failure, string resourceMetadataUrl, string s
 		if (scope_.length)
 			parts ~= `scope="` ~ quoteParamValue(scope_) ~ `"`;
 		break;
+	case AuthFailure.temporarilyUnavailable:
+		break;
 	}
 	foreach (i, p; parts)
 		v ~= (i == 0 ? " " : ", ") ~ p;
@@ -330,7 +488,7 @@ version (unittest) private ResourceServerConfig adminOnlyScopeConfig() @safe
 {
 	ResourceServerConfig cfg;
 	cfg.allowAnyAudience = true;
-	cfg.requiredScope = "mcp:read";
+	cfg.requiredScopes = ["mcp:read"];
 	cfg.validator = (string t) {
 		TokenInfo ti;
 		ti.valid = true;
@@ -409,6 +567,34 @@ unittest  // a validator that throws yields invalidToken (not a crash)
 	assert(authorize(cfg, "Bearer x", info) == AuthFailure.invalidToken);
 }
 
+unittest  // a validator reporting its verifier unavailable yields temporarilyUnavailable with the retry hint
+{
+	import core.time : seconds;
+
+	ResourceServerConfig cfg;
+	cfg.allowAnyAudience = true;
+	cfg.validator = (string t) @safe => TokenInfo.temporarilyUnavailable(7.seconds);
+	TokenInfo info;
+	assert(authorize(cfg, "Bearer t", info) == AuthFailure.temporarilyUnavailable);
+	assert(info.retryAfter == 7.seconds);
+	assert(!info.valid);
+}
+
+unittest  // a validator throwing TokenVerifierUnavailableException yields temporarilyUnavailable
+{
+	import core.time : seconds;
+
+	ResourceServerConfig cfg;
+	cfg.allowAnyAudience = true;
+	cfg.validator = (string t) @safe {
+		throw new TokenVerifierUnavailableException("IdP down", 3.seconds);
+		return TokenInfo.init;
+	};
+	TokenInfo info;
+	assert(authorize(cfg, "Bearer t", info) == AuthFailure.temporarilyUnavailable);
+	assert(info.retryAfter == 3.seconds);
+}
+
 unittest  // a valid token authorizes and surfaces TokenInfo
 {
 	ResourceServerConfig cfg;
@@ -456,6 +642,48 @@ unittest  // RFC 8707: a token whose audience includes the resource is accepted
 	assert(authorize(cfg, "Bearer good", info) == AuthFailure.none);
 }
 
+unittest  // RFC 8707: a configured resource with a trailing slash accepts the canonical audience
+{
+	ResourceServerConfig cfg;
+	cfg.resource = "https://mcp.example.com/mcp/";
+	cfg.validator = (string t) {
+		TokenInfo ti;
+		ti.valid = true;
+		ti.audience = ["https://mcp.example.com/mcp"];
+		return ti;
+	};
+	TokenInfo info;
+	assert(authorize(cfg, "Bearer good", info) == AuthFailure.none);
+}
+
+unittest  // RFC 8707: a configured resource with an uppercase host accepts the canonical audience
+{
+	ResourceServerConfig cfg;
+	cfg.resource = "https://MCP.Example.com/mcp";
+	cfg.validator = (string t) {
+		TokenInfo ti;
+		ti.valid = true;
+		ti.audience = ["https://mcp.example.com/mcp"];
+		return ti;
+	};
+	TokenInfo info;
+	assert(authorize(cfg, "Bearer good", info) == AuthFailure.none);
+}
+
+unittest  // RFC 8707: canonical comparison is not a prefix match
+{
+	ResourceServerConfig cfg;
+	cfg.resource = "https://mcp.example.com/mcp";
+	cfg.validator = (string t) {
+		TokenInfo ti;
+		ti.valid = true;
+		ti.audience = ["https://mcp.example.com", "https://mcp.example.com/MCP"];
+		return ti;
+	};
+	TokenInfo info;
+	assert(authorize(cfg, "Bearer good", info) == AuthFailure.invalidToken);
+}
+
 unittest  // RFC 8707: an empty audience is rejected when a resource is configured
 {
 	// The spec (basic/authorization, Access Token Privilege Restriction) says
@@ -500,7 +728,7 @@ unittest  // allowAnyAudience opts out of mandatory binding (dev/test escape hat
 unittest  // a token lacking the required scope yields insufficientScope
 {
 	ResourceServerConfig cfg;
-	cfg.requiredScope = "mcp:write";
+	cfg.requiredScopes = ["mcp:write"];
 	// Audience binding passes first (no resource configured -> opt out) so the
 	// scope check is what rejects the request.
 	cfg.allowAnyAudience = true;
@@ -568,12 +796,29 @@ unittest  // WWW-Authenticate never lets a reflected value break out of the quot
 	assert(v == `Bearer resource_metadata="https://x%22 foo=%22bar/meta", error="invalid_token"`);
 }
 
-unittest  // scopeHint prefers requiredScope when set
+unittest  // scopeHint prefers requiredScopes when set
 {
 	ResourceServerConfig cfg;
-	cfg.requiredScope = "mcp:write";
+	cfg.requiredScopes = ["mcp:write"];
 	cfg.scopesSupported = ["mcp:read", "mcp:write"];
 	assert(cfg.scopeHint() == "mcp:write");
+}
+
+unittest  // every required scope must be granted; one missing yields insufficientScope
+{
+	ResourceServerConfig cfg;
+	cfg.requiredScopes = ["mcp:read", "mcp:write"];
+	cfg.allowAnyAudience = true;
+	cfg.validator = (string t) {
+		TokenInfo ti;
+		ti.valid = true;
+		ti.scopes = t == "both" ? ["mcp:read", "mcp:write"] : ["mcp:read"];
+		return ti;
+	};
+	TokenInfo info;
+	assert(authorize(cfg, "Bearer one", info) == AuthFailure.insufficientScope);
+	assert(authorize(cfg, "Bearer both", info) == AuthFailure.none);
+	assert(cfg.scopeHint() == "mcp:read mcp:write");
 }
 
 unittest  // scopeHint falls back to space-joined scopesSupported

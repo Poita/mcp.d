@@ -10,15 +10,10 @@ module mcp.protocol.events;
 import std.typecons : Nullable, nullable;
 import vibe.data.json : Json;
 
-import mcp.protocol.jsonhelpers : getOr, tryGet;
+import mcp.protocol.jsonhelpers : getOr, tryGet, requireObject;
+import mcp.protocol.mrtr : MetaKey;
 
 @safe:
-
-/// The `_meta` key under which every `notifications/events/*` message carries the
-/// JSON-RPC id of its parent `events/stream` request, so a client holding several
-/// concurrent streams (notably on stdio, where they share one stdout) can route
-/// each notification to the right subscription (SEP-2575 correlation convention).
-enum string subscriptionIdMetaKey = "io.modelcontextprotocol/subscriptionId";
 
 /// JSON-RPC method names introduced by the extension.
 enum string eventsListMethod = "events/list";
@@ -81,8 +76,8 @@ Nullable!DeliveryMode deliveryModeFromWire(string s) @safe pure nothrow
 struct EventType
 {
 	string name;
-	string description;
-	string title; /// optional human-readable display name (empty = unset)
+	Nullable!string description;
+	Nullable!string title; /// optional human-readable display name
 	DeliveryMode[] delivery; /// non-empty subset of poll/push/webhook
 	Json inputSchema = Json.undefined; /// JSON Schema for subscription arguments
 	Json payloadSchema = Json.undefined; /// JSON Schema for delivered `data`
@@ -92,10 +87,10 @@ struct EventType
 	{
 		Json j = Json.emptyObject;
 		j["name"] = name;
-		if (description.length)
-			j["description"] = description;
-		if (title.length)
-			j["title"] = title;
+		if (!description.isNull)
+			j["description"] = description.get;
+		if (!title.isNull)
+			j["title"] = title.get;
 		Json arr = Json.emptyArray;
 		foreach (m; delivery)
 			arr ~= deliveryModeToWire(m);
@@ -111,10 +106,11 @@ struct EventType
 
 	static EventType fromJson(Json j) @safe
 	{
+		requireObject(j, "EventType");
 		EventType e;
 		e.name = j.getOr("name", "");
-		e.description = j.getOr("description", "");
-		e.title = j.getOr("title", "");
+		tryGet(j, "description", e.description);
+		tryGet(j, "title", e.title);
 		if ("delivery" in j && j["delivery"].type == Json.Type.array)
 			foreach (i; 0 .. j["delivery"].length)
 			{
@@ -155,6 +151,7 @@ struct EventListResult
 
 	static EventListResult fromJson(Json j) @safe
 	{
+		requireObject(j, "EventListResult");
 		EventListResult r;
 		if ("events" in j && j["events"].type == Json.Type.array)
 			foreach (i; 0 .. j["events"].length)
@@ -194,6 +191,7 @@ struct EventOccurrence
 
 	static EventOccurrence fromJson(Json j) @safe
 	{
+		requireObject(j, "EventOccurrence");
 		EventOccurrence e;
 		e.eventId = j.getOr("eventId", "");
 		e.name = j.getOr("name", "");
@@ -208,6 +206,87 @@ struct EventOccurrence
 			e.meta = j["_meta"];
 		return e;
 	}
+}
+
+/// Read a request's optional `cursor` into `val`. Absent or null leaves `val`
+/// null (bootstrap: start from now). Any value other than a string throws
+/// -32602 InvalidParams, so a malformed cursor is refused rather than silently
+/// treated as a bootstrap that skips the client's backlog.
+private void readCursor(Json j, ref Nullable!string val) @safe
+{
+	import mcp.protocol.errors : invalidParams;
+
+	auto v = "cursor" in j;
+	if (v is null || v.type == Json.Type.null_ || v.type == Json.Type.undefined)
+		return;
+	if (v.type != Json.Type.string)
+		throw invalidParams("'cursor' must be a string or null");
+	val = v.get!string;
+}
+
+/// Read the optional non-negative integer field `key` of a request's params into
+/// `val`. Absent or null leaves `val` null. A whole-number float (`60000.0`) is
+/// accepted, and an integer beyond `long.max` clamps to `long.max`. Any other
+/// value, a fraction, or a negative number throws -32602 InvalidParams, so a
+/// malformed bound is refused rather than silently ignored.
+private void readNonNegative(Json j, string key, ref Nullable!long val) @safe
+{
+	import std.bigint : BigInt;
+	import mcp.protocol.errors : invalidParams;
+
+	if (j.type != Json.Type.object)
+		return;
+	auto v = key in j;
+	if (v is null || v.type == Json.Type.null_ || v.type == Json.Type.undefined)
+		return;
+	auto bad = () => invalidParams("'" ~ key ~ "' must be a non-negative integer");
+	switch (v.type)
+	{
+	case Json.Type.int_:
+		if (v.get!long < 0)
+			throw bad();
+		val = v.get!long;
+		break;
+	case Json.Type.bigInt:
+		// vibe parses only out-of-`long`-range integers as bigInt.
+		if (v.get!BigInt < 0)
+			throw bad();
+		val = long.max;
+		break;
+	case Json.Type.float_:
+		const d = v.get!double;
+		// `!(d >= 0)` also rejects NaN.
+		if (!(d >= 0))
+			throw bad();
+		// Every double this large is a whole number; clamp like a bigInt.
+		if (d >= 0x1p63)
+		{
+			val = long.max;
+			break;
+		}
+		const l = cast(long) d;
+		if (l != d)
+			throw bad();
+		val = l;
+		break;
+	default:
+		throw bad();
+	}
+}
+
+/// Read the optional `arguments` object of an events request into `val`:
+/// absent or null leaves `val` untouched, an object sets it, and any other
+/// value throws -32602 InvalidParams.
+private void readArguments(Json j, ref Json val) @safe
+{
+	import mcp.protocol.errors : invalidParams;
+
+	auto v = "arguments" in j;
+	if (v is null || v.type == Json.Type.null_ || v.type == Json.Type.undefined)
+		return;
+	if (v.type != Json.Type.object)
+		throw invalidParams("'arguments' must be an object");
+	val = *v;
 }
 
 /// Parameters of an `events/poll` request. `cursor: null` means "from now".
@@ -234,14 +313,13 @@ struct PollParams
 
 	static PollParams fromJson(Json j) @safe
 	{
+		requireObject(j, "PollParams");
 		PollParams p;
 		p.name = j.getOr("name", "");
-		if ("arguments" in j && j["arguments"].type == Json.Type.object)
-			p.arguments = j["arguments"];
-		if ("cursor" in j && j["cursor"].type == Json.Type.string)
-			p.cursor = j["cursor"].get!string;
-		tryGet(j, "maxAgeMs", p.maxAgeMs);
-		tryGet(j, "maxEvents", p.maxEvents);
+		readArguments(j, p.arguments);
+		readCursor(j, p.cursor);
+		readNonNegative(j, "maxAgeMs", p.maxAgeMs);
+		readNonNegative(j, "maxEvents", p.maxEvents);
 		return p;
 	}
 }
@@ -274,6 +352,7 @@ struct PollResult
 
 	static PollResult fromJson(Json j) @safe
 	{
+		requireObject(j, "PollResult");
 		PollResult r;
 		if ("events" in j && j["events"].type == Json.Type.array)
 			foreach (i; 0 .. j["events"].length)
@@ -308,13 +387,12 @@ struct StreamParams
 
 	static StreamParams fromJson(Json j) @safe
 	{
+		requireObject(j, "StreamParams");
 		StreamParams p;
 		p.name = j.getOr("name", "");
-		if ("arguments" in j && j["arguments"].type == Json.Type.object)
-			p.arguments = j["arguments"];
-		if ("cursor" in j && j["cursor"].type == Json.Type.string)
-			p.cursor = j["cursor"].get!string;
-		tryGet(j, "maxAgeMs", p.maxAgeMs);
+		readArguments(j, p.arguments);
+		readCursor(j, p.cursor);
+		readNonNegative(j, "maxAgeMs", p.maxAgeMs);
 		return p;
 	}
 }
@@ -377,20 +455,18 @@ struct SubscribeParams
 
 	static SubscribeParams fromJson(Json j) @safe
 	{
+		requireObject(j, "SubscribeParams");
 		SubscribeParams p;
 		p.name = j.getOr("name", "");
-		if ("arguments" in j && j["arguments"].type == Json.Type.object)
-			p.arguments = j["arguments"];
+		readArguments(j, p.arguments);
 		if ("delivery" in j && j["delivery"].type == Json.Type.object)
 			p.delivery = WebhookDelivery.fromJson(j["delivery"]);
-		if ("cursor" in j && j["cursor"].type == Json.Type.string)
-			p.cursor = j["cursor"].get!string;
-		tryGet(j, "maxAgeMs", p.maxAgeMs);
+		readCursor(j, p.cursor);
+		readNonNegative(j, "maxAgeMs", p.maxAgeMs);
 		if ("ttlMs" in j)
 		{
 			p.ttlMsPresent = true;
-			if (j["ttlMs"].type != Json.Type.null_)
-				tryGet(j, "ttlMs", p.ttlMs);
+			readNonNegative(j, "ttlMs", p.ttlMs);
 		}
 		return p;
 	}
@@ -420,6 +496,7 @@ struct SubscribeResult
 
 	static SubscribeResult fromJson(Json j) @safe
 	{
+		requireObject(j, "SubscribeResult");
 		SubscribeResult r;
 		r.id = j.getOr("id", "");
 		if ("refreshBefore" in j && j["refreshBefore"].type == Json.Type.string)
@@ -454,10 +531,10 @@ struct UnsubscribeParams
 
 	static UnsubscribeParams fromJson(Json j) @safe
 	{
+		requireObject(j, "UnsubscribeParams");
 		UnsubscribeParams p;
 		p.name = j.getOr("name", "");
-		if ("arguments" in j && j["arguments"].type == Json.Type.object)
-			p.arguments = j["arguments"];
+		readArguments(j, p.arguments);
 		if ("delivery" in j && j["delivery"].type == Json.Type.object)
 			p.url = j["delivery"].getOr("url", "");
 		return p;
@@ -549,6 +626,7 @@ struct DeliveryStatus
 
 	static DeliveryStatus fromJson(Json j) @safe
 	{
+		requireObject(j, "DeliveryStatus");
 		DeliveryStatus s;
 		s.active = j.getOr("active", false);
 		tryGet(j, "lastDeliveryAt", s.lastDeliveryAt);
@@ -567,12 +645,13 @@ struct DeliveryStatus
 // ---------------------------------------------------------------------------
 
 /// A `gap` control envelope: a gap was detected between refreshes; the client
-/// persists `cursor` and treats it as `truncated: true`.
-Json gapEnvelope(string cursor) @safe
+/// persists `cursor` and treats it as `truncated: true`. A null `cursor` reports
+/// a loss with no position to resume from, so the client keeps its own.
+Json gapEnvelope(Nullable!string cursor) @safe
 {
 	Json j = Json.emptyObject;
 	j["type"] = "gap";
-	j["cursor"] = cursor;
+	j["cursor"] = cursor.isNull ? Json(null) : Json(cursor.get);
 	return j;
 }
 
@@ -651,15 +730,21 @@ Json streamEventsResult() @safe
 	return j;
 }
 
-/// Attach the SEP-2575 subscription-id correlation `_meta` to a push
-/// notification's params. `subscriptionId` is the parent `events/stream`
-/// request's JSON-RPC id (an integer or string).
+/// Attach the `io.modelcontextprotocol/subscriptionId` (`MetaKey.subscriptionId`)
+/// correlation `_meta` to a notification's params, returning a copy. A client
+/// holding several concurrent streams (notably on stdio, where they share one
+/// stdout) routes each notification to its subscription by this key. `subscriptionId` is the JSON-RPC
+/// id of the request that opened the stream (`events/stream` or
+/// `subscriptions/listen`), carried verbatim so a numeric id stays numeric. An
+/// absent (`undefined`) or `null` id is a no-op and returns `params` unchanged.
 Json withSubscriptionId(Json params, Json subscriptionId) @safe
 {
+	if (subscriptionId.type == Json.Type.undefined || subscriptionId.type == Json.Type.null_)
+		return params;
 	Json p = params.type == Json.Type.object ? params.clone() : Json.emptyObject;
 	Json meta = ("_meta" in p && p["_meta"].type == Json.Type.object) ? p["_meta"]
 		: Json.emptyObject;
-	meta[subscriptionIdMetaKey] = subscriptionId;
+	meta[MetaKey.subscriptionId] = subscriptionId;
 	p["_meta"] = meta;
 	return p;
 }
@@ -755,7 +840,9 @@ string controlKindToWire(EventControlKind k) @safe pure nothrow
 
 private void readCursorInto(Json j, ref Nullable!string cursor) @safe
 {
-	if (j.type == Json.Type.object && "cursor" in j && j["cursor"].type == Json.Type.string)
+	// An empty string names no position, so it is never adopted as a watermark.
+	if (j.type == Json.Type.object && "cursor" in j
+			&& j["cursor"].type == Json.Type.string && j["cursor"].get!string.length)
 		cursor = j["cursor"].get!string;
 }
 
@@ -856,6 +943,26 @@ unittest  // EventType carries an optional title and round-trips it
 	assert(back.title == "New Email");
 }
 
+unittest  // EventType leaves an absent title/description null on parse
+{
+	auto e = EventType.fromJson(Json([
+		"name": Json("x"),
+		"delivery": Json.emptyArray
+	]));
+	assert(e.title.isNull && e.description.isNull);
+}
+
+unittest  // EventType keeps an explicitly empty title distinct from an absent one
+{
+	auto e = EventType.fromJson(Json([
+		"name": Json("x"),
+		"title": Json(""),
+		"delivery": Json.emptyArray
+	]));
+	assert(!e.title.isNull && e.title.get == "");
+	assert(e.toJson()["title"].get!string == "");
+}
+
 unittest  // EventType omits description and schemas when unset
 {
 	EventType e;
@@ -884,7 +991,7 @@ unittest  // EventType.fromJson skips unknown delivery strings
 unittest  // EventListResult carries events and an optional nextCursor
 {
 	EventListResult r;
-	r.events = [EventType("a", "", [DeliveryMode.poll])];
+	r.events = [EventType(name: "a", delivery: [DeliveryMode.poll])];
 	auto j = r.toJson();
 	assert(j["events"].length == 1);
 	assert("nextCursor" !in j);
@@ -940,6 +1047,163 @@ unittest  // PollParams emits cursor:null for "from now" and round-trips a curso
 	assert(j2["maxAgeMs"].get!long == 300_000 && j2["maxEvents"].get!long == 50);
 	auto back2 = PollParams.fromJson(j2);
 	assert(back2.cursor.get == "c1" && back2.maxAgeMs.get == 300_000 && back2.maxEvents.get == 50);
+}
+
+unittest  // PollParams rejects a non-integer maxEvents with InvalidParams
+{
+	import std.exception : collectException;
+	import vibe.data.json : parseJsonString;
+	import mcp.protocol.errors : McpException, ErrorCode;
+
+	auto e = collectException!McpException(
+			PollParams.fromJson(parseJsonString(`{"name":"n","maxEvents":"10"}`)));
+	assert(e !is null && e.code == ErrorCode.invalidParams);
+}
+
+unittest  // PollParams rejects a negative maxEvents with InvalidParams
+{
+	import std.exception : collectException;
+	import vibe.data.json : parseJsonString;
+	import mcp.protocol.errors : McpException, ErrorCode;
+
+	auto e = collectException!McpException(
+			PollParams.fromJson(parseJsonString(`{"name":"n","maxEvents":-1}`)));
+	assert(e !is null && e.code == ErrorCode.invalidParams);
+}
+
+unittest  // PollParams rejects a negative maxAgeMs with InvalidParams
+{
+	import std.exception : collectException;
+	import vibe.data.json : parseJsonString;
+	import mcp.protocol.errors : McpException, ErrorCode;
+
+	auto e = collectException!McpException(
+			PollParams.fromJson(parseJsonString(`{"name":"n","maxAgeMs":-5}`)));
+	assert(e !is null && e.code == ErrorCode.invalidParams);
+}
+
+unittest  // PollParams accepts a whole-number float maxAgeMs/maxEvents
+{
+	import vibe.data.json : parseJsonString;
+
+	auto p = PollParams.fromJson(
+			parseJsonString(`{"name":"n","maxAgeMs":60000.0,"maxEvents":5.0}`));
+	assert(p.maxAgeMs.get == 60_000 && p.maxEvents.get == 5);
+}
+
+unittest  // PollParams clamps a maxAgeMs beyond long.max to long.max
+{
+	import vibe.data.json : parseJsonString;
+
+	auto p = PollParams.fromJson(parseJsonString(`{"name":"n","maxAgeMs":99999999999999999999}`));
+	assert(p.maxAgeMs.get == long.max);
+}
+
+unittest  // PollParams rejects a negative bigInt or out-of-range float maxAgeMs
+{
+	import std.exception : collectException;
+	import vibe.data.json : parseJsonString;
+	import mcp.protocol.errors : McpException, ErrorCode;
+
+	foreach (s; [
+		`{"name":"n","maxAgeMs":-99999999999999999999}`,
+		`{"name":"n","maxAgeMs":-1.0}`, `{"name":"n","maxAgeMs":"5"}`
+	])
+	{
+		auto e = collectException!McpException(PollParams.fromJson(parseJsonString(s)));
+		assert(e !is null && e.code == ErrorCode.invalidParams, s);
+	}
+}
+
+unittest  // PollParams treats null maxAgeMs/maxEvents as absent
+{
+	import vibe.data.json : parseJsonString;
+
+	auto p = PollParams.fromJson(parseJsonString(`{"name":"n","maxAgeMs":null,"maxEvents":null}`));
+	assert(p.maxAgeMs.isNull && p.maxEvents.isNull);
+}
+
+unittest  // StreamParams rejects a fractional maxAgeMs with InvalidParams
+{
+	import std.exception : collectException;
+	import vibe.data.json : parseJsonString;
+	import mcp.protocol.errors : McpException, ErrorCode;
+
+	auto e = collectException!McpException(
+			StreamParams.fromJson(parseJsonString(`{"name":"n","maxAgeMs":1.5}`)));
+	assert(e !is null && e.code == ErrorCode.invalidParams);
+}
+
+unittest  // Poll/Stream/Subscribe/Unsubscribe params reject a non-object arguments with InvalidParams
+{
+	import std.exception : collectException;
+	import vibe.data.json : parseJsonString;
+	import mcp.protocol.errors : McpException, ErrorCode;
+
+	foreach (args; [`"x"`, `[1]`, `3`])
+	{
+		auto j = parseJsonString(
+				`{"name":"n","arguments":` ~ args
+				~ `,"delivery":{"mode":"webhook","url":"https://h/x"}}`);
+		foreach (e; [
+			collectException!McpException(PollParams.fromJson(j)),
+			collectException!McpException(StreamParams.fromJson(j)),
+			collectException!McpException(SubscribeParams.fromJson(j)),
+			collectException!McpException(UnsubscribeParams.fromJson(j))
+		])
+			assert(e !is null && e.code == ErrorCode.invalidParams, args);
+	}
+}
+
+unittest  // Poll params treat a null arguments as absent
+{
+	import vibe.data.json : parseJsonString;
+
+	auto p = PollParams.fromJson(parseJsonString(`{"name":"n","arguments":null}`));
+	assert(p.arguments.type == Json.Type.object && p.arguments.length == 0);
+}
+
+unittest  // SubscribeParams rejects a non-integer ttlMs rather than treating it as no expiry
+{
+	import std.exception : collectException;
+	import vibe.data.json : parseJsonString;
+	import mcp.protocol.errors : McpException, ErrorCode;
+
+	auto e = collectException!McpException(
+			SubscribeParams.fromJson(parseJsonString(`{"name":"n","ttlMs":"forever"}`)));
+	assert(e !is null && e.code == ErrorCode.invalidParams);
+}
+
+unittest  // SubscribeParams rejects a negative ttlMs with InvalidParams
+{
+	import std.exception : collectException;
+	import vibe.data.json : parseJsonString;
+	import mcp.protocol.errors : McpException, ErrorCode;
+
+	auto e = collectException!McpException(
+			SubscribeParams.fromJson(parseJsonString(`{"name":"n","ttlMs":-1}`)));
+	assert(e !is null && e.code == ErrorCode.invalidParams);
+}
+
+unittest  // SubscribeParams rejects a negative maxAgeMs with InvalidParams
+{
+	import std.exception : collectException;
+	import vibe.data.json : parseJsonString;
+	import mcp.protocol.errors : McpException, ErrorCode;
+
+	auto e = collectException!McpException(
+			SubscribeParams.fromJson(parseJsonString(`{"name":"n","maxAgeMs":-1}`)));
+	assert(e !is null && e.code == ErrorCode.invalidParams);
+}
+
+unittest  // SubscribeParams keeps ttlMs null as an explicit no-expiry request
+{
+	import vibe.data.json : parseJsonString;
+
+	auto p = SubscribeParams.fromJson(parseJsonString(`{"name":"n","ttlMs":null}`));
+	assert(p.ttlMsPresent && p.ttlMs.isNull);
+	auto q = SubscribeParams.fromJson(parseJsonString(`{"name":"n","ttlMs":60000}`));
+	assert(q.ttlMsPresent && q.ttlMs.get == 60_000);
 }
 
 unittest  // PollResult round-trips events + flags
@@ -1114,15 +1378,15 @@ unittest  // DeliveryStatus carries throttling fields when set
 
 unittest  // control envelopes carry the right discriminator
 {
-	assert(gapEnvelope("c")["type"].get!string == "gap");
-	assert(gapEnvelope("c")["cursor"].get!string == "c");
+	assert(gapEnvelope(nullable("c"))["type"].get!string == "gap");
+	assert(gapEnvelope(nullable("c"))["cursor"].get!string == "c");
 	assert(terminatedEnvelope(Json(["code": Json(-32012)]))["type"].get!string == "terminated");
 	assert(verificationEnvelope("nonce")["challenge"].get!string == "nonce");
 }
 
 unittest  // isControlEnvelope distinguishes control bodies from event occurrences
 {
-	assert(isControlEnvelope(gapEnvelope("c")));
+	assert(isControlEnvelope(gapEnvelope(nullable("c"))));
 	auto occ = EventOccurrence("e", "n", "t").toJson();
 	assert(!isControlEnvelope(occ));
 }
@@ -1154,7 +1418,7 @@ unittest  // withSubscriptionId attaches the SEP-2575 correlation _meta (integer
 {
 	auto occ = EventOccurrence("e", "n", "t").toJson();
 	auto tagged = withSubscriptionId(occ, Json(1));
-	assert(tagged["_meta"][subscriptionIdMetaKey].get!int == 1);
+	assert(tagged["_meta"][MetaKey.subscriptionId].get!int == 1);
 	// original event fields preserved
 	assert(tagged["eventId"].get!string == "e");
 }
@@ -1165,7 +1429,20 @@ unittest  // withSubscriptionId merges into an existing _meta and supports strin
 	params["_meta"] = Json(["existing": Json("keep")]);
 	auto tagged = withSubscriptionId(params, Json("sub-7"));
 	assert(tagged["_meta"]["existing"].get!string == "keep");
-	assert(tagged["_meta"][subscriptionIdMetaKey].get!string == "sub-7");
+	assert(tagged["_meta"][MetaKey.subscriptionId].get!string == "sub-7");
+}
+
+unittest  // withSubscriptionId leaves params untagged when the id is absent or null
+{
+	Json params = Json(["uri": Json("file:///x")]);
+	assert("_meta" !in withSubscriptionId(params, Json.undefined));
+	assert("_meta" !in withSubscriptionId(params, Json(null)));
+}
+
+unittest  // withSubscriptionId stamps an empty-string id, which JSON-RPC allows
+{
+	auto tagged = withSubscriptionId(Json.emptyObject, Json(""));
+	assert(tagged["_meta"][MetaKey.subscriptionId].get!string == "");
 }
 
 unittest  // EventError round-trips code/message/data and tolerates a non-object
@@ -1220,9 +1497,21 @@ unittest  // a non-control push method (the event itself) is rejected
 unittest  // a webhook gap envelope parses to a typed gap with its cursor
 {
 	EventControl c;
-	assert(controlFromWebhookEnvelope(gapEnvelope("cur-3"), c));
+	assert(controlFromWebhookEnvelope(gapEnvelope(nullable("cur-3")), c));
 	assert(c.kind == EventControlKind.gap);
 	assert(c.cursor.get == "cur-3");
+}
+
+unittest  // a gap envelope with an empty or null cursor parses to a gap with no cursor
+{
+	import vibe.data.json : parseJsonString;
+
+	EventControl c;
+	assert(controlFromWebhookEnvelope(parseJsonString(`{"type":"gap","cursor":""}`), c));
+	assert(c.kind == EventControlKind.gap && c.cursor.isNull);
+	EventControl d;
+	assert(controlFromWebhookEnvelope(parseJsonString(`{"type":"gap","cursor":null}`), d));
+	assert(d.kind == EventControlKind.gap && d.cursor.isNull);
 }
 
 unittest  // a webhook terminated envelope carries its typed error
@@ -1239,4 +1528,55 @@ unittest  // a webhook verification envelope is not surfaced as control
 {
 	EventControl c;
 	assert(!controlFromWebhookEnvelope(verificationEnvelope("nonce"), c));
+}
+
+unittest  // every events fromJson rejects a non-object value with -32602
+{
+	import mcp.protocol.errors : ErrorCode, McpException;
+	import std.exception : collectException;
+	import std.meta : AliasSeq;
+
+	static foreach (T; AliasSeq!(EventType, EventListResult, EventOccurrence,
+			PollParams, PollResult,
+			StreamParams, SubscribeParams, SubscribeResult, UnsubscribeParams, DeliveryStatus))
+	{
+		{
+			auto ex = cast(McpException) collectException(T.fromJson(Json(5)));
+			assert(ex !is null && ex.code == ErrorCode.invalidParams, T.stringof);
+		}
+	}
+}
+
+unittest  // events/poll rejects a cursor that is neither a string nor null
+{
+	import std.exception : collectException;
+	import vibe.data.json : parseJsonString;
+	import mcp.protocol.errors : McpException, ErrorCode;
+
+	auto e = collectException!McpException(
+			PollParams.fromJson(parseJsonString(`{"name":"n","cursor":123}`)));
+	assert(e !is null && e.code == ErrorCode.invalidParams);
+	assert(PollParams.fromJson(parseJsonString(`{"name":"n","cursor":null}`)).cursor.isNull);
+}
+
+unittest  // events/stream rejects a cursor that is neither a string nor null
+{
+	import std.exception : collectException;
+	import vibe.data.json : parseJsonString;
+	import mcp.protocol.errors : McpException, ErrorCode;
+
+	auto e = collectException!McpException(
+			StreamParams.fromJson(parseJsonString(`{"name":"n","cursor":{"seq":1}}`)));
+	assert(e !is null && e.code == ErrorCode.invalidParams);
+}
+
+unittest  // events/subscribe rejects a cursor that is neither a string nor null
+{
+	import std.exception : collectException;
+	import vibe.data.json : parseJsonString;
+	import mcp.protocol.errors : McpException, ErrorCode;
+
+	auto e = collectException!McpException(
+			SubscribeParams.fromJson(parseJsonString(`{"name":"n","cursor":true}`)));
+	assert(e !is null && e.code == ErrorCode.invalidParams);
 }

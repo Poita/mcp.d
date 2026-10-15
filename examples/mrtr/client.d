@@ -47,8 +47,6 @@ module mrtr_client;
 import std.conv : to;
 import std.stdio : writeln;
 
-import vibe.data.json : Json;
-
 import mcp;
 
 import examples_common : check, runClient, connectFromArgs;
@@ -97,9 +95,9 @@ int main(string[] args) @safe
 /// function runs over stdio and HTTP.
 private int runE2E(McpClient client) @safe
 {
-	// Stateless 2026-07-28: MRTR is the input mechanism. Every request
-	// carries per-request `_meta`.
-	client.enableModern();
+	// connect() negotiates stateless 2026-07-28, where MRTR is the input
+	// mechanism and every request carries per-request `_meta`.
+	client.connect();
 
 	// Advertise the input capabilities this client can satisfy. The server only
 	// includes an InputRequest the client declared support for, so we must
@@ -107,7 +105,6 @@ private int runE2E(McpClient client) @safe
 	// deliberately installs NO handlers). The no-handler call still surfaces the
 	// InputRequiredResult verbatim — advertising a capability is distinct from
 	// installing a handler to auto-resolve it.
-	client.capabilities.elicitation = true;
 	client.capabilities.elicitationForm = true;
 	client.capabilities.sampling = true;
 

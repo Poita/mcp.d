@@ -8,6 +8,7 @@ module mcp.client.events;
 
 import std.base64 : Base64;
 import vibe.data.json : Json, parseJsonString;
+import mcp.protocol.jsonrpc : parseUntrustedJson;
 
 import standardwebhooks : Webhook;
 import mcp.protocol.events : EventOccurrence, isControlEnvelope, EventControl,
@@ -59,11 +60,27 @@ final class WebhookReceiver
 	}
 
 	private Reg[string] regs_;
+	// Secrets of subscriptions being created (see `expectSecret`), with counts.
+	private size_t[string] expected_;
 	// Dedup keyed per subscription (subId \0 webhook-id), value is the delivery's
 	// webhook-timestamp (seconds). The same eventId fans out to multiple
 	// subscriptions as deliveries sharing a webhook-id, so the key must include
 	// the subscription id or one subscription's copy would swallow the others'.
 	private long[string] seen_;
+	// `seen_` keys in arrival order (with their timestamps), consumed from
+	// `seenHead_`, so eviction pops the oldest arrivals instead of scanning.
+	private SeenEntry[] seenOrder_;
+	private size_t seenHead_;
+	private long newestSeenTs_;
+	// Dedup keys whose delivery is being routed right now. A callback can yield,
+	// so a server retry may arrive before the first copy is recorded in `seen_`.
+	private bool[string] inProgress_;
+
+	private static struct SeenEntry
+	{
+		string key;
+		long ts;
+	}
 
 	/// Dedup entries older than this many seconds (relative to the newest
 	/// webhook-timestamp seen) are evicted, and `seen_` is hard-capped at
@@ -91,16 +108,38 @@ final class WebhookReceiver
 		regs_.remove(subscriptionId);
 	}
 
+	/// Expect a subscription signed with `secret` whose id is not known yet: a
+	/// server may send its verification challenge before the subscribe call
+	/// that creates the subscription returns its id. While expected, a challenge
+	/// for an unregistered id that verifies under `secret` is answered; anything
+	/// else for that id still waits for `register`. Calls nest: each needs a
+	/// matching `unexpectSecret`.
+	void expectSecret(string secret) @safe
+	{
+		expected_[secret]++;
+	}
+
+	/// Withdraw one `expectSecret` for `secret`.
+	void unexpectSecret(string secret) @safe
+	{
+		if (auto n = secret in expected_)
+			if (--*n == 0)
+				expected_.remove(secret);
+	}
+
 	/// Verify and route one delivery. Returns the HTTP status (and body) the
 	/// endpoint should reply with: `200` once the event is durably accepted (or a
 	/// verification challenge is echoed), `400` on a signature/parse failure, and
-	/// `503` for an unknown subscription id (a retryable subscribe/delivery race).
+	/// `503` for an unknown subscription id (a retryable subscribe/delivery race)
+	/// or for a retry of a delivery whose callback is still running (the server
+	/// retries again, and that retry is acknowledged or routed depending on how
+	/// the first copy finished).
 	ReceiverResponse processDelivery(string body, string[string] headers) @safe
 	{
 		const subId = headerGet(headers, "x-mcp-subscription-id");
 		auto reg = subId in regs_;
 		if (reg is null)
-			return ReceiverResponse(503, ""); // not yet routable; the server retries
+			return answerExpectedChallenge(body, headers);
 
 		auto wh = Webhook(reg.secret);
 		auto vr = verifyTimestamp ? wh.tryVerify(body,
@@ -125,13 +164,57 @@ final class WebhookReceiver
 			const key = subId ~ "\0" ~ wid;
 			if ((key in seen_) !is null)
 				return ReceiverResponse(200, ""); // already processed
-			seen_[key] = ts;
-			evictSeen(ts);
+			if ((key in inProgress_) !is null)
+				return ReceiverResponse(503, "");
+			inProgress_[key] = true;
+			scope (exit)
+				inProgress_.remove(key);
+			// Recorded only once the delivery is handled: a callback that throws
+			// (the adapter answers 5xx) leaves the server's retry to be processed.
+			auto resp = route(body, *reg);
+			if (resp.status == 200)
+				recordSeen(key, ts);
+			return resp;
 		}
+		return route(body, *reg);
+	}
 
+	// Answer a verification challenge for a subscription id not registered yet
+	// when it verifies under an expected secret; anything else is not routable
+	// yet, and the server retries it.
+	private ReceiverResponse answerExpectedChallenge(string body, string[string] headers) @safe
+	{
+		foreach (secret, _; expected_)
+		{
+			bool ok;
+			try
+			{
+				auto wh = Webhook(secret);
+				ok = (verifyTimestamp ? wh.tryVerify(body,
+						headers) : wh.tryVerifyIgnoringTimestamp(body, headers)).ok;
+			}
+			catch (Exception)
+				continue;
+			if (!ok)
+				continue;
+			Json j;
+			try
+				j = parseUntrustedJson(body);
+			catch (Exception)
+				break;
+			if (isControlEnvelope(j) && j["type"].get!string == "verification")
+				return ReceiverResponse(200, Json(["challenge": j["challenge"]]).toString());
+			break;
+		}
+		return ReceiverResponse(503, "");
+	}
+
+	// Parse a verified delivery and hand it to the subscription's callbacks.
+	private ReceiverResponse route(string body, ref Reg reg) @safe
+	{
 		Json j;
 		try
-			j = parseJsonString(body);
+			j = parseUntrustedJson(body);
 		catch (Exception)
 			return ReceiverResponse(400, "");
 
@@ -146,35 +229,47 @@ final class WebhookReceiver
 			return ReceiverResponse(200, "");
 		}
 
+		// A malformed occurrence is the sender's fault and fails the same way on
+		// every retry, so it is answered 400 rather than surfacing as a 5xx.
+		EventOccurrence occ;
+		try
+			occ = EventOccurrence.fromJson(j);
+		catch (Exception)
+			return ReceiverResponse(400, "");
 		if (reg.onEvent !is null)
-			reg.onEvent(EventOccurrence.fromJson(j));
+			reg.onEvent(occ);
 		return ReceiverResponse(200, "");
 	}
 
-	// Bound the dedup set: drop entries older than `seenWindowSeconds` behind the
-	// newest delivery, then, if still over `seenCapacity`, drop the oldest entries
-	// until within cap. Webhook timestamps move forward, so anything far behind the
-	// freshness window will never be retried.
-	private void evictSeen(long newestTs) @safe
+	private void recordSeen(string key, long ts) @safe
 	{
-		import std.algorithm : sort;
-		import std.array : array;
+		seen_[key] = ts;
+		seenOrder_ ~= SeenEntry(key, ts);
+		if (ts > newestSeenTs_)
+			newestSeenTs_ = ts;
+		evictSeen();
+	}
 
-		if (seenWindowSeconds > 0 && newestTs > 0)
+	// Bound the dedup set, oldest arrivals first: drop entries older than
+	// `seenWindowSeconds` behind the newest delivery (webhook timestamps move
+	// forward, so anything far behind the freshness window will never be
+	// retried), and any beyond `seenCapacity`. Amortized O(1) per delivery.
+	private void evictSeen() @safe
+	{
+		const windowed = seenWindowSeconds > 0 && newestSeenTs_ > 0;
+		const cutoff = newestSeenTs_ - seenWindowSeconds;
+		while (seenHead_ < seenOrder_.length)
 		{
-			const cutoff = newestTs - seenWindowSeconds;
-			foreach (k; seen_.keys)
-				if (seen_[k] < cutoff)
-					seen_.remove(k);
+			const e = seenOrder_[seenHead_];
+			if (!(seen_.length > seenCapacity || (windowed && e.ts < cutoff)))
+				break;
+			seen_.remove(e.key);
+			seenHead_++;
 		}
-
-		if (seen_.length > seenCapacity)
+		if (seenHead_ > 64 && seenHead_ * 2 > seenOrder_.length)
 		{
-			auto byAge = seen_.byKeyValue.array;
-			byAge.sort!((a, b) => a.value < b.value);
-			const drop = seen_.length - seenCapacity;
-			foreach (kv; byAge[0 .. drop])
-				seen_.remove(kv.key);
+			seenOrder_ = seenOrder_[seenHead_ .. $].dup;
+			seenHead_ = 0;
 		}
 	}
 
@@ -197,7 +292,7 @@ final class WebhookReceiver
 
 version (unittest)
 {
-	import mcp.server.webhook_delivery : signDeliveryHeaders;
+	import mcp.server.webhook_delivery : DeliverySigning, signDeliveryHeaders;
 	import mcp.protocol.events : verificationEnvelope;
 
 	private enum testSecret = "whsec_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
@@ -229,8 +324,10 @@ unittest  // the receiver verifies a signed event delivery and routes the occurr
 	body = EventOccurrence("evt_1", "incident.created", "t", Json([
 		"severity": Json("P1")
 	])).toJson().toString();
-	auto headers = signDeliveryHeaders(testSecret, "", 0, 1000, "evt_1",
-			1700, body, "sub_1", null);
+	DeliverySigning signing = {
+		secret: testSecret, messageId: "evt_1", timestamp: 1700, subscriptionId: "sub_1"
+	};
+	auto headers = signDeliveryHeaders(signing, body);
 	auto resp = rx.processDelivery(body, headers);
 	assert(resp.status == 200);
 	assert(delivered && got.eventId == "evt_1");
@@ -245,8 +342,10 @@ unittest  // the receiver answers a verification challenge by echoing the nonce
 
 	const 
 	body = verificationEnvelope("nonce-123").toString();
-	auto headers = signDeliveryHeaders(testSecret, "", 0, 1000, "msg_verif",
-			1700, body, "sub_1", null);
+	DeliverySigning signing = {
+		secret: testSecret, messageId: "msg_verif", timestamp: 1700, subscriptionId: "sub_1"
+	};
+	auto headers = signDeliveryHeaders(signing, body);
 	auto resp = rx.processDelivery(body, headers);
 	assert(resp.status == 200);
 	assert(parseJsonString(resp.body)["challenge"].get!string == "nonce-123");
@@ -259,6 +358,42 @@ unittest  // an unknown subscription id yields a retryable 503
 	assert(resp.status == 503);
 }
 
+unittest  // a challenge for a subscription still being created is answered under an expected secret
+{
+	auto rx = new WebhookReceiver();
+	rx.verifyTimestamp = false;
+	const challenge = verificationEnvelope("nonce-early").toString();
+	DeliverySigning signing = {
+		secret: testSecret, messageId: "msg_verif", timestamp: 1700, subscriptionId: "sub_new"
+	};
+	auto headers = signDeliveryHeaders(signing, challenge);
+	assert(rx.processDelivery(challenge, headers).status == 503);
+	rx.expectSecret(testSecret);
+	auto resp = rx.processDelivery(challenge, headers);
+	assert(resp.status == 200);
+	assert(parseJsonString(resp.body)["challenge"].get!string == "nonce-early");
+	// Only the handshake is answered: an event still waits for the registration.
+	const event = EventOccurrence("evt_1", "n", "t").toJson().toString();
+	DeliverySigning evSigning = {
+		secret: testSecret, messageId: "evt_1", timestamp: 1700, subscriptionId: "sub_new"
+	};
+	assert(rx.processDelivery(event, signDeliveryHeaders(evSigning, event)).status == 503);
+	rx.unexpectSecret(testSecret);
+	assert(rx.processDelivery(challenge, headers).status == 503);
+}
+
+unittest  // a challenge signed under a secret nobody expects is not answered
+{
+	auto rx = new WebhookReceiver();
+	rx.verifyTimestamp = false;
+	rx.expectSecret("whsec_BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBA=");
+	const challenge = verificationEnvelope("nonce").toString();
+	DeliverySigning signing = {
+		secret: testSecret, messageId: "msg_verif", timestamp: 1700, subscriptionId: "sub_new"
+	};
+	assert(rx.processDelivery(challenge, signDeliveryHeaders(signing, challenge)).status == 503);
+}
+
 unittest  // a tampered body fails signature verification with 400
 {
 	auto rx = new WebhookReceiver();
@@ -266,9 +401,52 @@ unittest  // a tampered body fails signature verification with 400
 	rx.register("sub_1", testSecret, (EventOccurrence occ) @safe {});
 	const 
 	body = `{"eventId":"e","name":"n","timestamp":"t","data":{}}`;
-	auto headers = signDeliveryHeaders(testSecret, "", 0, 1000, "e", 1700, body, "sub_1", null);
+	DeliverySigning signing = {
+		secret: testSecret, messageId: "e", timestamp: 1700, subscriptionId: "sub_1"
+	};
+	auto headers = signDeliveryHeaders(signing, body);
 	auto resp = rx.processDelivery(body ~ "tampered", headers);
 	assert(resp.status == 400);
+}
+
+unittest  // a signed delivery whose body is not an event occurrence is rejected with 400
+{
+	auto rx = new WebhookReceiver();
+	rx.verifyTimestamp = false;
+	bool delivered;
+	rx.register("sub_1", testSecret, (EventOccurrence occ) @safe {
+		delivered = true;
+	});
+	foreach (body; [`[1,2]`, `"text"`, `42`])
+	{
+		DeliverySigning signing = {
+			secret: testSecret, messageId: "wid_bad", timestamp: 1700, subscriptionId: "sub_1"
+		};
+		auto headers = signDeliveryHeaders(signing, body);
+		assert(rx.processDelivery(body, headers).status == 400, body);
+	}
+	assert(!delivered);
+}
+
+unittest  // a signed delivery nested past the depth cap is rejected with 400
+{
+	import std.array : replicate;
+
+	auto rx = new WebhookReceiver();
+	rx.verifyTimestamp = false;
+	bool delivered;
+	rx.register("sub_1", testSecret, (EventOccurrence occ) @safe {
+		delivered = true;
+	});
+	const 
+	body = `{"eventId":"evt_1","name":"incident.created","timestamp":"t","data":{"x":`
+		~ "[".replicate(1000) ~ "]".replicate(1000) ~ `}}`;
+	DeliverySigning signing = {
+		secret: testSecret, messageId: "evt_1", timestamp: 1700, subscriptionId: "sub_1"
+	};
+	auto headers = signDeliveryHeaders(signing, body);
+	assert(rx.processDelivery(body, headers).status == 400);
+	assert(!delivered);
 }
 
 unittest  // a retried delivery (same webhook-id) is deduplicated, callback fires once
@@ -279,11 +457,108 @@ unittest  // a retried delivery (same webhook-id) is deduplicated, callback fire
 	rx.register("sub_1", testSecret, (EventOccurrence occ) @safe { count++; });
 	const 
 	body = EventOccurrence("evt_dup", "n", "t").toJson().toString();
-	auto headers = signDeliveryHeaders(testSecret, "", 0, 1000, "evt_dup",
-			1700, body, "sub_1", null);
+	DeliverySigning signing = {
+		secret: testSecret, messageId: "evt_dup", timestamp: 1700, subscriptionId: "sub_1"
+	};
+	auto headers = signDeliveryHeaders(signing, body);
 	assert(rx.processDelivery(body, headers).status == 200);
 	assert(rx.processDelivery(body, headers).status == 200); // retry
 	assert(count == 1); // routed only once
+}
+
+unittest  // a retry arriving while the first copy's callback is still running is not routed again
+{
+	import core.time : msecs;
+	import vibe.core.core : runTask, runEventLoop, exitEventLoop, sleep;
+
+	auto rx = new WebhookReceiver();
+	rx.verifyTimestamp = false;
+	int calls;
+	rx.register("sub_1", testSecret, (EventOccurrence occ) @safe {
+		++calls;
+		sleep(50.msecs); // the callback yields, e.g. awaiting a database write
+	});
+	const 
+	body = EventOccurrence("evt_1", "n", "t").toJson().toString();
+	DeliverySigning signing = {
+		secret: testSecret, messageId: "evt_1", timestamp: 1700, subscriptionId: "sub_1"
+	};
+	auto headers = signDeliveryHeaders(signing, body);
+	int first, retry, later;
+	runTask(() nothrow{
+		scope (exit)
+			exitEventLoop();
+		try
+		{
+			auto t = runTask(() nothrow{
+				try
+					first = rx.processDelivery(body, headers).status;
+				catch (Exception)
+				{
+				}
+			});
+			sleep(5.msecs);
+			retry = rx.processDelivery(body, headers).status;
+			t.join();
+			later = rx.processDelivery(body, headers).status;
+		}
+		catch (Exception)
+		{
+		}
+	});
+	runEventLoop();
+	assert(calls == 1, "a concurrent retry must not run the callback a second time");
+	assert(first == 200);
+	assert(retry != 200, "a retry during processing is answered retryable, not acknowledged");
+	assert(later == 200);
+}
+
+unittest  // a delivery whose callback fails while a retry waits leaves the next retry to be processed
+{
+	import core.time : msecs;
+	import vibe.core.core : runTask, runEventLoop, exitEventLoop, sleep;
+
+	auto rx = new WebhookReceiver();
+	rx.verifyTimestamp = false;
+	int calls;
+	rx.register("sub_1", testSecret, (EventOccurrence occ) @safe {
+		if (++calls == 1)
+		{
+			sleep(50.msecs);
+			throw new Exception("database down");
+		}
+	});
+	const 
+	body = EventOccurrence("evt_1", "n", "t").toJson().toString();
+	DeliverySigning signing = {
+		secret: testSecret, messageId: "evt_1", timestamp: 1700, subscriptionId: "sub_1"
+	};
+	auto headers = signDeliveryHeaders(signing, body);
+	int retry, later;
+	runTask(() nothrow{
+		scope (exit)
+			exitEventLoop();
+		try
+		{
+			auto t = runTask(() nothrow{
+				try
+					rx.processDelivery(body, headers);
+				catch (Exception)
+				{
+				}
+			});
+			sleep(5.msecs);
+			retry = rx.processDelivery(body, headers).status;
+			t.join();
+			later = rx.processDelivery(body, headers).status;
+		}
+		catch (Exception)
+		{
+		}
+	});
+	runEventLoop();
+	assert(retry != 200);
+	assert(later == 200 && calls == 2, "the failed delivery's retry must be routed");
 }
 
 unittest  // the same eventId fanned to two subscriptions reaches each subscription's callback
@@ -298,10 +573,14 @@ unittest  // the same eventId fanned to two subscriptions reaches each subscript
 	// deliveries that share the webhook-id but carry distinct subscription ids.
 	const 
 	body = EventOccurrence("evt_fan", "n", "t").toJson().toString();
-	auto ha = signDeliveryHeaders(testSecret, "", 0, 1000, "wid_shared",
-			1700, body, "sub_a", null);
-	auto hb = signDeliveryHeaders(testSecret, "", 0, 1000, "wid_shared",
-			1700, body, "sub_b", null);
+	DeliverySigning haSigning = {
+		secret: testSecret, messageId: "wid_shared", timestamp: 1700, subscriptionId: "sub_a"
+	};
+	auto ha = signDeliveryHeaders(haSigning, body);
+	DeliverySigning hbSigning = {
+		secret: testSecret, messageId: "wid_shared", timestamp: 1700, subscriptionId: "sub_b"
+	};
+	auto hb = signDeliveryHeaders(hbSigning, body);
 	assert(rx.processDelivery(body, ha).status == 200);
 	assert(rx.processDelivery(body, hb).status == 200);
 	assert(a == 1 && b == 1); // each subscription got its own copy
@@ -317,10 +596,14 @@ unittest  // a true retry (same subscription + webhook-id) is still deduplicated
 
 	const 
 	body = EventOccurrence("evt_fan", "n", "t").toJson().toString();
-	auto ha = signDeliveryHeaders(testSecret, "", 0, 1000, "wid_shared",
-			1700, body, "sub_a", null);
-	auto hb = signDeliveryHeaders(testSecret, "", 0, 1000, "wid_shared",
-			1700, body, "sub_b", null);
+	DeliverySigning haSigning = {
+		secret: testSecret, messageId: "wid_shared", timestamp: 1700, subscriptionId: "sub_a"
+	};
+	auto ha = signDeliveryHeaders(haSigning, body);
+	DeliverySigning hbSigning = {
+		secret: testSecret, messageId: "wid_shared", timestamp: 1700, subscriptionId: "sub_b"
+	};
+	auto hb = signDeliveryHeaders(hbSigning, body);
 	assert(rx.processDelivery(body, ha).status == 200);
 	assert(rx.processDelivery(body, hb).status == 200); // other subscription, not a dup
 	assert(rx.processDelivery(body, ha).status == 200); // sub_a retry, deduped
@@ -337,13 +620,17 @@ unittest  // stale dedup entries are evicted once deliveries advance past the wi
 
 	// An old delivery, then one far enough ahead to evict the old key.
 	const oldBody = EventOccurrence("evt_old", "n", "t").toJson().toString();
-	auto oldHeaders = signDeliveryHeaders(testSecret, "", 0, 1000, "wid_old",
-			1000, oldBody, "sub_1", null);
+	DeliverySigning oldHeadersSigning = {
+		secret: testSecret, messageId: "wid_old", timestamp: 1000, subscriptionId: "sub_1"
+	};
+	auto oldHeaders = signDeliveryHeaders(oldHeadersSigning, oldBody);
 	assert(rx.processDelivery(oldBody, oldHeaders).status == 200);
 
 	const newBody = EventOccurrence("evt_new", "n", "t").toJson().toString();
-	auto newHeaders = signDeliveryHeaders(testSecret, "", 0, 1000, "wid_new",
-			5000, newBody, "sub_1", null);
+	DeliverySigning newHeadersSigning = {
+		secret: testSecret, messageId: "wid_new", timestamp: 5000, subscriptionId: "sub_1"
+	};
+	auto newHeaders = signDeliveryHeaders(newHeadersSigning, newBody);
 	assert(rx.processDelivery(newBody, newHeaders).status == 200);
 
 	// The old key has aged out, so a redelivery of it routes again rather than
@@ -368,11 +655,70 @@ unittest  // the dedup set is hard-capped so it cannot grow without bound
 		const wid = "wid_" ~ i.to!string;
 		const 
 		body = EventOccurrence("evt_" ~ i.to!string, "n", "t").toJson().toString();
-		auto headers = signDeliveryHeaders(testSecret, "", 0, 1000, wid,
-				1700 + i, body, "sub_1", null);
+		DeliverySigning signing = {
+			secret: testSecret, messageId: wid, timestamp: 1700 + i, subscriptionId: "sub_1"
+		};
+		auto headers = signDeliveryHeaders(signing, body);
 		assert(rx.processDelivery(body, headers).status == 200);
 	}
 	assert(rx.seen_.length <= 10);
+}
+
+unittest  // a delivery whose callback throws is not recorded, so the retry is processed
+{
+	import std.exception : assertThrown;
+
+	auto rx = new WebhookReceiver();
+	rx.verifyTimestamp = false;
+	int calls;
+	rx.register("sub_1", testSecret, (EventOccurrence occ) @safe {
+		if (++calls == 1)
+			throw new Exception("database down");
+	});
+	const 
+	body = EventOccurrence("evt_1", "n", "t").toJson().toString();
+	DeliverySigning signing = {
+		secret: testSecret, messageId: "evt_1", timestamp: 1700, subscriptionId: "sub_1"
+	};
+	auto headers = signDeliveryHeaders(signing, body);
+	assertThrown!Exception(rx.processDelivery(body, headers));
+	assert(rx.processDelivery(body, headers).status == 200); // the server's retry
+	assert(calls == 2);
+	assert(rx.processDelivery(body, headers).status == 200); // now a true duplicate
+	assert(calls == 2);
+}
+
+unittest  // at capacity the oldest dedup entries go first, the newest are kept
+{
+	import std.conv : to;
+
+	auto rx = new WebhookReceiver();
+	rx.verifyTimestamp = false;
+	rx.seenWindowSeconds = 0;
+	rx.seenCapacity = 3;
+	int count;
+	rx.register("sub_1", testSecret, (EventOccurrence occ) @safe { count++; });
+	string[string][] sent;
+	string[] bodies;
+	foreach (i; 0 .. 5)
+	{
+		const wid = "wid_" ~ i.to!string;
+		const 
+		body = EventOccurrence("evt_" ~ i.to!string, "n", "t").toJson().toString();
+		// Timestamps out of insertion order: eviction follows arrival order.
+		DeliverySigning signing = {
+			secret: testSecret, messageId: wid, timestamp: 1700 - i, subscriptionId: "sub_1"
+		};
+		auto headers = signDeliveryHeaders(signing, body);
+		assert(rx.processDelivery(body, headers).status == 200);
+		sent ~= headers;
+		bodies ~= body;
+	}
+	assert(count == 5 && rx.seen_.length == 3);
+	rx.processDelivery(bodies[4], sent[4]); // newest: still a duplicate
+	assert(count == 5);
+	rx.processDelivery(bodies[0], sent[0]); // oldest arrival: evicted, processed again
+	assert(count == 6);
 }
 
 unittest  // a terminated control envelope is routed to onControl
@@ -389,8 +735,10 @@ unittest  // a terminated control envelope is routed to onControl
 	});
 	const 
 	body = terminatedEnvelope(Json(["code": Json(-32012)])).toString();
-	auto headers = signDeliveryHeaders(testSecret, "", 0, 1000, "msg_term",
-			1700, body, "sub_1", null);
+	DeliverySigning signing = {
+		secret: testSecret, messageId: "msg_term", timestamp: 1700, subscriptionId: "sub_1"
+	};
+	auto headers = signDeliveryHeaders(signing, body);
 	assert(rx.processDelivery(body, headers).status == 200);
 	assert(got);
 	assert(gotControl.kind == EventControlKind.terminated);

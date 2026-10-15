@@ -6,7 +6,7 @@ attaches them (in ergonomic **UDA style**) and a client that reads them — over
 **both** the **stdio** and **Streamable HTTP** transports from a single binary
 each.
 
-It is its own dub package (depends on the root `mcp` via a path dependency) and
+It is its own dub package (depends on the root `mcp-d` via a path dependency) and
 does **not** modify the root `dub.json`.
 
 ## What it teaches
@@ -14,24 +14,25 @@ does **not** modify the root `dub.json`.
 Cache hints let a server tell clients and intermediaries how long a result may
 be reused and by whom (`public` shared cache vs `private` per-client cache).
 They are **modern-only** (protocol `2026-07-28`): the server only emits the
-fields when the negotiated protocol is the modern protocol, and the client must
-opt in with `client.enableModern()`.
+fields when the negotiated protocol is the modern protocol, which `connect()`
+selects against a server that supports it.
 
-- **Per-resource hint** — `server.d` declares it with the `@cache(ttl, scope)`
+- **Per-resource hint** — `server.d` declares it with the `@cacheable(ttl, scope)`
   UDA (a `core.time.Duration`) on a `@resource` method; `registerHandlers` plumbs
   it onto that resource's `resources/read` result (serialized on the wire as
   `ttlMs` milliseconds).
   ```d
   @resource("config://app", "Application configuration", "application/json")
-  @cache(60.seconds, "private")
+  @cacheable(60.seconds, CacheScope.private_)
   string config() @safe { return `{"theme":"dark","retries":3}`; }
   ```
 - **Per-list hint** — `server.d` calls
   `server.setListCacheHint("resources/list", CacheHint(5.seconds, CacheScope.public_))`.
-  It rides on the `resources/list` result. (Valid list methods: `tools/list`,
-  `resources/list`, `resources/templates/list`, `prompts/list`.)
-- **Consumer's-eye view** — `client.d` enables modern mode
-  (`client.enableModern()`), then reads `list.cache.ttl` / `cacheScope` and
+  It rides on the `resources/list` result. (Valid methods: `tools/list`,
+  `resources/list`, `resources/templates/list`, `prompts/list`,
+  `server/discover`, and the Skills extension's `skills/list` and `skills/get`.)
+- **Consumer's-eye view** — `client.d` calls `client.connect()` (which
+  negotiates 2026-07-28), then reads `list.cache.ttl` / `cacheScope` and
   `readResource(uri).cache.ttl` / `cacheScope` (each `.ttl` a `Duration`).
 
 A third resource (`status://live`) is registered with **no** hint, and the
@@ -40,7 +41,7 @@ reported faithfully.
 
 ## Typed APIs used
 
-The server stays in the ergonomic UDA style (`@resource` + `@cache` +
+The server stays in the ergonomic UDA style (`@resource` + `@cacheable` +
 `registerHandlers`) — no low-level raw-Json registration. Cache hints are passed
 as typed `CacheHint` / `CacheScope` values, and the client consumes typed
 `listResources()` / `readResource()` results whose `.cache` field is a typed

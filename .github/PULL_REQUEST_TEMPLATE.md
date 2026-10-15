@@ -14,7 +14,7 @@ Closes #
 
 - [ ] **Tests added** — a failing test was written first (TDD), one case per `unittest` block.
 - [ ] **`dub test` passes** — all modules green locally (`ulimit -n 65536 && dub test`).
-- [ ] **`dfmt` clean** — ran `dub run dfmt -- --inplace source/ conformance/`; `git diff --exit-code` is clean.
+- [ ] **`dfmt` clean** — ran `just fmt` (`dub run dfmt -- --inplace source/ conformance/ examples/ bench/ deploy/ci-smoke/`); `git diff --exit-code` is clean.
 - [ ] **`dscanner` clean** — ran `./scripts/dscanner-lint.sh`.
 - [ ] **Conformance unaffected** — all four `--requirements` lanes (server + client, `2025-11-25` + `2026-07-28`) still pass with no warnings.
 - [ ] **Revision-specific behavior gated** — a `2026-07-28` change does NOT alter `2025-11-25` / `2025-06-18` wire output (and vice versa).

@@ -1,21 +1,50 @@
-/// The tool/prompt handler outcome DTOs returned by `McpServer` handlers.
+/// The handler signatures `McpServer` registers and the outcome DTOs its tool
+/// and prompt handlers return.
 ///
 /// `ToolResponse` and `PromptResponse` are the values a handler returns: either
 /// a final result, or — on a stateless (MRTR) request — a set of `InputRequest`s
 /// the client must satisfy and resubmit. They form part of the `api.reflection`
-/// registration contract and are re-exported from `mcp.server.server` so the
-/// public surface reaching them through `McpServer` is unchanged.
+/// registration contract and are re-exported by the top-level `mcp` module.
 module mcp.server.responses;
 
 import vibe.data.json : Json;
 
 import mcp.protocol.errors : internalError;
 import mcp.protocol.versions : ProtocolVersion, isModern, usesMRTR;
-import mcp.protocol.types : CallToolResult, GetPromptResult, Content;
+import mcp.protocol.types : CallToolResult, GetPromptResult, Content, ResourceContents;
 import mcp.protocol.mrtr : InputRequest, InputRequiredResult;
 import mcp.server.context : RequestContext;
 
 @safe:
+
+/// A tool execution failure whose message is written for the client. Thrown from
+/// a tool handler, it becomes a `CallToolResult` with `isError: true` and the
+/// message as its text content, so the model can see what went wrong and
+/// retry. Any other non-`McpException` a tool handler throws is logged
+/// server-side and reported as a generic "Internal error" tool result (its
+/// message is shown only after `McpServer.exposeInternalErrors`), since such a
+/// message can carry file paths, SQL, or other internals.
+class ToolError : Exception
+{
+	this(string msg, string file = __FILE__, size_t line = __LINE__) pure nothrow @safe
+	{
+		super(msg, file, line);
+	}
+}
+
+/// A prompt failure whose message is written for the client. Thrown from a
+/// prompt handler, it becomes a JSON-RPC Internal error (-32603) carrying the
+/// message unmasked. Any other non-`McpException` a prompt handler throws is
+/// logged server-side and reported as a generic "Internal error" (its message
+/// is shown only after `McpServer.exposeInternalErrors`). Throw an
+/// `McpException` such as `invalidParams` for a different error code.
+class PromptError : Exception
+{
+	this(string msg, string file = __FILE__, size_t line = __LINE__) pure nothrow @safe
+	{
+		super(msg, file, line);
+	}
+}
 
 /// A tool handler receiving the parsed arguments and the per-request context.
 alias ToolHandler = CallToolResult delegate(Json arguments, RequestContext ctx) @safe;
@@ -24,41 +53,91 @@ alias ToolHandler = CallToolResult delegate(Json arguments, RequestContext ctx) 
 /// more input instead of returning a final result. See `ToolResponse`.
 alias MrtrToolHandler = ToolResponse delegate(Json arguments, RequestContext ctx) @safe;
 
+/// A prompt handler receiving the raw `Json arguments` and the per-request
+/// `RequestContext`, always producing a final result. See `MrtrPromptHandler`
+/// for one that may ask the client for more input.
+alias PromptHandler = GetPromptResult delegate(Json arguments, RequestContext ctx) @safe;
+
+/// A prompt handler that may, on a stateless (MRTR) modern request, ask the client
+/// for more input instead of returning a final result. See `PromptResponse`.
+alias MrtrPromptHandler = PromptResponse delegate(Json arguments, RequestContext ctx) @safe;
+
+/// A direct resource reader receiving the per-request `RequestContext` (so it
+/// can log, observe cancellation, or elicit through the real request channel).
+/// It returns every content item of the `resources/read` result.
+alias ResourceReader = ResourceContents[]delegate(RequestContext ctx) @safe;
+
+/// A resource template reader receiving the concrete URI, the captured `{var}`
+/// parameters, and the per-request `RequestContext` (so a template handler can
+/// log, observe cancellation, or elicit through the real request channel).
+/// It returns every content item of the `resources/read` result.
+alias TemplateReader = ResourceContents[]delegate(string uri,
+		string[string] params, RequestContext ctx) @safe;
+
 /// The MRTR (input-required) machinery shared by `ToolResponse` and
 /// `PromptResponse`: the `needsInput_`/`required_` state, the
-/// `needsInput`/`inputRequests`/`requestState` accessors, the two non-typed
-/// `inputRequired` factories, and `withInputRequests`/`toJson`. Both response
-/// types carry an `InputRequiredResult required_` plus a `result_` final result
-/// of their respective type; `toJson` switches on `needsInput_`. The mixin keeps
-/// these in lockstep so MRTR edits land on both. The genuine divergences —
-/// `forVersion` (throw vs return on a non-MRTR peer) and `ToolResponse`'s typed
-/// `complete(T)`/`inputRequired(T)` helpers — stay per-struct.
-mixin template InputRequiredPart()
+/// `needsInput`/`inputRequests`/`requestState` accessors, the `inputRequired`
+/// factories (verbatim and typed `requestState`), and
+/// `withInputRequests`. Both response types carry an `InputRequiredResult
+/// required_` plus a `result_` final result of their respective type. The mixin
+/// keeps these in lockstep so MRTR edits land on both. The genuine divergences —
+/// `ToolResponse`'s task outcome and typed `complete(T)` helper, and each
+/// type's `toJson` — stay per-struct.
+private mixin template InputRequiredPart()
 {
 	private bool needsInput_;
 	private InputRequiredResult required_;
 
 	/// The handler needs input; the client must gather it and resubmit with the
-	/// matching `inputResponses`.
+	/// matching `inputResponses`. Throws when `requests` is empty (the client
+	/// would have nothing to answer; pass a `requestState` to resume without new
+	/// input) or when two requests share an `id` (ids key the wire map, so one
+	/// would silently replace the other).
 	static typeof(this) inputRequired(InputRequest[] requests) @safe
 	{
-		typeof(this) r;
-		r.needsInput_ = true;
-		r.required_.inputRequests = requests;
-		return r;
+		return inputRequired(requests, "");
 	}
 
 	/// As `inputRequired`, but also attaches an opaque `requestState`
 	/// (SEP-2322): a modern server encodes whatever context it needs
 	/// to resume the call into this blob, which the client echoes verbatim on
 	/// the retry and the handler reads back via `RequestContext.requestState`.
+	/// Throws on duplicate request ids, and when both `requests` and
+	/// `requestState` are empty.
 	static typeof(this) inputRequired(InputRequest[] requests, string requestState) @safe
 	{
+		if (requests.length == 0 && requestState.length == 0)
+			throw new Exception("inputRequired needs at least one InputRequest or a"
+					~ " requestState: an empty input_required result gives the client"
+					~ " nothing to answer and nothing to resume from");
+		bool[string] ids;
+		foreach (ref q; requests)
+		{
+			if (q.id in ids)
+				throw new Exception("inputRequired was given two InputRequests with id '"
+						~ q.id ~ "': each request needs a distinct id");
+			ids[q.id] = true;
+		}
 		typeof(this) r;
 		r.needsInput_ = true;
 		r.required_.inputRequests = requests;
 		r.required_.requestState = requestState;
 		return r;
+	}
+
+	/// As `inputRequired`, but encodes a typed `state` as the opaque
+	/// `requestState`. Serialises `state` to JSON and stores its string form.
+	/// ENCODING CONTRACT: the stored value is `serializeToJson(state).toString()`,
+	/// which `RequestContext.requestStateAs!T()` decodes via
+	/// `deserializeJson!T(parseUntrustedJson(state))`, failing a malformed echo
+	/// with invalid params (-32602). Constrained off `string` so it
+	/// does not collide with the verbatim-string overload above.
+	static typeof(this) inputRequired(T)(InputRequest[] requests, T state) @safe
+			if (!is(T : string))
+	{
+		import vibe.data.json : serializeToJson;
+
+		return inputRequired(requests, serializeToJson(state).toString());
 	}
 
 	/// Whether this outcome asks the client for more input.
@@ -88,13 +167,6 @@ mixin template InputRequiredPart()
 	{
 		return typeof(this).inputRequired(reqs, required_.requestState);
 	}
-
-	/// The JSON-RPC `result` payload (the final result, or an
-	/// `InputRequiredResult`).
-	Json toJson() const @safe
-	{
-		return needsInput_ ? required_.toJson() : result_.toJson();
-	}
 }
 
 /// The outcome of a tool call: either the final `CallToolResult`, or — on a
@@ -105,49 +177,30 @@ struct ToolResponse
 {
 	private CallToolResult result_;
 
-	mixin InputRequiredPart ireq;
-	// Merge the mixed-in non-typed `inputRequired` factories into the same
-	// overload set as the typed `inputRequired(T)` declared below; without this
-	// the local template would hide the mixin's overloads.
-	alias inputRequired = ireq.inputRequired;
+	mixin InputRequiredPart;
 
-	/// The handler is done; `r` is the final result.
+	/// The handler is done; `r` is the final result. A `CallToolResult` carrying
+	/// a task handle or MRTR `inputRequests`/`requestState` is classified as
+	/// `task` or `inputRequired`, so it gets the same capability filtering,
+	/// validation, and version gating as one built through those factories.
 	static ToolResponse complete(CallToolResult r) @safe
 	{
+		if (r.isTask)
+			return ToolResponse.task(r.toJson());
+		if (r.isInputRequired)
+			return ToolResponse.inputRequired(r.inputRequests, r.requestState);
 		ToolResponse t;
 		t.result_ = r;
 		return t;
 	}
 
-	/// Convenience: build a final result from a typed `value`. Serialises `value`
-	/// to JSON and uses it as the result's `structuredContent`, defaulting the
-	/// human-readable `content` to a single text block holding that same JSON.
-	/// The serialisation is done inline here (independent of any
-	/// `CallToolResult.structured!T` helper) so this overload stays compilable on
-	/// its own.
+	/// Convenience: build a final result from a typed `value` via
+	/// `CallToolResult.structured`, so a fieldwise struct becomes the
+	/// `structuredContent` object and any other value is wrapped under `result`,
+	/// with `content` defaulting to a text block holding that same JSON.
 	static ToolResponse complete(T)(T value) @safe if (!is(T : CallToolResult))
 	{
-		import vibe.data.json : serializeToJson;
-
-		Json sc = serializeToJson(value);
-		CallToolResult r;
-		r.structuredContent = sc;
-		r.content = [Content.makeText(sc.toString())];
-		return ToolResponse.complete(r);
-	}
-
-	/// As `inputRequired`, but encodes a typed `state` as the opaque
-	/// `requestState`. Serialises `state` to JSON and stores its string form.
-	/// ENCODING CONTRACT: the stored value is `serializeToJson(state).toString()`,
-	/// which `RequestContext.requestStateAs!T()` decodes via
-	/// `deserializeJson!T(parseJsonString(state))`. Constrained off `string` so it
-	/// does not collide with the verbatim-string overload above.
-	static ToolResponse inputRequired(T)(InputRequest[] requests, T state) @safe
-			if (!is(T : string))
-	{
-		import vibe.data.json : serializeToJson;
-
-		return ToolResponse.inputRequired(requests, serializeToJson(state).toString());
+		return ToolResponse.complete(CallToolResult.structured(value));
 	}
 
 	/// The handler created an asynchronous task: `j` is the `CreateTaskResult`
@@ -171,8 +224,7 @@ struct ToolResponse
 	private Json taskResult_;
 
 	/// The JSON-RPC `result` payload: the verbatim `CreateTaskResult` for a task
-	/// outcome, else the `InputRequiredResult` or final `CallToolResult`. Shadows
-	/// the mixed-in `toJson` to add the task case.
+	/// outcome, else the `InputRequiredResult` or final `CallToolResult`.
 	Json toJson() const @safe
 	{
 		if (isTask_)
@@ -220,29 +272,125 @@ struct PromptResponse
 
 	mixin InputRequiredPart;
 
-	/// The handler is done; `r` is the final prompt result.
+	/// The handler is done; `r` is the final prompt result. A `GetPromptResult`
+	/// carrying MRTR `inputRequests`/`requestState` is classified as
+	/// `inputRequired`, so it gets the same capability filtering and version
+	/// gating as one built through that factory.
 	static PromptResponse complete(GetPromptResult r) @safe
 	{
+		if (r.isInputRequired)
+			return PromptResponse.inputRequired(r.inputRequests, r.requestState);
 		PromptResponse p;
 		p.result_ = r;
 		return p;
+	}
+
+	/// The JSON-RPC `result` payload (the final result, or an
+	/// `InputRequiredResult`).
+	Json toJson() const @safe
+	{
+		return needsInput_ ? required_.toJson() : result_.toJson();
 	}
 
 	/// Project the final `GetPromptResult` to the negotiated protocol version so
 	/// version-gated message content (audio/resource_link/tool_use/tool_result
 	/// plus content-level `_meta`/`lastModified`) is not emitted to peers that do
 	/// not understand it. Mirrors `ToolResponse.forVersion`: an
-	/// `InputRequiredResult` is modern-only (MRTR) and carries no version-gated
-	/// content, so it is returned unchanged.
+	/// `InputRequiredResult` is modern-only (MRTR) and has no `messages`, so
+	/// emitting it to a non-MRTR peer is rejected rather than sent off-schema.
 	PromptResponse forVersion(ProtocolVersion v) const @safe
 	{
 		if (needsInput_)
+		{
+			if (!v.usesMRTR)
+				throw internalError("prompts/get handler returned an input-required result on a session that does not support MRTR");
 			return PromptResponse.inputRequired(required_.inputRequests.dup,
 					required_.requestState);
+		}
 		return PromptResponse.complete(result_.forVersion(v));
 	}
 }
 
-/// A prompt handler that may, on a stateless (MRTR) modern request, ask the client
-/// for more input instead of returning a final result. See `PromptResponse`.
-alias MrtrPromptHandler = PromptResponse delegate(Json arguments, RequestContext ctx) @safe;
+unittest  // PromptResponse.complete classifies a GetPromptResult carrying MRTR fields as input-required
+{
+	GetPromptResult r;
+	r.inputRequests = [InputRequest("q1", "elicitation", Json.emptyObject)];
+	r.requestState = "s1";
+	auto pr = PromptResponse.complete(r);
+	assert(pr.needsInput);
+	assert(pr.inputRequests.length == 1);
+	assert(pr.requestState == "s1");
+}
+
+unittest  // PromptResponse.forVersion rejects an input-required result on a non-MRTR session
+{
+	import std.exception : assertThrown, assertNotThrown;
+	import mcp.protocol.errors : McpException;
+
+	auto pr = PromptResponse.inputRequired([
+		InputRequest("q1", "elicitation", Json.emptyObject)
+	]);
+	assertThrown!McpException(pr.forVersion(ProtocolVersion.v2025_11_25));
+	assertNotThrown(pr.forVersion(ProtocolVersion.v2026_07_28));
+}
+
+unittest  // PromptResponse.inputRequired(T) encodes a typed requestState like ToolResponse's
+{
+	import vibe.data.json : parseJsonString;
+
+	static struct Step
+	{
+		int round;
+		string topic;
+	}
+
+	auto reqs = [InputRequest("q1", "elicitation", Json.emptyObject)];
+	auto pr = PromptResponse.inputRequired(reqs, Step(2, "d"));
+	assert(pr.needsInput);
+	auto state = parseJsonString(pr.requestState);
+	assert(state["round"].get!int == 2);
+	assert(state["topic"].get!string == "d");
+	assert(pr.requestState == ToolResponse.inputRequired(reqs, Step(2, "d")).requestState);
+	assert(PromptResponse.inputRequired(reqs, "raw").requestState == "raw");
+}
+
+unittest  // ToolResponse.complete(T) wraps a non-struct value under `result`
+{
+	auto r = ToolResponse.complete(42).toJson();
+	assert(r["structuredContent"].type == Json.Type.object);
+	assert(r["structuredContent"]["result"].get!int == 42);
+}
+
+unittest  // ToolResponse.complete(T) emits a fieldwise struct as the object itself
+{
+	static struct Point
+	{
+		int x;
+		int y;
+	}
+
+	auto r = ToolResponse.complete(Point(1, 2)).toJson();
+	assert(r["structuredContent"]["x"].get!int == 1);
+	assert(r["structuredContent"]["y"].get!int == 2);
+}
+
+unittest  // inputRequired rejects an empty request list with no requestState
+{
+	import std.exception : assertThrown, assertNotThrown;
+
+	assertThrown!Exception(ToolResponse.inputRequired([]));
+	assertThrown!Exception(PromptResponse.inputRequired([], ""));
+	assertNotThrown(ToolResponse.inputRequired([], "resume-token"));
+}
+
+unittest  // inputRequired rejects two input requests sharing an id
+{
+	import std.exception : assertThrown;
+
+	auto reqs = [
+		InputRequest("q", "roots", Json.emptyObject),
+		InputRequest("q", "roots", Json.emptyObject)
+	];
+	assertThrown!Exception(ToolResponse.inputRequired(reqs));
+	assertThrown!Exception(PromptResponse.inputRequired(reqs, "s"));
+}

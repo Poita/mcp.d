@@ -1,6 +1,6 @@
 module mcp.transport.coordinator;
 
-import core.time : Duration, seconds;
+import core.time : Duration, seconds, minutes;
 
 import vibe.core.sync : LocalManualEvent, createManualEvent;
 import vibe.data.json : Json;
@@ -9,10 +9,28 @@ import mcp.protocol.errors;
 
 @safe:
 
+/// How long a server->client request (elicitation, sampling, roots) waits for
+/// the client's reply unless the transport options say otherwise. Generous,
+/// because elicitation and sampling may wait on a human.
+enum Duration defaultServerRequestTimeout = 5.minutes;
+
+/// The `notifications/cancelled` a requester sends for its request `id` once it
+/// stops waiting for the reply, so the peer can abandon the work.
+Json cancelledNotification(long id, string reason) @safe
+{
+	import mcp.protocol.jsonrpc : makeNotification;
+
+	Json params = Json.emptyObject;
+	params["requestId"] = id;
+	params["reason"] = reason;
+	return makeNotification("notifications/cancelled", params);
+}
+
 /// Resolve a settled waiter's outcome into a value or an exception: if `error`
 /// is a JSON-RPC error object, throw `McpException` decoded from its `code`
-/// (defaulting to `internalError`) and `message` (defaulting to `defaultMsg`);
-/// otherwise return `result`. Shared by every coordinator's await path so the
+/// (defaulting to `internalError`), `message` (defaulting to `defaultMsg`) and
+/// `data` (the `McpException.data`, as for a locally raised error); otherwise
+/// return `result`. Shared by every coordinator's await path so the
 /// error decoding lives in one place.
 Json throwOrReturn(Json result, Json error, string defaultMsg) @safe
 {
@@ -22,7 +40,7 @@ Json throwOrReturn(Json result, Json error, string defaultMsg) @safe
 			.get!int : ErrorCode.internalError;
 		const m = ("message" in error && error["message"].type == Json.Type.string) ? error["message"]
 			.get!string : defaultMsg;
-		throw new McpException(code, m, error);
+		throw new McpException(code, m, "data" in error ? error["data"] : Json.undefined);
 	}
 	return result;
 }
@@ -110,26 +128,19 @@ final class DuplexCoordinator
 		auto ec = w.evt.emitCount;
 		while (!w.done)
 		{
-			const newEc = () @trusted { return w.evt.wait(timeout, ec); }();
+			const newEc = w.evt.wait(timeout, ec);
 			if (newEc == ec && !w.done)
-				throw internalError("Timed out awaiting peer response to request " ~ idStr(id));
+				throw new RequestTimeoutException(
+						"Timed out awaiting peer response to request " ~ idStr(id));
 			ec = newEc;
 		}
 		return throwOrReturn(w.result, w.error, "peer error");
 	}
 
-	/// Drop a registered-but-unawaited request id (e.g. when sending the request
-	/// frame failed so a response will never arrive). Idempotent; unknown ids are
-	/// ignored. Keeps the waiter table from leaking when `register` is not followed
-	/// by `await`.
-	void cancel(long id) @safe
-	{
-		waiters.remove(id);
-	}
-
 	/// Deliver a peer response / errorResponse. Returns true if `idJson` matched a
 	/// pending outbound request (waking its awaiting task), false otherwise (an id
-	/// we are not awaiting — e.g. a stray response — is ignored).
+	/// we are not awaiting — e.g. a stray response — is ignored). A request
+	/// already settled keeps its first outcome until its task wakes to take it.
 	///
 	/// Accepts both `int_` and whole-number `float_` ids: some peers (JavaScript,
 	/// Python `json.dumps`) serialise integer ids as floats (e.g. `1.0`), which
@@ -150,6 +161,8 @@ final class DuplexCoordinator
 			return false;
 		if (auto w = id in waiters)
 		{
+			if (w.done)
+				return true;
 			w.result = result;
 			w.error = error;
 			w.done = true;
@@ -161,7 +174,8 @@ final class DuplexCoordinator
 
 	/// Fail every still-pending request with `error` and wake its awaiting task.
 	/// Called by the read loop at end-of-input so a caller blocked in `await`
-	/// is released with an exception instead of hanging until its timeout. Marks
+	/// is released with an exception instead of hanging until its timeout. A
+	/// request whose reply was read before end-of-input keeps that reply. Marks
 	/// the coordinator closed so any request registered AFTER this point is failed
 	/// fast (see `register`) rather than left to time out.
 	void failPending(McpException error) @safe
@@ -174,6 +188,8 @@ final class DuplexCoordinator
 		{
 			if (auto w = id in waiters)
 			{
+				if (w.done)
+					continue;
 				Json err = Json.emptyObject;
 				err["code"] = error.code;
 				err["message"] = error.msg;
@@ -205,6 +221,19 @@ unittest  // alloc hands out distinct, increasing ids
 	const c = coord.alloc();
 	assert(a != b && b != c && a != c);
 	assert(b == a + 1 && c == b + 1);
+}
+
+unittest  // an unanswered request times out with the public RequestTimeoutException
+{
+	import core.time : msecs;
+	import std.exception : collectException;
+	static import mcp;
+
+	auto coord = new DuplexCoordinator;
+	const id = coord.alloc();
+	coord.register(id);
+	auto e = collectException!(mcp.RequestTimeoutException)(coord.await(id, 10.msecs));
+	assert(e !is null);
 }
 
 unittest  // resolve before await: a result registered then resolved is returned by await
@@ -302,6 +331,30 @@ unittest  // failPending wakes an awaiting task with an error instead of hanging
 	assert(threw);
 }
 
+unittest  // failPending keeps a reply that arrived before the awaiting task woke
+{
+	auto coord = new DuplexCoordinator;
+	coord.register(4);
+	coord.resolve(Json(4L), Json(["ok": Json(true)]), Json.undefined);
+	coord.failPending(internalError("channel closed"));
+	assert(coord.await(4)["ok"].get!bool);
+}
+
+unittest  // a second outcome for a settled request does not replace the first
+{
+	import std.exception : collectException;
+
+	auto coord = new DuplexCoordinator;
+	coord.register(5);
+	Json err = Json.emptyObject;
+	err["code"] = ErrorCode.requestCancelled;
+	err["message"] = "aborted";
+	coord.resolve(Json(5L), Json.undefined, err);
+	coord.resolve(Json(5L), Json(["ok": Json(true)]), Json.undefined);
+	auto e = collectException!McpException(coord.await(5));
+	assert(e !is null && e.code == ErrorCode.requestCancelled);
+}
+
 unittest  // a request registered AFTER failPending fails fast instead of blocking until timeout
 {
 	auto coord = new DuplexCoordinator;
@@ -347,16 +400,6 @@ unittest  // resolve ignores a non-integer id
 	auto coord = new DuplexCoordinator;
 	coord.register(1);
 	assert(!coord.resolve(Json("str-id"), Json.emptyObject, Json.undefined));
-	coord.cancel(1);
-}
-
-unittest  // cancel drops an unawaited registration without leaking
-{
-	auto coord = new DuplexCoordinator;
-	coord.register(5);
-	coord.cancel(5);
-	// A subsequent resolve for the cancelled id matches nothing.
-	assert(!coord.resolve(Json(5L), Json.emptyObject, Json.undefined));
 }
 
 unittest  // throwOrReturn yields McpException with internalError when "code" is not an integer
@@ -374,6 +417,26 @@ unittest  // throwOrReturn yields McpException with internalError when "code" is
 		caught = e;
 	assert(caught !is null, "expected McpException, got nothing");
 	assert(caught.code == ErrorCode.internalError);
+}
+
+unittest  // throwOrReturn keeps only the error's data member as McpException.data, like a local error
+{
+	import vibe.data.json : parseJsonString;
+
+	McpException caught;
+	try
+		throwOrReturn(Json.undefined, parseJsonString(
+				`{"code":-32042,"message":"m","data":{"elicitations":[]}}`), "fallback");
+	catch (McpException e)
+		caught = e;
+	assert(caught.data.type == Json.Type.object && "elicitations" in caught.data);
+
+	caught = null;
+	try
+		throwOrReturn(Json.undefined, parseJsonString(`{"code":-32601,"message":"m"}`), "fallback");
+	catch (McpException e)
+		caught = e;
+	assert(caught.data.type == Json.Type.undefined);
 }
 
 unittest  // throwOrReturn yields McpException with defaultMsg when "message" is not a string
@@ -441,5 +504,4 @@ unittest  // resolve returns false for a fractional float id (e.g. 1.5) — no w
 	auto coord = new DuplexCoordinator;
 	coord.register(1);
 	assert(!coord.resolve(Json(1.5), Json.emptyObject, Json.undefined));
-	coord.cancel(1);
 }

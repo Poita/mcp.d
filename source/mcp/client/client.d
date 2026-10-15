@@ -1,10 +1,11 @@
 module mcp.client.client;
 
-import core.time : Duration, seconds, msecs, hours;
+import core.time : Duration, MonoTime, seconds, msecs, minutes, hours;
 import std.algorithm : canFind, startsWith;
 import std.datetime : Clock, SysTime;
 import std.typecons : Nullable, nullable;
 
+import vibe.core.sync : LocalManualEvent, createManualEvent;
 import vibe.data.json : Json, parseJsonString;
 
 import mcp.protocol.jsonrpc;
@@ -16,14 +17,16 @@ import mcp.protocol.tasks : Task, TaskStatus;
 import mcp.protocol.sampling : validateSamplingMessages, CreateMessageRequest, CreateMessageResult;
 import mcp.protocol.modern;
 import mcp.protocol.mrtr;
-import mcp.client.transport : ClientTransport, ClientProtocol;
-import mcp.client.http_transport : HttpClientTransport, LegacyFallbackException;
+import mcp.client.transport : BearerProvider, ClientTransport, ClientProtocol, InboundOrigin;
+import mcp.client.http_transport : HttpClientTransport, HttpStatusException,
+	SessionExpiredException, isLegacyFallbackStatus, defaultMaxMessageBytes;
 import mcp.client.stdio : StdioClientTransport, spawnStdioTransport;
 import mcp.client.subscription : SubscriptionStream, SubscriptionFilter;
 import mcp.client.cache : CacheStore, InMemoryCacheStore, CacheKey, CacheEntry, noCache;
 import mcp.client.event_subscription : EventSubscription;
 import mcp.client.events : WebhookReceiver, NoCompatibleDeliveryMode, generateWhsecSecret;
 import mcp.protocol.events;
+import mcp.protocol.ssrf : TlsTrust;
 
 /// How a cacheable request verb interacts with the client's response cache.
 /// Only meaningful on the six cacheable reads (`listTools`, `listResources`,
@@ -44,29 +47,35 @@ enum CacheMode
 /// Per-request options shared by the `McpClient` request verbs. All fields are
 /// independently combinable and default to "unset".
 ///
-/// Exactly these verbs accept a trailing `RequestOptions`: `callTool`,
-/// `getPrompt`, `complete`, `readResource`, `listTools`, `listResources`,
-/// `listResourceTemplates`, `listPrompts`, and `discover`. (`cacheMode` is only
-/// meaningful on the cacheable reads — the four `*/list` verbs, `readResource`,
-/// and `discover` — and is ignored on the others.)
+/// Every `McpClient` request verb takes a `RequestOptions` after its own
+/// arguments (`callToolAwait` and `awaitTask` follow it with an optional
+/// input-required callback); `initialize`, `connect`, and the verbs that open a
+/// stream or a managed subscription do not. (`cacheMode` is only meaningful on
+/// the cacheable reads — the four `*/list` verbs, `readResource`, and
+/// `discover` — and is ignored on the others.)
 ///
 /// - `progressToken`: attached as `params._meta.progressToken` so the server may
 ///   emit `notifications/progress` for the request (basic/utilities/progress).
 /// - `logLevel`: minimum `notifications/message` severity for this request,
 ///   carried in `params._meta["io.modelcontextprotocol/logLevel"]` (modern
-///   server/utilities/logging, SEP-2575/2577); ignored on a released protocol,
-///   empty attaches nothing.
+///   server/utilities/logging, SEP-2575/2577). Not sent on a released-protocol
+///   session, which sets verbosity with `setLogLevel` instead; empty attaches
+///   nothing.
 /// - `onProgress`: a per-call progress sink. When non-null and no explicit
 ///   `progressToken` is given, the verb mints a unique token; for the duration
 ///   of the call, progress correlated to that token is routed here while
 ///   progress for other tokens still reaches the global `onProgress`.
 /// - `cacheMode`: per-call override of the response cache (default `use`).
+/// - `cancellation`: a `CancellationToken` another task can `cancel()` to abort
+///   the call: its in-flight request fails at once with `requestCancelled` and
+///   is cancelled on the server.
 struct RequestOptions
 {
 	ProgressToken progressToken;
 	string logLevel;
 	void delegate(ProgressNotification) @safe onProgress;
 	CacheMode cacheMode = CacheMode.use;
+	CancellationToken cancellation;
 
 	/// Convenience factory for the dominant per-call case: route this request's
 	/// progress to `cb` (the verb mints a unique token), leaving `progressToken`
@@ -78,6 +87,147 @@ struct RequestOptions
 		opts.onProgress = cb;
 		return opts;
 	}
+}
+
+/// A handle for cancelling a call from another task: pass it in
+/// `RequestOptions.cancellation`, then `cancel()` it. The request the call has in
+/// flight fails at once with an `McpException` of code `requestCancelled` and is
+/// cancelled on the server (`notifications/cancelled`, or by closing a modern
+/// Streamable HTTP request's stream); a call started after the token was
+/// cancelled fails without sending anything. A token is single-use.
+final class CancellationToken
+{
+	private bool cancelled_;
+	private string reason_;
+	// Keyed by a token-local counter, not a request id: a token may be shared by
+	// calls on several clients whose request ids overlap.
+	private void delegate(string reason) @safe[ulong] hooks_;
+	private ulong nextHookKey_;
+
+	/// Cancel the call(s) using this token. `reason` is sent to the server when
+	/// non-empty. Idempotent.
+	void cancel(string reason = null) @safe
+	{
+		if (cancelled_)
+			return;
+		cancelled_ = true;
+		reason_ = reason;
+		// Each hook aborts one in-flight call; a failing hook must not stop
+		// the remaining calls from being aborted.
+		foreach (hook; hooks_.dup.byValue)
+		{
+			try
+				hook(reason);
+			catch (Exception e)
+			{
+				import vibe.core.log : logWarn;
+
+				logWarn("[mcp.client] cancellation hook threw: %s", e.msg);
+			}
+		}
+	}
+
+	/// Whether `cancel` has been called.
+	bool isCancelled() const @safe nothrow
+	{
+		return cancelled_;
+	}
+
+	/// The reason given to `cancel`, if any.
+	string reason() const @safe nothrow
+	{
+		return reason_;
+	}
+
+	/// Register `hook` to run on `cancel`; returns the key `unbind` takes.
+	private ulong bind(void delegate(string reason) @safe hook) @safe nothrow
+	{
+		const key = nextHookKey_++;
+		hooks_[key] = hook;
+		return key;
+	}
+
+	private void unbind(ulong key) @safe nothrow
+	{
+		hooks_.remove(key);
+	}
+}
+
+unittest  // CancellationToken.cancel runs every hook even when one throws
+{
+	auto token = new CancellationToken;
+	int ran;
+	token.bind((string) @safe { ran++; throw new Exception("hook failed"); });
+	token.bind((string) @safe { ran++; throw new Exception("hook failed"); });
+	token.cancel("stop");
+	assert(ran == 2);
+	assert(token.isCancelled);
+}
+
+unittest  // one CancellationToken shared by two clients aborts both clients' in-flight requests
+{
+	import vibe.core.core : exitEventLoop, runEventLoop, runTask, sleep;
+
+	// Each transport holds its request open until the client aborts it, so both
+	// clients' first request (JSON-RPC id 1 on each) is in flight at once.
+	McpClient makeClient(RecordingClientTransport t)
+	{
+		t.responder = (Json, long) @safe {
+			foreach (_; 0 .. 200)
+			{
+				if (t.aborted.length)
+					throw new McpException(ErrorCode.internalError, "aborted");
+				sleep(10.msecs);
+			}
+			return Json.emptyObject;
+		};
+		return new McpClient(t);
+	}
+
+	auto ta = new RecordingClientTransport;
+	auto tb = new RecordingClientTransport;
+	auto a = makeClient(ta);
+	auto b = makeClient(tb);
+	auto token = new CancellationToken;
+	RequestOptions opts;
+	opts.cancellation = token;
+	int[2] codes;
+	int finished;
+	void run(McpClient c, size_t slot) nothrow
+	{
+		try
+			c.ping(opts);
+		catch (McpException e)
+			codes[slot] = e.code;
+		catch (Exception)
+		{
+		}
+		if (++finished == 2)
+			exitEventLoop();
+	}
+
+	runTask(() nothrow{ run(a, 0); });
+	runTask(() nothrow{ run(b, 1); });
+	runTask(() nothrow{
+		try
+		{
+			sleep(50.msecs);
+			token.cancel();
+		}
+		catch (Exception)
+		{
+		}
+	});
+	runEventLoop();
+	assert(codes[0] == ErrorCode.requestCancelled, "client A's request must be cancelled");
+	assert(codes[1] == ErrorCode.requestCancelled, "client B's request must be cancelled");
+}
+
+/// The error a cancelled request fails with.
+private McpException cancelledError(string reason) @safe
+{
+	return new McpException(ErrorCode.requestCancelled, reason.length
+			? "Request cancelled: " ~ reason : "Request cancelled");
 }
 
 /// Merge `progressToken` into a request's `params._meta.progressToken`, per
@@ -126,7 +276,7 @@ Json withRequestLogLevel(Json params, string level) @safe
 /// factories stay stable as options accumulate (rather than growing a positional
 /// argument per knob). Fields scoped to a particular transport are documented as
 /// such; other transports ignore them. Pass it to `McpClient.http` / `stdio` /
-/// `spawn` / `spawnSibling`; the defaults reproduce the previous behavior.
+/// `spawn` / `spawnSibling`, or to the constructor for a custom `ClientTransport`.
 struct ClientSettings
 {
 	/// Client identity advertised to the server during initialization.
@@ -137,15 +287,31 @@ struct ClientSettings
 	/// exhausted) fails with a typed error instead of hanging indefinitely.
 	Duration connectTimeout = 30.seconds;
 
-	/// HTTP transport only: cap on concurrent in-flight POSTs (0 = unlimited).
+	/// HTTP transport only: cap on concurrent in-flight request POSTs (0 = unlimited).
 	/// Each request uses its own connection, so a positive cap makes excess
 	/// requests await a permit rather than opening another socket, bounding
-	/// socket / ephemeral-port use. The cap counts both request POSTs and the
-	/// oneway POSTs that carry notifications and replies to server-initiated
-	/// requests (sampling / elicitation / roots); when a tool uses those, size the
-	/// cap above the round-trip nesting depth so an awaiting request POST and its
-	/// reply POST can both hold a permit.
+	/// socket / ephemeral-port use. A request POST holds its permit until its
+	/// response stream ends. Notifications and replies to server-initiated
+	/// requests (sampling / elicitation / roots) are short and never wait for a
+	/// permit, and neither do requests a handler for a server-initiated request
+	/// makes on its own task, so a request awaiting such a reply cannot deadlock
+	/// the cap. A task the handler spawns is not exempt.
 	uint maxInFlight = 0;
+
+	/// The largest message the client accepts from the server: an HTTP response
+	/// body or SSE event, or a stdout line of a server started by `spawn`. A
+	/// larger HTTP message fails the request it belongs to, and a longer stdio
+	/// line closes the channel, so a hostile or broken server cannot make the
+	/// client allocate without bound. Ignored by `McpClient.stdio`, whose caller
+	/// supplies `readLine`.
+	size_t maxMessageBytes = defaultMaxMessageBytes;
+
+	/// HTTP transport only: how https servers are validated. The default
+	/// requires a certificate chaining to a CA in the system store and matching
+	/// the endpoint host name. Set `tls.caFile` to trust a private CA or a local
+	/// server's self-signed certificate; `tls.insecureSkipVerify` disables
+	/// verification entirely and is for local development only.
+	TlsTrust tls;
 
 	/// Response cache for the six cacheable reads (the four `*/list` verbs,
 	/// `resources/read`, and `server/discover`). `null` (the default) installs an
@@ -163,23 +329,129 @@ struct ClientSettings
 	/// pre-cache behavior; a positive value caches even unhinted responses for
 	/// this long. A server-supplied hint always takes precedence over this.
 	///
-	/// This governs only whether a response is *served* from cache. The
-	/// `tools/list` response is always retained (stale-for-serving) so the
-	/// `x-mcp-header` mirroring and output-schema validation derived from it keep
-	/// working without a local `listTools` even at this default; see `cachedTool`.
+	/// A result cached only under this fallback is stored `private`, under this
+	/// client's `cachePartition`: without a server hint the client cannot know
+	/// the result is identity-independent, so a shared `cache` never serves it
+	/// to another partition. Only an explicit server `cacheScope: public` hint
+	/// makes a result shared.
+	///
+	/// This governs only which responses are cached. The tool schemas used for
+	/// `x-mcp-header` mirroring and output-schema validation are kept from every
+	/// `listTools` independently of the cache, until `tools/list_changed`.
 	Duration defaultCacheTtl = Duration.zero;
 
 	/// This client's cache partition — a stable principal identifier (user / tenant
 	/// id) under which its `private`-scoped results are namespaced. Only relevant
-	/// when several clients share one `cache` backend: it keeps one principal's
-	/// `private` entries from being served to another, while `public` entries stay
-	/// shared (every client hits the same key). Empty (the default) treats the
-	/// store as per-client and is the right value for the default in-memory store.
+	/// when several clients share one `cache` backend: clients naming the same
+	/// partition share their `private` entries, while `public` entries are shared
+	/// by every client (they all hit the same key). Empty (the default) keeps this
+	/// client's `private` entries to itself.
 	string cachePartition = "";
+
+	/// The server identity this client's cache entries are keyed under, so a
+	/// `cache` shared by clients of different servers never mixes their results.
+	/// Empty (the default) derives it from the transport: the endpoint URL for
+	/// HTTP, the command line for `spawn`, and a per-client value for any other
+	/// transport (which then shares nothing). Set the same value on clients that
+	/// reach one server by different routes to let them share entries.
+	string cacheServer;
 
 	/// Knobs for the managed Events-extension subscriptions (`subscribePoll`,
 	/// `subscribeStream`, `subscribeWebhook`, `subscribeEvents`).
 	EventClientSettings events;
+
+	/// How long a request may wait for its response before it fails with
+	/// `RequestTimeoutException`; on expiry the client also cancels it on the
+	/// server (`notifications/cancelled`, or by closing a modern HTTP request's
+	/// stream). Applies to every transport. `Duration.zero` disables the limit.
+	/// Over HTTP it also bounds each one-way POST (notifications and replies to
+	/// server requests), which otherwise default to a 30-second bound.
+	Duration requestTimeout = 60.seconds;
+
+	/// Whether each `notifications/progress` for a request restarts its
+	/// `requestTimeout`, so a long-running request that keeps reporting progress
+	/// is not cut off (basic/utilities/progress).
+	bool resetTimeoutOnProgress = true;
+
+	/// Absolute bound on how long a request may wait for its response, measured
+	/// from when it is sent and including time spent answering server requests
+	/// made on its behalf. Unlike `requestTimeout`, progress never extends it, so
+	/// a server that keeps reporting progress cannot hold a request open forever
+	/// (basic/utilities/progress). Defaults to 30 minutes; raise it for requests
+	/// expected to run longer. `Duration.zero` imposes no cap beyond
+	/// `requestTimeout`.
+	Duration maxTotalTimeout = 30.minutes;
+
+	/// Whether a request the server rejects because its HTTP session expired
+	/// (`SessionExpiredException`) starts a new session, re-running `initialize`
+	/// with the protocol version last requested, and is then retried once. Off
+	/// by default, so the application decides when a new session begins; the
+	/// new session does not carry over server-side state such as resource
+	/// subscriptions.
+	bool reinitializeOnSessionExpiry;
+
+	/// How long `awaitTask` waits between `tasks/get` polls when the server gives
+	/// no `pollIntervalMs`.
+	Duration taskPollInterval = 1.seconds;
+
+	/// Ceiling applied to a task's server-supplied `pollIntervalMs`, so a
+	/// misbehaving server cannot park `awaitTask` indefinitely between polls.
+	Duration maxTaskPollInterval = 1.minutes;
+
+	/// Upper bound on how long `awaitTask` / `callToolAwait` poll a task before
+	/// failing with `RequestTimeoutException` (the task itself is left running;
+	/// `cancelTask` stops it). `Duration.zero` polls until the task finishes.
+	Duration taskTimeout = Duration.zero;
+}
+
+/// Thrown by a request that cannot be carried because the connection to the
+/// server is gone for good: the client was closed, or the stdio channel ended
+/// (the server exited or closed its stdout). Retrying on the same client cannot
+/// succeed, so managed event subscriptions end rather than retry on it.
+///
+/// `code` is `ErrorCode.internalError`; catch this type to tell a dead
+/// connection apart from a server's own internal error.
+class TransportClosedException : McpException
+{
+	this(string message) @safe pure nothrow
+	{
+		super(ErrorCode.internalError, message);
+	}
+}
+
+/// Thrown when output-schema validation is enabled and a tool result's
+/// `structuredContent` does not conform to the tool's `outputSchema`: the server
+/// answered, but with a result that breaks its own declared contract.
+///
+/// `code` is `ErrorCode.internalError`; catch this type to tell it apart from a
+/// server's JSON-RPC rejection of the call (such as `invalidParams` for bad
+/// arguments).
+class OutputSchemaViolation : McpException
+{
+	this(string message) @safe pure nothrow
+	{
+		super(ErrorCode.internalError, message);
+	}
+}
+
+/// The client-side bookkeeping of one request awaiting its response.
+private final class InFlightRequest
+{
+	import core.time : Duration, MonoTime;
+	import vibe.core.core : Timer;
+
+	Timer timer;
+	bool armed;
+	// When the `requestTimeout` window ends; `MonoTime.max` when there is none.
+	MonoTime deadline = MonoTime.max;
+	// When `maxTotalTimeout` ends; `MonoTime.max` when there is no cap.
+	MonoTime hardDeadline = MonoTime.max;
+	// What was left of the `requestTimeout` window when `pauseDeadlines` paused it.
+	Duration remaining;
+	string progressKey; // the request's progress token rendered as JSON, or empty
+	bool modern; // whether the request was sent with modern framing
+	McpException abortReason;
+	uint paused; // server->client handlers currently running on this request's behalf
 }
 
 /// Configuration for the client side of the MCP Events extension: how the
@@ -192,6 +464,10 @@ struct EventClientSettings
 	/// drive a tight poll loop.
 	Duration pollFloor = 1.seconds;
 
+	/// Ceiling applied to the server's `nextPollMs`, so a misbehaving server
+	/// cannot park the poll loop indefinitely.
+	Duration pollCeiling = 5.minutes;
+
 	/// How many recent `eventId`s each managed subscription remembers, so an
 	/// occurrence redelivered across a reconnect or replay reaches `onEvent` once.
 	/// Zero disables deduplication.
@@ -200,7 +476,8 @@ struct EventClientSettings
 	/// How long a managed push stream may go without any frame (event or
 	/// heartbeat) before it is declared dead and reopened with the last cursor.
 	/// Servers heartbeat at least every 30 s, so twice that is the default. Zero
-	/// disables reconnection.
+	/// disables reconnection: the subscription then ends, with an `error`
+	/// control, when its stream does.
 	Duration streamDeadAfter = 60.seconds;
 
 	/// How often a webhook subscription granted no expiry is still refreshed: the
@@ -250,10 +527,18 @@ struct SubscribeOptions
 	Nullable!DeliveryMode delivery; /// force a mode instead of selecting one
 }
 
+/// The invalidation count of a logical cache entry and how many fetches for it
+/// are in flight.
+private struct CacheGeneration
+{
+	ulong generation;
+	uint inFlight;
+}
+
 /// A Model Context Protocol client, transport-agnostic.
 ///
 /// Speaks pure JSON-RPC + protocol logic over a `ClientTransport` (Streamable
-/// HTTP via `McpClient.http`/`McpClient.spawn`, or stdio via `McpClient.stdio`).
+/// HTTP via `McpClient.http`, or stdio via `McpClient.spawn`/`McpClient.stdio`).
 /// Drives the lifecycle (`initialize` + `notifications/initialized`) and the
 /// server features (tools, resources, prompts, completion, logging,
 /// subscriptions) with auto-pagination. Server->client requests received on an
@@ -275,8 +560,14 @@ final class McpClient : ClientProtocol
 	// `notifications/elicitation/complete` has been forwarded, so the set holds
 	// only ids still awaiting completion. Used to honour the spec rule "Clients
 	// MUST ignore notifications referencing unknown or already-completed IDs": an
-	// evicted (completed) or never-issued id is absent and so ignored.
+	// evicted (completed) or never-issued id is absent and so ignored. Capped at
+	// `maxTrackedElicitations_`, evicting the oldest, so a server that never
+	// completes its elicitations cannot grow it without bound.
 	private void[0][string] elicitationIds_;
+	// Insertion order of `elicitationIds_`; may hold ids already completed, which
+	// eviction skips and compaction drops.
+	private string[] elicitationOrder_;
+	private enum size_t maxTrackedElicitations_ = 1024;
 	// Request ids this client has cancelled via notifications/cancelled. Per
 	// basic/utilities/cancellation, "The sender of the cancellation notification
 	// SHOULD ignore any response to the request that arrives afterward", so a
@@ -286,8 +577,11 @@ final class McpClient : ClientProtocol
 	// Insertion order of the ids in `cancelledRequests_`, used to evict the
 	// single oldest id when the set is full (FIFO) rather than clearing it
 	// wholesale. May contain ids already removed by `isCancelled`; those are
-	// skipped during eviction.
+	// skipped during eviction, and dropped once they outnumber the live ids.
 	private long[] cancelledOrder_;
+	// The order queue is compacted once it holds more than twice this many
+	// entries or twice the live set, whichever is larger.
+	private enum size_t minCancelledOrderCompaction_ = 64;
 	// Size backstop for `cancelledRequests_`: ids are normally evicted when their
 	// late response is observed (`isCancelled`), but a late response that never
 	// arrives would otherwise pin its id forever. Once the tracked set is full,
@@ -299,18 +593,33 @@ final class McpClient : ClientProtocol
 	// The JSON-RPC id used for the `initialize` request, so cancel() can enforce
 	// the spec rule that clients MUST NOT cancel initialize. 0 until sent.
 	private long initializeRequestId;
-	// Parse cache of the cached tools/list response (name -> Tool descriptor),
-	// shared by `headersFor` (x-mcp-header mirroring, reads inputSchema) and
-	// `callTool(string, ...)` (output-schema validation, reads outputSchema). It
-	// is a pure derivative of the authoritative response cache: `cachedTool`
-	// re-derives it whenever the underlying CacheStore entry changes (a different
-	// physical key or expiry) and drops it when the entry is gone, so it never
-	// outlives or diverges from the store — including a shared/pre-seeded one.
-	private Tool[string] toolIndex_;
-	private CacheKey toolIndexKey_;
-	private SysTime toolIndexStamp_;
-	private bool toolIndexValid_;
-	// Modern (2026-07-28) per-request logging opt-in. The modern removed the
+	// The tool descriptors (name -> Tool) from this client's last `listTools`,
+	// read by `headersFor` (x-mcp-header mirroring, inputSchema) and `callTool`
+	// (output-schema validation, outputSchema). It lives outside the CacheStore
+	// so neither `noCache` nor eviction from a bounded store loses the schemas;
+	// `notifications/tools/list_changed` and an identity change clear it.
+	private Tool[string] listedTools_;
+	private bool haveListedTools_;
+	// A memoized parse of a `tools/list` entry found in the CacheStore, used
+	// only before this client has run `listTools` (a shared or pre-seeded store).
+	// It is re-derived whenever the underlying entry changes (a different
+	// physical key or expiry) and dropped when the entry is gone.
+	private Tool[string] storeToolIndex_;
+	// Invalidation state per logical cache entry (method + key) with a fetch in
+	// flight. `cachedFetch` stores a result only when no invalidation for its
+	// entry arrived while the fetch was in flight, so a change notification is
+	// never overwritten by the stale response it raced with. An entry lives only
+	// while a fetch for its key is outstanding, so the map stays bounded by the
+	// number of concurrent fetches.
+	private CacheGeneration[string] cacheGenerations_;
+	// Advanced whenever the identity behind requests changes (`setBearerToken`,
+	// `setBearerProvider`), so a cacheable read sent under the previous identity
+	// that completes afterwards is neither cached nor indexed for the new one.
+	private ulong identityEpoch_;
+	private CacheKey storeToolIndexKey_;
+	private SysTime storeToolIndexStamp_;
+	private bool storeToolIndexValid_;
+	// Modern (2026-07-28) per-request logging opt-in. The modern protocol has no
 	// `logging/setLevel` RPC; a client instead controls verbosity by stamping
 	// `_meta["io.modelcontextprotocol/logLevel"]` on each request, and a
 	// conformant server emits no `notifications/message` for a request that
@@ -335,6 +644,21 @@ final class McpClient : ClientProtocol
 	// by token (not stacked on a single mutable field) so overlapping concurrent
 	// calls never clobber each other's sink or leave a stale wrapper installed.
 	private void delegate(ProgressNotification) @safe[string] perCallProgress_;
+	// Every request awaiting its response, keyed by JSON-RPC id: its deadline
+	// timer, the progress token that restarts it, and the reason it was aborted
+	// (timed out / cancelled), which `rpc` throws in place of the transport's
+	// wake-up error.
+	private InFlightRequest[long] inFlight_;
+	// The `RequestOptions.cancellation` of the call running on each task, keyed by
+	// that task's fiber, so `rpc` (reached through the paging / MRTR / cache
+	// helpers) binds every request the call issues to the caller's token.
+	private CancellationToken[void* ] callTokens_;
+	// The cancellation of each server->client request being answered: keyed by
+	// its JSON-RPC id rendered as JSON, so the server's `notifications/cancelled`
+	// reaches it, and by the fiber running its handler, for
+	// `serverRequestCancellation`.
+	private CancellationToken[string] serverRequests_;
+	private CancellationToken[void* ] serverRequestTokens_;
 	// Per-subscription push handlers, keyed by the `events/stream` request id (the
 	// subscriptionId stamped on every `notifications/events/*` frame). streamEvents
 	// registers; the stream's cleanup hook and a `terminated` frame deregister, so
@@ -381,16 +705,28 @@ final class McpClient : ClientProtocol
 	// "do not cache unhinted responses" (the default), so behavior against such
 	// servers matches the uncached client. A server hint always wins over this.
 	private Duration defaultCacheTtl_;
-	/// Raised by `mrtrLoop` when the result it just produced came from an MRTR
-	/// retry or is itself input-required, so `cachedFetch` skips storing it.
-	private bool lastResultUncacheable_;
+	// Set by `close()`; a closed client opens no new streams or subscriptions.
+	private bool closed_;
+	// Set once `close()` has torn down its subscriptions and streams: from then
+	// on no request or notification is sent.
+	private bool released_;
+	// The open listen streams and managed event subscriptions `close()` cancels.
+	private bool[SubscriptionStream] liveStreams_;
+	private bool[EventSubscription] liveSubscriptions_;
 	// This client's cache partition: the namespace under which its `private`-scoped
 	// cacheable results are stored, so a SHARED `cacheStore_` keeps one principal's
 	// private entries from being served to another. `public` results ignore it and
 	// live under the shared empty partition (every client hits the same key). Empty
-	// (the default) means the store is treated as per-client: public and private
-	// both land under "" and the distinction is moot.
+	// (the default) stores private results under `clientPartition_` instead.
 	private string cachePartition_;
+	// The private partition of a client with no `cachePartition_`: unique to this
+	// client, so "" (the public namespace) is never a private one.
+	private string clientPartition_;
+	// Whether `cacheStore_` was supplied by the caller and so may be shared with
+	// other clients, rather than installed for this client alone.
+	private bool sharedCache_;
+	// The server identity every physical cache key carries (`CacheKey.server`).
+	private string cacheServer_;
 	// Clock seam behind the cache's freshness check: `cachedFetch` stamps an entry
 	// with `now_() + ttl` and treats it as a hit while `now_() < expiresAt`.
 	// Defaults to the wall clock; tests substitute a controllable clock to make
@@ -430,7 +766,9 @@ final class McpClient : ClientProtocol
 	/// requests (2025-11-25+) set `mode == "url"` and carry `url` and
 	/// `elicitationId` instead of a schema — present the URL for the user to
 	/// complete out-of-band and return an action (no content). The SDK enforces
-	/// the advertised-mode capability check before invoking this.
+	/// the advertised-mode capability check before invoking this. A handler
+	/// waiting on the user can watch `serverRequestCancellation` to stop once
+	/// the server cancels the request.
 	ElicitResult delegate(ElicitParams params) @safe onElicitation;
 	/// Handler for `roots/list`; returns the typed `ListRootsResult`. Null =>
 	/// unsupported. (`roots/list` carries no meaningful params, so the handler
@@ -475,18 +813,39 @@ final class McpClient : ClientProtocol
 	/// `onNotification`.
 	void delegate(string uri) @safe onResourceUpdated;
 
-	/// Construct over an explicit `ClientTransport`. The client installs its
-	/// inbound dispatcher (and, for the HTTP transport, the per-message header /
-	/// cancelled-response callbacks) on the transport.
-	this(ClientTransport transport, Implementation clientInfo = ClientSettings.init.clientInfo) @safe
+	/// Construct over an explicit `ClientTransport`, configured by `settings`. The
+	/// client installs its inbound dispatcher on the transport and tells it the
+	/// request timeout. The settings that configure how a transport is built
+	/// (`connectTimeout`, `maxInFlight`, `maxMessageBytes`, `tls`) are the caller's
+	/// to apply to `transport` and are ignored here. A null `settings.cache` installs
+	/// an in-memory store; an empty `settings.cacheServer` keys this client's cache
+	/// entries under a per-client value.
+	this(ClientTransport transport, ClientSettings settings = ClientSettings.init) @safe
 	{
 		this.transport = transport;
-		this.clientInfo = clientInfo;
-		// Caching is on by default: install the in-memory store and the wall clock.
-		// Factories override the store from `ClientSettings`; `setCache`/
-		// `setDefaultCacheTtl`/`setCacheClock` adjust them at runtime.
-		cacheStore_ = new InMemoryCacheStore();
+		this.clientInfo = settings.clientInfo;
+		cacheStore_ = settings.cache !is null ? settings.cache : new InMemoryCacheStore();
+		sharedCache_ = settings.cache !is null;
+		defaultCacheTtl_ = settings.defaultCacheTtl;
+		cachePartition_ = settings.cachePartition;
+		clientPartition_ = () {
+			import std.uuid : randomUUID;
+
+			return "client:" ~ randomUUID().toString();
+		}();
+		cacheServer_ = settings.cacheServer.length ? settings.cacheServer : () {
+			import std.conv : to;
+
+			return "client:" ~ (cast(size_t) cast(void*) this).to!string;
+		}();
 		now_ = () @safe => Clock.currTime();
+		eventSettings_ = settings.events;
+		resetTimeoutOnProgress_ = settings.resetTimeoutOnProgress;
+		maxTotalTimeout_ = settings.maxTotalTimeout;
+		reinitializeOnSessionExpiry_ = settings.reinitializeOnSessionExpiry;
+		taskPollInterval_ = settings.taskPollInterval;
+		taskTimeout_ = settings.taskTimeout;
+		maxTaskPollInterval_ = settings.maxTaskPollInterval;
 		transport.setInboundHandler(&dispatchInbound);
 		// Hand the transport this client as its `ClientProtocol`: it pulls the
 		// protocol-derived request headers (`headersFor`) and the cancelled-response
@@ -494,20 +853,34 @@ final class McpClient : ClientProtocol
 		// schema-lookup logic and the cancellation set stay here and no transport has
 		// to be a concrete type the client downcasts to.
 		transport.setProtocol(this);
+		requestTimeout = settings.requestTimeout;
 	}
 
-	/// Apply the cache-related `ClientSettings` to a freshly constructed client and
-	/// return it (for fluent use in the factories). A null `settings.cache` keeps
-	/// the constructor's default in-memory store; a non-null value (including
-	/// `noCache`) replaces it.
-	private McpClient applySettings(ClientSettings settings) @safe
+	private Duration taskPollInterval_ = ClientSettings.init.taskPollInterval;
+	private Duration taskTimeout_ = ClientSettings.init.taskTimeout;
+	private Duration maxTaskPollInterval_ = ClientSettings.init.maxTaskPollInterval;
+
+	private Duration requestTimeout_ = ClientSettings.init.requestTimeout;
+	private bool resetTimeoutOnProgress_ = ClientSettings.init.resetTimeoutOnProgress;
+	private bool reinitializeOnSessionExpiry_;
+	// The version the last `initialize` requested, which a session restarted
+	// after expiry requests again.
+	private string lastRequestedVersion_;
+	private Duration maxTotalTimeout_ = ClientSettings.init.maxTotalTimeout;
+
+	/// How long a request may wait for its response; see
+	/// `ClientSettings.requestTimeout`. Settable after construction; applies to
+	/// requests issued afterwards.
+	Duration requestTimeout() const @safe
 	{
-		if (settings.cache !is null)
-			cacheStore_ = settings.cache;
-		defaultCacheTtl_ = settings.defaultCacheTtl;
-		cachePartition_ = settings.cachePartition;
-		eventSettings_ = settings.events;
-		return this;
+		return requestTimeout_;
+	}
+
+	/// ditto
+	void requestTimeout(Duration timeout) @safe
+	{
+		requestTimeout_ = timeout;
+		transport.setRequestTimeout(timeout);
 	}
 
 	private EventClientSettings eventSettings_;
@@ -527,38 +900,48 @@ final class McpClient : ClientProtocol
 
 	/// Build a client over the Streamable HTTP transport at `url`. `settings`
 	/// carries the client identity plus the HTTP transport knobs (connect timeout
-	/// and in-flight cap); see `ClientSettings`. The defaults reproduce the
-	/// previous behavior.
+	/// and in-flight cap); see `ClientSettings`. Throws when `url` is not a valid
+	/// `http(s)://host[:port][/path]` endpoint (a bad port, userinfo, no host).
 	static McpClient http(string url, ClientSettings settings = ClientSettings.init) @safe
 	{
 		auto transport = new HttpClientTransport(url, settings.maxInFlight);
 		transport.setConnectTimeout(settings.connectTimeout);
-		return (new McpClient(transport, settings.clientInfo)).applySettings(settings);
+		transport.setMaxMessageBytes(settings.maxMessageBytes);
+		transport.setTlsTrust(settings.tls);
+		if (!settings.cacheServer.length)
+			settings.cacheServer = url;
+		return new McpClient(transport, settings);
 	}
 
 	/// Build a client over the stdio transport, exchanging newline-delimited
 	/// JSON-RPC over the supplied `readLine`/`writeLine` channel (symmetric to
 	/// `mcp.transport.stdio.serveStdio`). `readLine` returns the next server line
 	/// (without its terminator) or `null` at end-of-input; `writeLine` emits one
-	/// message line (the sink appends the terminator). Only `settings.clientInfo`
-	/// applies to stdio; the HTTP-only fields are ignored.
+	/// message line (the sink appends the terminator). Every `settings` field
+	/// applies except the HTTP transport knobs (`connectTimeout`, `maxInFlight`,
+	/// `tls`) and `maxMessageBytes` (`readLine` bounds its own lines), which are
+	/// ignored.
 	static McpClient stdio(string delegate() @safe readLine,
 			void delegate(string) @safe writeLine, ClientSettings settings = ClientSettings.init) @safe
 	{
-		return (new McpClient(new StdioClientTransport(readLine, writeLine), settings.clientInfo))
-			.applySettings(settings);
+		return new McpClient(new StdioClientTransport(readLine, writeLine), settings);
 	}
 
 	/// Launch an MCP server as a subprocess and build a client over its
 	/// stdin/stdout (stderr inherited for logging). `command` is the command line
 	/// (`command[0]` is the executable). The returned client is NOT yet
 	/// initialized — call `initialize()` (or `ping()` for a stateless probe).
-	/// `close()` runs the MCP stdio shutdown sequence on the subprocess. Only
-	/// `settings.clientInfo` applies; the HTTP-only fields are ignored.
+	/// `close()` runs the MCP stdio shutdown sequence on the subprocess. Every
+	/// `settings` field applies except the HTTP transport knobs (`connectTimeout`,
+	/// `maxInFlight`, `tls`), which are ignored; `maxMessageBytes` bounds each
+	/// line the server writes to stdout.
 	static McpClient spawn(string[] command, ClientSettings settings = ClientSettings.init) @safe
 	{
-		return (new McpClient(spawnStdioTransport(command), settings.clientInfo)).applySettings(
-				settings);
+		import std.array : join;
+
+		if (!settings.cacheServer.length)
+			settings.cacheServer = "stdio:" ~ command.join(" ");
+		return new McpClient(spawnStdioTransport(command, settings.maxMessageBytes), settings);
 	}
 
 	/// Launch an MCP server binary that ships *next to this executable* and build a
@@ -595,10 +978,61 @@ final class McpClient : ClientProtocol
 	}
 
 	/// Release the underlying transport (stdio terminates the subprocess; HTTP
-	/// stops any background streams).
+	/// stops any background streams), first cancelling every managed event
+	/// subscription and every stream opened by `subscriptionsListen` /
+	/// `streamEvents`, so no background loop outlives the client. A closed client
+	/// opens no new streams, and every later request or notification fails with
+	/// an `McpException` ("the client is closed") without being sent.
 	void close() @safe
 	{
+		closed_ = true;
+		foreach (wake; pollWakes_)
+			wake.emit();
+		foreach (sub; liveSubscriptions_.keys)
+			sub.cancel();
+		liveSubscriptions_ = null;
+		foreach (stream; liveStreams_.keys)
+			stream.cancel();
+		liveStreams_ = null;
+		// Teardown above may still unsubscribe or cancel on the server; every
+		// request and notification after this point is refused.
+		released_ = true;
 		transport.close();
+	}
+
+	/// Remember an opened listen stream so `close()` can cancel it, dropping
+	/// any already-ended ones.
+	private void trackStream(SubscriptionStream stream) @safe
+	{
+		foreach (s; liveStreams_.keys)
+			if (s.ended)
+				liveStreams_.remove(s);
+		liveStreams_[stream] = true;
+	}
+
+	/// Remember a managed event subscription so `close()` can cancel it, dropping
+	/// any that already ended.
+	private void trackSubscription(EventSubscription sub) @safe
+	{
+		foreach (s; liveSubscriptions_.keys)
+			if (!s.active)
+				liveSubscriptions_.remove(s);
+		liveSubscriptions_[sub] = true;
+	}
+
+	/// Throw when the client has been closed, so nothing new is opened on it.
+	private void ensureOpen() @safe
+	{
+		if (closed_)
+			throw new TransportClosedException("the client is closed");
+	}
+
+	/// Throw when `close()` has released the transport, so a request or
+	/// notification fails clearly instead of reaching a closed transport.
+	private void ensureNotReleased() @safe
+	{
+		if (released_)
+			throw new TransportClosedException("the client is closed");
 	}
 
 	/// The protocol version negotiated with the server (valid after initialize).
@@ -609,7 +1043,8 @@ final class McpClient : ClientProtocol
 
 	/// The auto-pagination page cap: the maximum number of pages any
 	/// auto-paginating list verb (`listTools`/`listResources`/`listPrompts`/
-	/// `listResourceTemplates`) follows before giving up, guarding against a peer
+	/// `listResourceTemplates`/`readDirectory`/`skillsList`/`listEvents`) follows
+	/// before giving up, guarding against a peer
 	/// whose `nextCursor` never converges. `0` disables the cap (the
 	/// non-progress/cycle checks still apply); the default is 1000.
 	size_t maxListPages() const @safe nothrow
@@ -638,13 +1073,29 @@ final class McpClient : ClientProtocol
 	/// `server/discover` (2026-07-28): fetch the server's supported versions,
 	/// capabilities, and identity. `DiscoverResult` is a `CacheableResult`, so a
 	/// still-fresh response is served from the cache without a round-trip;
-	/// `opts.cacheMode` overrides.
+	/// `opts.cacheMode` overrides. On a modern session the result also becomes
+	/// what `serverCapabilities`/`serverInfo`/`serverInstructions` report.
 	DiscoverResult discover(RequestOptions opts = RequestOptions.init) @safe
 	{
-		auto result = cachedFetch!DiscoverResult(CacheKey("server/discover", ""), opts.cacheMode,
-				() @safe => DiscoverResult.fromJson(rpc("server/discover", Json.emptyObject)));
+		auto result = withCancellation!DiscoverResult(opts.cancellation,
+				() @safe => cachedFetch!DiscoverResult(CacheKey("server/discover",
+					""), opts.cacheMode, () @safe => DiscoverResult.fromJson(
+					rpcWith("server/discover", Json.emptyObject, opts))));
 		discoverResult_ = result;
+		// A modern session has no initialize handshake, so discovery is where the
+		// server's capabilities and identity come from.
+		if (useModern)
+			adoptDiscovered(result);
 		return result;
+	}
+
+	/// Record what a `server/discover` result advertises as the server's
+	/// capabilities, identity and instructions.
+	private void adoptDiscovered(DiscoverResult d) @safe
+	{
+		serverCapabilities_ = d.capabilities;
+		serverInfo_ = d.serverInfo;
+		serverInstructions_ = d.instructions;
 	}
 
 	/// `server/discover` self-advertising modern framing, used by `connect()` to
@@ -655,27 +1106,14 @@ final class McpClient : ClientProtocol
 	/// framing (the `MCP-Protocol-Version` modern header and a modern
 	/// `_meta.protocolVersion`). Without it the server falls back to its stable
 	/// default and answers methodNotFound, so an undecorated probe can never select
-	/// modern. This temporarily stamps modern framing on the single probe request and
-	/// restores the prior (unnegotiated) state on any legacy outcome, so a
-	/// genuine legacy server is still detected by the caller.
+	/// modern. This stamps modern framing on the probe request alone, leaving the
+	/// session's framing untouched for requests other tasks send meanwhile; the
+	/// transport and `headersFor` read it off the request. `connect` commits modern
+	/// state once it has chosen a mutually supported modern version.
 	private DiscoverResult discoverProbe() @safe
 	{
-		const priorUseModern = useModern;
-		const priorNegotiated = negotiated;
-		useModern = true;
-		negotiated = ProtocolVersion.v2026_07_28;
-		bool keepModernFraming;
-		scope (exit)
-			if (!keepModernFraming)
-			{
-				useModern = priorUseModern;
-				negotiated = priorNegotiated;
-			}
-		auto result = DiscoverResult.fromJson(rpc("server/discover", Json.emptyObject));
-		// The probe succeeded as modern; leave the framing in place so `connect`'s
-		// version selection runs against a modern-capable peer.
-		keepModernFraming = true;
-		return result;
+		return DiscoverResult.fromJson(rpc("server/discover", Json.emptyObject,
+				nullable(ProtocolVersion.v2026_07_28)));
 	}
 
 	/// Attach an OAuth bearer access token, sent as `Authorization: Bearer
@@ -684,19 +1122,46 @@ final class McpClient : ClientProtocol
 	void setBearerToken(string token) @safe
 	{
 		transport.setBearerToken(token);
-		// The identity behind requests just changed; evict this client's own
-		// partition so a re-authenticated session cannot read the previous
-		// identity's `private` results. For the default per-client store the
-		// partition is "" and this drops every entry (the prior safety-net
-		// behavior); for a shared store it leaves the shared `public` entries and
-		// other principals' partitions intact.
-		if (cacheStore_ !is null)
-			cacheStore_.invalidatePartition(cachePartition_);
+		identityEpoch_++;
+		evictIdentityEntries();
+		clearToolIndex();
+	}
+
+	/// Attach an OAuth bearer provider, whose `token` is called for every request
+	/// so a token that is refreshed between requests (e.g. `OAuthSession.bearer`)
+	/// is always the one sent, and whose optional `onRejected` is told of a token
+	/// the server rejects before the request is retried once. Replaces any token
+	/// set by `setBearerToken`; a no-op over stdio.
+	void setBearerProvider(BearerProvider provider) @safe
+	{
+		transport.setBearerProvider(provider);
+		identityEpoch_++;
+		evictIdentityEntries();
+		clearToolIndex();
+	}
+
+	/// The identity behind requests just changed: evict this client's private
+	/// partition of this server's entries so a re-authenticated session cannot
+	/// read the previous identity's `private` results. A store installed for this
+	/// client alone also drops its `public` entries; a shared store keeps them,
+	/// along with other principals' partitions and other servers' entries.
+	private void evictIdentityEntries() @safe
+	{
+		if (cacheStore_ is null)
+			return;
+		cacheStore_.invalidatePartition(cacheServer_, privatePartition());
+		if (!sharedCache_)
+			cacheStore_.invalidatePartition(cacheServer_, "");
 	}
 
 	/// Perform the initialize handshake and send `notifications/initialized`.
 	InitializeResult initialize(string requestedVersion = latestLegacy.toWire) @safe
 	{
+		// The initialize handshake belongs to the stable protocols, so it runs
+		// (and the session continues) without modern per-request framing.
+		useModern = false;
+		transport.setModernProtocol(false);
+		lastRequestedVersion_ = requestedVersion;
 		InitializeParams params;
 		params.protocolVersion = requestedVersion;
 		// Advertise capabilities in the wire shape for the requested version:
@@ -734,12 +1199,17 @@ final class McpClient : ClientProtocol
 	///   - success → modern server; switch to the newest mutually-supported
 	///     version (modern mode if that version uses per-request
 	///     `_meta`, otherwise an `initialize` handshake for that stable version);
-	///   - `Method not found` (-32601) → legacy server; fall back to the
-	///     `initialize` handshake;
+	///   - `Method not found` (-32601) or another JSON-RPC rejection → legacy
+	///     server; fall back to the `initialize` handshake;
 	///   - `UnsupportedProtocolVersionError` (-32022) → modern server; pick from
-	///     the advertised `supported` list rather than falling back.
+	///     the advertised `supported` list rather than falling back;
+	///   - HTTP 400/404/405 without a recognised modern error → an older server;
+	///     try a Streamable HTTP `initialize`, and only if that is rejected the
+	///     same way fall back to the 2024-11-05 HTTP+SSE transport.
 	/// Returns the negotiated protocol version. Throws if there is no mutually
-	/// supported version, or on any other error.
+	/// supported version, or on any other error — including a probe that times
+	/// out, fails at the transport, or gets an internal error, none of which
+	/// identify a legacy server.
 	ProtocolVersion connect() @safe
 	{
 		string[] serverVersions;
@@ -753,29 +1223,49 @@ final class McpClient : ClientProtocol
 			disc = discoverProbe();
 			haveDisc = true;
 			discoverResult_ = disc;
-			serverVersions = disc.protocolVersions;
+			serverVersions = disc.supportedVersions;
 		}
-		catch (LegacyFallbackException)
+		catch (HttpStatusException e)
 		{
-			// Modern POST rejected with 400/404/405: this is (or may be) an old
-			// HTTP+SSE server. Ask the transport to open its backward-compatibility
-			// fallback (HTTP: the legacy two-endpoint GET-SSE transport; a no-op on
-			// transports without one), then run the legacy initialize handshake.
+			if (!isLegacyFallbackStatus(e.status))
+				throw e;
+			// Modern POST rejected with 400/404/405 and no recognised modern error:
+			// the peer speaks an older version. Per basic/transports §Backward
+			// Compatibility, fall back to a Streamable HTTP `initialize` first; only
+			// when that is rejected the same way is the peer a 2024-11-05 HTTP+SSE
+			// server, so open the transport's legacy two-endpoint fallback (a no-op
+			// on transports without one) and run the legacy handshake.
+			try
+			{
+				initialize();
+				return negotiated;
+			}
+			catch (HttpStatusException e)
+			{
+				if (!isLegacyFallbackStatus(e.status))
+					throw e;
+			}
 			transport.startLegacyFallback();
 			initialize(ProtocolVersion.v2024_11_05.toWire);
 			return negotiated;
 		}
 		catch (McpException e)
 		{
-			if (e.code == ErrorCode.methodNotFound)
+			// A timeout, a dead transport, a local failure or a server internal
+			// error says nothing about the peer's protocol era, so it is surfaced
+			// rather than read as a legacy server.
+			if (!isDiscoverRejection(e))
+				throw e;
+			// Only UnsupportedProtocolVersionError carries a version list to
+			// negotiate from. Any other JSON-RPC error means the peer does not
+			// serve `server/discover` (legacy servers answer -32601, -32600,
+			// -32602 or -32002), so run the initialize handshake instead.
+			if (e.code != ErrorCode.unsupportedProtocolVersion)
 			{
-				initialize(); // legacy initialize-based server
+				initialize();
 				return negotiated;
 			}
-			if (e.code == ErrorCode.unsupportedProtocolVersion)
-				serverVersions = supportedListFromError(e);
-			else
-				throw e;
+			serverVersions = supportedListFromError(e);
 		}
 
 		ProtocolVersion chosen;
@@ -789,59 +1279,66 @@ final class McpClient : ClientProtocol
 			negotiated = chosen;
 			transport.setModernProtocol(true);
 			// No initialize handshake follows on the modern protocol path, so
-			// capture what `server/discover` advertised; otherwise the caller
-			// would have no way to inspect the server's capabilities/identity.
-			// When the probe succeeded (haveDisc), the result is already in hand;
-			// when it failed with UnsupportedProtocolVersionError (haveDisc is
-			// false), modern framing is now active so a fresh discover() populates
-			// the same fields.
+			// capture what `server/discover` advertised. A probe rejected with
+			// UnsupportedProtocolVersionError left nothing in hand, so a fresh
+			// discover() under the now-active modern framing supplies it.
 			if (haveDisc)
-			{
-				serverCapabilities_ = disc.capabilities;
-				serverInfo_ = disc.serverInfo;
-				serverInstructions_ = disc.instructions;
-			}
+				adoptDiscovered(disc);
 			else
-			{
-				auto freshDisc = discover();
-				serverCapabilities_ = freshDisc.capabilities;
-				serverInfo_ = freshDisc.serverInfo;
-				serverInstructions_ = freshDisc.instructions;
-			}
+				discover();
 		}
 		else
 		{
-			// The modern-framed probe left modern framing set; the mutually-chosen
-			// version is stable, so clear it before the `initialize` handshake runs
-			// under that stable version.
-			useModern = false;
 			negotiated = chosen;
 			initialize(chosen.toWire); // modern discovery, legacy version
 		}
 		return negotiated;
 	}
 
+	/// Whether `e`, raised by the `server/discover` probe, is the peer's JSON-RPC
+	/// rejection of the method rather than a failure to get any answer: not a
+	/// timeout, a closed transport, a cancellation, or an internal error (the code
+	/// local transport failures carry). Nor is it a modern-only error
+	/// (`HeaderMismatch`, `MissingRequiredClientCapability`): only a server that
+	/// speaks the modern protocol emits those, so they are no sign of an older
+	/// peer.
+	private static bool isDiscoverRejection(McpException e) @safe
+	{
+		if (cast(RequestTimeoutException) e || cast(TransportClosedException) e)
+			return false;
+		switch (e.code)
+		{
+		case ErrorCode.internalError:
+		case ErrorCode.requestCancelled:
+		case ErrorCode.headerMismatch:
+		case ErrorCode.missingRequiredClientCapability:
+			return false;
+		default:
+			return true;
+		}
+	}
+
 	/// Connect using a `server/discover` result obtained earlier, performing the
-	/// same version selection as `connect()` over `prior.protocolVersions` but
+	/// same version selection as `connect()` over `prior.supportedVersions` but
 	/// WITHOUT any network probe. This is the zero-round-trip reconnect: a caller
 	/// that persisted a previous session's `discoverResult()` (it round-trips via
 	/// `DiscoverResult.toJson`/`fromJson`) can rehydrate it and reconnect without
 	/// re-issuing `server/discover`.
 	///
-	/// When the mutually-chosen version is modern, modern (modern) framing
+	/// When the mutually-chosen version is modern (2026-07-28), modern framing
 	/// is enabled and `prior`'s capabilities/serverInfo/instructions are adopted
 	/// directly — zero round trips. When the chosen version is stable, modern
 	/// framing is cleared and a single `initialize(chosen.toWire)` handshake runs
 	/// (one round trip), because a stable session still requires the handshake.
 	/// Throws `McpException(unsupportedProtocolVersion)` when there is no mutually
-	/// supported version in `prior.protocolVersions`. Records `prior` as the
+	/// supported version in `prior.supportedVersions`. Records `prior` as the
 	/// client's `discoverResult()`.
 	ProtocolVersion connect(DiscoverResult prior) @safe
 	{
 		discoverResult_ = prior;
 
 		ProtocolVersion chosen;
-		if (!selectMutualVersion(prior.protocolVersions, chosen))
+		if (!selectMutualVersion(prior.supportedVersions, chosen))
 			throw new McpException(ErrorCode.unsupportedProtocolVersion,
 					"No mutually supported protocol version");
 
@@ -852,9 +1349,7 @@ final class McpClient : ClientProtocol
 			transport.setModernProtocol(true);
 			// No `initialize` follows on the modern protocol path, so adopt what the
 			// prior discovery advertised directly — no `server/discover` round-trip.
-			serverCapabilities_ = prior.capabilities;
-			serverInfo_ = prior.serverInfo;
-			serverInstructions_ = prior.instructions;
+			adoptDiscovered(prior);
 		}
 		else
 		{
@@ -868,14 +1363,10 @@ final class McpClient : ClientProtocol
 	}
 
 	/// Extract the `supported` wire-version list from an
-	/// `UnsupportedProtocolVersionError`. The transport's `errorFrom`
-	/// (http_transport.d) stores the whole JSON-RPC error object in `data`, so the
-	/// list lives at `data.data.supported`.
+	/// `UnsupportedProtocolVersionError`'s `data`.
 	private static string[] supportedListFromError(McpException e) @safe
 	{
 		auto d = e.data;
-		if (d.type == Json.Type.object && "data" in d && d["data"].type == Json.Type.object)
-			d = d["data"];
 		string[] versions;
 		if (d.type == Json.Type.object && "supported" in d && d["supported"].type == Json
 				.Type.array)
@@ -889,9 +1380,28 @@ final class McpClient : ClientProtocol
 	}
 
 	/// `ping` — returns when the server acknowledges.
-	void ping() @safe
+	void ping(RequestOptions opts = RequestOptions.init) @safe
 	{
-		rpc("ping", Json.emptyObject);
+		rpcWith("ping", Json.emptyObject, opts);
+	}
+
+	/// Send `method` with the per-call `opts` applied: its progress token and log
+	/// level travel in `params._meta`, its progress sink receives the call's
+	/// progress, and its cancellation token aborts the call. A token minted for
+	/// `opts.onProgress` is kept in `opts`, so a caller issuing several requests
+	/// (a paginated listing) correlates them all under one token.
+	private Json rpcWith(string method, Json params, ref RequestOptions opts) @safe
+	{
+		auto token = effectiveToken(opts);
+		auto p = withSessionLogLevel(withProgressToken(params, token), opts.logLevel);
+		return withPerCallProgress!Json(opts, () @safe => rpc(method, p));
+	}
+
+	/// `withRequestLogLevel` on a modern session; `params` unchanged on a released
+	/// protocol, which has no per-request log level (use `setLogLevel` there).
+	private Json withSessionLogLevel(Json params, string level) @safe
+	{
+		return useModern ? withRequestLogLevel(params, level) : params;
 	}
 
 	/// Drive an auto-paginating list call. `fetchPage` is invoked once per page
@@ -900,7 +1410,7 @@ final class McpClient : ClientProtocol
 	///
 	/// Guards against a peer that never makes forward progress: a returned
 	/// `nextCursor` equal to the one just sent, or any cursor already seen on a
-	/// prior page (a cycle), throws `McpException(invalidParams)` rather than
+	/// prior page (a cycle), throws `McpException(internalError)` rather than
 	/// looping; a configurable `maxListPages_` cap throws
 	/// `McpException(internalError)` once exceeded. Without these checks a
 	/// malicious or buggy server could make the client loop forever, growing the
@@ -921,10 +1431,10 @@ final class McpClient : ClientProtocol
 			{
 				const advanced = next.get;
 				if (!cursor.isNull && advanced == cursor.get)
-					throw new McpException(ErrorCode.invalidParams,
+					throw new McpException(ErrorCode.internalError,
 							"Server returned a non-progressing pagination cursor");
 				if (advanced in seenCursors)
-					throw new McpException(ErrorCode.invalidParams,
+					throw new McpException(ErrorCode.internalError,
 							"Server returned a cycling pagination cursor");
 				seenCursors[advanced] = true;
 			}
@@ -934,24 +1444,25 @@ final class McpClient : ClientProtocol
 	}
 
 	/// Drain a paginated `<method>` list into a single accumulated result `R`.
-	/// Owns the cursor-param building, the first-page `cache` capture, and the
-	/// `nextCursor` reset shared by every `list*` method; `append` is the only
-	/// per-call variation, concatenating one page's items onto the accumulator.
-	private R drainList(R)(string method, scope void delegate(ref R acc, ref R page) @safe append) @safe
+	/// Owns the cursor-param building, the first-page `cache` capture (for a
+	/// result that carries one), and the `nextCursor` reset shared by every
+	/// paginated verb. Each page sends `params` plus its cursor; `append`
+	/// concatenates one page's items onto the accumulator.
+	private R drainList(R)(string method, Json params, scope void delegate(ref R acc,
+			ref R page) @safe append, RequestOptions opts = RequestOptions.init) @safe
 	{
 		R acc;
 		bool first = true;
 		paginate((Nullable!string cursor) @safe {
-			Json p = Json.emptyObject;
+			Json p = params.clone;
 			if (!cursor.isNull)
 				p["cursor"] = cursor.get;
-			auto res = R.fromJson(rpc(method, p));
+			auto res = R.fromJson(rpcWith(method, p, opts));
 			append(acc, res);
-			if (first)
-			{
-				acc.cache = res.cache;
-				first = false;
-			}
+			static if (is(typeof(acc.cache)))
+				if (first)
+					acc.cache = res.cache;
+			first = false;
 			return res.nextCursor;
 		});
 		acc.nextCursor = Nullable!string.init;
@@ -965,22 +1476,48 @@ final class McpClient : ClientProtocol
 	/// from the response cache without a round-trip; `opts.cacheMode` overrides.
 	ListToolsResult listTools(RequestOptions opts = RequestOptions.init) @safe
 	{
+		return withCancellation!ListToolsResult(opts.cancellation, () @safe => listToolsImpl(opts));
+	}
+
+	private ListToolsResult listToolsImpl(RequestOptions opts) @safe
+	{
+		const generation = beginCacheFetch("tools/list", "");
+		scope (exit)
+			endCacheFetch("tools/list", "");
+		const epoch = identityEpoch_;
 		auto acc = cachedFetch!ListToolsResult(CacheKey("tools/list", ""), opts.cacheMode, () @safe {
-			auto a = drainList!ListToolsResult("tools/list",
+			return drainList!ListToolsResult("tools/list", Json.emptyObject,
 				(ref ListToolsResult x, ref ListToolsResult r) @safe {
 				x.tools ~= r.tools;
-			});
-			// On a modern session over HTTP (the x-mcp-header feature), the client MUST
-			// exclude from tools/list any tool whose inputSchema carries an invalid
-			// `x-mcp-header` annotation (2026-07-28 server/tools #x-mcp-header). Validate each
-			// tool's schema and drop offenders before the result is cached, keeping
-			// siblings. stdio / legacy sessions MAY ignore x-mcp-header, so they are
-			// unaffected.
-			if (useModern)
-				a.tools = excludeInvalidHeaderTools(a.tools);
-			return a;
-		}, true); // retainForSchema: keep tools/list available to cachedTool
+			}, opts);
+		});
+		// On a modern session over HTTP (the x-mcp-header feature), the client MUST
+		// exclude from tools/list any tool whose inputSchema carries an invalid
+		// `x-mcp-header` annotation (2026-07-28 server/tools #x-mcp-header). Each
+		// tool's schema is validated and offenders dropped, keeping siblings, whether
+		// the list came from the server or from a (possibly shared or pre-seeded)
+		// cache. A modern stdio session MAY ignore x-mcp-header; it applies the same
+		// exclusion so a server's tool set does not depend on the transport. Legacy
+		// sessions predate the annotation and are left unfiltered.
+		if (useModern)
+			acc.tools = excludeInvalidHeaderTools(acc.tools);
+		if (cacheGeneration("tools/list", "") == generation && identityEpoch_ == epoch)
+		{
+			listedTools_ = null;
+			foreach (t; acc.tools)
+				listedTools_[t.name] = t;
+			haveListedTools_ = true;
+		}
 		return acc;
+	}
+
+	/// Forget the tool descriptors held for schema lookups, so mirroring and
+	/// output validation stop until the next `listTools`.
+	private void clearToolIndex() @safe nothrow
+	{
+		listedTools_ = null;
+		haveListedTools_ = false;
+		storeToolIndexValid_ = false;
 	}
 
 	/// Filter out any tool whose `inputSchema` has an invalid `x-mcp-header`
@@ -1017,6 +1554,7 @@ final class McpClient : ClientProtocol
 	void setCache(CacheStore store) @safe
 	{
 		cacheStore_ = store is null ? new InMemoryCacheStore() : store;
+		sharedCache_ = store !is null;
 	}
 
 	/// The active response cache backend (never null), so callers can pre-seed or
@@ -1035,7 +1573,8 @@ final class McpClient : ClientProtocol
 
 	/// Set this client's cache partition — a stable principal id under which its
 	/// `private`-scoped results are namespaced in a shared `cache` backend (see
-	/// `ClientSettings.cachePartition`). Empty treats the store as per-client.
+	/// `ClientSettings.cachePartition`). Empty keeps `private` results to this
+	/// client alone.
 	void setCachePartition(string partition) @safe nothrow
 	{
 		cachePartition_ = partition;
@@ -1066,11 +1605,19 @@ final class McpClient : ClientProtocol
 
 	/// The partition a `public` result is stored under (the shared empty
 	/// partition, so every client hits the same key) versus a `private` one (this
-	/// client's `cachePartition`, isolating it from other identities).
+	/// client's `privatePartition`, isolating it from other identities).
 	private CacheKey scopedKey(CacheKey logical, CacheScope scope_) @safe
 	{
 		return CacheKey(logical.method, logical.key,
-				scope_ == CacheScope.private_ ? cachePartition_ : "");
+				scope_ == CacheScope.private_ ? privatePartition() : "", cacheServer_);
+	}
+
+	/// The partition this client's `private` results live under: its
+	/// `cachePartition`, or a partition unique to this client when it has none.
+	/// Never "", which is the shared `public` namespace.
+	private string privatePartition() @safe nothrow
+	{
+		return cachePartition_.length ? cachePartition_ : clientPartition_;
 	}
 
 	/// A still-fresh entry under `key`, or null if absent or expired.
@@ -1083,8 +1630,8 @@ final class McpClient : ClientProtocol
 	}
 
 	/// Resolve the cache entry for `logical`, probing this client's own partition
-	/// first and then the shared/public one (only when partitioned, since
-	/// otherwise they coincide) — the same read order `cachedFetch` uses. `hitKey`
+	/// first and then the shared/public one — the same read order `cachedFetch`
+	/// uses. `hitKey`
 	/// reports the physical key that hit so callers can memoize against it. With
 	/// `requireFresh` (the default, used for serving cached responses) an expired
 	/// entry counts as a miss; without it the entry is returned regardless of
@@ -1096,56 +1643,57 @@ final class McpClient : ClientProtocol
 	{
 		if (cacheStore_ is null)
 			return Nullable!CacheEntry.init;
-		const ownKey = CacheKey(logical.method, logical.key, cachePartition_);
+		const ownKey = scopedKey(logical, CacheScope.private_);
 		auto own = requireFresh ? freshEntry(ownKey) : cacheStore_.get(ownKey);
 		if (!own.isNull)
 		{
 			hitKey = ownKey;
 			return own;
 		}
-		if (cachePartition_.length)
+		const sharedKey = scopedKey(logical, CacheScope.public_);
+		auto shared_ = requireFresh ? freshEntry(sharedKey) : cacheStore_.get(sharedKey);
+		if (!shared_.isNull)
 		{
-			const sharedKey = scopedKey(logical, CacheScope.public_);
-			auto shared_ = requireFresh ? freshEntry(sharedKey) : cacheStore_.get(sharedKey);
-			if (!shared_.isNull)
-			{
-				hitKey = sharedKey;
-				return shared_;
-			}
+			hitKey = sharedKey;
+			return shared_;
 		}
 		return Nullable!CacheEntry.init;
 	}
 
-	/// The descriptor for tool `name` taken from the cached `tools/list` response
-	/// — the single source for both `x-mcp-header` mirroring and output-schema
-	/// validation. Returns a null `Nullable` only when no `tools/list` response is
-	/// held at all (locally OR in a shared/pre-seeded store), so a caller that
-	/// never ran `listTools` still gets schemas from a populated cache. The read
-	/// ignores serving-freshness (`requireFresh: false`): a tool's schema stays
-	/// valid for as long as the entry is held, and `notifications/*/list_changed`
-	/// eviction — not the TTL clock — is what stops mirroring/validation. The
-	/// parsed `name -> Tool` index is memoized and re-derived only when the backing
-	/// cache entry changes (a different physical key or expiry stamp).
+	/// The descriptor for tool `name` — the single source for both `x-mcp-header`
+	/// mirroring and output-schema validation. After a local `listTools` this is
+	/// the listed tool set, independent of the response cache. Before one, a
+	/// `tools/list` entry held in the CacheStore (a shared or pre-seeded store)
+	/// supplies it; that read ignores serving-freshness, since a schema stays
+	/// valid until `notifications/tools/list_changed` evicts the entry. Null when
+	/// no descriptor for `name` is known.
 	private Nullable!Tool cachedTool(string name) @safe
 	{
+		if (haveListedTools_)
+		{
+			if (auto t = name in listedTools_)
+				return nullable(*t);
+			return Nullable!Tool.init;
+		}
 		CacheKey hitKey;
 		auto entry = cachedEntry(CacheKey("tools/list", ""), hitKey, false);
 		if (entry.isNull)
 		{
-			toolIndexValid_ = false;
+			storeToolIndexValid_ = false;
 			return Nullable!Tool.init;
 		}
-		if (!toolIndexValid_ || hitKey != toolIndexKey_ || entry.get.expiresAt != toolIndexStamp_)
+		if (!storeToolIndexValid_ || hitKey != storeToolIndexKey_
+				|| entry.get.expiresAt != storeToolIndexStamp_)
 		{
 			auto list = ListToolsResult.fromJson(entry.get.value);
-			toolIndex_ = null;
+			storeToolIndex_ = null;
 			foreach (t; list.tools)
-				toolIndex_[t.name] = t;
-			toolIndexKey_ = hitKey;
-			toolIndexStamp_ = entry.get.expiresAt;
-			toolIndexValid_ = true;
+				storeToolIndex_[t.name] = t;
+			storeToolIndexKey_ = hitKey;
+			storeToolIndexStamp_ = entry.get.expiresAt;
+			storeToolIndexValid_ = true;
 		}
-		if (auto t = name in toolIndex_)
+		if (auto t = name in storeToolIndex_)
 			return nullable(*t);
 		return Nullable!Tool.init;
 	}
@@ -1158,27 +1706,31 @@ final class McpClient : ClientProtocol
 	/// calling `fetch`; `bypass` skips the cache entirely (no read, no write);
 	/// `refresh` always fetches and re-stores. On a miss/refresh the result is
 	/// stored with an absolute expiry of `now + ttl` (the server hint, or
-	/// `defaultCacheTtl` when absent); a non-positive `ttl` stores nothing.
+	/// `defaultCacheTtl` when absent); a non-positive `ttl` stores nothing. An
+	/// unhinted result is stored `private`: only a server hint makes it `public`.
 	///
 	/// A `public` result lives under the shared empty partition (every client hits
 	/// the same key); a `private` result lives under this client's `cachePartition`
 	/// so a shared store never serves it to another identity. Because the scope is
 	/// only known after fetching, a read probes this client's own partition first
 	/// and then the shared one.
-	///
-	/// `retainForSchema` (set by `listTools`) keeps the result available to
-	/// `cachedTool` even when it is not cached for serving: on a non-positive `ttl`
-	/// the body is stored stale-for-serving (expiry = now) instead of being
-	/// dropped, so `x-mcp-header` mirroring and output-schema validation work after
-	/// a local `listTools` regardless of `defaultCacheTtl`, while a cached
-	/// `listTools` still refetches per its hint.
-	private R cachedFetch(R)(CacheKey logical, CacheMode mode,
-			scope R delegate() @safe fetch, bool retainForSchema = false) @safe
+	private R cachedFetch(R)(CacheKey logical, CacheMode mode, scope R delegate() @safe fetch) @safe
 	{
+		return cachedFetch!R(logical, mode, (out bool uncacheable) @safe => fetch());
+	}
+
+	/// `cachedFetch` over a `fetch` that reports, through `uncacheable`, a result
+	/// that must never be stored (an MRTR interim or retried result; see
+	/// `mrtrLoop`). The flag travels with the call rather than through client
+	/// state, so concurrent requests on other tasks cannot affect it.
+	private R cachedFetch(R)(CacheKey logical, CacheMode mode,
+			scope R delegate(out bool uncacheable) @safe fetch) @safe
+	{
+		bool uncacheable;
 		if (cacheStore_ is null || mode == CacheMode.bypass)
-			return fetch();
+			return fetch(uncacheable);
 		const sharedKey = scopedKey(logical, CacheScope.public_); // partition ""
-		const ownKey = CacheKey(logical.method, logical.key, cachePartition_);
+		const ownKey = scopedKey(logical, CacheScope.private_);
 		if (mode == CacheMode.use)
 		{
 			CacheKey hitKey;
@@ -1186,18 +1738,18 @@ final class McpClient : ClientProtocol
 			if (!hit.isNull)
 				return R.fromJson(hit.get.value);
 		}
-		lastResultUncacheable_ = false;
-		R result = fetch();
-		if (lastResultUncacheable_)
-		{
-			// Set by `mrtrLoop` for an interim or retried result (see there).
-			lastResultUncacheable_ = false;
+		const generation = beginCacheFetch(logical.method, logical.key);
+		scope (exit)
+			endCacheFetch(logical.method, logical.key);
+		const epoch = identityEpoch_;
+		R result = fetch(uncacheable);
+		if (uncacheable || cacheGeneration(logical.method,
+				logical.key) != generation || identityEpoch_ != epoch)
 			return result;
-		}
 		const ttl = result.cache.isNull ? defaultCacheTtl_ : result.cache.get.ttl;
 		if (ttl > Duration.zero)
 		{
-			const scope_ = result.cache.isNull ? CacheScope.public_ : result.cache.get.cacheScope;
+			const scope_ = result.cache.isNull ? CacheScope.private_ : result.cache.get.cacheScope;
 			const storeKey = scopedKey(logical, scope_);
 			cacheStore_.put(storeKey, CacheEntry(result.toJson(), now_() + ttl, scope_));
 			// If the scope flipped since a prior fetch, drop the now-stale entry
@@ -1206,33 +1758,67 @@ final class McpClient : ClientProtocol
 			if (otherKey != storeKey)
 				cacheStore_.invalidate(otherKey);
 		}
-		else if (retainForSchema)
-		{
-			// Not cached for serving, but keep the body for schema lookups: store it
-			// already-expired (expiry = now) under the shared partition so a cached
-			// `listTools` still refetches, while `cachedTool` (which ignores
-			// serving-freshness) can read the descriptors until a `list_changed`.
-			const storeKey = scopedKey(logical, CacheScope.public_);
-			cacheStore_.put(storeKey, CacheEntry(result.toJson(), now_(), CacheScope.public_));
-			const otherKey = (storeKey == ownKey) ? sharedKey : ownKey;
-			if (otherKey != storeKey)
-				cacheStore_.invalidate(otherKey);
-		}
 		else
-			invalidateLogical(logical.method, logical.key); // do-not-cache: drop any stale entry
+			evictLogical(logical.method, logical.key); // do-not-cache: drop any stale entry
 		return result;
+	}
+
+	private static string generationKey(string method, string key) @safe pure nothrow
+	{
+		return method ~ "\0" ~ key;
+	}
+
+	/// How many times the logical entry `method`/`key` has been invalidated
+	/// since its oldest outstanding fetch began.
+	private ulong cacheGeneration(string method, string key) @safe
+	{
+		if (auto g = generationKey(method, key) in cacheGenerations_)
+			return g.generation;
+		return 0;
+	}
+
+	/// Register a fetch for the logical entry `method`/`key`, returning its
+	/// current generation. Each call is paired with `endCacheFetch`.
+	private ulong beginCacheFetch(string method, string key) @safe
+	{
+		const k = generationKey(method, key);
+		if (auto g = k in cacheGenerations_)
+		{
+			g.inFlight++;
+			return g.generation;
+		}
+		cacheGenerations_[k] = CacheGeneration(0, 1);
+		return 0;
+	}
+
+	/// End a fetch registered by `beginCacheFetch`, dropping the entry's state
+	/// once no fetch for it remains.
+	private void endCacheFetch(string method, string key) @safe
+	{
+		const k = generationKey(method, key);
+		if (auto g = k in cacheGenerations_)
+			if (--g.inFlight == 0)
+				cacheGenerations_.remove(k);
+	}
+
+	/// Handle a server change notification for a logical entry: evict it and
+	/// advance its generation so an in-flight fetch does not re-store it.
+	private void invalidateLogical(string method, string key) @safe
+	{
+		if (auto g = generationKey(method, key) in cacheGenerations_)
+			g.generation++;
+		evictLogical(method, key);
 	}
 
 	/// Evict a logical cacheable entry from both this client's own partition and
 	/// the shared partition (the only two places a given client could have stored
-	/// it). Used on do-not-cache results and on the server's change notifications.
-	private void invalidateLogical(string method, string key) @safe
+	/// it).
+	private void evictLogical(string method, string key) @safe
 	{
 		if (cacheStore_ is null)
 			return;
-		cacheStore_.invalidate(CacheKey(method, key, ""));
-		if (cachePartition_.length)
-			cacheStore_.invalidate(CacheKey(method, key, cachePartition_));
+		cacheStore_.invalidate(CacheKey(method, key, "", cacheServer_));
+		cacheStore_.invalidate(CacheKey(method, key, privatePartition(), cacheServer_));
 	}
 
 	/// `tools/call`. Per-request `progressToken` / `logLevel` / `onProgress` are
@@ -1248,28 +1834,37 @@ final class McpClient : ClientProtocol
 	/// `CallToolResult`. The loop only
 	/// engages when modern mode is enabled (see `enableModern`/`connect`); other
 	/// protocol versions never see `inputRequests`.
+	/// If an input request has no matching handler installed, or the server keeps
+	/// asking past the round limit, the loop stops and the still-unfinished result
+	/// is returned as-is rather than thrown: check `isInputRequired` before using
+	/// it, and inspect `inputRequests` / `requestState` to answer it yourself.
 	///
 	/// When output-schema validation is enabled (see
 	/// `enableOutputSchemaValidation`) and the cached `tools/list` response carries
 	/// this tool's `outputSchema` (from any source — a local `listTools`, or a
 	/// shared/pre-seeded `CacheStore`), the returned `structuredContent` is
-	/// validated against it and a non-conforming result raises an `invalidParams`
-	/// `McpException` — the same guarantee as `callTool(Tool, ...)`, without the
+	/// validated against it and a non-conforming result raises an
+	/// `OutputSchemaViolation` — the same guarantee as `callTool(Tool, ...)`, without the
 	/// caller holding the descriptor.
 	CallToolResult callTool(string name, Json arguments = Json.emptyObject,
 			RequestOptions opts = RequestOptions.init) @safe
 	{
 		auto result = callToolImpl(name, arguments, opts);
-		// When output-schema validation is enabled and the cached tools/list carries
-		// this tool's outputSchema, validate the returned structuredContent against
-		// it so a string-name call gets the same guarantee as `callTool(Tool, ...)`.
-		if (validateOutputSchema_)
-		{
-			auto tool = cachedTool(name);
-			if (!tool.isNull)
-				enforceOutputSchema(name, tool.get.outputSchema, result);
-		}
+		enforceKnownOutputSchema(name, result);
 		return result;
+	}
+
+	/// When output-schema validation is enabled and tool `name`'s descriptor is
+	/// known (see `cachedTool`), validate `result`'s structuredContent against its
+	/// outputSchema, so a string-name call gets the same guarantee as
+	/// `callTool(Tool, ...)`.
+	private void enforceKnownOutputSchema(string name, const CallToolResult result) @safe
+	{
+		if (!validateOutputSchema_)
+			return;
+		auto tool = cachedTool(name);
+		if (!tool.isNull)
+			enforceOutputSchema(name, tool.get.outputSchema, result);
 	}
 
 	/// Issue the `tools/call` (with per-call progress routing and MRTR looping)
@@ -1320,9 +1915,10 @@ final class McpClient : ClientProtocol
 	/// keeps asking for input cannot loop forever. If a handler for a requested
 	/// input type is missing, or the loop bound is exceeded, the (still
 	/// `inputRequired`) result is returned so the caller can inspect it via
-	/// `R.isInputRequired`.
-	private R mrtrLoop(R)(string method, string logLevel,
-			scope Json delegate(InputResponse[] responses, string requestState) @safe buildParams) @safe
+	/// `R.isInputRequired`. `uncacheable` is set when the returned result came from
+	/// a retry or is itself input-required, so a caching caller must not store it.
+	private R mrtrLoop(R)(string method, string logLevel, scope Json delegate(InputResponse[] responses,
+			string requestState) @safe buildParams, out bool uncacheable) @safe
 	{
 		enum maxRounds = 16;
 		InputResponse[] responses;
@@ -1338,14 +1934,14 @@ final class McpClient : ClientProtocol
 			// Per-request modern logging opt-in: stamp the explicit level so
 			// `injectModernMeta` carries it (and leaves it to win over any sticky
 			// `setLogLevel` default). Empty -> no field.
-			auto params = withRequestLogLevel(buildParams(responses, requestState), logLevel);
+			auto params = withSessionLogLevel(buildParams(responses, requestState), logLevel);
 			result = R.fromJson(rpc(method, params));
 			// server/utilities/caching: an interim input_required result carries no
 			// caching hint, and a result produced by a retry carrying
 			// inputResponses/requestState MUST NOT be cached, because it depends on
 			// inputs outside the cache key. Only a first-round completed result may
 			// be stored by a caching caller.
-			lastResultUncacheable_ = round > 0 || result.isInputRequired;
+			uncacheable = round > 0 || result.isInputRequired;
 			if (!result.isInputRequired)
 				return result;
 			// Gather an answer for each requested input. If any cannot be
@@ -1373,9 +1969,10 @@ final class McpClient : ClientProtocol
 	private CallToolResult callToolLoop(string name, Json arguments,
 			ProgressToken progressToken, string logLevel = "") @safe
 	{
+		bool uncacheable;
 		return mrtrLoop!CallToolResult("tools/call", logLevel, (responses,
-				requestState) => buildToolCallParams(name,
-				arguments, progressToken, responses, requestState));
+				requestState) => withMrtr(buildToolCallParams(name,
+				arguments, progressToken), responses, requestState), uncacheable);
 	}
 
 	/// Mint a process-unique string `ProgressToken` for a per-call progress sink.
@@ -1416,12 +2013,12 @@ final class McpClient : ClientProtocol
 	private R withPerCallProgress(R)(RequestOptions opts, scope R delegate() @safe body_) @safe
 	{
 		if (opts.onProgress is null)
-			return body_();
+			return withCancellation!R(opts.cancellation, body_);
 		const key = opts.progressToken.toJson().toString();
 		perCallProgress_[key] = opts.onProgress;
 		scope (exit)
 			perCallProgress_.remove(key);
-		return body_();
+		return withCancellation!R(opts.cancellation, body_);
 	}
 
 	/// The elicitation `mode` carried in a request's `params`. Per
@@ -1435,17 +2032,15 @@ final class McpClient : ClientProtocol
 	/// Whether `advertised` client capabilities declare support for elicitation
 	/// `mode`, per client/elicitation §Error Handling (2025-11-25): a request
 	/// whose `mode` was not declared in client capabilities must be rejected.
-	/// A bare `elicitation` declaration is parsed as form-capable
-	/// (elicitationForm=true). An explicit url-only declaration (`{"url":{}}` =>
-	/// elicitation=true, elicitationUrl=true, elicitationForm=false) does NOT
-	/// declare form mode, so it must not satisfy the form case.
+	/// A bare `{}` parses as elicitationForm=true. An explicit url-only
+	/// declaration (`{"url":{}}` => elicitationUrl=true only) does NOT declare
+	/// form mode, so it must not satisfy the form case.
 	private static bool supportsElicitationMode(ClientCapabilities advertised, string mode) @safe
 	{
 		switch (mode)
 		{
 		case "form":
-			return advertised.elicitationForm || (advertised.elicitation
-					&& !advertised.elicitationUrl);
+			return advertised.elicitationForm;
 		case "url":
 			return advertised.elicitationUrl;
 		default:
@@ -1502,21 +2097,6 @@ final class McpClient : ClientProtocol
 		return withProgressToken(p, progressToken);
 	}
 
-	/// Build the `tools/call` params with any gathered MRTR (SEP-2322) input
-	/// responses attached as the top-level `params.inputResponses` map, and the
-	/// opaque `requestState` echoed back as `params.requestState`. Per SEP-2322
-	/// these are RequestParams fields, NOT `_meta` entries. With no responses
-	/// and no requestState this is identical to the plain `buildToolCallParams`.
-	/// Separated as a package static so the resubmission param shaping can be
-	/// unit-tested without a live server.
-	package static Json buildToolCallParams(string name, Json arguments,
-			ProgressToken progressToken, InputResponse[] responses, string requestState = "") @safe
-	{
-		Json p = buildToolCallParams(name, arguments, progressToken);
-		p = withInputResponses(p, responses);
-		return withRequestState(p, requestState);
-	}
-
 	/// Attach MRTR (SEP-2322) input responses to a request as the top-level
 	/// `params.inputResponses` map (id -> bare client result). An empty
 	/// `responses` list returns `params` unchanged. Exposed so callers can
@@ -1548,13 +2128,21 @@ final class McpClient : ClientProtocol
 		return params;
 	}
 
+	/// Attach an MRTR (SEP-2322) resubmission's gathered `responses` and echoed
+	/// `requestState` to `params` (see `withInputResponses`/`withRequestState`).
+	/// With neither, `params` is returned unchanged.
+	package static Json withMrtr(Json params, InputResponse[] responses, string requestState = "") @safe
+	{
+		return withRequestState(withInputResponses(params, responses), requestState);
+	}
+
 	/// `tools/call` for a tool whose descriptor (and therefore `outputSchema`) is
 	/// known — typically one returned by `listTools`. When the client has output-
 	/// schema validation enabled (see `enableOutputSchemaValidation`) and `tool`
 	/// carries an `outputSchema`, the returned `structuredContent` is validated
 	/// against it: per the spec, "Clients SHOULD validate structured results
-	/// against this schema." A non-conforming result raises a clear
-	/// `McpException` rather than being accepted silently.
+	/// against this schema." A non-conforming result raises an
+	/// `OutputSchemaViolation` rather than being accepted silently.
 	CallToolResult callTool(const Tool tool, Json arguments = Json.emptyObject,
 			RequestOptions opts = RequestOptions.init) @safe
 	{
@@ -1591,50 +2179,110 @@ final class McpClient : ClientProtocol
 	/// Fetch a task's current state (`tasks/get`). Returns the raw `DetailedTask`
 	/// JSON, which carries the `Task` fields plus, for terminal/blocked states,
 	/// `result` (completed), `error` (failed), or `inputRequests` (input_required).
-	Json getTaskState(string taskId) @safe
+	Json getTaskState(string taskId, RequestOptions opts = RequestOptions.init) @safe
 	{
-		return rpc("tasks/get", Json(["taskId": Json(taskId)]));
+		return rpcWith("tasks/get", Json(["taskId": Json(taskId)]), opts);
 	}
 
 	/// The typed `Task` metadata for `taskId` (status/timestamps/ttl), parsed from
 	/// `getTaskState`.
-	Task getTask(string taskId) @safe
+	Task getTask(string taskId, RequestOptions opts = RequestOptions.init) @safe
 	{
-		return Task.fromJson(getTaskState(taskId));
+		return Task.fromJson(getTaskState(taskId, opts));
 	}
 
 	/// Supply responses to a task's outstanding `inputRequests` (`tasks/update`).
 	/// `inputResponses` is a map keyed by the request keys surfaced under the
 	/// `input_required` state.
-	void respondTaskInput(string taskId, Json inputResponses) @safe
+	void respondTaskInput(string taskId, Json inputResponses,
+			RequestOptions opts = RequestOptions.init) @safe
 	{
 		Json p = Json.emptyObject;
 		p["taskId"] = taskId;
 		p["inputResponses"] = (inputResponses.type == Json.Type.object) ? inputResponses
 			: Json.emptyObject;
-		rpc("tasks/update", p);
+		rpcWith("tasks/update", p, opts);
 	}
 
 	/// Request cancellation of a task (`tasks/cancel`). Cancellation is
 	/// cooperative: the server acknowledges but may still finish the work.
-	void cancelTask(string taskId) @safe
+	void cancelTask(string taskId, RequestOptions opts = RequestOptions.init) @safe
 	{
-		rpc("tasks/cancel", Json(["taskId": Json(taskId)]));
+		rpcWith("tasks/cancel", Json(["taskId": Json(taskId)]), opts);
 	}
 
 	/// Poll `tasks/get` until the task reaches a terminal status, honoring the
-	/// server's `pollIntervalMs`. Returns the final `CallToolResult` on
-	/// `completed`; throws on `failed`/`cancelled`. While the task is
-	/// `input_required`, `onInputRequired` (if provided) is invoked with the raw
-	/// `inputRequests` map so the caller can answer via `respondTaskInput`; with no
-	/// handler the poll continues. Works from a bare `taskId` string, so a client
-	/// can resume a task persisted across a restart.
-	CallToolResult awaitTask(string taskId, void delegate(string taskId,
-			Json inputRequests) @safe onInputRequired = null) @safe
+	/// server's `pollIntervalMs` (`ClientSettings.taskPollInterval` when it gives
+	/// none). Returns the final `CallToolResult` on `completed`; throws on
+	/// `failed`/`cancelled`, and `RequestTimeoutException` once
+	/// `ClientSettings.taskTimeout` (when set) elapses. While the task is
+	/// `input_required`, `onInputRequired` is invoked with the `inputRequests`
+	/// entries it has not yet been given in that phase (each key is delivered once,
+	/// even while it stays pending across polls) so the caller can answer via
+	/// `respondTaskInput`; with no handler the task
+	/// can never progress, so this throws. Works from a bare `taskId` string, so a
+	/// client can resume a task persisted across a restart.
+	///
+	/// Cancelling `opts.cancellation` stops polling, cancels the task on the server
+	/// (best effort), and throws the cancellation error. When `opts.onProgress`
+	/// and `opts.progressToken` are both set, progress the server reports under
+	/// that token (the one the task's originating call carried) is routed to
+	/// `opts.onProgress` while the task is polled.
+	CallToolResult awaitTask(string taskId, RequestOptions opts = RequestOptions.init,
+			void delegate(string taskId, Json inputRequests) @safe onInputRequired = null) @safe
 	{
+		if (!opts.progressToken.isSet)
+			opts.onProgress = null;
+		return withPerCallProgress!CallToolResult(opts, () @safe {
+			return awaitTaskImpl(taskId, onInputRequired, opts.cancellation);
+		});
+	}
+
+	/// `awaitTask`, stopping once `cancellation` (when non-null) is cancelled: the
+	/// task is then cancelled on the server (best effort) and this throws the
+	/// cancellation error.
+	private CallToolResult awaitTaskImpl(string taskId, void delegate(string taskId,
+			Json inputRequests) @safe onInputRequired, CancellationToken cancellation) @safe
+	{
+		import core.time : MonoTime;
+
+		void checkCancelled() @safe
+		{
+			if (cancellation is null || !cancellation.isCancelled)
+				return;
+			// Send tasks/cancel outside the cancelled token, which would otherwise
+			// refuse the request before it is sent.
+			const key = currentFiberKey();
+			auto bound = callTokens_.get(key, null);
+			callTokens_.remove(key);
+			scope (exit)
+				if (bound !is null)
+					callTokens_[key] = bound;
+			try
+				cancelTask(taskId);
+			catch (Exception)
+			{
+			}
+			throw cancelledError(cancellation.reason);
+		}
+
+		const start = MonoTime.currTime;
+		// The inputRequests keys already handed to `onInputRequired` during the
+		// current input_required phase, so a request still pending on the next poll
+		// is not answered twice.
+		bool[string] handledInputs;
+		bool inInputPhase;
 		for (;;)
 		{
-			auto state = getTaskState(taskId);
+			checkCancelled();
+			Json state;
+			try
+				state = getTaskState(taskId);
+			catch (McpException e)
+			{
+				checkCancelled();
+				throw e;
+			}
 			const status = ("status" in state && state["status"].type == Json.Type.string) ? state["status"]
 				.get!string : "working";
 			switch (status)
@@ -1645,20 +2293,60 @@ final class McpClient : ClientProtocol
 			case "failed":
 				throw taskFailedError(taskId, state);
 			case "cancelled":
-				throw new McpException(ErrorCode.invalidRequest, "Task was cancelled: " ~ taskId);
+				throw new McpException(ErrorCode.requestCancelled, "Task was cancelled: " ~ taskId);
 			case "input_required":
-				if (onInputRequired !is null)
-					onInputRequired(taskId, ("inputRequests" in state)
-							? state["inputRequests"] : Json.emptyObject);
+				if (onInputRequired is null)
+					throw new McpException(ErrorCode.internalError,
+							"Task " ~ taskId
+							~ " requires input but no onInputRequired handler was given");
+				auto fresh = takeUnhandledInputRequests(state, handledInputs);
+				if (fresh.length || !inInputPhase)
+					onInputRequired(taskId, fresh);
+				inInputPhase = true;
 				break;
-			default: // working
+			case "working":
+				handledInputs = null;
+				inInputPhase = false;
 				break;
+			default:
+				throw new McpException(ErrorCode.internalError,
+						"Task " ~ taskId ~ " reported an unrecognized status: " ~ status);
 			}
-			long pollMs;
-			if ("pollIntervalMs" in state && state["pollIntervalMs"].type == Json.Type.int_)
-				pollMs = state["pollIntervalMs"].get!long;
-			taskPollSleep(pollMs.msecs);
+			if (taskTimeout_ > Duration.zero && MonoTime.currTime - start >= taskTimeout_)
+				throw new RequestTimeoutException(
+						"Task " ~ taskId ~ " did not finish within " ~ taskTimeout_.toString());
+			auto interval = taskPollInterval_;
+			if ("pollIntervalMs" in state && state["pollIntervalMs"].type == Json.Type.int_
+					&& state["pollIntervalMs"].get!long > 0)
+				interval = state["pollIntervalMs"].get!long.msecs;
+			if (interval > maxTaskPollInterval_)
+				interval = maxTaskPollInterval_;
+			if (taskTimeout_ > Duration.zero)
+			{
+				const left = taskTimeout_ - (MonoTime.currTime - start);
+				if (interval > left)
+					interval = left;
+			}
+			taskPollSleep(interval, cancellation);
 		}
+	}
+
+	/// The entries of a task state's `inputRequests` whose keys are not yet in
+	/// `handled`, recording each returned key as handled. A missing or non-object
+	/// `inputRequests` yields an empty object.
+	private static Json takeUnhandledInputRequests(Json state, ref bool[string] handled) @safe
+	{
+		Json fresh = Json.emptyObject;
+		if ("inputRequests" !in state || state["inputRequests"].type != Json.Type.object)
+			return fresh;
+		foreach (key, value; state["inputRequests"].get!(Json[string]))
+		{
+			if (key in handled)
+				continue;
+			handled[key] = true;
+			fresh[key] = value;
+		}
+		return fresh;
 	}
 
 	/// Call a tool and transparently drive the task flow: if the server answers
@@ -1666,20 +2354,29 @@ final class McpClient : ClientProtocol
 	/// the final `CallToolResult`; otherwise return the synchronous result. Lets a
 	/// caller treat task and non-task tools identically. Requires `enableTasks`.
 	///
-	/// Built on `callTool`, so any MRTR (SEP-2322) round-trips and per-call progress
-	/// are handled before the task handle is observed. A caller that instead needs
+	/// Built on `callTool`, so any MRTR (SEP-2322) round-trips are handled before
+	/// the task handle is observed. `opts.onProgress` keeps receiving the call's
+	/// progress while the task is polled, and cancelling `opts.cancellation` stops
+	/// polling and cancels the task on the server. A caller that instead needs
 	/// to persist the task and resume after a restart should call `callTool`
 	/// directly, store `result.task.taskId` when `result.isTask`, and later resume
-	/// with `awaitTask`.
+	/// with `awaitTask`. With output-schema validation enabled, the final result
+	/// is validated like a `callTool` result.
 	CallToolResult callToolAwait(string name, Json arguments = Json.emptyObject,
-			void delegate(string taskId,
-				Json inputRequests) @safe onInputRequired = null,
-			RequestOptions opts = RequestOptions.init) @safe
+			RequestOptions opts = RequestOptions.init,
+			void delegate(string taskId, Json inputRequests) @safe onInputRequired = null) @safe
 	{
+		// Mint the progress token up front so the task phase routes the same
+		// token's progress to `opts.onProgress` as the initial call did.
+		effectiveToken(opts);
 		auto r = callTool(name, arguments, opts);
-		if (r.isTask())
-			return awaitTask(r.task.taskId, onInputRequired);
-		return r;
+		if (!r.isTask())
+			return r;
+		auto done = withPerCallProgress!CallToolResult(opts, () @safe {
+			return awaitTaskImpl(r.task.taskId, onInputRequired, opts.cancellation);
+		});
+		enforceKnownOutputSchema(name, done);
+		return done;
 	}
 
 	private McpException taskFailedError(string taskId, Json state) @safe
@@ -1691,14 +2388,15 @@ final class McpClient : ClientProtocol
 				.get!int : ErrorCode.internalError;
 			const msg = ("message" in e && e["message"].type == Json.Type.string) ? e["message"]
 				.get!string : "Task failed";
-			return new McpException(cast(ErrorCode) code, msg);
+			return new McpException(code, msg, "data" in e ? e["data"] : Json.undefined);
 		}
 		return new McpException(ErrorCode.internalError, "Task failed: " ~ taskId);
 	}
 
-	/// Sleep between task polls. A test seam mirrors `onRpcForTest` so polling
-	/// loops run without a live event loop under `unittest`.
-	private void taskPollSleep(Duration d) @safe
+	/// Sleep between task polls, waking early when `cancellation` (when non-null)
+	/// is cancelled or the client is closed. A test seam mirrors `onRpcForTest`
+	/// so polling loops run without a live event loop under `unittest`.
+	private void taskPollSleep(Duration d, CancellationToken cancellation) @safe
 	{
 		version (unittest)
 			if (onTaskSleepForTest !is null)
@@ -1706,11 +2404,36 @@ final class McpClient : ClientProtocol
 				onTaskSleepForTest(d);
 				return;
 			}
-		import vibe.core.core : sleep;
-
-		if (d > Duration.zero)
-			() @trusted { sleep(d); }();
+		if (d <= Duration.zero || closed_)
+			return;
+		auto wake = createManualEvent();
+		const key = nextPollWake_++;
+		pollWakes_[key] = wake;
+		scope (exit)
+			pollWakes_.remove(key);
+		const ec = wake.emitCount;
+		ulong hookKey;
+		if (cancellation !is null)
+		{
+			hookKey = cancellation.bind((string) @safe { wake.emit(); });
+			if (cancellation.isCancelled)
+			{
+				cancellation.unbind(hookKey);
+				return;
+			}
+		}
+		scope (exit)
+			if (cancellation !is null)
+				cancellation.unbind(hookKey);
+		wake.wait(d, ec);
 	}
+
+	// One event per sleeping task poll, woken by its own wait's cancellation and
+	// by `close()`, so `taskPollSleep` never sleeps out a long poll interval
+	// after its caller has gone away, and one wait's cancellation leaves the
+	// others asleep.
+	private LocalManualEvent[ulong] pollWakes_;
+	private ulong nextPollWake_;
 
 	version (unittest) package void delegate(Duration) @safe onTaskSleepForTest;
 
@@ -1747,14 +2470,14 @@ final class McpClient : ClientProtocol
 		return validateAgainstSchema(result.structuredContent, outputSchema);
 	}
 
-	/// Throw an `invalidParams` `McpException` if `result`'s `structuredContent`
-	/// does not conform to `outputSchema`; a no-op when it conforms.
+	/// Throw an `OutputSchemaViolation` if `result`'s `structuredContent` does not
+	/// conform to `outputSchema`; a no-op when it conforms.
 	private static void enforceOutputSchema(string name, Json outputSchema,
 			const CallToolResult result) @safe
 	{
 		const msg = validateStructured(result, outputSchema);
 		if (msg.length)
-			throw new McpException(ErrorCode.invalidParams, "Tool '" ~ name
+			throw new OutputSchemaViolation("Tool '" ~ name
 					~ "' returned structuredContent that does not conform to its outputSchema: "
 					~ msg);
 	}
@@ -1765,12 +2488,18 @@ final class McpClient : ClientProtocol
 	/// still-fresh result is served from the cache; `opts.cacheMode` overrides.
 	ListResourcesResult listResources(RequestOptions opts = RequestOptions.init) @safe
 	{
+		return withCancellation!ListResourcesResult(opts.cancellation,
+				() @safe => listResourcesImpl(opts));
+	}
+
+	private ListResourcesResult listResourcesImpl(RequestOptions opts) @safe
+	{
 		return cachedFetch!ListResourcesResult(CacheKey("resources/list", ""),
 				opts.cacheMode, () @safe {
-			return drainList!ListResourcesResult("resources/list",
+			return drainList!ListResourcesResult("resources/list", Json.emptyObject,
 				(ref ListResourcesResult a, ref ListResourcesResult r) @safe {
 				a.resources ~= r.resources;
-			});
+			}, opts);
 		});
 	}
 
@@ -1781,12 +2510,19 @@ final class McpClient : ClientProtocol
 	/// still-fresh result is served from the cache; `opts.cacheMode` overrides.
 	ListResourceTemplatesResult listResourceTemplates(RequestOptions opts = RequestOptions.init) @safe
 	{
+		return withCancellation!ListResourceTemplatesResult(opts.cancellation,
+				() @safe => listResourceTemplatesImpl(opts));
+	}
+
+	private ListResourceTemplatesResult listResourceTemplatesImpl(RequestOptions opts) @safe
+	{
 		return cachedFetch!ListResourceTemplatesResult(CacheKey("resources/templates/list",
 				""), opts.cacheMode, () @safe {
 			return drainList!ListResourceTemplatesResult("resources/templates/list",
-				(ref ListResourceTemplatesResult a, ref ListResourceTemplatesResult r) @safe {
+				Json.emptyObject, (ref ListResourceTemplatesResult a,
+				ref ListResourceTemplatesResult r) @safe {
 				a.resourceTemplates ~= r.resourceTemplates;
-			});
+			}, opts);
 		});
 	}
 
@@ -1794,13 +2530,18 @@ final class McpClient : ClientProtocol
 	/// are carried in `opts` (see `RequestOptions`). A still-fresh result (keyed by
 	/// `uri`) is served from the cache without a round-trip — and so fires no
 	/// progress callbacks; `opts.cacheMode` overrides.
+	/// A modern server's input requests are completed as for `callTool`; one the
+	/// client cannot answer is returned unfinished (`isInputRequired`).
 	ReadResourceResult readResource(string uri, RequestOptions opts = RequestOptions.init) @safe
 	{
 		return cachedFetch!ReadResourceResult(CacheKey("resources/read", uri),
-				opts.cacheMode, () @safe {
+				opts.cacheMode, (out bool uncacheable) @safe {
 			auto token = effectiveToken(opts);
-			return withPerCallProgress!ReadResourceResult(opts,
-				() @safe => readResourceLoop(uri, token, opts.logLevel));
+			bool fromMrtr;
+			auto result = withPerCallProgress!ReadResourceResult(opts,
+				() @safe => readResourceLoop(uri, token, fromMrtr, opts.logLevel));
+			uncacheable = fromMrtr;
+			return result;
 		});
 	}
 
@@ -1808,11 +2549,11 @@ final class McpClient : ClientProtocol
 	/// answer a read with an `InputRequiredResult`, which the loop satisfies and
 	/// retries like a tool call.
 	private ReadResourceResult readResourceLoop(string uri,
-			ProgressToken progressToken, string logLevel = "") @safe
+			ProgressToken progressToken, out bool uncacheable, string logLevel = "") @safe
 	{
 		return mrtrLoop!ReadResourceResult("resources/read", logLevel, (responses,
-				requestState) => buildReadResourceParams(uri, progressToken,
-				responses, requestState));
+				requestState) => withMrtr(buildReadResourceParams(uri,
+				progressToken), responses, requestState), uncacheable);
 	}
 
 	/// Build the `resources/read` params, optionally attaching a progress token.
@@ -1823,17 +2564,6 @@ final class McpClient : ClientProtocol
 		return withProgressToken(p, progressToken);
 	}
 
-	/// Build the `resources/read` params with any gathered MRTR (SEP-2322) input
-	/// responses attached as the top-level `params.inputResponses` map and the
-	/// opaque `requestState` echoed back, exactly as `buildToolCallParams` does.
-	package static Json buildReadResourceParams(string uri,
-			ProgressToken progressToken, InputResponse[] responses, string requestState = "") @safe
-	{
-		Json p = buildReadResourceParams(uri, progressToken);
-		p = withInputResponses(p, responses);
-		return withRequestState(p, requestState);
-	}
-
 	/// `resources/directory/read` (SEP-2640): the direct children of the directory
 	/// resource at `uri`, following pagination cursors to completion. Files come
 	/// back with their own metadata; subdirectories carry the `inode/directory`
@@ -1842,20 +2572,13 @@ final class McpClient : ClientProtocol
 	/// otherwise the server answers -32601 (method not found). Not cached: a
 	/// directory listing is cheap and the skill catalogs that motivate it are
 	/// often generated on demand.
-	ListResourcesResult readDirectory(string uri) @safe
+	ListResourcesResult readDirectory(string uri, RequestOptions opts = RequestOptions.init) @safe
 	{
-		ListResourcesResult acc;
-		paginate((Nullable!string cursor) @safe {
-			Json p = Json.emptyObject;
-			p["uri"] = uri;
-			if (!cursor.isNull)
-				p["cursor"] = cursor.get;
-			auto res = ListResourcesResult.fromJson(rpc("resources/directory/read", p));
-			acc.resources ~= res.resources;
-			return res.nextCursor;
-		});
-		acc.nextCursor = Nullable!string.init;
-		return acc;
+		return drainList!ListResourcesResult("resources/directory/read",
+				Json(["uri": Json(uri)]), (ref ListResourcesResult a,
+					ref ListResourcesResult r) @safe {
+			a.resources ~= r.resources;
+		}, opts);
 	}
 
 	/// `skills/list` (Skills extension): the skill entries the connected server
@@ -1866,10 +2589,12 @@ final class McpClient : ClientProtocol
 	/// skills. `cache` carries the first page's `ttlMs`/`cacheScope` (a modern
 	/// server always sends them); the listing is not served from the response
 	/// cache, since the per-entry digests are the signal hosts act on.
-	ListSkillsResult skillsList() @safe
+	ListSkillsResult skillsList(RequestOptions opts = RequestOptions.init) @safe
 	{
-		return drainList!ListSkillsResult("skills/list", (ref ListSkillsResult a,
-				ref ListSkillsResult r) @safe { a.skills ~= r.skills; });
+		return drainList!ListSkillsResult("skills/list", Json.emptyObject,
+				(ref ListSkillsResult a, ref ListSkillsResult r) @safe {
+			a.skills ~= r.skills;
+		}, opts);
 	}
 
 	/// `skills/get` (Skills extension): the entry for the single skill whose
@@ -1879,11 +2604,11 @@ final class McpClient : ClientProtocol
 	/// always sends them): how long the entry may be treated as current before
 	/// re-calling. Never served from the response cache: the point of the call is
 	/// a fresh snapshot of the skill's digests.
-	GetSkillResult skillsGet(string uri) @safe
+	GetSkillResult skillsGet(string uri, RequestOptions opts = RequestOptions.init) @safe
 	{
 		Json p = Json.emptyObject;
 		p["uri"] = uri;
-		return GetSkillResult.fromJson(rpc("skills/get", p));
+		return GetSkillResult.fromJson(rpcWith("skills/get", p, opts));
 	}
 
 	/// `prompts/list`, auto-paginated. Returns the drained `ListPromptsResult`:
@@ -1892,11 +2617,17 @@ final class McpClient : ClientProtocol
 	/// the cache; `opts.cacheMode` overrides.
 	ListPromptsResult listPrompts(RequestOptions opts = RequestOptions.init) @safe
 	{
+		return withCancellation!ListPromptsResult(opts.cancellation,
+				() @safe => listPromptsImpl(opts));
+	}
+
+	private ListPromptsResult listPromptsImpl(RequestOptions opts) @safe
+	{
 		return cachedFetch!ListPromptsResult(CacheKey("prompts/list", ""), opts.cacheMode, () @safe {
-			return drainList!ListPromptsResult("prompts/list",
+			return drainList!ListPromptsResult("prompts/list", Json.emptyObject,
 				(ref ListPromptsResult a, ref ListPromptsResult r) @safe {
 				a.prompts ~= r.prompts;
-			});
+			}, opts);
 		});
 	}
 
@@ -1907,6 +2638,10 @@ final class McpClient : ClientProtocol
 	/// `onListRoots`) and the call is resubmitted with the answers. Returns the
 	/// first completed `GetPromptResult`. Against stable-protocol servers the loop
 	/// never fires (stable-protocol servers never emit `inputRequests`).
+	/// If an input request has no matching handler installed, or the server keeps
+	/// asking past the round limit, the loop stops and the still-unfinished result
+	/// is returned as-is rather than thrown: check `isInputRequired` before using
+	/// it, and inspect `inputRequests` / `requestState` to answer it yourself.
 	/// Per-request `progressToken` / `logLevel` / `onProgress` are carried in
 	/// `opts` (see `RequestOptions`).
 	GetPromptResult getPrompt(string name, Json arguments = Json.emptyObject,
@@ -1921,9 +2656,10 @@ final class McpClient : ClientProtocol
 	private GetPromptResult getPromptLoop(string name, Json arguments,
 			ProgressToken progressToken, string logLevel = "") @safe
 	{
+		bool uncacheable;
 		return mrtrLoop!GetPromptResult("prompts/get", logLevel, (responses,
-				requestState) => buildGetPromptParams(name,
-				arguments, progressToken, responses, requestState));
+				requestState) => withMrtr(buildGetPromptParams(name,
+				arguments, progressToken), responses, requestState), uncacheable);
 	}
 
 	/// Build the `prompts/get` params, optionally attaching a progress token.
@@ -1934,19 +2670,6 @@ final class McpClient : ClientProtocol
 		p["name"] = name;
 		p["arguments"] = arguments;
 		return withProgressToken(p, progressToken);
-	}
-
-	/// Build the `prompts/get` params with any gathered MRTR (SEP-2322) input
-	/// responses attached as the top-level `params.inputResponses` map, and the
-	/// opaque `requestState` echoed back as `params.requestState`. With no
-	/// responses and no requestState this is identical to the plain
-	/// `buildGetPromptParams`. Mirrors `buildToolCallParams`.
-	package static Json buildGetPromptParams(string name, Json arguments,
-			ProgressToken progressToken, InputResponse[] responses, string requestState = "") @safe
-	{
-		Json p = buildGetPromptParams(name, arguments, progressToken);
-		p = withInputResponses(p, responses);
-		return withRequestState(p, requestState);
 	}
 
 	/// `completion/complete` — request autocompletion suggestions for an
@@ -1963,7 +2686,7 @@ final class McpClient : ClientProtocol
 			RequestOptions opts = RequestOptions.init) @safe
 	{
 		auto token = effectiveToken(opts);
-		auto params = withRequestLogLevel(withProgressToken(buildCompleteParams(reference,
+		auto params = withSessionLogLevel(withProgressToken(buildCompleteParams(reference,
 				argumentName, argumentValue, context), token), opts.logLevel);
 		return withPerCallProgress!CompleteResult(opts,
 				() @safe => CompleteResult.fromJson(rpc("completion/complete", params)));
@@ -1992,19 +2715,25 @@ final class McpClient : ClientProtocol
 		return p;
 	}
 
-	/// `resources/subscribe` / `resources/unsubscribe`.
-	void subscribe(string uri) @safe
+	/// `resources/subscribe` / `resources/unsubscribe`, on a released protocol
+	/// (<= 2025-11-25). The 2026-07-28 protocol removed both RPCs in favour of
+	/// `subscriptionsListen`, so on a modern session these throw a
+	/// `methodNotFound` `McpException` without sending anything.
+	void subscribe(string uri, RequestOptions opts = RequestOptions.init) @safe
 	{
+		ensureLegacyOnly("resources/subscribe");
 		Json p = Json.emptyObject;
 		p["uri"] = uri;
-		rpc("resources/subscribe", p);
+		rpcWith("resources/subscribe", p, opts);
 	}
 
-	void unsubscribe(string uri) @safe
+	/// ditto
+	void unsubscribe(string uri, RequestOptions opts = RequestOptions.init) @safe
 	{
+		ensureLegacyOnly("resources/unsubscribe");
 		Json p = Json.emptyObject;
 		p["uri"] = uri;
-		rpc("resources/unsubscribe", p);
+		rpcWith("resources/unsubscribe", p, opts);
 	}
 
 	/// Open a modern `subscriptions/listen` notification stream (modern
@@ -2017,20 +2746,50 @@ final class McpClient : ClientProtocol
 	/// and every subsequent opted-in change notification to `onNotification`
 	/// (and `onProgress` for progress). Returns a `SubscriptionStream` handle;
 	/// call its `cancel()`/`close()` to stop listening and close the stream.
+	/// Throws `McpException` (an `HttpStatusException` for an HTTP error status)
+	/// when the server refuses the stream; a stream the server ends later reports
+	/// it through the handle's `ended`/`error`.
 	///
-	/// Only meaningful for modern servers (call `enableModern`/`connect` first);
-	/// legacy servers do not implement `subscriptions/listen`.
+	/// Modern sessions only (call `enableModern`/`connect` first): on a released
+	/// protocol, which has no `subscriptions/listen`, this throws a
+	/// `methodNotFound` `McpException` without opening a stream.
 	SubscriptionStream subscriptionsListen(SubscriptionFilter filter) @safe
 	{
+		if (!useModern)
+			throw new McpException(ErrorCode.methodNotFound,
+					"subscriptions/listen requires the 2026-07-28 protocol; "
+					~ "call enableModern() or connect() first");
 		const id = nextId++;
-		Json params = buildSubscriptionsListenParams(filter);
-		if (useModern)
-			params = injectModernMeta(params);
+		Json params = injectModernMeta(buildSubscriptionsListenParams(filter));
 		auto message = makeRequest(Json(id), "subscriptions/listen", params);
-		return transport.openListen(message);
+		ensureOpen();
+		auto stream = transport.openListen(message);
+		trackStream(stream);
+		return stream;
+	}
+
+	/// Throw when `method`, which the 2026-07-28 protocol removed, is called on a
+	/// modern session.
+	private void ensureLegacyOnly(string method) @safe
+	{
+		if (useModern)
+			throw new McpException(ErrorCode.methodNotFound,
+					method ~ " is not part of the 2026-07-28 protocol; use subscriptionsListen");
 	}
 
 	// --- MCP Events extension (2026-07-28) --------------------------------------
+	// Modern sessions only: on a released protocol every Events call below throws
+	// a `methodNotFound` `McpException` without contacting the server.
+
+	/// Throw when the Events extension method `method` is called on a session
+	/// that is not modern: the extension exists only on the 2026-07-28 protocol.
+	private void ensureEventsSession(string method) @safe
+	{
+		if (!useModern)
+			throw new McpException(ErrorCode.methodNotFound, method
+					~ " requires the 2026-07-28 protocol; "
+					~ "call enableModern() or connect() first");
+	}
 
 	/// Whether the connected server advertised the Events extension. Only true on
 	/// a modern session whose `server/discover`/`initialize` capabilities carried
@@ -2043,36 +2802,22 @@ final class McpClient : ClientProtocol
 
 	/// `events/list`, auto-paginated. Returns the drained `EventListResult` whose
 	/// `events` aggregates every page (and `nextCursor` is null).
-	EventListResult listEvents() @safe
+	EventListResult listEvents(RequestOptions opts = RequestOptions.init) @safe
 	{
-		EventListResult acc;
-		paginate((Nullable!string cursor) @safe {
-			Json p = Json.emptyObject;
-			if (!cursor.isNull)
-				p["cursor"] = cursor.get;
-			auto res = EventListResult.fromJson(rpc("events/list", p));
-			acc.events ~= res.events;
-			return res.nextCursor;
-		});
-		acc.nextCursor = Nullable!string.init;
-		return acc;
+		ensureEventsSession("events/list");
+		return drainList!EventListResult("events/list", Json.emptyObject,
+				(ref EventListResult a, ref EventListResult r) @safe {
+			a.events ~= r.events;
+		}, opts);
 	}
 
 	/// One `events/poll` round-trip for a single subscription. The low-level
 	/// primitive; a poll-mode subscription loops this at the server-recommended
 	/// `nextPollMs`, persisting the returned `cursor` and passing it back.
-	PollResult pollEvents(string name, Json arguments = Json.emptyObject,
-			Nullable!string cursor = Nullable!string.init,
-			Nullable!long maxAgeMs = Nullable!long.init,
-			Nullable!long maxEvents = Nullable!long.init) @safe
+	PollResult pollEvents(PollParams p, RequestOptions opts = RequestOptions.init) @safe
 	{
-		PollParams p;
-		p.name = name;
-		p.arguments = arguments;
-		p.cursor = cursor;
-		p.maxAgeMs = maxAgeMs;
-		p.maxEvents = maxEvents;
-		return PollResult.fromJson(rpc("events/poll", p.toJson()));
+		ensureEventsSession("events/poll");
+		return PollResult.fromJson(rpcWith("events/poll", p.toJson(), opts));
 	}
 
 	/// Open a push `events/stream` for one subscription. Occurrences are delivered
@@ -2082,29 +2827,31 @@ final class McpClient : ClientProtocol
 	/// The SDK demuxes internally by the stream's
 	/// `params._meta["io.modelcontextprotocol/subscriptionId"]`; the client never
 	/// sees raw notifications. `cancel()`/`close()` ends the stream and drops its
-	/// handlers; a `terminated` control also drops them.
-	SubscriptionStream streamEvents(string name, void delegate(EventOccurrence) @safe onEvent,
-			void delegate(EventControl) @safe onControl = null, Json arguments = Json.emptyObject,
-			Nullable!string cursor = Nullable!string.init,
-			Nullable!long maxAgeMs = Nullable!long.init) @safe
+	/// handlers; a `terminated` control also drops them. Throws `McpException`
+	/// when the server refuses the stream, as `subscriptionsListen` does.
+	SubscriptionStream streamEvents(StreamParams p, void delegate(EventOccurrence) @safe onEvent,
+			void delegate(EventControl) @safe onControl = null) @safe
 	{
 		import std.conv : to;
 
+		ensureEventsSession("events/stream");
 		const id = nextId++;
-		StreamParams sp;
-		sp.name = name;
-		sp.arguments = arguments;
-		sp.cursor = cursor;
-		sp.maxAgeMs = maxAgeMs;
-		Json params = sp.toJson();
-		if (useModern)
-			params = injectModernMeta(params);
+		Json params = injectModernMeta(p.toJson());
 		auto message = makeRequest(Json(id), "events/stream", params);
 		const key = id.to!string;
 		// Register before opening so an occurrence racing the open is routable.
+		ensureOpen();
 		eventStreams_[key] = EventStreamHandlers(onEvent, onControl);
-		auto stream = transport.openListen(message);
+		SubscriptionStream stream;
+		try
+			stream = transport.openListen(message);
+		catch (Exception e)
+		{
+			eventStreams_.remove(key);
+			throw e;
+		}
 		stream.addCleanup(() @safe nothrow{ eventStreams_.remove(key); });
+		trackStream(stream);
 		return stream;
 	}
 
@@ -2112,20 +2859,19 @@ final class McpClient : ClientProtocol
 	/// subscription. Idempotent on `(principal, url, name, arguments)`. Returns the
 	/// server's `SubscribeResult` (id, granted `refreshBefore`, watermark cursor,
 	/// and — on a refresh — `deliveryStatus`).
-	SubscribeResult subscribeWebhookEvents(SubscribeParams p) @safe
+	SubscribeResult subscribeWebhookEvents(SubscribeParams p,
+			RequestOptions opts = RequestOptions.init) @safe
 	{
-		return SubscribeResult.fromJson(rpc("events/subscribe", p.toJson()));
+		ensureEventsSession("events/subscribe");
+		return SubscribeResult.fromJson(rpcWith("events/subscribe", p.toJson(), opts));
 	}
 
 	/// `events/unsubscribe` (webhook delivery): eager teardown of the subscription
 	/// keyed by `(principal, url, name, arguments)`.
-	void unsubscribeWebhookEvents(string name, Json arguments, string url) @safe
+	void unsubscribeWebhookEvents(UnsubscribeParams p, RequestOptions opts = RequestOptions.init) @safe
 	{
-		UnsubscribeParams p;
-		p.name = name;
-		p.arguments = arguments;
-		p.url = url;
-		rpc("events/unsubscribe", p.toJson());
+		ensureEventsSession("events/unsubscribe");
+		rpcWith("events/unsubscribe", p.toJson(), opts);
 	}
 
 	// --- Managed subscriptions (poll / push / webhook) ---------------------
@@ -2229,52 +2975,67 @@ final class McpClient : ClientProtocol
 	EventSubscription subscribePoll(PollParams p, void delegate(EventOccurrence) @safe onEvent,
 			void delegate(EventControl) @safe onControl = null) @safe
 	{
+		ensureEventsSession("events/poll");
 		auto sub = new EventSubscription();
 		sub.setMode(DeliveryMode.poll);
 		sub.dedupCapacity(eventSettings_.dedupWindow);
 		sub.advanceCursor(p.cursor);
+		ensureOpen();
+		trackSubscription(sub);
 		spawnEventTask(() @safe { runPollLoop(sub, p, onEvent, onControl); });
 		return sub;
 	}
 
 	/// The poll loop body, factored out and seam-driven so it runs synchronously
-	/// under `unittest` without a live event loop (mirrors `awaitTask`). Exits when
-	/// the subscription is cancelled or the server reports the subscription gone.
+	/// under `unittest` without a live event loop (mirrors `awaitTask`). A
+	/// transient poll failure is retried with exponential backoff from the poll
+	/// floor; the loop exits when the subscription is cancelled, or when the server
+	/// rejects the poll or `onEvent` throws, either of which ends the subscription
+	/// and is reported to `onControl` as an `error` control.
 	package void runPollLoop(EventSubscription sub, PollParams p,
 			void delegate(EventOccurrence) @safe onEvent, void delegate(EventControl) @safe onControl) @safe
 	{
 		auto cur = p;
+		uint failures; // consecutive failed polls
 		while (!sub.isCancelled())
 		{
 			cur.cursor = sub.cursor();
 			PollResult res;
 			try
+			{
 				res = PollResult.fromJson(rpc("events/poll", cur.toJson()));
+				failures = 0;
+			}
 			catch (McpException e)
 			{
-				// A poll error ends the managed subscription; surface it as a typed
-				// control so the caller learns why rather than seeing silence.
-				if (onControl !is null)
+				// A server rejection ends the managed subscription; surface it as a
+				// typed control so the caller learns why rather than seeing silence.
+				if (!isTransientEventFailure(e))
 				{
-					EventControl c;
-					c.kind = EventControlKind.error;
-					EventError err;
-					err.code = e.code;
-					err.message = e.msg;
-					c.error = err;
-					onControl(c);
+					reportEventError(onControl, e);
+					sub.markTerminated();
+					return;
 				}
-				sub.markTerminated();
-				return;
+				failures++;
+			}
+			catch (Exception)
+				failures++;
+			if (failures)
+			{
+				eventPollSleep(sub,
+						eventSettings_.pollFloor.total!"msecs" << (failures < 6 ? failures : 6));
+				continue;
 			}
 			foreach (occ; res.events)
 			{
 				if (sub.isCancelled())
 					return;
-				if (sub.alreadySeen(occ.eventId))
-					continue;
-				if (onEvent !is null)
-					onEvent(occ);
+				if (!deliverManagedEvent(sub, occ, onEvent))
+				{
+					sub.markTerminated();
+					reportEventError(onControl, handlerFailure(occ));
+					return;
+				}
 			}
 			if (res.truncated && onControl !is null)
 			{
@@ -2283,12 +3044,15 @@ final class McpClient : ClientProtocol
 				c.cursor = res.cursor;
 				onControl(c);
 			}
+			const progressed = res.events.length > 0 || res.cursor != cur.cursor;
 			sub.advanceCursor(res.cursor);
 			if (sub.isCancelled())
 				return;
-			if (res.hasMore)
-				continue; // more buffered now — re-poll without sleeping
-			eventPollSleep(res.nextPollMs);
+			// Re-poll at once only while the server's backlog is draining; a
+			// hasMore poll that returned nothing new would otherwise spin.
+			if (res.hasMore && progressed)
+				continue;
+			eventPollSleep(sub, res.nextPollMs);
 		}
 	}
 
@@ -2297,10 +3061,13 @@ final class McpClient : ClientProtocol
 	/// and ending the handle on a `terminated` control. A stream that goes quiet
 	/// for `eventSettings.streamDeadAfter` (no event, no heartbeat) is treated as
 	/// dead and reopened with the last-known cursor, so a dropped connection resumes
-	/// without a gap. `cancel()` closes the stream and deregisters its handlers.
+	/// without a gap; a stream the server refuses or fails ends the handle instead
+	/// (see `runStreamWatchdog`). `cancel()` closes the stream and deregisters its
+	/// handlers.
 	EventSubscription subscribeStream(StreamParams p, void delegate(EventOccurrence) @safe onEvent,
 			void delegate(EventControl) @safe onControl = null) @safe
 	{
+		ensureEventsSession("events/stream");
 		auto sub = new EventSubscription();
 		sub.setMode(DeliveryMode.push);
 		sub.dedupCapacity(eventSettings_.dedupWindow);
@@ -2308,14 +3075,17 @@ final class McpClient : ClientProtocol
 		auto ms = new ManagedStream(p, onEvent, onControl);
 		openManagedStream(sub, ms, p.cursor);
 		managedStreams_[sub] = ms;
-		sub.onTeardown(() @safe nothrow{
+		auto release = () @safe nothrow{
 			ms.stream.close();
 			try
 				managedStreams_.remove(sub);
 			catch (Exception)
 			{
 			}
-		});
+		};
+		sub.onTeardown(release);
+		sub.onEnd(release);
+		trackSubscription(sub);
 		spawnEventTask(() @safe { runStreamWatchdog(sub); });
 		return sub;
 	}
@@ -2334,6 +3104,13 @@ final class McpClient : ClientProtocol
 		void delegate(EventControl) @safe onControl;
 		SubscriptionStream stream;
 		long lastFrameMs;
+		// When `stream` was opened, to tell a stream the server ends at once.
+		long openedMs;
+		// Emitted when `stream` ends, so the watchdog wakes at once rather than at
+		// its next scheduled check; `wakeCount` is its emit count when `stream`
+		// was opened.
+		LocalManualEvent wake;
+		int wakeCount;
 
 		this(StreamParams p, void delegate(EventOccurrence) @safe onEvent,
 				void delegate(EventControl) @safe onControl) @safe
@@ -2341,6 +3118,7 @@ final class McpClient : ClientProtocol
 			params = p;
 			this.onEvent = onEvent;
 			this.onControl = onControl;
+			wake = createManualEvent();
 		}
 	}
 
@@ -2350,55 +3128,186 @@ final class McpClient : ClientProtocol
 	private void openManagedStream(EventSubscription sub, ManagedStream ms, Nullable!string cursor) @safe
 	{
 		ms.lastFrameMs = eventNowMs();
-		ms.stream = streamEvents(ms.params.name, (EventOccurrence o) @safe {
+		ms.openedMs = ms.lastFrameMs;
+		ms.wakeCount = ms.wake.emitCount;
+		auto sp = ms.params;
+		sp.cursor = cursor;
+		ms.stream = streamEvents(sp, (EventOccurrence o) @safe {
 			ms.lastFrameMs = eventNowMs();
-			sub.advanceCursor(o.cursor);
-			if (sub.alreadySeen(o.eventId))
+			if (!sub.active)
 				return;
-			if (ms.onEvent !is null)
-				ms.onEvent(o);
+			if (!deliverManagedEvent(sub, o, ms.onEvent))
+				endManagedStream(sub, ms, handlerFailure(o));
 		}, (EventControl c) @safe {
 			ms.lastFrameMs = eventNowMs();
+			if (!sub.active)
+				return;
 			sub.advanceCursor(c.cursor);
 			if (c.kind == EventControlKind.terminated)
 				sub.markTerminated();
 			if (ms.onControl !is null)
 				ms.onControl(c);
-		}, ms.params.arguments, cursor, ms.params.maxAgeMs);
+		});
+		ms.stream.addCleanup(() @safe nothrow{ ms.wake.emit(); });
 	}
 
-	/// The push-stream liveness watchdog: wakes every `streamDeadAfter`, and if no
-	/// frame arrived in that window closes the stream and reopens it from the
-	/// subscription's last cursor. Ends when the subscription is cancelled or
-	/// terminated, or when reconnection is disabled. Seam-driven for tests.
+	/// The push-stream liveness watchdog: wakes every `streamDeadAfter` (or at
+	/// once when the stream ends), and if the stream ended or no frame arrived in
+	/// that window closes it and reopens it from
+	/// the subscription's last cursor. A transient failure (connection loss, HTTP
+	/// 5xx/408/429, internal error) is retried, backing off exponentially across
+	/// consecutive failed reopens; so is a stream that ends before its leading
+	/// frame or within `minStreamLifetime` of opening, so a server that keeps
+	/// ending streams cannot drive a tight reconnect loop. While backing off, the
+	/// watchdog waits out the whole delay even if the stream ends. Any other
+	/// failure — the server refusing or failing the stream — ends the
+	/// subscription and is reported to `onControl` as an `error` control. With
+	/// reconnection disabled, the subscription instead ends with its stream,
+	/// reporting why it ended. Ends when the subscription is cancelled or
+	/// terminated. Seam-driven for tests.
 	package void runStreamWatchdog(EventSubscription sub) @safe
 	{
 		auto msp = sub in managedStreams_;
 		if (msp is null)
 			return;
 		auto ms = *msp;
+		uint failures; // consecutive failed reopens
 		while (sub.active)
 		{
 			const dead = eventSettings_.streamDeadAfter;
 			if (dead <= Duration.zero)
+			{
+				streamWatchSleep(sub, ms, Duration.max, true);
+				if (!sub.active || closed_)
+					return;
+				if (!ms.stream.ended)
+					continue;
+				endManagedStream(sub, ms, ms.stream.error !is null ? ms.stream.error
+						: internalError("the server ended the event stream"));
 				return;
-			streamWatchSleep(dead);
-			if (!sub.active)
+			}
+			streamWatchSleep(sub, ms, dead * (1L << (failures < 5 ? failures : 5)), failures == 0);
+			if (!sub.active || closed_)
 				return;
-			if (eventNowMs() - ms.lastFrameMs < dead.total!"msecs")
+			if (!ms.stream.ended && eventNowMs() - ms.lastFrameMs < dead.total!"msecs")
 				continue;
+			if (ms.stream.error !is null && !isTransientEventFailure(ms.stream.error))
+			{
+				endManagedStream(sub, ms, ms.stream.error);
+				return;
+			}
+			const shortLived = ms.stream.ended
+				&& eventNowMs() - ms.openedMs < minStreamLifetime.total!"msecs";
 			ms.stream.close();
 			try
-				openManagedStream(sub, ms, sub.cursor());
-			catch (Exception)
 			{
-				// Reopen failed (server unreachable): the next wake-up retries.
+				openManagedStream(sub, ms, sub.cursor());
+				// The subscription can end while the open blocks; its teardown
+				// closed only the stream it saw, so close the new one here.
+				if (!sub.active || closed_)
+				{
+					ms.stream.close();
+					return;
+				}
+				// A stream that is already over came back without its leading frame.
+				failures = shortLived || ms.stream.ended ? failures + 1 : 0;
 			}
+			catch (McpException e)
+			{
+				if (!isTransientEventFailure(e))
+				{
+					endManagedStream(sub, ms, e);
+					return;
+				}
+				failures++;
+			}
+			catch (Exception)
+				failures++;
 		}
 	}
 
-	/// Sleep between watchdog checks. A test seam runs the loop synchronously.
-	private void streamWatchSleep(Duration d) @safe
+	/// Hand `occ` to a managed subscription's `onEvent`, recording it as delivered
+	/// and moving the watermark past it only once the handler returns, so the
+	/// cursor never passes an occurrence that was not handled. Returns false when
+	/// the handler threw, which the caller answers by ending the subscription;
+	/// true when the occurrence was handled or skipped as a duplicate.
+	private bool deliverManagedEvent(EventSubscription sub, EventOccurrence occ,
+			void delegate(EventOccurrence) @safe onEvent) @safe
+	{
+		if (sub.isSeen(occ.eventId))
+			return true;
+		if (onEvent !is null)
+		{
+			try
+				onEvent(occ);
+			catch (Exception e)
+			{
+				import vibe.core.log : logWarn;
+
+				logWarn("[mcp.client] event handler for %s threw: %s", occ.name, e.msg);
+				return false;
+			}
+		}
+		sub.markSeen(occ.eventId);
+		sub.advanceCursor(occ.cursor);
+		return true;
+	}
+
+	/// The error a managed subscription reports when its `onEvent` threw on `occ`.
+	private static McpException handlerFailure(EventOccurrence occ) @safe
+	{
+		return new McpException(ErrorCode.internalError,
+				"onEvent threw on event " ~ occ.eventId ~ "; the subscription has ended");
+	}
+
+	/// Whether a managed-subscription failure may clear on its own, so retrying
+	/// is worthwhile: a local request timeout, a lost connection or server
+	/// internal error, or an HTTP 5xx / 408 / 429. A JSON-RPC rejection, any
+	/// other HTTP 4xx, or a closed transport will repeat on every retry.
+	private static bool isTransientEventFailure(McpException e) @safe
+	{
+		if (cast(TransportClosedException) e)
+			return false;
+		if (cast(RequestTimeoutException) e)
+			return true;
+		if (auto h = cast(HttpStatusException) e)
+			return h.status >= 500 || h.status == 408 || h.status == 429;
+		return e.code == ErrorCode.internalError;
+	}
+
+	/// Report `e` to `onControl` (when set) as an `error` control.
+	private static void reportEventError(void delegate(EventControl) @safe onControl, McpException e) @safe
+	{
+		if (onControl is null)
+			return;
+		EventControl c;
+		c.kind = EventControlKind.error;
+		EventError err;
+		err.code = e.code;
+		err.message = e.msg;
+		c.error = err;
+		onControl(c);
+	}
+
+	/// End a managed push subscription the server refused or failed with `e`:
+	/// close its stream, report `e` as an `error` control, and mark it terminated.
+	private void endManagedStream(EventSubscription sub, ManagedStream ms, McpException e) @safe
+	{
+		ms.stream.close();
+		managedStreams_.remove(sub);
+		sub.markTerminated();
+		reportEventError(ms.onControl, e);
+	}
+
+	/// How long a managed push stream must stay open for its reopen to count
+	/// as successful.
+	private enum minStreamLifetime = 1.seconds;
+
+	/// Wait up to `d` between watchdog checks, returning early once `ms`'s
+	/// current stream ends when `wakeOnEnd` is set, and otherwise once `sub` is
+	/// cancelled or terminated. A test seam runs the loop synchronously.
+	private void streamWatchSleep(EventSubscription sub, ManagedStream ms,
+			Duration d, bool wakeOnEnd) @safe
 	{
 		version (unittest)
 			if (onStreamWatchSleepForTest !is null)
@@ -2406,9 +3315,10 @@ final class McpClient : ClientProtocol
 				onStreamWatchSleepForTest(d);
 				return;
 			}
-		import vibe.core.core : sleep;
-
-		() @trusted { sleep(d); }();
+		if (wakeOnEnd)
+			ms.wake.wait(d, ms.wakeCount);
+		else
+			sub.sleepWhileActive(d);
 	}
 
 	/// Monotonic milliseconds for stream liveness. A test seam supplies the clock.
@@ -2419,9 +3329,7 @@ final class McpClient : ClientProtocol
 				return onEventNowForTest();
 		import core.time : MonoTime;
 
-		return () @trusted {
-			return MonoTime.currTime.ticks / (MonoTime.ticksPerSecond / 1000);
-		}();
+		return MonoTime.currTime.ticks / (MonoTime.ticksPerSecond / 1000);
 	}
 
 	version (unittest) package void delegate(Duration) @safe onStreamWatchSleepForTest;
@@ -2438,53 +3346,114 @@ final class McpClient : ClientProtocol
 			void delegate(EventOccurrence) @safe onEvent,
 			void delegate(EventControl) @safe onControl = null) @safe
 	{
+		ensureOpen();
 		auto sub = new EventSubscription();
 		sub.setMode(DeliveryMode.webhook);
-		auto res = subscribeWebhookEvents(p);
+		sub.dedupCapacity(eventSettings_.dedupWindow);
+		// The server may challenge the endpoint before this call returns the id
+		// the receiver routes by; expecting the secret lets that challenge pass.
+		rx.expectSecret(p.delivery.secret);
+		SubscribeResult res;
+		{
+			scope (exit)
+				rx.unexpectSecret(p.delivery.secret);
+			res = subscribeWebhookEvents(p);
+		}
 		const id = res.id;
 		sub.advanceCursor(res.cursor);
-		rx.register(id, p.delivery.secret, onEvent, onControl);
+		// Bind deliveries to the subscription's watermark, dedup, and terminal
+		// state before the caller's handlers, as the poll and stream modes do.
+		rx.register(id, p.delivery.secret, (EventOccurrence o) @safe {
+			// The occurrence is recorded and the watermark moved past it only once
+			// it is handled, so a throwing handler leaves the server's redelivery
+			// to be processed and the cursor at the last processed event.
+			if (!sub.active || sub.isSeen(o.eventId))
+				return;
+			if (onEvent !is null)
+				onEvent(o);
+			sub.markSeen(o.eventId);
+			sub.advanceCursor(o.cursor);
+		}, (EventControl c) @safe {
+			sub.advanceCursor(c.cursor);
+			if (c.kind == EventControlKind.terminated)
+				sub.markTerminated();
+			if (onControl !is null)
+				onControl(c);
+		});
 		sub.onTeardown(() @safe nothrow{
+			// Deregister first so a failed unsubscribe still stops local delivery.
+			try
+				rx.unregister(id);
+			catch (Exception)
+			{
+			}
 			try
 			{
-				unsubscribeWebhookEvents(p.name, p.arguments, p.delivery.url);
-				rx.unregister(id);
+				UnsubscribeParams u;
+				u.name = p.name;
+				u.arguments = p.arguments;
+				u.url = p.delivery.url;
+				unsubscribeWebhookEvents(u);
 			}
 			catch (Exception)
 			{
 			}
 		});
-		spawnEventTask(() @safe { runWebhookRefreshLoop(sub, p, res); });
+		sub.onEnd(() @safe nothrow{
+			try
+				rx.unregister(id);
+			catch (Exception)
+			{
+			}
+		});
+		trackSubscription(sub);
+		spawnEventTask(() @safe { runWebhookRefreshLoop(sub, p, res, onControl); });
 		return sub;
 	}
 
 	/// The webhook refresh loop: sleeps until shortly before the current grant
 	/// expires (or, for a no-expiry grant, for the health-check interval),
 	/// re-subscribes (refreshing the TTL and advancing the watermark), and repeats
-	/// until cancelled. A no-expiry grant with health checks disabled ends the loop:
-	/// correctness no longer depends on refreshing. Seam-driven for tests.
+	/// until the subscription is cancelled or the server terminates it. A
+	/// transient refresh failure is retried with exponential backoff; any other
+	/// failure (the server rejecting the refresh) ends the subscription and is
+	/// reported to `onControl` as an `error` control. A no-expiry grant with health
+	/// checks disabled ends the loop: correctness no longer depends on refreshing.
+	/// Seam-driven for tests.
 	package void runWebhookRefreshLoop(EventSubscription sub, SubscribeParams p,
-			SubscribeResult first) @safe
+			SubscribeResult first, void delegate(EventControl) @safe onControl) @safe
 	{
 		auto cur = p;
 		auto res = first;
-		while (!sub.isCancelled())
+		uint failures; // consecutive failed refreshes
+		while (sub.active)
 		{
-			if (res.refreshBefore.isNull && eventSettings_.noExpiryRefreshInterval <= Duration.zero)
+			if (failures == 0 && res.refreshBefore.isNull
+					&& eventSettings_.noExpiryRefreshInterval <= Duration.zero)
 				return;
-			webhookRefreshSleep(res);
-			if (sub.isCancelled())
+			webhookRefreshSleep(sub, failures == 0 ? webhookRefreshDelay(
+					res) : minWebhookRefreshMs.msecs * (1L << (failures < 6 ? failures : 6)));
+			if (!sub.active)
 				return;
 			try
 			{
 				cur.cursor = sub.cursor();
 				res = subscribeWebhookEvents(cur);
 				sub.advanceCursor(res.cursor);
+				failures = 0;
+			}
+			catch (McpException e)
+			{
+				if (!isTransientEventFailure(e))
+				{
+					sub.markTerminated();
+					reportEventError(onControl, e);
+					return;
+				}
+				failures++;
 			}
 			catch (Exception)
-			{
-				// Transient refresh failure: retry on the next cycle.
-			}
+				failures++;
 		}
 	}
 
@@ -2511,12 +3480,17 @@ final class McpClient : ClientProtocol
 		}
 	}
 
-	/// Sleep between event polls, clamped to `eventSettings.pollFloor` so a
-	/// misbehaving server can't drive a hot loop. A test seam mirrors `taskPollSleep`.
-	private void eventPollSleep(long nextPollMs) @safe
+	/// Sleep between event polls of `sub`, clamped between
+	/// `eventSettings.pollFloor` and `eventSettings.pollCeiling` so a misbehaving
+	/// server can neither drive a hot loop nor park it indefinitely. Wakes early
+	/// when `sub` stops. A test seam mirrors `taskPollSleep`.
+	private void eventPollSleep(EventSubscription sub, long nextPollMs) @safe
 	{
 		const floorMs = eventSettings_.pollFloor.total!"msecs";
+		const ceilingMs = eventSettings_.pollCeiling.total!"msecs";
 		long ms = nextPollMs > 0 ? nextPollMs : floorMs;
+		if (ceilingMs > 0 && ms > ceilingMs)
+			ms = ceilingMs;
 		if (ms < floorMs)
 			ms = floorMs;
 		version (unittest)
@@ -2525,24 +3499,20 @@ final class McpClient : ClientProtocol
 				onEventPollSleepForTest(ms.msecs);
 				return;
 			}
-		import vibe.core.core : sleep;
-
-		() @trusted { sleep(ms.msecs); }();
+		sub.sleepWhileActive(ms.msecs);
 	}
 
-	/// Sleep until shortly before `res.refreshBefore`. A test seam runs the loop
-	/// synchronously and lets a test end it.
-	private void webhookRefreshSleep(SubscribeResult res) @safe
+	/// Sleep `d` before the next webhook refresh, waking early once `sub` stops. A
+	/// test seam runs the loop synchronously and lets a test end it.
+	private void webhookRefreshSleep(EventSubscription sub, Duration d) @safe
 	{
 		version (unittest)
 			if (onWebhookRefreshSleepForTest !is null)
 			{
-				onWebhookRefreshSleepForTest(res);
+				onWebhookRefreshSleepForTest(d);
 				return;
 			}
-		import vibe.core.core : sleep;
-
-		() @trusted { sleep(webhookRefreshDelay(res)); }();
+		sub.sleepWhileActive(d);
 	}
 
 	/// How long to wait before refreshing a webhook grant: ~80% of the way to
@@ -2557,7 +3527,7 @@ final class McpClient : ClientProtocol
 		try
 		{
 			auto expiry = SysTime.fromISOExtString(res.refreshBefore.get);
-			auto now = () @trusted { return Clock.currTime(expiry.timezone); }();
+			auto now = Clock.currTime(expiry.timezone);
 			auto remaining = expiry - now;
 			if (remaining <= Duration.zero)
 				return minWebhookRefreshMs.msecs;
@@ -2574,7 +3544,7 @@ final class McpClient : ClientProtocol
 	private enum long defaultWebhookRefreshMs = 60_000;
 
 	version (unittest) package void delegate(Duration) @safe onEventPollSleepForTest;
-	version (unittest) package void delegate(SubscribeResult) @safe onWebhookRefreshSleepForTest;
+	version (unittest) package void delegate(Duration) @safe onWebhookRefreshSleepForTest;
 
 	/// Build the `subscriptions/listen` params, nesting the filter under
 	/// `params.notifications` exactly as the 2026-07-28 spec's `SubscriptionFilter`
@@ -2597,6 +3567,13 @@ final class McpClient : ClientProtocol
 				uris ~= Json(uri);
 			notifications["resourceSubscriptions"] = uris;
 		}
+		if (filter.taskIds.length)
+		{
+			Json ids = Json.emptyArray;
+			foreach (id; filter.taskIds)
+				ids ~= Json(id);
+			notifications["taskIds"] = ids;
+		}
 		Json p = Json.emptyObject;
 		p["notifications"] = notifications;
 		return p;
@@ -2614,25 +3591,26 @@ final class McpClient : ClientProtocol
 	/// the sticky per-request opt-in that `injectModernMeta` stamps onto every
 	/// subsequent request's `_meta` (see `withRequestLogLevel` and
 	/// `RequestOptions.logLevel` for a single-request override). Passing
-	/// an empty `level` clears the modern opt-in.
+	/// an empty `level` clears the modern opt-in; on a released protocol, where
+	/// there is nothing to clear, an empty `level` is rejected like any other
+	/// unrecognised name.
 	///
 	/// Typed entry point: pass a `LogLevel` for compile-time safety, so an invalid
 	/// level name can never reach the wire. Forwards to the string overload (whose
 	/// runtime validation always passes for a `LogLevel`).
-	void setLogLevel(LogLevel level) @safe
+	void setLogLevel(LogLevel level, RequestOptions opts = RequestOptions.init) @safe
 	{
-		setLogLevel(cast(string) level);
+		setLogLevel(cast(string) level, opts);
 	}
 
-	/// an empty `level` clears the modern opt-in.
-	void setLogLevel(string level) @safe
+	/// ditto
+	void setLogLevel(string level, RequestOptions opts = RequestOptions.init) @safe
 	{
 		// Reject an unrecognised level locally rather than POSTing it to a server
 		// that will reject it (released protocol) or silently stamping it into
-		// every modern request's `_meta` (2026-07-28). The empty string is the documented
-		// modern-opt-in clear and is left to pass through. Mirrors the server-side
-		// guard at server.d:1118.
-		if (level.length && logLevelRank(level) < 0)
+		// every modern request's `_meta` (2026-07-28). The empty string is the
+		// modern opt-in clear, so it passes only on a modern session.
+		if ((level.length || !useModern) && logLevelRank(level) < 0)
 			throw new McpException(ErrorCode.invalidParams, "Invalid log level: " ~ level);
 		if (useModern)
 		{
@@ -2641,7 +3619,7 @@ final class McpClient : ClientProtocol
 		}
 		Json p = Json.emptyObject;
 		p["level"] = level;
-		rpc("logging/setLevel", p);
+		rpcWith("logging/setLevel", p, opts);
 	}
 
 	// --- transport internals -------------------------------------------------
@@ -2655,7 +3633,7 @@ final class McpClient : ClientProtocol
 	/// Send a request and return its result (or throw `McpException`).
 	///
 	/// When the server answers with a `URLElicitationRequiredError`
-	/// (`-32042`, client/elicitation Â§"URL Elicitation Required Error",
+	/// (`-32042`, client/elicitation §"URL Elicitation Required Error",
 	/// 2025-11-25 / modern), its `data.elicitations[]` carries URL-mode
 	/// elicitations the server has begun out-of-band. Per SEP-1036 the client
 	/// MUST treat such an error as equivalent to an `elicitation/create` request,
@@ -2663,18 +3641,66 @@ final class McpClient : ClientProtocol
 	/// what later lets a `notifications/elicitation/complete` for one of those ids
 	/// correlate (in `dispatchNotification`) and be forwarded to the application
 	/// rather than dropped as "unknown".
-	private Json rpc(string method, Json params) @safe
+	///
+	/// `framing` sends the request with modern framing at that version whatever
+	/// the session's own framing; null uses the session's.
+	private Json rpc(string method, Json params,
+			Nullable!ProtocolVersion framing = Nullable!ProtocolVersion.init) @safe
 	{
+		try
+			return rpcOnce(method, params, framing);
+		catch (SessionExpiredException e)
+		{
+			if (!reinitializeOnSessionExpiry_ || !didInitialize || method == "initialize")
+				throw e;
+			initialize(lastRequestedVersion_);
+			return rpcOnce(method, params, framing);
+		}
+	}
+
+	/// One attempt of `rpc`.
+	private Json rpcOnce(string method, Json params, Nullable!ProtocolVersion framing) @safe
+	{
+		ensureNotReleased();
 		try
 		{
 			version (unittest)
 				if (onRpcForTest !is null)
 					return onRpcForTest(method, params);
 			const id = nextId++;
-			if (useModern)
-				params = injectModernMeta(params);
+			const modern = !framing.isNull || useModern;
+			if (modern)
+				params = injectModernMeta(params, framing.isNull ? negotiated : framing.get);
 			auto message = makeRequest(Json(id), method, params);
-			return transport.deliver(message, id);
+			auto token = callTokens_.get(currentFiberKey(), null);
+			if (token !is null && token.isCancelled)
+				throw cancelledError(token.reason);
+			auto req = beginRequest(id, params);
+			req.modern = modern;
+			scope (exit)
+				endRequest(id, req);
+			ulong hookKey;
+			if (token !is null)
+			{
+				hookKey = token.bind((string reason) @safe {
+					abortRequest(id, cancelledError(reason), reason);
+				});
+			}
+			scope (exit)
+				if (token !is null)
+					token.unbind(hookKey);
+			Json result;
+			try
+				result = transport.deliver(message, id);
+			catch (Exception e)
+			{
+				if (req.abortReason !is null)
+					throw req.abortReason;
+				throw e;
+			}
+			if (req.abortReason !is null)
+				throw req.abortReason;
+			return result;
 		}
 		catch (McpException e)
 		{
@@ -2684,18 +3710,209 @@ final class McpClient : ClientProtocol
 		}
 	}
 
+	/// Track request `id` as in flight and, when a `requestTimeout` is set, arm
+	/// its deadline timer.
+	private InFlightRequest beginRequest(long id, Json params) @safe
+	{
+		import vibe.core.core : createTimer;
+
+		auto req = new InFlightRequest;
+		if (params.type == Json.Type.object && "_meta" in params
+				&& params["_meta"].type == Json.Type.object && "progressToken" in params["_meta"])
+			req.progressKey = params["_meta"]["progressToken"].toString();
+		const now = MonoTime.currTime;
+		if (requestTimeout_ > Duration.zero)
+			req.deadline = now + requestTimeout_;
+		if (maxTotalTimeout_ > Duration.zero)
+			req.hardDeadline = now + maxTotalTimeout_;
+		if (req.deadline != MonoTime.max || req.hardDeadline != MonoTime.max)
+		{
+			req.timer = createTimer(() @safe nothrow{
+				try
+					onRequestTimeout(id);
+				catch (Exception)
+				{
+				}
+			});
+			req.armed = true;
+			armDeadline(req, now);
+		}
+		inFlight_[id] = req;
+		return req;
+	}
+
+	private void endRequest(long id, InFlightRequest req) @safe nothrow
+	{
+		// Release the timer now, while the event driver is alive; left to the GC it
+		// is destroyed at process exit after the driver, which can crash.
+		if (req.armed)
+		{
+			req.timer.stop();
+			req.timer = typeof(req.timer).init;
+			req.armed = false;
+		}
+		inFlight_.remove(id);
+	}
+
+	/// The deadline of request `id` passed: fail its waiter with a
+	/// `RequestTimeoutException` and cancel it on the server.
+	private void onRequestTimeout(long id) @safe
+	{
+		import std.conv : to;
+
+		auto r = id in inFlight_;
+		if (r is null || (*r).abortReason !is null)
+			return;
+		const capped = MonoTime.currTime >= (*r).hardDeadline;
+		// A paused request answers only to its `maxTotalTimeout` cap.
+		if ((*r).paused && !capped)
+			return;
+		abortRequest(id,
+				new RequestTimeoutException("Request " ~ id.to!string ~ " timed out after " ~ (capped
+					? maxTotalTimeout_.toString() ~ " (maxTotalTimeout)" : requestTimeout_.toString())),
+				"Request timed out");
+	}
+
+	/// Arm `req`'s timer to fire at the earlier of its `requestTimeout` window
+	/// and its `maxTotalTimeout` cap.
+	private static void armDeadline(InFlightRequest req, MonoTime now) @safe nothrow
+	{
+		import std.algorithm.comparison : max, min;
+
+		const due = min(req.deadline, req.hardDeadline);
+		req.timer.rearm(max(due - now, Duration.zero));
+	}
+
+	/// Abort in-flight request `id`: wake its waiter with `reason`, then signal
+	/// the cancellation to the server (never for `initialize`, which clients MUST
+	/// NOT cancel).
+	private void abortRequest(long id, McpException reason, string cancelReason) @safe
+	{
+		bool modern = useModern;
+		if (auto r = id in inFlight_)
+		{
+			(*r).abortReason = reason;
+			modern = (*r).modern;
+		}
+		transport.abort(id, reason);
+		if (id != initializeRequestId || initializeRequestId == 0)
+			signalCancellation(id, cancelReason, modern);
+	}
+
+	/// Restart the deadline of every in-flight request whose progress token
+	/// renders as `progressKey`.
+	private void restartDeadlines(string progressKey) @safe
+	{
+		if (!resetTimeoutOnProgress_ || progressKey.length == 0)
+			return;
+		if (requestTimeout_ <= Duration.zero)
+			return;
+		const now = MonoTime.currTime;
+		foreach (r; inFlight_.byValue)
+			if (r.armed && r.progressKey == progressKey && r.abortReason is null && !r.paused)
+			{
+				r.deadline = now + requestTimeout_;
+				armDeadline(r, now);
+			}
+	}
+
+	/// Stop the deadlines of the requests a server->client request read on a
+	/// stream of `origin` may belong to while the client's handler answers it,
+	/// since the server withholds those requests' responses until it gets the
+	/// reply. One read on a client request's response stream (HTTP) pauses
+	/// only that request; one read on a stream that belongs to no request (the
+	/// standalone GET stream, a listen stream) pauses none; one read on a stream
+	/// shared by every request (stdio, legacy HTTP+SSE) cannot be attributed, so
+	/// every in-flight request is paused. The `maxTotalTimeout` cap stays armed
+	/// while paused, so a handler that never returns cannot hold a capped request
+	/// open. Returns the paused requests for `resumeDeadlines`.
+	private InFlightRequest[] pauseDeadlines(InboundOrigin origin) @safe nothrow
+	{
+		InFlightRequest[] related;
+		final switch (origin.source)
+		{
+		case InboundOrigin.Source.request:
+			if (auto r = origin.requestId in inFlight_)
+				related ~= *r;
+			break;
+		case InboundOrigin.Source.standalone:
+			break;
+		case InboundOrigin.Source.shared_:
+			foreach (r; inFlight_.byValue)
+				related ~= r;
+			break;
+		}
+		const now = MonoTime.currTime;
+		foreach (r; related)
+		{
+			if (r.paused++ == 0 && r.armed)
+			{
+				if (r.deadline != MonoTime.max)
+					r.remaining = r.deadline > now ? r.deadline - now : Duration.zero;
+				if (r.hardDeadline != MonoTime.max)
+					r.timer.rearm(r.hardDeadline > now ? r.hardDeadline - now : Duration.zero);
+				else
+					r.timer.stop();
+			}
+		}
+		return related;
+	}
+
+	/// Restart the deadlines `pauseDeadlines` stopped, once no handler holds them
+	/// paused, with the `requestTimeout` time that was left when they paused. The
+	/// `maxTotalTimeout` cap keeps running throughout.
+	private void resumeDeadlines(InFlightRequest[] paused) @safe nothrow
+	{
+		const now = MonoTime.currTime;
+		foreach (r; paused)
+			if (--r.paused == 0 && r.armed && r.abortReason is null)
+			{
+				if (r.deadline != MonoTime.max)
+					r.deadline = now + r.remaining;
+				armDeadline(r, now);
+			}
+	}
+
+	/// Identity of the running task for `callTokens_` (its fiber; null outside
+	/// any fiber).
+	private static void* currentFiberKey() @safe nothrow
+	{
+		import core.thread : Fiber;
+
+		return cast(void*) Fiber.getThis();
+	}
+
+	/// Run `body_` with `token` as the cancellation of the requests it issues on
+	/// this task. A null `token` runs `body_` directly (inheriting any enclosing
+	/// call's token).
+	private R withCancellation(R)(CancellationToken token, scope R delegate() @safe body_) @safe
+	{
+		if (token is null)
+			return body_();
+		if (token.isCancelled)
+			throw cancelledError(token.reason);
+		auto key = currentFiberKey();
+		auto prev = callTokens_.get(key, null);
+		callTokens_[key] = token;
+		scope (exit)
+		{
+			if (prev is null)
+				callTokens_.remove(key);
+			else
+				callTokens_[key] = prev;
+		}
+		return body_();
+	}
+
 	/// Register the `elicitationId`s announced by a `URLElicitationRequiredError`
 	/// (`-32042`) so a subsequent `notifications/elicitation/complete` correlates
-	/// and is forwarded. `error` is the JSON-RPC error object; the URL-mode
-	/// elicitations live under `error.data.elicitations[]`, each an
+	/// and is forwarded. `data` is the error's `data` member; the URL-mode
+	/// elicitations live under `data.elicitations[]`, each an
 	/// `ElicitRequestURLParams` carrying an `elicitationId` (2025-11-25 / modern
 	/// schema `URLElicitationRequiredError`). Ids already tracked are left as-is so
 	/// an in-flight completion state is not reset; malformed entries are skipped.
-	package void registerUrlElicitations(Json error) @safe
+	package void registerUrlElicitations(Json data) @safe
 	{
-		if (error.type != Json.Type.object || "data" !in error)
-			return;
-		auto data = error["data"];
 		if (data.type != Json.Type.object || "elicitations" !in data)
 			return;
 		auto elicitations = data["elicitations"];
@@ -2708,9 +3925,29 @@ final class McpClient : ClientProtocol
 					|| e["elicitationId"].type != Json.Type.string)
 				continue;
 			const eid = e["elicitationId"].get!string;
-			if (eid.length && eid !in elicitationIds_)
-				elicitationIds_[eid] = (void[0]).init;
+			trackElicitationId(eid);
 		}
+	}
+
+	/// Remember URL elicitation `eid` as awaiting completion. Once
+	/// `maxTrackedElicitations_` ids are tracked the oldest is forgotten, so its
+	/// eventual completion notification is ignored as unknown.
+	private void trackElicitationId(string eid) @safe
+	{
+		import std.algorithm : filter;
+		import std.array : array;
+
+		if (eid.length == 0 || eid in elicitationIds_)
+			return;
+		if (elicitationOrder_.length >= 2 * maxTrackedElicitations_)
+			elicitationOrder_ = elicitationOrder_.filter!(id => id in elicitationIds_).array;
+		while (elicitationIds_.length >= maxTrackedElicitations_ && elicitationOrder_.length)
+		{
+			elicitationIds_.remove(elicitationOrder_[0]);
+			elicitationOrder_ = elicitationOrder_[1 .. $];
+		}
+		elicitationIds_[eid] = (void[0]).init;
+		elicitationOrder_ ~= eid;
 	}
 
 	/// The capabilities actually advertised on the wire: `capabilities` augmented
@@ -2728,13 +3965,11 @@ final class McpClient : ClientProtocol
 			return caps;
 		if (onSampling !is null)
 			caps.sampling = true;
-		if (onElicitation !is null)
+		// A bare `elicitation` object means form mode only; declare it unless the
+		// caller has already advertised a submode explicitly.
+		if (onElicitation !is null && !caps.elicitationForm && !caps.elicitationUrl)
 		{
-			caps.elicitation = true;
-			// A bare `elicitation` object means form mode only; declare the form
-			// submode unless the caller has already advertised a submode explicitly.
-			if (!caps.elicitationForm && !caps.elicitationUrl)
-				caps.elicitationForm = true;
+			caps.elicitationForm = true;
 		}
 		if (onListRoots !is null)
 			caps.roots = true;
@@ -2745,15 +3980,21 @@ final class McpClient : ClientProtocol
 	/// capabilities) to a request's params.
 	private Json injectModernMeta(Json params) @safe
 	{
+		return injectModernMeta(params, negotiated);
+	}
+
+	/// `injectModernMeta` framing the request at `version_`.
+	private Json injectModernMeta(Json params, ProtocolVersion version_) @safe
+	{
 		if (params.type != Json.Type.object)
 			params = Json.emptyObject;
 		Json meta = ("_meta" in params && params["_meta"].type == Json.Type.object) ? params["_meta"] : Json
 			.emptyObject;
-		meta[MetaKey.protocolVersion] = negotiated.toWire;
+		meta[MetaKey.protocolVersion] = version_.toWire;
 		meta[MetaKey.clientInfo] = clientInfo.toJson();
-		// Project to the negotiated (2026-07-28) wire shape: modern has no top-level
+		// Project to the request's (2026-07-28) wire shape: modern has no top-level
 		// client `tasks` capability, so it is folded into the `extensions` map.
-		meta[MetaKey.clientCapabilities] = effectiveCapabilities().forVersion(negotiated).toJson();
+		meta[MetaKey.clientCapabilities] = effectiveCapabilities().forVersion(version_).toJson();
 		// Modern per-request logging opt-in: stamp the sticky default level (set via
 		// `setLogLevel`) unless this request already carries an explicit
 		// `MetaKey.logLevel` (a per-request override via `withRequestLogLevel` / an
@@ -2780,6 +4021,7 @@ final class McpClient : ClientProtocol
 	/// Send a notification (no reply expected).
 	private void notify(string method, Json params) @safe
 	{
+		ensureNotReleased();
 		auto message = makeNotification(method, params);
 		version (unittest)
 			if (onNotifyForTest !is null)
@@ -2844,14 +4086,38 @@ final class McpClient : ClientProtocol
 	/// sends for `requestId` is ignored, per "The sender of the cancellation
 	/// notification SHOULD ignore any response to the request that arrives
 	/// afterward". `reason` is an optional free-form explanation included in the
-	/// notification when non-empty.
+	/// notification when non-empty. When `requestId` is still in flight, the call
+	/// waiting on it fails at once with `requestCancelled`. Request ids are
+	/// internal, so applications cancel a call through the `CancellationToken` in
+	/// its `RequestOptions.cancellation`.
 	///
 	/// Per spec, the `initialize` request MUST NOT be cancelled by clients;
 	/// attempting to cancel the id of the `initialize` request throws.
-	void cancel(long requestId, string reason = null) @safe
+	package void cancel(long requestId, string reason = null) @safe
 	{
 		if (requestId == initializeRequestId && initializeRequestId != 0)
 			throw invalidRequest("The initialize request MUST NOT be cancelled by clients");
+		if (requestId in inFlight_)
+			abortRequest(requestId, cancelledError(reason), reason);
+		else
+			signalCancellation(requestId, reason, useModern);
+	}
+
+	/// Drop the ids `isCancelled` already consumed from `cancelledOrder_`, keeping
+	/// the live ones in insertion order.
+	private void compactCancelledOrder() @safe
+	{
+		import std.algorithm : filter;
+		import std.array : array;
+
+		cancelledOrder_ = cancelledOrder_.filter!(id => id in cancelledRequests_).array;
+	}
+
+	/// Record `requestId` as cancelled (so a late response is dropped) and signal
+	/// it to the server: `notifications/cancelled`, or nothing more over a modern
+	/// Streamable HTTP transport, where closing the request's stream is the signal.
+	private void signalCancellation(long requestId, string reason, bool modern) @safe
+	{
 		// Already tracked: nothing to add (and avoid a duplicate order entry).
 		if (requestId !in cancelledRequests_)
 		{
@@ -2863,10 +4129,7 @@ final class McpClient : ClientProtocol
 				// Drop ids from the order queue that isCancelled() already removed
 				// from the set, so the eviction pick below always reaches a live
 				// entry in O(1) rather than scanning an unbounded stale prefix.
-				import std.algorithm : filter;
-				import std.array : array;
-
-				cancelledOrder_ = cancelledOrder_.filter!(id => id in cancelledRequests_).array;
+				compactCancelledOrder();
 				if (cancelledOrder_.length)
 				{
 					cancelledRequests_.remove(cancelledOrder_[0]);
@@ -2875,19 +4138,36 @@ final class McpClient : ClientProtocol
 			}
 			cancelledRequests_[requestId] = true;
 			cancelledOrder_ ~= requestId;
+			// Ids consumed by `isCancelled` stay in the order queue; drop them once
+			// they dominate it, so the queue is bounded by the live set (amortized
+			// O(1) per cancel).
+			const live = cancelledRequests_.length > minCancelledOrderCompaction_
+				? cancelledRequests_.length : minCancelledOrderCompaction_;
+			if (cancelledOrder_.length > 2 * live)
+				compactCancelledOrder();
 		}
-		// Over a modern Streamable HTTP transport, closing the request's SSE response
-		// stream is itself the cancellation signal and no `notifications/cancelled`
-		// is sent (basic/transports §Sending Messages, Note); the local tracking
-		// above still drops a late response. stdio and legacy HTTP send the
-		// notification as the cancellation signal.
-		if (transport.cancelsByStreamClose())
+		// For a modern request over Streamable HTTP, closing the request's SSE
+		// response stream is itself the cancellation signal and no
+		// `notifications/cancelled` is sent (basic/transports §Sending Messages,
+		// Note); the local tracking above still drops a late response. stdio and
+		// earlier-protocol requests send the notification as the signal.
+		if (modern && transport.cancelsByStreamClose())
 			return;
 		Json params = Json.emptyObject;
 		params["requestId"] = requestId;
 		if (reason.length)
 			params["reason"] = reason;
-		notify("notifications/cancelled", params);
+		ensureNotReleased();
+		auto message = makeNotification("notifications/cancelled", params);
+		version (unittest)
+			if (onNotifyForTest !is null)
+			{
+				onNotifyForTest(message);
+				return;
+			}
+		// Posted, not sent: a cancellation (from a CancellationToken or a request
+		// deadline) must not park behind a server that has stopped reading.
+		transport.postOneway(message);
 	}
 
 	/// Register the client's filesystem roots using the typed `Root` API,
@@ -2932,10 +4212,16 @@ final class McpClient : ClientProtocol
 	/// cache in the client rather than the transport.
 	string[string] headersFor(Json message) @safe
 	{
+		import mcp.client.transport : modernFraming;
+
 		string[string] headers;
-		if (useModern)
+		// A request framed as modern on its own (`connect`'s probe) is routed as
+		// one whatever the session's framing.
+		ProtocolVersion framed;
+		const ownFraming = modernFraming(message, framed);
+		if (useModern || ownFraming)
 		{
-			headers[HttpHeader.protocolVersion] = negotiated.toWire;
+			headers[HttpHeader.protocolVersion] = ownFraming ? framed.toWire : negotiated.toWire;
 			if (message.type != Json.Type.object || "method" !in message)
 				return headers; // no message (GET stream) or a response: version only
 			const method = message["method"].get!string;
@@ -3060,6 +4346,18 @@ final class McpClient : ClientProtocol
 	/// outcome. Every other notification is forwarded unchanged.
 	private void dispatchNotification(string method, Json params) @safe
 	{
+		// The server gave up on a request it sent us: tell its handler, and the
+		// reply is withheld (basic/utilities/cancellation).
+		if (method == "notifications/cancelled"
+				&& params.type == Json.Type.object && "requestId" in params)
+		{
+			if (auto token = params["requestId"].toString() in serverRequests_)
+			{
+				const reason = "reason" in params && params["reason"].type == Json.Type.string
+					? params["reason"].get!string : null;
+				(*token).cancel(reason);
+			}
+		}
 		if (method == "notifications/elicitation/complete")
 		{
 			if (params.type != Json.Type.object || "elicitationId" !in params
@@ -3076,6 +4374,8 @@ final class McpClient : ClientProtocol
 		// global observer.
 		if (method == "notifications/progress")
 		{
+			if (params.type == Json.Type.object && "progressToken" in params)
+				restartDeadlines(params["progressToken"].toString());
 			auto pn = ProgressNotification.fromJson(params);
 			auto perCall = pn.progressToken.toString() in perCallProgress_;
 			if (perCall !is null)
@@ -3103,7 +4403,8 @@ final class McpClient : ClientProtocol
 	/// registered for its `_meta` subscriptionId. Returns true when the frame was
 	/// an event-stream frame addressed to a live stream (and was delivered), so the
 	/// caller skips the generic `onNotification`. A frame with no/unknown
-	/// subscriptionId falls through (returns false) for back-compat.
+	/// subscriptionId falls through (returns false) so it still reaches
+	/// `onNotification`.
 	private bool dispatchEventStream(string method, Json params) @safe
 	{
 		if (method != eventsEventNotification && method != eventsActiveNotification
@@ -3113,9 +4414,9 @@ final class McpClient : ClientProtocol
 		if (params.type != Json.Type.object || "_meta" !in params)
 			return false;
 		auto meta = params["_meta"];
-		if (meta.type != Json.Type.object || subscriptionIdMetaKey !in meta)
+		if (meta.type != Json.Type.object || MetaKey.subscriptionId !in meta)
 			return false;
-		const key = subscriptionKey(meta[subscriptionIdMetaKey]);
+		const key = subscriptionKey(meta[MetaKey.subscriptionId]);
 		auto h = key in eventStreams_;
 		if (h is null)
 			return false;
@@ -3161,6 +4462,7 @@ final class McpClient : ClientProtocol
 		{
 		case "notifications/tools/list_changed":
 			invalidateLogical("tools/list", "");
+			clearToolIndex();
 			if (onToolsListChanged !is null)
 				onToolsListChanged();
 			break;
@@ -3193,21 +4495,41 @@ final class McpClient : ClientProtocol
 	}
 
 	/// Dispatch an inbound message handed up by the transport: server->
-	/// client requests and notifications (never an awaited response).
-	private void dispatchInbound(Message msg) @safe
+	/// client requests and notifications (never an awaited response), read on a
+	/// stream of `origin`.
+	private void dispatchInbound(Message msg, InboundOrigin origin = InboundOrigin.init) @safe
 	{
 		final switch (msg.kind)
 		{
 		case MessageKind.request:
-			handleServerRequest(msg);
+			handleServerRequest(msg, origin);
 			break;
 		case MessageKind.notification:
-			dispatchNotification(msg.method, msg.params);
+			// A notification shares its stream with unrelated responses, so a
+			// throwing application callback is logged rather than propagated into
+			// the transport's read loop, where it would fail the request in flight.
+			try
+				dispatchNotification(msg.method, msg.params);
+			catch (Exception e)
+				logNotificationHandlerError(msg.method, e);
 			break;
 		case MessageKind.response:
 		case MessageKind.errorResponse:
 			break; // not expected on the listening stream
 		}
+	}
+
+	private static void logNotificationHandlerError(string method, Exception e) @safe nothrow
+	{
+		import std.stdio : stderr;
+
+		() @trusted nothrow{
+			try
+				stderr.writeln("[mcp.client] notification handler for ", method, ": ", e.msg);
+			catch (Exception)
+			{
+			}
+		}();
 	}
 
 	/// Open the standalone server->client stream (HTTP GET SSE), so the server
@@ -3219,41 +4541,82 @@ final class McpClient : ClientProtocol
 		transport.startServerStream();
 	}
 
-	/// Answer a server->client request by dispatching to the matching handler and
-	/// sending the response. We are inside the transport's inbound-read callback of
-	/// an in-flight request, and the server withholds that request's final response
-	/// until it receives this reply, so *how* we send it depends on
-	/// `transport.repliesSynchronously` (see `ClientTransport` for the rationale):
-	/// true sends the reply inline, false defers it via `runTask` so the read loop
-	/// keeps draining and the two directions cannot wedge each other.
-	private void handleServerRequest(Message msg) @safe
+	/// Answer a server->client request, read on a stream of `origin`, by
+	/// dispatching to the matching handler and sending the response. The server
+	/// may withhold the response of the request whose stream carried it until it
+	/// receives this reply, so that request's deadline stops while the handler
+	/// runs (see `pauseDeadlines`). The reply is sent from its own task, so the
+	/// caller's read loop keeps draining and the two directions cannot wedge each
+	/// other (stdio would block the read loop on the child's stdin pipe while the
+	/// child blocks on its stdout; HTTP's reply travels on a different request).
+	private void handleServerRequest(Message msg, InboundOrigin origin) @safe
 	{
 		import vibe.core.core : runTask;
 
 		Json response;
+		// A ping is answered at once and holds up no request, so it leaves the
+		// deadlines running.
+		auto paused = msg.method == "ping" ? null : pauseDeadlines(origin);
+		scope (exit)
+			resumeDeadlines(paused);
+		// The handler runs under a token the server's `notifications/cancelled`
+		// for this request cancels; requests the handler makes inherit it.
+		auto token = new CancellationToken;
+		const key = msg.id.toString();
+		const fiber = currentFiberKey();
+		serverRequests_[key] = token;
+		auto outer = serverRequestTokens_.get(fiber, null);
+		serverRequestTokens_[fiber] = token;
+		scope (exit)
+		{
+			if (auto t = key in serverRequests_)
+				if (*t is token)
+					serverRequests_.remove(key);
+			if (outer is null)
+				serverRequestTokens_.remove(fiber);
+			else
+				serverRequestTokens_[fiber] = outer;
+		}
 		try
 		{
-			Json result = dispatchServerMethod(msg.method, msg.params);
+			Json result = withCancellation(token,
+					() @safe => dispatchServerMethod(msg.method, msg.params));
 			response = makeResponse(msg.id, result);
 		}
 		catch (McpException e)
 			response = makeErrorResponse(msg.id, e);
 		catch (Exception e)
 			response = makeErrorResponse(msg.id, internalError(e.msg));
-
-		if (transport.repliesSynchronously())
-		{
-			transport.sendOneway(response);
+		// The receiver of a cancellation does not answer the cancelled request.
+		if (token.isCancelled)
 			return;
-		}
 
 		runTask((Json r) nothrow{
 			try
 				transport.sendOneway(r);
-			catch (Exception)
+			catch (Exception e)
 			{
+				import vibe.core.log : logWarn;
+
+				// The server is left waiting for this reply, so the failure must
+				// be visible even though no caller can receive it.
+				logWarn("[mcp.client] failed to send the reply to server request %s: %s",
+					r["id"].toString(), e.msg);
 			}
 		}, response);
+	}
+
+	/// The cancellation of the server->client request (sampling, elicitation,
+	/// roots) whose handler is running on the calling task; null outside one.
+	/// It is cancelled when the server sends `notifications/cancelled` for the
+	/// request, after which the client sends no reply, so a handler waiting on a
+	/// user or a model can stop early. Requests the handler itself makes are
+	/// bound to it and fail with `requestCancelled` once it is cancelled.
+	CancellationToken serverRequestCancellation() @safe nothrow
+	{
+		if (auto t = currentFiberKey() in serverRequestTokens_)
+			return *t;
+		return null;
 	}
 
 	private Json dispatchServerMethod(string method, Json params) @safe
@@ -3294,8 +4657,7 @@ final class McpClient : ClientProtocol
 						&& params["elicitationId"].type == Json.Type.string)
 				{
 					const eid = params["elicitationId"].get!string;
-					if (eid.length && eid !in elicitationIds_)
-						elicitationIds_[eid] = (void[0]).init;
+					trackElicitationId(eid);
 				}
 			}
 			return onElicitation(ElicitParams.fromJson(params)).toJson();
@@ -3310,12 +4672,14 @@ final class McpClient : ClientProtocol
 		}
 	}
 
-	/// Whether a response with JSON-RPC id `id` belongs to a request this client
-	/// has cancelled (and so should be ignored per basic/utilities/cancellation).
-	/// Exposed for tests; cheap membership check on the cancelled-id set.
-	package bool isResponseCancelled(long id) const @safe nothrow
+	version (unittest)
 	{
-		return (id in cancelledRequests_) !is null;
+		/// Whether a response with JSON-RPC id `id` belongs to a request this
+		/// client has cancelled.
+		package bool isResponseCancelled(long id) const @safe nothrow
+		{
+			return (id in cancelledRequests_) !is null;
+		}
 	}
 
 	/// `ClientProtocol.isCancelled`: the transport consults this through the
@@ -3529,7 +4893,7 @@ unittest  // withRequestLogLevel preserves existing _meta entries
 
 unittest  // modern setLogLevel does NOT send the removed logging/setLevel RPC
 {
-	// The 2026-07-28 removed logging/setLevel (SEP-2575/2577); a conformant
+	// The 2026-07-28 protocol has no logging/setLevel (SEP-2575/2577); a conformant
 	// modern server answers it with -32601. So on a modern session setLogLevel must
 	// NOT POST that RPC — it records the sticky per-request opt-in instead.
 	auto c = McpClient.http("http://localhost");
@@ -3613,6 +4977,7 @@ unittest  // callToolAwait drives a server-created task to completion transparen
 			"resultType": Json("task"),
 			"taskId": Json("t1"),
 			"status": Json("working"),
+			"ttlMs": Json(null),
 			"pollIntervalMs": Json(5_000)
 		]);
 		assert(method == "tasks/get");
@@ -3714,13 +5079,111 @@ unittest  // awaitTask surfaces input_required to the callback and continues to 
 		assert(params["inputResponses"]["k1"]["answer"].get!string == "yes");
 		return Json.emptyObject;
 	};
-	auto result = c.awaitTask("t1", (string id, Json reqs) @safe {
+	auto result = c.awaitTask("t1", RequestOptions.init, (string id, Json reqs) @safe {
 		sawInput = true;
 		assert("k1" in reqs);
 		c.respondTaskInput(id, Json(["k1": Json(["answer": Json("yes")])]));
 	});
 	assert(sawInput && polls == 2);
 	assert(result.content.length == 0);
+}
+
+unittest  // awaitTask stops polling and cancels the task once its RequestOptions token is cancelled
+{
+	import std.exception : collectException;
+
+	auto c = McpClient.http("http://localhost");
+	auto token = new CancellationToken;
+	int polls;
+	bool cancelledOnServer;
+	c.onTaskSleepForTest = (Duration d) @safe { token.cancel("stop"); };
+	c.onRpcForTest = (string method, Json params) @safe {
+		if (method == "tasks/cancel")
+		{
+			cancelledOnServer = true;
+			return Json.emptyObject;
+		}
+		polls++;
+		return Json(["taskId": Json("t1"), "status": Json("working")]);
+	};
+	RequestOptions opts;
+	opts.cancellation = token;
+	auto e = cast(McpException) collectException(c.awaitTask("t1", opts));
+	assert(e !is null && e.code == ErrorCode.requestCancelled);
+	assert(polls == 1);
+	assert(cancelledOnServer);
+}
+
+unittest  // awaitTask hands each inputRequests key to onInputRequired only once
+{
+	auto c = McpClient.http("http://localhost");
+	c.onTaskSleepForTest = (Duration d) @safe {};
+	int polls;
+	string[][] seen;
+	c.onRpcForTest = (string method, Json params) @safe {
+		polls++;
+		if (polls <= 2)
+			return Json([
+			"taskId": Json("t1"),
+			"status": Json("input_required"),
+			"inputRequests": Json([
+				"k1": Json(["method": Json("elicitation/create")])
+			])
+		]);
+		if (polls == 3)
+			return Json([
+			"taskId": Json("t1"),
+			"status": Json("input_required"),
+			"inputRequests": Json([
+				"k1": Json(["method": Json("elicitation/create")]),
+				"k2": Json(["method": Json("sampling/createMessage")])
+			])
+		]);
+		return Json([
+			"taskId": Json("t1"),
+			"status": Json("completed"),
+			"result": Json(["content": Json.emptyArray])
+		]);
+	};
+	c.awaitTask("t1", RequestOptions.init, (string id, Json reqs) @safe {
+		import std.algorithm : sort;
+
+		auto keys = reqs.get!(Json[string]).keys;
+		sort(keys);
+		seen ~= keys;
+	});
+	assert(seen == [["k1"], ["k2"]],
+			"a pending input request must not be re-delivered on every poll");
+}
+
+unittest  // awaitTask re-delivers an input request key after the task leaves input_required
+{
+	auto c = McpClient.http("http://localhost");
+	c.onTaskSleepForTest = (Duration d) @safe {};
+	int polls;
+	int calls;
+	c.onRpcForTest = (string method, Json params) @safe {
+		polls++;
+		if (polls == 1 || polls == 3)
+			return Json([
+			"taskId": Json("t1"),
+			"status": Json("input_required"),
+			"inputRequests": Json([
+				"k1": Json(["method": Json("elicitation/create")])
+			])
+		]);
+		if (polls == 2)
+			return Json(["taskId": Json("t1"), "status": Json("working")]);
+		return Json([
+			"taskId": Json("t1"),
+			"status": Json("completed"),
+			"result": Json(["content": Json.emptyArray])
+		]);
+	};
+	c.awaitTask("t1", RequestOptions.init, (string id, Json reqs) @safe {
+		calls++;
+	});
+	assert(calls == 2);
 }
 
 unittest  // awaitTask throws on a failed task carrying a JSON-RPC error
@@ -3739,6 +5202,301 @@ unittest  // awaitTask throws on a failed task carrying a JSON-RPC error
 	};
 	auto ex = cast(McpException) collectException(c.awaitTask("t1"));
 	assert(ex !is null && ex.msg == "boom");
+}
+
+unittest  // a failed task's error keeps its code and data
+{
+	import std.exception : collectException;
+
+	auto c = McpClient.http("http://localhost");
+	c.onTaskSleepForTest = (Duration d) @safe {};
+	c.onRpcForTest = (string method, Json params) @safe {
+		return Json([
+			"resultType": Json("complete"),
+			"taskId": Json("t1"),
+			"status": Json("failed"),
+			"error": Json([
+				"code": Json(-31999),
+				"message": Json("boom"),
+				"data": Json(["detail": Json("disk full")])
+			])
+		]);
+	};
+	auto ex = cast(McpException) collectException(c.awaitTask("t1"));
+	assert(ex !is null && ex.code == -31999);
+	assert(ex.data.type == Json.Type.object && ex.data["detail"].get!string == "disk full",
+			"the task error's data must reach the caller");
+}
+
+unittest  // a finished request releases its deadline timer
+{
+	auto c = McpClient.http("http://localhost");
+	auto req = c.beginRequest(1, Json.emptyObject);
+	assert(cast(bool) req.timer);
+	c.endRequest(1, req);
+	assert(!cast(bool) req.timer,
+			"an ended request must release its timer while the event driver is alive");
+}
+
+unittest  // awaitTask throws on a status it does not recognize instead of polling forever
+{
+	import std.exception : collectException;
+
+	auto c = McpClient.http("http://localhost");
+	int polls;
+	c.onTaskSleepForTest = (Duration d) @safe {};
+	c.onRpcForTest = (string method, Json params) @safe {
+		assert(++polls < 5, "awaitTask kept polling an unrecognized status");
+		return Json([
+			"resultType": Json("complete"),
+			"taskId": Json("t1"),
+			"status": Json("expired")
+		]);
+	};
+	auto ex = cast(McpException) collectException(c.awaitTask("t1"));
+	assert(ex !is null);
+	assert(polls == 1);
+}
+
+unittest  // awaitTask waits the default poll interval when the server gives none
+{
+	auto c = McpClient.http("http://localhost");
+	Duration[] sleeps;
+	c.onTaskSleepForTest = (Duration d) @safe { sleeps ~= d; };
+	int polls;
+	c.onRpcForTest = (string method, Json params) @safe {
+		if (++polls < 3)
+			return Json(["taskId": Json("t1"), "status": Json("working")]);
+		return Json([
+			"taskId": Json("t1"),
+			"status": Json("completed"),
+			"result": Json(["content": Json.emptyArray])
+		]);
+	};
+	c.awaitTask("t1");
+	assert(sleeps == [1.seconds, 1.seconds], "a missing pollIntervalMs must not poll back-to-back");
+}
+
+unittest  // awaitTask caps a huge server pollIntervalMs at ClientSettings.maxTaskPollInterval
+{
+	auto c = McpClient.http("http://localhost");
+	Duration[] sleeps;
+	c.onTaskSleepForTest = (Duration d) @safe { sleeps ~= d; };
+	int polls;
+	c.onRpcForTest = (string method, Json params) @safe {
+		if (++polls < 2)
+			return Json([
+			"taskId": Json("t1"),
+			"status": Json("working"),
+			"pollIntervalMs": Json(10L * 24 * 3600 * 1000)
+		]);
+		return Json([
+			"taskId": Json("t1"),
+			"status": Json("completed"),
+			"result": Json(["content": Json.emptyArray])
+		]);
+	};
+	c.awaitTask("t1");
+	assert(sleeps == [ClientSettings.init.maxTaskPollInterval]);
+}
+
+unittest  // awaitTask never sleeps past ClientSettings.taskTimeout
+{
+	ClientSettings s;
+	s.taskTimeout = 5.seconds;
+	auto c = McpClient.http("http://localhost", s);
+	Duration[] sleeps;
+	c.onTaskSleepForTest = (Duration d) @safe { sleeps ~= d; };
+	int polls;
+	c.onRpcForTest = (string method, Json params) @safe {
+		if (++polls < 2)
+			return Json([
+			"taskId": Json("t1"),
+			"status": Json("working"),
+			"pollIntervalMs": Json(50_000)
+		]);
+		return Json([
+			"taskId": Json("t1"),
+			"status": Json("completed"),
+			"result": Json(["content": Json.emptyArray])
+		]);
+	};
+	c.awaitTask("t1");
+	assert(sleeps.length == 1 && sleeps[0] <= 5.seconds,
+			"the poll sleep must end by the task deadline");
+}
+
+unittest  // cancelling a task wait wakes it from a long poll interval
+{
+	import core.time : MonoTime;
+	import vibe.core.core : exitEventLoop, runEventLoop, runTask, sleep;
+
+	auto c = McpClient.http("http://localhost");
+	c.onRpcForTest = (string method, Json params) @safe {
+		if (method == "tasks/cancel")
+			return Json.emptyObject;
+		return Json([
+			"taskId": Json("t1"),
+			"status": Json("working"),
+			"pollIntervalMs": Json(30_000)
+		]);
+	};
+	auto token = new CancellationToken;
+	Duration took = Duration.max;
+	int code;
+	runTask(() nothrow{
+		scope (exit)
+			exitEventLoop();
+		const start = MonoTime.currTime;
+		try
+			c.awaitTaskImpl("t1", null, token);
+		catch (McpException e)
+			code = e.code;
+		catch (Exception)
+		{
+		}
+		took = MonoTime.currTime - start;
+	});
+	runTask(() nothrow{
+		try
+		{
+			sleep(100.msecs);
+			token.cancel();
+		}
+		catch (Exception)
+		{
+		}
+	});
+	runEventLoop();
+	assert(code == ErrorCode.requestCancelled);
+	assert(took < 2.seconds, "a cancelled task wait must not sleep out the poll interval");
+}
+
+unittest  // cancelling one task wait does not wake another into an early poll
+{
+	import vibe.core.core : exitEventLoop, runEventLoop, runTask, sleep;
+
+	auto c = McpClient.http("http://localhost");
+	int[string] polls;
+	c.onRpcForTest = (string method, Json params) @safe {
+		if (method == "tasks/cancel")
+			return Json.emptyObject;
+		const id = params["taskId"].get!string;
+		polls[id] = polls.get(id, 0) + 1;
+		return Json([
+			"taskId": Json(id),
+			"status": Json("working"),
+			"pollIntervalMs": Json(30_000)
+		]);
+	};
+	auto first = new CancellationToken;
+	auto second = new CancellationToken;
+	int done;
+	foreach (pair; [["t1", "first"], ["t2", "second"]])
+	{
+		auto token = pair[1] == "first" ? first : second;
+		string id = pair[0];
+		runTask((string taskId, CancellationToken tok) nothrow{
+			scope (exit)
+				if (++done == 2)
+					exitEventLoop();
+			try
+				c.awaitTaskImpl(taskId, null, tok);
+			catch (Exception)
+			{
+			}
+		}, id, token);
+	}
+	runTask(() nothrow{
+		try
+		{
+			sleep(100.msecs);
+			first.cancel();
+			sleep(200.msecs);
+			second.cancel();
+		}
+		catch (Exception)
+		{
+		}
+	});
+	runEventLoop();
+	assert(polls["t2"] == 1, "another wait's cancellation must not wake this one");
+}
+
+unittest  // close() wakes every task wait from a long poll interval
+{
+	import core.time : MonoTime;
+	import vibe.core.core : exitEventLoop, runEventLoop, runTask, sleep;
+
+	auto c = McpClient.http("http://localhost");
+	c.onRpcForTest = (string method, Json params) @safe {
+		return Json([
+			"taskId": params["taskId"],
+			"status": Json("working"),
+			"pollIntervalMs": Json(30_000)
+		]);
+	};
+	const start = MonoTime.currTime;
+	int done;
+	foreach (string id; ["t1", "t2"])
+		runTask((string taskId) nothrow{
+			scope (exit)
+				if (++done == 2)
+					exitEventLoop();
+			try
+				c.awaitTaskImpl(taskId, null, null);
+			catch (Exception)
+			{
+			}
+		}, id);
+	runTask(() nothrow{
+		try
+		{
+			sleep(100.msecs);
+			c.close();
+		}
+		catch (Exception)
+		{
+		}
+	});
+	runEventLoop();
+	assert(MonoTime.currTime - start < 2.seconds, "close() must wake every sleeping task wait");
+}
+
+unittest  // awaitTask fails fast on input_required when no handler is given
+{
+	import std.exception : collectException;
+
+	auto c = McpClient.http("http://localhost");
+	c.onTaskSleepForTest = (Duration d) @safe {};
+	int polls;
+	c.onRpcForTest = (string method, Json params) @safe {
+		polls++;
+		return Json([
+			"taskId": Json("t1"),
+			"status": Json("input_required"),
+			"inputRequests": Json.emptyObject
+		]);
+	};
+	auto ex = cast(McpException) collectException(c.awaitTask("t1"));
+	assert(ex !is null, "input_required with no handler must throw, not poll forever");
+	assert(polls == 1);
+}
+
+unittest  // awaitTask gives up once ClientSettings.taskTimeout elapses
+{
+	import std.exception : collectException;
+	import core.thread : Thread;
+
+	ClientSettings s;
+	s.taskTimeout = 30.msecs;
+	auto c = McpClient.http("http://localhost", s);
+	c.onTaskSleepForTest = (Duration d) @safe { Thread.sleep(10.msecs); };
+	c.onRpcForTest = (string method, Json params) @safe {
+		return Json(["taskId": Json("t1"), "status": Json("working")]);
+	};
+	auto ex = collectException(c.awaitTask("t1"));
+	assert(cast(RequestTimeoutException) ex !is null, "a task past its deadline must time out");
 }
 
 unittest  // callToolAwait returns a synchronous CallToolResult unchanged
@@ -3763,7 +5521,8 @@ unittest  // callToolAwait drives a task reply to completion
 			return Json([
 			"resultType": Json("task"),
 			"taskId": Json("t9"),
-			"status": Json("working")
+			"status": Json("working"),
+			"ttlMs": Json(null)
 		]);
 		assert(method == "tasks/get" && params["taskId"].get!string == "t9");
 		return Json([
@@ -3779,6 +5538,220 @@ unittest  // callToolAwait drives a task reply to completion
 	};
 	auto r = c.callToolAwait("deploy");
 	assert(r.content[0].text == "async");
+}
+
+unittest  // callToolAwait routes progress to opts.onProgress while it polls the task
+{
+	import mcp.protocol.types : ProgressNotification;
+
+	auto c = McpClient.http("http://localhost");
+	Json token;
+	int progressSeen;
+	int polls;
+	c.onTaskSleepForTest = (Duration d) @safe {
+		Json p = Json.emptyObject;
+		p["progressToken"] = token;
+		p["progress"] = polls;
+		c.dispatchNotification("notifications/progress", p);
+	};
+	c.onRpcForTest = (string method, Json params) @safe {
+		if (method == "tools/call")
+		{
+			token = params["_meta"]["progressToken"];
+			return Json([
+				"resultType": Json("task"),
+				"taskId": Json("t1"),
+				"status": Json("working"),
+				"ttlMs": Json(null)
+			]);
+		}
+		assert(method == "tasks/get");
+		if (++polls < 3)
+			return Json(["taskId": Json("t1"), "status": Json("working")]);
+		return Json([
+			"taskId": Json("t1"),
+			"status": Json("completed"),
+			"result": Json(["content": Json.emptyArray])
+		]);
+	};
+	c.callToolAwait("slow", Json.emptyObject,
+			RequestOptions.withProgress((ProgressNotification n) @safe {
+				progressSeen++;
+			}));
+	assert(progressSeen == 2, "progress during task polling must reach opts.onProgress");
+}
+
+unittest  // plain verbs honour RequestOptions: progress token, log level and cancellation
+{
+	auto c = McpClient.http("http://localhost");
+	Json[string] seen;
+	c.onRpcForTest = (string method, Json params) @safe {
+		seen[method] = params;
+		if (method == "skills/list")
+			return Json(["skills": Json.emptyArray]);
+		if (method == "resources/directory/read")
+			return Json(["resources": Json.emptyArray]);
+		if (method == "tasks/get")
+			return Json(["taskId": Json("t1"), "status": Json("working")]);
+		if (method == "skills/get")
+			return Json(["skill": Json.emptyObject]);
+		return Json.emptyObject;
+	};
+	RequestOptions opts;
+	opts.progressToken = ProgressToken("p1");
+	c.ping(opts);
+	c.subscribe("file:///a", opts);
+	c.unsubscribe("file:///a", opts);
+	c.readDirectory("file:///d", opts);
+	c.skillsList(opts);
+	c.getTaskState("t1", opts);
+	c.cancelTask("t1", opts);
+	c.setLogLevel("info", opts);
+	foreach (method; [
+		"ping", "resources/subscribe", "resources/unsubscribe",
+		"resources/directory/read", "skills/list", "tasks/get",
+		"tasks/cancel", "logging/setLevel"
+	])
+		assert(seen[method]["_meta"]["progressToken"].get!string == "p1", method);
+
+	auto cancel = new CancellationToken;
+	cancel.cancel();
+	RequestOptions cancelled;
+	cancelled.cancellation = cancel;
+	int code;
+	try
+		c.ping(cancelled);
+	catch (McpException e)
+		code = e.code;
+	assert(code == ErrorCode.requestCancelled);
+}
+
+unittest  // the Events extension verbs honour RequestOptions' progress token
+{
+	auto c = McpClient.http("http://localhost");
+	c.enableModern();
+	Json[string] seen;
+	c.onRpcForTest = (string method, Json params) @safe {
+		seen[method] = params;
+		if (method == "events/list")
+			return Json(["events": Json.emptyArray]);
+		return Json.emptyObject;
+	};
+	RequestOptions opts;
+	opts.progressToken = ProgressToken("p1");
+	c.listEvents(opts);
+	UnsubscribeParams u;
+	u.name = "e";
+	u.url = "https://example.com/hook";
+	c.unsubscribeWebhookEvents(u, opts);
+	foreach (method; ["events/list", "events/unsubscribe"])
+		assert(seen[method]["_meta"]["progressToken"].get!string == "p1", method);
+}
+
+unittest  // callToolAwait takes RequestOptions in the same position as callTool
+{
+	auto c = McpClient.http("http://localhost");
+	c.onRpcForTest = (string method, Json params) @safe => Json([
+		"content": Json.emptyArray
+	]);
+	RequestOptions opts;
+	auto r = c.callToolAwait("add", Json.emptyObject, opts, null);
+	assert(!r.isTask);
+}
+
+unittest  // a task the server cancelled fails awaitTask with requestCancelled
+{
+	auto c = McpClient.http("http://localhost");
+	c.onRpcForTest = (string method, Json params) @safe => Json([
+		"taskId": Json("t1"),
+		"status": Json("cancelled")
+	]);
+	int code;
+	try
+		c.awaitTask("t1");
+	catch (McpException e)
+		code = e.code;
+	assert(code == ErrorCode.requestCancelled);
+}
+
+unittest  // a request timeout is a transient event failure, identified by type
+{
+	assert(McpClient.isTransientEventFailure(new RequestTimeoutException("slow")));
+	assert(!McpClient.isTransientEventFailure(new McpException(ErrorCode.invalidParams, "bad")));
+}
+
+unittest  // callToolAwait validates the awaited task result against the listed outputSchema
+{
+	import mcp.api.binding : jsonSchemaOf, SchemaUse;
+
+	struct AddResult
+	{
+		int result;
+	}
+
+	auto c = McpClient.http("http://localhost");
+	c.enableOutputSchemaValidation();
+	c.onTaskSleepForTest = (Duration d) @safe {};
+	Tool t = {
+		name: "add", outputSchema: jsonSchemaOf!(AddResult, SchemaUse.output)
+	};
+	c.onRpcForTest = (string method, Json params) @safe {
+		if (method == "tools/list")
+			return Json(["tools": Json([t.toJson()])]);
+		if (method == "tools/call")
+			return Json([
+			"resultType": Json("task"),
+			"taskId": Json("t1"),
+			"status": Json("working"),
+			"ttlMs": Json(null)
+		]);
+		return Json([
+			"taskId": Json("t1"),
+			"status": Json("completed"),
+			"result": Json([
+				"content": Json.emptyArray,
+				"structuredContent": Json(["result": Json("oops")])
+			])
+		]);
+	};
+	c.listTools();
+	bool violated;
+	try
+		c.callToolAwait("add");
+	catch (OutputSchemaViolation)
+		violated = true;
+	assert(violated, "a non-conforming awaited result must fail output-schema validation");
+}
+
+unittest  // cancelling callToolAwait's token stops polling and cancels the task
+{
+	auto c = McpClient.http("http://localhost");
+	auto cancel = new CancellationToken;
+	string[] methods;
+	c.onTaskSleepForTest = (Duration d) @safe { cancel.cancel(); };
+	c.onRpcForTest = (string method, Json params) @safe {
+		methods ~= method;
+		if (method == "tools/call")
+			return Json([
+			"resultType": Json("task"),
+			"taskId": Json("t1"),
+			"status": Json("working"),
+			"ttlMs": Json(null)
+		]);
+		if (method == "tasks/cancel")
+			return Json.emptyObject;
+		return Json(["taskId": Json("t1"), "status": Json("working")]);
+	};
+	RequestOptions opts;
+	opts.cancellation = cancel;
+	int code;
+	try
+		c.callToolAwait("slow", Json.emptyObject, opts);
+	catch (McpException e)
+		code = e.code;
+	assert(code == ErrorCode.requestCancelled, "a cancelled await must fail as cancelled");
+	assert(methods == ["tools/call", "tasks/get", "tasks/cancel"],
+			"cancellation must stop polling and cancel the task on the server");
 }
 
 unittest  // cancelTask issues a tasks/cancel for the given id
@@ -3928,7 +5901,8 @@ unittest  // a pre-seeded tools/list cache drives x-mcp-header mirroring with no
 	// Pre-seed a shared store as if another process (or a prior session) had
 	// already fetched tools/list; this client never calls listTools itself.
 	auto store = new InMemoryCacheStore();
-	store.put(CacheKey("tools/list", ""), CacheEntry(lr.toJson(), SysTime(DateTime(2999, 1, 1))));
+	store.put(CacheKey("tools/list", "", "", "http://localhost"),
+			CacheEntry(lr.toJson(), SysTime(DateTime(2999, 1, 1))));
 	c.setCache(store);
 
 	Json msg = Json.emptyObject;
@@ -3959,7 +5933,8 @@ unittest  // a stale-but-present tools/list entry still drives mirroring (schema
 	// expiresAt in the past: stale for *serving* a cached listTools, but schema
 	// lookups deliberately ignore serving-freshness — the schema is still valid
 	// until tools/list_changed evicts the entry.
-	store.put(CacheKey("tools/list", ""), CacheEntry(lr.toJson(), SysTime(DateTime(2000, 1, 1))));
+	store.put(CacheKey("tools/list", "", "", "http://localhost"),
+			CacheEntry(lr.toJson(), SysTime(DateTime(2000, 1, 1))));
 	c.setCache(store);
 
 	Json msg = Json.emptyObject;
@@ -3985,7 +5960,8 @@ unittest  // evicting the tools/list entry (e.g. tools/list_changed) stops heade
 	ListToolsResult lr;
 	lr.tools = [t];
 	auto store = new InMemoryCacheStore();
-	store.put(CacheKey("tools/list", ""), CacheEntry(lr.toJson(), SysTime(DateTime(2999, 1, 1))));
+	store.put(CacheKey("tools/list", "", "", "http://localhost"),
+			CacheEntry(lr.toJson(), SysTime(DateTime(2999, 1, 1))));
 	c.setCache(store);
 
 	Json msg = Json.emptyObject;
@@ -4031,6 +6007,98 @@ unittest  // a local listTools with no server hint still enables header mirrorin
 			"header mirroring must work after a local listTools even with no cache hint");
 }
 
+version (unittest)
+{
+	// A modern client whose `tools/list` returns the `locate` tool with a
+	// `Region` x-mcp-header annotation, and every other method an empty result.
+	private McpClient headerToolClient() @safe
+	{
+		auto c = McpClient.http("http://localhost");
+		c.enableModern();
+		Tool t = headerTool("locate", [
+			"region": Json([
+				"type": Json("string"),
+				"x-mcp-header": Json("Region")
+			])
+		]);
+		c.onRpcForTest = (string method, Json params) @safe {
+			if (method == "tools/list")
+				return Json(["tools": Json([t.toJson()])]);
+			if (method == "resources/read")
+				return Json(["contents": Json.emptyArray, "ttlMs": Json(60_000)]);
+			return Json.emptyObject;
+		};
+		return c;
+	}
+
+	private Json locateCallMessage() @safe
+	{
+		Json params = Json.emptyObject;
+		params["name"] = "locate";
+		params["arguments"] = Json(["region": Json("us-west1")]);
+		return Json(["method": Json("tools/call"), "params": params]);
+	}
+}
+
+unittest  // header mirroring works after listTools with caching disabled
+{
+	auto c = headerToolClient();
+	c.setCache(noCache);
+	c.listTools();
+	assert("Mcp-Param-Region" in c.headersFor(locateCallMessage()));
+}
+
+unittest  // header mirroring survives eviction of tools/list from a full response cache
+{
+	import std.conv : to;
+
+	auto c = headerToolClient();
+	c.setCache(new InMemoryCacheStore(4));
+	c.listTools();
+	foreach (i; 0 .. 8)
+		c.readResource("file:///r" ~ i.to!string);
+	assert("Mcp-Param-Region" in c.headersFor(locateCallMessage()));
+}
+
+unittest  // a private-scoped tools/list with no freshness is not left in the shared partition
+{
+	auto c = McpClient.http("http://localhost");
+	auto store = new InMemoryCacheStore();
+	c.setCache(store);
+	c.setCachePartition("alice");
+	c.onRpcForTest = (string method, Json params) @safe => Json([
+		"tools": Json.emptyArray,
+		"ttlMs": Json(0),
+		"cacheScope": Json("private")
+	]);
+	c.listTools();
+	assert(store.get(CacheKey("tools/list", "", "", "http://localhost")).isNull);
+}
+
+unittest  // a list_changed that arrives while tools/list is in flight is not overwritten by the stale result
+{
+	auto c = McpClient.http("http://localhost");
+	int calls;
+	c.onRpcForTest = (string method, Json params) @safe {
+		calls++;
+		if (calls == 1)
+			c.dispatchNotification("notifications/tools/list_changed", Json.emptyObject);
+		return Json(["tools": Json.emptyArray, "ttlMs": Json(60_000)]);
+	};
+	c.listTools();
+	c.listTools();
+	assert(calls == 2, "the result fetched before list_changed must not be cached");
+}
+
+unittest  // tools/list_changed clears the tool index built by listTools
+{
+	auto c = headerToolClient();
+	c.setCache(noCache);
+	c.listTools();
+	c.dispatchNotification("notifications/tools/list_changed", Json.emptyObject);
+	assert("Mcp-Param-Region" !in c.headersFor(locateCallMessage()));
+}
+
 unittest  // the tool index re-derives when the underlying cache entry changes
 {
 	import std.datetime : SysTime, DateTime;
@@ -4052,7 +6120,8 @@ unittest  // the tool index re-derives when the underlying cache entry changes
 	]);
 	ListToolsResult lrA;
 	lrA.tools = [a];
-	store.put(CacheKey("tools/list", ""), CacheEntry(lrA.toJson(), SysTime(DateTime(2999, 1, 1))));
+	store.put(CacheKey("tools/list", "", "", "http://localhost"),
+			CacheEntry(lrA.toJson(), SysTime(DateTime(2999, 1, 1))));
 	assert("Mcp-Param-Region" in c.headersFor(msg)); // builds the index
 
 	// Replace the entry (new expiry) with the same tool annotated differently;
@@ -4062,7 +6131,8 @@ unittest  // the tool index re-derives when the underlying cache entry changes
 	]);
 	ListToolsResult lrB;
 	lrB.tools = [b];
-	store.put(CacheKey("tools/list", ""), CacheEntry(lrB.toJson(), SysTime(DateTime(2999, 1, 2))));
+	store.put(CacheKey("tools/list", "", "", "http://localhost"),
+			CacheEntry(lrB.toJson(), SysTime(DateTime(2999, 1, 2))));
 	auto headers = c.headersFor(msg);
 	assert("Mcp-Param-Region" !in headers, "stale memoized schema must not survive a cache change");
 	assert("Mcp-Param-Zone" in headers, "re-derived index must reflect the new cache entry");
@@ -4093,6 +6163,41 @@ unittest  // listTools excludes a tool whose x-mcp-header value is empty (2026-0
 	auto names = res.tools.map!(t => t.name).array;
 	assert(!names.canFind("bad"), "tool with empty x-mcp-header must be excluded");
 	assert(names.canFind("good"), "sibling valid tool must remain");
+}
+
+unittest  // listTools excludes an invalid x-mcp-header tool served from a pre-seeded cache
+{
+	import std.algorithm : canFind, map;
+	import std.array : array;
+	import std.datetime : SysTime, DateTime;
+
+	auto c = McpClient.http("http://localhost");
+	c.enableModern();
+	ListToolsResult lr;
+	lr.tools = [
+		headerTool("bad", [
+			"region": Json(["type": Json("string"), "x-mcp-header": Json("")])
+		]),
+		headerTool("good", [
+			"region": Json([
+				"type": Json("string"),
+				"x-mcp-header": Json("Region")
+			])
+		])
+	];
+	auto store = new InMemoryCacheStore();
+	store.put(CacheKey("tools/list", "", "", "http://localhost"),
+			CacheEntry(lr.toJson(), SysTime(DateTime(2999, 1, 1))));
+	c.setCache(store);
+	int calls;
+	c.onRpcForTest = (string method, Json params) @safe {
+		calls++;
+		return Json.emptyObject;
+	};
+	auto names = c.listTools().tools.map!(t => t.name).array;
+	assert(calls == 0, "the pre-seeded entry must be served from the cache");
+	assert(!names.canFind("bad"), "a cached tool with an invalid x-mcp-header must be excluded");
+	assert(names.canFind("good"));
 }
 
 unittest  // listTools excludes a tool whose x-mcp-header value contains CR/LF
@@ -4273,16 +6378,115 @@ unittest  // getPrompt RequestOptions.logLevel attaches the modern per-request o
 	assert(seen["_meta"][MetaKey.logLevel].get!string == "warning");
 }
 
+version (unittest)
+{
+	// Issue `method`'s list verb on a modern client with a per-request log level
+	// and progress token, returning the params the server saw.
+	private Json listParamsSeen(string method, Json page,
+			void delegate(McpClient c, RequestOptions opts) @safe call)
+	{
+		auto c = McpClient.http("http://localhost");
+		c.enableModern();
+		Json seen = Json.undefined;
+		c.onRpcForTest = (string m, Json params) @safe {
+			if (m == method)
+				seen = params;
+			return page;
+		};
+		RequestOptions opts;
+		opts.progressToken = ProgressToken("list-tok");
+		opts.logLevel = "debug";
+		call(c, opts);
+		return seen;
+	}
+}
+
+unittest  // a legacy session never stamps the modern per-request logLevel
+{
+	auto c = McpClient.http("http://localhost");
+	Json[string] seen;
+	c.onRpcForTest = (string method, Json params) @safe {
+		seen[method] = params;
+		if (method == "tools/call")
+			return Json(["content": Json.emptyArray]);
+		if (method == "completion/complete")
+			return Json(["completion": Json(["values": Json.emptyArray])]);
+		return Json.emptyObject;
+	};
+	RequestOptions opts;
+	opts.logLevel = "debug";
+	c.ping(opts);
+	c.callTool("t", Json.emptyObject, opts);
+	c.complete(CompletionReference.forPrompt("p"), "a", "v", null, opts);
+	foreach (method; ["ping", "tools/call", "completion/complete"])
+	{
+		auto p = seen[method];
+		assert("_meta" !in p || MetaKey.logLevel !in p["_meta"], method);
+	}
+}
+
+unittest  // listTools applies RequestOptions progressToken and logLevel
+{
+	auto seen = listParamsSeen("tools/list", Json(["tools": Json.emptyArray]), (c, opts) @safe {
+		c.listTools(opts);
+	});
+	assert(seen["_meta"][MetaKey.logLevel].get!string == "debug");
+	assert(seen["_meta"]["progressToken"].get!string == "list-tok");
+}
+
+unittest  // listResources applies RequestOptions progressToken and logLevel
+{
+	auto seen = listParamsSeen("resources/list",
+			Json(["resources": Json.emptyArray]), (c, opts) @safe {
+		c.listResources(opts);
+	});
+	assert(seen["_meta"][MetaKey.logLevel].get!string == "debug");
+	assert(seen["_meta"]["progressToken"].get!string == "list-tok");
+}
+
+unittest  // listResourceTemplates applies RequestOptions progressToken and logLevel
+{
+	auto seen = listParamsSeen("resources/templates/list",
+			Json(["resourceTemplates": Json.emptyArray]), (c, opts) @safe {
+		c.listResourceTemplates(opts);
+	});
+	assert(seen["_meta"][MetaKey.logLevel].get!string == "debug");
+	assert(seen["_meta"]["progressToken"].get!string == "list-tok");
+}
+
+unittest  // listPrompts applies RequestOptions progressToken and logLevel
+{
+	auto seen = listParamsSeen("prompts/list", Json(["prompts": Json.emptyArray]), (c, opts) @safe {
+		c.listPrompts(opts);
+	});
+	assert(seen["_meta"][MetaKey.logLevel].get!string == "debug");
+	assert(seen["_meta"]["progressToken"].get!string == "list-tok");
+}
+
+unittest  // discover applies RequestOptions progressToken and logLevel
+{
+	auto seen = listParamsSeen("server/discover",
+			Json([
+				"supportedVersions": Json([Json("2026-07-28")]),
+				"capabilities": Json.emptyObject,
+				"serverInfo": Json(["name": Json("s"), "version": Json("1")])
+	]), (c, opts) @safe { c.discover(opts); });
+	assert(seen["_meta"][MetaKey.logLevel].get!string == "debug");
+	assert(seen["_meta"]["progressToken"].get!string == "list-tok");
+}
+
 unittest  // validateOutput passes a conforming structured result
 {
-	import mcp.protocol.schema : jsonSchemaOf;
+	import mcp.api.binding : jsonSchemaOf, SchemaUse;
 
 	struct AddResult
 	{
 		int result;
 	}
 
-	Tool t = {name: "add", outputSchema: jsonSchemaOf!AddResult};
+	Tool t = {
+		name: "add", outputSchema: jsonSchemaOf!(AddResult, SchemaUse.output)
+	};
 	CallToolResult r;
 	r.structuredContent = Json(["result": Json(5)]);
 	assert(McpClient.validateOutput(t, r) == "");
@@ -4290,14 +6494,16 @@ unittest  // validateOutput passes a conforming structured result
 
 unittest  // validateOutput rejects a non-conforming structured result
 {
-	import mcp.protocol.schema : jsonSchemaOf;
+	import mcp.api.binding : jsonSchemaOf, SchemaUse;
 
 	struct AddResult
 	{
 		int result;
 	}
 
-	Tool t = {name: "add", outputSchema: jsonSchemaOf!AddResult};
+	Tool t = {
+		name: "add", outputSchema: jsonSchemaOf!(AddResult, SchemaUse.output)
+	};
 	CallToolResult r;
 	r.structuredContent = Json(["result": Json("oops")]);
 	assert(McpClient.validateOutput(t, r).length > 0);
@@ -4313,21 +6519,23 @@ unittest  // validateOutput is a no-op when the tool has no output schema
 
 unittest  // validateOutput is a no-op when there is no structured content
 {
-	import mcp.protocol.schema : jsonSchemaOf;
+	import mcp.api.binding : jsonSchemaOf, SchemaUse;
 
 	struct AddResult
 	{
 		int result;
 	}
 
-	Tool t = {name: "add", outputSchema: jsonSchemaOf!AddResult};
+	Tool t = {
+		name: "add", outputSchema: jsonSchemaOf!(AddResult, SchemaUse.output)
+	};
 	CallToolResult r; // structuredContent stays undefined
 	assert(McpClient.validateOutput(t, r) == "");
 }
 
 unittest  // string-name callTool validates against the listTools-cached outputSchema
 {
-	import mcp.protocol.schema : jsonSchemaOf;
+	import mcp.api.binding : jsonSchemaOf, SchemaUse;
 
 	struct AddResult
 	{
@@ -4336,7 +6544,9 @@ unittest  // string-name callTool validates against the listTools-cached outputS
 
 	auto c = McpClient.http("http://localhost");
 	c.enableOutputSchemaValidation();
-	Tool t = {name: "add", outputSchema: jsonSchemaOf!AddResult};
+	Tool t = {
+		name: "add", outputSchema: jsonSchemaOf!(AddResult, SchemaUse.output)
+	};
 	c.onRpcForTest = (string method, Json params) @safe {
 		if (method == "tools/list")
 		{
@@ -4356,14 +6566,15 @@ unittest  // string-name callTool validates against the listTools-cached outputS
 	catch (McpException e)
 	{
 		threw = true;
-		assert(e.code == ErrorCode.invalidParams);
+		assert(cast(OutputSchemaViolation) e !is null,
+				"a local schema violation must not look like a server rejection");
 	}
 	assert(threw, "string-name callTool must reject a result that violates the cached outputSchema");
 }
 
 unittest  // string-name callTool accepts a conforming result against the cached outputSchema
 {
-	import mcp.protocol.schema : jsonSchemaOf;
+	import mcp.api.binding : jsonSchemaOf, SchemaUse;
 
 	struct AddResult
 	{
@@ -4372,7 +6583,9 @@ unittest  // string-name callTool accepts a conforming result against the cached
 
 	auto c = McpClient.http("http://localhost");
 	c.enableOutputSchemaValidation();
-	Tool t = {name: "add", outputSchema: jsonSchemaOf!AddResult};
+	Tool t = {
+		name: "add", outputSchema: jsonSchemaOf!(AddResult, SchemaUse.output)
+	};
 	c.onRpcForTest = (string method, Json params) @safe {
 		if (method == "tools/list")
 		{
@@ -4391,7 +6604,7 @@ unittest  // string-name callTool accepts a conforming result against the cached
 
 unittest  // string-name callTool skips output validation when it is not enabled
 {
-	import mcp.protocol.schema : jsonSchemaOf;
+	import mcp.api.binding : jsonSchemaOf, SchemaUse;
 
 	struct AddResult
 	{
@@ -4400,7 +6613,9 @@ unittest  // string-name callTool skips output validation when it is not enabled
 
 	auto c = McpClient.http("http://localhost");
 	// validation left disabled (the default)
-	Tool t = {name: "add", outputSchema: jsonSchemaOf!AddResult};
+	Tool t = {
+		name: "add", outputSchema: jsonSchemaOf!(AddResult, SchemaUse.output)
+	};
 	c.onRpcForTest = (string method, Json params) @safe {
 		if (method == "tools/list")
 		{
@@ -4419,7 +6634,7 @@ unittest  // string-name callTool skips output validation when it is not enabled
 
 unittest  // a pre-seeded tools/list cache drives output validation with no local listTools
 {
-	import mcp.protocol.schema : jsonSchemaOf;
+	import mcp.api.binding : jsonSchemaOf, SchemaUse;
 	import std.datetime : SysTime, DateTime;
 
 	struct AddResult
@@ -4429,11 +6644,14 @@ unittest  // a pre-seeded tools/list cache drives output validation with no loca
 
 	auto c = McpClient.http("http://localhost");
 	c.enableOutputSchemaValidation();
-	Tool t = {name: "add", outputSchema: jsonSchemaOf!AddResult};
+	Tool t = {
+		name: "add", outputSchema: jsonSchemaOf!(AddResult, SchemaUse.output)
+	};
 	ListToolsResult lr;
 	lr.tools = [t];
 	auto store = new InMemoryCacheStore();
-	store.put(CacheKey("tools/list", ""), CacheEntry(lr.toJson(), SysTime(DateTime(2999, 1, 1))));
+	store.put(CacheKey("tools/list", "", "", "http://localhost"),
+			CacheEntry(lr.toJson(), SysTime(DateTime(2999, 1, 1))));
 	c.setCache(store);
 	c.onRpcForTest = (string method, Json params) @safe {
 		return Json(["structuredContent": Json(["result": Json("oops")])]);
@@ -4445,14 +6663,14 @@ unittest  // a pre-seeded tools/list cache drives output validation with no loca
 	catch (McpException e)
 	{
 		threw = true;
-		assert(e.code == ErrorCode.invalidParams);
+		assert(cast(OutputSchemaViolation) e !is null);
 	}
 	assert(threw, "output validation must work from a pre-seeded cache without a local listTools");
 }
 
 unittest  // a pre-seeded tools/list cache accepts a conforming result with no local listTools
 {
-	import mcp.protocol.schema : jsonSchemaOf;
+	import mcp.api.binding : jsonSchemaOf, SchemaUse;
 	import std.datetime : SysTime, DateTime;
 
 	struct AddResult
@@ -4462,11 +6680,14 @@ unittest  // a pre-seeded tools/list cache accepts a conforming result with no l
 
 	auto c = McpClient.http("http://localhost");
 	c.enableOutputSchemaValidation();
-	Tool t = {name: "add", outputSchema: jsonSchemaOf!AddResult};
+	Tool t = {
+		name: "add", outputSchema: jsonSchemaOf!(AddResult, SchemaUse.output)
+	};
 	ListToolsResult lr;
 	lr.tools = [t];
 	auto store = new InMemoryCacheStore();
-	store.put(CacheKey("tools/list", ""), CacheEntry(lr.toJson(), SysTime(DateTime(2999, 1, 1))));
+	store.put(CacheKey("tools/list", "", "", "http://localhost"),
+			CacheEntry(lr.toJson(), SysTime(DateTime(2999, 1, 1))));
 	c.setCache(store);
 	c.onRpcForTest = (string method, Json params) @safe {
 		return Json(["structuredContent": Json(["result": Json(5)])]);
@@ -4559,14 +6780,13 @@ unittest  // installing onSampling auto-advertises the sampling capability
 unittest  // installing onElicitation auto-advertises elicitation (form submode)
 {
 	auto c = McpClient.http("http://localhost");
-	assert(!c.effectiveCapabilities().elicitation);
+	assert(!c.effectiveCapabilities().elicitationForm);
 	c.onElicitation = (ElicitParams params) @safe { return ElicitResult.init; };
 	auto caps = c.effectiveCapabilities();
-	assert(caps.elicitation);
 	assert(caps.elicitationForm); // a bare handler means form mode only
+	assert(!caps.elicitationUrl);
 	auto j = caps.toJson();
-	assert(j["elicitation"].type == Json.Type.object);
-	assert("form" in j["elicitation"]);
+	assert(j["elicitation"] == Json.emptyObject);
 }
 
 unittest  // installing onListRoots auto-advertises the roots capability
@@ -4582,7 +6802,6 @@ unittest  // installing onListRoots auto-advertises the roots capability
 unittest  // auto-advertise preserves explicitly declared submodes (url)
 {
 	auto c = McpClient.http("http://localhost");
-	c.capabilities.elicitation = true;
 	c.capabilities.elicitationUrl = true; // explicit url-only advertisement
 	c.onElicitation = (ElicitParams params) @safe { return ElicitResult.init; };
 	auto caps = c.effectiveCapabilities();
@@ -4680,7 +6899,7 @@ unittest  // a modern Streamable-HTTP client cancels by closing the stream, not 
 {
 	auto t = new HttpClientTransport("http://localhost", 8);
 	auto c = new McpClient(t);
-	t.setModernProtocol(true); // negotiated the modern (modern) protocol
+	c.enableModern(); // negotiated the modern (2026-07-28) protocol
 	bool postedCancelled;
 	c.onNotifyForTest = (Json message) @safe {
 		if (message["method"].get!string == "notifications/cancelled")
@@ -4757,7 +6976,7 @@ unittest  // sampling dispatch forwards a valid request to the delegate
 	string seenText;
 	c.onSampling = (CreateMessageRequest request) @safe {
 		delegateCalled = true;
-		// The handler now receives the typed request, parsed from the wire.
+		// The handler receives the typed request, parsed from the wire.
 		if (request.messages.length)
 			seenText = request.messages[0].content.text;
 		return CreateMessageResult.text("test-model", "reply");
@@ -4773,6 +6992,7 @@ unittest  // sampling dispatch forwards a valid request to the delegate
 	m["content"] = b;
 	Json params = Json.emptyObject;
 	params["messages"] = Json([m]);
+	params["maxTokens"] = 16;
 
 	c.dispatchServerMethod("sampling/createMessage", params);
 	assert(delegateCalled);
@@ -4783,7 +7003,6 @@ unittest  // elicitation/create rejects a mode the client did not advertise (-32
 {
 	auto c = McpClient.http("http://localhost");
 	// Advertise form mode only (the default bare elicitation declaration).
-	c.capabilities.elicitation = true;
 	c.capabilities.elicitationForm = true;
 
 	bool delegateCalled;
@@ -4812,7 +7031,6 @@ unittest  // elicitation/create rejects a mode the client did not advertise (-32
 unittest  // elicitation/create rejects an unknown mode (-32602)
 {
 	auto c = McpClient.http("http://localhost");
-	c.capabilities.elicitation = true;
 	c.capabilities.elicitationForm = true;
 
 	bool delegateCalled;
@@ -4839,7 +7057,6 @@ unittest  // elicitation/create rejects an unknown mode (-32602)
 unittest  // elicitation/create forwards an advertised mode to the delegate
 {
 	auto c = McpClient.http("http://localhost");
-	c.capabilities.elicitation = true;
 	c.capabilities.elicitationForm = true;
 	c.capabilities.elicitationUrl = true;
 
@@ -4861,9 +7078,8 @@ unittest  // elicitation/create forwards an advertised mode to the delegate
 unittest  // url-only client rejects a form-mode elicitation/create (-32602)
 {
 	auto c = McpClient.http("http://localhost");
-	// A url-only client is the canonical shape parsed from `{"url":{}}`:
-	// elicitation present + url submode, but no form submode.
-	c.capabilities.elicitation = true;
+	// A url-only client is the canonical shape parsed from `{"url":{}}`: the
+	// url submode alone.
 	c.capabilities.elicitationUrl = true;
 
 	bool delegateCalled;
@@ -4891,7 +7107,6 @@ unittest  // url-only client rejects a form-mode elicitation/create (-32602)
 unittest  // url-only client rejects a mode-absent (defaults to form) elicitation/create (-32602)
 {
 	auto c = McpClient.http("http://localhost");
-	c.capabilities.elicitation = true;
 	c.capabilities.elicitationUrl = true;
 
 	bool delegateCalled;
@@ -4921,7 +7136,6 @@ unittest  // bare elicitation declaration still accepts form-mode requests
 	auto c = McpClient.http("http://localhost");
 	// A bare `{}` declaration is parsed as elicitationForm=true; ensure the
 	// tightened check does not regress that case.
-	c.capabilities.elicitation = true;
 	c.capabilities.elicitationForm = true;
 
 	bool delegateCalled;
@@ -4943,7 +7157,6 @@ unittest  // installing onElicitation alone accepts an inbound form elicitation/
 	// Install ONLY the handler; set NO manual capability flags. The documented
 	// auto-advertise contract sends the form submode via effectiveCapabilities()
 	// at the handshake, so an inbound form request must be accepted (not -32602).
-	assert(!c.capabilities.elicitation);
 	assert(!c.capabilities.elicitationForm);
 
 	bool delegateCalled;
@@ -4962,7 +7175,6 @@ unittest  // installing onElicitation alone accepts an inbound form elicitation/
 unittest  // elicitation/complete for a known id is forwarded once, then ignored
 {
 	auto c = McpClient.http("http://localhost");
-	c.capabilities.elicitation = true;
 	c.capabilities.elicitationForm = true;
 	c.capabilities.elicitationUrl = true;
 	c.onElicitation = (ElicitParams) @safe { return ElicitResult.init; };
@@ -5003,18 +7215,14 @@ unittest  // -32042 URLElicitationRequiredError registers its elicitationIds (cl
 {
 	auto c = McpClient.http("http://localhost");
 
-	// Build the error object exactly as the transport hands it to rpc():
-	// {code: -32042, message, data: {elicitations: [ElicitRequestURLParams...]}}.
+	// The error's data member as the transport hands it to rpc():
+	// {elicitations: [ElicitRequestURLParams...]}.
 	Json e0 = Json.emptyObject;
 	e0["mode"] = "url";
 	e0["url"] = "https://example.com/elicit/a";
 	e0["elicitationId"] = "e-from-error";
 	Json data = Json.emptyObject;
 	data["elicitations"] = Json([e0]);
-	Json error = Json.emptyObject;
-	error["code"] = cast(int) ErrorCode.urlElicitationRequired;
-	error["message"] = "URL elicitation required";
-	error["data"] = data;
 
 	// rpc() must surface the error AND, as a side effect, register the id so a
 	// later completion correlates. Drive it through the real rpc() path via the
@@ -5022,7 +7230,7 @@ unittest  // -32042 URLElicitationRequiredError registers its elicitationIds (cl
 	// (HttpClientTransport.errorFrom) would build.
 	c.onRpcForTest = (string, Json) @safe {
 		throw new McpException(cast(int) ErrorCode.urlElicitationRequired,
-				"URL elicitation required", error);
+				"URL elicitation required", data);
 	};
 
 	bool threw;
@@ -5052,10 +7260,8 @@ unittest  // registerUrlElicitations records every announced id; a non-32042 err
 	e1["elicitationId"] = "id-2";
 	Json data = Json.emptyObject;
 	data["elicitations"] = Json([e0, e1]);
-	Json error = Json.emptyObject;
-	error["data"] = data;
 
-	c.registerUrlElicitations(error);
+	c.registerUrlElicitations(data);
 
 	string[] seen;
 	c.onNotification = (string method, Json) @safe { seen ~= method; };
@@ -5071,14 +7277,10 @@ unittest  // registerUrlElicitations records every announced id; a non-32042 err
 unittest  // registerUrlElicitations tolerates a malformed/absent elicitations payload
 {
 	auto c = McpClient.http("http://localhost");
-	c.registerUrlElicitations(Json.emptyObject); // no data
-	Json missingArray = Json.emptyObject;
-	missingArray["data"] = Json.emptyObject; // data present, elicitations absent
-	c.registerUrlElicitations(missingArray);
+	c.registerUrlElicitations(Json.undefined); // no data
+	c.registerUrlElicitations(Json.emptyObject); // data present, elicitations absent
 	Json badEntries = Json.emptyObject;
-	Json d = Json.emptyObject;
-	d["elicitations"] = Json([Json("not-an-object"), Json.emptyObject]);
-	badEntries["data"] = d;
+	badEntries["elicitations"] = Json([Json("not-an-object"), Json.emptyObject]);
 	c.registerUrlElicitations(badEntries); // entries without a string id are skipped
 
 	// None of the above should have registered a correlatable id.
@@ -5088,6 +7290,73 @@ unittest  // registerUrlElicitations tolerates a malformed/absent elicitations p
 	note["elicitationId"] = "not-an-object";
 	c.dispatchNotification("notifications/elicitation/complete", note);
 	assert(!forwarded);
+}
+
+unittest  // the URL elicitation ids awaiting completion are capped, evicting the oldest
+{
+	auto c = McpClient.http("http://localhost");
+	enum total = 5_000;
+	Json[] elicitations;
+	foreach (i; 0 .. total)
+	{
+		import std.conv : to;
+
+		elicitations ~= Json([
+			"mode": Json("url"),
+			"elicitationId": Json("e" ~ i.to!string)
+		]);
+	}
+	c.registerUrlElicitations(Json(["elicitations": Json(elicitations)]));
+	assert(c.elicitationIds_.length < total, "ids awaiting completion must be capped");
+	assert("e4999" in c.elicitationIds_, "the newest id must still be tracked");
+	assert("e0" !in c.elicitationIds_, "the oldest id is evicted first");
+}
+
+unittest  // a reply to a server request that fails to send is logged
+{
+	import std.algorithm : any, canFind;
+	import vibe.core.core : exitEventLoop, runEventLoop, runTask, yield;
+	import vibe.core.log : deregisterLogger, registerLogger, LogLevel, Logger, LogLine;
+
+	static final class CaptureLogger : Logger
+	{
+		string[] lines;
+		this() @safe
+		{
+			minLevel = LogLevel.warn;
+		}
+
+		override void log(ref LogLine line) @safe
+		{
+			lines ~= line.text;
+		}
+	}
+
+	auto logger = new CaptureLogger;
+	auto shared_ = () @trusted { return cast(shared) logger; }();
+	() @trusted { registerLogger(shared_); }();
+	scope (exit)
+		() @trusted { deregisterLogger(shared_); }();
+
+	auto t = new RecordingClientTransport();
+	t.sendFailure = new Exception("reply pipe broken");
+	auto c = new McpClient(t);
+	runTask(() nothrow{
+		scope (exit)
+			exitEventLoop();
+		try
+		{
+			c.dispatchInbound(Message(makeRequest(Json(5), "ping", Json.emptyObject)));
+			foreach (_; 0 .. 4)
+				yield();
+		}
+		catch (Exception)
+		{
+		}
+	});
+	runEventLoop();
+	auto lines = (cast() logger).lines;
+	assert(lines.any!(l => l.canFind("reply pipe broken")), "a failed reply must be logged");
 }
 
 unittest  // elicitation/complete without an elicitationId is ignored
@@ -5190,7 +7459,6 @@ unittest  // a log message is still forwarded to the generic onNotification obse
 unittest  // elicitation/create defaults to form mode when mode is absent
 {
 	auto c = McpClient.http("http://localhost");
-	c.capabilities.elicitation = true;
 	c.capabilities.elicitationForm = true;
 
 	bool delegateCalled;
@@ -5593,6 +7861,18 @@ unittest  // buildSubscriptionsListenParams nests resourceSubscriptions URIs as 
 	assert(rs[1].get!string == "file:///b");
 }
 
+unittest  // buildSubscriptionsListenParams nests taskIds as a string array
+{
+	SubscriptionFilter f;
+	f.taskIds = ["task-1", "task-2"];
+	auto p = McpClient.buildSubscriptionsListenParams(f);
+	auto ids = p["notifications"]["taskIds"];
+	assert(ids.type == Json.Type.array);
+	assert(ids.length == 2);
+	assert(ids[0].get!string == "task-1");
+	assert(ids[1].get!string == "task-2");
+}
+
 unittest  // buildSubscriptionsListenParams emits an empty notifications filter for an empty subscription
 {
 	SubscriptionFilter f;
@@ -5730,8 +8010,8 @@ unittest  // MRTR: withInputResponses attaches answers in top-level params.input
 	auto resp = InputResponse("date", Json([
 			"content": Json(["day": Json("monday")])
 	]));
-	auto params = McpClient.buildToolCallParams("book", Json.emptyObject,
-			ProgressToken.init, [resp]);
+	auto params = McpClient.withMrtr(McpClient.buildToolCallParams("book",
+			Json.emptyObject, ProgressToken.init), [resp]);
 	// SEP-2322: a top-level map keyed by the InputRequest id, value is the bare
 	// result — NOT under _meta and NOT an array of {id, result} wrappers.
 	auto map = params["inputResponses"];
@@ -5745,8 +8025,8 @@ unittest  // MRTR: withInputResponses attaches answers in top-level params.input
 
 unittest  // MRTR: withInputResponses with no answers leaves params untouched
 {
-	auto params = McpClient.buildToolCallParams("book", Json.emptyObject, ProgressToken.init, [
-	]);
+	auto params = McpClient.withMrtr(McpClient.buildToolCallParams("book",
+			Json.emptyObject, ProgressToken.init), []);
 	assert("inputResponses" !in params);
 	assert("_meta" !in params);
 }
@@ -5770,8 +8050,8 @@ unittest  // MRTR: withInputResponses preserves an existing params payload
 unittest  // MRTR: withRequestState echoes the opaque requestState at the top level
 {
 	auto resp = InputResponse("date", Json(["action": Json("accept")]));
-	auto params = McpClient.buildToolCallParams("book", Json.emptyObject,
-			ProgressToken.init, [resp], "eyJyIjoiRHVwIn0");
+	auto params = McpClient.withMrtr(McpClient.buildToolCallParams("book",
+			Json.emptyObject, ProgressToken.init), [resp], "eyJyIjoiRHVwIn0");
 	// SEP-2322: requestState is echoed verbatim as a top-level params field.
 	assert(params["requestState"].get!string == "eyJyIjoiRHVwIn0");
 }
@@ -5779,8 +8059,8 @@ unittest  // MRTR: withRequestState echoes the opaque requestState at the top le
 unittest  // MRTR: an empty requestState is never echoed (client MUST NOT invent one)
 {
 	auto resp = InputResponse("date", Json(["action": Json("accept")]));
-	auto params = McpClient.buildToolCallParams("book", Json.emptyObject,
-			ProgressToken.init, [resp]);
+	auto params = McpClient.withMrtr(McpClient.buildToolCallParams("book",
+			Json.emptyObject, ProgressToken.init), [resp]);
 	assert("requestState" !in params);
 }
 
@@ -5809,7 +8089,8 @@ unittest  // MRTR: resolveInputRequest routes a sampling request to onSampling
 		return CreateMessageResult.text("test-model", "reply");
 	};
 	InputResponse answer;
-	const ok = c.resolveInputRequest(InputRequest("s1", "sampling", Json.emptyObject), answer);
+	const ok = c.resolveInputRequest(InputRequest("s1", "sampling",
+			Json(["messages": Json.emptyArray, "maxTokens": Json(16)])), answer);
 	assert(ok);
 	assert(answer.id == "s1");
 	assert(answer.result["role"].get!string == "assistant");
@@ -5849,7 +8130,6 @@ unittest  // MRTR: resolveInputRequest rejects url-mode elicitation when only fo
 {
 	auto c = McpClient.http("http://localhost/mcp");
 	// Install only form-mode elicitation capability; url mode is not advertised.
-	c.capabilities.elicitation = true;
 	c.capabilities.elicitationForm = true;
 	bool delegateCalled;
 	c.onElicitation = (ElicitParams) @safe {
@@ -5869,7 +8149,6 @@ unittest  // MRTR: resolveInputRequest rejects url-mode elicitation when only fo
 unittest  // MRTR: resolveInputRequest accepts form-mode elicitation when form capability advertised (#934)
 {
 	auto c = McpClient.http("http://localhost/mcp");
-	c.capabilities.elicitation = true;
 	c.capabilities.elicitationForm = true;
 	bool delegateCalled;
 	c.onElicitation = (ElicitParams) @safe {
@@ -5911,6 +8190,19 @@ unittest  // cancel() eviction does not O(n)-scan unbounded stale cancelledOrder
 	const newId = cast(long)(N + McpClient.maxCancelledTracked_);
 	c.cancel(newId);
 	assert(c.isResponseCancelled(newId));
+}
+
+unittest  // the cancelled-id order queue stays bounded when late responses keep consuming ids
+{
+	auto c = McpClient.http("http://localhost");
+	c.onNotifyForTest = (Json message) @safe {};
+	foreach (i; 0 .. 10_000)
+	{
+		c.cancel(cast(long) i);
+		c.isCancelled(cast(long) i);
+	}
+	assert(c.cancelledOrder_.length <= 2 * McpClient.minCancelledOrderCompaction_,
+			"consumed ids must not accumulate in the order queue");
 }
 
 unittest  // a server that keeps requesting input stops at exactly maxRounds tools/call requests
@@ -6066,6 +8358,25 @@ unittest  // a direct resources/read result with a ttl is cached (control for th
 	c.readResource("file://r");
 	c.readResource("file://r");
 	assert(calls == 1);
+}
+
+unittest  // an MRTR call on another task does not stop a concurrent cacheable fetch from being cached
+{
+	// The nested callTool stands in for a request on another fiber that
+	// completes while this fetch is awaiting its reply.
+	auto c = McpClient.http("http://localhost");
+	c.enableModern();
+	int lists;
+	c.onRpcForTest = (string method, Json params) @safe {
+		if (method == "tools/call")
+			return inputRequiredRead();
+		lists++;
+		c.callTool("t", Json.emptyObject);
+		return Json(["tools": Json.emptyArray, "ttlMs": Json(60_000)]);
+	};
+	c.listTools();
+	c.listTools();
+	assert(lists == 1, "a concurrent MRTR call must not mark this fetch's result uncacheable");
 }
 
 unittest  // an unresolvable input-required read is returned as such and not cached
@@ -6289,6 +8600,60 @@ unittest  // listResources throws when the server cycles the pagination cursor
 	assertThrown!McpException(c.listResources());
 }
 
+unittest  // a non-converging pagination cursor is reported as a server fault, not invalid params
+{
+	auto c = McpClient.http("http://localhost");
+	c.onRpcForTest = (string method, Json params) @safe {
+		Json r = Json.emptyObject;
+		r["tools"] = Json.emptyArray;
+		r["nextCursor"] = "stuck";
+		return r;
+	};
+	int code;
+	try
+		c.listTools();
+	catch (McpException e)
+		code = e.code;
+	assert(code == ErrorCode.internalError);
+}
+
+unittest  // pollEvents sends every field of its PollParams
+{
+	auto c = McpClient.http("http://localhost");
+	c.enableModern();
+	Json sent;
+	c.onRpcForTest = (string method, Json params) @safe {
+		assert(method == "events/poll");
+		sent = params;
+		PollResult r;
+		r.cursor = "c2";
+		return r.toJson();
+	};
+	PollParams p;
+	p.name = "incident.created";
+	p.cursor = "c1";
+	p.maxEvents = 5;
+	auto res = c.pollEvents(p);
+	assert(sent["name"].get!string == "incident.created");
+	assert(sent["cursor"].get!string == "c1");
+	assert(sent["maxEvents"].get!long == 5);
+	assert(res.cursor.get == "c2");
+}
+
+unittest  // streamEvents opens events/stream from its StreamParams
+{
+	auto t = new RecordingClientTransport();
+	auto c = new McpClient(t);
+	c.enableModern();
+	StreamParams p;
+	p.name = "incident.created";
+	p.cursor = "c1";
+	c.streamEvents(p, (EventOccurrence o) @safe {});
+	assert(t.listens.length == 1);
+	assert(t.listens[0]["method"].get!string == "events/stream");
+	assert(t.listens[0]["params"]["cursor"].get!string == "c1");
+}
+
 unittest  // a cancelled-request id is evicted once its late response has been dropped
 {
 	auto transport = new RecordingClientTransport();
@@ -6303,7 +8668,7 @@ unittest  // a cancelled-request id is evicted once its late response has been d
 unittest  // a completed URL-elicitation id is evicted from the in-flight tracking set
 {
 	auto c = McpClient.http("http://localhost");
-	c.capabilities.elicitation = true;
+	c.capabilities.elicitationForm = true;
 	c.capabilities.elicitationUrl = true;
 	c.onElicitation = (ElicitParams) @safe { return ElicitResult.init; };
 
@@ -6692,13 +9057,14 @@ version (unittest)
 {
 	// A `tools/list` client over a SHARED store, bound to `partition`, whose
 	// canned response declares the given `cacheScope` and counts its wire hits.
-	private McpClient sharedCacheClient(CacheStore store, string partition,
-			string cacheScope, ref int calls) @safe
+	private McpClient sharedCacheClient(CacheStore store, string partition, string cacheScope,
+			ref int calls, string url = "http://localhost", string cacheServer = null) @safe
 	{
 		ClientSettings s;
 		s.cache = store;
 		s.cachePartition = partition;
-		auto c = McpClient.http("http://localhost", s);
+		s.cacheServer = cacheServer;
+		auto c = McpClient.http(url, s);
 		c.onRpcForTest = (string m, Json p) @safe {
 			Json r = Json.emptyObject;
 			if (m == "tools/list")
@@ -6712,6 +9078,55 @@ version (unittest)
 		};
 		return c;
 	}
+}
+
+unittest  // a bearer switch on one server's client keeps the principal's entries for other servers
+{
+	auto store = new InMemoryCacheStore();
+	int aCalls, bCalls;
+	auto a = sharedCacheClient(store, "alice", "private", aCalls, "http://10.0.0.1/mcp");
+	auto b = sharedCacheClient(store, "alice", "private", bCalls, "http://10.0.0.2/mcp");
+	a.listTools();
+	b.listTools();
+	a.setBearerToken("rotated");
+	b.listTools();
+	assert(bCalls == 1, "server B's entry must survive a re-authentication against server A");
+	a.listTools();
+	assert(aCalls == 2, "server A's own private entry must be evicted");
+}
+
+unittest  // an unhinted result cached under defaultCacheTtl stays in its own partition
+{
+	import core.time : seconds;
+
+	auto store = new InMemoryCacheStore();
+	int aCalls, bCalls;
+	McpClient unhinted(string partition, int* calls) @safe
+	{
+		ClientSettings s;
+		s.cache = store;
+		s.cachePartition = partition;
+		s.defaultCacheTtl = 60.seconds;
+		auto c = McpClient.http("http://localhost", s);
+		c.onRpcForTest = (string m, Json p) @safe {
+			Json r = Json.emptyObject;
+			if (m == "tools/list")
+			{
+				(*calls)++;
+				r["tools"] = Json.emptyArray;
+			}
+			return r;
+		};
+		return c;
+	}
+
+	auto a = unhinted("alice", &aCalls);
+	auto b = unhinted("bob", &bCalls);
+	a.listTools();
+	b.listTools();
+	a.listTools();
+	assert(aCalls == 1 && bCalls == 1,
+			"a fallback-TTL entry must not be served to another partition");
 }
 
 unittest  // a public result in a shared store is hit by every partition (one fetch total)
@@ -6762,6 +9177,84 @@ unittest  // a partitioned client's setBearerToken spares shared public entries
 	assert(aCalls == 1, "public entries survive an own-partition eviction");
 }
 
+unittest  // clients of different servers sharing a store never see each other's entries
+{
+	auto store = new InMemoryCacheStore();
+	int aCalls, bCalls;
+	auto a = sharedCacheClient(store, "", "public", aCalls, "http://server-a/mcp");
+	auto b = sharedCacheClient(store, "", "public", bCalls, "http://server-b/mcp");
+	a.listTools();
+	b.listTools(); // server B's tools are not server A's: must fetch
+	assert(aCalls == 1 && bCalls == 1, "a shared store must be namespaced by server");
+}
+
+unittest  // clients over custom transports sharing a store are isolated unless they name a cacheServer
+{
+	auto store = new InMemoryCacheStore();
+	int calls;
+	McpClient make() @safe
+	{
+		auto c = new McpClient(new RecordingClientTransport());
+		c.setCache(store);
+		c.onRpcForTest = (string m, Json p) @safe {
+			calls++;
+			return Json(["tools": Json.emptyArray, "ttlMs": Json(5000)]);
+		};
+		return c;
+	}
+
+	make().listTools();
+	make().listTools();
+	assert(calls == 2, "an unidentifiable transport must not share another client's entries");
+}
+
+unittest  // an explicit cacheServer lets clients of one server share entries across URLs
+{
+	auto store = new InMemoryCacheStore();
+	int aCalls, bCalls;
+	auto a = sharedCacheClient(store, "", "public", aCalls, "http://10.0.0.1/mcp", "svc");
+	auto b = sharedCacheClient(store, "", "public", bCalls, "http://10.0.0.2/mcp", "svc");
+	a.listTools();
+	b.listTools();
+	assert(aCalls == 1 && bCalls == 0);
+}
+
+unittest  // unpartitioned clients of one server sharing a store never see each other's private results
+{
+	auto store = new InMemoryCacheStore();
+	int aCalls, bCalls;
+	auto a = sharedCacheClient(store, "", "private", aCalls);
+	auto b = sharedCacheClient(store, "", "private", bCalls);
+	a.listTools();
+	b.listTools();
+	assert(aCalls == 1 && bCalls == 1, "a private result must not be served to another client");
+	a.listTools();
+	assert(aCalls == 1, "a client still hits its own private result");
+}
+
+unittest  // an unpartitioned client's setBearerToken spares another client's public entries in a shared store
+{
+	auto store = new InMemoryCacheStore();
+	int aCalls, bCalls;
+	auto a = sharedCacheClient(store, "", "public", aCalls);
+	auto b = sharedCacheClient(store, "", "public", bCalls);
+	a.listTools();
+	b.setBearerToken("rotated");
+	a.listTools();
+	assert(aCalls == 1, "a shared public entry must survive another client's re-authentication");
+}
+
+unittest  // an unpartitioned client's setBearerToken evicts its own private results from a shared store
+{
+	auto store = new InMemoryCacheStore();
+	int calls;
+	auto a = sharedCacheClient(store, "", "private", calls);
+	a.listTools();
+	a.setBearerToken("rotated");
+	a.listTools();
+	assert(calls == 2);
+}
+
 version (unittest)
 {
 	// A minimal, HTTP-free `ClientTransport` used to prove that `McpClient`
@@ -6781,7 +9274,7 @@ version (unittest)
 			protocol = p;
 		}
 
-		void setInboundHandler(void delegate(Message) @safe handler) @safe
+		void setInboundHandler(void delegate(Message, InboundOrigin) @safe handler) @safe
 		{
 		}
 
@@ -6789,8 +9282,21 @@ version (unittest)
 		{
 		}
 
+		void setBearerProvider(BearerProvider provider) @safe
+		{
+		}
+
+		bool modern; // the last value passed to setModernProtocol
+		Duration requestTimeout = Duration.max; // the last value passed to setRequestTimeout
+
+		void setRequestTimeout(Duration timeout) @safe
+		{
+			requestTimeout = timeout;
+		}
+
 		void setModernProtocol(bool modern) @safe
 		{
+			this.modern = modern;
 		}
 
 		bool cancelsByStreamClose() @safe
@@ -6808,12 +9314,31 @@ version (unittest)
 		}
 
 		Json[] listens; // every message passed to openListen, in order
+		SubscriptionStream[] streams; // every stream openListen returned, in order
+		// Failures thrown by the next openListen calls, consumed front first.
+		McpException[] listenFailures;
+		// When set, openListen returns a stream the server already ended cleanly,
+		// as one that closes before its leading frame.
+		bool listensEndAtOpen;
+		// Run inside each openListen, as a caller acting while the open blocks.
+		void delegate() @safe onListen;
 
 		SubscriptionStream openListen(Json message) @safe
 		{
 			listens ~= message;
-			auto cancelled = () @trusted { return new shared bool(false); }();
-			return new SubscriptionStream(cancelled);
+			if (onListen !is null)
+				onListen();
+			if (listenFailures.length)
+			{
+				auto e = listenFailures[0];
+				listenFailures = listenFailures[1 .. $];
+				throw e;
+			}
+			auto cancelled = new shared bool(false);
+			streams ~= new SubscriptionStream(cancelled);
+			if (listensEndAtOpen)
+				streams[$ - 1].finish();
+			return streams[$ - 1];
 		}
 
 		Json deliver(Json message, long expectId) @safe
@@ -6821,11 +9346,113 @@ version (unittest)
 			return responder is null ? Json.emptyObject : responder(message, expectId);
 		}
 
+		Exception sendFailure; // thrown by every sendOneway when set
+
 		void sendOneway(Json message) @safe
+		{
+			if (sendFailure !is null)
+				throw sendFailure;
+		}
+
+		void postOneway(Json message) @safe nothrow
 		{
 		}
 
-		bool repliesSynchronously() @safe
+		long[] aborted; // every id passed to abort, in order
+
+		void abort(long expectId, McpException reason) @safe
+		{
+			aborted ~= expectId;
+		}
+
+		void close() @safe
+		{
+		}
+	}
+}
+
+version (unittest)
+{
+	import mcp.server.server : McpServer;
+
+	// A `ClientTransport` that hands each message straight to an in-process
+	// `McpServer`, so `McpClient` runs end-to-end against the real server
+	// dispatcher without a socket.
+	private final class ServerBackedTransport : ClientTransport
+	{
+		private McpServer server_;
+
+		this(McpServer server) @safe
+		{
+			server_ = server;
+		}
+
+		Json deliver(Json message, long) @safe
+		{
+			auto resp = server_.handle(Message(message)).get;
+			if ("error" in resp)
+				throw new McpException(cast(ErrorCode) resp["error"]["code"].get!int,
+						resp["error"]["message"].get!string, "data" in resp["error"]
+						? resp["error"]["data"] : Json.undefined);
+			return resp["result"];
+		}
+
+		void sendOneway(Json message) @safe
+		{
+			server_.handle(Message(message));
+		}
+
+		void postOneway(Json message) @safe nothrow
+		{
+			try
+				sendOneway(message);
+			catch (Exception)
+			{
+			}
+		}
+
+		void abort(long, McpException) @safe
+		{
+		}
+
+		void startServerStream() @safe
+		{
+		}
+
+		SubscriptionStream openListen(Json) @safe
+		{
+			return null;
+		}
+
+		void setInboundHandler(void delegate(Message, InboundOrigin) @safe) @safe
+		{
+		}
+
+		void setProtocol(ClientProtocol) @safe
+		{
+		}
+
+		void startLegacyFallback() @safe
+		{
+		}
+
+		void setBearerToken(string) @safe
+		{
+		}
+
+		void setBearerProvider(BearerProvider) @safe
+		{
+		}
+
+		void setModernProtocol(bool) @safe
+		{
+		}
+
+		void setRequestTimeout(Duration) @safe
+		{
+		}
+
+		bool cancelsByStreamClose() @safe
 		{
 			return false;
 		}
@@ -6834,6 +9461,123 @@ version (unittest)
 		{
 		}
 	}
+}
+
+unittest  // connect() negotiates a legacy version with a stateful server that requires initialization
+{
+	auto server = McpServer.stateful("stateful-srv", "1.0");
+	server.requireInitialized();
+	auto c = new McpClient(new ServerBackedTransport(server));
+	const chosen = c.connect();
+	assert(!chosen.isModern);
+	assert(c.serverInfo().name == "stateful-srv");
+}
+
+unittest  // connect() falls back to initialize when the discover probe gets any non-version JSON-RPC error
+{
+	foreach (code; [
+		ErrorCode.invalidRequest, ErrorCode.invalidParams, cast(ErrorCode)-32002
+	])
+	{
+		auto transport = new RecordingClientTransport();
+		auto c = new McpClient(transport);
+		transport.responder = (Json message, long expectId) @safe {
+			if (message["method"].get!string == "server/discover")
+				throw new McpException(code, "rejected");
+			Json r = Json.emptyObject;
+			r["protocolVersion"] = latestLegacy.toWire;
+			r["capabilities"] = Json.emptyObject;
+			r["serverInfo"] = Json([
+				"name": Json("legacy-srv"),
+				"version": Json("1.0")
+			]);
+			return r;
+		};
+		assert(c.connect() == latestLegacy);
+	}
+}
+
+unittest  // connect() rethrows a probe timeout, transport failure or internal error instead of assuming a legacy server
+{
+	import std.exception : collectException;
+
+	McpException[] failures = [
+		new RequestTimeoutException("timed out"),
+		new TransportClosedException("stdio channel closed"),
+		new McpException(ErrorCode.internalError, "connection refused"),
+	];
+	foreach (failure; failures)
+	{
+		auto transport = new RecordingClientTransport();
+		auto c = new McpClient(transport);
+		bool initialized;
+		transport.responder = (Json message, long expectId) @safe {
+			if (message["method"].get!string == "server/discover")
+				throw failure;
+			initialized = true;
+			return Json.emptyObject;
+		};
+		auto thrown = collectException!McpException(c.connect());
+		assert(thrown is failure, "connect() must surface the probe failure");
+		assert(!initialized, "a failed probe must not fall back to initialize");
+	}
+}
+
+unittest  // connect() rethrows a modern-only probe rejection instead of assuming a legacy server
+{
+	import std.exception : collectException;
+
+	foreach (code; [
+		ErrorCode.headerMismatch, ErrorCode.missingRequiredClientCapability
+	])
+	{
+		auto transport = new RecordingClientTransport();
+		auto c = new McpClient(transport);
+		bool initialized;
+		auto failure = new McpException(code, "rejected");
+		transport.responder = (Json message, long expectId) @safe {
+			if (message["method"].get!string == "server/discover")
+				throw failure;
+			initialized = true;
+			return Json.emptyObject;
+		};
+		auto thrown = collectException!McpException(c.connect());
+		assert(thrown is failure, "connect() must surface a modern-only rejection");
+		assert(!initialized, "a modern-only rejection must not fall back to initialize");
+	}
+}
+
+unittest  // initialize after enableModern runs the legacy handshake and leaves modern mode
+{
+	auto transport = new RecordingClientTransport();
+	auto c = new McpClient(transport);
+	c.enableModern();
+	Json initMessage;
+	transport.responder = (Json message, long expectId) @safe {
+		if (message["method"].get!string == "initialize")
+			initMessage = message;
+		Json r = Json.emptyObject;
+		r["protocolVersion"] = latestLegacy.toWire;
+		r["capabilities"] = Json.emptyObject;
+		r["serverInfo"] = Json([
+			"name": Json("legacy-srv"),
+			"version": Json("1.0")
+		]);
+		return r;
+	};
+	c.initialize();
+	assert("_meta" !in initMessage["params"], "initialize must not carry modern _meta");
+	assert(!transport.modern, "the transport must leave modern mode");
+}
+
+unittest  // the requestTimeout setter forwards the new timeout to the transport
+{
+	auto transport = new RecordingClientTransport();
+	auto c = new McpClient(transport);
+	c.requestTimeout = 5.seconds;
+	assert(transport.requestTimeout == 5.seconds);
+	c.requestTimeout = Duration.zero;
+	assert(transport.requestTimeout == Duration.zero);
 }
 
 unittest  // McpClient installs its ClientProtocol collaborator on an arbitrary transport
@@ -6932,21 +9676,19 @@ unittest  // the task methods mirror params.taskId into Mcp-Name on a modern ses
 
 unittest  // connect() routes a legacy HTTP+SSE fallback through the transport seam, not a downcast
 {
-	// When discover() raises LegacyFallbackException, the client must initiate the
+	// When discover() is rejected with HTTP 404, the client must initiate the
 	// fallback via ClientTransport.startLegacyFallback(), with no cast to
 	// HttpClientTransport. A custom transport observes the call and then answers
 	// the subsequent legacy initialize handshake.
-	import mcp.client.http_transport : LegacyFallbackException;
+	import mcp.client.http_transport : HttpStatusException;
 
 	auto transport = new RecordingClientTransport();
 	auto c = new McpClient(transport);
-	bool firstCall = true;
 	transport.responder = (Json message, long expectId) @safe {
-		if (firstCall)
-		{
-			firstCall = false;
-			throw new LegacyFallbackException(404);
-		}
+		// Both the modern probe and the Streamable HTTP initialize are rejected;
+		// only the handshake after the fallback opens succeeds.
+		if (!transport.legacyFallbackCalled)
+			throw new HttpStatusException(404, "not found");
 		// The legacy initialize handshake: echo a minimal initialize result.
 		Json r = Json.emptyObject;
 		r["protocolVersion"] = ProtocolVersion.v2024_11_05.toWire;
@@ -6981,8 +9723,8 @@ unittest  // connect() auto-detect probes server/discover with modern framing an
 		assert(headers[HttpHeader.protocolVersion] == ProtocolVersion.v2026_07_28.toWire);
 		sawModernFramedDiscover = true;
 		Json r = Json.emptyObject;
-		r["protocolVersions"] = Json.emptyArray;
-		r["protocolVersions"] ~= Json(ProtocolVersion.v2026_07_28.toWire);
+		r["supportedVersions"] = Json.emptyArray;
+		r["supportedVersions"] ~= Json(ProtocolVersion.v2026_07_28.toWire);
 		r["capabilities"] = Json.emptyObject;
 		Json info = Json.emptyObject;
 		info["name"] = "modern-srv";
@@ -7068,6 +9810,125 @@ unittest  // connect() populates serverCapabilities/serverInfo/serverInstruction
 	assert(c.serverInstructions().get == "hello");
 }
 
+unittest  // a cacheable read that completes after a bearer switch is neither cached nor indexed
+{
+	auto c = new McpClient(new RecordingClientTransport());
+	c.setDefaultCacheTtl(1.minutes);
+	int calls;
+	c.onRpcForTest = (string method, Json params) @safe {
+		if (++calls == 1)
+			c.setBearerToken("identity-b"); // the identity changes mid-flight
+		ListToolsResult r;
+		r.tools = [Tool("alice-only")];
+		return r.toJson();
+	};
+	c.listTools();
+	assert(!c.haveListedTools_, "identity A's tool list must not be indexed for identity B");
+	c.listTools();
+	assert(calls == 2, "identity A's response must not be served to identity B");
+}
+
+unittest  // a default client caps every request with a finite maxTotalTimeout
+{
+	auto c = new McpClient(new RecordingClientTransport());
+	assert(ClientSettings.init.maxTotalTimeout == 30.minutes);
+	assert(c.maxTotalTimeout_ == 30.minutes,
+			"progress must not keep a default request alive forever");
+}
+
+unittest  // a client over a custom transport applies every ClientSettings knob
+{
+	auto t = new RecordingClientTransport();
+	ClientSettings s;
+	s.clientInfo = Implementation("custom", "9.9");
+	s.requestTimeout = 5.seconds;
+	s.resetTimeoutOnProgress = false;
+	s.maxTotalTimeout = 7.seconds;
+	s.reinitializeOnSessionExpiry = true;
+	s.taskPollInterval = 2.seconds;
+	s.taskTimeout = 3.seconds;
+	s.maxTaskPollInterval = 4.seconds;
+	s.cacheServer = "svc";
+	s.cachePartition = "alice";
+	s.defaultCacheTtl = 9.seconds;
+	auto c = new McpClient(t, s);
+	assert(c.clientInfo.name == "custom");
+	assert(t.requestTimeout == 5.seconds, "the transport must learn the request timeout");
+	assert(c.requestTimeout == 5.seconds);
+	assert(!c.resetTimeoutOnProgress_);
+	assert(c.maxTotalTimeout_ == 7.seconds);
+	assert(c.reinitializeOnSessionExpiry_);
+	assert(c.taskPollInterval_ == 2.seconds);
+	assert(c.taskTimeout_ == 3.seconds);
+	assert(c.maxTaskPollInterval_ == 4.seconds);
+	assert(c.cacheServer_ == "svc");
+	assert(c.cachePartition_ == "alice");
+	assert(c.defaultCacheTtl_ == 9.seconds);
+}
+
+unittest  // connect() leaves the client unnegotiated when discovery finds no mutual version
+{
+	import std.exception : collectException;
+
+	auto transport = new RecordingClientTransport();
+	auto c = new McpClient(transport);
+	const before = c.protocolVersion;
+	transport.responder = (Json message, long expectId) @safe {
+		DiscoverResult d;
+		d.supportedVersions = ["1999-01-01"];
+		return d.toJson();
+	};
+	auto e = collectException!McpException(c.connect());
+	assert(e !is null && e.code == ErrorCode.unsupportedProtocolVersion);
+	assert(c.protocolVersion == before, "a failed connect must not leave a negotiated version");
+	assert(!transport.modern);
+	assert(!c.useModern, "a failed connect must not leave modern framing on");
+}
+
+unittest  // connect()'s discover probe frames only itself as modern
+{
+	auto transport = new RecordingClientTransport();
+	auto c = new McpClient(transport);
+	string[string] probeHeaders, otherHeaders;
+	transport.responder = (Json message, long expectId) @safe {
+		probeHeaders = c.headersFor(message);
+		// A request another task sends while the probe is in flight.
+		otherHeaders = c.headersFor(makeRequest(Json(99), "tools/list", Json.emptyObject));
+		DiscoverResult d;
+		d.supportedVersions = ["1999-01-01"];
+		return d.toJson();
+	};
+	try
+		c.connect();
+	catch (McpException)
+	{
+	}
+	assert(probeHeaders.get(HttpHeader.method, "") == "server/discover",
+			"the probe must carry the modern routing headers");
+	assert(probeHeaders.get(HttpHeader.protocolVersion, "") == ProtocolVersion.v2026_07_28.toWire);
+	assert(HttpHeader.method !in otherHeaders,
+			"a concurrent request must not pick up the probe's modern framing");
+}
+
+unittest  // discover() on a modern session adopts the server's capabilities, identity and instructions
+{
+	auto transport = new RecordingClientTransport();
+	auto c = new McpClient(transport);
+	c.enableModern();
+	c.onRpcForTest = (string method, Json params) @safe {
+		DiscoverResult d;
+		d.supportedVersions = [ProtocolVersion.v2026_07_28.toWire];
+		d.serverInfo = Implementation("modern-srv", "2.0");
+		d.capabilities.logging = true;
+		d.instructions = "hello";
+		return d.toJson();
+	};
+	c.discover();
+	assert(c.serverInfo().name == "modern-srv");
+	assert(c.serverCapabilities().logging);
+	assert(!c.serverInstructions().isNull && c.serverInstructions().get == "hello");
+}
+
 version (unittest)
 {
 	// A `DiscoverResult` advertising `versions`, plus a fixed identity/instructions,
@@ -7075,7 +9936,7 @@ version (unittest)
 	private DiscoverResult fixtureDiscover(string[] versions) @safe
 	{
 		DiscoverResult d;
-		d.protocolVersions = versions;
+		d.supportedVersions = versions;
 		d.serverInfo = Implementation("cached-srv", "3.1");
 		d.instructions = "from cache";
 		return d;
@@ -7103,7 +9964,7 @@ unittest  // connect(DiscoverResult) adopts a modern session with zero round tri
 	assert(!c.serverInstructions().isNull && c.serverInstructions().get == "from cache");
 	// The adopted result is exposed via discoverResult().
 	assert(!c.discoverResult().isNull);
-	assert(c.discoverResult().get.protocolVersions == [
+	assert(c.discoverResult().get.supportedVersions == [
 		ProtocolVersion.v2026_07_28.toWire
 	]);
 }
@@ -7256,6 +10117,68 @@ unittest  // MRTR: getPrompt stops at maxRounds prompts/get requests
 	assert(result.isInputRequired);
 }
 
+unittest  // MRTR: callTool retries a requestState-only input_required result, echoing the state
+{
+	auto c = McpClient.http("http://localhost/mcp");
+	int calls;
+	string echoed;
+	c.onRpcForTest = (string method, Json params) @safe {
+		assert(method == "tools/call");
+		calls++;
+		Json res = Json.emptyObject;
+		if (calls == 1)
+		{
+			res["resultType"] = "input_required";
+			res["requestState"] = "s";
+			return res;
+		}
+		if ("requestState" in params)
+			echoed = params["requestState"].get!string;
+		res["content"] = Json([
+			Json(["type": Json("text"), "text": Json("done")])
+		]);
+		return res;
+	};
+
+	auto result = c.callTool("t", Json.emptyObject);
+	assert(calls == 2);
+	assert(echoed == "s");
+	assert(!result.isInputRequired);
+	assert(result.content[0].text == "done");
+}
+
+unittest  // a request on a closed client is refused without reaching the transport
+{
+	auto c = McpClient.http("http://localhost");
+	int sent;
+	c.onRpcForTest = (string method, Json params) @safe {
+		sent++;
+		return Json(["tools": Json.emptyArray]);
+	};
+	c.close();
+	string msg;
+	try
+		c.listTools();
+	catch (McpException e)
+		msg = e.msg;
+	assert(sent == 0, "a closed client must not send requests");
+	assert(msg == "the client is closed", "unexpected error: " ~ msg);
+}
+
+unittest  // a notification on a closed client is refused without being sent
+{
+	auto c = McpClient.http("http://localhost");
+	int sent;
+	c.onNotifyForTest = (Json message) @safe { sent++; };
+	c.close();
+	bool refused;
+	try
+		c.sendNotification("notifications/roots/list_changed");
+	catch (McpException)
+		refused = true;
+	assert(refused && sent == 0, "a closed client must not send notifications");
+}
+
 unittest  // test-only RPC/notify hooks are guarded behind version(unittest)
 {
 	// The test seams `onRpcForTest`, `onNotifyForTest`, and
@@ -7304,16 +10227,17 @@ unittest  // concurrent push streams for one event type each get only their own 
 	// two same-event streams independent.
 	auto transport = new RecordingClientTransport();
 	auto c = new McpClient(transport);
+	c.enableModern();
 
 	int aCount, bCount;
 	string aSev, bSev;
 	// nextId starts at 1, so the first stream is subscriptionId 1, the second 2.
-	cast(void) c.streamEvents("incident.created", (EventOccurrence o) @safe {
+	cast(void) c.streamEvents(StreamParams("incident.created"), (EventOccurrence o) @safe {
 		aCount++;
 		if ("severity" in o.data)
 			aSev = o.data["severity"].get!string;
 	});
-	cast(void) c.streamEvents("incident.created", (EventOccurrence o) @safe {
+	cast(void) c.streamEvents(StreamParams("incident.created"), (EventOccurrence o) @safe {
 		bCount++;
 		if ("severity" in o.data)
 			bSev = o.data["severity"].get!string;
@@ -7342,11 +10266,12 @@ unittest  // a push terminated control is delivered typed and drops the stream's
 {
 	auto transport = new RecordingClientTransport();
 	auto c = new McpClient(transport);
+	c.enableModern();
 
 	int events;
 	EventControl gotCtrl;
 	bool gotControl;
-	cast(void) c.streamEvents("incident.created", (EventOccurrence o) @safe {
+	cast(void) c.streamEvents(StreamParams("incident.created"), (EventOccurrence o) @safe {
 		events++;
 	}, (EventControl ctrl) @safe { gotCtrl = ctrl; gotControl = true; });
 
@@ -7371,9 +10296,10 @@ unittest  // cancelling a stream deregisters its handlers (later occurrences ign
 {
 	auto transport = new RecordingClientTransport();
 	auto c = new McpClient(transport);
+	c.enableModern();
 
 	int events;
-	auto s = c.streamEvents("incident.created", (EventOccurrence o) @safe {
+	auto s = c.streamEvents(StreamParams("incident.created"), (EventOccurrence o) @safe {
 		events++;
 	});
 	s.close();
@@ -7393,6 +10319,7 @@ version (unittest) private enum managedTestWhsec = "whsec_AAAAAAAAAAAAAAAAAAAAAA
 unittest  // subscribePoll's loop: delivers events, advances the cursor, drains hasMore, signals a gap
 {
 	auto c = new McpClient(new RecordingClientTransport());
+	c.enableModern();
 	int polls;
 	c.onRpcForTest = (string method, Json params) @safe {
 		assert(method == "events/poll");
@@ -7429,9 +10356,37 @@ unittest  // subscribePoll's loop: delivers events, advances the cursor, drains 
 	assert(sub.cursor.get == "c2");
 }
 
+unittest  // the poll loop sleeps on a hasMore poll that made no progress
+{
+	auto c = new McpClient(new RecordingClientTransport());
+	c.enableModern();
+	int polls;
+	auto sub = new EventSubscription();
+	c.onRpcForTest = (string method, Json params) @safe {
+		polls++;
+		if (polls > 5)
+			sub.cancel();
+		PollResult r;
+		r.cursor = "c";
+		r.hasMore = true;
+		return r.toJson();
+	};
+	int sleeps;
+	sub.advanceCursor(Nullable!string("c"));
+	c.onEventPollSleepForTest = (Duration d) @safe {
+		sleeps++;
+		if (sleeps == 2)
+			sub.cancel();
+	};
+	c.runPollLoop(sub, PollParams("incident.created"), null, null);
+	assert(polls == 2, "a hasMore poll with no events and the same cursor must not re-poll at once");
+	assert(sleeps == 2);
+}
+
 unittest  // the poll loop clamps a tiny nextPollMs up to the default 1000 ms floor
 {
 	auto c = new McpClient(new RecordingClientTransport());
+	c.enableModern();
 	c.onRpcForTest = (string method, Json params) @safe {
 		PollResult r;
 		r.cursor = "c";
@@ -7445,9 +10400,67 @@ unittest  // the poll loop clamps a tiny nextPollMs up to the default 1000 ms fl
 	assert(slept == 1.seconds);
 }
 
+unittest  // the poll loop caps a huge nextPollMs at EventClientSettings.pollCeiling
+{
+	auto c = new McpClient(new RecordingClientTransport());
+	c.enableModern();
+	c.onRpcForTest = (string method, Json params) @safe {
+		PollResult r;
+		r.cursor = "c";
+		r.nextPollMs = 10L * 24 * 3600 * 1000;
+		return r.toJson();
+	};
+	Duration slept;
+	auto sub = new EventSubscription();
+	c.onEventPollSleepForTest = (Duration d) @safe { slept = d; sub.cancel(); };
+	c.runPollLoop(sub, PollParams("incident.created"), null, null);
+	assert(slept == EventClientSettings.init.pollCeiling);
+}
+
+unittest  // cancelling a poll subscription wakes its loop from a long nextPollMs
+{
+	import core.time : MonoTime;
+	import vibe.core.core : exitEventLoop, runEventLoop, runTask, sleep;
+
+	auto c = new McpClient(new RecordingClientTransport());
+	c.enableModern();
+	c.onRpcForTest = (string method, Json params) @safe {
+		PollResult r;
+		r.cursor = "c";
+		r.nextPollMs = 30_000;
+		return r.toJson();
+	};
+	auto sub = new EventSubscription();
+	Duration took = Duration.max;
+	runTask(() nothrow{
+		scope (exit)
+			exitEventLoop();
+		const start = MonoTime.currTime;
+		try
+			c.runPollLoop(sub, PollParams("incident.created"), null, null);
+		catch (Exception)
+		{
+		}
+		took = MonoTime.currTime - start;
+	});
+	runTask(() nothrow{
+		try
+		{
+			sleep(100.msecs);
+			sub.cancel();
+		}
+		catch (Exception)
+		{
+		}
+	});
+	runEventLoop();
+	assert(took < 2.seconds, "a cancelled poll subscription must not sleep out nextPollMs");
+}
+
 unittest  // the poll floor is configurable via EventClientSettings
 {
 	auto c = new McpClient(new RecordingClientTransport());
+	c.enableModern();
 	EventClientSettings es;
 	es.pollFloor = 5.seconds;
 	c.eventSettings = es;
@@ -7467,6 +10480,7 @@ unittest  // the poll floor is configurable via EventClientSettings
 unittest  // the poll loop delivers a redelivered eventId only once
 {
 	auto c = new McpClient(new RecordingClientTransport());
+	c.enableModern();
 	int polls;
 	c.onRpcForTest = (string method, Json params) @safe {
 		polls++;
@@ -7491,7 +10505,7 @@ unittest  // the poll loop delivers a redelivered eventId only once
 unittest  // selectDeliveryMode prefers webhook, then push, then poll among advertised modes
 {
 	auto c = new McpClient(new RecordingClientTransport());
-	EventType all = EventType("t", "", "", [
+	EventType all = EventType(name: "t", delivery: [
 		DeliveryMode.poll, DeliveryMode.push, DeliveryMode.webhook
 	]);
 	assert(c.selectDeliveryMode(all) == DeliveryMode.push); // no webhook config
@@ -7502,7 +10516,7 @@ unittest  // selectDeliveryMode prefers webhook, then push, then poll among adve
 	c.eventSettings = es;
 	assert(c.selectDeliveryMode(all) == DeliveryMode.webhook);
 
-	EventType pollOnly = EventType("t", "", "", [DeliveryMode.poll]);
+	EventType pollOnly = EventType(name: "t", delivery: [DeliveryMode.poll]);
 	assert(c.selectDeliveryMode(pollOnly) == DeliveryMode.poll);
 }
 
@@ -7512,14 +10526,18 @@ unittest  // a mode the client removed from preferredModes is never selected
 	EventClientSettings es;
 	es.preferredModes = [DeliveryMode.poll];
 	c.eventSettings = es;
-	EventType t = EventType("t", "", "", [DeliveryMode.push, DeliveryMode.poll]);
+	EventType t = EventType(name: "t", delivery: [
+		DeliveryMode.push, DeliveryMode.poll
+	]);
 	assert(c.selectDeliveryMode(t) == DeliveryMode.poll);
 }
 
 unittest  // selectDeliveryMode throws NoCompatibleDeliveryMode when nothing fits
 {
 	auto c = new McpClient(new RecordingClientTransport());
-	EventType webhookOnly = EventType("t", "", "", [DeliveryMode.webhook]);
+	EventType webhookOnly = EventType(name: "t", delivery: [
+		DeliveryMode.webhook
+	]);
 	bool threw;
 	try
 		c.selectDeliveryMode(webhookOnly);
@@ -7531,7 +10549,9 @@ unittest  // selectDeliveryMode throws NoCompatibleDeliveryMode when nothing fit
 unittest  // a forced mode is honoured when advertised and rejected otherwise
 {
 	auto c = new McpClient(new RecordingClientTransport());
-	EventType t = EventType("t", "", "", [DeliveryMode.push, DeliveryMode.poll]);
+	EventType t = EventType(name: "t", delivery: [
+		DeliveryMode.push, DeliveryMode.poll
+	]);
 	assert(c.selectDeliveryMode(t, nullable(DeliveryMode.poll)) == DeliveryMode.poll);
 	bool threw;
 	try
@@ -7545,11 +10565,12 @@ unittest  // subscribeEvents looks the type up and opens a push stream for a pus
 {
 	auto t = new RecordingClientTransport();
 	auto c = new McpClient(t);
+	c.enableModern();
 	c.onRpcForTest = (string method, Json params) @safe {
 		assert(method == "events/list");
 		EventListResult r;
 		r.events = [
-			EventType("incident.created", "", "", [
+			EventType(name: "incident.created", delivery: [
 				DeliveryMode.poll, DeliveryMode.push
 			])
 		];
@@ -7566,9 +10587,12 @@ unittest  // subscribeEvents looks the type up and opens a push stream for a pus
 unittest  // subscribeEvents falls back to poll and reports an unknown type as NotFound
 {
 	auto c = new McpClient(new RecordingClientTransport());
+	c.enableModern();
 	c.onRpcForTest = (string method, Json params) @safe {
 		EventListResult r;
-		r.events = [EventType("email.received", "", "", [DeliveryMode.poll])];
+		r.events = [
+			EventType(name: "email.received", delivery: [DeliveryMode.poll])
+		];
 		return r.toJson();
 	};
 	auto sub = c.subscribeEvents("email.received", SubscribeOptions.init, null);
@@ -7584,6 +10608,7 @@ unittest  // subscribeEvents falls back to poll and reports an unknown type as N
 unittest  // subscribeEvents in webhook mode mints a secret, registers the receiver, and subscribes
 {
 	auto c = new McpClient(new RecordingClientTransport());
+	c.enableModern();
 	auto rx = new WebhookReceiver();
 	EventClientSettings es;
 	es.webhook.url = "https://proxy.example.com/hooks/c1";
@@ -7596,7 +10621,7 @@ unittest  // subscribeEvents in webhook mode mints a secret, registers the recei
 		{
 			EventListResult r;
 			r.events = [
-				EventType("incident.created", "", "", [
+				EventType(name: "incident.created", delivery: [
 					DeliveryMode.webhook, DeliveryMode.poll
 				])
 			];
@@ -7623,6 +10648,7 @@ unittest  // subscribeEvents in webhook mode mints a secret, registers the recei
 unittest  // subscribePoll surfaces a poll error as a typed control and ends the subscription
 {
 	auto c = new McpClient(new RecordingClientTransport());
+	c.enableModern();
 	c.onRpcForTest = (string method, Json params) @safe {
 		throw new McpException(ErrorCode.invalidRequest, "boom");
 	};
@@ -7636,9 +10662,137 @@ unittest  // subscribePoll surfaces a poll error as a typed control and ends the
 	assert(!sub.active);
 }
 
+unittest  // a throwing poll onEvent ends the subscription with an error control at the last handled cursor
+{
+	auto c = new McpClient(new RecordingClientTransport());
+	c.enableModern();
+	c.onRpcForTest = (string method, Json params) @safe {
+		PollResult r;
+		auto ok = EventOccurrence("e1", "incident.created", "t");
+		ok.cursor = "c1";
+		auto bad = EventOccurrence("e2", "incident.created", "t");
+		bad.cursor = "c2";
+		r.events = [ok, bad];
+		r.cursor = "c3";
+		return r.toJson();
+	};
+	EventControl[] ctrls;
+	auto sub = new EventSubscription();
+	sub.dedupCapacity(100);
+	c.onEventPollSleepForTest = (Duration d) @safe { sub.cancel(); };
+	bool escaped;
+	try
+		c.runPollLoop(sub, PollParams("incident.created"), (EventOccurrence o) @safe {
+			if (o.eventId == "e2")
+				throw new Exception("handler failed");
+		}, (EventControl ctrl) @safe { ctrls ~= ctrl; });
+	catch (Exception)
+		escaped = true;
+	assert(!escaped, "a handler failure must not escape the poll loop");
+	assert(ctrls.length == 1 && ctrls[0].kind == EventControlKind.error);
+	assert(!sub.active, "a handler failure must end the subscription");
+	assert(sub.cursor.get == "c1", "the cursor must stay at the last handled event");
+	assert(!sub.isSeen("e2"), "the failed event must not be recorded as delivered");
+}
+
+unittest  // a throwing stream onEvent ends the subscription without advancing past the event
+{
+	auto t = new RecordingClientTransport();
+	auto c = new McpClient(t);
+	c.enableModern();
+	EventControl[] ctrls;
+	auto sub = c.subscribeStream(StreamParams("incident.created"), (EventOccurrence o) @safe {
+		throw new Exception("handler failed");
+	}, (EventControl ctrl) @safe { ctrls ~= ctrl; });
+	try
+		c.dispatchInbound(Message(makeNotification(eventsEventNotification,
+				withSubscriptionId(Json([
+					"eventId": Json("e"),
+					"name": Json("incident.created"),
+					"timestamp": Json("t"),
+					"data": Json.emptyObject,
+					"cursor": Json("c9")
+	]), Json(1)))));
+	catch (Exception)
+	{
+	}
+	assert(sub.cursor.isNull, "the cursor must not move past an unhandled event");
+	assert(!sub.isSeen("e"), "the failed event must not be recorded as delivered");
+	assert(ctrls.length == 1 && ctrls[0].kind == EventControlKind.error);
+	assert(!sub.active, "a handler failure must end the subscription");
+	assert(t.streams[0].ended, "the ended subscription must close its stream");
+}
+
+unittest  // a poll on a closed transport ends the subscription instead of retrying forever
+{
+	auto c = new McpClient(new RecordingClientTransport());
+	c.enableModern();
+	int polls;
+	c.onRpcForTest = (string method, Json params) @safe {
+		polls++;
+		throw new TransportClosedException("stdio channel closed");
+	};
+	EventControl[] ctrls;
+	auto sub = new EventSubscription();
+	c.onEventPollSleepForTest = (Duration d) @safe {
+		if (polls > 3)
+			sub.cancel();
+	};
+	c.runPollLoop(sub, PollParams("incident.created"), null, (EventControl ctrl) @safe {
+		ctrls ~= ctrl;
+	});
+	assert(polls == 1, "a closed transport must not be retried");
+	assert(ctrls.length == 1 && ctrls[0].kind == EventControlKind.error);
+	assert(!sub.active);
+}
+
+unittest  // a request on a closed client fails with TransportClosedException
+{
+	auto c = new McpClient(new RecordingClientTransport());
+	c.close();
+	bool closedError;
+	try
+		c.ping();
+	catch (TransportClosedException)
+		closedError = true;
+	assert(closedError);
+}
+
+unittest  // a transient poll failure is retried with backoff instead of ending the subscription
+{
+	auto c = new McpClient(new RecordingClientTransport());
+	c.enableModern();
+	int polls;
+	c.onRpcForTest = (string method, Json params) @safe {
+		if (++polls <= 3)
+			throw new McpException(ErrorCode.internalError, "connection lost");
+		PollResult r;
+		r.events ~= EventOccurrence("e1", "incident.created", "t");
+		r.cursor = "c1";
+		return r.toJson();
+	};
+	EventOccurrence[] got;
+	EventControl[] ctrls;
+	Duration[] delays;
+	auto sub = new EventSubscription();
+	c.onEventPollSleepForTest = (Duration d) @safe {
+		delays ~= d;
+		if (polls > 3)
+			sub.cancel();
+	};
+	c.runPollLoop(sub, PollParams("incident.created"), (EventOccurrence o) @safe {
+		got ~= o;
+	}, (EventControl ctrl) @safe { ctrls ~= ctrl; });
+	assert(got.length == 1, "the poll after the transient failures must deliver");
+	assert(ctrls.length == 0, "a transient failure is not reported as an error");
+	assert(delays.length == 4);
+	assert(delays[0] < delays[1] && delays[1] < delays[2], "retries must back off");
+}
+
 unittest  // subscribeStream tracks the cursor and ends the handle on a terminated control
 {
 	auto c = new McpClient(new RecordingClientTransport());
+	c.enableModern();
 	int events;
 	auto sub = c.subscribeStream(StreamParams("incident.created"), (EventOccurrence o) @safe {
 		events++;
@@ -7661,9 +10815,35 @@ unittest  // subscribeStream tracks the cursor and ends the handle on a terminat
 	assert(!sub.active);
 }
 
+unittest  // an events stream the server ends drops its handlers
+{
+	auto t = new RecordingClientTransport();
+	auto c = new McpClient(t);
+	c.enableModern();
+	c.streamEvents(StreamParams("incident.created"), (EventOccurrence o) @safe {});
+	assert(c.eventStreams_.length == 1);
+	t.streams[0].finish();
+	assert(c.eventStreams_.length == 0, "a server-ended stream must not keep its handlers");
+}
+
+unittest  // a terminated managed push subscription releases its stream
+{
+	auto t = new RecordingClientTransport();
+	auto c = new McpClient(t);
+	c.enableModern();
+	auto sub = c.subscribeStream(StreamParams("incident.created"), (EventOccurrence o) @safe {
+	});
+	c.dispatchInbound(Message(makeNotification(eventsTerminatedNotification,
+			withSubscriptionId(Json(["error": Json(["code": Json(-32012)])]), Json(1)))));
+	assert(!sub.active);
+	assert(c.managedStreams_.length == 0, "a terminated subscription must leave the registry");
+	assert(t.streams[0].ended, "a terminated subscription must close its stream");
+}
+
 unittest  // a managed push stream drops an occurrence whose eventId was already delivered
 {
 	auto c = new McpClient(new RecordingClientTransport());
+	c.enableModern();
 	int events;
 	auto sub = c.subscribeStream(StreamParams("incident.created"), (EventOccurrence o) @safe {
 		events++;
@@ -7684,6 +10864,7 @@ unittest  // a quiet managed stream is reopened from the last cursor after strea
 {
 	auto t = new RecordingClientTransport();
 	auto c = new McpClient(t);
+	c.enableModern();
 	long now = 0;
 	c.onEventNowForTest = () @safe => now;
 	int events;
@@ -7742,24 +10923,434 @@ unittest  // a quiet managed stream is reopened from the last cursor after strea
 	assert(events == 2);
 }
 
+unittest  // a managed stream cancelled while its reopen is in flight closes the reopened stream
+{
+	auto t = new RecordingClientTransport();
+	auto c = new McpClient(t);
+	c.enableModern();
+	long now = 0;
+	c.onEventNowForTest = () @safe => now;
+	int controls;
+	auto sub = c.subscribeStream(StreamParams("incident.created"), null, (EventControl ctrl) @safe {
+		controls++;
+	});
+	t.streams[0].finish();
+	t.onListen = () @safe { sub.cancel(); };
+	int wakes;
+	c.onStreamWatchSleepForTest = (Duration d) @safe {
+		assert(++wakes < 10, "the watchdog kept running after cancel");
+		now += 200_000;
+	};
+	c.runStreamWatchdog(sub);
+	assert(t.listens.length == 2);
+	assert(t.streams[1].ended, "a stream reopened after cancel must be closed");
+	c.dispatchInbound(Message(makeNotification(eventsHeartbeatNotification,
+			withSubscriptionId(heartbeatParams(nullable("c1")), Json(2)))));
+	assert(controls == 0, "onControl must not run after cancel");
+}
+
+unittest  // a managed stream whose reopen is refused with a non-transient error stops reconnecting
+{
+	auto t = new RecordingClientTransport();
+	auto c = new McpClient(t);
+	c.enableModern();
+	long now = 0;
+	c.onEventNowForTest = () @safe => now;
+	EventControl[] ctrls;
+	auto sub = c.subscribeStream(StreamParams("incident.created"), null, (EventControl ctrl) @safe {
+		ctrls ~= ctrl;
+	});
+	t.listenFailures = [
+		new McpException(ErrorCode.methodNotFound, "no events/stream")
+	];
+	int wakes;
+	c.onStreamWatchSleepForTest = (Duration d) @safe {
+		assert(++wakes < 10, "the watchdog kept reopening a refused stream");
+		now += 200_000;
+	};
+	c.runStreamWatchdog(sub);
+	assert(t.listens.length == 2, "a refused reopen must not be retried");
+	assert(!sub.active);
+	assert(ctrls.length == 1 && ctrls[0].kind == EventControlKind.error);
+	assert(ctrls[0].error.get.code == ErrorCode.methodNotFound);
+}
+
+unittest  // a managed stream the server ended with a non-transient error stops at the next wake
+{
+	auto t = new RecordingClientTransport();
+	auto c = new McpClient(t);
+	c.enableModern();
+	long now = 0;
+	c.onEventNowForTest = () @safe => now;
+	auto sub = c.subscribeStream(StreamParams("incident.created"), null);
+	t.streams[0].finish(new McpException(ErrorCode.invalidParams, "bad arguments"));
+	int wakes;
+	c.onStreamWatchSleepForTest = (Duration d) @safe {
+		assert(++wakes < 10, "the watchdog kept reopening a failed stream");
+	};
+	c.runStreamWatchdog(sub);
+	assert(wakes == 1);
+	assert(t.listens.length == 1, "a stream failed with a non-transient error must not be reopened");
+	assert(!sub.active);
+}
+
+unittest  // a managed stream the server closed cleanly is reopened at the next wake
+{
+	auto t = new RecordingClientTransport();
+	auto c = new McpClient(t);
+	c.enableModern();
+	long now = 0;
+	c.onEventNowForTest = () @safe => now;
+	auto sub = c.subscribeStream(StreamParams("incident.created"), null);
+	t.streams[0].finish();
+	int wakes;
+	c.onStreamWatchSleepForTest = (Duration d) @safe {
+		if (++wakes == 2)
+			sub.cancel();
+	};
+	c.runStreamWatchdog(sub);
+	assert(t.listens.length == 2,
+			"a stream the server closed must be reopened without waiting to go quiet");
+}
+
+unittest  // the watchdog reopens a stream the server closed without waiting out streamDeadAfter
+{
+	import core.time : MonoTime;
+	import vibe.core.core : exitEventLoop, runEventLoop, runTask, sleep;
+
+	auto t = new RecordingClientTransport();
+	auto c = new McpClient(t);
+	c.enableModern();
+	EventClientSettings es;
+	es.streamDeadAfter = 10.seconds;
+	c.eventSettings = es;
+	auto sub = c.subscribeStream(StreamParams("incident.created"), null);
+	Duration took = Duration.max;
+	runTask(() nothrow{
+		try
+			c.runStreamWatchdog(sub);
+		catch (Exception)
+		{
+		}
+	});
+	runTask(() nothrow{
+		scope (exit)
+			exitEventLoop();
+		try
+		{
+			sleep(50.msecs);
+			const start = MonoTime.currTime;
+			t.streams[0].finish();
+			while (t.listens.length < 2 && MonoTime.currTime - start < 3.seconds)
+				sleep(10.msecs);
+			if (t.listens.length >= 2)
+				took = MonoTime.currTime - start;
+			sub.cancel();
+			sleep(20.msecs);
+		}
+		catch (Exception)
+		{
+		}
+	});
+	runEventLoop();
+	assert(took < 1.seconds, "a server-closed stream must be reopened promptly");
+}
+
+unittest  // cancelling a managed stream wakes a watchdog that is backing off
+{
+	import core.time : MonoTime;
+	import vibe.core.core : exitEventLoop, runEventLoop, runTask, sleep;
+
+	auto t = new RecordingClientTransport();
+	auto c = new McpClient(t);
+	c.enableModern();
+	EventClientSettings es;
+	es.streamDeadAfter = 2.seconds;
+	c.eventSettings = es;
+	auto sub = c.subscribeStream(StreamParams("incident.created"), null);
+	bool done;
+	MonoTime finished;
+	runTask(() nothrow{
+		try
+			c.runStreamWatchdog(sub);
+		catch (Exception)
+		{
+		}
+		finished = MonoTime.currTime;
+		done = true;
+	});
+	Duration took = Duration.max;
+	runTask(() nothrow{
+		scope (exit)
+			exitEventLoop();
+		try
+		{
+			sleep(50.msecs);
+			t.listenFailures ~= new HttpStatusException(503, "unavailable");
+			t.streams[0].finish(); // the reopen fails, so the watchdog backs off
+			sleep(200.msecs);
+			const cancelled = MonoTime.currTime;
+			sub.cancel();
+			while (!done && MonoTime.currTime - cancelled < 6.seconds)
+				sleep(10.msecs);
+			if (done)
+				took = finished - cancelled;
+		}
+		catch (Exception)
+		{
+		}
+	});
+	runEventLoop();
+	assert(t.listens.length == 2, "the watchdog must have tried to reopen the stream");
+	assert(took < 1.seconds, "cancel must wake a watchdog in its backoff sleep");
+}
+
+unittest  // transient reopen failures back off between attempts
+{
+	auto t = new RecordingClientTransport();
+	auto c = new McpClient(t);
+	c.enableModern();
+	long now = 0;
+	c.onEventNowForTest = () @safe => now;
+	auto sub = c.subscribeStream(StreamParams("incident.created"), null);
+	foreach (_; 0 .. 3)
+		t.listenFailures ~= new HttpStatusException(503, "unavailable");
+	Duration[] sleeps;
+	c.onStreamWatchSleepForTest = (Duration d) @safe {
+		sleeps ~= d;
+		now += d.total!"msecs" + 1;
+		if (sleeps.length == 5)
+			sub.cancel();
+	};
+	c.runStreamWatchdog(sub);
+	assert(t.listens.length == 5, "a transient failure must be retried");
+	assert(sleeps[1] > sleeps[0] && sleeps[2] > sleeps[1] && sleeps[3] > sleeps[2],
+			"consecutive failures must back off");
+	assert(sleeps[4] == sleeps[0], "a successful reopen must reset the backoff");
+}
+
+unittest  // reopens that end before their leading frame back off between attempts
+{
+	auto t = new RecordingClientTransport();
+	auto c = new McpClient(t);
+	c.enableModern();
+	long now = 0;
+	c.onEventNowForTest = () @safe => now;
+	auto sub = c.subscribeStream(StreamParams("incident.created"), null);
+	now = 10_000;
+	t.streams[0].finish();
+	t.listensEndAtOpen = true;
+	Duration[] sleeps;
+	c.onStreamWatchSleepForTest = (Duration d) @safe {
+		sleeps ~= d;
+		now += d.total!"msecs" + 1;
+		if (sleeps.length == 4)
+			sub.cancel();
+	};
+	c.runStreamWatchdog(sub);
+	assert(sleeps[2] > sleeps[1] && sleeps[3] > sleeps[2],
+			"a stream that ends before its leading frame must count as a failed reopen");
+}
+
+unittest  // streams the server keeps ending right after they open back off between reopens
+{
+	auto t = new RecordingClientTransport();
+	auto c = new McpClient(t);
+	c.enableModern();
+	long now = 0;
+	c.onEventNowForTest = () @safe => now;
+	auto sub = c.subscribeStream(StreamParams("incident.created"), null);
+	Duration[] sleeps;
+	c.onStreamWatchSleepForTest = (Duration d) @safe {
+		sleeps ~= d;
+		// The stream opened at `now` ends at once, so it lived no time at all.
+		t.streams[$ - 1].finish();
+		if (sleeps.length == 4)
+			sub.cancel();
+	};
+	c.runStreamWatchdog(sub);
+	assert(t.listens.length == 4);
+	assert(sleeps[1] > sleeps[0] && sleeps[2] > sleeps[1],
+			"a stream that ends as soon as it opens must count as a failed reopen");
+}
+
+unittest  // close() cancels every open subscriptions/listen stream
+{
+	auto t = new RecordingClientTransport();
+	auto c = new McpClient(t);
+	c.enableModern();
+	auto a = c.subscriptionsListen(SubscriptionFilter.init);
+	auto b = c.streamEvents(StreamParams("incident.created"), null);
+	c.close();
+	assert(a.cancelled && b.cancelled, "close() must stop the client's listen streams");
+}
+
+unittest  // close() cancels managed subscriptions and their watchdog does not reopen
+{
+	auto t = new RecordingClientTransport();
+	auto c = new McpClient(t);
+	c.enableModern();
+	long now = 0;
+	c.onEventNowForTest = () @safe => now;
+	auto pushed = c.subscribeStream(StreamParams("incident.created"), null);
+	auto polled = c.subscribePoll(PollParams("incident.created"), null);
+	c.close();
+	assert(!pushed.active && !polled.active, "close() must cancel managed subscriptions");
+	assert(t.streams[0].cancelled);
+	c.onStreamWatchSleepForTest = (Duration d) @safe { now += 200_000; };
+	c.runStreamWatchdog(pushed);
+	assert(t.listens.length == 1, "a closed client must not reopen a managed stream");
+}
+
+unittest  // setLogLevel rejects an empty level on a legacy session without sending it
+{
+	import std.exception : collectException;
+
+	auto c = new McpClient(new RecordingClientTransport());
+	string[] sent;
+	c.onRpcForTest = (string method, Json params) @safe {
+		sent ~= method;
+		return Json.emptyObject;
+	};
+	auto e = collectException!McpException(c.setLogLevel(""));
+	assert(e !is null && e.code == ErrorCode.invalidParams);
+	assert(sent.length == 0);
+}
+
+unittest  // resources/subscribe and resources/unsubscribe fail locally on a modern session
+{
+	import std.exception : collectException;
+
+	auto t = new RecordingClientTransport();
+	auto c = new McpClient(t);
+	c.enableModern();
+	string[] sent;
+	c.onRpcForTest = (string method, Json params) @safe {
+		sent ~= method;
+		return Json.emptyObject;
+	};
+	assert(collectException!McpException(c.subscribe("file:///a")) !is null);
+	assert(collectException!McpException(c.unsubscribe("file:///a")) !is null);
+	assert(sent.length == 0, "a verb the modern protocol removed must not be sent");
+}
+
+unittest  // subscriptionsListen fails locally on a legacy session
+{
+	import std.exception : collectException;
+
+	auto t = new RecordingClientTransport();
+	auto c = new McpClient(t);
+	assert(collectException!McpException(c.subscriptionsListen(SubscriptionFilter.init)) !is null);
+	assert(t.listens.length == 0, "a modern-only stream must not be opened on a legacy session");
+}
+
+unittest  // the Events extension calls fail locally on a legacy session
+{
+	import std.exception : collectException;
+
+	auto t = new RecordingClientTransport();
+	auto c = new McpClient(t);
+	string[] sent;
+	c.onRpcForTest = (string method, Json params) @safe {
+		sent ~= method;
+		return Json.emptyObject;
+	};
+	void refused(E)(lazy E call, string what)
+	{
+		auto e = collectException!McpException(call);
+		assert(e !is null && e.code == ErrorCode.methodNotFound,
+				what ~ " must be refused on a legacy session");
+	}
+
+	refused(c.listEvents(), "events/list");
+	refused(c.pollEvents(PollParams("incident.created")), "events/poll");
+	refused(c.streamEvents(StreamParams("incident.created"), (EventOccurrence o) @safe {
+		}), "events/stream");
+	refused(c.subscribeWebhookEvents(SubscribeParams.init), "events/subscribe");
+	refused(c.unsubscribeWebhookEvents(UnsubscribeParams.init), "events/unsubscribe");
+	refused(c.subscribeEvents("incident.created", SubscribeOptions.init, (EventOccurrence o) @safe {
+		}), "subscribeEvents");
+	refused(c.subscribePoll(PollParams("incident.created"), (EventOccurrence o) @safe {
+		}), "subscribePoll");
+	refused(c.subscribeStream(StreamParams("incident.created"), (EventOccurrence o) @safe {
+		}), "subscribeStream");
+	assert(sent.length == 0, "an Events request must not be sent on a legacy session");
+	assert(t.listens.length == 0, "an events/stream must not be opened on a legacy session");
+}
+
+unittest  // a closed client refuses to open a new listen stream
+{
+	import std.exception : collectException;
+
+	auto t = new RecordingClientTransport();
+	auto c = new McpClient(t);
+	c.enableModern();
+	c.close();
+	assert(collectException(c.subscriptionsListen(SubscriptionFilter.init)) !is null);
+	assert(t.listens.length == 0);
+}
+
 unittest  // reconnection is disabled by a zero streamDeadAfter
 {
 	auto t = new RecordingClientTransport();
 	auto c = new McpClient(t);
+	c.enableModern();
 	EventClientSettings es;
 	es.streamDeadAfter = Duration.zero;
 	c.eventSettings = es;
+	long now = 0;
+	c.onEventNowForTest = () @safe => now;
 	auto sub = c.subscribeStream(StreamParams("incident.created"), null);
 	c.onStreamWatchSleepForTest = (Duration d) @safe {
-		assert(false, "must not sleep");
+		now += 200_000;
+		t.streams[0].finish();
 	};
 	c.runStreamWatchdog(sub);
-	assert(t.listens.length == 1 && sub.active);
+	assert(t.listens.length == 1, "a stream must not be reopened with reconnection disabled");
+}
+
+unittest  // with reconnection disabled a stream the server ends cleanly ends the subscription
+{
+	auto t = new RecordingClientTransport();
+	auto c = new McpClient(t);
+	c.enableModern();
+	EventClientSettings es;
+	es.streamDeadAfter = Duration.zero;
+	c.eventSettings = es;
+	EventControl[] ctrls;
+	auto sub = c.subscribeStream(StreamParams("incident.created"), null, (EventControl ctrl) @safe {
+		ctrls ~= ctrl;
+	});
+	c.onStreamWatchSleepForTest = (Duration d) @safe { t.streams[0].finish(); };
+	c.runStreamWatchdog(sub);
+	assert(!sub.active, "the subscription must end with its stream");
+	assert(ctrls.length == 1 && ctrls[0].kind == EventControlKind.error);
+}
+
+unittest  // with reconnection disabled a stream the server fails reports its error
+{
+	auto t = new RecordingClientTransport();
+	auto c = new McpClient(t);
+	c.enableModern();
+	EventClientSettings es;
+	es.streamDeadAfter = Duration.zero;
+	c.eventSettings = es;
+	EventControl[] ctrls;
+	auto sub = c.subscribeStream(StreamParams("incident.created"), null, (EventControl ctrl) @safe {
+		ctrls ~= ctrl;
+	});
+	c.onStreamWatchSleepForTest = (Duration d) @safe {
+		t.streams[0].finish(new HttpStatusException(503, "unavailable"));
+	};
+	c.runStreamWatchdog(sub);
+	assert(!sub.active);
+	assert(ctrls.length == 1 && ctrls[0].error.get.message == "unavailable");
 }
 
 unittest  // cancelling a managed stream stops delivery
 {
 	auto c = new McpClient(new RecordingClientTransport());
+	c.enableModern();
 	int events;
 	auto sub = c.subscribeStream(StreamParams("incident.created"), (EventOccurrence o) @safe {
 		events++;
@@ -7779,6 +11370,7 @@ unittest  // cancelling a managed stream stops delivery
 unittest  // subscribeWebhook registers the receiver under the server id and tears it down on cancel
 {
 	auto c = new McpClient(new RecordingClientTransport());
+	c.enableModern();
 	int subs, unsubs;
 	c.onRpcForTest = (string method, Json params) @safe {
 		if (method == "events/subscribe")
@@ -7817,9 +11409,270 @@ unittest  // subscribeWebhook registers the receiver under the server id and tea
 	assert(rx.processDelivery("{}", known).status == 503); // deregistered
 }
 
+unittest  // cancelling a webhook subscription wakes its refresh loop from a long sleep
+{
+	import vibe.core.core : exitEventLoop, runEventLoop, runTask, sleep;
+
+	auto c = new McpClient(new RecordingClientTransport());
+	c.enableModern();
+	c.onRpcForTest = (string method, Json params) @safe => Json.emptyObject;
+	auto sub = new EventSubscription();
+	SubscribeResult first;
+	first.id = "sub_x"; // no expiry: sleeps the hour-long health-check interval
+	SubscribeParams sp;
+	sp.name = "incident.created";
+	Duration took = Duration.max;
+	runTask(() nothrow{
+		scope (exit)
+			exitEventLoop();
+		const start = MonoTime.currTime;
+		try
+			c.runWebhookRefreshLoop(sub, sp, first, null);
+		catch (Exception)
+		{
+		}
+		took = MonoTime.currTime - start;
+	});
+	runTask(() nothrow{
+		try
+		{
+			sleep(50.msecs);
+			sub.cancel();
+		}
+		catch (Exception)
+		{
+		}
+	});
+	runEventLoop();
+	assert(took < 2.seconds, "a cancelled webhook refresh loop must not sleep out its interval");
+}
+
+unittest  // cancelling a webhook subscription deregisters the receiver even when unsubscribe fails
+{
+	auto c = new McpClient(new RecordingClientTransport());
+	c.enableModern();
+	c.onRpcForTest = (string method, Json params) @safe {
+		if (method == "events/unsubscribe")
+			throw new McpException(ErrorCode.internalError, "server down");
+		SubscribeResult r;
+		r.id = "sub_x";
+		return r.toJson();
+	};
+	auto rx = new WebhookReceiver();
+	SubscribeParams sp;
+	sp.name = "incident.created";
+	sp.delivery = WebhookDelivery("https://hook/x", managedTestWhsec);
+	auto sub = c.subscribeWebhook(rx, sp, (EventOccurrence o) @safe {});
+	sub.cancel();
+	string[string] known;
+	known["x-mcp-subscription-id"] = "sub_x";
+	assert(rx.processDelivery("{}", known).status == 503,
+			"a cancelled subscription must stop being routed by the receiver");
+}
+
+version (unittest)
+{
+	/// A webhook-mode subscription (server id "sub_x", receiver timestamps
+	/// unchecked) plus a helper that delivers a signed envelope to it.
+	private struct WebhookHarness
+	{
+		McpClient client;
+		WebhookReceiver rx;
+		EventSubscription sub;
+		EventControl[] controls;
+		EventOccurrence[] events;
+
+		void deliver(Json envelope, string msgId) @safe
+		{
+			import mcp.server.webhook_delivery : DeliverySigning, signDeliveryHeaders;
+
+			const 
+			body = envelope.toString();
+			DeliverySigning signing = {
+				secret: managedTestWhsec, messageId: msgId, timestamp: 1700,
+				subscriptionId: "sub_x"
+			};
+			auto headers = signDeliveryHeaders(signing, body);
+			assert(rx.processDelivery(body, headers).status == 200);
+		}
+	}
+
+	private WebhookHarness* webhookHarness() @safe
+	{
+		auto h = new WebhookHarness;
+		h.client = new McpClient(new RecordingClientTransport());
+		h.client.enableModern();
+		h.client.onRpcForTest = (string method, Json params) @safe {
+			SubscribeResult r;
+			r.id = "sub_x";
+			r.cursor = "c0";
+			return method == "events/subscribe" ? r.toJson() : Json.emptyObject;
+		};
+		h.rx = new WebhookReceiver();
+		h.rx.verifyTimestamp = false;
+		SubscribeParams sp;
+		sp.name = "incident.created";
+		sp.delivery = WebhookDelivery("https://hook/x", managedTestWhsec);
+		h.sub = h.client.subscribeWebhook(h.rx, sp, (EventOccurrence o) @safe {
+			h.events ~= o;
+		}, (EventControl c) @safe { h.controls ~= c; });
+		return h;
+	}
+}
+
+unittest  // a webhook `terminated` envelope ends the managed subscription
+{
+	import mcp.protocol.events : terminatedEnvelope;
+
+	auto h = webhookHarness();
+	assert(h.sub.active);
+	h.deliver(terminatedEnvelope(Json([
+		"code": Json(-32012),
+		"message": Json("revoked")
+	])), "m1");
+	assert(h.controls.length == 1 && h.controls[0].kind == EventControlKind.terminated);
+	assert(!h.sub.active, "a terminated subscription must no longer report active");
+}
+
+unittest  // a terminated webhook subscription unregisters from the receiver
+{
+	import mcp.protocol.events : terminatedEnvelope;
+
+	auto h = webhookHarness();
+	h.deliver(terminatedEnvelope(Json([
+		"code": Json(-32012),
+		"message": Json("revoked")
+	])), "m1");
+	assert(h.rx.processDelivery("{}", ["X-MCP-Subscription-Id": "sub_x"]).status == 503,
+			"a terminated subscription must no longer be routed by the receiver");
+}
+
+unittest  // the webhook refresh loop stops once the subscription is terminated
+{
+	import mcp.protocol.events : terminatedEnvelope;
+
+	auto h = webhookHarness();
+	int subs;
+	h.client.onRpcForTest = (string method, Json params) @safe {
+		subs++;
+		SubscribeResult r;
+		r.id = "sub_x";
+		r.refreshBefore = "2000-01-01T00:00:00Z"; // already past: refresh at the floor
+		return r.toJson();
+	};
+	h.deliver(terminatedEnvelope(Json([
+		"code": Json(-32012),
+		"message": Json("revoked")
+	])), "m1");
+	SubscribeResult first;
+	first.id = "sub_x";
+	first.refreshBefore = "2000-01-01T00:00:00Z";
+	int sleeps;
+	h.client.onWebhookRefreshSleepForTest = (Duration d) @safe {
+		if (++sleeps > 3)
+			h.sub.cancel(); // backstop so a broken loop still ends
+	};
+	SubscribeParams sp;
+	sp.name = "incident.created";
+	h.client.runWebhookRefreshLoop(h.sub, sp, first, null);
+	assert(subs == 0, "a terminated subscription must not be re-subscribed");
+}
+
+unittest  // webhook `gap` envelopes and occurrences advance the subscription cursor
+{
+	import mcp.protocol.events : gapEnvelope;
+
+	auto h = webhookHarness();
+	assert(h.sub.cursor.get == "c0");
+	h.deliver(gapEnvelope(nullable("c7")), "m1");
+	assert(h.sub.cursor.get == "c7", "a gap control must advance the watermark");
+	auto occ = EventOccurrence("e1", "incident.created", "t", Json.emptyObject);
+	occ.cursor = "c8";
+	h.deliver(occ.toJson(), "m2");
+	assert(h.sub.cursor.get == "c8");
+	assert(h.events.length == 1);
+}
+
+unittest  // a webhook occurrence whose handler throws does not advance the cursor
+{
+	import mcp.server.webhook_delivery : DeliverySigning, signDeliveryHeaders;
+
+	auto c = new McpClient(new RecordingClientTransport());
+	c.enableModern();
+	c.onRpcForTest = (string method, Json params) @safe {
+		SubscribeResult r;
+		r.id = "sub_x";
+		r.cursor = "c0";
+		return method == "events/subscribe" ? r.toJson() : Json.emptyObject;
+	};
+	auto rx = new WebhookReceiver();
+	rx.verifyTimestamp = false;
+	SubscribeParams sp;
+	sp.name = "incident.created";
+	sp.delivery = WebhookDelivery("https://hook/x", managedTestWhsec);
+	auto sub = c.subscribeWebhook(rx, sp, (EventOccurrence o) @safe {
+		throw new Exception("handler failed");
+	});
+	auto occ = EventOccurrence("e1", "incident.created", "t", Json.emptyObject);
+	occ.cursor = "c8";
+	const 
+	body = occ.toJson().toString();
+	DeliverySigning signing = {
+		secret: managedTestWhsec, messageId: "m1", timestamp: 1700, subscriptionId: "sub_x"
+	};
+	auto headers = signDeliveryHeaders(signing, body);
+	try
+		rx.processDelivery(body, headers);
+	catch (Exception)
+	{
+	}
+	assert(sub.cursor.get == "c0");
+}
+
+unittest  // a webhook occurrence whose handler throws is handled again on redelivery
+{
+	import mcp.server.webhook_delivery : DeliverySigning, signDeliveryHeaders;
+
+	auto c = new McpClient(new RecordingClientTransport());
+	c.enableModern();
+	c.onRpcForTest = (string method, Json params) @safe {
+		SubscribeResult r;
+		r.id = "sub_x";
+		r.cursor = "c0";
+		return method == "events/subscribe" ? r.toJson() : Json.emptyObject;
+	};
+	auto rx = new WebhookReceiver();
+	rx.verifyTimestamp = false;
+	SubscribeParams sp;
+	sp.name = "incident.created";
+	sp.delivery = WebhookDelivery("https://hook/x", managedTestWhsec);
+	int calls;
+	string[] handled;
+	c.subscribeWebhook(rx, sp, (EventOccurrence o) @safe {
+		if (++calls == 1)
+			throw new Exception("handler failed");
+		handled ~= o.eventId;
+	});
+	auto occ = EventOccurrence("e1", "incident.created", "t", Json.emptyObject);
+	const 
+	body = occ.toJson().toString();
+	DeliverySigning signing = {
+		secret: managedTestWhsec, messageId: "m1", timestamp: 1700, subscriptionId: "sub_x"
+	};
+	auto headers = signDeliveryHeaders(signing, body);
+	try
+		rx.processDelivery(body, headers);
+	catch (Exception)
+	{
+	}
+	rx.processDelivery(body, headers);
+	assert(handled == ["e1"], "the redelivered occurrence must reach the handler");
+}
+
 unittest  // a no-expiry grant still refreshes at the health-check cadence
 {
 	auto c = new McpClient(new RecordingClientTransport());
+	c.enableModern();
 	int subs;
 	c.onRpcForTest = (string method, Json params) @safe {
 		if (method == "events/subscribe")
@@ -7839,12 +11692,12 @@ unittest  // a no-expiry grant still refreshes at the health-check cadence
 	SubscribeResult first;
 	first.id = "sub_x";
 	int sleeps;
-	c.onWebhookRefreshSleepForTest = (SubscribeResult r) @safe {
+	c.onWebhookRefreshSleepForTest = (Duration d) @safe {
 		sleeps++;
 		if (sleeps == 3)
 			sub.cancel();
 	};
-	c.runWebhookRefreshLoop(sub, sp, first);
+	c.runWebhookRefreshLoop(sub, sp, first, null);
 	assert(subs == 2); // two health-check refreshes before the third sleep cancelled
 	assert(sub.cursor.get == "w2"); // the refresh response advanced the watermark
 	assert(c.webhookRefreshDelay(first) == 1.hours);
@@ -7853,6 +11706,7 @@ unittest  // a no-expiry grant still refreshes at the health-check cadence
 unittest  // disabling the health-check interval ends the loop for a no-expiry grant
 {
 	auto c = new McpClient(new RecordingClientTransport());
+	c.enableModern();
 	EventClientSettings es;
 	es.noExpiryRefreshInterval = Duration.zero;
 	c.eventSettings = es;
@@ -7866,16 +11720,73 @@ unittest  // disabling the health-check interval ends the loop for a no-expiry g
 	sp.name = "incident.created";
 	SubscribeResult first;
 	first.id = "sub_x";
-	c.onWebhookRefreshSleepForTest = (SubscribeResult r) @safe {
+	c.onWebhookRefreshSleepForTest = (Duration d) @safe {
 		assert(false, "must not sleep");
 	};
-	c.runWebhookRefreshLoop(sub, sp, first);
+	c.runWebhookRefreshLoop(sub, sp, first, null);
 	assert(subs == 0 && sub.active);
+}
+
+unittest  // a webhook refresh the server rejects ends the subscription and reports the error
+{
+	auto c = new McpClient(new RecordingClientTransport());
+	c.enableModern();
+	int subs;
+	c.onRpcForTest = (string method, Json params) @safe {
+		subs++;
+		throw new McpException(ErrorCode.invalidParams, "unknown subscription");
+	};
+	auto sub = new EventSubscription();
+	SubscribeParams sp;
+	sp.name = "incident.created";
+	SubscribeResult first;
+	first.id = "sub_x";
+	first.refreshBefore = "2000-01-01T00:00:00Z";
+	int sleeps;
+	c.onWebhookRefreshSleepForTest = (Duration d) @safe {
+		if (++sleeps > 3)
+			sub.cancel(); // backstop so a broken loop still ends
+	};
+	EventControl[] controls;
+	c.runWebhookRefreshLoop(sub, sp, first, (EventControl ctl) @safe {
+		controls ~= ctl;
+	});
+	assert(subs == 1, "a rejected refresh must not be retried");
+	assert(!sub.active, "a rejected refresh must end the subscription");
+	assert(controls.length == 1 && controls[0].kind == EventControlKind.error);
+	assert(controls[0].error.get.code == ErrorCode.invalidParams);
+}
+
+unittest  // transient webhook refresh failures back off between attempts
+{
+	auto c = new McpClient(new RecordingClientTransport());
+	c.enableModern();
+	c.onRpcForTest = (string method, Json params) @safe {
+		throw new McpException(ErrorCode.internalError, "connection lost");
+	};
+	auto sub = new EventSubscription();
+	SubscribeParams sp;
+	sp.name = "incident.created";
+	SubscribeResult first;
+	first.id = "sub_x";
+	first.refreshBefore = "2000-01-01T00:00:00Z";
+	Duration[] delays;
+	c.onWebhookRefreshSleepForTest = (Duration d) @safe {
+		delays ~= d;
+		if (delays.length == 4)
+			sub.cancel();
+	};
+	c.runWebhookRefreshLoop(sub, sp, first, null);
+	assert(delays.length == 4);
+	assert(delays[1] < delays[2] && delays[2] < delays[3],
+			"consecutive transient failures must back off");
+	assert(sub.isCancelled);
 }
 
 unittest  // the webhook refresh loop re-subscribes before the grant expires
 {
 	auto c = new McpClient(new RecordingClientTransport());
+	c.enableModern();
 	int subs;
 	c.onRpcForTest = (string method, Json params) @safe {
 		if (method == "events/subscribe")
@@ -7896,10 +11807,55 @@ unittest  // the webhook refresh loop re-subscribes before the grant expires
 	SubscribeResult first;
 	first.id = "sub_x";
 	first.refreshBefore = "2999-01-01T00:00:00Z";
-	c.onWebhookRefreshSleepForTest = (SubscribeResult r) @safe {
+	c.onWebhookRefreshSleepForTest = (Duration d) @safe {
 		if (subs >= 1)
 			sub.cancel(); // end the loop after one refresh
 	};
-	c.runWebhookRefreshLoop(sub, sp, first);
+	c.runWebhookRefreshLoop(sub, sp, first, null);
 	assert(subs == 1);
+}
+
+unittest  // change notifications for keys with no fetch in flight retain no invalidation state
+{
+	import std.conv : to;
+
+	auto c = McpClient.http("http://localhost");
+	foreach (i; 0 .. 100)
+	{
+		Json p = Json.emptyObject;
+		p["uri"] = "test://r" ~ i.to!string;
+		c.dispatchNotification("notifications/resources/updated", p);
+	}
+	c.dispatchNotification("notifications/tools/list_changed", Json.emptyObject);
+	assert(c.cacheGenerations_.length == 0);
+}
+
+unittest  // a resources/updated arriving while that resource's read is in flight keeps the stale result out of the cache
+{
+	auto c = McpClient.http("http://localhost");
+	int calls;
+	c.onRpcForTest = (string m, Json p) @safe {
+		Json r = Json.emptyObject;
+		if (m == "resources/read")
+		{
+			calls++;
+			if (calls == 1)
+			{
+				Json n = Json.emptyObject;
+				n["uri"] = "a";
+				c.dispatchNotification("notifications/resources/updated", n);
+			}
+			Json arr = Json.emptyArray;
+			arr ~= ResourceContents.makeText("a", "text/plain", "hi").toJson();
+			r["contents"] = arr;
+			r["ttlMs"] = 5000;
+		}
+		return r;
+	};
+	c.readResource("a");
+	c.readResource("a"); // the first result was not cached -> refetch
+	assert(calls == 2);
+	c.readResource("a"); // the second one was
+	assert(calls == 2);
+	assert(c.cacheGenerations_.length == 0);
 }

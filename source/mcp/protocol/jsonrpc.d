@@ -57,19 +57,42 @@ struct Message
 	}
 }
 
+/// An envelope error for a request whose id is known, so the error reply
+/// carries that id rather than null (JSON-RPC 2.0 §5).
+class RequestEnvelopeException : McpException
+{
+	Json id; /// the offending request's id
+
+	this(int code, string message, Json data, Json id, string file = __FILE__, size_t line = __LINE__) @safe pure nothrow
+	{
+		super(code, message, data, file, line);
+		this.id = id;
+	}
+}
+
+/// The id for the error reply to a message that failed parsing or envelope
+/// validation with `e`: the request's id when one was determined, else null.
+Json errorReplyId(Exception e) @safe
+{
+	if (auto re = cast(RequestEnvelopeException) e)
+		return re.id;
+	return Json(null);
+}
+
+/// `e` rebound to the id of request `j` when `j` is a request, else `e` itself.
+private McpException requestError(Json j, McpException e) @safe
+{
+	if (("method" in j) && ("id" in j) && j["id"].type != Json.Type.null_)
+		return new RequestEnvelopeException(e.code, e.msg, e.data, j["id"]);
+	return e;
+}
+
 private void validateEnvelope(Json j) @safe
 {
 	if (j.type != Json.Type.object)
 		throw invalidRequest("JSON-RPC message must be an object");
-	if (("jsonrpc" !in j) || j["jsonrpc"].type != Json.Type.string
-			|| j["jsonrpc"].get!string != "2.0")
-		throw invalidRequest("Missing or invalid jsonrpc version (expected \"2.0\")");
-	// A present `method` must be a string. Without this guard a non-string method
-	// (number, object, array, boolean, null) is classified by presence alone and
-	// later read with `.get!string`, throwing an uncaught JSONException instead of
-	// yielding a clean -32600 across every transport.
-	if (("method" in j) && j["method"].type != Json.Type.string)
-		throw invalidRequest("`method` must be a string");
+	// The id is validated first so every later envelope error on a request
+	// can carry it.
 	// A message bearing a `method` with an explicit `id:null` is neither a valid
 	// request (the spec requires a request id that is not null) nor a
 	// notification (which omits `id` entirely). Reject it so the peer receives a
@@ -95,15 +118,39 @@ private void validateEnvelope(Json j) @safe
 		if (v != cast(long) v)
 			throw invalidRequest("JSON-RPC id MUST NOT have a fractional part");
 	}
+	if (("jsonrpc" !in j) || j["jsonrpc"].type != Json.Type.string
+			|| j["jsonrpc"].get!string != "2.0")
+		throw requestError(j,
+				invalidRequest("Missing or invalid jsonrpc version (expected \"2.0\")"));
+	// A present `method` must be a string. Without this guard a non-string method
+	// (number, object, array, boolean, null) is classified by presence alone and
+	// later read with `.get!string`, throwing an uncaught JSONException instead of
+	// yielding a clean -32600 across every transport.
+	if (("method" in j) && j["method"].type != Json.Type.string)
+		throw requestError(j, invalidRequest("`method` must be a string"));
+	// JSON-RPC 2.0 §4.2: `params`, when present, MUST be a structured value
+	// (object or array); a primitive is an invalid request. MCP further defines
+	// every request's and notification's params as an object, so by-position
+	// (array) params are invalid params. Rejecting both here keeps every handler
+	// from having to guard against reading fields off a non-object. The id is
+	// valid by this point, so a request's error reply carries it.
+	if (("params" in j) && j["params"].type == Json.Type.array)
+		throw requestError(j, invalidParams("`params` must be an object"));
+	if (("params" in j) && j["params"].type != Json.Type.object)
+		throw requestError(j, invalidRequest("`params` must be an object or array"));
 	// Every JSON-RPC 2.0 message is exactly one of: request (has method + non-null id),
-	// notification (has method, no id), or response (no method, has non-null id).
-	// A message with neither method nor a non-null id fits no category and must be
-	// rejected so that truncated or malformed frames never reach the dispatcher.
+	// notification (has method, no id), response (no method, has non-null id), or an
+	// error response with `id:null`, which JSON-RPC 2.0 §5 prescribes when the
+	// request id could not be determined (e.g. a parse error). Any other method-less
+	// message fits no category and is rejected so that truncated or malformed frames
+	// never reach the dispatcher.
 	const hasNonNullId = ("id" in j) && j["id"].type != Json.Type.null_
 		&& j["id"].type != Json.Type.undefined;
-	if (("method" !in j) && !hasNonNullId)
-		throw invalidRequest("Message must have either method (request/notification) "
-				~ "or a non-null id with result/error (response)");
+	const isNullIdError = ("method" !in j) && ("id" in j)
+		&& j["id"].type == Json.Type.null_ && ("error" in j) && ("result" !in j);
+	if (("method" !in j) && !hasNonNullId && !isNullIdError)
+		throw invalidRequest("Message must have either method (request/notification), "
+				~ "a non-null id with result/error (response), or a null id with error");
 	// A `method`-less message with a non-null `id` is a response. JSON-RPC 2.0 §5
 	// requires a response to carry exactly one of `result`/`error`; otherwise
 	// `Message.kind` would silently classify a both-present reply as an error (the
@@ -118,37 +165,83 @@ private void validateEnvelope(Json j) @safe
 		if (hasResult == hasError)
 			throw invalidRequest("Response must contain exactly one of result or error");
 	}
+	// JSON-RPC 2.0 §5.1: a response's `error` is an object with an integer `code`
+	// and a string `message`. Readers of an error response index those members
+	// directly and read `code` as an `int`, so any other shape is rejected here.
+	if (("method" !in j) && ("error" in j))
+	{
+		const err = j["error"];
+		if (err.type != Json.Type.object)
+			throw invalidRequest("Response `error` must be an object");
+		if ("code" !in err || err["code"].type != Json.Type.int_
+				|| err["code"].get!long < int.min || err["code"].get!long > int.max)
+			throw invalidRequest("Response `error.code` must be a 32-bit integer");
+		if ("message" !in err || err["message"].type != Json.Type.string)
+			throw invalidRequest("Response `error.message` must be a string");
+	}
+}
+
+/// The deepest array/object nesting accepted in JSON text from a peer.
+enum maxJsonNestingDepth = 128;
+
+/// Parse JSON text from an untrusted source (a network peer, an upstream server,
+/// a decoded token). The vibe.d parser recurses once per nested array or
+/// object, so the nesting depth is checked with a flat scan first: deeper input
+/// is rejected instead of overflowing the stack. Throws `JSONException` for
+/// over-deep or invalid JSON, as `parseJsonString` does, so callers outside
+/// JSON-RPC keep their own error mapping.
+Json parseUntrustedJson(string text) @safe
+{
+	import vibe.data.json : JSONException;
+
+	size_t depth;
+	bool inString;
+	for (size_t i = 0; i < text.length; i++)
+	{
+		const c = text[i];
+		if (inString)
+		{
+			if (c == '\\')
+				i++;
+			else if (c == '"')
+				inString = false;
+			continue;
+		}
+		if (c == '"')
+			inString = true;
+		else if (c == '[' || c == '{')
+		{
+			if (++depth > maxJsonNestingDepth)
+			{
+				import std.conv : to;
+
+				throw new JSONException(
+						"nesting deeper than " ~ maxJsonNestingDepth.to!string ~ " levels");
+			}
+		}
+		else if ((c == ']' || c == '}') && depth > 0)
+			depth--;
+	}
+	return parseJsonString(text);
+}
+
+/// Parse JSON text from a JSON-RPC peer with the nesting bound of
+/// `parseUntrustedJson`. Throws a -32700 `McpException` for over-deep or
+/// invalid JSON.
+Json parseJsonBounded(string text) @safe
+{
+	try
+		return parseUntrustedJson(text);
+	catch (Exception e)
+		throw parseError("Invalid JSON: " ~ e.msg);
 }
 
 /// Parse and classify a single JSON-RPC message from text.
 Message parseMessage(string text) @safe
 {
-	Json j;
-	try
-		j = parseJsonString(text);
-	catch (Exception e)
-		throw parseError("Invalid JSON: " ~ e.msg);
+	Json j = parseJsonBounded(text);
 	validateEnvelope(j);
 	return Message(j);
-}
-
-/// Parse a JSON-RPC batch (array) from text.
-///
-/// Throws `McpException` when the input is not valid JSON, is not an array,
-/// is an empty array, or when every member fails `validateEnvelope` (all-malformed
-/// batch). For mixed batches the well-formed members are returned and malformed
-/// members are silently dropped.
-///
-/// Deprecated: Use `parseBatchTolerant` or `parseAny` to preserve per-member error
-/// information, which is required to produce the JSON-RPC 2.0 §6 `id:null` error
-/// response for each malformed member.
-deprecated("Use parseBatchTolerant or parseAny to preserve per-member error information") Message[] parseBatch(
-		string text) @safe
-{
-	auto result = parseBatchTolerant(text);
-	if (result.messages.length == 0 && result.errors.length > 0)
-		throw invalidRequest("All batch members are malformed");
-	return result.messages;
 }
 
 /// A malformed batch member: its position in the array, the raw member item, and
@@ -162,22 +255,20 @@ struct BatchMemberError
 	McpException error;
 }
 
-/// `parseBatch` result that keeps malformed members rather than discarding the
-/// whole batch.
+/// `parseBatchTolerant` result: the well-formed members plus each malformed one.
 struct BatchResult
 {
 	Message[] messages;
 	BatchMemberError[] errors;
 }
 
-/// As `parseBatch`, but tolerant of individual malformed members (see `parseBatch`).
+/// Parse a JSON-RPC batch (array) from text, keeping well-formed members and
+/// recording each malformed one in `errors` rather than failing the whole batch.
+/// Throws `McpException` when the input is not valid JSON, is not an array, or is
+/// an empty array.
 BatchResult parseBatchTolerant(string text) @safe
 {
-	Json arr;
-	try
-		arr = parseJsonString(text);
-	catch (Exception e)
-		throw parseError("Invalid JSON: " ~ e.msg);
+	Json arr = parseJsonBounded(text);
 	if (arr.type != Json.Type.array)
 		throw invalidRequest("Batch must be a JSON array");
 	if (arr.length == 0)
@@ -220,6 +311,61 @@ ParsedInput parseAny(string text) @safe
 	return ParsedInput(false, [parseMessage(text)]);
 }
 
+/// Split the client replies out of the batch text `raw`: each well-formed
+/// response or error response member is passed to `onReply`, and the text of a
+/// batch holding the remaining members, in their original order, is returned
+/// for the server core to dispatch. A server core answers requests and
+/// notifications only, so a reply left in the batch would never reach the
+/// handler awaiting it. Returns `raw` unchanged when it is not a parseable batch
+/// or holds no reply, and `null` when it holds nothing but replies.
+string takeBatchReplies(string raw, scope void delegate(Message) @safe onReply) @safe
+{
+	return takeBatchMembers(raw, (Message m) @safe {
+		if (m.kind != MessageKind.response && m.kind != MessageKind.errorResponse)
+			return false;
+		onReply(m);
+		return true;
+	});
+}
+
+/// Split the members `take` claims out of the batch text `raw`: `take` sees
+/// each well-formed member in order and returns true to remove it. The text of
+/// a batch holding the remaining members, in their original order, is
+/// returned. Returns `raw` unchanged when it is not a parseable batch or `take`
+/// claims nothing, and `null` when it claims every member.
+string takeBatchMembers(string raw, scope bool delegate(Message) @safe take) @safe
+{
+	import std.string : strip, startsWith;
+
+	if (!raw.strip.startsWith("["))
+		return raw;
+	Json arr;
+	try
+		arr = parseJsonBounded(raw);
+	catch (McpException)
+		return raw;
+	if (arr.type != Json.Type.array)
+		return raw;
+	Json[] rest;
+	bool tookAny;
+	foreach (i; 0 .. arr.length)
+	{
+		auto item = arr[i];
+		bool wellFormed = true;
+		try
+			validateEnvelope(item);
+		catch (McpException)
+			wellFormed = false;
+		if (wellFormed && take(Message(item)))
+			tookAny = true;
+		else
+			rest ~= item;
+	}
+	if (!tookAny)
+		return raw;
+	return rest.length ? Json(rest).toString() : null;
+}
+
 /// Build a request object.
 Json makeRequest(Json id, string method, Json params = Json.undefined) @safe
 {
@@ -232,52 +378,79 @@ Json makeRequest(Json id, string method, Json params = Json.undefined) @safe
 	return j;
 }
 
-/// Render a JSON-RPC request id (a string or a number per the spec) to a stable
-/// string form. Used where an id must be carried as a string value — e.g. the
-/// modern `subscriptions/listen` id stamped into outbound notifications'
-/// `_meta["io.modelcontextprotocol/subscriptionId"]`. A string id is returned
-/// verbatim; a numeric id is rendered as its decimal text; anything else (null /
-/// absent) yields an empty string.
-string rpcIdString(Json id) @safe
+unittest  // parseMessage rejects nesting beyond the depth cap as a parse error
 {
-	import std.conv : to;
+	import std.array : replicate;
+	import std.exception : collectException;
 
-	switch (id.type)
-	{
-	case Json.Type.string:
-		return id.get!string;
-	case Json.Type.int_:
-		return id.get!long
-			.to!string;
-	case Json.Type.bigInt:
-		return id.toString();
-	case Json.Type.float_:
-		immutable v = id.get!double;
-		if (v != cast(long) v)
-			throw invalidRequest("JSON-RPC id MUST NOT have a fractional part");
-		return (cast(long) v).to!string;
-	default:
-		return "";
-	}
+	const text = `{"jsonrpc":"2.0","id":1,"method":"x","params":{"a":` ~ "[".replicate(
+			maxJsonNestingDepth) ~ "]".replicate(maxJsonNestingDepth) ~ "}}";
+	auto e = collectException!McpException(parseMessage(text));
+	assert(e !is null);
+	assert(e.code == ErrorCode.parseError);
 }
 
-unittest  // rpcIdString renders string and numeric ids, empties null
+unittest  // a batch of huge nesting depth is rejected rather than overflowing the stack
 {
-	assert(rpcIdString(Json("abc")) == "abc");
-	assert(rpcIdString(Json(42)) == "42");
-	assert(rpcIdString(Json(null)) == "");
+	import std.array : replicate;
+	import std.exception : collectException;
+
+	auto e = collectException!McpException(parseBatchTolerant("[".replicate(200_000)));
+	assert(e !is null);
+	assert(e.code == ErrorCode.parseError);
+	e = collectException!McpException(parseAny("[".replicate(200_000)));
+	assert(e !is null && e.code == ErrorCode.parseError);
+	assert(takeBatchReplies("[".replicate(200_000), (Message) {}) !is null);
 }
 
-unittest  // rpcIdString rejects a float id with a fractional part
+unittest  // nesting at the depth cap parses
+{
+	import std.array : replicate;
+
+	const text = `{"jsonrpc":"2.0","id":1,"method":"x","params":{"a":` ~ "[".replicate(
+			maxJsonNestingDepth - 2) ~ "]".replicate(maxJsonNestingDepth - 2) ~ "}}";
+	assert(parseMessage(text).kind == MessageKind.request);
+}
+
+unittest  // brackets inside strings, including escaped quotes, do not count as nesting
+{
+	import std.array : replicate;
+
+	const s = `\"` ~ "[".replicate(500);
+	const j = parseJsonBounded(`{"s":"` ~ s ~ `"}`);
+	assert(j["s"].get!string == `"` ~ "[".replicate(500));
+}
+
+unittest  // parseJsonBounded reports invalid JSON as a parse error
+{
+	import std.exception : collectException;
+
+	auto e = collectException!McpException(parseJsonBounded("{nope"));
+	assert(e !is null && e.code == ErrorCode.parseError);
+}
+
+unittest  // parseUntrustedJson rejects nesting beyond the depth cap as a JSONException
+{
+	import std.array : replicate;
+	import std.exception : collectException;
+	import vibe.data.json : JSONException;
+
+	auto e = collectException!JSONException(parseUntrustedJson("[".replicate(1000)));
+	assert(e !is null);
+	assert(e.msg == "nesting deeper than 128 levels");
+}
+
+unittest  // parseUntrustedJson reports invalid JSON as a JSONException
 {
 	import std.exception : assertThrown;
+	import vibe.data.json : JSONException;
 
-	assertThrown!McpException(rpcIdString(Json(1.5)));
+	assertThrown!JSONException(parseUntrustedJson("{nope"));
 }
 
-unittest  // rpcIdString accepts a whole-number float id and renders it as an integer
+unittest  // parseUntrustedJson parses JSON within the depth cap
 {
-	assert(rpcIdString(Json(3.0)) == "3");
+	assert(parseUntrustedJson(`{"a":[1,{"b":2}]}`)["a"][1]["b"].get!int == 2);
 }
 
 unittest  // parseMessage rejects a request with a fractional float id
@@ -298,14 +471,24 @@ Json makeNotification(string method, Json params = Json.undefined) @safe
 	return j;
 }
 
-/// Build a success response object.
+/// Build a success response object. An undefined `result` becomes `{}`, since
+/// assigning undefined would drop the member and leave a reply with neither
+/// `result` nor `error`.
 Json makeResponse(Json id, Json result) @safe
 {
 	Json j = Json.emptyObject;
 	j["jsonrpc"] = "2.0";
 	j["id"] = id;
-	j["result"] = result;
+	j["result"] = result.type == Json.Type.undefined ? Json.emptyObject : result;
 	return j;
+}
+
+unittest  // makeResponse with an undefined result still carries a result member
+{
+	const j = makeResponse(Json(1), Json.undefined);
+	assert("result" in j);
+	assert(j["result"] == Json.emptyObject);
+	assert(parseMessage(j.toString()).kind == MessageKind.response);
 }
 
 /// Build an error response object from an McpException.
@@ -461,12 +644,9 @@ unittest  // an unrecognizable batch (empty / non-array) still throws
 	assertThrown!McpException(parseBatchTolerant(`{"jsonrpc":"2.0"}`));
 }
 
-unittest  // parseBatch throws when every batch member is malformed (no silent empty return)
+unittest  // parseBatch is not part of the API; parseBatchTolerant is the one batch parser
 {
-	import std.exception : assertThrown;
-
-	// All members malformed — parseBatch must not silently return [] with no signal.
-	assertThrown!McpException(parseBatch(`[{"id":1,"method":"ping"},{"jsonrpc":"1.0"}]`));
+	static assert(!__traits(compiles, parseBatch(`[]`)));
 }
 
 unittest  // a message with no method and no id is rejected as unclassifiable
@@ -484,6 +664,23 @@ unittest  // method with explicit null id is rejected, not treated as notificati
 	assertThrown!McpException(parseMessage(`{"jsonrpc":"2.0","id":null,"method":"tools/list"}`));
 }
 
+unittest  // an error response with a null id is accepted as an errorResponse
+{
+	auto m = parseMessage(`{"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":"bad"}}`);
+	assert(m.kind == MessageKind.errorResponse);
+	assert(m.id.type == Json.Type.null_);
+	assert(m.error["code"].get!int == -32700);
+}
+
+unittest  // a success response with a null id is rejected
+{
+	import std.exception : assertThrown;
+
+	assertThrown!McpException(parseMessage(`{"jsonrpc":"2.0","id":null,"result":{}}`));
+	assertThrown!McpException(parseMessage(
+			`{"jsonrpc":"2.0","id":null,"result":{},"error":{"code":-1,"message":"x"}}`));
+}
+
 unittest  // a genuine notification (no id) is still accepted
 {
 	auto m = parseMessage(`{"jsonrpc":"2.0","method":"notifications/initialized"}`);
@@ -496,6 +693,20 @@ unittest  // a response carrying both result and error is rejected
 
 	assertThrown!McpException(parseMessage(
 			`{"jsonrpc":"2.0","id":1,"result":{},"error":{"code":-1,"message":"x"}}`));
+}
+
+unittest  // an error response whose code is outside the int range is rejected
+{
+	import std.exception : assertThrown;
+
+	assertThrown!McpException(parseMessage(
+			`{"jsonrpc":"2.0","id":1,"error":{"code":4294967296,"message":"x"}}`));
+	assertThrown!McpException(parseMessage(
+			`{"jsonrpc":"2.0","id":1,"error":{"code":-2147483649,"message":"x"}}`));
+	assertThrown!McpException(parseMessage(
+			`{"jsonrpc":"2.0","id":1,"error":{"code":99999999999999999999,"message":"x"}}`));
+	auto m = parseMessage(`{"jsonrpc":"2.0","id":1,"error":{"code":-2147483648,"message":"x"}}`);
+	assert(m.raw["error"]["code"].get!int == int.min);
 }
 
 unittest  // a response carrying neither result nor error is rejected
@@ -525,4 +736,174 @@ unittest  // array id is rejected (JSON-RPC 2.0 §5: id must be string, number, 
 	import std.exception : assertThrown;
 
 	assertThrown!McpException(parseMessage(`{"jsonrpc":"2.0","id":[],"method":"ping"}`));
+}
+
+unittest  // a request with primitive params is rejected (JSON-RPC 2.0 §4.2: params is structured)
+{
+	import std.exception : collectException;
+
+	foreach (p; [`5`, `"x"`, `true`, `null`])
+	{
+		auto ex = collectException!McpException(parseMessage(
+				`{"jsonrpc":"2.0","id":1,"method":"ping","params":` ~ p ~ `}`));
+		assert(ex !is null && ex.code == ErrorCode.invalidRequest, p);
+	}
+}
+
+unittest  // a notification with primitive params is rejected
+{
+	import std.exception : assertThrown;
+
+	assertThrown!McpException(parseMessage(
+			`{"jsonrpc":"2.0","method":"notifications/initialized","params":7}`));
+}
+
+unittest  // object and absent params are accepted
+{
+	cast(void) parseMessage(`{"jsonrpc":"2.0","id":1,"method":"ping","params":{}}`);
+	cast(void) parseMessage(`{"jsonrpc":"2.0","id":1,"method":"ping"}`);
+}
+
+unittest  // by-position (array) params are rejected with -32602 on requests and notifications
+{
+	import std.exception : collectException;
+
+	foreach (msg; [
+		`{"jsonrpc":"2.0","id":1,"method":"ping","params":[]}`,
+		`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":["x",{}]}`,
+		`{"jsonrpc":"2.0","method":"notifications/cancelled","params":[1]}`
+	])
+	{
+		auto ex = collectException!McpException(parseMessage(msg));
+		assert(ex !is null && ex.code == ErrorCode.invalidParams, msg);
+	}
+}
+
+unittest  // a params error carries a request's id and a null id for a notification
+{
+	import std.exception : collectException;
+
+	auto req = collectException!McpException(
+			parseMessage(`{"jsonrpc":"2.0","id":"a","method":"ping","params":7}`));
+	assert(req.code == ErrorCode.invalidRequest && errorReplyId(req) == Json("a"));
+	auto note = collectException!McpException(
+			parseMessage(`{"jsonrpc":"2.0","method":"notifications/x","params":[]}`));
+	assert(note.code == ErrorCode.invalidParams && errorReplyId(note).type == Json.Type.null_);
+}
+
+unittest  // a bad jsonrpc version on a request carries the request's id
+{
+	import std.exception : collectException;
+
+	auto ex = collectException!McpException(
+			parseMessage(`{"jsonrpc":"1.0","id":5,"method":"ping"}`));
+	assert(ex.code == ErrorCode.invalidRequest && errorReplyId(ex) == Json(5));
+}
+
+unittest  // a non-string method on a request carries the request's id
+{
+	import std.exception : collectException;
+
+	auto ex = collectException!McpException(parseMessage(`{"jsonrpc":"2.0","id":"x","method":42}`));
+	assert(ex.code == ErrorCode.invalidRequest && errorReplyId(ex) == Json("x"));
+}
+
+unittest  // an invalid id is reported with a null reply id
+{
+	import std.exception : collectException;
+
+	auto ex = collectException!McpException(
+			parseMessage(`{"jsonrpc":"1.0","id":true,"method":"ping"}`));
+	assert(ex.code == ErrorCode.invalidRequest && errorReplyId(ex).type == Json.Type.null_);
+}
+
+unittest  // a batch member with array params is reported as a -32602 member error
+{
+	auto r = parseBatchTolerant(`[{"jsonrpc":"2.0","id":1,"method":"ping","params":[]},`
+			~ `{"jsonrpc":"2.0","id":2,"method":"ping"}]`);
+	assert(r.messages.length == 1 && r.errors.length == 1);
+	assert(r.errors[0].index == 0 && r.errors[0].error.code == ErrorCode.invalidParams);
+}
+
+unittest  // an error response whose error is not an object is rejected with -32600
+{
+	import std.exception : collectException;
+
+	foreach (e; [`"boom"`, `5`, `null`, `[]`, `true`])
+		foreach (id; [`1`, `null`])
+		{
+			auto ex = collectException!McpException(
+					parseMessage(`{"jsonrpc":"2.0","id":` ~ id ~ `,"error":` ~ e ~ `}`));
+			assert(ex !is null && ex.code == ErrorCode.invalidRequest, e);
+		}
+}
+
+unittest  // an error object needs an integer code and a string message
+{
+	import std.exception : collectException;
+
+	foreach (e; [
+		`{}`, `{"message":"x"}`, `{"code":-1}`, `{"code":"-1","message":"x"}`,
+		`{"code":-1.5,"message":"x"}`, `{"code":-1,"message":7}`
+	])
+	{
+		auto ex = collectException!McpException(
+				parseMessage(`{"jsonrpc":"2.0","id":1,"error":` ~ e ~ `}`));
+		assert(ex !is null && ex.code == ErrorCode.invalidRequest, e);
+	}
+}
+
+unittest  // a well-formed error object with data is accepted
+{
+	auto m = parseMessage(
+			`{"jsonrpc":"2.0","id":1,"error":{"code":-32602,"message":"bad","data":[1]}}`);
+	assert(m.kind == MessageKind.errorResponse);
+	assert(m.error["code"].get!long == -32602);
+}
+
+unittest  // takeBatchReplies hands replies to onReply and keeps the other members in order
+{
+	Json[] replies;
+	const rest = takeBatchReplies(`[{"jsonrpc":"2.0","id":1,"method":"ping"},`
+			~ `{"jsonrpc":"2.0","id":7,"result":{}},{"jsonrpc":"2.0","method":"n"},`
+			~ `{"jsonrpc":"2.0","id":8,"error":{"code":-1,"message":"no"}}]`, (Message m) @safe {
+		replies ~= m.id;
+	});
+	assert(replies == [Json(7), Json(8)]);
+	auto arr = parseJsonString(rest);
+	assert(arr.length == 2 && arr[0]["method"].get!string == "ping"
+			&& arr[1]["method"].get!string == "n");
+}
+
+unittest  // takeBatchMembers removes exactly the well-formed members `take` claims
+{
+	string[] taken;
+	const rest = takeBatchMembers(`[{"jsonrpc":"2.0","id":1,"method":"ping"},`
+			~ `{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":1}},`
+			~ `{"jsonrpc":"2.0","method":"n"}]`, (Message m) @safe {
+		if (m.method != "notifications/cancelled")
+			return false;
+		taken ~= m.method;
+		return true;
+	});
+	assert(taken == ["notifications/cancelled"]);
+	auto arr = parseJsonString(rest);
+	assert(arr.length == 2 && arr[0]["method"].get!string == "ping"
+			&& arr[1]["method"].get!string == "n");
+}
+
+unittest  // takeBatchReplies returns null for a batch of replies only
+{
+	assert(takeBatchReplies(`[{"jsonrpc":"2.0","id":7,"result":{}}]`, (Message) @safe {
+		}) is null);
+}
+
+unittest  // takeBatchReplies leaves a batch without replies, or a single message, untouched
+{
+	const batch = `[{"jsonrpc":"2.0","id":1,"method":"ping"}]`;
+	const single = `{"jsonrpc":"2.0","id":7,"result":{}}`;
+	bool called;
+	assert(takeBatchReplies(batch, (Message) @safe { called = true; }) is batch);
+	assert(takeBatchReplies(single, (Message) @safe { called = true; }) is single);
+	assert(!called);
 }

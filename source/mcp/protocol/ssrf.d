@@ -2,6 +2,8 @@ module mcp.protocol.ssrf;
 
 import core.time : Duration;
 import vibe.http.client : HTTPClientRequest, HTTPClientResponse;
+import vibe.stream.tls : TLSContext;
+import mcp.protocol.jsonhelpers : asciiEqualsIgnoreCase;
 
 @safe:
 
@@ -21,11 +23,12 @@ import vibe.http.client : HTTPClientRequest, HTTPClientResponse;
 // resolution of every A/AAAA record, failing CLOSED to `privateOrLinkLocal` on
 // a resolution error or when any resolved address is internal.
 //
-// `SsrfPolicy.blockInternal` rejects loopback/private/link-local hosts (the
-// dev-loopback-over-http allowance excepted) and is used for every
-// attacker-influenceable fetch. `SsrfPolicy.allowUserConfigured` resolves and
-// pins the address for stability but permits internal/loopback targets, for the
-// user-chosen client transport endpoint.
+// `SsrfPolicy.blockInternal` rejects loopback/private/link-local hosts and is
+// used for every URL an untrusted party names. `SsrfPolicy.allowLoopback` adds
+// a plain-http allowance for explicit loopback hosts, for URLs the operator or
+// user configured (local development). `SsrfPolicy.allowUserConfigured`
+// resolves and pins the address for stability but permits internal/loopback
+// targets, for the user-chosen client transport endpoint.
 // ===========================================================================
 
 /// The trust class of a host or resolved address.
@@ -46,11 +49,17 @@ enum AddressClass
 /// How a fetch treats internal targets.
 enum SsrfPolicy
 {
-	/// Reject loopback/private/link-local hosts. The only internal targets
-	/// permitted are explicit loopback hosts reached over plaintext `http`
-	/// (the local-development allowance). Used for every attacker-influenceable
-	/// fetch (OAuth/discovery, JWKS, introspection, proxy upstream).
+	/// Require `https` to a public host: loopback, private and link-local
+	/// targets are all rejected. Used for every URL an untrusted party names
+	/// (endpoints from discovered OAuth metadata of a remote server, Client ID
+	/// Metadata Document URLs, webhook callbacks).
 	blockInternal,
+	/// As `blockInternal`, but an explicit literal loopback host (`localhost`,
+	/// `127.0.0.0/8` in any encoding, `[::1]`) is also permitted over plain
+	/// `http` — the local-development allowance. Used only for URLs the operator
+	/// or user configured (JWKS, introspection, upstream OAuth endpoints) or that
+	/// a user-configured loopback MCP endpoint names.
+	allowLoopback,
 	/// Resolve and pin the address (TOCTOU-stable) but do NOT reject internal or
 	/// loopback targets. Used for the user-chosen MCP client transport endpoint.
 	allowUserConfigured,
@@ -184,6 +193,34 @@ bool canonicalizeNumericIpv4(string host, out ubyte[4] outOct) @safe pure nothro
 	return true;
 }
 
+/// True when a numeric IPv4 literal has a multi-digit, non-hex part that starts
+/// with `0` (e.g. `0127.0.0.1`). `inet_aton` reads such a part as octal but some
+/// resolvers (macOS `getaddrinfo`) read it as decimal, so the literal names no
+/// single address and the classifiers fail it closed.
+private bool hasLeadingZeroPart(string host) @safe pure nothrow @nogc
+{
+	size_t start;
+	foreach (i; 0 .. host.length + 1)
+	{
+		if (i < host.length && host[i] != '.')
+			continue;
+		const part = host[start .. i];
+		if (part.length > 1 && part[0] == '0' && part[1] != 'x' && part[1] != 'X')
+			return true;
+		start = i + 1;
+	}
+	return false;
+}
+
+/// The canonical dotted-quad text of `oct`.
+private string dottedQuad(const ubyte[4] oct) @safe pure nothrow
+{
+	import std.conv : to;
+
+	return oct[0].to!string ~ "." ~ oct[1].to!string ~ "." ~ oct[2].to!string
+		~ "." ~ oct[3].to!string;
+}
+
 // ---------------------------------------------------------------------------
 // IPv6 literal parsing.
 // ---------------------------------------------------------------------------
@@ -227,6 +264,10 @@ private bool parseIpv6Literal(string s, out ubyte[16] outBytes) @safe pure nothr
 			{
 				uint v;
 				size_t digits;
+				// A multi-digit octet starting with `0` is octal to some resolvers
+				// and decimal here; reject the ambiguous spelling.
+				if (i + 1 < tail.length && tail[i] == '0' && tail[i + 1] >= '0' && tail[i + 1] <= '9')
+					return false;
 				while (i < tail.length && tail[i] >= '0' && tail[i] <= '9')
 				{
 					v = v * 10 + cast(uint)(tail[i] - '0');
@@ -254,8 +295,14 @@ private bool parseIpv6Literal(string s, out ubyte[16] outBytes) @safe pure nothr
 				cast(ubyte) oct[3]
 			];
 			haveV4 = true;
-			// Replace the IPv4 tail with the hextet portion for hextet parsing.
-			s = (lastColon < 0) ? "" : s[0 .. lastColon + 1];
+			// Replace the IPv4 tail with the hextet portion for hextet parsing,
+			// dropping the separator colon unless it closes a `::`.
+			if (lastColon < 0)
+				s = "";
+			else if (lastColon > 0 && s[lastColon - 1] == ':')
+				s = s[0 .. lastColon + 1];
+			else
+				s = s[0 .. lastColon];
 		}
 	}
 
@@ -312,6 +359,64 @@ private bool parseIpv6Literal(string s, out ubyte[16] outBytes) @safe pure nothr
 	return true;
 }
 
+/// Render 16 IPv6 address bytes in the RFC 5952 canonical text form: lowercase
+/// hextets without leading zeros, with the longest run of two or more zero
+/// hextets (the first, on a tie) compressed to `::`.
+private string renderIpv6(const ubyte[16] b) @safe pure nothrow
+{
+	ushort[8] h;
+	foreach (i; 0 .. 8)
+		h[i] = cast(ushort)((b[2 * i] << 8) | b[2 * i + 1]);
+
+	ptrdiff_t bestStart = -1;
+	size_t bestLen;
+	for (size_t i = 0; i < 8;)
+	{
+		if (h[i] != 0)
+		{
+			i++;
+			continue;
+		}
+		size_t j = i;
+		while (j < 8 && h[j] == 0)
+			j++;
+		if (j - i > bestLen)
+		{
+			bestStart = i;
+			bestLen = j - i;
+		}
+		i = j;
+	}
+	if (bestLen < 2)
+		bestStart = -1;
+
+	static immutable hexDigits = "0123456789abcdef";
+	string s;
+	for (size_t i = 0; i < 8;)
+	{
+		if (i == bestStart)
+		{
+			s ~= "::";
+			i += bestLen;
+			continue;
+		}
+		if (s.length && s[$ - 1] != ':')
+			s ~= ':';
+		bool started;
+		foreach (shift; [12, 8, 4, 0])
+		{
+			const nibble = (h[i] >> shift) & 0xF;
+			if (nibble != 0 || started || shift == 0)
+			{
+				s ~= hexDigits[nibble];
+				started = true;
+			}
+		}
+		i++;
+	}
+	return s;
+}
+
 /// Parse a colon-separated list of IPv6 hextets into bytes; returns count of
 /// bytes written, or -1 on error. An empty segment yields 0 bytes.
 private ptrdiff_t parseHextets(string seg, ubyte[] dst) @safe pure nothrow @nogc
@@ -363,7 +468,8 @@ private ptrdiff_t parseHextets(string seg, ubyte[] dst) @safe pure nothrow @nogc
 // ---------------------------------------------------------------------------
 
 /// Range-check four IPv4 octets. Returns the class: loopback (127/8), private/
-/// link-local/this-host (RFC 1918, 169.254/16, 0/8), or public. `@safe pure
+/// link-local/this-host/special-purpose (RFC 1918, 169.254/16, 0/8, CGNAT,
+/// IETF-assigned, benchmarking, documentation, multicast, reserved), or public. `@safe pure
 /// nothrow @nogc`.
 private AddressClass classifyIpv4Octets(ubyte a, ubyte b, ubyte c, ubyte d) @safe pure nothrow @nogc
 {
@@ -380,6 +486,14 @@ private AddressClass classifyIpv4Octets(ubyte a, ubyte b, ubyte c, ubyte d) @saf
 	if (a == 100 && b >= 64 && b <= 127) // 100.64.0.0/10 RFC 6598 carrier-grade-NAT shared space (not globally routable)
 		return AddressClass.privateOrLinkLocal;
 	if (a == 0) // 0.0.0.0/8 "this host"
+		return AddressClass.privateOrLinkLocal;
+	if (a == 192 && b == 0 && (c == 0 || c == 2)) // 192.0.0.0/24 IETF protocol assignments, 192.0.2.0/24 TEST-NET-1
+		return AddressClass.privateOrLinkLocal;
+	if (a == 198 && (b == 18 || b == 19)) // 198.18.0.0/15 benchmarking
+		return AddressClass.privateOrLinkLocal;
+	if (a == 198 && b == 51 && c == 100) // 198.51.100.0/24 TEST-NET-2
+		return AddressClass.privateOrLinkLocal;
+	if (a == 203 && b == 0 && c == 113) // 203.0.113.0/24 TEST-NET-3
 		return AddressClass.privateOrLinkLocal;
 	if (a >= 224 && a <= 239) // 224.0.0.0/4 multicast (not a unicast destination)
 		return AddressClass.privateOrLinkLocal;
@@ -425,6 +539,10 @@ private AddressClass classifyIpv6Literal(string inner) @safe pure nothrow @nogc
 	// Link-local fe80::/10 (0xFE 0x80..0xBF).
 	if (b[0] == 0xFE && (b[1] & 0xC0) == 0x80)
 		return AddressClass.privateOrLinkLocal;
+	// Deprecated site-local fec0::/10 (0xFE 0xC0..0xFF), still routed internally
+	// by some networks.
+	if (b[0] == 0xFE && (b[1] & 0xC0) == 0xC0)
+		return AddressClass.privateOrLinkLocal;
 	// Multicast ff00::/8 (first byte 0xFF) — not a unicast destination.
 	if (b[0] == 0xFF)
 		return AddressClass.privateOrLinkLocal;
@@ -441,9 +559,33 @@ private AddressClass classifyIpv6Literal(string inner) @safe pure nothrow @nogc
 	if (mapped && ((b[10] == 0xFF && b[11] == 0xFF) || (b[10] == 0 && b[11] == 0)))
 		return classifyIpv4Octets(b[12], b[13], b[14], b[15]);
 
-	// NAT64 prefixes carry an embedded IPv4 in the low 32 bits that a NAT64
-	// gateway translates and routes, so classify that IPv4 the same as ::ffff:.
-	// Well-known 64:ff9b::/96 (RFC 6052): 00 64 ff 9b then bytes 4..11 zero.
+	// IPv4-translated ::ffff:0:a.b.c.d/96 (RFC 2765 SIIT): bytes 0..7 zero,
+	// then ff ff 00 00, then the IPv4 a translator routes to.
+	bool translated = true;
+	foreach (k; 0 .. 8)
+		if (b[k] != 0)
+		{
+			translated = false;
+			break;
+		}
+	if (translated && b[8] == 0xFF && b[9] == 0xFF && b[10] == 0 && b[11] == 0)
+		return classifyIpv4Octets(b[12], b[13], b[14], b[15]);
+
+	// An IPv4 embedded in a 6to4 or NAT64 address is reached through a relay or
+	// gateway, not on this host, so an embedded 127.x is internal but never the
+	// literal-loopback dev allowance.
+	static AddressClass routed(AddressClass c) @safe pure nothrow @nogc
+	{
+		return c == AddressClass.loopback ? AddressClass.privateOrLinkLocal : c;
+	}
+
+	// 6to4 2002::/16 (RFC 3056) carries the relay-routed IPv4 in bytes 2..5.
+	if (b[0] == 0x20 && b[1] == 0x02)
+		return routed(classifyIpv4Octets(b[2], b[3], b[4], b[5]));
+
+	// NAT64 prefixes carry an embedded IPv4 that a NAT64 gateway translates and
+	// routes. Well-known 64:ff9b::/96 (RFC 6052): 00 64 ff 9b then bytes 4..11
+	// zero, with the IPv4 in the low 32 bits.
 	if (b[0] == 0x00 && b[1] == 0x64 && b[2] == 0xFF && b[3] == 0x9B)
 	{
 		bool wellKnown = true;
@@ -454,13 +596,42 @@ private AddressClass classifyIpv6Literal(string inner) @safe pure nothrow @nogc
 				break;
 			}
 		if (wellKnown)
-			return classifyIpv4Octets(b[12], b[13], b[14], b[15]);
-		// Local-use 64:ff9b:1::/48 (RFC 8215): 00 64 ff 9b 00 01.
+			return routed(classifyIpv4Octets(b[12], b[13], b[14], b[15]));
+		// Local-use 64:ff9b:1::/48 (RFC 8215): 00 64 ff 9b 00 01. Its prefix
+		// length, and so where the IPv4 sits, is a local choice, so the whole
+		// block is internal.
 		if (b[4] == 0x00 && b[5] == 0x01)
-			return classifyIpv4Octets(b[12], b[13], b[14], b[15]);
+			return AddressClass.privateOrLinkLocal;
 	}
 
+	// Documentation 2001:db8::/32 (RFC 3849): never a real destination.
+	if (b[0] == 0x20 && b[1] == 0x01 && b[2] == 0x0D && b[3] == 0xB8)
+		return AddressClass.privateOrLinkLocal;
+	// Benchmarking 2001:2::/48 (RFC 5180): lab-only, not globally routed.
+	if (b[0] == 0x20 && b[1] == 0x01 && b[2] == 0 && b[3] == 0x02 && b[4] == 0 && b[5] == 0)
+		return AddressClass.privateOrLinkLocal;
+	// Discard-only 100::/64 (RFC 6666): blackholed by design.
+	if (b[0] == 0x01 && b[1] == 0 && b[2] == 0 && b[3] == 0 && b[4] == 0
+			&& b[5] == 0 && b[6] == 0 && b[7] == 0)
+		return AddressClass.privateOrLinkLocal;
+
+	// Teredo 2001::/32 (RFC 4380) tunnels to an obfuscated IPv4 client address
+	// via a relay; it is never a direct public destination, so fail closed.
+	if (b[0] == 0x20 && b[1] == 0x01 && b[2] == 0 && b[3] == 0)
+		return AddressClass.privateOrLinkLocal;
+
 	return AddressClass.public_;
+}
+
+/// Whether `name` is the loopback name `localhost`. Host names compare
+/// case-insensitively, and one trailing dot marks the same name fully qualified.
+private bool isLocalhostName(string name) @safe pure nothrow @nogc
+{
+	import mcp.protocol.jsonhelpers : asciiEqualsIgnoreCase;
+
+	if (name.length && name[$ - 1] == '.')
+		name = name[0 .. $ - 1];
+	return asciiEqualsIgnoreCase(name, "localhost");
 }
 
 /// Classify a resolved address given as its numeric string form (as produced by
@@ -521,11 +692,17 @@ private string stripPortAndBrackets(string host) @safe pure nothrow @nogc
 /// `pinnedIp`. This is the SINGLE address classifier all SSRF decisions flow
 /// through:
 ///
-/// - IP literals (IPv4 in every numeric encoding, IPv6 including embedded-IPv4,
-///   ULA, link-local and loopback) are classified directly and `pinnedIp` is the
-///   host verbatim (already a literal vibe will not re-resolve).
-/// - `localhost` and `::1` are classified as loopback; `pinnedIp` is the host
-///   verbatim.
+/// - IPv4 literals in every numeric encoding are classified directly and
+///   `pinnedIp` is their canonical dotted quad. A literal with a multi-digit
+///   part that starts with `0` (`0127.0.0.1`) is octal to `inet_aton` but
+///   decimal to some resolvers, so it is `privateOrLinkLocal` with an empty
+///   `pinnedIp` (fail CLOSED).
+/// - IPv6 literals (including embedded-IPv4, ULA, link-local and loopback) are
+///   classified directly and `pinnedIp` is the RFC 5952 rendering of the parsed
+///   bytes (unbracketed, no port, zone id kept). An unparseable literal is
+///   `privateOrLinkLocal` with an empty `pinnedIp` (fail CLOSED).
+/// - `localhost` is classified as loopback and pinned to `127.0.0.1`, so the
+///   connection never re-resolves the name.
 /// - A registered hostname is resolved; EVERY returned A/AAAA address is
 ///   classified and `pinnedIp` is set to the first one. If ANY resolved address
 ///   is loopback/private/link-local the result is `privateOrLinkLocal` (resolved
@@ -537,8 +714,6 @@ private string stripPortAndBrackets(string host) @safe pure nothrow @nogc
 /// `@safe` (DNS resolution is `@system` in `std.socket`; wrapped here).
 AddressClass classifyHost(string host, out string pinnedIp) @safe
 {
-	import std.socket : getAddressInfo, AddressFamily, SocketException;
-
 	pinnedIp = "";
 	if (host.length == 0)
 		return AddressClass.privateOrLinkLocal; // fail closed
@@ -547,68 +722,102 @@ AddressClass classifyHost(string host, out string pinnedIp) @safe
 	if (bare.length == 0)
 		return AddressClass.privateOrLinkLocal;
 
-	// Bracketed or bracketless IPv6 literal (contains ':').
+	// A bracketed host, or a bare one that still contains ':' after the port
+	// strip (two or more colons), is an IPv6 literal.
 	{
 		import std.string : indexOf;
 
-		if (host[0] == '[' || (bare.indexOf(':') >= 0 && bare.indexOf('.') < 0)
-				|| (bare.indexOf(':') >= 0 && bare.indexOf("::") >= 0))
+		if (host[0] == '[' || bare.indexOf(':') >= 0)
 		{
-			pinnedIp = host;
+			ubyte[16] bytes;
+			if (!parseIpv6Literal(bare, bytes))
+				return AddressClass.privateOrLinkLocal; // fail closed
+			// Pin the parsed address, not the text as written, so the connection
+			// reaches exactly the classified bytes; a zone id is kept verbatim.
+			const pct = bare.indexOf('%');
+			pinnedIp = renderIpv6(bytes) ~ (pct >= 0 ? bare[pct .. $] : "");
 			return classifyIpv6Literal(bare);
 		}
 	}
 
-	if (bare == "localhost")
+	if (isLocalhostName(bare))
 	{
-		pinnedIp = host;
+		pinnedIp = "127.0.0.1";
 		return AddressClass.loopback;
 	}
 
-	// A numeric IPv4 literal in any encoding — classify directly, pin verbatim.
+	// A numeric IPv4 literal in any encoding — classify directly and pin the
+	// canonical dotted quad, so the connection reaches exactly the classified
+	// address whatever the resolver makes of the original spelling.
 	ubyte[4] oct;
 	if (canonicalizeNumericIpv4(bare, oct))
 	{
-		pinnedIp = host;
+		if (hasLeadingZeroPart(bare))
+			return AddressClass.privateOrLinkLocal; // ambiguous literal -> fail CLOSED
+		pinnedIp = dottedQuad(oct);
 		return classifyIpv4Octets(oct[0], oct[1], oct[2], oct[3]);
 	}
 
 	// A registered hostname: resolve and vet every returned address.
+	const res = resolveHostAddresses(bare);
+	if (res.failed || res.addresses.length == 0)
+		return AddressClass.privateOrLinkLocal; // unresolved / no usable record -> fail CLOSED
+	AddressClass worst = AddressClass.public_;
+	foreach (addr; res.addresses)
+	{
+		auto cls = classifyResolvedAddress(addr);
+		// A resolved loopback address is demoted to private/link-local: the
+		// literal-loopback dev allowance applies only to literal hosts
+		// (localhost/127.x/[::1], handled above before this DNS branch), never to
+		// a registered name an attacker can point at 127.x via DNS.
+		if (cls == AddressClass.loopback)
+			cls = AddressClass.privateOrLinkLocal;
+		// A single internal address taints the whole host (DNS-rebinding guard).
+		if (cls != AddressClass.public_)
+			worst = cls;
+	}
+	pinnedIp = res.addresses[0];
+	return worst;
+}
+
+/// The numeric A/AAAA addresses a name resolves to, or `failed` when the
+/// resolver reported an error.
+private struct Resolution
+{
+	string[] addresses;
+	bool failed;
+}
+
+/// Resolve `host` with the system resolver (`getaddrinfo`), keeping every
+/// IPv4/IPv6 address. Blocks the calling thread.
+private Resolution systemResolve(string host) @safe nothrow
+{
+	import std.socket : getAddressInfo, AddressFamily;
+
+	Resolution r;
 	try
 	{
-		auto infos = getAddressInfo(bare);
-		string chosen;
-		AddressClass worst = AddressClass.public_;
-		bool any;
-		foreach (info; infos)
-		{
-			if (info.family != AddressFamily.INET && info.family != AddressFamily.INET6)
-				continue;
-			const addr = info.address.toAddrString();
-			auto cls = classifyResolvedAddress(addr);
-			any = true;
-			// A resolved loopback address is demoted to private/link-local: the
-			// literal-loopback dev allowance applies only to literal hosts
-			// (localhost/127.x/[::1], handled above before this DNS branch), never to
-			// a registered name an attacker can point at 127.x via DNS.
-			if (cls == AddressClass.loopback)
-				cls = AddressClass.privateOrLinkLocal;
-			// A single internal address taints the whole host (DNS-rebinding guard).
-			if (cls != AddressClass.public_)
-				worst = cls;
-			if (chosen.length == 0)
-				chosen = addr;
-		}
-		if (!any || chosen.length == 0)
-			return AddressClass.privateOrLinkLocal; // no usable record -> fail closed
-		pinnedIp = chosen;
-		return worst;
+		foreach (info; getAddressInfo(host))
+			if (info.family == AddressFamily.INET || info.family == AddressFamily.INET6)
+				r.addresses ~= info.address.toAddrString();
 	}
-	catch (SocketException)
-	{
-		pinnedIp = "";
-		return AddressClass.privateOrLinkLocal; // unresolved -> fail CLOSED
-	}
+	catch (Exception)
+		r.failed = true;
+	return r;
+}
+
+/// The resolver `classifyHost` uses for registered names.
+private __gshared Resolution function(string) @safe nothrow hostResolver = &systemResolve;
+
+/// Resolve `host` through `hostResolver` on a worker thread: the system
+/// resolver blocks, and running it on the caller's event loop would stall every
+/// other task there until it returns. The caller waits without blocking its
+/// thread.
+private Resolution resolveHostAddresses(string host) @trusted
+{
+	import vibe.core.concurrency : asyncWork;
+
+	return asyncWork(hostResolver, host).getResult();
 }
 
 // ---------------------------------------------------------------------------
@@ -620,7 +829,8 @@ AddressClass classifyHost(string host, out string pinnedIp) @safe
 /// explicit loopback names (`localhost`) are classified directly; any registered
 /// hostname is treated as `public_` (a lexical pre-filter cannot know what it
 /// resolves to — the resolve-and-pin connector makes the authoritative call).
-/// `@safe pure nothrow @nogc`.
+/// An IPv4 literal with a leading-zero multi-digit part is `privateOrLinkLocal`,
+/// as in `classifyHost`. `@safe pure nothrow @nogc`.
 AddressClass classifyHostLexical(string host) @safe pure nothrow @nogc
 {
 	import std.string : indexOf;
@@ -632,17 +842,21 @@ AddressClass classifyHostLexical(string host) @safe pure nothrow @nogc
 	if (bare.length == 0)
 		return AddressClass.privateOrLinkLocal;
 
-	// Bracketed or bracketless IPv6 literal (contains ':').
-	if (host[0] == '[' || (bare.indexOf(':') >= 0 && bare.indexOf('.') < 0)
-			|| (bare.indexOf(':') >= 0 && bare.indexOf("::") >= 0))
+	// A bracketed host, or a bare one that still contains ':' after the port
+	// strip (two or more colons), is an IPv6 literal.
+	if (host[0] == '[' || bare.indexOf(':') >= 0)
 		return classifyIpv6Literal(bare);
 
-	if (bare == "localhost")
+	if (isLocalhostName(bare))
 		return AddressClass.loopback;
 
 	ubyte[4] oct;
 	if (canonicalizeNumericIpv4(bare, oct))
+	{
+		if (hasLeadingZeroPart(bare))
+			return AddressClass.privateOrLinkLocal; // ambiguous literal -> fail closed
 		return classifyIpv4Octets(oct[0], oct[1], oct[2], oct[3]);
+	}
 
 	// A registered hostname: lexically public (no resolution here).
 	return AddressClass.public_;
@@ -662,24 +876,24 @@ struct PinnedConnect
 /// Vet a `host` (authority host, optionally bracketed / with a `:port` suffix)
 /// against `policy` for a raw-TCP connect, returning the address to connect to
 /// and the SNI/Host name to present. `tls` records whether the connection uses
-/// TLS; the http-vs-loopback scheme restriction itself is enforced by the
-/// caller's scheme gate (`secureRequestHTTP`), not here.
+/// TLS.
 ///
-/// `blockInternal`: public hosts pass; an explicit literal-loopback host
-/// (`localhost`, `127.x` in any encoding, `[::1]`) passes as the dev-loopback
-/// allowance; everything else — including a registered name that DNS-resolves to
-/// loopback — is rejected (`classifyHost` demotes resolved loopback to private).
+/// `blockInternal`: only public hosts pass.
+/// `allowLoopback`: public hosts pass, and an explicit literal-loopback host
+/// (`localhost`, `127.x` in any encoding, `[::1]`) passes over plain http as
+/// the dev-loopback allowance; loopback over TLS and a registered name that
+/// DNS-resolves to loopback are rejected (`classifyHost` demotes resolved
+/// loopback to private). A caller that must reach a loopback TLS service uses
+/// `allowUserConfigured`.
 /// `allowUserConfigured`: every classifiable host passes (loopback and private
 /// included); only a fail-closed classification (unresolvable / malformed)
 /// is rejected.
 ///
-/// The returned `pinnedIp` has any `:port` suffix stripped and bracketing
-/// preserved for IPv6 so the caller pins the connection to the vetted address.
+/// The returned `pinnedIp` is the bare numeric address `classifyHost` vetted
+/// (no port, IPv6 unbracketed) so the caller pins the connection to it.
 /// `@safe`.
 PinnedConnect pinnedConnectAddress(string host, bool tls, SsrfPolicy policy) @safe
 {
-	import std.string : indexOf;
-
 	PinnedConnect r;
 	string pinned;
 	const cls = classifyHost(host, pinned);
@@ -693,9 +907,15 @@ PinnedConnect pinnedConnectAddress(string host, bool tls, SsrfPolicy policy) @sa
 	case SsrfPolicy.blockInternal:
 		if (cls == AddressClass.public_)
 			break;
-		if (cls == AddressClass.loopback)
-			break; // literal-loopback dev allowance; the caller's scheme gate restricts http to it
-		return r; // private/link-local -> reject
+		return r; // loopback, private/link-local -> reject
+	case SsrfPolicy.allowLoopback:
+		if (cls == AddressClass.public_)
+			break;
+		// Literal loopback is the plain-http dev allowance only: over TLS it would
+		// reach local TLS services (admin consoles, sidecars).
+		if (cls == AddressClass.loopback && !tls)
+			break;
+		return r; // loopback over TLS, private/link-local -> reject
 	case SsrfPolicy.allowUserConfigured:
 		break; // any classifiable host is permitted
 	}
@@ -704,48 +924,191 @@ PinnedConnect pinnedConnectAddress(string host, bool tls, SsrfPolicy policy) @sa
 	// off — vibe's TLS layer wants the bare name).
 	r.sniHost = stripPortAndBrackets(host);
 
-	// Strip a port suffix from the pinned address (the caller keeps its own port).
-	string connHost = pinned;
-	if (connHost.length && connHost[0] == '[')
-	{
-		const close = connHost.indexOf(']');
-		if (close > 0)
-			connHost = connHost[1 .. close];
-	}
-	else if (connHost.length)
-	{
-		const c = connHost.indexOf(':');
-		// IPv4/host:port carries a single ':'; a bracketless IPv6 literal has many.
-		if (c >= 0 && connHost.indexOf(':', c + 1) < 0)
-			connHost = connHost[0 .. c];
-	}
-	r.pinnedIp = connHost;
+	r.pinnedIp = pinned;
 	r.ok = true;
 	return r;
+}
+
+/// How outbound TLS connections validate the server certificate.
+struct TlsTrust
+{
+	/// A PEM file of CA certificates to trust in place of the system store — a
+	/// private CA, or the certificate of a self-signed development server. Empty
+	/// (the default) trusts the system CA bundle: the file named by
+	/// `SSL_CERT_FILE` when set, else OpenSSL's default bundle, else a
+	/// well-known platform location. Where no system bundle exists (e.g.
+	/// Windows) set this or `SSL_CERT_FILE`; TLS connections fail otherwise.
+	string caFile;
+
+	/// Accept any server certificate without verifying its chain or host name.
+	/// For local development and tests against self-signed servers only: it
+	/// leaves every TLS connection open to interception.
+	bool insecureSkipVerify;
+}
+
+/// Per-request knobs for `secureRequestHTTP`.
+struct FetchOptions
+{
+	import core.time : seconds;
+
+	/// Overall bound on the request — name resolution, connect, sending, and
+	/// reading the response, however slowly the server trickles bytes — so an
+	/// unresponsive endpoint cannot hold the calling task indefinitely. Zero
+	/// removes the bound.
+	Duration timeout = 30.seconds;
+
+	/// Certificate validation for `https` URLs.
+	TlsTrust tls;
+}
+
+/// The system CA bundle: the file `SSL_CERT_FILE` names, else OpenSSL's
+/// compiled-in default, else the first well-known platform bundle that exists.
+/// Empty when none is found. Resolved once per thread.
+private string systemCaBundle() @safe
+{
+	import deimos.openssl.x509 : X509_get_default_cert_file, X509_get_default_cert_file_env;
+	import std.file : exists, isFile;
+	import std.process : environment;
+	import std.string : fromStringz;
+
+	static bool resolved;
+	static string bundle;
+	if (resolved)
+		return bundle;
+	resolved = true;
+
+	const envVar = () @trusted {
+		return fromStringz(X509_get_default_cert_file_env()).idup;
+	}();
+	const defaultFile = () @trusted {
+		return fromStringz(X509_get_default_cert_file()).idup;
+	}();
+	string[] candidates = [
+		environment.get(envVar, ""), defaultFile, "/etc/ssl/cert.pem",
+		"/etc/ssl/certs/ca-certificates.crt", "/etc/pki/tls/certs/ca-bundle.crt",
+		"/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem",
+		"/etc/ssl/ca-bundle.pem", "/usr/local/etc/openssl/cert.pem",
+		"/usr/local/share/certs/ca-root-nss.crt",
+	];
+	foreach (c; candidates)
+	{
+		try
+		{
+			if (c.length && exists(c) && isFile(c))
+			{
+				bundle = c;
+				break;
+			}
+		}
+		catch (Exception)
+		{
+		}
+	}
+	return bundle;
+}
+
+/// Build the setup for a client TLS context that validates servers under
+/// `trust`: the full chain against the trusted CAs plus the host name, or
+/// nothing when `trust.insecureSkipVerify` is set. The CA bundle is resolved
+/// here, so a missing bundle throws before any connection is attempted rather
+/// than letting one proceed unverified.
+void delegate(TLSContext) @safe nothrow tlsContextSetup(TlsTrust trust) @safe
+{
+	import mcp.protocol.errors : internalError;
+	import vibe.stream.tls : TLSPeerValidationMode;
+
+	if (trust.insecureSkipVerify)
+		return (TLSContext ctx) @safe nothrow{
+		try
+			ctx.peerValidationMode = TLSPeerValidationMode.none;
+		catch (Exception)
+		{
+		}
+	};
+
+	const caFile = trust.caFile.length ? trust.caFile : systemCaBundle();
+	if (caFile.length == 0)
+		throw internalError("No CA bundle is available to verify TLS server certificates; "
+				~ "set SSL_CERT_FILE or TlsTrust.caFile");
+	return (TLSContext ctx) @safe nothrow{
+		// A bundle that fails to load leaves the trust store empty, so every
+		// handshake is refused.
+		try
+		{
+			ctx.peerValidationMode = TLSPeerValidationMode.trustedCert;
+			ctx.useTrustedCertificateFile(caFile);
+		}
+		catch (Exception)
+		{
+		}
+	};
 }
 
 /// SSRF-safe HTTP fetch. Parses `url` with vibe's `URL` — the exact parser the
 /// connector uses — so the host vetted is the host connected to (no parser
 /// differential). The host is classified ONCE via `classifyHost`; under
-/// `policy` an internal target is rejected (`blockInternal`, dev-loopback-over-
-/// http excepted) or pinned-but-permitted (`allowUserConfigured`). The request
+/// `policy` an internal target is rejected (`blockInternal`; `allowLoopback`
+/// excepts plain-http literal loopback) or pinned-but-permitted
+/// (`allowUserConfigured`). The request
 /// URL's host is rewritten to the vetted numeric IP and the connection pinned to
 /// it, while the original hostname is preserved for the `Host` header and TLS
 /// SNI (no TOCTOU re-resolution).
 ///
+/// An `https` server must present a certificate chaining to a trusted CA and
+/// matching the original host name; `options.tls` selects the trusted CAs.
+/// `options.timeout` bounds the whole request.
+///
 /// Throws `invalidRequest` when the URL is unsafe under `policy` (insecure
-/// scheme for `blockInternal`, an internal IP-literal/resolved address, or an
-/// unresolvable host — fail CLOSED). `@trusted` because the vibe HTTP client API
-/// is `@system`.
+/// scheme for `blockInternal`/`allowLoopback`, an internal IP-literal/resolved address, or an
+/// unresolvable host — fail CLOSED), and `internalError` when the request
+/// times out.
 void secureRequestHTTP(string url, SsrfPolicy policy,
-		scope void delegate(scope HTTPClientRequest) requester,
-		scope void delegate(scope HTTPClientResponse) responder,
-		Duration requestTimeout = Duration.zero) @trusted
+		scope void delegate(scope HTTPClientRequest) @safe requester,
+		scope void delegate(scope HTTPClientResponse) @safe responder,
+		FetchOptions options = FetchOptions.init) @safe
+{
+	import mcp.protocol.errors : internalError;
+	import vibe.core.core : setTimer, Timer;
+	import vibe.core.task : InterruptException, Task;
+
+	// The deadline interrupts the calling task when it elapses, cutting short
+	// whichever step (resolution, connect, or a drip-fed read) is in progress.
+	// Outside a task the per-operation connect/read timeouts still apply.
+	auto self = Task.getThis();
+	bool finished, expired;
+	Timer deadline;
+	if (options.timeout > Duration.zero && self != Task.init)
+		deadline = setTimer(options.timeout, () @safe nothrow{
+			if (finished)
+				return;
+			expired = true;
+			self.interrupt();
+		});
+	scope (exit)
+	{
+		finished = true;
+		if (deadline)
+			deadline.stop();
+	}
+	try
+		fetchPinned(url, policy, requester, responder, options);
+	catch (InterruptException e)
+	{
+		if (!expired)
+			throw e;
+		throw internalError("Request timed out after " ~ options.timeout.toString());
+	}
+}
+
+/// The body of `secureRequestHTTP`: vet, pin and perform the request.
+private void fetchPinned(string url, SsrfPolicy policy,
+		scope void delegate(scope HTTPClientRequest) @safe requester,
+		scope void delegate(scope HTTPClientResponse) @safe responder, FetchOptions options) @safe
 {
 	import mcp.protocol.errors : invalidRequest;
-	import std.string : indexOf;
 	import vibe.inet.url : URL;
-	import vibe.http.client : requestHTTP, HTTPClientSettings;
+	import vibe.http.client : HTTPClient, HTTPClientSettings;
+	import vibe.http.internal.basic_auth_client : addBasicAuth;
 
 	string scheme, host;
 	try
@@ -759,31 +1122,33 @@ void secureRequestHTTP(string url, SsrfPolicy policy,
 		// Unparseable -> fail closed.
 	}
 	if (host.length == 0)
-		throw invalidRequest("Refusing to fetch URL with no parseable host: " ~ url);
+		throw invalidRequest("Refusing to fetch URL with no parseable host: " ~ redactUrl(url));
 
-	// Scheme gate (only meaningful for blockInternal): https to any host, or http
-	// to an explicit loopback host for dev. allowUserConfigured leaves the scheme
-	// to the caller (the transport already enforces its own scheme rules).
-	const isHttps = eqSchemeAscii(scheme, "https");
-	const isHttp = eqSchemeAscii(scheme, "http");
+	// Scheme gate: https to any host, plus (allowLoopback only) http to an
+	// explicit loopback host for dev. allowUserConfigured leaves the scheme to
+	// the caller (the transport already enforces its own scheme rules).
+	const isHttps = asciiEqualsIgnoreCase(scheme, "https");
+	const isHttp = asciiEqualsIgnoreCase(scheme, "http");
 	const tls = isHttps;
 
-	if (policy == SsrfPolicy.blockInternal)
+	if (policy == SsrfPolicy.blockInternal && !isHttps)
+		throw invalidRequest(
+				"Refusing to fetch insecure URL (must be https to a public host): " ~ redactUrl(url));
+	if (policy == SsrfPolicy.allowLoopback)
 	{
-		// Scheme gate uses the lexical class (no DNS): https to any host, or http
-		// only to an explicit loopback host. The resolved-address verdict comes from
-		// pinnedConnectAddress below.
+		// The lexical class (no DNS) decides the scheme; the resolved-address
+		// verdict comes from pinnedConnectAddress below.
 		const loopback = classifyHostLexical(host) == AddressClass.loopback;
 		if (!(isHttps || (isHttp && loopback)))
 			throw invalidRequest(
-					"Refusing to fetch insecure OAuth/discovery URL (must be https, or http to an "
-					~ "explicit loopback host; private/link-local addresses are rejected): " ~ url);
+					"Refusing to fetch insecure URL (must be https, or http to an explicit "
+					~ "loopback host; private/link-local addresses are rejected): " ~ redactUrl(url));
 	}
 
 	const pin = pinnedConnectAddress(host, tls, policy);
 	if (!pin.ok)
 		throw invalidRequest("Refusing to fetch URL whose host resolves to a "
-				~ "private/link-local address (or could not be resolved): " ~ url);
+				~ "private/link-local address (or could not be resolved): " ~ redactUrl(url));
 
 	// Build the pinned URL: same scheme/path/port/userinfo, host replaced by the
 	// vetted numeric address so the connector cannot re-resolve to a different
@@ -794,26 +1159,62 @@ void secureRequestHTTP(string url, SsrfPolicy policy,
 
 	auto settings = new HTTPClientSettings;
 	settings.tlsPeerName = originalHost;
-	// Bound the whole request (connect + read) so one slow callback can't hold a
-	// delivery worker — and its lease — open indefinitely.
-	if (requestTimeout > Duration.zero)
+	if (tls)
+		settings.tlsContextSetup = tlsContextSetup(options.tls);
+	if (options.timeout > Duration.zero)
 	{
-		settings.connectTimeout = requestTimeout;
-		settings.readTimeout = requestTimeout;
+		settings.connectTimeout = options.timeout;
+		settings.readTimeout = options.timeout;
 	}
 
-	// vibe derives the Host header from u.host; restore the original host so the
-	// server sees the intended virtual host, not the pinned IP.
+	// Restore the original host so the server sees the intended virtual host,
+	// not the pinned IP.
 	string hostHeader = buildHostHeader(originalHost, u.port, u.defaultPort);
 
-	requestHTTP(u, (scope HTTPClientRequest req) {
+	// A dedicated connection per request rather than vibe's shared pool: the
+	// pool is keyed by host and port only, so a connection opened under one
+	// TLS trust setting (e.g. insecureSkipVerify) would otherwise be handed to
+	// a later request that expects full certificate verification.
+	auto client = new HTTPClient;
+	client.connect(u.host, u.port, tls, settings);
+	scope (exit)
+		client.disconnect();
+	client.request((scope HTTPClientRequest req) {
+		req.requestURL = u.localURI;
 		req.headers["Host"] = hostHeader;
+		if (u.username.length)
+			req.addBasicAuth(u.username, u.password);
 		if (requester !is null)
 			requester(req);
 	}, (scope HTTPClientResponse res) {
 		if (responder !is null)
 			responder(res);
-	}, settings);
+	});
+}
+
+/// `url` fit for an error message or log line: userinfo is dropped and any
+/// query or fragment is replaced by `?[redacted]`, since either may carry
+/// credentials, codes or tokens.
+string redactUrl(string url) @safe pure
+{
+	import std.string : indexOf, indexOfAny, lastIndexOf;
+
+	string prefix, rest = url;
+	const schemeEnd = url.indexOf("://");
+	if (schemeEnd >= 0)
+	{
+		const afterScheme = schemeEnd + 3;
+		auto authorityEnd = url[afterScheme .. $].indexOfAny("/?#");
+		const authority = authorityEnd < 0 ? url[afterScheme .. $]
+			: url[afterScheme .. afterScheme + authorityEnd];
+		const at = authority.lastIndexOf('@');
+		prefix = url[0 .. afterScheme] ~ (at < 0 ? authority : authority[at + 1 .. $]);
+		rest = url[afterScheme + authority.length .. $];
+	}
+	const tail = rest.indexOfAny("?#");
+	if (tail < 0)
+		return prefix ~ rest;
+	return prefix ~ rest[0 .. tail] ~ "?[redacted]";
 }
 
 /// Build the RFC 7230 §5.4 Host header value from a bare host string (as
@@ -831,22 +1232,6 @@ private string buildHostHeader(string host, ushort port, ushort defaultPort) @sa
 	if (port && port != defaultPort)
 		return base ~ ":" ~ port.to!string;
 	return base;
-}
-
-/// Case-insensitive ASCII scheme compare without allocating.
-private bool eqSchemeAscii(string scheme, string sc) @safe pure nothrow @nogc
-{
-	if (scheme.length != sc.length)
-		return false;
-	foreach (k, ch; scheme)
-	{
-		char c = ch;
-		if (c >= 'A' && c <= 'Z')
-			c = cast(char)(c + 32);
-		if (c != sc[k])
-			return false;
-	}
-	return true;
 }
 
 // ===========================================================================
@@ -918,16 +1303,25 @@ unittest  // classifyIpv6Literal classes NAT64 well-known 64:ff9b::/96 embedded 
 {
 	// A NAT64 gateway translates these to the embedded low-32-bit IPv4 and routes it,
 	// reaching loopback / link-local-metadata / RFC1918 internal targets. The embedded
-	// IPv4 is classified exactly as the ::ffff: path does, so each matches the IPv4 class.
-	assert(classifyIpv6Literal("64:ff9b::7f00:1") == AddressClass.loopback); // 127.0.0.1
+	// IPv4 is classified as the ::ffff: path does, except that an embedded 127.x is
+	// reached through the gateway rather than on this host, so it is not loopback.
+	assert(classifyIpv6Literal("64:ff9b::7f00:1") == AddressClass.privateOrLinkLocal); // 127.0.0.1
 	assert(classifyIpv6Literal("64:ff9b::a9fe:a9fe") == AddressClass.privateOrLinkLocal); // 169.254.169.254
 	assert(classifyIpv6Literal("64:ff9b::a00:5") == AddressClass.privateOrLinkLocal); // 10.0.0.5
 }
 
-unittest  // classifyIpv6Literal classes NAT64 local-use 64:ff9b:1::/48 embedded internal IPv4 as internal
+unittest  // classifyIpv6Literal classes the whole NAT64 local-use 64:ff9b:1::/48 as private
 {
-	assert(classifyIpv6Literal("64:ff9b:1::7f00:1") == AddressClass.loopback); // 127.0.0.1
+	assert(classifyIpv6Literal("64:ff9b:1::7f00:1") == AddressClass.privateOrLinkLocal); // 127.0.0.1
 	assert(classifyIpv6Literal("64:ff9b:1::a9fe:a9fe") == AddressClass.privateOrLinkLocal); // 169.254.169.254
+	assert(classifyIpv6Literal("64:ff9b:1::808:808") == AddressClass.privateOrLinkLocal); // 8.8.8.8
+	assert(classifyIpv6Literal("64:ff9b:1:abcd::808:808") == AddressClass.privateOrLinkLocal);
+}
+
+unittest  // embedded 127.x in 6to4 and NAT64 is not the plain-http loopback dev allowance
+{
+	assert(!pinnedConnectAddress("[2002:7f00:1::]", false, SsrfPolicy.allowLoopback).ok);
+	assert(!pinnedConnectAddress("[64:ff9b::7f00:1]", false, SsrfPolicy.allowLoopback).ok);
 }
 
 unittest  // classifyIpv6Literal treats NAT64 with public embedded IPv4 like ::ffff: public embedded
@@ -957,6 +1351,86 @@ unittest  // classifyIpv4Octets classes 240.0.0.0/4 reserved (incl. broadcast) a
 	assert(classifyIpv4Octets(255, 255, 255, 255) == AddressClass.privateOrLinkLocal);
 }
 
+unittest  // classifyIpv4Octets classes IETF protocol-assignment, benchmarking and documentation ranges as internal
+{
+	assert(classifyIpv4Octets(192, 0, 0, 1) == AddressClass.privateOrLinkLocal); // 192.0.0.0/24
+	assert(classifyIpv4Octets(192, 0, 0, 170) == AddressClass.privateOrLinkLocal);
+	assert(classifyIpv4Octets(198, 18, 0, 1) == AddressClass.privateOrLinkLocal); // 198.18.0.0/15
+	assert(classifyIpv4Octets(198, 19, 255, 255) == AddressClass.privateOrLinkLocal);
+	assert(classifyIpv4Octets(192, 0, 2, 1) == AddressClass.privateOrLinkLocal); // TEST-NET-1
+	assert(classifyIpv4Octets(198, 51, 100, 1) == AddressClass.privateOrLinkLocal); // TEST-NET-2
+	assert(classifyIpv4Octets(203, 0, 113, 1) == AddressClass.privateOrLinkLocal); // TEST-NET-3
+	// Neighbours of those ranges stay public.
+	assert(classifyIpv4Octets(192, 0, 1, 1) == AddressClass.public_);
+	assert(classifyIpv4Octets(198, 17, 255, 255) == AddressClass.public_);
+	assert(classifyIpv4Octets(198, 20, 0, 1) == AddressClass.public_);
+	assert(classifyIpv4Octets(203, 0, 114, 1) == AddressClass.public_);
+}
+
+unittest  // classifyIpv6Literal classes documentation, discard-only and benchmarking ranges as non-routable
+{
+	assert(classifyIpv6Literal("2001:db8::1") == AddressClass.privateOrLinkLocal);
+	assert(classifyIpv6Literal("2001:db8:ffff::1") == AddressClass.privateOrLinkLocal);
+	assert(classifyIpv6Literal("100::1") == AddressClass.privateOrLinkLocal);
+	assert(classifyIpv6Literal("100::ffff:ffff:ffff:ffff") == AddressClass.privateOrLinkLocal);
+	assert(classifyIpv6Literal("2001:2::1") == AddressClass.privateOrLinkLocal);
+	assert(classifyIpv6Literal("2001:2:0:ffff::1") == AddressClass.privateOrLinkLocal);
+	// Neighbours outside those prefixes stay public.
+	assert(classifyIpv6Literal("100:0:0:1::1") == AddressClass.public_);
+	assert(classifyIpv6Literal("2001:2:1::1") == AddressClass.public_);
+	assert(classifyIpv6Literal("2001:db9::1") == AddressClass.public_);
+}
+
+unittest  // redactUrl drops userinfo and hides the query and fragment
+{
+	assert(redactUrl("https://user:pw@as.example.com/jwks?key=s3cret#f")
+			== "https://as.example.com/jwks?[redacted]");
+	assert(redactUrl("https://as.example.com?tenant=x") == "https://as.example.com?[redacted]");
+	assert(redactUrl("https://as.example.com/jwks") == "https://as.example.com/jwks");
+	assert(redactUrl("https://as.example.com/a@b") == "https://as.example.com/a@b");
+	assert(redactUrl("no scheme?x") == "no scheme?[redacted]");
+}
+
+unittest  // a refused fetch names the URL without its credentials or query
+{
+	import std.algorithm : canFind;
+	import std.exception : collectExceptionMsg;
+
+	const msg = collectExceptionMsg(secureRequestHTTP("http://user:pw@as.example.com/t?code=abc",
+			SsrfPolicy.blockInternal, null, null));
+	assert(msg.canFind("as.example.com/t"), msg);
+	assert(!msg.canFind("pw") && !msg.canFind("code=abc"), msg);
+}
+
+unittest  // classifyIpv6Literal classes Teredo 2001::/32 as private/link-local
+{
+	assert(classifyIpv6Literal(
+			"2001:0:4136:e378:8000:63bf:80ff:fffe") == AddressClass.privateOrLinkLocal);
+	assert(classifyIpv6Literal("2001::1") == AddressClass.privateOrLinkLocal);
+	assert(classifyIpv6Literal("2001:4860:4860::8888") == AddressClass.public_);
+}
+
+unittest  // classifyIpv6Literal classifies the IPv4 embedded in a 6to4 2002::/16 address
+{
+	assert(classifyIpv6Literal("2002:7f00:1::1") == AddressClass.privateOrLinkLocal); // 127.0.0.1
+	assert(classifyIpv6Literal("2002:a9fe:a9fe::") == AddressClass.privateOrLinkLocal); // 169.254.169.254
+	assert(classifyIpv6Literal("2002:a00:5::1") == AddressClass.privateOrLinkLocal); // 10.0.0.5
+	assert(classifyIpv6Literal("2002:808:808::1") == AddressClass.public_); // 8.8.8.8
+}
+
+unittest  // classifyIpv6Literal classifies the IPv4 in an IPv4-translated ::ffff:0:0:0/96 address
+{
+	assert(classifyIpv6Literal("::ffff:0:7f00:1") == AddressClass.loopback); // 127.0.0.1
+	assert(classifyIpv6Literal("::ffff:0:a9fe:a9fe") == AddressClass.privateOrLinkLocal); // 169.254.169.254
+	assert(classifyIpv6Literal("::ffff:0:808:808") == AddressClass.public_); // 8.8.8.8
+}
+
+unittest  // classifyIpv6Literal classes deprecated site-local fec0::/10 as private
+{
+	assert(classifyIpv6Literal("fec0::1") == AddressClass.privateOrLinkLocal);
+	assert(classifyIpv6Literal("feff::1") == AddressClass.privateOrLinkLocal);
+}
+
 unittest  // classifyIpv4Octets keeps a public unicast control public
 {
 	assert(classifyIpv4Octets(8, 8, 8, 8) == AddressClass.public_);
@@ -980,16 +1454,79 @@ unittest  // classifyIpv6Literal classes ff00::/8 multicast as private/link-loca
 
 unittest  // classifyIpv6Literal keeps a public global-unicast control public
 {
-	assert(classifyIpv6Literal("2001:db8::1") == AddressClass.public_);
+	assert(classifyIpv6Literal("2606:4700:4700::1111") == AddressClass.public_);
+}
+
+unittest  // an IPv6 literal's embedded IPv4 tail with a leading-zero octet fails closed
+{
+	string pin;
+	assert(classifyIpv6Literal("::0177.0.0.1") == AddressClass.privateOrLinkLocal);
+	assert(classifyHost("[::0177.0.0.1]", pin) == AddressClass.privateOrLinkLocal);
+	assert(pin.length == 0);
+	assert(!pinnedConnectAddress("[::0177.0.0.1]", true, SsrfPolicy.allowUserConfigured).ok);
+}
+
+unittest  // an embedded IPv4 tail after hextets parses into the low 32 bits
+{
+	string pin;
+	assert(classifyIpv6Literal("::ffff:8.8.8.8") == AddressClass.public_);
+	assert(classifyIpv6Literal("::ffff:127.0.0.1") == AddressClass.loopback);
+	assert(classifyIpv6Literal("64:ff9b::10.0.0.1") == AddressClass.privateOrLinkLocal);
+	assert(classifyIpv6Literal("2606:4700:1:2:3:4:8.8.8.8") == AddressClass.public_);
+	assert(classifyHost("[::FFFF:8.8.8.8]", pin) == AddressClass.public_);
+	assert(pin == "::ffff:808:808", pin);
+}
+
+unittest  // an embedded IPv4 tail octet of a single zero is still accepted
+{
+	assert(classifyIpv6Literal("::8.8.0.8") == AddressClass.public_);
+}
+
+unittest  // classifyHost pins an IPv6 literal as the canonical rendering of its bytes
+{
+	static string pinOf(string host)
+	{
+		string pin;
+		cast(void) classifyHost(host, pin);
+		return pin;
+	}
+
+	assert(pinOf("[2001:0DB8:0:0::1]:443") == "2001:db8::1");
+	assert(pinOf("[::8.8.8.8]") == "::808:808");
+	assert(pinOf("[::FFFF:808:808]") == "::ffff:808:808");
+	assert(pinOf("[2001:db8:0:1:0:0:0:1]") == "2001:db8:0:1::1");
+	assert(pinOf("[2001:db8:1:2:3:4:5:6]") == "2001:db8:1:2:3:4:5:6");
+	assert(pinOf("[fe80::1%25eth0]") == "fe80::1%25eth0");
+}
+
+unittest  // classifyHost leaves an unparseable IPv6 literal unpinned
+{
+	string pin;
+	assert(classifyHost("[2001:db8::zz]", pin) == AddressClass.privateOrLinkLocal);
+	assert(pin.length == 0);
 }
 
 unittest  // classifyHost classes loopback hosts without resolving
 {
 	string pin;
-	assert(classifyHost("localhost", pin) == AddressClass.loopback && pin == "localhost");
+	assert(classifyHost("localhost", pin) == AddressClass.loopback && pin == "127.0.0.1");
+	assert(classifyHost("localhost:8080", pin) == AddressClass.loopback && pin == "127.0.0.1");
 	assert(classifyHost("127.0.0.1", pin) == AddressClass.loopback && pin == "127.0.0.1");
-	assert(classifyHost("[::1]", pin) == AddressClass.loopback && pin == "[::1]");
+	assert(classifyHost("[::1]", pin) == AddressClass.loopback && pin == "::1");
 	assert(classifyHost("127.0.0.1:8765", pin) == AddressClass.loopback);
+}
+
+unittest  // localhost matches case-insensitively and with one trailing root dot
+{
+	string pin;
+	foreach (h; ["LOCALHOST", "localhost.", "LocalHost.:8080"])
+	{
+		assert(classifyHost(h, pin) == AddressClass.loopback && pin == "127.0.0.1", h);
+		assert(classifyHostLexical(h) == AddressClass.loopback, h);
+		assert(pinnedConnectAddress(h, false, SsrfPolicy.allowLoopback).ok, h);
+	}
+	assert(classifyHostLexical("localhost..") == AddressClass.public_);
+	assert(classifyHostLexical("localhostx") == AddressClass.public_);
 }
 
 unittest  // classifyHost classes numeric-encoded loopback as loopback (SSRF encodings)
@@ -998,7 +1535,40 @@ unittest  // classifyHost classes numeric-encoded loopback as loopback (SSRF enc
 	assert(classifyHost("2130706433", pin) == AddressClass.loopback); // 127.0.0.1
 	assert(classifyHost("127.1", pin) == AddressClass.loopback);
 	assert(classifyHost("0x7f000001", pin) == AddressClass.loopback);
-	assert(classifyHost("0177.0.0.1", pin) == AddressClass.loopback);
+}
+
+unittest  // classifyHost pins a numeric IPv4 literal to its canonical dotted quad
+{
+	string pin;
+	assert(classifyHost("0x7f000001", pin) == AddressClass.loopback && pin == "127.0.0.1");
+	assert(classifyHost("2130706433:8080", pin) == AddressClass.loopback && pin == "127.0.0.1");
+	assert(classifyHost("8.8.2056", pin) == AddressClass.public_ && pin == "8.8.8.8");
+}
+
+unittest  // classifyHost fails closed on a multi-digit IPv4 part with a leading zero
+{
+	// Resolvers disagree on whether `0127` is octal (87) or decimal (127).
+	string pin;
+	assert(classifyHost("0127.0.0.1", pin) == AddressClass.privateOrLinkLocal && pin.length == 0);
+	assert(classifyHost("8.8.8.010", pin) == AddressClass.privateOrLinkLocal && pin.length == 0);
+	assert(classifyHost("00", pin) == AddressClass.privateOrLinkLocal && pin.length == 0);
+	assert(classifyHostLexical("0127.0.0.1") == AddressClass.privateOrLinkLocal);
+	assert(classifyHostLexical("0177.0.0.1:80") == AddressClass.privateOrLinkLocal);
+}
+
+unittest  // pinnedConnectAddress rejects a leading-zero IPv4 literal under every policy
+{
+	assert(!pinnedConnectAddress("0127.0.0.1", false, SsrfPolicy.blockInternal).ok);
+	assert(!pinnedConnectAddress("0127.0.0.1", false, SsrfPolicy.allowLoopback).ok);
+	assert(!pinnedConnectAddress("0127.0.0.1", false, SsrfPolicy.allowUserConfigured).ok);
+}
+
+unittest  // classifyHost keeps single-digit zero parts and hex parts unambiguous
+{
+	string pin;
+	assert(classifyHost("0.0.0.0", pin) == AddressClass.privateOrLinkLocal && pin == "0.0.0.0");
+	assert(classifyHost("10.0.0.1", pin) == AddressClass.privateOrLinkLocal && pin == "10.0.0.1");
+	assert(classifyHost("0x08.0x08.0x08.0x08", pin) == AddressClass.public_ && pin == "8.8.8.8");
 }
 
 unittest  // classifyHost classes numeric-encoded metadata/RFC1918 as private (SSRF encodings)
@@ -1036,6 +1606,60 @@ unittest  // classifyHost fails closed for an unresolvable hostname
 	assert(pin.length == 0);
 }
 
+unittest  // classifyHost resolves a name without stalling other tasks on the event loop
+{
+	import core.thread : Thread;
+	import core.time : msecs;
+	import vibe.core.core : runTask, sleep;
+
+	static Resolution slowResolve(string host) @safe nothrow
+	{
+		Thread.sleep(300.msecs);
+		return Resolution(["93.184.216.34"], false);
+	}
+
+	auto saved = () @trusted { return hostResolver; }();
+	() @trusted { hostResolver = &slowResolve; }();
+	scope (exit)
+		() @trusted { hostResolver = saved; }();
+
+	int ticks;
+	bool done;
+	auto ticker = runTask(() nothrow{
+		while (!done)
+		{
+			ticks++;
+			try
+				sleep(10.msecs);
+			catch (Exception)
+			{
+			}
+		}
+	});
+	string pin;
+	const cls = classifyHost("slow.example", pin);
+	done = true;
+	ticker.join();
+	assert(cls == AddressClass.public_ && pin == "93.184.216.34");
+	assert(ticks >= 5, "other tasks must keep running while a name resolves");
+}
+
+unittest  // classifyHost fails closed when any resolved address is internal
+{
+	static Resolution mixedResolve(string host) @safe nothrow
+	{
+		return Resolution(["93.184.216.34", "10.0.0.5"], false);
+	}
+
+	auto saved = () @trusted { return hostResolver; }();
+	() @trusted { hostResolver = &mixedResolve; }();
+	scope (exit)
+		() @trusted { hostResolver = saved; }();
+
+	string pin;
+	assert(classifyHost("rebind.example", pin) == AddressClass.privateOrLinkLocal);
+}
+
 unittest  // classifyHost fails closed for an empty host
 {
 	string pin = "stale";
@@ -1049,12 +1673,76 @@ unittest  // blockInternal accepts a public host over https and pins it
 	assert(r.ok && r.pinnedIp == "8.8.8.8" && r.sniHost == "8.8.8.8");
 }
 
-unittest  // blockInternal permits the explicit loopback dev allowance (http and https)
+unittest  // blockInternal rejects a literal loopback host even over plain http
 {
-	assert(pinnedConnectAddress("127.0.0.1", false, SsrfPolicy.blockInternal).ok);
-	assert(pinnedConnectAddress("127.0.0.1", true, SsrfPolicy.blockInternal).ok);
-	assert(pinnedConnectAddress("localhost", false, SsrfPolicy.blockInternal).ok);
-	assert(pinnedConnectAddress("[::1]", false, SsrfPolicy.blockInternal).ok);
+	assert(!pinnedConnectAddress("127.0.0.1", false, SsrfPolicy.blockInternal).ok);
+	assert(!pinnedConnectAddress("localhost", false, SsrfPolicy.blockInternal).ok);
+	assert(!pinnedConnectAddress("[::1]", false, SsrfPolicy.blockInternal).ok);
+}
+
+unittest  // secureRequestHTTP(blockInternal) refuses a plain-http loopback URL before connecting
+{
+	import std.exception : assertThrown;
+	import mcp.protocol.errors : McpException;
+
+	assertThrown!McpException(secureRequestHTTP("http://127.0.0.1:1/token",
+			SsrfPolicy.blockInternal, null, null));
+	assertThrown!McpException(secureRequestHTTP("http://localhost:1/token",
+			SsrfPolicy.blockInternal, null, null));
+}
+
+unittest  // allowLoopback permits the explicit loopback dev allowance over plain http
+{
+	assert(pinnedConnectAddress("127.0.0.1", false, SsrfPolicy.allowLoopback).ok);
+	assert(pinnedConnectAddress("localhost", false, SsrfPolicy.allowLoopback).ok);
+	assert(pinnedConnectAddress("[::1]", false, SsrfPolicy.allowLoopback).ok);
+}
+
+unittest  // pinnedConnectAddress pins localhost to the numeric loopback address
+{
+	const r = pinnedConnectAddress("localhost:8080", false, SsrfPolicy.allowLoopback);
+	assert(r.ok && r.pinnedIp == "127.0.0.1" && r.sniHost == "localhost");
+}
+
+unittest  // allowLoopback still rejects loopback over https and private/link-local hosts
+{
+	assert(!pinnedConnectAddress("127.0.0.1", true, SsrfPolicy.allowLoopback).ok);
+	assert(!pinnedConnectAddress("10.0.0.5", false, SsrfPolicy.allowLoopback).ok);
+	assert(!pinnedConnectAddress("169.254.169.254", true, SsrfPolicy.allowLoopback).ok);
+	assert(pinnedConnectAddress("8.8.8.8", true, SsrfPolicy.allowLoopback).ok);
+}
+
+unittest  // allowLoopback refuses plain http to anything but an explicit loopback host
+{
+	import std.exception : assertThrown;
+	import mcp.protocol.errors : McpException;
+
+	assertThrown!McpException(secureRequestHTTP("http://as.example.com/token",
+			SsrfPolicy.allowLoopback, null, null));
+	assertThrown!McpException(secureRequestHTTP("http://8.8.8.8/token",
+			SsrfPolicy.allowLoopback, null, null));
+}
+
+unittest  // blockInternal rejects loopback over https (local TLS services are not reachable)
+{
+	assert(!pinnedConnectAddress("127.0.0.1", true, SsrfPolicy.blockInternal).ok);
+	assert(!pinnedConnectAddress("2130706433", true, SsrfPolicy.blockInternal).ok);
+	assert(!pinnedConnectAddress("localhost", true, SsrfPolicy.blockInternal).ok);
+	assert(!pinnedConnectAddress("[::1]", true, SsrfPolicy.blockInternal).ok);
+	assert(!pinnedConnectAddress("[64:ff9b::7f00:1]", true, SsrfPolicy.blockInternal).ok);
+}
+
+unittest  // allowUserConfigured still reaches loopback over https
+{
+	assert(pinnedConnectAddress("127.0.0.1", true, SsrfPolicy.allowUserConfigured).ok);
+}
+
+unittest  // secureRequestHTTP(blockInternal) refuses an https loopback URL before connecting
+{
+	import std.exception : assertThrown;
+
+	assertThrown(secureRequestHTTP("https://127.0.0.1:8443/client.json",
+			SsrfPolicy.blockInternal, null, null));
 }
 
 unittest  // blockInternal rejects private/link-local hosts
@@ -1067,13 +1755,23 @@ unittest  // blockInternal rejects private/link-local hosts
 
 unittest  // blockInternal rejects a registered name that DNS-resolves to loopback (no literal-loopback allowance for resolved hosts)
 {
-	// "LOCALHOST" does not match the case-sensitive literal `localhost` fast path,
-	// so it goes through DNS resolution and resolves to 127.0.0.1/::1. A resolved
-	// loopback address must NOT receive the literal dev-loopback allowance.
+	// A resolved loopback address must NOT receive the literal dev-loopback
+	// allowance.
+	static Resolution loopbackResolve(string host) @safe nothrow
+	{
+		return Resolution(["127.0.0.1", "::1"], false);
+	}
+
+	auto saved = () @trusted { return hostResolver; }();
+	() @trusted { hostResolver = &loopbackResolve; }();
+	scope (exit)
+		() @trusted { hostResolver = saved; }();
+
 	string pin;
-	assert(classifyHost("LOCALHOST", pin) == AddressClass.privateOrLinkLocal);
-	assert(!pinnedConnectAddress("LOCALHOST", true, SsrfPolicy.blockInternal).ok);
-	assert(!pinnedConnectAddress("LOCALHOST", false, SsrfPolicy.blockInternal).ok);
+	assert(classifyHost("loop.example", pin) == AddressClass.privateOrLinkLocal);
+	assert(!pinnedConnectAddress("loop.example", true, SsrfPolicy.blockInternal).ok);
+	assert(!pinnedConnectAddress("loop.example", false, SsrfPolicy.blockInternal).ok);
+	assert(!pinnedConnectAddress("loop.example", false, SsrfPolicy.allowLoopback).ok);
 }
 
 unittest  // allowUserConfigured permits loopback and private targets (user-chosen endpoint)
@@ -1195,4 +1893,261 @@ unittest  // malformed IPv6 literals fail closed; an IPv4-mapped public address 
 	// A fully-specified (no "::") public global-unicast literal fills the entire
 	// hextet area and classifies public.
 	assert(classifyHostLexical("[2606:4700:4700:1:2:3:4:5]") == AddressClass.public_);
+}
+
+unittest  // a bracketless full-form IPv4-mapped IPv6 host classifies by its embedded address
+{
+	static immutable string[] internal = [
+		"0:0:0:0:0:ffff:169.254.169.254", "0:0:0:0:0:ffff:127.0.0.1",
+		"0:0:0:0:0:ffff:10.0.0.1",
+	];
+	foreach (h; internal)
+	{
+		assert(classifyHostLexical(h) != AddressClass.public_, h);
+		string pinned;
+		assert(classifyHost(h, pinned) != AddressClass.public_, h);
+	}
+	assert(classifyHostLexical("0:0:0:0:0:ffff:8.8.8.8") == AddressClass.public_);
+	string pinned;
+	assert(classifyHost("0:0:0:0:0:ffff:8.8.8.8", pinned) == AddressClass.public_);
+	assert(pinned == "::ffff:808:808", pinned);
+}
+
+unittest  // secureRequestHTTP enforces an overall deadline on a server that drip-feeds its response
+{
+	import core.time : msecs, seconds;
+	import std.conv : to;
+	import std.datetime.stopwatch : StopWatch, AutoStart;
+	import vibe.core.core : exitEventLoop, runEventLoop, runTask, sleep;
+	import vibe.http.server : HTTPServerRequest, HTTPServerResponse,
+		HTTPServerSettings, listenHTTP;
+	import vibe.stream.operations : readAllUTF8;
+
+	string failure;
+	bool timedOut, stopDripping, handlerDone;
+	Duration elapsed;
+	runTask(() nothrow{
+		try
+		{
+			auto settings = new HTTPServerSettings();
+			settings.bindAddresses = ["127.0.0.1"];
+			settings.port = 0;
+			auto listener = listenHTTP(settings, (scope HTTPServerRequest req,
+				scope HTTPServerResponse res) @safe {
+				scope (exit)
+					handlerDone = true;
+				res.contentType = "text/plain";
+				// Each byte arrives well inside a per-read timeout; the whole body
+				// takes far longer than the request may.
+				while (!stopDripping)
+				{
+					res.bodyWriter.write("x");
+					res.bodyWriter.flush();
+					sleep(50.msecs);
+				}
+			});
+			scope (exit)
+				listener.stopListening();
+			const url = "http://127.0.0.1:" ~ listener.bindAddresses[0].port.to!string ~ "/";
+
+			FetchOptions opts;
+			opts.timeout = 400.msecs;
+			auto sw = StopWatch(AutoStart.yes);
+			try
+				secureRequestHTTP(url, SsrfPolicy.allowLoopback, null,
+					(scope HTTPClientResponse res) {
+					res.bodyReader.readAllUTF8();
+				}, opts);
+			catch (Exception e)
+				timedOut = true;
+			elapsed = sw.peek();
+			// Let the server handler finish before the listener and loop go away.
+			stopDripping = true;
+			while (!handlerDone)
+				sleep(10.msecs);
+		}
+		catch (Exception e)
+			failure = e.msg;
+		exitEventLoop();
+	});
+	runEventLoop();
+
+	assert(failure.length == 0, failure);
+	assert(timedOut, "a drip-fed response must not outlive the request timeout");
+	assert(elapsed < 3.seconds, "the deadline must cut the request short");
+}
+
+unittest  // outbound fetches are bounded by a timeout unless a caller sets its own
+{
+	assert(FetchOptions.init.timeout > Duration.zero);
+}
+
+// ---------------------------------------------------------------------------
+// TLS peer validation against a local server whose certificate no trusted CA
+// vouches for.
+// ---------------------------------------------------------------------------
+
+version (unittest)
+{
+	import vibe.http.server : HTTPListener;
+
+	/// A self-signed certificate for `localhost` / `127.0.0.1` (valid until
+	/// 2126) and its private key.
+	package(mcp) enum string selfSignedTestCertPem = `-----BEGIN CERTIFICATE-----
+MIIBmjCCAUGgAwIBAgIUAovDwvpLlQMt8gK+erC9S5I42yIwCgYIKoZIzj0EAwIw
+FDESMBAGA1UEAwwJbG9jYWxob3N0MCAXDTI2MDkzMDIzMzkzNloYDzIxMjYwOTA2
+MjMzOTM2WjAUMRIwEAYDVQQDDAlsb2NhbGhvc3QwWTATBgcqhkjOPQIBBggqhkjO
+PQMBBwNCAARK4ceRzW/TvRDjH6cserBLy70rdIJd/O+iiA11+NVcrtBaf1RXgENx
+PtEo4dB2AjfdyjZG2bkI3tMjdREfJS6Go28wbTAdBgNVHQ4EFgQUzK5LlfqR4ye2
+dOlo7ZCfU7rIWAUwHwYDVR0jBBgwFoAUzK5LlfqR4ye2dOlo7ZCfU7rIWAUwGgYD
+VR0RBBMwEYIJbG9jYWxob3N0hwR/AAABMA8GA1UdEwEB/wQFMAMBAf8wCgYIKoZI
+zj0EAwIDRwAwRAIgRiBXZ0iBHYlwFM1lvIDVuGHIAhQ6PeWnIM3O2IVLTmECIFg1
+KwQhpZaxyjtic6lb644+zasZ1FhrQxH85bL68vNc
+-----END CERTIFICATE-----
+`;
+
+	/// ditto
+	package(mcp) enum string selfSignedTestKeyPem = `-----BEGIN PRIVATE KEY-----
+MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgyac0Dphvj23tfCMC
+9gshddtbn//XQZ9+DFg/hs80DCKhRANCAARK4ceRzW/TvRDjH6cserBLy70rdIJd
+/O+iiA11+NVcrtBaf1RXgENxPtEo4dB2AjfdyjZG2bkI3tMjdREfJS6G
+-----END PRIVATE KEY-----
+`;
+
+	/// Write `pem` to a fresh temporary file and return its path.
+	package(mcp) string writeTestPemFile(string pem) @safe
+	{
+		import std.conv : to;
+		import std.file : tempDir, write;
+		import std.path : buildPath;
+		import std.random : uniform;
+
+		const path = buildPath(tempDir(), "mcp-d-test-" ~ uniform!ulong().to!string ~ ".pem");
+		write(path, pem);
+		return path;
+	}
+
+	/// Listen for HTTPS on an ephemeral `127.0.0.1` port presenting the
+	/// self-signed test certificate, answering every request with 200 "ok".
+	package(mcp) HTTPListener startSelfSignedTlsServer() @safe
+	{
+		import vibe.http.server : HTTPServerRequest, HTTPServerResponse,
+			HTTPServerSettings, listenHTTP;
+		import vibe.stream.tls : createTLSContext, TLSContextKind;
+
+		auto settings = new HTTPServerSettings();
+		settings.bindAddresses = ["127.0.0.1"];
+		settings.port = 0;
+		settings.tlsContext = createTLSContext(TLSContextKind.server);
+		settings.tlsContext.useCertificateChainFile(writeTestPemFile(selfSignedTestCertPem));
+		settings.tlsContext.usePrivateKeyFile(writeTestPemFile(selfSignedTestKeyPem));
+		return listenHTTP(settings, (scope HTTPServerRequest req, scope HTTPServerResponse res) @safe {
+			res.writeBody("ok", "text/plain");
+		});
+	}
+}
+
+unittest  // secureRequestHTTP refuses a server whose certificate no trusted CA vouches for
+{
+	import std.conv : to;
+
+	auto listener = startSelfSignedTlsServer();
+	scope (exit)
+		listener.stopListening();
+	const url = "https://127.0.0.1:" ~ listener.bindAddresses[0].port.to!string ~ "/";
+
+	bool reached;
+	try
+		secureRequestHTTP(url, SsrfPolicy.allowUserConfigured, null, (scope HTTPClientResponse res) {
+			reached = true;
+		});
+	catch (Exception)
+	{
+	}
+	assert(!reached, "an untrusted server certificate must fail the TLS handshake");
+}
+
+unittest  // secureRequestHTTP trusts a server certificate issued by the configured caFile
+{
+	import std.conv : to;
+
+	auto listener = startSelfSignedTlsServer();
+	scope (exit)
+		listener.stopListening();
+	const url = "https://127.0.0.1:" ~ listener.bindAddresses[0].port.to!string ~ "/";
+
+	int status;
+	FetchOptions opts;
+	opts.tls.caFile = writeTestPemFile(selfSignedTestCertPem);
+	secureRequestHTTP(url, SsrfPolicy.allowUserConfigured, null, (scope HTTPClientResponse res) {
+		status = res.statusCode;
+	}, opts);
+	assert(status == 200);
+}
+
+unittest  // secureRequestHTTP skips certificate verification only when insecureSkipVerify is set
+{
+	import std.conv : to;
+
+	auto listener = startSelfSignedTlsServer();
+	scope (exit)
+		listener.stopListening();
+	const url = "https://127.0.0.1:" ~ listener.bindAddresses[0].port.to!string ~ "/";
+
+	int status;
+	FetchOptions opts;
+	opts.tls.insecureSkipVerify = true;
+	secureRequestHTTP(url, SsrfPolicy.allowUserConfigured, null, (scope HTTPClientResponse res) {
+		status = res.statusCode;
+	}, opts);
+	assert(status == 200);
+}
+
+unittest  // a connection opened with insecureSkipVerify is never reused by a verifying request
+{
+	import std.conv : to;
+
+	auto listener = startSelfSignedTlsServer();
+	scope (exit)
+		listener.stopListening();
+	const url = "https://127.0.0.1:" ~ listener.bindAddresses[0].port.to!string ~ "/";
+
+	FetchOptions insecure;
+	insecure.tls.insecureSkipVerify = true;
+	int status;
+	secureRequestHTTP(url, SsrfPolicy.allowUserConfigured, null, (scope HTTPClientResponse res) {
+		status = res.statusCode;
+	}, insecure);
+	assert(status == 200);
+
+	bool reached;
+	try
+		secureRequestHTTP(url, SsrfPolicy.allowUserConfigured, null, (scope HTTPClientResponse res) {
+			reached = true;
+		});
+	catch (Exception)
+	{
+	}
+	assert(!reached, "a verifying request must not ride an unverified pooled connection");
+}
+
+unittest  // secureRequestHTTP rejects a @system requester delegate at compile time
+{
+	static assert(!__traits(compiles, secureRequestHTTP("https://example.com",
+			SsrfPolicy.blockInternal, (scope HTTPClientRequest req) @system {}, null)));
+}
+
+unittest  // secureRequestHTTP rejects a @system responder delegate at compile time
+{
+	static assert(!__traits(compiles, secureRequestHTTP("https://example.com",
+			SsrfPolicy.blockInternal, null, (scope HTTPClientResponse res) @system {
+			})));
+}
+
+unittest  // secureRequestHTTP is callable from @safe code with @safe delegates
+{
+	static assert(__traits(compiles, () @safe {
+			secureRequestHTTP("https://example.com", SsrfPolicy.blockInternal,
+			(scope HTTPClientRequest req) {}, (scope HTTPClientResponse res) {});
+		}));
 }

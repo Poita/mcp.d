@@ -2,27 +2,173 @@ module mcp.transport.streamable_http;
 
 import vibe.http.server;
 import vibe.http.router : URLRouter;
-import vibe.stream.operations : readAllUTF8;
 import vibe.data.json : Json;
 import std.typecons : Nullable;
+import core.time : Duration, seconds;
 
 import mcp.server.server;
+import mcp.server.settings : ServerSettings;
 import mcp.protocol.jsonrpc;
 import mcp.protocol.errors;
 import mcp.protocol.versions;
 import mcp.protocol.modern;
 import mcp.protocol.mrtr;
 import mcp.protocol.events;
+import mcp.transport.coordinator : defaultServerRequestTimeout, cancelledNotification;
 import mcp.transport.sse_context;
 import mcp.transport.session;
+import mcp.transport.client_bucket : clientBucket, defaultIpv6BucketPrefix;
 import mcp.auth.resource_server;
-import mcp.server.context : RequestContext, BaseRequestContext, ConnectionScoped;
+import mcp.server.context : RequestContext, BaseRequestContext,
+	ConnectionScoped, StdioContext, StdioContextOptions;
 import mcp.server.connection : ConnectionState;
 import mcp.server.push : ListenFilter;
-import mcp.protocol.capabilities : ClientCapabilities;
+import mcp.protocol.capabilities : ClientCapabilities, ClientCapability;
 
 /// The HTTP header carrying the session id (basic/transports §Session Management).
 enum SessionHeader = "Mcp-Session-Id";
+
+/// Caps on the long-lived streams and concurrent work one mount accepts, so a
+/// client cannot exhaust the server's fibers and sockets. `0` disables a cap.
+struct StreamLimits
+{
+	/// Open legacy HTTP+SSE GET streams at once; past it a GET is answered 503.
+	size_t maxLegacyStreams = 1_000;
+	/// Legacy HTTP+SSE GET streams one authenticated principal holds open at
+	/// once; past it that principal's GET is answered 429.
+	size_t maxLegacyStreamsPerPrincipal = 100;
+	/// Legacy HTTP+SSE GET streams unauthenticated callers from one remote
+	/// address hold open at once; past it that address's GET is answered 429.
+	/// Behind a reverse proxy every caller shares the proxy's address; raise
+	/// this, or set it to `0`, there.
+	size_t maxLegacyStreamsPerAddress = 100;
+	/// Requests dispatched concurrently from one legacy HTTP+SSE stream; past it
+	/// a POST is answered 429. A client's reply to a server->client request is
+	/// never refused. Notification POSTs draw on a separate pool of this many
+	/// slots and wait for one rather than being refused.
+	size_t maxLegacyInFlight = 16;
+	/// Standalone GET streams open at once on one session; past it a GET is
+	/// answered 429.
+	size_t maxGetStreamsPerSession = 4;
+	/// Standalone GET streams open at once across the mount; past it a GET is
+	/// answered 503. A session holding a GET stream is never evicted, so keep
+	/// this well below `SessionLimits.maxSessions`: the gap is the room left for
+	/// new sessions once every GET slot is taken.
+	size_t maxGetStreams = 1_000;
+	/// Standalone GET streams one authenticated principal holds open at once
+	/// across all its sessions; past it that principal's GET is answered 429, so
+	/// one client cannot take every `maxGetStreams` slot.
+	size_t maxGetStreamsPerPrincipal = 100;
+	/// Standalone GET streams unauthenticated callers from one remote address
+	/// hold open at once; past it that address's GET is answered 429. Behind a
+	/// reverse proxy every caller shares the proxy's address; raise this, or set
+	/// it to `0`, there.
+	size_t maxGetStreamsPerAddress = 100;
+	/// `subscriptions/listen` and `events/stream` response streams open at once
+	/// across the mount; past it such a request is answered 503.
+	size_t maxPushStreams = 1_000;
+	/// `subscriptions/listen` and `events/stream` response streams one
+	/// authenticated principal holds open at once; past it that principal's
+	/// request is answered 429, so one client cannot take every `maxPushStreams`
+	/// slot.
+	size_t maxPushStreamsPerPrincipal = 100;
+	/// `subscriptions/listen` and `events/stream` response streams
+	/// unauthenticated callers from one remote address hold open at once; past it
+	/// that address's request is answered 429. Behind a reverse proxy every
+	/// caller shares the proxy's address; raise this, or set it to `0`, there.
+	size_t maxPushStreamsPerAddress = 100;
+	/// Bytes queued for one long-lived SSE stream whose client is not reading.
+	/// Past it, delivery waits briefly (`SseWriter.queueStallTimeout`) for the
+	/// client to catch up, then closes and drops the stream, so a stalled client
+	/// never blocks delivery to anyone else for long.
+	size_t maxQueuedStreamBytes = defaultMaxQueuedStreamBytes;
+}
+
+/// Counts a mount's open streams of one kind against a mount-wide cap and a
+/// per-client cap: per principal for authenticated callers, per remote address
+/// for unauthenticated ones (`0`: unbounded).
+private final class StreamGate
+{
+	private size_t open;
+	private size_t max;
+	private size_t maxPerPrincipal;
+	private size_t maxPerAddress;
+	private size_t[string] openBy;
+
+	/// Why `tryAcquire` refused a slot.
+	enum Refusal
+	{
+		none, /// the slot was claimed
+		mount, /// the mount-wide cap is reached
+		caller /// the caller's per-principal or per-address cap is reached
+	}
+
+	this(size_t max, size_t maxPerPrincipal, size_t maxPerAddress) @safe
+	{
+		this.max = max;
+		this.maxPerPrincipal = maxPerPrincipal;
+		this.maxPerAddress = maxPerAddress;
+	}
+
+	/// Claim a stream slot for the caller `principal` ("" when unauthenticated)
+	/// connecting from `address` ("" when unknown). Pair a claimed slot
+	/// (`Refusal.none`) with `release(principal, address)`.
+	Refusal tryAcquire(string principal, string address) @safe
+	{
+		if (max != 0 && open >= max)
+			return Refusal.mount;
+		const key = callerBucket(principal, address);
+		const cap = principal.length ? maxPerPrincipal : maxPerAddress;
+		if (key.length && cap != 0 && openBy.get(key, 0) >= cap)
+			return Refusal.caller;
+		open++;
+		if (key.length)
+			openBy[key] = openBy.get(key, 0) + 1;
+		return Refusal.none;
+	}
+
+	void release(string principal, string address) @safe
+	{
+		if (open > 0)
+			open--;
+		const key = callerBucket(principal, address);
+		if (auto n = key in openBy)
+		{
+			if (*n <= 1)
+				openBy.remove(key);
+			else
+				(*n)--;
+		}
+	}
+}
+
+unittest  // an anonymous caller past its per-address stream cap is refused
+{
+	auto gate = new StreamGate(10, 5, 1);
+	assert(gate.tryAcquire("", "10.0.0.1") == StreamGate.Refusal.none);
+	assert(gate.tryAcquire("", "10.0.0.1") == StreamGate.Refusal.caller);
+	assert(gate.tryAcquire("", "10.0.0.2") == StreamGate.Refusal.none,
+			"another address still gets a slot");
+	gate.release("", "10.0.0.1");
+	assert(gate.tryAcquire("", "10.0.0.1") == StreamGate.Refusal.none);
+}
+
+unittest  // a principal's streams do not count against its address's anonymous cap
+{
+	auto gate = new StreamGate(10, 2, 1);
+	assert(gate.tryAcquire("alice", "10.0.0.1") == StreamGate.Refusal.none);
+	assert(gate.tryAcquire("alice", "10.0.0.1") == StreamGate.Refusal.none);
+	assert(gate.tryAcquire("alice", "10.0.0.1") == StreamGate.Refusal.caller);
+	assert(gate.tryAcquire("", "10.0.0.1") == StreamGate.Refusal.none);
+}
+
+unittest  // a caller with neither principal nor address is bounded only by the mount cap
+{
+	auto gate = new StreamGate(2, 1, 1);
+	assert(gate.tryAcquire("", "") == StreamGate.Refusal.none);
+	assert(gate.tryAcquire("", "") == StreamGate.Refusal.none);
+	assert(gate.tryAcquire("", "") == StreamGate.Refusal.mount);
+}
 
 /// Configuration for the Streamable HTTP server transport.
 struct StreamableHttpOptions
@@ -31,13 +177,29 @@ struct StreamableHttpOptions
 	string path = "/mcp"; /// the single MCP endpoint path
 	string[] bindAddresses = ["127.0.0.1"]; /// addresses to bind
 
-	/// DNS-rebinding protection: reject requests whose Host/Origin is not a
-	/// recognized localhost value (or in the explicit allow-lists below). On by
-	/// default per the MCP transport security guidance; disable when fronting
-	/// the server with a trusted reverse proxy.
+	/// DNS-rebinding protection, part 1: reject a request whose `Host` is not a
+	/// localhost value or in `allowedHosts`. On by default. Prefer listing the
+	/// public hostname in `allowedHosts`; disable only behind a trusted reverse
+	/// proxy that already restricts `Host`. With it off, the 401 challenge's
+	/// `resource_metadata` URL comes from `auth.resource` rather than the
+	/// client-supplied `Host`.
+	bool validateHost = true;
+	/// Honour the `X-Forwarded-Proto` request header (`http` or `https` only)
+	/// as the scheme of the 401 challenge's `resource_metadata` URL. Off by
+	/// default, since any client can send the header; enable only behind a
+	/// reverse proxy that sets it.
+	bool trustProxyHeaders = false;
+	/// DNS-rebinding protection, part 2: reject a request carrying an `Origin`
+	/// that is not a localhost origin or in `allowedOrigins` (MCP transport
+	/// security: servers MUST validate `Origin`). On by default and independent
+	/// of `validateHost`, so it keeps protecting browser callers behind a proxy.
+	/// Requests without an `Origin` (non-browser clients) are unaffected.
 	bool validateOrigin = true;
 	string[] allowedHosts = []; /// extra Host header values to accept
-	string[] allowedOrigins = []; /// extra Origin header values to accept
+	/// Extra Origin header values to accept. Requests from these origins, and
+	/// from localhost origins, get CORS headers (and their `OPTIONS` preflights
+	/// are answered) so browser-based clients can reach the endpoint.
+	string[] allowedOrigins = [];
 
 	/// OAuth 2.1 Resource Server enforcement (basic/authorization). When
 	/// `auth.validator` is set, every MCP request must present a valid
@@ -45,7 +207,9 @@ struct StreamableHttpOptions
 	/// audience), returns `401` with a `WWW-Authenticate: Bearer` header carrying
 	/// the `resource_metadata` URL on failure, returns `403 insufficient_scope`
 	/// when a required scope is missing, and serves the RFC 9728 Protected
-	/// Resource Metadata document at `/.well-known/oauth-protected-resource`.
+	/// Resource Metadata document at its path-inserted well-known URL
+	/// (`protectedResourceMetadataPath`: `/.well-known/oauth-protected-resource`
+	/// followed by the `auth.resource` path).
 	/// Validated token info is surfaced to handlers via `RequestContext.auth`.
 	/// When unset (the default) the transport performs no token checks.
 	ResourceServerConfig auth;
@@ -93,14 +257,67 @@ struct StreamableHttpOptions
 	/// process. Lines are written through vibe.core.log to the console, unless
 	/// `accessLogFile` directs them to a file instead.
 	bool accessLog = false;
+
+	/// The largest POST body (in bytes) the MCP and legacy message endpoints
+	/// accept. A larger body is answered with 413 and a JSON-RPC error.
+	size_t maxRequestBytes = 2 * 1024 * 1024;
 	/// When `accessLog` is enabled, write the access-log lines to this file path
 	/// instead of the console. Ignored unless `accessLog` is set.
 	string accessLogFile = "";
+
+	/// How long a server->client request (elicitation, sampling, roots) waits for
+	/// the client's reply before it fails with `RequestTimeoutException` and is
+	/// cancelled toward the client with `notifications/cancelled`. When one server
+	/// is mounted more than once, the first mount's value applies to every mount.
+	Duration serverRequestTimeout = defaultServerRequestTimeout;
+
+	/// Stateful servers only: how much SSE stream history is kept so a client
+	/// can resume a dropped stream with `Last-Event-ID`. When one server is
+	/// mounted more than once, the first mount's value applies to every mount.
+	ReplayHistoryOptions replayHistory;
+
+	/// Stateful servers only: the idle expiry and the global and per-principal
+	/// caps on `Mcp-Session-Id` sessions. An `initialize` that would exceed a
+	/// cap when every session that could make room is busy is answered 503.
+	SessionLimits sessionLimits;
+
+	/// Caps on concurrent streams and legacy dispatches.
+	StreamLimits streamLimits;
+
+	/// The IPv6 prefix length, in bits, that the per-address caps in
+	/// `streamLimits` and `sessionLimits` group unauthenticated callers by, so
+	/// a client cannot multiply its share by rotating through its own block.
+	/// IPv4 callers are counted per address.
+	uint ipv6BucketPrefix = defaultIpv6BucketPrefix;
 }
 
-/// The well-known path (RFC 9728 §3) at which a protected resource server
-/// publishes its OAuth 2.0 Protected Resource Metadata document.
+/// The well-known path prefix (RFC 9728 §3) under which a protected resource
+/// server publishes its OAuth 2.0 Protected Resource Metadata document.
 enum ProtectedResourceMetadataPath = "/.well-known/oauth-protected-resource";
+
+/// The path of the Protected Resource Metadata document for `resource` (RFC 9728
+/// §3.1): `ProtectedResourceMetadataPath` followed by the resource identifier's
+/// path, its query and fragment dropped, so two resources on one host publish
+/// separate documents. A resource with no path uses the bare prefix. With no
+/// `resource` configured the MCP endpoint `mcpPath` is the resource.
+string protectedResourceMetadataPath(string resource, string mcpPath) @safe
+{
+	import std.algorithm : findSplitBefore;
+	import std.string : indexOf;
+
+	string path = mcpPath;
+	if (resource.length)
+	{
+		const sep = resource.indexOf("://");
+		auto rest = sep >= 0 ? resource[sep + 3 .. $] : resource;
+		const slash = rest.indexOf('/');
+		path = slash >= 0 ? rest[slash .. $] : "";
+		path = path.findSplitBefore("?")[0].findSplitBefore("#")[0];
+	}
+	while (path.length && path[$ - 1] == '/')
+		path = path[0 .. $ - 1];
+	return ProtectedResourceMetadataPath ~ path;
+}
 
 /// Validate that an auth-enabled `ResourceServerConfig` can publish a
 /// spec-compliant Protected Resource Metadata document before the transport
@@ -156,19 +373,50 @@ unittest  // a disabled (no-validator) config is never rejected, even with no AS
 
 /// Mount an `McpServer` onto a vibe.d `URLRouter` at the configured path,
 /// implementing the modern Streamable HTTP transport (single endpoint):
-///   - POST: a JSON-RPC message/batch; returns `application/json` for requests,
-///     or `202 Accepted` with no body when the payload needs no reply.
-///   - GET:  on the stable revisions, opens a standalone server->client SSE
-///     stream wired to the server-push channel (`McpServer.notify`); on the
-///     modern, which drops the standalone stream, GET -> 405.
-///   - DELETE: 2026-07-28 has no protocol-level sessions to tear down -> 405.
+///   - POST: a JSON-RPC message/batch; `202 Accepted` with no body when the
+///     payload needs no reply. A request's reply is `application/json`, or a
+///     `text/event-stream` when the handler sends progress, log or
+///     server->client messages first, or when the client's Accept admits only
+///     `text/event-stream`. `subscriptions/listen` and `events/stream` always
+///     answer with a long-lived `text/event-stream`.
+///   - GET: on a stateful server, opens the session's standalone
+///     server->client SSE stream wired to the server-push channel
+///     (`McpServer.notify`): 400 without `Mcp-Session-Id`, 404 for an unknown
+///     session, 406 when Accept excludes `text/event-stream`, 429 past
+///     `StreamLimits.maxGetStreamsPerSession`, `maxGetStreamsPerPrincipal` or
+///     `maxGetStreamsPerAddress`, 503 past `maxGetStreams`. A stateless
+///     server keeps no session to push on, so GET is always 405 (`Allow: POST`).
+///   - DELETE: on a stateful server, terminates the session named by
+///     `Mcp-Session-Id` (204; 400 without the header, 404 for an unknown
+///     session). A stateless server has no session to tear down -> 405.
+///
+/// A stateful server never speaks 2026-07-28, so GET and DELETE are 2025-era
+/// only; an unsupported `MCP-Protocol-Version` on either is 400.
+///
+/// On a stateless server a `notifications/cancelled` POST reaches only requests
+/// of the same authenticated principal, and none when several of that
+/// principal's in-flight requests share the id. Unauthenticated callers cannot be told
+/// apart, so their requests ignore `notifications/cancelled`; a 2026-07-28
+/// client still cancels by closing the response stream.
 void mountMcp(URLRouter router, McpServer server,
 		StreamableHttpOptions opts = StreamableHttpOptions.init) @safe
 {
-	auto coord = new StreamCoordinator;
+	// Every mount of one server shares the push channel and its coordinator, so
+	// stream ordinals and server->client request waiters stay unique across
+	// mounts. The first mount's `serverRequestTimeout` applies.
+	auto fresh = new StreamCoordinator;
+	fresh.requestTimeout = opts.serverRequestTimeout;
+	auto push = ensurePushChannel(server, fresh, opts.replayHistory);
 	// Session minting is derived from the server's mode: a `stateful`
 	// server mints/tracks an `Mcp-Session-Id`; a `stateless` server never does.
-	auto sessions = server.mode == ServerMode.stateful ? new SessionManager : null;
+	auto sessions = server.mode == ServerMode.stateful ? new SessionManager(opts.sessionLimits)
+		: null;
+	auto statelessInFlight = sessions is null ? new StatelessInFlight : null;
+	auto pushStreams = new StreamGate(opts.streamLimits.maxPushStreams,
+			opts.streamLimits.maxPushStreamsPerPrincipal,
+			opts.streamLimits.maxPushStreamsPerAddress);
+	auto getStreams = new StreamGate(opts.streamLimits.maxGetStreams,
+			opts.streamLimits.maxGetStreamsPerPrincipal, opts.streamLimits.maxGetStreamsPerAddress);
 
 	// This mount owns a single fallback `ConnectionState`, which the server core
 	// threads through dispatch and reads back for the notify/push path. It is the
@@ -184,32 +432,56 @@ void mountMcp(URLRouter router, McpServer server,
 
 	// basic/authorization (RFC 9728 §3): publish the Protected Resource Metadata
 	// document so clients can discover the authorization server(s). Served
-	// unauthenticated (it is the discovery hook the 401 points clients to).
+	// unauthenticated (it is the discovery hook the 401 points clients to). The
+	// document is public, so any origin may read it: a browser-based client must
+	// fetch it before it holds a token.
 	if (opts.auth.enabled)
 	{
-		router.get(ProtectedResourceMetadataPath, (HTTPServerRequest req,
-				HTTPServerResponse res) @safe {
+		const prmPath = protectedResourceMetadataPath(opts.auth.resource, opts.path);
+		router.get(prmPath, (HTTPServerRequest req, HTTPServerResponse res) @safe {
+			res.headers["Access-Control-Allow-Origin"] = "*";
 			res.statusCode = HTTPStatus.ok;
 			res.writeJsonBody(opts.auth.metadata().toJson());
 		});
+		router.match(HTTPMethod.OPTIONS, prmPath, (HTTPServerRequest req,
+				HTTPServerResponse res) @safe {
+			res.headers["Access-Control-Allow-Origin"] = "*";
+			res.headers["Access-Control-Allow-Methods"] = "GET";
+			res.headers["Access-Control-Allow-Headers"] = "MCP-Protocol-Version";
+			res.headers["Access-Control-Max-Age"] = "600";
+			res.statusCode = HTTPStatus.noContent;
+			res.writeVoidBody();
+		});
 	}
 
+	mountCorsPreflight(router, opts.path, sessions !is null ? "POST, GET, DELETE" : "POST", opts);
 	router.post(opts.path, (HTTPServerRequest req, HTTPServerResponse res) @safe {
 		if (!guardOrigin(req, res, opts))
 			return;
 		TokenInfo token;
 		if (!guardAuth(req, res, opts, token))
 			return;
-		handlePost(server, coord, sessions, token, req, res);
+		if (!isJsonContentType(req.headers.get("Content-Type", "")))
+		{
+			writeJsonRpcError(res, HTTPStatus.unsupportedMediaType,
+				invalidRequest("POST Content-Type must be application/json"));
+			return;
+		}
+		string payload;
+		if (!readPostBody(req, res, opts.maxRequestBytes, payload))
+			return;
+		handlePost(server, push, sessions, statelessInFlight, pushStreams,
+			opts, token, payload, req, res);
 	});
-	auto push = ensurePushChannel(server, coord);
+	if (sessions !is null)
+		sessions.onExpire = (string sid) @safe { push.closeSession(sid); };
 	router.get(opts.path, (HTTPServerRequest req, HTTPServerResponse res) @safe {
 		if (!guardOrigin(req, res, opts))
 			return;
 		TokenInfo token;
 		if (!guardAuth(req, res, opts, token))
 			return;
-		handleGet(server, push, sessions, opts.reconnectDelayMs, req, res);
+		handleGet(server, push, sessions, getStreams, opts, principalOf(token), req, res);
 	});
 	router.match(HTTPMethod.DELETE, opts.path, (HTTPServerRequest req,
 			HTTPServerResponse res) @safe {
@@ -222,21 +494,19 @@ void mountMcp(URLRouter router, McpServer server,
 		// rule as the POST and GET paths: an invalid or unsupported
 		// MCP-Protocol-Version MUST be answered with 400 Bad Request (a null-id
 		// JSON-RPC error) rather than proceeding to a 204 terminate or a 405.
-		if (auto verErr = postProtocolVersionGate(req.headers.get(HttpHeader.protocolVersion, "")))
+		if (auto verErr = validateProtocolVersionHeader(req.headers.get(HttpHeader.protocolVersion,
+			""), server.servedVersions))
 		{
 			res.statusCode = HTTPStatus.badRequest;
 			res.writeBody(makeErrorResponse(Json(null), verErr).toString(), "application/json");
 			return;
 		}
-		if (sessions !is null && deleteTerminatesSession(server.negotiatedVersion))
+		if (sessions !is null)
 		{
 			// Session Management: a client signals it no longer needs the
 			// session via DELETE with the Mcp-Session-Id header. Terminate it
 			// and reply 204; an absent header is 400, an unknown/already-
-			// terminated session is 404. The modern removed protocol-level
-			// sessions, so this branch is version-gated: a modern-negotiated
-			// server falls through to the 405 below even when sessions are
-			// enabled (mirroring the GET getOpensSseStream gate).
+			// terminated session is 404.
 			const sid = req.headers.get(SessionHeader, "");
 			if (sid.length == 0)
 			{
@@ -244,25 +514,22 @@ void mountMcp(URLRouter router, McpServer server,
 				res.writeBody("Missing Mcp-Session-Id header", "text/plain");
 				return;
 			}
-			if (!sessions.terminate(sid))
+			if (!sessions.ownedBy(sid, principalOf(token)) || !sessions.terminate(sid))
 			{
 				res.statusCode = HTTPStatus.notFound;
 				res.writeBody("Unknown or terminated session", "text/plain");
 				return;
 			}
+			push.closeSession(sid);
 			res.statusCode = HTTPStatus.noContent;
 			res.writeBody("", "text/plain");
 			return;
 		}
-		// No protocol-level session to tear down (stateless mode, or a
-		// modern-negotiated session which removed sessions entirely): per the
-		// backward-compatibility rules, DELETE -> 405. The Allow header MUST list
-		// every method the endpoint actually supports (RFC 9110 §10.2.1): on the
-		// stable revisions that is GET (the standalone SSE stream) and POST, while
-		// 2026-07-28 drops the GET stream so only POST remains.
+		// A stateless server has no session to tear down, so DELETE -> 405. The
+		// Allow header MUST list every method the endpoint supports (RFC 9110
+		// §10.2.1); a stateless server also answers GET with 405, leaving POST.
 		res.statusCode = HTTPStatus.methodNotAllowed;
-		res.headers["Allow"] = allowedMethodsHeader(server.negotiatedVersion,
-			server.mode == ServerMode.stateful);
+		res.headers["Allow"] = "POST";
 		res.writeBody("", "text/plain");
 	});
 
@@ -291,7 +558,18 @@ void mountMcp(URLRouter router, McpServer server,
 void mountLegacyHttpSse(URLRouter router, McpServer server,
 		StreamableHttpOptions opts = StreamableHttpOptions.init) @safe
 {
-	auto channel = new LegacySseChannel(opts.legacyMessagePath);
+	// Each legacy stream also listens on the server's push channel, so `notify*`
+	// and server pings reach legacy clients; sharing its coordinator lets the
+	// replies POSTed here resolve those pings.
+	auto fresh = new StreamCoordinator;
+	fresh.requestTimeout = opts.serverRequestTimeout;
+	auto push = ensurePushChannel(server, fresh, opts.replayHistory);
+	auto channel = new LegacySseChannel(opts.legacyMessagePath, opts.streamLimits, push.coordinator);
+	auto streams = new StreamGate(opts.streamLimits.maxLegacyStreams,
+			opts.streamLimits.maxLegacyStreamsPerPrincipal,
+			opts.streamLimits.maxLegacyStreamsPerAddress);
+	mountCorsPreflight(router, opts.legacySsePath, "GET", opts);
+	mountCorsPreflight(router, opts.legacyMessagePath, "POST", opts);
 
 	router.get(opts.legacySsePath, (HTTPServerRequest req, HTTPServerResponse res) @safe {
 		if (!guardOrigin(req, res, opts))
@@ -299,7 +577,24 @@ void mountLegacyHttpSse(URLRouter router, McpServer server,
 		TokenInfo token;
 		if (!guardAuth(req, res, opts, token))
 			return;
-		handleLegacyGet(channel, res);
+		if (!acceptsEventStream(req.headers.get("Accept", "")))
+		{
+			res.statusCode = HTTPStatus.notAcceptable;
+			res.writeBody("The legacy SSE stream is text/event-stream;"
+				~ " Accept must admit text/event-stream", "text/plain");
+			return;
+		}
+		const principal = principalOf(token);
+		const address = remoteAddressOf(req, opts);
+		if (const why = streams.tryAcquire(principal, address))
+		{
+			refuseTooManyStreams(res, why);
+			return;
+		}
+		scope (exit)
+			streams.release(principal, address);
+		handleLegacyGet(server, channel, push, principal,
+			opts.streamLimits.maxQueuedStreamBytes, res);
 	});
 
 	router.post(opts.legacyMessagePath, (HTTPServerRequest req, HTTPServerResponse res) @safe {
@@ -308,15 +603,40 @@ void mountLegacyHttpSse(URLRouter router, McpServer server,
 		TokenInfo token;
 		if (!guardAuth(req, res, opts, token))
 			return;
-		const payload = req.bodyReader.readAllUTF8();
+		if (!isJsonContentType(req.headers.get("Content-Type", "")))
+		{
+			writeJsonRpcError(res, HTTPStatus.unsupportedMediaType,
+				invalidRequest("POST Content-Type must be application/json"));
+			return;
+		}
+		string payload;
+		if (!readPostBody(req, res, opts.maxRequestBytes, payload))
+			return;
 		// The per-stream session token the client echoes from its `endpoint` event
 		// correlates this POST with the GET stream that should receive the reply, so
-		// a response never leaks onto another client's stream.
+		// a response never leaks onto another client's stream. A POST without one,
+		// or for a stream that is not open, has nowhere to deliver its response.
 		const sessionId = req.query.get("sessionId", "");
-		// Resolve the per-stream ConnectionState so each client's dispatch runs
-		// against its own isolated state rather than the shared fallback.
-		auto connState = channel.connStateFor(sessionId);
-		cast(void) handleLegacyPostBody(server, channel, sessionId, payload, connState);
+		if (sessionId.length == 0)
+		{
+			res.statusCode = HTTPStatus.badRequest;
+			res.writeBody("Missing sessionId query parameter", "text/plain");
+			return;
+		}
+		final switch (dispatchLegacyPost(server, channel, sessionId, payload, token))
+		{
+		case LegacyPostOutcome.accepted:
+			break;
+		case LegacyPostOutcome.unknownStream:
+			res.statusCode = HTTPStatus.notFound;
+			res.writeBody("Unknown or closed session", "text/plain");
+			return;
+		case LegacyPostOutcome.tooManyRequests:
+			res.statusCode = HTTPStatus.tooManyRequests;
+			res.headers["Retry-After"] = "1";
+			res.writeBody("Too many requests in flight on this stream", "text/plain");
+			return;
+		}
 		// All subsequent client messages are POSTed here; the response (if any)
 		// is delivered on the GET SSE stream, so the POST itself just acknowledges
 		// receipt with 202 Accepted and no body.
@@ -338,28 +658,104 @@ void mountLegacyHttpSse(URLRouter router, McpServer server,
 /// Each registered listener owns a fresh `ConnectionState` so concurrent clients
 /// do not interfere with each other's negotiated version, client capabilities,
 /// subscriptions, or in-flight cancellation registry.
-final class LegacySseChannel
+private final class LegacySseChannel
 {
+	import vibe.core.sync : LocalManualEvent, createManualEvent;
+
 	private struct Listener
 	{
 		long id;
 		string sessionId;
 		void delegate(string frame) @safe write;
 		ConnectionState connState;
+		string principal;
 	}
 
 	private string endpointPath;
 	private Listener[] listeners;
 	private long nextId = 1;
+	private StreamLimits limits;
+	/// Requests currently dispatched per stream session token.
+	private size_t[string] inFlight;
+	/// Notification-only payloads currently dispatched per stream session token.
+	private size_t[string] notificationsInFlight;
+	/// Emitted whenever a notification dispatch slot frees.
+	private LocalManualEvent notificationSlotFreed;
 	/// Correlates server->client requests with the client's reply POSTs, keyed by
 	/// (sessionId, requestId). A handler that blocks in ctx.sample/ctx.elicit/
 	/// ctx.listRoots registers here; the client's reply POST resolves the waiter.
-	StreamCoordinator coord;
+	private StreamCoordinator coord;
 
-	this(string endpointPath) @safe
+	/// `coord` correlates server->client requests; pass the server's push channel
+	/// coordinator so requests the server issues through its push channel are
+	/// resolved by the replies POSTed here. Null creates a private one.
+	this(string endpointPath, StreamLimits limits = StreamLimits.init, StreamCoordinator coord = null) @safe
 	{
 		this.endpointPath = endpointPath;
-		this.coord = new StreamCoordinator;
+		this.limits = limits;
+		this.coord = coord !is null ? coord : new StreamCoordinator;
+		notificationSlotFreed = createManualEvent();
+	}
+
+	/// Claim a dispatch slot on the stream `sessionId`, returning false when it
+	/// already runs `maxLegacyInFlight` requests. Pair with `releaseDispatch`.
+	bool tryAcquireDispatch(string sessionId) @safe
+	{
+		auto n = inFlight.get(sessionId, 0);
+		if (limits.maxLegacyInFlight != 0 && n >= limits.maxLegacyInFlight)
+			return false;
+		inFlight[sessionId] = n + 1;
+		return true;
+	}
+
+	/// Release a slot claimed by `tryAcquireDispatch`.
+	void releaseDispatch(string sessionId) @safe
+	{
+		if (auto n = sessionId in inFlight)
+		{
+			if (*n <= 1)
+				inFlight.remove(sessionId);
+			else
+				(*n)--;
+		}
+	}
+
+	/// Claim a notification dispatch slot on the stream `sessionId`, waiting
+	/// while it already runs `maxLegacyInFlight` notification payloads. These
+	/// slots are separate from the request slots, so a stream saturated with
+	/// requests still takes its notifications. Returns false, without a slot,
+	/// once the stream closes. Pair a claimed slot with `releaseNotification`.
+	bool acquireNotification(string sessionId) @safe
+	{
+		import core.time : seconds;
+
+		while (true)
+		{
+			const ec = notificationSlotFreed.emitCount;
+			if (!isOpen(sessionId))
+				return false;
+			const n = notificationsInFlight.get(sessionId, 0);
+			if (limits.maxLegacyInFlight == 0 || n < limits.maxLegacyInFlight)
+			{
+				notificationsInFlight[sessionId] = n + 1;
+				return true;
+			}
+			// The timeout rechecks whether the stream has closed meanwhile.
+			notificationSlotFreed.wait(1.seconds, ec);
+		}
+	}
+
+	/// Release a slot claimed by `acquireNotification`.
+	void releaseNotification(string sessionId) @safe
+	{
+		if (auto n = sessionId in notificationsInFlight)
+		{
+			if (*n <= 1)
+				notificationsInFlight.remove(sessionId);
+			else
+				(*n)--;
+		}
+		notificationSlotFreed.emit();
 	}
 
 	/// Register an open GET SSE stream. A fresh per-stream session token and a
@@ -367,13 +763,15 @@ final class LegacySseChannel
 	/// receives the leading `endpoint` event (basic/transports §HTTP with SSE:
 	/// the server MUST send it "When a client connects") whose URI carries that
 	/// token, so a later POST can be correlated back to exactly this stream.
+	/// `principal` is the authenticated subject that opened the stream ("" when
+	/// unauthenticated); only POSTs from the same principal may use the stream.
 	/// Returns the listener id.
-	long addListener(void delegate(string frame) @safe write) @safe
+	long addListener(void delegate(string frame) @safe write, string principal = "") @safe
 	{
 		const id = nextId++;
 		const sessionId = generateSessionId();
 		write(formatLegacyEndpointEvent(endpointWithSession(endpointPath, sessionId)));
-		listeners ~= Listener(id, sessionId, write, new ConnectionState);
+		listeners ~= Listener(id, sessionId, write, new ConnectionState, principal);
 		return id;
 	}
 
@@ -389,22 +787,37 @@ final class LegacySseChannel
 	}
 
 	/// The per-stream `ConnectionState` for the stream whose session token is
-	/// `sessionId`, or null when no matching open stream exists. The POST handler
-	/// passes this to `handleRaw` so each client's JSON-RPC dispatch runs against
-	/// its own isolated state (negotiated version, client capabilities, etc.).
-	ConnectionState connStateFor(string sessionId) @safe
+	/// `sessionId`, or null when no matching open stream exists or the stream was
+	/// opened by a principal other than `principal`. The POST handler dispatches
+	/// against it so each client's JSON-RPC dispatch runs against its own isolated
+	/// state (negotiated version, client capabilities, etc.).
+	ConnectionState connStateFor(string sessionId, string principal = "") @safe
 	{
 		foreach (l; listeners)
 			if (l.sessionId == sessionId)
-				return l.connState;
+				return l.principal == principal ? l.connState : null;
 		return null;
 	}
 
-	/// Drop a listener (its GET stream closed).
+	/// Whether a stream with the session token `sessionId` is still open.
+	bool isOpen(string sessionId) @safe
+	{
+		foreach (l; listeners)
+			if (l.sessionId == sessionId)
+				return true;
+		return false;
+	}
+
+	/// Drop a listener (its GET stream closed), cancelling the requests in
+	/// flight on it: their replies have nowhere left to go.
 	void removeListener(long id) @safe
 	{
 		import std.algorithm : remove;
 
+		foreach (l; listeners)
+			if (l.id == id)
+				foreach (tok; l.connState.inFlight)
+					tok.cancel();
 		listeners = listeners.remove!(l => l.id == id);
 	}
 
@@ -447,7 +860,7 @@ final class LegacySseChannel
 /// `endpoint` event tells a client where to POST AND which stream its replies
 /// belong to. The token is added as a `sessionId` query parameter, preserving any
 /// existing query string already present on the path.
-string endpointWithSession(string endpointPath, string sessionId) @safe
+private string endpointWithSession(string endpointPath, string sessionId) @safe
 {
 	import std.string : indexOf;
 
@@ -455,26 +868,175 @@ string endpointWithSession(string endpointPath, string sessionId) @safe
 	return endpointPath ~ sep ~ "sessionId=" ~ sessionId;
 }
 
-/// Serialize every write to one response's bodyWriter through a fresh per-stream
-/// TaskMutex and return the resulting write+flush closure. Each SSE handler shares
-/// its connection between a registered-listener writer and a heartbeat loop running
-/// on different fibers, and the underlying channel mutex guards only channel state,
-/// not these foreign writers — so without per-stream serialization two concurrent
-/// writes could interleave the bytes of different SSE frames.
-private void delegate(string) @safe sseFrameWriter(HTTPServerResponse res) @safe
-{
-	import vibe.core.sync : TaskMutex;
+/// The default bound on the bytes queued for one SSE stream
+/// (`StreamLimits.maxQueuedStreamBytes`).
+enum size_t defaultMaxQueuedStreamBytes = 1024 * 1024;
 
-	auto writeMtx = new TaskMutex;
-	return (string frame) @safe {
-		() @trusted {
-			synchronized (writeMtx)
+/// The writer for one long-lived SSE response. Each SSE handler shares its
+/// connection between a push-channel listener and a heartbeat loop running on
+/// different fibers, so frames are queued and written in order by one writer
+/// task, which keeps them whole. Queuing does not wait for the socket, so a
+/// client that stops reading cannot stall `notify*` callers or delivery to
+/// other streams. Once `maxQueued` bytes are waiting and the client has not
+/// read for `queueStallTimeout`, it is deemed gone: the connection is closed
+/// and every later write throws, so the push channel drops the stream.
+private final class SseWriter
+{
+	import core.time : MonoTime;
+	import vibe.core.sync : LocalManualEvent, createManualEvent;
+	import vibe.core.task : Task;
+
+	private HTTPServerResponse res;
+	private size_t maxQueued;
+	private string[] queue;
+	private size_t queued;
+	private bool dead;
+	private bool closing;
+	private bool started;
+	private Task writer;
+	/// When the in-progress socket write last made progress (`MonoTime.init`
+	/// while it is not writing).
+	private MonoTime writingSince;
+	private LocalManualEvent wake;
+	private LocalManualEvent drained;
+	private LocalManualEvent finished;
+
+	/// How long a full queue waits for its client to read before the stream is
+	/// closed.
+	enum Duration queueStallTimeout = sseStallTimeout;
+
+	this(HTTPServerResponse res, size_t maxQueued) @safe
+	{
+		this.res = res;
+		this.maxQueued = maxQueued;
+		wake = createManualEvent();
+		drained = createManualEvent();
+		finished = createManualEvent();
+	}
+
+	/// Queue `frame` for writing. When `maxQueued` bytes are already waiting, the
+	/// writer gets until `queueStallTimeout` after the socket last accepted a
+	/// slice to make room, since a burst queued without yielding outruns even a
+	/// healthy client; a client still not reading by then is deemed gone. The
+	/// deadline is anchored to the stalled write rather than to this call, so
+	/// streams that stalled together give up together and a fan-out across them
+	/// waits about one timeout in all. Throws once the stream has failed.
+	void opCall(string frame) @safe
+	{
+		import vibe.core.core : runTask;
+
+		if (dead)
+			throw new Exception("SSE stream closed");
+		if (maxQueued != 0 && queued > 0 && queued + frame.length > maxQueued)
+		{
+			const called = MonoTime.currTime;
+			while (!dead && queued > 0 && queued + frame.length > maxQueued)
 			{
-				res.bodyWriter.write(cast(const(ubyte)[]) frame);
-				res.bodyWriter.flush();
+				const deadline = (writingSince == MonoTime.init ? called : writingSince)
+					+ queueStallTimeout;
+				const left = deadline - MonoTime.currTime;
+				if (left <= Duration.zero)
+				{
+					abort();
+					break;
+				}
+				drained.wait(left, drained.emitCount);
 			}
-		}();
-	};
+			if (dead)
+				throw new Exception("SSE client stopped reading; stream closed");
+		}
+		queue ~= frame;
+		queued += frame.length;
+		if (!started)
+		{
+			started = true;
+			writer = runTask(&run);
+		}
+		wake.emit();
+	}
+
+	private void run() nothrow @safe
+	{
+		scope (exit)
+			finished.emit();
+		try
+		{
+			while (true)
+			{
+				while (queue.length == 0)
+				{
+					if (closing || dead)
+						return;
+					wake.wait(wake.emitCount);
+				}
+				auto batch = queue;
+				queue = null;
+				writingSince = MonoTime.currTime;
+				// Slices let a client that keeps reading re-arm the stall deadline and
+				// free queue room as each one is accepted, however large the frame.
+				enum size_t slice = 16 * 1024;
+				foreach (frame; batch)
+				{
+					auto bytes = cast(const(ubyte)[]) frame;
+					while (bytes.length)
+					{
+						const n = bytes.length < slice ? bytes.length : slice;
+						res.bodyWriter.write(bytes[0 .. n]);
+						bytes = bytes[n .. $];
+						queued -= n;
+						writingSince = MonoTime.currTime;
+						drained.emit();
+					}
+				}
+				res.bodyWriter.flush();
+				writingSince = MonoTime.init;
+				drained.emit();
+			}
+		}
+		catch (Exception)
+		{
+			dead = true;
+			// Wake writes waiting for room so they fail now rather than at their
+			// stall deadline.
+			drained.emit();
+		}
+	}
+
+	/// Write out what is queued, waiting at most `drain`, then stop the writer;
+	/// a client still not reading by then has its connection closed.
+	void close(Duration drain = 5.seconds) @safe
+	{
+		closing = true;
+		const ec = finished.emitCount;
+		if (!started || !writer.running)
+			return;
+		wake.emit();
+		finished.wait(drain, ec);
+		if (writer.running)
+		{
+			abort();
+			finished.wait(drain, ec);
+		}
+	}
+
+	/// Give up on the stream: drop the queue, close the connection so a write
+	/// parked on the stalled socket fails, and stop the writer.
+	private void abort() @safe
+	{
+		dead = true;
+		queue = null;
+		drained.emit();
+		closeRawConnection(res);
+		if (started && writer.running && writer != Task.getThis())
+			writer.interrupt();
+	}
+}
+
+/// The queued writer for one SSE response; see `SseWriter`.
+private SseWriter sseFrameWriter(HTTPServerResponse res,
+		size_t maxQueued = defaultMaxQueuedStreamBytes) @safe
+{
+	return new SseWriter(res, maxQueued);
 }
 
 /// Hold an SSE connection open, emitting a comment heartbeat every 15s so a write
@@ -494,68 +1056,117 @@ private void runSseHeartbeat(void delegate(string) @safe writeFrame) @safe
 	}
 }
 
+/// Hold a standalone GET SSE stream open until its listener is closed (the
+/// session was terminated), its session has expired or been evicted, or the
+/// client disconnects. Every `interval` it writes a comment heartbeat, which
+/// detects a disconnect, and refreshes the session's idle timer, so a client that
+/// only listens keeps its session alive.
+private void holdSessionStream(void delegate(string) @safe writeFrame, ServerPushChannel push,
+		long listenerId, SessionManager sessions, string sid, Duration interval) @safe
+{
+	while (!push.awaitClosed(listenerId, interval))
+	{
+		if (sessions !is null && sessions.stateFor(sid) is null)
+			break;
+		try
+			writeFrame(": ping\n\n");
+		catch (Exception)
+			break;
+	}
+}
+
 /// Open a legacy GET SSE stream: register it on `channel` (which emits the
 /// leading `endpoint` event), then hold the connection open with SSE comment
 /// heartbeats so a client disconnect terminates the loop and drops the listener.
-private void handleLegacyGet(LegacySseChannel channel, HTTPServerResponse res) @safe
+/// The stream is bound to `principal`, the authenticated subject of the GET.
+/// It also listens on `push`, the server's push channel, under its own session
+/// token, so server notifications and requests reach it as `message` events;
+/// `notifications/resources/updated` is gated on the stream's own subscriptions.
+private void handleLegacyGet(McpServer server, LegacySseChannel channel,
+		ServerPushChannel push, string principal, size_t maxQueued, HTTPServerResponse res) @safe
 {
 	res.contentType = "text/event-stream";
 	applySseStreamHeaders(res, false);
 
-	// LegacySseChannel.deliverTo itself has no write serialization, so without the
-	// per-stream lock two concurrent deliveries -- or a delivery racing the
-	// heartbeat -- could interleave SSE frames.
-	auto writeFrame = sseFrameWriter(res);
+	auto writeFrame = sseFrameWriter(res, maxQueued);
+	scope (exit)
+		writeFrame.close();
 
 	const listenerId = channel.addListener((string frame) @safe {
 		writeFrame(frame);
-	});
+	}, principal);
 	scope (exit)
 		channel.removeListener(listenerId);
 
-	runSseHeartbeat(writeFrame);
+	const sessionId = channel.sessionIdFor(listenerId);
+	const pushId = push.addListener((string frame) @safe {
+		writeFrame("event: message\n" ~ frame);
+	}, Json.init, ListenFilter.init, "", server.sessionPushEligibility(
+			channel.connStateFor(sessionId, principal)), sessionId, principal, false);
+	scope (exit)
+		push.removeListener(pushId);
+
+	holdSessionStream(&writeFrame.opCall, push, pushId, null, sessionId, 15.seconds);
 }
 
-/// Process a single JSON-RPC message POSTed to the legacy message endpoint and
-/// route any response back onto the originating client's legacy GET SSE stream as a
-/// `message` event. `sessionId` is the per-stream token the client echoed from its
-/// `endpoint` event, so the response is delivered ONLY to the stream that issued
-/// this POST — never broadcast across concurrently-connected clients. `conn` is the
-/// per-stream `ConnectionState` owned by the originating GET listener. Returns true
-/// (the server accepts every well-formed POST on this transport; a parse failure
-/// still yields a JSON-RPC error response delivered on the stream). A notification
-/// produces no response, so nothing is delivered. A client response/errorResponse
-/// (the client's reply to a server->client request) is routed to the channel's
-/// coordinator so a handler blocked in ctx.sample/ctx.elicit/ctx.listRoots is
-/// unblocked. Exposed (package-level) so the two-endpoint flow can be exercised
-/// without a live socket.
-bool handleLegacyPostBody(McpServer server, LegacySseChannel channel,
-		string sessionId, string payload, ConnectionState conn = null) @safe
+/// Parse a legacy POST body. A malformed one is answered with a JSON-RPC error
+/// on the stream `sessionId`, and false is returned.
+private bool parseLegacyPayload(LegacySseChannel channel, string sessionId,
+		string payload, out ParsedInput input) @safe
 {
-	// Parse the message to distinguish client responses (replies to a server->client
-	// request) from client requests and notifications. A parse failure falls through
-	// to handleRaw which produces a JSON-RPC error response on the SSE stream.
 	try
+		input = parseAny(payload);
+	catch (McpException e)
 	{
-		const msg = parseMessage(payload);
-		if (msg.kind == MessageKind.response || msg.kind == MessageKind.errorResponse)
-		{
-			// Route the client's reply to whatever handler task is awaiting it.
-			// The coordinator key is (sessionId, requestId) so a reply for one session
-			// cannot wake a waiter registered under a different session token.
-			channel.coord.resolve(msg.id, msg.result, msg.error, sessionId);
-			return true;
-		}
+		channel.deliverTo(sessionId, makeErrorResponse(errorReplyId(e), e).toString());
+		return false;
 	}
-	catch (Exception)
+	catch (Exception e)
 	{
-		// Parse failure: fall through so handleRaw returns the protocol error.
+		channel.deliverTo(sessionId, makeErrorResponse(Json(null), parseError(e.msg)).toString());
+		return false;
 	}
+	return true;
+}
 
-	// Wire a sink that pushes any out-of-band server frame (progress, log,
-	// server->client request) onto the originating SSE stream, and a serverRequest
-	// delegate that issues a server->client request through the channel coordinator
-	// and blocks until the client's reply POST arrives.
+/// Whether `input` is a single client reply to a server->client request.
+private bool isLegacyReply(ref const ParsedInput input) @safe
+{
+	return !input.isBatch && input.messages.length == 1
+		&& (input.messages[0].kind == MessageKind.response
+				|| input.messages[0].kind == MessageKind.errorResponse);
+}
+
+/// Whether `input` holds at least one request, as opposed to only replies and
+/// notifications.
+private bool carriesRequest(ref const ParsedInput input) @safe
+{
+	foreach (ref m; input.messages)
+		if (m.kind == MessageKind.request)
+			return true;
+	return false;
+}
+
+/// Whether `input` holds nothing but `notifications/cancelled` messages, whose
+/// handling only flips cancellation tokens and never blocks.
+private bool onlyCancellations(ref const ParsedInput input) @safe
+{
+	if (input.messages.length == 0 || input.errors.length)
+		return false;
+	foreach (ref m; input.messages)
+		if (m.kind != MessageKind.notification || m.method != "notifications/cancelled")
+			return false;
+	return true;
+}
+
+/// Dispatch a parsed legacy POST against the stream `sessionId` and its
+/// connection state `conn`, delivering any response on the stream.
+private void handleLegacyInput(McpServer server, LegacySseChannel channel,
+		string sessionId, ConnectionState conn, ParsedInput input, TokenInfo token) @safe
+{
+	// Push any out-of-band server frame (progress, log, server->client request)
+	// onto the originating SSE stream, and issue server->client requests through
+	// the channel coordinator, blocking until the client's reply POST arrives.
 	void sink(string frame) @safe
 	{
 		channel.deliverTo(sessionId, frame);
@@ -563,7 +1174,7 @@ bool handleLegacyPostBody(McpServer server, LegacySseChannel channel,
 
 	Json serverRequest(string method, Json params) @safe
 	{
-		import core.time : seconds;
+		import core.time : seconds, msecs;
 
 		const id = channel.coord.alloc();
 		channel.coord.register(id, sessionId);
@@ -574,18 +1185,219 @@ bool handleLegacyPostBody(McpServer server, LegacySseChannel channel,
 			channel.coord.cancel(id, sessionId);
 			throw e;
 		}
-		return channel.coord.await(id, 60.seconds, sessionId);
+		// Closing the GET stream leaves nowhere for the reply to come from, so the
+		// waiter fails as soon as the stream is gone rather than at the timeout.
+		try
+			return channel.coord.awaitLive(id, () @safe => channel.isOpen(sessionId),
+					internalError("client disconnected before responding"),
+					channel.coord.requestTimeout, 250.msecs, sessionId);
+		catch (RequestTimeoutException e)
+		{
+			try
+				channel.deliverTo(sessionId, cancelledNotification(id,
+						"request timed out").toString());
+			catch (Exception)
+			{
+			}
+			throw e;
+		}
 	}
 
-	const responseText = server.handleRaw(payload, &sink, &serverRequest);
-	channel.deliverTo(sessionId, responseText);
-	return true;
+	Nullable!Json dispatch(Message msg) @safe
+	{
+		// The coordinator key is (sessionId, requestId), so a reply for one
+		// session cannot wake a waiter registered under another session token.
+		if (msg.kind == MessageKind.response || msg.kind == MessageKind.errorResponse)
+		{
+			channel.coord.resolve(msg.id, msg.result, msg.error, sessionId);
+			return Nullable!Json.init;
+		}
+		auto inner = new StdioContext(&sink, StdioContextOptions(&serverRequest, conn.clientCaps,
+				extractProgressToken(msg.params), conn.negotiated,
+				server.mode == ServerMode.stateless));
+		return server.handle(msg, new LegacySseContext(inner, sessionId, conn, token));
+	}
+
+	if (!input.isBatch)
+	{
+		auto resp = dispatch(input.messages[0]);
+		if (!resp.isNull)
+			channel.deliverTo(sessionId, resp.get.toString());
+		return;
+	}
+
+	Json responses = Json.emptyArray;
+	if (conn.negotiated >= ProtocolVersion.v2025_06_18)
+		responses = makeErrorResponse(Json(null),
+				invalidRequest("JSON-RPC batching is not supported on this protocol version"));
+	else
+	{
+		foreach (m; input.messages)
+		{
+			auto resp = dispatch(m);
+			if (!resp.isNull)
+				responses ~= resp.get;
+		}
+		foreach (err; input.errors)
+			responses ~= makeErrorResponse(errorReplyId(err.error), err.error);
+	}
+	if (responses.type == Json.Type.object || responses.length)
+		channel.deliverTo(sessionId, responses.toString());
+}
+
+/// What became of a message POSTed to the legacy message endpoint.
+private enum LegacyPostOutcome
+{
+	accepted, /// dispatched (or answered on the stream with a parse error)
+	unknownStream, /// no open stream owned by the caller has the session token
+	tooManyRequests, /// the stream already runs `StreamLimits.maxLegacyInFlight` requests
+}
+
+/// Accept a message POSTed to the legacy message endpoint and dispatch it on a
+/// separate task, returning as soon as the owning stream is known. Responses
+/// travel over the GET stream, so the POST is acknowledged without waiting for
+/// the handler: a client that sends POSTs one at a time can then answer a
+/// server->client request (elicitation, sampling, roots) the handler blocks on.
+/// A request is refused when its stream already runs as many requests as the
+/// channel's `StreamLimits.maxLegacyInFlight`; a client reply only wakes its
+/// waiter, so it is handled at once and never refused. A payload without a
+/// request is never refused either: one holding only `notifications/cancelled`
+/// is handled at once, so a saturated stream can always be told to stop work,
+/// and any other notification payload waits for one of the stream's separate
+/// pool of `maxLegacyInFlight` notification slots, so a client cannot park an
+/// unbounded number of notification handlers.
+private LegacyPostOutcome dispatchLegacyPost(McpServer server, LegacySseChannel channel,
+		string sessionId, string payload, TokenInfo token = TokenInfo.invalid()) @safe
+{
+	import vibe.core.core : runTask;
+	import vibe.core.log : logError;
+
+	auto conn = channel.connStateFor(sessionId, principalOf(token));
+	if (conn is null)
+		return LegacyPostOutcome.unknownStream;
+	ParsedInput input;
+	if (!parseLegacyPayload(channel, sessionId, payload, input))
+		return LegacyPostOutcome.accepted;
+	if (isLegacyReply(input) || onlyCancellations(input))
+	{
+		handleLegacyInput(server, channel, sessionId, conn, input, token);
+		return LegacyPostOutcome.accepted;
+	}
+	const isRequest = carriesRequest(input);
+	if (isRequest)
+	{
+		if (!channel.tryAcquireDispatch(sessionId))
+			return LegacyPostOutcome.tooManyRequests;
+	}
+	else if (!channel.acquireNotification(sessionId))
+		return LegacyPostOutcome.unknownStream;
+	runTask(() nothrow{
+		try
+		{
+			scope (exit)
+			{
+				if (isRequest)
+					channel.releaseDispatch(sessionId);
+				else
+					channel.releaseNotification(sessionId);
+			}
+			handleLegacyInput(server, channel, sessionId, conn, input, token);
+		}
+		catch (Exception e)
+			logError("legacy HTTP+SSE dispatch failed: %s", e.msg);
+	});
+	return LegacyPostOutcome.accepted;
+}
+
+/// The `RequestContext` for one message on a legacy HTTP+SSE stream: it streams
+/// server->client traffic onto that stream through the wrapped `StdioContext`,
+/// and scopes dispatch to the stream's own token and `ConnectionState`.
+private final class LegacySseContext : RequestContext, ConnectionScoped
+{
+	private StdioContext inner;
+	private string token_;
+	private ConnectionState conn_;
+	private TokenInfo auth_;
+
+	this(StdioContext inner, string token, ConnectionState conn, TokenInfo auth) @safe
+	{
+		this.inner = inner;
+		this.token_ = token;
+		this.conn_ = conn;
+		this.auth_ = auth;
+	}
+
+	string connectionToken() @safe
+	{
+		return token_;
+	}
+
+	ConnectionState connectionState() @safe
+	{
+		return conn_;
+	}
+
+	bool isCancelled() @safe
+	{
+		return inner.isCancelled();
+	}
+
+	void reportProgress(double progress,
+			Nullable!double total = Nullable!double.init, string message = null) @safe
+	{
+		inner.reportProgress(progress, total, message);
+	}
+
+	void log(string level, Json data, string logger = null) @safe
+	{
+		inner.log(level, data, logger);
+	}
+
+	Json sampleRaw(Json params) @safe
+	{
+		return inner.sampleRaw(params);
+	}
+
+	Json elicitRaw(Json params) @safe
+	{
+		return inner.elicitRaw(params);
+	}
+
+	Json listRootsRaw() @safe
+	{
+		return inner.listRootsRaw();
+	}
+
+	bool clientSupports(ClientCapability cap) @safe
+	{
+		return inner.clientSupports(cap);
+	}
+
+	bool usesInputRequired() @safe
+	{
+		return inner.usesInputRequired();
+	}
+
+	Json[string] inputResponses() @safe
+	{
+		return inner.inputResponses();
+	}
+
+	string requestState() @safe
+	{
+		return inner.requestState();
+	}
+
+	TokenInfo auth() @safe
+	{
+		return auth_;
+	}
 }
 
 /// Frame the legacy `endpoint` SSE event (2024-11-05 basic/transports §HTTP with
 /// SSE): a typed `endpoint` event whose data is the URI the client must POST
 /// subsequent messages to.
-string formatLegacyEndpointEvent(string uri) @safe
+private string formatLegacyEndpointEvent(string uri) @safe
 {
 	return "event: endpoint\ndata: " ~ uri ~ "\n\n";
 }
@@ -593,37 +1405,92 @@ string formatLegacyEndpointEvent(string uri) @safe
 /// Frame a legacy server `message` SSE event from already-serialised JSON text
 /// (2024-11-05 basic/transports §HTTP with SSE: "Server messages are sent as SSE
 /// `message` events, with the message content encoded as JSON in the event data").
-string formatLegacyMessageEventRaw(string jsonText) @safe
+private string formatLegacyMessageEventRaw(string jsonText) @safe
 {
 	return "event: message\ndata: " ~ jsonText ~ "\n\n";
 }
 
-/// Enforce DNS-rebinding protection. Returns true if the request may proceed;
+/// Enforce DNS-rebinding protection. Returns true if the request may proceed,
+/// with the CORS headers for an allowed cross-origin caller already set;
 /// otherwise writes a `403 Forbidden` and returns false.
 private bool guardOrigin(scope HTTPServerRequest req, scope HTTPServerResponse res,
 		StreamableHttpOptions opts) @safe
 {
-	if (!opts.validateOrigin)
-		return true;
-
-	const host = req.headers.get("Host", "");
-	const origin = req.headers.get("Origin", "");
-
 	// HTTP/1.1 mandates a Host header; an absent (or disallowed) Host is rejected
 	// so a request carrying neither Host nor Origin cannot fall through the guard.
-	if (!hostAllowed(host, opts.allowedHosts))
+	if (opts.validateHost && !hostAllowed(req.headers.get("Host", ""), opts.allowedHosts))
 	{
 		res.statusCode = HTTPStatus.forbidden;
 		res.writeBody("Forbidden: Host not allowed", "text/plain");
 		return false;
 	}
-	if (origin.length && !originAllowed(origin, opts.allowedOrigins))
+	const origin = req.headers.get("Origin", "");
+	if (opts.validateOrigin && origin.length && !originAllowed(origin, opts.allowedOrigins))
 	{
 		res.statusCode = HTTPStatus.forbidden;
 		res.writeBody("Forbidden: Origin not allowed", "text/plain");
 		return false;
 	}
+	applyCorsHeaders(req, res, opts);
 	return true;
+}
+
+/// The request's `Origin` when it is one the mount admits for cross-origin
+/// access (localhost or `opts.allowedOrigins`), else "".
+private string corsOrigin(scope HTTPServerRequest req, StreamableHttpOptions opts) @safe
+{
+	const origin = req.headers.get("Origin", "");
+	return origin.length && originAllowed(origin, opts.allowedOrigins) ? origin : "";
+}
+
+/// Let a browser page on an admitted origin read the response, including the
+/// `Mcp-Session-Id` it must echo and the `WWW-Authenticate` challenge that
+/// starts authorization. Responses to any other origin carry no CORS headers.
+private void applyCorsHeaders(scope HTTPServerRequest req,
+		scope HTTPServerResponse res, StreamableHttpOptions opts) @safe
+{
+	const origin = corsOrigin(req, opts);
+	if (origin.length == 0)
+		return;
+	res.headers["Access-Control-Allow-Origin"] = origin;
+	res.headers["Access-Control-Expose-Headers"]
+		= "Mcp-Session-Id, MCP-Protocol-Version, WWW-Authenticate";
+	res.headers["Vary"] = "Origin";
+}
+
+/// Answer CORS preflight (`OPTIONS`) requests for `path` from admitted origins,
+/// allowing `methods` and the MCP request headers. A preflight from any other
+/// origin, or for a disallowed Host, is left unhandled.
+private void mountCorsPreflight(URLRouter router, string path, string methods,
+		StreamableHttpOptions opts) @safe
+{
+	router.match(HTTPMethod.OPTIONS, path, (HTTPServerRequest req, HTTPServerResponse res) @safe {
+		import std.algorithm : splitter, startsWith;
+		import std.string : strip, toLower;
+
+		if (opts.validateHost && !hostAllowed(req.headers.get("Host", ""), opts.allowedHosts))
+			return;
+		const origin = corsOrigin(req, opts);
+		if (origin.length == 0)
+			return;
+		// Tool parameters mirrored into `Mcp-Param-*` headers have per-tool names,
+		// so the ones the browser asks for are admitted alongside the fixed set.
+		string allowed = "Content-Type, Accept, Authorization, Mcp-Session-Id, "
+			~ "MCP-Protocol-Version, Last-Event-ID, Mcp-Method, Mcp-Name";
+		foreach (h; req.headers.get("Access-Control-Request-Headers", "").splitter(','))
+		{
+			const name = h.strip;
+			if (name.toLower.startsWith("mcp-param-"))
+				allowed ~= ", " ~ name;
+		}
+		res.headers["Access-Control-Allow-Origin"] = origin;
+		res.headers["Access-Control-Allow-Methods"] = methods;
+		res.headers["Access-Control-Allow-Headers"] = allowed;
+		res.headers["Access-Control-Max-Age"] = "600";
+		res.headers["Vary"] = "Origin";
+		res.statusCode = HTTPStatus.noContent;
+		res.writeVoidBody();
+	});
 }
 
 /// Enforce OAuth 2.1 Resource Server authorization (basic/authorization). When
@@ -631,8 +1498,10 @@ private bool guardOrigin(scope HTTPServerRequest req, scope HTTPServerResponse r
 /// and, on failure, write the spec-mandated response: `401` with a
 /// `WWW-Authenticate: Bearer` header carrying the `resource_metadata` URL for a
 /// missing/invalid token, or `403` with `error="insufficient_scope"` when a
-/// required scope is absent. Returns true (with `token` populated) when the
-/// request may proceed; false when a failure response was written.
+/// required scope is absent. When the token verifier is temporarily unavailable
+/// it answers `503` instead, with `Retry-After` when the verifier gave a hint.
+/// Returns true (with `token` populated) when the request may proceed; false
+/// when a failure response was written.
 private bool guardAuth(scope HTTPServerRequest req, scope HTTPServerResponse res,
 		StreamableHttpOptions opts, out TokenInfo token) @safe
 {
@@ -642,6 +1511,20 @@ private bool guardAuth(scope HTTPServerRequest req, scope HTTPServerResponse res
 	const failure = authorize(opts.auth, req.headers.get("Authorization", ""), token);
 	if (failure == AuthFailure.none)
 		return true;
+
+	// The verifier, not the token, failed: 503 keeps the client from
+	// discarding a token that may well be good.
+	if (failure == AuthFailure.temporarilyUnavailable)
+	{
+		import std.conv : to;
+
+		const retrySeconds = token.retryAfter.total!"seconds";
+		if (retrySeconds > 0)
+			res.headers["Retry-After"] = retrySeconds.to!string;
+		res.statusCode = HTTPStatus.serviceUnavailable;
+		res.writeBody("Token verification is temporarily unavailable", "text/plain");
+		return false;
+	}
 
 	const metaUrl = resourceMetadataUrl(req, opts);
 	res.headers["WWW-Authenticate"] = wwwAuthenticate(failure, metaUrl, opts.auth.scopeHint());
@@ -665,10 +1548,10 @@ private bool guardAuth(scope HTTPServerRequest req, scope HTTPServerResponse res
 /// The raw Host header is client-controlled and is reflected verbatim into the
 /// `WWW-Authenticate: ... resource_metadata="..."` challenge, so it is NOT trusted
 /// unconditionally:
-///   - When origin validation is disabled (`validateOrigin == false`, the trusted-
+///   - When Host validation is disabled (`validateHost == false`, the trusted-
 ///     reverse-proxy mode), the configured `resource` origin is preferred as the
 ///     primary source so an attacker-supplied Host cannot steer RFC 9728 discovery.
-///   - A Host that does not satisfy the host/port grammar (or, under enabled origin
+///   - A Host that does not satisfy the host/port grammar (or, under enabled Host
 ///     validation, the allow-list) is rejected before interpolation, so it can never
 ///     break out of the quoted-string or redirect discovery.
 /// `wwwAuthenticate` additionally percent-encodes any residual quoted-string-illegal
@@ -677,31 +1560,39 @@ private string resourceMetadataUrl(scope HTTPServerRequest req, StreamableHttpOp
 {
 	import std.string : startsWith;
 
+	const prmPath = protectedResourceMetadataPath(opts.auth.resource, opts.path);
 	// In unvalidated (reverse-proxy) mode the client-controlled Host is untrusted,
 	// so the operator-configured `resource` origin is the PRIMARY source: prefer it
 	// whenever it is set, falling back to the Host only when no resource is
 	// configured. In validated mode the Host already cleared the allow-list guard,
 	// so the request's own origin is used. Either way a Host that does not satisfy
 	// the host/port grammar (validated mode: the allow-list) is never interpolated.
-	if (!opts.validateOrigin)
+	if (!opts.validateHost)
 	{
 		if (auto fromResource = resourceOrigin(opts.auth.resource))
-			return fromResource ~ ProtectedResourceMetadataPath;
+			return fromResource ~ prmPath;
 	}
 
 	const host = req.headers.get("Host", "");
-	const hostUsable = host.length && (opts.validateOrigin ? hostAllowed(host,
+	const hostUsable = host.length && (opts.validateHost ? hostAllowed(host,
 			opts.allowedHosts) : isAllowedHostGrammar(host));
 	if (hostUsable)
 	{
-		const scheme = req.headers.get("X-Forwarded-Proto",
-				isLoopbackHostname(stripPort(host)) ? "http" : "https");
-		return scheme ~ "://" ~ host ~ ProtectedResourceMetadataPath;
+		import std.string : strip, toLower;
+
+		string scheme = isLoopbackHostname(stripPort(host)) ? "http" : "https";
+		if (opts.trustProxyHeaders)
+		{
+			const forwarded = req.headers.get("X-Forwarded-Proto", "").strip.toLower;
+			if (forwarded == "http" || forwarded == "https")
+				scheme = forwarded;
+		}
+		return scheme ~ "://" ~ host ~ prmPath;
 	}
 	// No usable Host header: derive the origin from the configured resource identifier.
 	if (auto fromResource = resourceOrigin(opts.auth.resource))
-		return fromResource ~ ProtectedResourceMetadataPath;
-	return ProtectedResourceMetadataPath;
+		return fromResource ~ prmPath;
+	return prmPath;
 }
 
 /// The scheme://host[:port] origin of a configured RFC 8707 `resource` identifier
@@ -765,155 +1656,18 @@ unittest  // resourceOrigin strips the path from a configured resource identifie
 	assert(resourceOrigin("no-scheme") is null);
 }
 
-/// Decide how to answer an HTTP GET to the MCP endpoint
-/// (basic/transports §Listening for Messages from the Server): the server "MUST
-/// either return Content-Type: text/event-stream in response to this HTTP GET,
-/// or else return HTTP 405 Method Not Allowed".
-///
-/// Returns true when the GET should open a standalone server->client SSE stream,
-/// false when it must be answered with 405. The standalone stream is offered for
-/// the stable revisions (2025-03-26 / 2025-06-18 / 2025-11-25); on 2026-07-28,
-/// which drops the standalone GET stream in favour of POST-response SSE, GET ->
-/// 405 is the correct answer.
-bool getOpensSseStream(ProtocolVersion negotiated) @safe
-{
-	return !negotiated.isModern;
-}
-
-unittest  // stable revisions open the GET SSE stream; 2026-07-28 does not
-{
-	assert(getOpensSseStream(ProtocolVersion.v2025_11_25));
-	assert(getOpensSseStream(ProtocolVersion.v2025_06_18));
-	assert(getOpensSseStream(ProtocolVersion.v2025_03_26));
-	assert(!getOpensSseStream(ProtocolVersion.v2026_07_28));
-}
-
-/// Decide how to answer an HTTP DELETE to the MCP endpoint
-/// (basic/transports §Session Management / §Backward Compatibility). The stable
-/// revisions (2025-03-26 / 2025-06-18 / 2025-11-25) carry protocol-level sessions
-/// a client tears down via DELETE + `Mcp-Session-Id`. The modern removed
-/// protocol-level sessions ("Removal of protocol-level sessions"), so there is
-/// nothing to terminate: a modern-negotiated server "SHOULD respond as follows:
-/// HTTP GET or DELETE to the MCP endpoint: respond with 405 Method Not Allowed."
-///
-/// Returns true when DELETE should drive session termination (stable revisions),
-/// false when it must be answered with 405 (2026-07-28) — mirroring the version
-/// gate `getOpensSseStream` already applies to GET.
-bool deleteTerminatesSession(ProtocolVersion negotiated) @safe
-{
-	return !negotiated.isModern;
-}
-
-unittest  // stable revisions terminate sessions on DELETE; the modern answers 405
-{
-	assert(deleteTerminatesSession(ProtocolVersion.v2025_11_25));
-	assert(deleteTerminatesSession(ProtocolVersion.v2025_06_18));
-	assert(deleteTerminatesSession(ProtocolVersion.v2025_03_26));
-	assert(!deleteTerminatesSession(ProtocolVersion.v2026_07_28));
-}
-
-/// Decide whether protocol-level sessions apply to a POST request
-/// (basic/transports §Backward Compatibility / §Earlier Streamable HTTP
-/// Revisions). The stable revisions (2025-03-26 / 2025-06-18 / 2025-11-25) carry
-/// protocol-level sessions: the server mints an `Mcp-Session-Id` on the
-/// `InitializeResult` and requires the client to echo it on every later request.
-/// The modern removed protocol-level sessions (revision 2026-07-28: "Removal of
-/// protocol-level sessions"), so a modern-only server "SHOULD respond as follows:
-/// ... An `Mcp-Session-Id` header on a request: ignore it, and do not mint or echo
-/// session IDs."
-///
-/// Returns true when POST session minting/requiring applies (stable revisions),
-/// false when the server must neither mint nor require a session id (2026-07-28) —
-/// mirroring the version gates `getOpensSseStream` (GET) and
-/// `deleteTerminatesSession` (DELETE) already apply.
-bool sessionsApply(ProtocolVersion negotiated) @safe
-{
-	return !negotiated.isModern;
-}
-
-unittest  // stable revisions mint/require Mcp-Session-Id on POST; 2026-07-28 does not
-{
-	assert(sessionsApply(ProtocolVersion.v2025_11_25));
-	assert(sessionsApply(ProtocolVersion.v2025_06_18));
-	assert(sessionsApply(ProtocolVersion.v2025_03_26));
-	assert(!sessionsApply(ProtocolVersion.v2026_07_28));
-}
-
-/// The value of the `Allow` header a 405 Method Not Allowed response must carry
-/// at the MCP endpoint. Per RFC 9110 §10.2.1 the `Allow` header MUST enumerate
-/// the set of methods the resource actually supports. On the stable revisions
-/// (2025-03-26 / 2025-06-18 / 2025-11-25) the single MCP endpoint "supports both
-/// POST and GET methods" (basic/transports §Streamable HTTP) — the standalone
-/// server->client SSE stream is mounted on GET (getOpensSseStream is true) — so a
-/// 405 (e.g. to a DELETE the server does not honour) MUST advertise `GET, POST`.
-/// On the modern the standalone GET stream and protocol-level DELETE are both
-/// dropped, leaving POST as the only supported method, so the header is `POST`.
-///
-/// The GET stream is, however, only actually mounted on a stateful server: a
-/// stateless server answers GET with 405 `Allow: POST` (handleGet) regardless of
-/// version. `getSupported` carries that mode gate so the DELETE 405 cannot
-/// advertise a GET the same endpoint provably rejects with its own 405.
-string allowedMethodsHeader(ProtocolVersion negotiated, bool getSupported = true) @safe
-{
-	return (getSupported && getOpensSseStream(negotiated)) ? "GET, POST" : "POST";
-}
-
-unittest  // 405 Allow header enumerates every supported method (RFC 9110 §10.2.1)
-{
-	// Stable revisions mount both GET (standalone SSE stream) and POST on the MCP
-	// endpoint, so a 405 there MUST advertise both — not just POST.
-	assert(allowedMethodsHeader(ProtocolVersion.v2025_11_25) == "GET, POST");
-	assert(allowedMethodsHeader(ProtocolVersion.v2025_06_18) == "GET, POST");
-	assert(allowedMethodsHeader(ProtocolVersion.v2025_03_26) == "GET, POST");
-	// 2026-07-28 drops the standalone GET stream and protocol-level DELETE, so POST
-	// is the only supported method and the 405 advertises only POST.
-	assert(allowedMethodsHeader(ProtocolVersion.v2026_07_28) == "POST");
-}
-
-unittest  // a stateless server (no GET stream) advertises only POST, matching its own GET 405
-{
-	// handleGet answers a stateless GET with 405 Allow: POST, so the DELETE 405 on
-	// the same endpoint MUST NOT advertise GET — even on a stable revision.
-	assert(allowedMethodsHeader(ProtocolVersion.v2025_11_25, false) == "POST");
-	assert(allowedMethodsHeader(ProtocolVersion.v2025_06_18, false) == "POST");
-	assert(allowedMethodsHeader(ProtocolVersion.v2025_03_26, false) == "POST");
-	assert(allowedMethodsHeader(ProtocolVersion.v2026_07_28, false) == "POST");
-}
-
 /// Whether the given `Accept` request-header value admits a `text/event-stream`
 /// response. The standalone GET stream the MCP endpoint opens is always an SSE
 /// stream, so a client whose `Accept` provably excludes that media type cannot
 /// consume what the server would send. A media type is admitted by an exact
 /// `text/event-stream` token, by the `text/*` subtype wildcard, or by the `*/*`
-/// full wildcard; quality and other parameters after a `;` are ignored. An empty
+/// full wildcard, unless the most specific matching range carries `q=0`. An empty
 /// value (no `Accept` header) is treated permissively as acceptable, since the
 /// transport never required clients to send one. Only a header that names media
 /// types and omits any matching one returns false.
-bool acceptsEventStream(string accept) @safe
+private bool acceptsEventStream(string accept) @safe
 {
-	import std.string : strip, toLower;
-	import std.algorithm : splitter;
-
-	auto trimmed = accept.strip;
-	if (trimmed.length == 0)
-		return true;
-
-	foreach (part; trimmed.splitter(','))
-	{
-		auto mediaType = part;
-		foreach (i, c; part)
-		{
-			if (c == ';')
-			{
-				mediaType = part[0 .. i];
-				break;
-			}
-		}
-		const token = mediaType.strip.toLower;
-		if (token == "text/event-stream" || token == "text/*" || token == "*/*")
-			return true;
-	}
-	return false;
+	return acceptsMediaType(accept, "text", "event-stream");
 }
 
 unittest  // an Accept that names text/event-stream (or a wildcard covering it) is admitted
@@ -948,33 +1702,58 @@ unittest  // matching is case-insensitive and tolerant of surrounding whitespace
 /// Whether the given `Accept` request-header value admits an `application/json`
 /// response — the single-JSON reply a plain POST request receives. Matching
 /// mirrors `acceptsEventStream`: an exact `application/json` token, the
-/// `application/*` subtype wildcard, or the `*/*` full wildcard; quality and
-/// other `;`-parameters are ignored. An empty value (no `Accept`) is permissive.
-bool acceptsJson(string accept) @safe
+/// `application/*` subtype wildcard, or the `*/*` full wildcard, unless the
+/// most specific matching range carries `q=0`. An empty value (no `Accept`) is
+/// permissive.
+private bool acceptsJson(string accept) @safe
 {
-	import std.string : strip, toLower;
+	return acceptsMediaType(accept, "application", "json");
+}
+
+/// Whether the `Accept` value `accept` admits the media type `type/subtype`: an
+/// exact token, the `type/*` subtype wildcard, or the `*/*` full wildcard,
+/// matched case-insensitively. The most specific matching range decides, and
+/// one weighted `q=0` excludes the type (RFC 9110 §12.5.1); other parameters
+/// are ignored. An empty value (no `Accept`) is permissive.
+private bool acceptsMediaType(string accept, string type, string subtype) @safe
+{
 	import std.algorithm : splitter;
+	import std.string : strip, toLower;
 
 	auto trimmed = accept.strip;
 	if (trimmed.length == 0)
 		return true;
-
+	const exact = type ~ "/" ~ subtype;
+	const anySubtype = type ~ "/*";
+	int best = -1; // specificity of the most specific matching range so far
+	bool admitted;
 	foreach (part; trimmed.splitter(','))
 	{
-		auto mediaType = part;
-		foreach (i, c; part)
+		auto fields = part.splitter(';');
+		const token = fields.front.strip.toLower;
+		fields.popFront();
+		const specificity = token == exact ? 2 : token == anySubtype ? 1 : token == "*/*" ? 0 : -1;
+		if (specificity < 0 || specificity < best)
+			continue;
+		bool positive = true;
+		foreach (param; fields)
 		{
-			if (c == ';')
+			import std.algorithm : findSplit;
+			import std.conv : to;
+
+			auto kv = param.findSplit("=");
+			if (kv[0].strip.toLower != "q")
+				continue;
+			try
+				positive = kv[2].strip.to!double > 0;
+			catch (Exception)
 			{
-				mediaType = part[0 .. i];
-				break;
 			}
 		}
-		const token = mediaType.strip.toLower;
-		if (token == "application/json" || token == "application/*" || token == "*/*")
-			return true;
+		admitted = specificity > best ? positive : admitted || positive;
+		best = specificity;
 	}
-	return false;
+	return admitted;
 }
 
 unittest  // an Accept that names application/json (or a wildcard covering it) is admitted
@@ -1002,7 +1781,7 @@ unittest  // an Accept that names media types but omits application/json is reje
 /// provably excludes BOTH could not consume any response the server may produce,
 /// so it is rejected up front with 406 Not Acceptable. A missing/blank Accept is
 /// permissive (both helpers admit it), matching the GET path's tolerance.
-bool postAccepted(string accept) @safe
+private bool postAccepted(string accept) @safe
 {
 	return acceptsJson(accept) || acceptsEventStream(accept);
 }
@@ -1019,16 +1798,42 @@ unittest  // a POST Accept admitting either media type is accepted; one excludin
 	assert(!postAccepted("application/xml"));
 }
 
-private void handleGet(McpServer server, ServerPushChannel push, SessionManager sessions,
-		uint reconnectDelayMs, HTTPServerRequest req, HTTPServerResponse res) @safe
+/// The authenticated principal (token subject) behind a request, or "" when it
+/// is unauthenticated.
+private string principalOf(TokenInfo token) @safe
+{
+	return token.valid ? token.subject : "";
+}
+
+/// The key the per-address caps count `req`'s caller under; see `clientBucket`.
+private string remoteAddressOf(HTTPServerRequest req, StreamableHttpOptions opts) @safe nothrow
+{
+	return clientBucket(req.clientAddress, opts.ipv6BucketPrefix);
+}
+
+/// Answer a GET refused a stream slot: 503 when the mount-wide cap is reached,
+/// 429 when the caller's per-principal or per-address cap is.
+private void refuseTooManyStreams(HTTPServerResponse res, StreamGate.Refusal why) @safe
+{
+	const mine = why == StreamGate.Refusal.caller;
+	res.statusCode = mine ? HTTPStatus.tooManyRequests : HTTPStatus.serviceUnavailable;
+	res.headers["Retry-After"] = "30";
+	res.writeBody(mine
+			? "Too many open streams for this client" : "Too many open streams", "text/plain");
+}
+
+private void handleGet(McpServer server, ServerPushChannel push,
+		SessionManager sessions, StreamGate getStreams,
+		StreamableHttpOptions opts, string principal, HTTPServerRequest req, HTTPServerResponse res) @safe
 {
 	// The GET that opens the standalone stream is a subsequent HTTP request and
 	// is subject to the same rule as the POST path: an invalid or unsupported
 	// MCP-Protocol-Version MUST be answered with 400 Bad Request rather than a
-	// 200 text/event-stream or a 405. This precedes the mode/getOpensSseStream
-	// gate so a stateless or modern-negotiated server still rejects a bad version
-	// with 400 rather than masking it behind a 405.
-	if (auto verErr = postProtocolVersionGate(req.headers.get(HttpHeader.protocolVersion, "")))
+	// 200 text/event-stream or a 405. This precedes the stateless 405 gate so a
+	// stateless server still rejects a bad version with 400 rather than masking
+	// it behind a 405.
+	if (auto verErr = validateProtocolVersionHeader(req.headers.get(HttpHeader.protocolVersion,
+			""), server.servedVersions))
 	{
 		res.statusCode = HTTPStatus.badRequest;
 		res.writeBody(makeErrorResponse(Json(null), verErr).toString(), "application/json");
@@ -1039,35 +1844,29 @@ private void handleGet(McpServer server, ServerPushChannel push, SessionManager 
 	// push channel — shared state correlating more than one HTTP call. A stateless
 	// server keeps no such state, so it MUST answer 405 (no unsolicited push
 	// without a session) regardless of the negotiated version. Only a stateful
-	// server (sessions keyed on Mcp-Session-Id) opens the stream.
-	//
-	// Per the transport: the server MUST either open a text/event-stream or
-	// answer 405. 2026-07-28 drops the standalone GET stream (server->client
-	// traffic rides the POST-response SSE), so it keeps the 405 alternative.
-	if (server.mode != ServerMode.stateful || !getOpensSseStream(server.negotiatedVersion))
+	// server (sessions keyed on Mcp-Session-Id) opens the stream. A stateful
+	// server never speaks 2026-07-28 (which drops the GET stream): the version
+	// gate above already refused it.
+	if (server.mode != ServerMode.stateful)
 	{
 		res.statusCode = HTTPStatus.methodNotAllowed;
 		res.headers["Allow"] = "POST";
-		// A stateless server has no session to anchor the unsolicited push stream;
-		// name the remedy. The modern (stateful or not) simply has no standalone GET
-		// stream, so its 405 stays bodiless.
-		res.writeBody(server.mode != ServerMode.stateful
-				? "The standalone GET SSE stream requires a stateful server;"
-				~ " construct it with McpServer.stateful()." : "", "text/plain");
+		res.writeBody("The standalone GET SSE stream requires a stateful server;"
+				~ " construct it with McpServer.stateful().", "text/plain");
 		return;
 	}
 
 	// The standalone stream this GET would open is always text/event-stream. A
 	// well-behaved client signals it can consume that via Accept; a client whose
 	// Accept provably excludes text/event-stream could not read the stream, so
-	// answer with the spec-sanctioned GET alternative (405 Allow: POST) rather
-	// than opening a stream it cannot use. A missing Accept is treated
-	// permissively and still opens the stream.
+	// it is refused with 406 rather than opened; 405 would wrongly claim this
+	// mount does not serve GET. A missing Accept is treated permissively and
+	// still opens the stream.
 	if (!acceptsEventStream(req.headers.get("Accept", "")))
 	{
-		res.statusCode = HTTPStatus.methodNotAllowed;
-		res.headers["Allow"] = "POST";
-		res.writeBody("", "text/plain");
+		res.statusCode = HTTPStatus.notAcceptable;
+		res.writeBody("The standalone GET stream is text/event-stream;"
+				~ " Accept must admit text/event-stream", "text/plain");
 		return;
 	}
 
@@ -1082,6 +1881,7 @@ private void handleGet(McpServer server, ServerPushChannel push, SessionManager 
 	// `notifications/resources/updated` delivery on this stream gates on THIS
 	// session's `resources/subscribe` set rather than the shared fallback state.
 	ConnectionState getConn;
+	const address = remoteAddressOf(req, opts);
 	// The owning session's `Mcp-Session-Id`, used to scope Last-Event-ID resume to
 	// this session so one client cannot replay another session's buffered stream
 	// history by presenting its event id (cross-session disclosure).
@@ -1089,7 +1889,7 @@ private void handleGet(McpServer server, ServerPushChannel push, SessionManager 
 	if (sessions !is null)
 	{
 		const sid = req.headers.get(SessionHeader, "");
-		const status = sessionStatus(sessions, sid);
+		const status = sessionStatus(sessions, sid, principal);
 		if (status != 0)
 		{
 			res.statusCode = cast(HTTPStatus) status;
@@ -1098,34 +1898,62 @@ private void handleGet(McpServer server, ServerPushChannel push, SessionManager 
 					"text/plain");
 			return;
 		}
+		const cap = opts.streamLimits.maxGetStreamsPerSession;
+		if (cap != 0 && sessions.openStreams(sid) >= cap)
+		{
+			res.statusCode = HTTPStatus.tooManyRequests;
+			res.headers["Retry-After"] = "1";
+			res.writeBody("Too many open streams on this session", "text/plain");
+			return;
+		}
+		if (const why = getStreams.tryAcquire(principal, address))
+		{
+			refuseTooManyStreams(res, why);
+			return;
+		}
 		getConn = sessions.stateFor(sid);
 		ownerToken = sid;
+		sessions.streamOpened(sid);
 	}
+	scope (exit)
+		if (sessions !is null)
+		{
+			sessions.streamClosed(ownerToken);
+			getStreams.release(principal, address);
+		}
 
 	// Open a long-lived SSE stream wired to the server-push channel, so the
 	// server can deliver unsolicited notifications/requests outside any POST.
 	res.contentType = "text/event-stream";
-	// The standalone GET stream is offered only on the stable revisions
-	// (getOpensSseStream gated above); the X-Accel-Buffering: no SHOULD is a
-	// modern-only rule, so it is not emitted here.
+	// The standalone GET stream is offered only on the stable revisions; the
+	// X-Accel-Buffering: no SHOULD is a modern-only rule, so it is not emitted here.
 	applySseStreamHeaders(res, false);
 
-	auto writeFrame = sseFrameWriter(res);
+	auto writeFrame = sseFrameWriter(res, opts.streamLimits.maxQueuedStreamBytes);
+	scope (exit)
+		writeFrame.close();
 
 	// Resumability and Redelivery (basic/transports §Resumability and Redelivery):
 	// if the reconnecting client supplied the `Last-Event-ID` header, hand it to
 	// the channel so it resumes the disconnected stream — replaying the events
 	// emitted after that id on the same stream ordinal — instead of opening a fresh
-	// one. The header is honoured only on the stable revisions that mount the GET
-	// stream (gated by getOpensSseStream above); the modern never reaches here.
+	// one. Only the stable revisions reach here, all of which mount the GET stream.
 	const lastEventId = req.headers.get("Last-Event-ID", "");
 	const listenerId = push.addListener((string frame) @safe {
 		writeFrame(frame);
 	}, Json.init, ListenFilter.init, lastEventId, getConn !is null
-			? server.sessionPushEligibility(getConn) : null, ownerToken);
+			? server.sessionPushEligibility(getConn) : null, ownerToken, principal);
 	// Drop the listener when the stream ends so the channel self-heals.
 	scope (exit)
 		push.removeListener(listenerId);
+
+	// vibe.d sends the response headers with the first body write; an SSE comment
+	// flushes them now so the client sees the stream open without waiting for the
+	// first message or heartbeat.
+	try
+		writeFrame(": open\n\n");
+	catch (Exception)
+		return;
 
 	// 2025-11-25 basic/transports §Listening for Messages item 4 / §Sending
 	// Messages item 6: if the server closes the connection without terminating
@@ -1134,16 +1962,16 @@ private void handleGet(McpServer server, ServerPushChannel push, SessionManager 
 	// after opening) when configured, so the client has cached the reconnect
 	// delay before any server-initiated close. Version-gated to 2025-11-25 only,
 	// so other revisions' wire output is unchanged.
-	if (reconnectDelayMs > 0 && sendsRetryOnClose(server.negotiatedVersion))
+	if (opts.reconnectDelayMs > 0 && getConn !is null && sendsRetryOnClose(getConn.negotiated))
 	{
 		try
-			writeFrame(formatRetryEvent(reconnectDelayMs));
+			writeFrame(formatRetryEvent(opts.reconnectDelayMs));
 		catch (Exception)
 		{
 		}
 	}
 
-	runSseHeartbeat(writeFrame);
+	holdSessionStream(&writeFrame.opCall, push, listenerId, sessions, ownerToken, 15.seconds);
 }
 
 /// Serve a modern `subscriptions/listen` request as a long-lived SSE notification
@@ -1159,8 +1987,9 @@ private void handleGet(McpServer server, ServerPushChannel push, SessionManager 
 /// existing `notify*` / `notifyResourceUpdated` APIs deliver opted-in change
 /// notifications onto it. The connection is held open (with SSE comment
 /// heartbeats) until the client disconnects.
-private void handleListenStream(McpServer server, StreamCoordinator coord,
-		Message msg, HTTPServerResponse res, string protoHeader, string connToken) @safe
+private void handleListenStream(McpServer server, ServerPushChannel push, Message msg,
+		HTTPServerResponse res, string protoHeader, string connToken,
+		TokenInfo token, size_t maxQueued) @safe
 {
 	// Record the opted-in filters (route -> doSubscribeListen). The one-shot JSON
 	// result is discarded on success: the acknowledgement is delivered as the
@@ -1168,10 +1997,10 @@ private void handleListenStream(McpServer server, StreamCoordinator coord,
 	// the request) is surfaced as a JSON-RPC error response — listen is modern-only,
 	// so a method-not-found rides the modern 404 — rather than opening the stream
 	// with a stale filter. The state is built the same way the regular POST path
-	// builds it (`freshStatelessState`: header, then body `_meta`, then the
-	// server default).
-	auto reqState = freshStatelessState(protoHeader, msg.params, server.negotiatedVersion);
-	auto routed = routeListenRequest(server, msg, reqState, connToken);
+	// builds it (`freshStatelessState`: body `_meta`, then header, then
+	// 2025-03-26).
+	auto reqState = freshStatelessState(protoHeader, msg.params);
+	auto routed = routeListenRequest(server, msg, reqState, connToken, token);
 	if (!routed.isNull)
 	{
 		res.statusCode = httpStatusForResponse(routed.get, true);
@@ -1192,17 +2021,18 @@ private void handleListenStream(McpServer server, StreamCoordinator coord,
 	// §Receiving Messages).
 	applySseStreamHeaders(res, true);
 
-	auto writeFrame = sseFrameWriter(res);
+	auto writeFrame = sseFrameWriter(res, maxQueued);
+	scope (exit)
+		writeFrame.close();
 
-	auto push = ensurePushChannel(server, coord);
 	// The listen request's id becomes the stream's subscriptionId: every
 	// notification delivered to this listener (including the leading
 	// acknowledgement) is stamped with it in
 	// `params._meta["io.modelcontextprotocol/subscriptionId"]` (modern
 	// basic/utilities/subscriptions).
-	const listenerId = push.addListener((string frame) @safe {
+	const listenerId = addListenStreamListener(push, (string frame) @safe {
 		writeFrame(frame);
-	}, msg.id, streamFilter);
+	}, msg.id, streamFilter, principalOf(token));
 	// Drop the listener when the stream ends so the channel self-heals.
 	scope (exit)
 		push.removeListener(listenerId);
@@ -1217,11 +2047,22 @@ private void handleListenStream(McpServer server, StreamCoordinator coord,
 	push.emitTo(listenerId,
 			subscriptionsAcknowledgedNotification(server.acknowledgedSubsetFor(streamFilter)));
 
-	runSseHeartbeat(writeFrame);
+	runSseHeartbeat(&writeFrame.opCall);
+}
+
+/// Register a `subscriptions/listen` stream on `push`: its notifications are
+/// stamped with `subscriptionId`, delivered by `filter`, and scoped to
+/// `principal`. The stream keeps no replay history and its events carry no SSE
+/// id, since a listen stream is never resumed (2026-07-28 has no
+/// `Last-Event-ID`, and a stateless server serves no GET to resume on).
+private long addListenStreamListener(ServerPushChannel push, void delegate(
+		string) @safe write, Json subscriptionId, ListenFilter filter, string principal) @safe
+{
+	return push.addListener(write, subscriptionId, filter, "", null, "", principal, false);
 }
 
 /// Whether `method` opens a modern `events/stream` push response.
-bool opensEventsStream(string method, bool modern) @safe
+private bool opensEventsStream(string method, bool modern) @safe
 {
 	return modern && method == "events/stream";
 }
@@ -1229,7 +2070,7 @@ bool opensEventsStream(string method, bool modern) @safe
 /// The JSON-RPC error surfaced (under a 406 Not Acceptable) when a POST that would
 /// open a `text/event-stream` response (`subscriptions/listen` or `events/stream`)
 /// carries an `Accept` that provably excludes that media type.
-McpException eventStreamNotAcceptable() @safe
+private McpException eventStreamNotAcceptable() @safe
 {
 	return invalidRequest(
 			"this request opens a text/event-stream response; Accept must admit text/event-stream");
@@ -1238,11 +2079,11 @@ McpException eventStreamNotAcceptable() @safe
 /// The heartbeat cadence: a `notifications/events/heartbeat` carries the cursor at
 /// least this often so a quiet stream still advances the client cursor and the
 /// periodic write doubles as the client-disconnect detector.
-enum long eventStreamHeartbeatIntervalMs = 15_000;
+private enum long eventStreamHeartbeatIntervalMs = 15_000;
 
 /// One iteration's decision for the SSE hold-open loop, computed purely from the
 /// timing inputs so it is unit-testable without a network or a real clock.
-struct EventStreamTick
+private struct EventStreamTick
 {
 	bool poll; /// pull check-function events this iteration (false for emit-only streams)
 	bool heartbeat; /// write a cursor-carrying heartbeat this iteration
@@ -1253,7 +2094,7 @@ struct EventStreamTick
 /// stream wakes on its poll cadence, clamped to `[1s, heartbeat interval]` so a
 /// fast poll never starves the disconnect-detecting heartbeat and a slow one never
 /// outlives it.
-long eventStreamSleepMs(bool emitOnly, long pollMs) @safe pure nothrow @nogc
+private long eventStreamSleepMs(bool emitOnly, long pollMs) @safe pure nothrow @nogc
 {
 	import std.algorithm : min, max;
 
@@ -1265,7 +2106,7 @@ long eventStreamSleepMs(bool emitOnly, long pollMs) @safe pure nothrow @nogc
 /// and how long it has been since the last heartbeat. A poll-driven stream always
 /// polls; either kind heartbeats only once the cadence has elapsed (so a sub-15s
 /// poll loop does not heartbeat on every wake-up).
-EventStreamTick eventStreamTick(bool emitOnly, long sinceHeartbeatMs) @safe pure nothrow @nogc
+private EventStreamTick eventStreamTick(bool emitOnly, long sinceHeartbeatMs) @safe pure nothrow @nogc
 {
 	EventStreamTick t;
 	t.poll = !emitOnly;
@@ -1284,30 +2125,42 @@ EventStreamTick eventStreamTick(bool emitOnly, long sinceHeartbeatMs) @safe pure
 /// advances during quiet periods. Every frame is stamped with the request id in
 /// `_meta` so a client multiplexing several streams can route it.
 private void handleEventsStream(McpServer server, Message msg,
-		HTTPServerResponse res, string principal) @safe
+		HTTPServerResponse res, string principal, size_t maxQueued) @safe
 {
-	import vibe.core.core : sleep;
 	import core.time : msecs;
 
+	if (auto e = server.modernStreamRequestError(RequestMeta.fromParams(msg.params)))
+	{
+		res.statusCode = httpStatusForResponse(makeErrorResponse(msg.id, e), true);
+		res.writeBody(makeErrorResponse(msg.id, e).toString(), "application/json");
+		return;
+	}
 	auto rt = server.events();
 	if (rt is null)
 	{
-		auto e = methodNotFound("events");
+		auto e = methodNotFound("events/stream");
 		res.statusCode = httpStatusForResponse(makeErrorResponse(msg.id, e), true);
 		res.writeBody(makeErrorResponse(msg.id, e).toString(), "application/json");
 		return;
 	}
 
-	auto p = StreamParams.fromJson(msg.params);
-	if (p.name.length == 0)
+	StreamParams p;
+	try
 	{
-		auto e = invalidParams("events/stream requires a string 'name'");
+		p = StreamParams.fromJson(msg.params);
+		if (p.name.length == 0)
+			throw invalidParams("events/stream requires a string 'name'");
+	}
+	catch (McpException e)
+	{
 		res.statusCode = httpStatusForResponse(makeErrorResponse(msg.id, e), true);
 		res.writeBody(makeErrorResponse(msg.id, e).toString(), "application/json");
 		return;
 	}
 
-	auto writeFrame = sseFrameWriter(res);
+	auto writeFrame = sseFrameWriter(res, maxQueued);
+	scope (exit)
+		writeFrame.close();
 	const subId = msg.id;
 	void deliver(string method, Json params) @safe
 	{
@@ -1315,14 +2168,18 @@ private void handleEventsStream(McpServer server, Message msg,
 	}
 
 	// Validate (and register the emit sink + fire on_subscribe) BEFORE upgrading
-	// the response, so an invalid subscription returns a JSON-RPC error.
+	// the response, so an invalid subscription returns a JSON-RPC error. The
+	// runtime holds live events until `startPushStream`, after the headers.
 	import mcp.server.events_runtime : PushHandle;
 
 	PushHandle handle;
 	try
 		handle = rt.openPushStream(p.name, p.arguments, principal, subId, &deliver);
-	catch (McpException e)
+	catch (Exception ex)
 	{
+		auto e = cast(McpException) ex;
+		if (e is null)
+			e = server.unexpectedFailure(msg.method, ex);
 		res.statusCode = httpStatusForResponse(makeErrorResponse(msg.id, e), true);
 		res.writeBody(makeErrorResponse(msg.id, e).toString(), "application/json");
 		return;
@@ -1334,35 +2191,38 @@ private void handleEventsStream(McpServer server, Message msg,
 	applySseStreamHeaders(res, true);
 
 	// A server-initiated close (terminatePush) ends with the StreamEventsResult as
-	// the final frame; a client abort never gets one.
+	// the final frame; a client abort never gets one. It also wakes the hold loop
+	// below so the socket and stream slot are released at once.
+	import vibe.core.sync : createManualEvent;
+
+	auto terminatedEvt = createManualEvent();
 	handle.stream.onTerminated = () @safe {
 		try
 			writeFrame("data: " ~ makeResponse(msg.id, streamEventsResult()).toString() ~ "\n\n");
 		catch (Exception)
 		{
 		}
+		terminatedEvt.emit();
 	};
 
 	const emitOnly = rt.isEmitOnly(p.name);
-	Nullable!string cursor = p.cursor;
 	long pollMs = 15_000;
+	// Set when the check reported more events than one batch carried: the next
+	// batch is fetched without waiting out the poll cadence (yielding only, so a
+	// check that always reports more cannot monopolise the thread).
+	bool more;
 
-	// Leading active frame + any backlog, from an initial poll.
+	// Leading active frame + any backlog, then the live events held since open.
 	try
 	{
-		auto first = rt.poll(p.name, p.arguments, principal, p.cursor,
-				p.maxAgeMs, Nullable!long.init);
-		deliver(eventsActiveNotification,
-				withSubscriptionId(activeParams(first.cursor, first.truncated), subId));
-		foreach (ev; first.events)
-			deliver(eventsEventNotification, withSubscriptionId(ev.toJson(), subId));
-		cursor = first.cursor;
-		handle.stream.cursor = first.cursor;
-		if (first.nextPollMs > 0)
-			pollMs = first.nextPollMs;
+		const start = rt.startPushStream(handle.stream, p.cursor, p.maxAgeMs);
+		if (start.nextPollMs > 0)
+			pollMs = start.nextPollMs;
+		more = start.hasMore;
 	}
 	catch (Exception)
-		deliver(eventsActiveNotification, withSubscriptionId(activeParams(p.cursor, false), subId));
+		return; // client disconnected
+	Nullable!string cursor = handle.stream.cursor;
 
 	// Hold open: poll-driven check types pull events on a cadence; emit-driven
 	// types receive them via the sink. Either way a heartbeat carries the cursor.
@@ -1370,15 +2230,25 @@ private void handleEventsStream(McpServer server, Message msg,
 	// (`eventStreamTick`/`eventStreamSleepMs`); this loop only supplies the clock,
 	// the I/O, and the disconnect-on-write-failure break.
 	import core.time : MonoTime;
+	import vibe.core.core : yield;
 
 	const sleepMs = eventStreamSleepMs(emitOnly, pollMs);
 	auto lastHeartbeat = MonoTime.currTime;
-	while (true)
+	while (!handle.stream.terminated)
 	{
 		try
-			sleep(sleepMs.msecs);
+		{
+			if (more)
+				yield();
+			else
+			{
+				const ec = terminatedEvt.emitCount;
+				terminatedEvt.wait(sleepMs.msecs, ec);
+			}
+		}
 		catch (Exception)
 			break;
+		more = false;
 		if (handle.stream.terminated)
 			break; // the server ended the stream; its final frame is already written
 		const sinceHeartbeatMs = (MonoTime.currTime - lastHeartbeat).total!"msecs";
@@ -1386,7 +2256,7 @@ private void handleEventsStream(McpServer server, Message msg,
 		if (tick.poll)
 		{
 			try
-				rt.advancePushStream(handle.stream);
+				more = rt.advancePushStream(handle.stream);
 			catch (Exception)
 			{
 				break; // client disconnected mid-delivery
@@ -1418,17 +2288,26 @@ private final class HttpScopedContext : BaseRequestContext, ConnectionScoped
 {
 	private string token_;
 	// The request's ConnectionState. For an inbound `notifications/cancelled` this
-	// is the session's state, so the cancellation flips the token in the SAME
-	// per-session in-flight registry the request side used (null in stateless mode,
-	// which has no cross-POST cancellation correlation). For the modern listen route
+	// is the session's state (or, stateless, a state over the mount's shared
+	// registry), so the cancellation flips the token in the SAME in-flight registry
+	// the request side used. For the modern listen route
 	// it is the per-request modern state, so dispatch resolves the modern effective
 	// version and serves the modern-only listen RPC.
 	private ConnectionState connState_;
+	// The POST's validated bearer token, so a notification observer can tell
+	// which principal sent it.
+	private TokenInfo auth_;
 
-	this(string token, ConnectionState connState = null) @safe
+	this(string token, ConnectionState connState = null, TokenInfo auth = TokenInfo.invalid()) @safe
 	{
 		this.token_ = token;
 		this.connState_ = connState;
+		this.auth_ = auth;
+	}
+
+	override TokenInfo auth() @safe
+	{
+		return auth_;
 	}
 
 	string connectionToken() @safe
@@ -1454,11 +2333,12 @@ private final class HttpScopedContext : BaseRequestContext, ConnectionScoped
 /// `_meta.protocolVersion`). On success the server has recorded this request's
 /// per-stream filter on `reqState.listenFilter` and `null` is returned; when
 /// routing rejects the request the JSON-RPC error response is returned for the
-/// caller to surface instead of opening a stream with a stale filter.
+/// caller to surface instead of opening a stream with a stale filter. `token`
+/// is the POST's validated bearer token, reported as `ctx.auth()`.
 private Nullable!Json routeListenRequest(McpServer server, Message msg,
-		ConnectionState reqState, string connToken) @safe
+		ConnectionState reqState, string connToken, TokenInfo token = TokenInfo.invalid()) @safe
 {
-	auto resp = server.handle(msg, new HttpScopedContext(connToken, reqState));
+	auto resp = server.handle(msg, new HttpScopedContext(connToken, reqState, token));
 	if (!resp.isNull && "error" in resp.get && resp.get["error"].type == Json.Type.object)
 		return resp;
 	return Nullable!Json.init;
@@ -1474,7 +2354,7 @@ unittest  // a modern listen signalled by the header alone routes against the mo
 	// subscriptions/listen RPC is served (not -32601 methodNotFound) and THIS
 	// request's opt-in filter is recorded — not dropped on an error path that
 	// would open the stream with a stale filter.
-	auto server = McpServer.stateful("t", "1");
+	auto server = McpServer.stateless("t", "1");
 	server.enableToolsListChanged();
 
 	Json notifications = Json.emptyObject;
@@ -1489,7 +2369,7 @@ unittest  // a modern listen signalled by the header alone routes against the mo
 	params["_meta"] = meta;
 	auto msg = Message(makeRequest(Json(7), "subscriptions/listen", params));
 
-	auto reqState = freshStatelessState("2026-07-28", params, server.negotiatedVersion);
+	auto reqState = freshStatelessState("2026-07-28", params);
 	auto routed = routeListenRequest(server, msg, reqState, "");
 	assert(routed.isNull, "a header-signalled modern listen must route, not error");
 	assert(reqState.listenFilter.active);
@@ -1504,7 +2384,7 @@ unittest  // concurrent listens each keep their own per-stream filter
 	// concurrent HTTP listen streams race). Each stream's opt-in must be recorded
 	// on its own request state: a server-global "last filter" field would hand
 	// the first stream the second stream's filter.
-	auto server = McpServer.stateful("t", "1");
+	auto server = McpServer.stateless("t", "1");
 	server.enableToolsListChanged();
 	server.enablePromptsListChanged();
 
@@ -1526,8 +2406,8 @@ unittest  // concurrent listens each keep their own per-stream filter
 	auto msgA = Message(makeRequest(Json(1), "subscriptions/listen", paramsA));
 	auto msgB = Message(makeRequest(Json(2), "subscriptions/listen", paramsB));
 
-	auto a = freshStatelessState("2026-07-28", paramsA, server.negotiatedVersion);
-	auto b = freshStatelessState("2026-07-28", paramsB, server.negotiatedVersion);
+	auto a = freshStatelessState("2026-07-28", paramsA);
+	auto b = freshStatelessState("2026-07-28", paramsB);
 	assert(routeListenRequest(server, msgA, a, "").isNull);
 	assert(routeListenRequest(server, msgB, b, "").isNull);
 
@@ -1541,7 +2421,7 @@ unittest  // concurrent listens each keep their own per-stream filter
 
 /// Validate the modern-only request headers on a POSTed JSON-RPC request, returning
 /// the first error (caller emits it as a 400) or null when they pass. The
-/// MCP-Protocol-Version header is already validated by `postProtocolVersionGate`.
+/// MCP-Protocol-Version header is already validated by `validateProtocolVersionHeader`.
 private McpException validatePostRequestHeaders(HTTPServerRequest req,
 		ref Message msg, bool isModernReq, McpServer server) @safe
 {
@@ -1559,16 +2439,142 @@ private McpException validatePostRequestHeaders(HTTPServerRequest req,
 			.params["name"].get!string : "";
 		auto schema = server.toolInputSchema(tname);
 		auto args = ("arguments" in msg.params) ? msg.params["arguments"] : Json.emptyObject;
-		return validateParamHeaders(schema, args, (string h) => req.headers.get(h, ""));
+		return validateParamHeaders(schema, args, (string h) {
+			auto v = h in req.headers;
+			return v is null ? Nullable!string.init : Nullable!string(*v);
+		});
 	}
 
 	return null;
 }
 
-private void handlePost(McpServer server, StreamCoordinator coord,
-		SessionManager sessions, TokenInfo token, HTTPServerRequest req, HTTPServerResponse res) @safe
+/// Whether a POST `Content-Type` names `application/json` (case-insensitive,
+/// parameters such as `charset` allowed).
+private bool isJsonContentType(string contentType) @safe
 {
-	const payload = req.bodyReader.readAllUTF8();
+	import std.string : indexOf, strip;
+	import std.uni : sicmp;
+
+	const semi = contentType.indexOf(';');
+	const media = (semi < 0 ? contentType : contentType[0 .. semi]).strip;
+	return sicmp(media, "application/json") == 0;
+}
+
+/// Write `e` as a null-id JSON-RPC error response with HTTP `status`.
+private void writeJsonRpcError(HTTPServerResponse res, HTTPStatus status, McpException e) @safe
+{
+	res.statusCode = status;
+	res.writeBody(makeErrorResponse(Json(null), e).toString(), "application/json");
+}
+
+/// Read a POST body of at most `maxBytes` as UTF-8. On failure a JSON-RPC error
+/// response has already been written — 413 for an oversized body, 400 for a
+/// body that could not be read (a dropped connection, a malformed chunked
+/// encoding) or, with -32700, for invalid UTF-8 — and false is returned.
+private bool readPostBody(HTTPServerRequest req, HTTPServerResponse res,
+		size_t maxBytes, out string payload) @safe
+{
+	import std.algorithm : min;
+	import std.conv : to, ConvException;
+	import std.utf : validate, UTFException;
+	import vibe.core.stream : IOMode;
+	import vibe.utils.string : stripUTF8Bom;
+
+	auto tooLarge = invalidRequest("request body exceeds " ~ maxBytes.to!string ~ " bytes");
+	const declared = req.headers.get("Content-Length", "");
+	if (declared.length)
+	{
+		ulong n;
+		try
+			n = declared.to!ulong;
+		catch (ConvException)
+			n = ulong.max;
+		if (n > maxBytes)
+		{
+			writeJsonRpcError(res, HTTPStatus.requestEntityTooLarge, tooLarge);
+			return false;
+		}
+	}
+	ubyte[] raw;
+	try
+	{
+		ubyte[4096] chunk;
+		auto body_ = req.bodyReader;
+		while (!body_.empty)
+		{
+			const n = cast(size_t) min(body_.leastSize, chunk.length);
+			body_.read(chunk[0 .. n], IOMode.all);
+			if (raw.length + n > maxBytes)
+			{
+				writeJsonRpcError(res, HTTPStatus.requestEntityTooLarge, tooLarge);
+				return false;
+			}
+			raw ~= chunk[0 .. n];
+		}
+	}
+	catch (Exception e)
+	{
+		import vibe.core.log : logDiagnostic;
+
+		// The stream's exception text can describe server internals, so it is
+		// logged here and the client gets a fixed message.
+		logDiagnostic("could not read a POST body: %s", e.msg);
+		writeJsonRpcError(res, HTTPStatus.badRequest,
+				invalidRequest("could not read the request body"));
+		return false;
+	}
+	auto text = () @trusted { return cast(string) raw; }();
+	try
+		validate(text);
+	catch (UTFException)
+	{
+		writeJsonRpcError(res, HTTPStatus.badRequest,
+				parseError("request body is not valid UTF-8"));
+		return false;
+	}
+	payload = stripUTF8Bom(text);
+	return true;
+}
+
+/// Answer a `subscriptions/listen` or `events/stream` request refused a stream
+/// slot: 503 when the mount already holds `StreamLimits.maxPushStreams` such
+/// streams, 429 when the caller holds `StreamLimits.maxPushStreamsPerPrincipal`
+/// (authenticated) or `maxPushStreamsPerAddress` (unauthenticated).
+private void refuseTooManyPushStreams(HTTPServerResponse res, Json id, StreamGate.Refusal why) @safe
+{
+	const mine = why == StreamGate.Refusal.caller;
+	res.statusCode = mine ? HTTPStatus.tooManyRequests : HTTPStatus.serviceUnavailable;
+	res.headers["Retry-After"] = "30";
+	res.writeBody(makeErrorResponse(id, internalError(mine
+			? "too many open notification streams for this client"
+			: "too many open notification streams")).toString(), "application/json");
+}
+
+/// The token a POST's request is scoped by (its cancellation, server->client
+/// waiter and replay-owner key): the session an `initialize` just minted, else
+/// `headerScope`, the scope the request's own headers name. A stateful
+/// `initialize` may carry a stale or foreign `Mcp-Session-Id`, which must never
+/// own the new session's stream.
+private string requestScope(string headerScope, string mintedSessionId) @safe pure nothrow
+{
+	return mintedSessionId.length ? mintedSessionId : headerScope;
+}
+
+unittest  // a stateful initialize is scoped by its minted session, never the header's
+{
+	assert(requestScope("stale-or-foreign", "minted") == "minted");
+	assert(requestScope("", "minted") == "minted");
+	assert(requestScope("sess", "") == "sess");
+}
+
+private void handlePost(McpServer server, ServerPushChannel push,
+		SessionManager sessions, StatelessInFlight statelessInFlight,
+		StreamGate pushStreams,
+		StreamableHttpOptions opts,
+		TokenInfo token, string payload, HTTPServerRequest req, HTTPServerResponse res) @safe
+{
+	auto coord = push.coordinator;
+	const maxQueued = opts.streamLimits.maxQueuedStreamBytes;
 
 	ParsedInput input;
 	try
@@ -1576,7 +2582,7 @@ private void handlePost(McpServer server, StreamCoordinator coord,
 	catch (McpException e)
 	{
 		res.statusCode = HTTPStatus.badRequest;
-		res.writeBody(makeErrorResponse(Json(null), e).toString(), "application/json");
+		res.writeBody(makeErrorResponse(errorReplyId(e), e).toString(), "application/json");
 		return;
 	}
 	catch (Exception e)
@@ -1591,14 +2597,14 @@ private void handlePost(McpServer server, StreamCoordinator coord,
 	// `initialize` (which receives a freshly-minted Mcp-Session-Id); every
 	// later request MUST carry that id (400 when absent, 404 when unknown or
 	// terminated). The id is also issued for the InitializeResult below.
-	if (sessions !is null && sessionsApply(server.negotiatedVersion))
+	if (sessions !is null)
 	{
 		const isInit = !input.isBatch && input.messages.length == 1
 			&& input.messages[0].method == "initialize";
 		if (!isInit)
 		{
 			const sid = req.headers.get(SessionHeader, "");
-			const status = sessionStatus(sessions, sid);
+			const status = sessionStatus(sessions, sid, principalOf(token));
 			if (status != 0)
 			{
 				res.statusCode = cast(HTTPStatus) status;
@@ -1611,29 +2617,39 @@ private void handlePost(McpServer server, StreamCoordinator coord,
 	}
 
 	// Per-connection cancellation scope. A request and its later
-	// `notifications/cancelled` arrive on SEPARATE POSTs that share only the
-	// `Mcp-Session-Id` header, so the cancellation registry must be keyed by that
-	// session id for the two to match. The token is therefore the session id when
-	// stateful sessions are enabled and applicable; otherwise the empty (shared)
-	// token, in which case bare-id cancellation is unscoped across connections
-	// (documented in `mcp.transport.session` -- stateful sessions are required for
-	// cross-client cancellation isolation).
-	const connToken = (sessions !is null && sessionsApply(server.negotiatedVersion)) ? req
-		.headers.get(SessionHeader, "") : "";
+	// `notifications/cancelled` arrive on SEPARATE POSTs, so both must resolve to
+	// the same in-flight registry key. A stateful request is scoped by its
+	// `Mcp-Session-Id`; a stateless one by a scope of its own in the mount's
+	// shared `StatelessInFlight` registry, which routes the principal's
+	// `notifications/cancelled` to it. An unauthenticated stateless request
+	// cannot be cancelled by a later POST, since any caller could forge it.
+	const connToken = (sessions !is null) ? req.headers.get(SessionHeader, "") : "";
+	const cancelScope = (sessions !is null) ? connToken : statelessInFlight.scopeFor(
+			principalOf(token));
 
 	// JSON-RPC batching (an array body) was introduced in 2025-03-26 and removed
 	// in every later revision: 2025-06-18 / 2025-11-25 / modern all require the
 	// POST body to be a SINGLE request, notification, or response
 	// (basic/transports §Sending Messages). The MCP-Protocol-Version header is
-	// first validated by postProtocolVersionGate (so an invalid/unsupported
+	// first validated by validateProtocolVersionHeader (so an invalid/unsupported
 	// version on a batch is still rejected with 400), then the effective version
 	// decides batch acceptance: only 2025-03-26 keeps the legacy batch path.
 	if (input.isBatch)
 	{
-		if (auto verErr = postProtocolVersionGate(req.headers.get(HttpHeader.protocolVersion, "")))
+		if (auto verErr = validateProtocolVersionHeader(req.headers.get(HttpHeader.protocolVersion,
+				""), server.servedVersions))
 		{
 			res.statusCode = HTTPStatus.badRequest;
 			res.writeBody(makeErrorResponse(Json(null), verErr).toString(), "application/json");
+			return;
+		}
+		const accept = req.headers.get("Accept", "");
+		if (carriesRequest(input) && !postAccepted(accept))
+		{
+			res.statusCode = HTTPStatus.notAcceptable;
+			res.writeBody(
+					"Not Acceptable: POST requests must accept application/json or text/event-stream",
+					"text/plain");
 			return;
 		}
 		// Resolve THIS request's connection state (the SessionManager-owned state
@@ -1645,9 +2661,9 @@ private void handlePost(McpServer server, StreamCoordinator coord,
 		// A batch is never an `initialize` (that is a single message), so no session
 		// is minted on this path: the only session id is the `Mcp-Session-Id` header
 		// (`connToken`).
-		ConnectionState reqState = postState(server, sessions, "", connToken,
-				req.headers.get(HttpHeader.protocolVersion, ""), Json.undefined);
-		const ver = (reqState !is null) ? reqState.negotiated : server.negotiatedVersion;
+		ConnectionState reqState = postState(server, sessions, statelessInFlight, "",
+				connToken, req.headers.get(HttpHeader.protocolVersion, ""), Json.undefined);
+		const ver = (reqState !is null) ? reqState.negotiated : latestLegacy;
 		if (!streamableBatchAllowed(ver))
 		{
 			// Single-message-only: reject the array body with -32600 on HTTP 400.
@@ -1661,14 +2677,54 @@ private void handlePost(McpServer server, StreamCoordinator coord,
 		// 2025-03-26 back-compat: the non-streaming batch path (no in-flight
 		// server->client traffic), dispatched against the resolved state so the
 		// legacy path is actually reachable for a session that negotiated 2025-03-26.
-		const txt = server.handleRaw(payload, reqState);
+		// Client replies in the batch wake their server->client waiters (scoped to
+		// this POST's session, as for a single reply) and only the rest is
+		// dispatched. On a stateless mount each `notifications/cancelled` member is
+		// taken out too and dispatched once under the scope of the request it
+		// names, which may be running on another POST of the same principal.
+		Message[] statelessCancels;
+		const rest = takeBatchMembers(payload, (Message m) @safe {
+			if (m.kind == MessageKind.response || m.kind == MessageKind.errorResponse)
+			{
+				coord.resolve(m.id, m.result, m.error, connToken);
+				return true;
+			}
+			if (statelessInFlight !is null && m.kind == MessageKind.notification
+				&& m.method == "notifications/cancelled"
+				&& m.params.type == Json.Type.object && "requestId" in m.params)
+			{
+				statelessCancels ~= m;
+				return true;
+			}
+			return false;
+		});
+		// The batch's own requests are tracked so a later POST's cancel can reach
+		// them.
+		if (statelessInFlight !is null)
+		{
+			const principal = principalOf(token);
+			foreach (m; statelessCancels)
+				server.handle(m, new HttpScopedContext(statelessInFlight.cancelScopeFor(principal,
+						m.params["requestId"]), statelessInFlight.share(new ConnectionState), token));
+			foreach (m; input.messages)
+				if (m.kind == MessageKind.request)
+					statelessInFlight.track(principal, m.id, cancelScope);
+		}
+		scope (exit)
+			if (statelessInFlight !is null)
+				foreach (m; input.messages)
+					if (m.kind == MessageKind.request)
+						statelessInFlight.untrack(principalOf(token), m.id, cancelScope);
+		const txt = rest is null ? "" : server.handleRaw(rest, reqState, cancelScope, token);
 		if (txt.length == 0)
 		{
 			res.statusCode = HTTPStatus.accepted;
 			res.writeBody("", "text/plain");
 		}
-		else
+		else if (acceptsJson(accept))
 			res.writeBody(txt, "application/json");
+		else
+			res.writeBody("data: " ~ txt ~ "\n\n", "text/event-stream");
 		return;
 	}
 
@@ -1681,7 +2737,8 @@ private void handlePost(McpServer server, StreamCoordinator coord,
 	// per-kind switch so all branches are covered. A notification/response error
 	// body carries no id (basic/transports: "a JSON-RPC error response that has
 	// no id"); a request error echoes the request id.
-	if (auto verErr = postProtocolVersionGate(req.headers.get(HttpHeader.protocolVersion, "")))
+	if (auto verErr = validateProtocolVersionHeader(req.headers.get(HttpHeader.protocolVersion,
+			""), server.servedVersions))
 	{
 		const errId = (msg.kind == MessageKind.request) ? msg.id : Json(null);
 		res.statusCode = HTTPStatus.badRequest;
@@ -1713,13 +2770,17 @@ private void handlePost(McpServer server, StreamCoordinator coord,
 		// `notifications/cancelled` resolves to the SAME per-session in-flight key the
 		// request side (HttpStreamContext) uses. Without this it would go through
 		// NullContext (token ""), never matching the scoped in-flight request.
-		// Carry the session's ConnectionState so a
-		// `notifications/cancelled` flips the cancellation token in the SAME
-		// per-session in-flight registry the request side used. Stateful only —
-		// stateless has no cross-POST correlation, so the state is null there.
-		ConnectionState noteState = (sessions !is null
-				&& sessionsApply(server.negotiatedVersion)) ? sessions.stateFor(connToken) : null;
-		server.handle(msg, new HttpScopedContext(connToken, noteState));
+		// Carry the session's ConnectionState (stateful) or a state over the
+		// mount's shared stateless registry, so a `notifications/cancelled` flips the
+		// cancellation token in the SAME in-flight registry the request side used.
+		ConnectionState noteState = sessions !is null
+			? sessions.stateFor(connToken) : statelessInFlight.share(new ConnectionState);
+		// A stateless cancel runs under the scope of the one request it names.
+		const noteScope = sessions is null && msg.method == "notifications/cancelled"
+			&& msg.params.type == Json.Type.object
+			&& "requestId" in msg.params ? statelessInFlight.cancelScopeFor(
+					principalOf(token), msg.params["requestId"]) : cancelScope;
+		server.handle(msg, new HttpScopedContext(noteScope, noteState, token));
 		res.statusCode = HTTPStatus.accepted;
 		res.writeBody("", "text/plain");
 		return;
@@ -1753,11 +2814,18 @@ private void handlePost(McpServer server, StreamCoordinator coord,
 		// the same shape as every other error path in handlePost -- instead of
 		// letting it escape to vibe's generic error page.
 		string mintedSessionId;
-		if (sessions !is null && sessionsApply(server.negotiatedVersion)
-				&& msg.method == "initialize")
+		if (sessions !is null && msg.method == "initialize")
 		{
 			try
-				mintedSessionId = sessions.create();
+				mintedSessionId = sessions.create(principalOf(token), remoteAddressOf(req, opts));
+			catch (SessionCapacityException e)
+			{
+				res.statusCode = HTTPStatus.serviceUnavailable;
+				res.headers["Retry-After"] = "30";
+				res.writeBody(makeErrorResponse(msg.id, internalError(e.msg))
+						.toString(), "application/json");
+				return;
+			}
 			catch (McpException e)
 			{
 				res.statusCode = HTTPStatus.internalServerError;
@@ -1773,6 +2841,19 @@ private void handlePost(McpServer server, StreamCoordinator coord,
 		// uses. All modern-gated header validation below keys off this single value.
 		const isModernReq = tryModern(req.headers.get(HttpHeader.protocolVersion, ""))
 			|| tryModern(RequestMeta.fromParams(msg.params).protocolVersion);
+		// 2026-07-28 is stateless-only: a stateful server refuses it, listing the
+		// versions it serves, before any modern-only route (listen, events/stream).
+		if (isModernReq && server.mode == ServerMode.stateful)
+		{
+			sessions !is null && sessions.terminate(mintedSessionId);
+			const requested = RequestMeta.fromParams(msg.params).protocolVersion;
+			res.statusCode = HTTPStatus.badRequest;
+			res.writeBody(makeErrorResponse(msg.id,
+					server.unsupportedVersionError(requested.length
+					? requested : req.headers.get(HttpHeader.protocolVersion, ""))).toString(),
+					"application/json");
+			return;
+		}
 		if (auto hdrErr = validatePostRequestHeaders(req, msg, isModernReq, server))
 		{
 			// Roll back a session minted above for an initialize that fails header
@@ -1791,8 +2872,8 @@ private void handlePost(McpServer server, StreamCoordinator coord,
 		// server-push channel so notify*/notifyResourceUpdated reach it.
 		if (opensListenStream(msg.method, isModernReq))
 		{
-			// subscriptions/listen is a DRAFT RPC and the modern protocol is
-			// stateless-only, so it MUST work on a stateless server too. It is a single
+			// Only a stateless server reaches here (a stateful one refused 2026-07-28
+			// above), and subscriptions/listen needs no session. It is a single
 			// self-contained long-lived HTTP request: this POST opens the SSE response
 			// stream, and notify*/notifyResourceUpdated stream
 			// `notifications/resources/updated` and `.../list_changed` down THAT SAME
@@ -1813,8 +2894,17 @@ private void handlePost(McpServer server, StreamCoordinator coord,
 						eventStreamNotAcceptable()).toString(), "application/json");
 				return;
 			}
-			handleListenStream(server, coord, msg, res,
-					req.headers.get(HttpHeader.protocolVersion, ""), connToken);
+			const principal = principalOf(token);
+			const address = remoteAddressOf(req, opts);
+			if (const why = pushStreams.tryAcquire(principal, address))
+			{
+				refuseTooManyPushStreams(res, msg.id, why);
+				return;
+			}
+			scope (exit)
+				pushStreams.release(principal, address);
+			handleListenStream(server, push, msg, res,
+					req.headers.get(HttpHeader.protocolVersion, ""), connToken, token, maxQueued);
 			return;
 		}
 		// Modern events/stream (push): like subscriptions/listen, this POST opens a
@@ -1833,31 +2923,50 @@ private void handlePost(McpServer server, StreamCoordinator coord,
 						eventStreamNotAcceptable()).toString(), "application/json");
 				return;
 			}
-			handleEventsStream(server, msg, res, token.valid ? token.subject : "");
+			const principal = principalOf(token);
+			const address = remoteAddressOf(req, opts);
+			if (const why = pushStreams.tryAcquire(principal, address))
+			{
+				refuseTooManyPushStreams(res, msg.id, why);
+				return;
+			}
+			scope (exit)
+				pushStreams.release(principal, address);
+			handleEventsStream(server, msg, res, principal, maxQueued);
 			return;
 		}
-		// The effective version for this POST decides whether a server-initiated
-		// SSE stream must lead with the 2025-11-25 priming event (event id + empty
-		// data field; basic/transports §Sending Messages item 6).
-		const effVersion = effectivePostVersion(req.headers.get(HttpHeader.protocolVersion,
-				""), server.negotiatedVersion);
 		// Resolve THIS request's per-connection state and hand it to
 		// the context so the server core dispatches against it (never the single
 		// bound `activeConnection`). Stateful HTTP -> the SessionManager-owned state
 		// for this session id (the just-minted id on `initialize`, else the
 		// `Mcp-Session-Id` header). Stateless HTTP -> a FRESH per-request state
 		// seeded from the effective version + `_meta`, retained nowhere.
-		ConnectionState reqState = postState(server, sessions, mintedSessionId,
+		ConnectionState reqState = postState(server, sessions, statelessInFlight, mintedSessionId,
 				connToken, req.headers.get(HttpHeader.protocolVersion, ""), msg.params);
+		// This request's version (its session's, or the stateless request's own)
+		// decides whether a server-initiated SSE stream leads with the
+		// 2025-11-25 priming event (basic/transports §Sending Messages item 6).
+		const effVersion = reqState !is null ? reqState.negotiated : latestLegacy;
 		// Whether this POST's Accept admits text/event-stream. When it provably does
-		// not, an attempt by the handler to stream (progress/log/server-initiated
-		// request) is refused inside the context and surfaced as 406 below, rather
-		// than emitting an SSE body the client declared it cannot read.
+		// not, progress/log notifications are dropped and a server-initiated request
+		// is refused inside the context and surfaced as 406 below, rather than
+		// emitting an SSE body the client declared it cannot read.
 		const reqAcceptsSse = acceptsEventStream(req.headers.get("Accept", ""));
-		auto ctx = new HttpStreamContext(res, coord, clientCapsFor(server, reqState),
-				extractProgressToken(msg.params),
-				token, isModernReq, effVersion, connToken, reqState,
-				server.mode == ServerMode.stateless, reqAcceptsSse);
+		auto ctx = new HttpStreamContext(res, coord, clientCapsFor(server,
+				reqState), extractProgressToken(msg.params),
+				token, isModernReq, effVersion, requestScope(cancelScope, mintedSessionId),
+				reqState, server.mode == ServerMode.stateless, reqAcceptsSse);
+		// A session-bound 2025-11-25 stream advertises resumability with its
+		// priming event, so record its events for a GET Last-Event-ID resume.
+		if (sessions !is null && sendsPrimingEvent(effVersion))
+			ctx.enableReplay(push);
+		scope (exit)
+			ctx.endReplay();
+		if (statelessInFlight !is null)
+			statelessInFlight.track(principalOf(token), msg.id, cancelScope);
+		scope (exit)
+			if (statelessInFlight !is null)
+				statelessInFlight.untrack(principalOf(token), msg.id, cancelScope);
 		auto resp = server.handle(msg, ctx);
 		// Modern basic/utilities/cancellation §Transport-Specific Cancellation: on
 		// Streamable HTTP "Closing the SSE response stream is the cancellation
@@ -1867,7 +2976,7 @@ private void handlePost(McpServer server, StreamCoordinator coord,
 		// cancellation: emit no response, exactly as `notifications/cancelled` would
 		// suppress it. Released versions (2025-*) keep their behaviour: a dropped
 		// connection still completes the write, which is a harmless no-op there.
-		if (suppressOnDisconnect(isModernReq, res.connected))
+		if (suppressOnDisconnect(isModernReq, clientConnected(res)))
 		{
 			// 2026-07-28 is stateless-only, so it never mints a session; the rollback
 			// is a no-op there. Kept for symmetry: a suppressed initialize must not
@@ -1909,9 +3018,9 @@ private void handlePost(McpServer server, StreamCoordinator coord,
 		}
 		// The handler tried to stream but this POST's Accept excludes
 		// text/event-stream, so the context refused the SSE upgrade (no body was
-		// written). Surface 406 Not Acceptable with the refusal as a JSON-RPC error,
-		// rather than the would-be SSE body the client declared it cannot read.
-		if (ctx.streamRefused)
+		// written). When the handler failed, surface 406 Not Acceptable with the
+		// error; a handler that recovered from the refusal answers normally.
+		if (ctx.streamRefused && "error" in j)
 		{
 			res.statusCode = HTTPStatus.notAcceptable;
 			res.writeBody(j.toString(), "application/json");
@@ -1925,7 +3034,12 @@ private void handlePost(McpServer server, StreamCoordinator coord,
 			// (400 for unsupported-version/header-mismatch, modern 404 for
 			// method-not-found); everything else rides on 200.
 			res.statusCode = httpStatusForResponse(j, isModernReq);
-			res.writeBody(j.toString(), "application/json");
+			// A client that accepts only text/event-stream gets the reply as a
+			// single SSE event, since it declared it cannot read a JSON body.
+			if (acceptsJson(req.headers.get("Accept", "")))
+				res.writeBody(j.toString(), "application/json");
+			else
+				res.writeBody(formatSseEvent("", j), "text/event-stream");
 		}
 		return;
 	}
@@ -1938,12 +3052,13 @@ private void handlePost(McpServer server, StreamCoordinator coord,
 ///             session ID SHOULD respond to requests without an Mcp-Session-Id
 ///             header (other than initialization) with HTTP 400 Bad Request").
 ///   - `404` — the id names an unknown or already-terminated session ("after
-///             [termination] it MUST respond ... with HTTP 404 Not Found").
-int sessionStatus(SessionManager sessions, string sessionId) @safe
+///             [termination] it MUST respond ... with HTTP 404 Not Found"), or a
+///             session created under a different authenticated `principal`.
+private int sessionStatus(SessionManager sessions, string sessionId, string principal = "") @safe
 {
 	if (sessionId.length == 0)
 		return 400;
-	if (!sessions.isActive(sessionId))
+	if (!sessions.ownedBy(sessionId, principal))
 		return 404;
 	return 0;
 }
@@ -1957,6 +3072,279 @@ unittest  // missing session id -> 400, unknown -> 404, active -> 0
 	assert(sessionStatus(mgr, id) == 0);
 	mgr.terminate(id);
 	assert(sessionStatus(mgr, id) == 404);
+}
+
+unittest  // a session presented under another principal's token is unknown (404)
+{
+	auto mgr = new SessionManager;
+	const id = mgr.create("alice");
+	assert(sessionStatus(mgr, id, "alice") == 0);
+	assert(sessionStatus(mgr, id, "bob") == 404);
+	assert(sessionStatus(mgr, id, "") == 404);
+}
+
+unittest  // with auth on, a session id only works with its creator's token
+{
+	import vibe.http.server : createTestHTTPServerResponse, TestHTTPResponseMode;
+	import vibe.http.common : HTTPMethod;
+	import vibe.stream.memory : createMemoryOutputStream;
+
+	StreamableHttpOptions opts;
+	opts.auth.allowAnyAudience = true;
+	opts.auth.authorizationServers = ["https://auth.example.com"];
+	opts.auth.validator = (string t) @safe {
+		TokenInfo info;
+		info.valid = t == "tok-alice" || t == "tok-bob";
+		info.subject = t == "tok-alice" ? "alice" : "bob";
+		return info;
+	};
+	auto server = McpServer.stateful("t", "1");
+	auto router = new URLRouter;
+	mountMcp(router, server, opts);
+
+	HTTPServerResponse send(string body_, string bearer, string sid,
+			HTTPMethod method = HTTPMethod.POST) @safe
+	{
+		string[string] h = [
+			"Accept": "application/json, text/event-stream",
+			"Authorization": "Bearer " ~ bearer,
+			"MCP-Protocol-Version": "2025-11-25"
+		];
+		if (sid.length)
+			h[SessionHeader] = sid;
+		auto req = makeInitPostReq(body_, h);
+		req.method = method;
+		auto res = createTestHTTPServerResponse(createMemoryOutputStream(),
+				null, TestHTTPResponseMode.bodyOnly);
+		router.handleRequest(req, res);
+		return res;
+	}
+
+	auto init = send(initializeBody(), "tok-alice", "");
+	const sid = init.headers[SessionHeader];
+	const ping = `{"jsonrpc":"2.0","id":2,"method":"ping"}`;
+	assert(send(ping, "tok-bob", sid).statusCode == 404,
+			"another principal must not use alice's session");
+	assert(send("", "tok-bob", sid, HTTPMethod.DELETE).statusCode == 404,
+			"another principal must not terminate alice's session");
+	assert(send(ping, "tok-alice", sid).statusCode == 200);
+}
+
+unittest  // with auth on, every member of a 2025-03-26 batch sees the caller's token
+{
+	import vibe.http.server : createTestHTTPServerResponse, TestHTTPResponseMode;
+	import vibe.stream.memory : createMemoryOutputStream;
+	import vibe.data.json : parseJsonString;
+	import mcp.protocol.types : Tool, CallToolResult, Content;
+
+	StreamableHttpOptions opts;
+	opts.auth.allowAnyAudience = true;
+	opts.auth.authorizationServers = ["https://auth.example.com"];
+	opts.auth.validator = (string t) @safe {
+		TokenInfo info;
+		info.valid = t == "tok-alice";
+		info.subject = "alice";
+		return info;
+	};
+	auto server = new McpServer("t", "1");
+	Tool whoami = {name: "whoami"};
+	server.registerTool(whoami, (Json args, RequestContext ctx) @safe {
+		CallToolResult r;
+		r.content = [
+			Content.makeText(ctx.auth().valid ? ctx.auth().subject : "<anonymous>")
+		];
+		return r;
+	});
+	auto router = new URLRouter;
+	mountMcp(router, server, opts);
+
+	auto sink = createMemoryOutputStream();
+	auto res = createTestHTTPServerResponse(sink, null, TestHTTPResponseMode.bodyOnly);
+	router.handleRequest(makeInitPostReq(`[{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"whoami","arguments":{}}}]`,
+			[
+				"Accept": "application/json, text/event-stream",
+				"Authorization": "Bearer tok-alice"
+	]), res);
+	const reply = cast(string) sink.data.idup;
+	assert(res.statusCode == HTTPStatus.ok, reply);
+	auto arr = parseJsonString(reply);
+	assert(arr[0]["result"]["content"][0]["text"].get!string == "alice",
+			"a batch member must run under the request's authenticated principal: " ~ reply);
+}
+
+version (unittest) private string initializeFrom(URLRouter router, string from) @safe
+{
+	import vibe.core.net : resolveHost;
+	import vibe.http.server : createTestHTTPServerResponse, TestHTTPResponseMode;
+	import vibe.stream.memory : createMemoryOutputStream;
+
+	auto req = makeInitPostReq(initializeBody(), [
+		"Accept": "application/json, text/event-stream"
+	]);
+	req.clientAddress = resolveHost(from);
+	auto res = createTestHTTPServerResponse(createMemoryOutputStream(), null,
+			TestHTTPResponseMode.bodyOnly);
+	router.handleRequest(req, res);
+	return res.headers.get(SessionHeader, "");
+}
+
+version (unittest) private int pingStatus(URLRouter router, string sid) @safe
+{
+	import vibe.http.server : createTestHTTPServerResponse, TestHTTPResponseMode;
+	import vibe.stream.memory : createMemoryOutputStream;
+
+	auto res = createTestHTTPServerResponse(createMemoryOutputStream(), null,
+			TestHTTPResponseMode.bodyOnly);
+	router.handleRequest(makeInitPostReq(`{"jsonrpc":"2.0","id":2,"method":"ping"}`,
+			[
+				"Accept": "application/json, text/event-stream",
+				"MCP-Protocol-Version": "2025-11-25",
+				SessionHeader: sid
+	]), res);
+	return res.statusCode;
+}
+
+unittest  // anonymous sessions from one IPv6 /64 share the per-address session cap
+{
+	auto server = McpServer.stateful("t", "1");
+	auto router = new URLRouter;
+	StreamableHttpOptions opts;
+	opts.sessionLimits.maxAnonymousPerAddress = 1;
+	mountMcp(router, server, opts);
+
+	const first = initializeFrom(router, "2001:db8:1:2::1");
+	const second = initializeFrom(router, "2001:db8:1:2::2");
+	assert(first.length && second.length);
+	assert(pingStatus(router, first) == 404, "the /64's older session is evicted");
+	assert(pingStatus(router, second) == 200);
+}
+
+unittest  // the IPv6 bucket prefix for per-address caps is configurable
+{
+	auto server = McpServer.stateful("t", "1");
+	auto router = new URLRouter;
+	StreamableHttpOptions opts;
+	opts.sessionLimits.maxAnonymousPerAddress = 1;
+	opts.ipv6BucketPrefix = 128;
+	mountMcp(router, server, opts);
+
+	const first = initializeFrom(router, "2001:db8:1:2::1");
+	const second = initializeFrom(router, "2001:db8:1:2::2");
+	assert(pingStatus(router, first) == 200);
+	assert(pingStatus(router, second) == 200);
+}
+
+unittest  // a 2025-03-26 batch whose Accept excludes both reply media types is refused with 406
+{
+	import vibe.http.server : createTestHTTPServerResponse, TestHTTPResponseMode;
+	import vibe.stream.memory : createMemoryOutputStream;
+
+	auto server = new McpServer("t", "1");
+	auto router = new URLRouter;
+	mountMcp(router, server);
+
+	auto res = createTestHTTPServerResponse(createMemoryOutputStream(), null,
+			TestHTTPResponseMode.bodyOnly);
+	router.handleRequest(makeInitPostReq(
+			`[{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}]`,
+			["Accept": "text/plain"]), res);
+	assert(res.statusCode == HTTPStatus.notAcceptable);
+}
+
+unittest  // a 2025-03-26 batch from a client accepting only text/event-stream is answered as SSE
+{
+	import std.algorithm : startsWith;
+	import vibe.http.server : createTestHTTPServerResponse, TestHTTPResponseMode;
+	import vibe.stream.memory : createMemoryOutputStream;
+
+	auto server = new McpServer("t", "1");
+	auto router = new URLRouter;
+	mountMcp(router, server);
+
+	auto sink = createMemoryOutputStream();
+	auto res = createTestHTTPServerResponse(sink, null, TestHTTPResponseMode.bodyOnly);
+	router.handleRequest(makeInitPostReq(
+			`[{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}]`,
+			["Accept": "text/event-stream"]), res);
+	const reply = cast(string) sink.data.idup;
+	assert(res.statusCode == HTTPStatus.ok, reply);
+	assert(res.headers.get("Content-Type", "").startsWith("text/event-stream"));
+	assert(reply.startsWith("data: ["), reply);
+}
+
+unittest  // a notification observer sees the POST's session and authenticated principal
+{
+	import vibe.http.server : createTestHTTPServerResponse, TestHTTPResponseMode;
+	import vibe.stream.memory : createMemoryOutputStream;
+	import mcp.server.context : connectionTokenOf;
+
+	StreamableHttpOptions opts;
+	opts.auth.allowAnyAudience = true;
+	opts.auth.authorizationServers = ["https://auth.example.com"];
+	opts.auth.validator = (string t) @safe {
+		TokenInfo info;
+		info.valid = t == "tok-alice";
+		info.subject = "alice";
+		return info;
+	};
+	auto server = McpServer.stateful("t", "1");
+	string seenSession, seenSubject;
+	server.setRootsListChangedHandler((RequestContext ctx) @safe {
+		seenSession = connectionTokenOf(ctx);
+		seenSubject = ctx.auth().subject;
+	});
+	auto router = new URLRouter;
+	mountMcp(router, server, opts);
+
+	HTTPServerResponse send(string body_, string sid) @safe
+	{
+		string[string] h = [
+			"Accept": "application/json, text/event-stream",
+			"Authorization": "Bearer tok-alice",
+			"MCP-Protocol-Version": "2025-11-25"
+		];
+		if (sid.length)
+			h[SessionHeader] = sid;
+		auto res = createTestHTTPServerResponse(createMemoryOutputStream(),
+				null, TestHTTPResponseMode.bodyOnly);
+		router.handleRequest(makeInitPostReq(body_, h), res);
+		return res;
+	}
+
+	const sid = send(initializeBody(), "").headers[SessionHeader];
+	auto res = send(`{"jsonrpc":"2.0","method":"notifications/roots/list_changed"}`, sid);
+	assert(res.statusCode == HTTPStatus.accepted);
+	assert(seenSession == sid);
+	assert(seenSubject == "alice");
+}
+
+unittest  // a client reply inside a 2025-03-26 batch resolves the waiting server->client request
+{
+	import core.time : msecs;
+	import std.conv : to;
+	import vibe.http.server : createTestHTTPServerResponse, TestHTTPResponseMode;
+	import vibe.stream.memory : createMemoryOutputStream;
+	import vibe.data.json : parseJsonString;
+	import mcp.transport.sse_context : StreamCoordinator, ensurePushChannel;
+
+	auto server = new McpServer("t", "1");
+	auto coord = new StreamCoordinator;
+	ensurePushChannel(server, coord);
+	auto router = new URLRouter;
+	mountMcp(router, server);
+	const id = coord.alloc();
+	coord.register(id);
+
+	auto sink = createMemoryOutputStream();
+	auto res = createTestHTTPServerResponse(sink, null, TestHTTPResponseMode.bodyOnly);
+	router.handleRequest(makeInitPostReq(`[{"jsonrpc":"2.0","id":` ~ id.to!string
+			~ `,"result":{"answer":42}},{"jsonrpc":"2.0","id":"p","method":"ping"}]`,
+			["Accept": "application/json, text/event-stream"]), res);
+	const reply = cast(string) sink.data.idup;
+	assert(res.statusCode == HTTPStatus.ok, reply);
+	auto arr = parseJsonString(reply);
+	assert(arr.length == 1 && arr[0]["id"].get!string == "p", reply);
+	assert(coord.await(id, 10.msecs)["answer"].get!int == 42);
 }
 
 unittest  // the standalone GET SSE stream uses the same session gate as POST/DELETE
@@ -1990,7 +3378,7 @@ unittest  // the standalone GET SSE stream uses the same session gate as POST/DE
 ///   - `Method not found` (-32601) -> `404` on modern requests, which lets a client
 ///     tell a modern MCP endpoint apart from a legacy HTTP+SSE `404`. Legacy
 ///     versions keep the legacy JSON-RPC-error-over-`200` shape.
-int httpStatusForResponse(Json resp, bool modern) @safe
+private int httpStatusForResponse(Json resp, bool modern) @safe
 {
 	if ("error" !in resp || resp["error"].type != Json.Type.object)
 		return 200;
@@ -2017,7 +3405,7 @@ int httpStatusForResponse(Json resp, bool modern) @safe
 /// set, the session kept) only when this is true; an error response (e.g. a
 /// second initialize rejected with `invalidRequest`) rolls the minted session
 /// back instead.
-bool initializeSucceeded(Json resp) @safe
+private bool initializeSucceeded(Json resp) @safe
 {
 	return ("result" in resp) !is null && ("error" in resp) is null;
 }
@@ -2046,7 +3434,7 @@ unittest  // a successful InitializeResult commits; an error response does not
 /// So when the connection has dropped on a modern request, the response is
 /// suppressed. Released versions (2025-*) never suppress on this basis: that MUST
 /// is modern-only, so their wire behaviour is unchanged.
-bool suppressOnDisconnect(bool modern, bool connected) @safe pure nothrow @nogc
+private bool suppressOnDisconnect(bool modern, bool connected) @safe pure nothrow @nogc
 {
 	return modern && !connected;
 }
@@ -2065,6 +3453,141 @@ unittest  // released versions never suppress on disconnect (modern-only MUST)
 {
 	assert(!suppressOnDisconnect(false, false));
 	assert(!suppressOnDisconnect(false, true));
+}
+
+unittest  // modern: a client closing its TCP connection mid-request cancels the request
+{
+	import core.time : MonoTime, msecs;
+	import std.conv : to;
+	import vibe.core.core : runTask, runEventLoop, exitEventLoop, sleep;
+	import vibe.core.net : connectTCP;
+	import vibe.http.server : HTTPServerSettings, listenHTTP;
+	import mcp.protocol.types : Tool, CallToolResult;
+
+	auto server = McpServer.stateless("t", "1");
+	bool started, finished, cancelled;
+	Tool wait = {name: "wait"};
+	server.registerTool(wait, (Json args, RequestContext ctx) @safe {
+		started = true;
+		const deadline = MonoTime.currTime + 5.seconds;
+		while (!ctx.isCancelled && MonoTime.currTime < deadline)
+			sleep(10.msecs);
+		cancelled = ctx.isCancelled;
+		finished = true;
+		CallToolResult r;
+		return r;
+	});
+	auto router = new URLRouter;
+	mountMcp(router, server);
+	auto settings = new HTTPServerSettings;
+	settings.port = 0;
+	settings.bindAddresses = ["127.0.0.1"];
+
+	string failure;
+	runTask(() nothrow{
+		scope (exit)
+			exitEventLoop();
+		try
+		{
+			auto listener = listenHTTP(settings, router);
+			scope (exit)
+				listener.stopListening();
+			auto conn = connectTCP("127.0.0.1", listener.bindAddresses[0].port);
+			const body_ = `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"wait",`
+				~ `"arguments":{},"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28",`
+				~ `"io.modelcontextprotocol/clientCapabilities":{}}}}`;
+			conn.write(
+				"POST /mcp HTTP/1.1\r\nHost: 127.0.0.1\r\n" ~ "Content-Type: application/json\r\n"
+				~ "Accept: application/json, text/event-stream\r\n"
+				~ "MCP-Protocol-Version: 2026-07-28\r\nMcp-Method: tools/call\r\n"
+				~ "Mcp-Name: wait\r\nContent-Length: " ~ body_.length.to!string ~ "\r\n\r\n" ~ body_);
+			conn.flush();
+			const startBy = MonoTime.currTime + 2.seconds;
+			while (!started && MonoTime.currTime < startBy)
+				sleep(10.msecs);
+			if (!started)
+			{
+				ubyte[512] buf;
+				const n = conn.read(buf[], IOMode.once);
+				failure = cast(string) buf[0 .. n].idup;
+			}
+			conn.close();
+			const finishBy = MonoTime.currTime + 6.seconds;
+			while (!finished && MonoTime.currTime < finishBy)
+				sleep(10.msecs);
+		}
+		catch (Exception e)
+			failure = e.msg;
+	});
+	runEventLoop();
+	assert(failure.length == 0, failure);
+	assert(started, "the tool handler never ran");
+	assert(cancelled, "a client disconnect must cancel a modern request");
+}
+
+unittest  // a POST stream whose client stops reading does not pin its handler
+{
+	import core.time : MonoTime, msecs;
+	import std.array : replicate;
+	import std.conv : to;
+	import vibe.core.core : runTask, runEventLoop, exitEventLoop, sleep;
+	import vibe.core.net : connectTCP;
+	import vibe.http.server : HTTPServerSettings, listenHTTP;
+	import mcp.protocol.types : Tool, CallToolResult;
+
+	auto server = McpServer.stateless("t", "1");
+	server.enableLogging();
+	bool started, finished;
+	Tool flood = {name: "flood"};
+	server.registerTool(flood, (Json args, RequestContext ctx) @safe {
+		started = true;
+		const big = Json("x".replicate(64 * 1024));
+		foreach (_; 0 .. 400)
+			ctx.log("info", big);
+		finished = true;
+		CallToolResult r;
+		return r;
+	});
+	auto router = new URLRouter;
+	mountMcp(router, server);
+	auto settings = new HTTPServerSettings;
+	settings.port = 0;
+	settings.bindAddresses = ["127.0.0.1"];
+
+	string failure;
+	Duration took;
+	runTask(() nothrow{
+		scope (exit)
+			exitEventLoop();
+		try
+		{
+			auto listener = listenHTTP(settings, router);
+			scope (exit)
+				listener.stopListening();
+			auto conn = connectTCP("127.0.0.1", listener.bindAddresses[0].port);
+			scope (exit)
+				conn.close();
+			const body_ = `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"flood",` ~ `"arguments":{},"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28",` ~ `"io.modelcontextprotocol/clientCapabilities":{},` ~ `"io.modelcontextprotocol/logLevel":"debug"}}}`;
+			conn.write(
+				"POST /mcp HTTP/1.1\r\nHost: 127.0.0.1\r\n" ~ "Content-Type: application/json\r\n"
+				~ "Accept: application/json, text/event-stream\r\n"
+				~ "MCP-Protocol-Version: 2026-07-28\r\nMcp-Method: tools/call\r\n"
+				~ "Mcp-Name: flood\r\nContent-Length: " ~ body_.length.to!string
+				~ "\r\n\r\n" ~ body_);
+			conn.flush();
+			const began = MonoTime.currTime;
+			while (!finished && MonoTime.currTime - began < 10.seconds)
+				sleep(20.msecs);
+			took = MonoTime.currTime - began;
+		}
+		catch (Exception e)
+			failure = e.msg;
+	});
+	runEventLoop();
+	assert(failure.length == 0, failure);
+	assert(started, "the tool handler never ran");
+	assert(finished, "a client that stops reading must not block its handler forever");
+	assert(took < 8.seconds, took.toString);
 }
 
 /// Validate the modern Streamable HTTP request headers against the JSON-RPC body.
@@ -2151,18 +3674,22 @@ McpException validateModernHeaders(string protoHeader, string methodHeader,
 /// respond with `400 Bad Request`. Returns an `UnsupportedProtocolVersionError`
 /// (-32022, which the transport maps to HTTP 400) in that case, else null.
 ///
-/// An absent header is permitted: older clients omit it, and the request then
-/// proceeds under the previously negotiated version.
-McpException validateProtocolVersionHeader(string protoHeader) @safe
+/// It gates every request to the MCP endpoint (each POST body kind, GET and
+/// DELETE) before any routing. An absent header is permitted: older clients
+/// omit it, and the request then proceeds under the previously negotiated
+/// version.
+McpException validateProtocolVersionHeader(string protoHeader, const(ProtocolVersion)[] served) @safe
 {
+	import std.algorithm : canFind;
+
 	if (protoHeader.length == 0)
 		return null; // header optional; fall back to negotiated version
 	ProtocolVersion pv;
-	if (tryParseVersion(protoHeader, pv))
-		return null; // a known, supported version
+	if (tryParseVersion(protoHeader, pv) && served.canFind(pv))
+		return null; // a version this server serves
 	Json data = Json.emptyObject;
 	Json supported = Json.emptyArray;
-	foreach (v; supportedVersions)
+	foreach (v; served)
 		supported ~= Json(v.toWire);
 	data["supported"] = supported;
 	data["requested"] = Json(protoHeader);
@@ -2170,27 +3697,54 @@ McpException validateProtocolVersionHeader(string protoHeader) @safe
 			"Unsupported MCP-Protocol-Version header: " ~ protoHeader, data);
 }
 
-/// The transport-level MCP-Protocol-Version check that gates EVERY POST to the
-/// MCP endpoint, irrespective of whether the body is a request, notification, or
-/// response. basic/transports §Protocol Version Header (2025-06-18 /
-/// 2025-11-25): "If the server receives a request with an invalid or unsupported
-/// MCP-Protocol-Version, it MUST respond with 400 Bad Request." Returns the
-/// rejecting McpException (mapped to HTTP 400) or null when the header is absent
-/// or names a supported version. This is just `validateProtocolVersionHeader`,
-/// named to make explicit that it runs before the per-kind routing switch.
-McpException postProtocolVersionGate(string protoHeader) @safe
-{
-	return validateProtocolVersionHeader(protoHeader);
-}
-
 /// Whether a `Host` header value (e.g. "127.0.0.1:3000") is localhost or listed.
+/// Host names compare case-insensitively. A listed entry without a port accepts
+/// its host on any port, as the loopback check does; an entry with a port
+/// accepts only that port.
 package bool hostAllowed(string host, const string[] extra) @safe
 {
-	import std.algorithm : canFind;
+	import std.uni : sicmp;
 
-	if (extra.canFind(host))
-		return true;
-	return isLoopbackHostname(stripPort(host));
+	string name, port;
+	splitHostPort(host, name, port);
+	foreach (entry; extra)
+	{
+		string entryName, entryPort;
+		splitHostPort(entry, entryName, entryPort);
+		if (entryName.length && sicmp(entryName, name) == 0
+				&& (entryPort.length == 0 || entryPort == port))
+			return true;
+	}
+	return isLoopbackHostname(name);
+}
+
+/// Split a `host[:port]` value into its host name and port ("" when absent). A
+/// bracketed IPv6 literal loses its brackets; an unbracketed value with more
+/// than one colon is a bare IPv6 address with no port.
+private void splitHostPort(string value, out string name, out string port) @safe
+{
+	import std.algorithm : count;
+	import std.string : indexOf, lastIndexOf;
+
+	if (value.length && value[0] == '[')
+	{
+		const close = value.indexOf(']');
+		if (close >= 0)
+		{
+			name = value[1 .. close];
+			if (close + 1 < value.length && value[close + 1] == ':')
+				port = value[close + 2 .. $];
+			return;
+		}
+	}
+	const colon = value.lastIndexOf(':');
+	if (colon >= 0 && value.count(':') == 1)
+	{
+		name = value[0 .. colon];
+		port = value[colon + 1 .. $];
+		return;
+	}
+	name = value;
 }
 
 /// Whether an `Origin` header value (e.g. "http://localhost:3000") is localhost
@@ -2235,31 +3789,38 @@ private string stripPort(string hostport) @safe
 
 private bool isLoopbackHostname(string h) @safe
 {
-	return h == "localhost" || h == "127.0.0.1" || h == "::1";
+	import std.uni : sicmp;
+
+	return sicmp(h, "localhost") == 0 || h == "127.0.0.1" || h == "::1";
 }
 
-/// Whether the server is bound to a public (non-loopback) address while accepting
-/// no extra Host values — the configuration in which the DNS-rebinding guard
+/// Whether `opts` binds a public (non-loopback) address while validating `Host`
+/// against no extra values — the configuration in which the DNS-rebinding guard
 /// rejects every external request with 403. Used to warn at startup.
-private bool publicBindWithoutAllowlist(const string[] bindAddresses, const string[] allowedHosts) @safe
+private bool publicBindWithoutAllowlist(StreamableHttpOptions opts) @safe
 {
-	if (allowedHosts.length)
+	if (!opts.validateHost || opts.allowedHosts.length)
 		return false;
-	foreach (a; bindAddresses)
+	foreach (a; opts.bindAddresses)
 		if (!isLoopbackHostname(a))
 			return true;
 	return false;
 }
 
 /// Translate the transport-level `opts` into a vibe.d `HTTPServerSettings`:
-/// listen address, plus access logging when `opts.accessLog` is set (to
-/// `opts.accessLogFile` if given, otherwise the console). Access logging stays
-/// off unless explicitly opted in.
-private HTTPServerSettings buildStreamableHttpSettings(ushort port, StreamableHttpOptions opts) @safe
+/// listen port and addresses, plus access logging when `opts.accessLog` is set
+/// (to `opts.accessLogFile` if given, otherwise the console). Access logging
+/// stays off unless explicitly opted in.
+private HTTPServerSettings buildStreamableHttpSettings(StreamableHttpOptions opts) @safe
 {
 	auto settings = new HTTPServerSettings;
-	settings.port = port;
+	settings.port = opts.port;
 	settings.bindAddresses = opts.bindAddresses;
+	// Every body-reading route enforces `opts.maxRequestBytes` itself so an
+	// oversized body gets a JSON-RPC error instead of vibe's plain-text 400. The
+	// listener's own cap sits above that limit with headroom, bounding how much
+	// of a rejected body vibe drains before reusing the connection.
+	settings.maxRequestSize = cast(ulong) opts.maxRequestBytes * 2 + 64 * 1024;
 	if (opts.accessLog)
 	{
 		if (opts.accessLogFile.length)
@@ -2270,16 +3831,16 @@ private HTTPServerSettings buildStreamableHttpSettings(ushort port, StreamableHt
 	return settings;
 }
 
-/// Start a standalone Streamable HTTP server for `server` on `port` and run the
-/// vibe.d event loop. Blocks until the application exits.
-void runStreamableHttp(McpServer server, ushort port,
-		StreamableHttpOptions opts = StreamableHttpOptions.init) @safe
+/// Start a standalone Streamable HTTP server for `server` fully described by
+/// `opts` (listening on `opts.port`) and run the vibe.d event loop. Blocks until
+/// the application exits.
+void runStreamableHttp(McpServer server, StreamableHttpOptions opts = StreamableHttpOptions.init) @safe
 {
 	import vibe.core.core : runEventLoop, lowerPrivileges;
 	import vibe.core.log : logWarn;
 	import std.array : join;
 
-	if (publicBindWithoutAllowlist(opts.bindAddresses, opts.allowedHosts))
+	if (publicBindWithoutAllowlist(opts))
 		logWarn("Streamable HTTP bound to a public address (%s) with an empty "
 				~ "allowedHosts: the DNS-rebinding guard will reject external requests "
 				~ "with 403. Set StreamableHttpOptions.allowedHosts to your public host(s).",
@@ -2288,7 +3849,7 @@ void runStreamableHttp(McpServer server, ushort port,
 	auto router = new URLRouter;
 	mountMcp(router, server, opts);
 
-	auto settings = buildStreamableHttpSettings(port, opts);
+	auto settings = buildStreamableHttpSettings(opts);
 	auto listener = listenHTTP(settings, router);
 	scope (exit)
 		listener.stopListening();
@@ -2297,36 +3858,48 @@ void runStreamableHttp(McpServer server, ushort port,
 	runEventLoop();
 }
 
-/// Convenience: start a Streamable HTTP server for `server` on `port`, bound to
-/// a single `host`. Sets `StreamableHttpOptions.bindAddresses = [host]` and
-/// forwards to `runStreamableHttp(server, port, opts)`. Blocks until exit.
-void runStreamableHttp(McpServer server, ushort port, string host) @safe
+/// Convenience: serve `server` on `port` with every other option at its
+/// default. Blocks until exit.
+void runStreamableHttp(McpServer server, ushort port) @safe
 {
 	StreamableHttpOptions opts;
-	opts.bindAddresses = [host];
-	runStreamableHttp(server, port, opts);
+	opts.port = port;
+	runStreamableHttp(server, opts);
 }
 
-/// Start a Streamable HTTP server fully described by `opts` (listening on
-/// `opts.port`). The single-struct form of `runStreamableHttp`, used by the
-/// `ServerSettings`-based entry point. Blocks until exit.
-void runStreamableHttp(McpServer server, StreamableHttpOptions opts) @safe
+/// Serve `server` over Streamable HTTP using `settings.http`. Blocks until exit.
+void runStreamableHttp(McpServer server, ServerSettings settings) @safe
 {
-	runStreamableHttp(server, opts.port, opts);
+	runStreamableHttp(server, settings.http);
 }
 
 unittest  // a public bind with no allowedHosts is flagged (would 403 external hosts)
 {
+	StreamableHttpOptions bound(string[] addrs, string[] hosts = []) @safe
+	{
+		StreamableHttpOptions o;
+		o.bindAddresses = addrs;
+		o.allowedHosts = hosts;
+		return o;
+	}
 	// 0.0.0.0 / :: are wildcard (public) binds; with an empty allowlist the
 	// DNS-rebinding guard rejects every non-loopback Host.
-	assert(publicBindWithoutAllowlist(["0.0.0.0"], []));
-	assert(publicBindWithoutAllowlist(["::"], []));
-	assert(publicBindWithoutAllowlist(["10.0.0.5", "127.0.0.1"], []));
+	assert(publicBindWithoutAllowlist(bound(["0.0.0.0"])));
+	assert(publicBindWithoutAllowlist(bound(["::"])));
+	assert(publicBindWithoutAllowlist(bound(["10.0.0.5", "127.0.0.1"])));
 	// Loopback-only binds are fine without an allowlist.
-	assert(!publicBindWithoutAllowlist(["127.0.0.1"], []));
-	assert(!publicBindWithoutAllowlist(["localhost"], []));
+	assert(!publicBindWithoutAllowlist(bound(["127.0.0.1"])));
+	assert(!publicBindWithoutAllowlist(bound(["localhost"])));
 	// An allowlist resolves the public-bind case.
-	assert(!publicBindWithoutAllowlist(["0.0.0.0"], ["myapp.fly.dev"]));
+	assert(!publicBindWithoutAllowlist(bound(["0.0.0.0"], ["myapp.fly.dev"])));
+}
+
+unittest  // a public bind with Host validation off (behind a proxy) is not flagged
+{
+	StreamableHttpOptions o;
+	o.bindAddresses = ["0.0.0.0"];
+	o.validateHost = false;
+	assert(!publicBindWithoutAllowlist(o));
 }
 
 unittest  // access logging is off by default
@@ -2340,7 +3913,7 @@ unittest  // accessLog routes per-request lines to the console
 {
 	StreamableHttpOptions opts;
 	opts.accessLog = true;
-	auto settings = buildStreamableHttpSettings(cast(ushort) 8080, opts);
+	auto settings = buildStreamableHttpSettings(opts);
 	assert(settings.accessLogToConsole);
 	assert(settings.accessLogFile == "");
 }
@@ -2350,7 +3923,7 @@ unittest  // accessLogFile sends lines to the file instead of the console
 	StreamableHttpOptions opts;
 	opts.accessLog = true;
 	opts.accessLogFile = "/var/log/mcp.log";
-	auto settings = buildStreamableHttpSettings(cast(ushort) 8080, opts);
+	auto settings = buildStreamableHttpSettings(opts);
 	assert(!settings.accessLogToConsole);
 	assert(settings.accessLogFile == "/var/log/mcp.log");
 }
@@ -2359,7 +3932,7 @@ unittest  // accessLogFile alone (without accessLog) emits nothing
 {
 	StreamableHttpOptions opts;
 	opts.accessLogFile = "/var/log/mcp.log";
-	auto settings = buildStreamableHttpSettings(cast(ushort) 8080, opts);
+	auto settings = buildStreamableHttpSettings(opts);
 	assert(!settings.accessLogToConsole);
 	assert(settings.accessLogFile == "");
 }
@@ -2367,23 +3940,36 @@ unittest  // accessLogFile alone (without accessLog) emits nothing
 unittest  // port and bind addresses still flow through unchanged
 {
 	StreamableHttpOptions opts;
+	opts.port = 9090;
 	opts.bindAddresses = ["0.0.0.0"];
-	auto settings = buildStreamableHttpSettings(cast(ushort) 9090, opts);
+	auto settings = buildStreamableHttpSettings(opts);
 	assert(settings.port == 9090);
 	assert(settings.bindAddresses == ["0.0.0.0"]);
 }
 
-unittest  // runStreamableHttp(server, port, host) overload exists and forwards
+unittest  // runStreamableHttp takes its port from the options, never a separate argument
 {
-	// Compile-only: a full run blocks on the event loop and isn't unit-testable.
-	// Assert the single-host overload is callable (and that the existing
-	// options overload still is, so we didn't shadow it).
+	// Compile-only: a full run blocks on the event loop. A port passed next to
+	// options would silently shadow `opts.port`, so no such overload exists.
 	static assert(__traits(compiles, (McpServer s) {
-			runStreamableHttp(s, cast(ushort) 8080, "0.0.0.0");
+			runStreamableHttp(s, StreamableHttpOptions.init);
 		}));
 	static assert(__traits(compiles, (McpServer s) {
+			runStreamableHttp(s, cast(ushort) 8080);
+		}));
+	static assert(!__traits(compiles, (McpServer s) {
 			runStreamableHttp(s, cast(ushort) 8080, StreamableHttpOptions.init);
 		}));
+	static assert(!__traits(compiles, (McpServer s) {
+			runStreamableHttp(s, cast(ushort) 8080, "0.0.0.0");
+		}));
+}
+
+unittest  // the listener binds the port named in the options
+{
+	StreamableHttpOptions opts;
+	opts.port = 9123;
+	assert(buildStreamableHttpSettings(opts).port == 9123);
 }
 
 unittest  // legacy endpoint event: `event: endpoint` carrying the message-POST URI
@@ -2438,6 +4024,32 @@ unittest  // legacy channel: GET stream first receives the endpoint event, then 
 	assert(ch.listenerCount == 0);
 }
 
+unittest  // closing a legacy SSE stream cancels the requests in flight on it
+{
+	import mcp.server.context : CancellationToken;
+
+	auto ch = new LegacySseChannel("/message");
+	const id = ch.addListener((string) @safe {});
+	auto tok = new CancellationToken;
+	ch.connStateFor(ch.sessionIdFor(id)).inFlight["i:1"] = tok;
+	ch.removeListener(id);
+	assert(tok.cancelled, "a closed stream's in-flight request must be cancelled");
+}
+
+// Let other tasks run until `done` holds, or for at most about five seconds.
+version (unittest) private void yieldUntil(scope bool delegate() @safe done) @safe
+{
+	import core.time : msecs;
+	import vibe.core.core : sleep;
+
+	foreach (_; 0 .. 500)
+	{
+		if (done())
+			return;
+		sleep(10.msecs);
+	}
+}
+
 unittest  // legacy POST: a request is processed and its response pushed onto the SSE stream
 {
 	// The legacy two-endpoint transport: the client POSTs a JSON-RPC request to
@@ -2455,29 +4067,35 @@ unittest  // legacy POST: a request is processed and its response pushed onto th
 
 	// A request: the response is pushed onto the originating stream as a `message`
 	// event, routed by the per-stream session token.
-	const accepted = handleLegacyPostBody(server, ch, sid,
-			`{"jsonrpc":"2.0","id":1,"method":"ping"}`);
-	assert(accepted); // the server accepted the message
+	assert(dispatchLegacyPost(server, ch, sid,
+			`{"jsonrpc":"2.0","id":1,"method":"ping"}`) == LegacyPostOutcome.accepted);
+	yieldUntil(() => frames.length == 2);
 	assert(frames.length == 2);
 	assert(frames[1].canFind("\"id\":1"));
 
 	// A notification: accepted, but nothing is pushed back.
-	const accepted2 = handleLegacyPostBody(server, ch, sid,
-			`{"jsonrpc":"2.0","method":"notifications/initialized"}`);
-	assert(accepted2);
+	bool notified;
+	server.setClientNotificationHandler((string method, Json, RequestContext) @safe {
+		notified = true;
+	});
+	assert(dispatchLegacyPost(server, ch, sid,
+			`{"jsonrpc":"2.0","method":"notifications/ping"}`) == LegacyPostOutcome.accepted);
+	yieldUntil(() => notified);
+	assert(notified);
 	assert(frames.length == 2); // no new frame
 }
 
 unittest  // legacy POST: a handler that calls ctx.listRoots() sends the request on the SSE stream
 {
 	// A handler may issue a server->client request (roots/list, sampling, elicitation).
-	// On the legacy HTTP+SSE transport, handleLegacyPostBody must wire a serverRequest
+	// On the legacy HTTP+SSE transport, dispatchLegacyPost must wire a serverRequest
 	// delegate so the outbound request is pushed onto the originating GET SSE stream
 	// and the client's reply POST is correlated back to the blocked handler.
 	import std.algorithm : canFind;
 	import vibe.core.core : runTask, yield;
 	import vibe.data.json : parseJsonString;
 	import mcp.protocol.types : Tool, CallToolResult;
+	import mcp.server.responses : ToolResponse;
 
 	auto server = McpServer.stateful("t", "1");
 	// Register a tool whose handler issues a roots/list server->client request.
@@ -2495,21 +4113,10 @@ unittest  // legacy POST: a handler that calls ctx.listRoots() sends the request
 	const sid = ch.sessionIdFor(id);
 	assert(frames.length == 1); // endpoint event only
 
-	// The tool call is dispatched in a task so it can block on the roots/list reply.
-	bool done;
-	runTask(() nothrow{
-		try
-		{
-			cast(void) handleLegacyPostBody(server, ch, sid, `{"jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":"roottool","arguments":{}}}`);
-		}
-		catch (Exception)
-		{
-		}
-		finally
-			done = true;
-	});
-	// Yield so the task runs and the handler blocks awaiting the roots/list reply.
-	yield();
+	// The tool call runs on its own task, so it can block on the roots/list reply.
+	assert(dispatchLegacyPost(server, ch, sid, `{"jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":"roottool","arguments":{}}}`) == LegacyPostOutcome
+			.accepted);
+	yieldUntil(() => frames.length == 2);
 	// The handler must have sent the roots/list request as an SSE message event.
 	assert(frames.length == 2, "expected roots/list request on SSE stream");
 	assert(frames[1].canFind("roots/list"), "SSE frame must contain roots/list");
@@ -2520,25 +4127,183 @@ unittest  // legacy POST: a handler that calls ctx.listRoots() sends the request
 	auto reqJson = parseJsonString(reqFrame);
 	const serverReqId = reqJson["id"];
 
-	// Client POSTs back a roots/list response; handleLegacyPostBody routes it to
+	// Client POSTs back a roots/list response; dispatchLegacyPost routes it to
 	// the coordinator, waking the blocked handler.
 	Json resp = Json.emptyObject;
 	resp["jsonrpc"] = "2.0";
 	resp["id"] = serverReqId;
 	resp["result"] = Json(["roots": Json.emptyArray]);
-	cast(void) handleLegacyPostBody(server, ch, sid, resp.toString());
+	assert(dispatchLegacyPost(server, ch, sid, resp.toString()) == LegacyPostOutcome.accepted);
 
-	// Drain until the handler task completes and delivers the tool result.
-	foreach (_; 0 .. 4096)
-	{
-		if (done)
-			break;
-		yield();
-	}
-	assert(done, "handler task must complete after receiving the roots/list reply");
+	yieldUntil(() => frames.length == 3);
 	// The tool-call response must now appear on the SSE stream.
 	assert(frames.length == 3, "expected tool-call response on SSE stream");
 	assert(frames[2].canFind("\"id\":10"), "tool response must echo the original request id");
+}
+
+unittest  // a session GET stream keeps its session alive and ends when the session does
+{
+	import core.time : msecs;
+	import vibe.core.core : runTask, sleep, exitEventLoop, runEventLoop;
+
+	auto sessions = new SessionManager(SessionLimits(300.msecs, 0));
+	const sid = sessions.create();
+	auto push = new ServerPushChannel(new StreamCoordinator);
+	const lid = push.addListener((string) @safe {}, Json.init, ListenFilter.init, "", null, sid);
+
+	bool ended, aliveAfterIdle;
+	runTask(() @safe nothrow{
+		try
+			holdSessionStream((string) @safe {}, push, lid, sessions, sid, 10.msecs);
+		catch (Exception)
+		{
+		}
+		ended = true;
+	});
+	runTask(() @safe nothrow{
+		try
+		{
+			// Several idle TTLs pass with no POST: the open stream keeps it alive.
+			sleep(900.msecs);
+			aliveAfterIdle = sessions.isActive(sid);
+			assert(!ended);
+			// DELETE ends the session and closes its stream.
+			sessions.terminate(sid);
+			push.closeSession(sid);
+			sleep(50.msecs);
+		}
+		catch (Exception)
+		{
+		}
+		exitEventLoop();
+	});
+	runEventLoop();
+	assert(aliveAfterIdle, "an open GET stream must count as session activity");
+	assert(ended, "terminating the session must end its GET stream");
+}
+
+unittest  // a session GET stream ends once its session has been evicted
+{
+	import core.time : msecs;
+	import vibe.core.core : runTask, sleep, exitEventLoop, runEventLoop;
+
+	auto sessions = new SessionManager;
+	const sid = sessions.create();
+	auto push = new ServerPushChannel(new StreamCoordinator);
+	const lid = push.addListener((string) @safe {}, Json.init, ListenFilter.init, "", null, sid);
+
+	bool ended;
+	runTask(() @safe nothrow{
+		try
+			holdSessionStream((string) @safe {}, push, lid, sessions, sid, 10.msecs);
+		catch (Exception)
+		{
+		}
+		ended = true;
+	});
+	runTask(() @safe nothrow{
+		try
+		{
+			sessions.terminate(sid); // no closeSession: the stream notices on its own
+			sleep(80.msecs);
+		}
+		catch (Exception)
+		{
+		}
+		exitEventLoop();
+	});
+	runEventLoop();
+	assert(ended, "a stream whose session is gone must end");
+}
+
+unittest  // legacy POST: each stream initializes its own connection on a stateful server
+{
+	import std.algorithm : canFind;
+
+	auto server = McpServer.stateful("t", "1");
+	auto ch = new LegacySseChannel("/message");
+	string[] framesA, framesB;
+	const sidA = ch.sessionIdFor(ch.addListener((string f) @safe { framesA ~= f; }));
+	const sidB = ch.sessionIdFor(ch.addListener((string f) @safe { framesB ~= f; }));
+
+	assert(dispatchLegacyPost(server, ch, sidA,
+			initializeBody("2024-11-05")) == LegacyPostOutcome.accepted);
+	assert(dispatchLegacyPost(server, ch, sidB,
+			initializeBody("2025-03-26")) == LegacyPostOutcome.accepted);
+	yieldUntil(() => framesA.length == 2 && framesB.length == 2);
+	assert(framesA.length == 2 && framesA[1].canFind("\"result\""));
+	assert(framesB.length == 2 && framesB[1].canFind("\"result\""),
+			"a second legacy client must be able to initialize");
+	assert(ch.connStateFor(sidA).negotiated == ProtocolVersion.v2024_11_05);
+	assert(ch.connStateFor(sidB).negotiated == ProtocolVersion.v2025_03_26);
+}
+
+unittest  // legacy POST: an unknown sessionId is rejected and nothing is dispatched
+{
+	auto server = McpServer.stateful("t", "1");
+	auto ch = new LegacySseChannel("/message");
+	assert(dispatchLegacyPost(server, ch, "no-such-session",
+			initializeBody("2024-11-05")) == LegacyPostOutcome.unknownStream);
+	assert(dispatchLegacyPost(server, ch, "",
+			initializeBody("2024-11-05")) == LegacyPostOutcome.unknownStream);
+}
+
+unittest  // legacy POST: a stream opened under one principal rejects another principal's POSTs
+{
+	auto server = McpServer.stateful("t", "1");
+	auto ch = new LegacySseChannel("/message");
+	string[] frames;
+	const sid = ch.sessionIdFor(ch.addListener((string f) @safe { frames ~= f; }, "alice"));
+
+	TokenInfo tokenFor(string subject) @safe
+	{
+		TokenInfo t;
+		t.valid = true;
+		t.subject = subject;
+		return t;
+	}
+
+	assert(dispatchLegacyPost(server, ch, sid, initializeBody("2024-11-05"),
+			tokenFor("bob")) == LegacyPostOutcome.unknownStream,
+			"another principal must not use alice's legacy stream");
+	assert(dispatchLegacyPost(server, ch, sid,
+			initializeBody("2024-11-05")) == LegacyPostOutcome.unknownStream,
+			"an unauthenticated POST must not use alice's legacy stream");
+	assert(frames.length == 1, "nothing may be dispatched for a foreign principal");
+	assert(dispatchLegacyPost(server, ch, sid, initializeBody("2024-11-05"),
+			tokenFor("alice")) == LegacyPostOutcome.accepted);
+	yieldUntil(() => frames.length == 2);
+	assert(frames.length == 2);
+}
+
+unittest  // legacy POST route: missing sessionId is 400, unknown sessionId is 404
+{
+	import vibe.http.server : createTestHTTPServerRequest,
+		createTestHTTPServerResponse, TestHTTPResponseMode;
+	import vibe.http.common : HTTPMethod;
+	import vibe.inet.url : URL;
+	import vibe.stream.memory : createMemoryStream, createMemoryOutputStream;
+
+	auto server = McpServer.stateful("t", "1");
+	auto router = new URLRouter;
+	StreamableHttpOptions opts;
+	mountLegacyHttpSse(router, server, opts);
+
+	int post(string url) @safe
+	{
+		auto buf = cast(ubyte[]) initializeBody("2024-11-05").dup;
+		auto req = createTestHTTPServerRequest(URL(url), HTTPMethod.POST,
+				createMemoryStream(buf, false));
+		req.headers["Host"] = "127.0.0.1";
+		req.headers["Content-Type"] = "application/json";
+		auto res = createTestHTTPServerResponse(createMemoryOutputStream(),
+				null, TestHTTPResponseMode.bodyOnly);
+		router.handleRequest(req, res);
+		return res.statusCode;
+	}
+
+	assert(post("http://127.0.0.1/message") == 400);
+	assert(post("http://127.0.0.1/message?sessionId=bogus") == 404);
 }
 
 unittest  // legacy channel: a response routes only to the originating stream, not all clients
@@ -2643,54 +4408,60 @@ unittest  // legacy support is opt-in: off by default
 	assert(opts.legacyMessagePath == "/message");
 }
 
-unittest  // legacy GET write serialization keeps concurrent SSE frames non-interleaved
+version (unittest) private final class ByteYieldingSink : OutputStream
 {
-	// LegacySseChannel.deliver has no write serialization, so two
-	// concurrent deliveries to one legacy listener could interleave SSE frame bytes
-	// when the underlying socket write yields. handleLegacyGet routes every write --
-	// the listener writer AND the heartbeat -- through one per-stream TaskMutex
-	// (writeFrame), so a write that yields mid-frame cannot be cut into by another
-	// writer. This test models that writeFrame and proves the mutex prevents
-	// interleaving even when the write yields between its two halves.
-	import vibe.core.core : runTask, runEventLoop, exitEventLoop, sleep;
-	import vibe.core.sync : TaskMutex;
-	import core.time : msecs;
-
-	auto writeMtx = new TaskMutex;
+@safe:
 	string log;
-	// A write that yields between writing the frame's head and tail: without the
-	// lock a second writer would slot its bytes into the gap.
-	void writeFrame(string head, string tail) @safe
+
+	size_t write(scope const(ubyte)[] bytes, IOMode)
 	{
-		() @trusted {
-			synchronized (writeMtx)
-			{
-				log ~= head;
-				sleep(5.msecs); // yield mid-frame
-				log ~= tail;
-			}
-		}();
+		import vibe.core.core : yield;
+
+		foreach (b; bytes)
+		{
+			log ~= cast(char) b;
+			yield();
+		}
+		return bytes.length;
 	}
 
+	void flush()
+	{
+	}
+
+	void finalize()
+	{
+	}
+}
+
+unittest  // concurrent writes to one SSE stream keep their frames whole
+{
+	import vibe.core.core : runTask, runEventLoop, exitEventLoop;
+	import vibe.http.server : createTestHTTPServerResponse, TestHTTPResponseMode;
+
+	auto sink = new ByteYieldingSink;
+	auto writer = sseFrameWriter(createTestHTTPServerResponse(sink, null,
+			TestHTTPResponseMode.bodyOnly));
 	runTask(() nothrow{
 		try
 		{
 			auto t1 = runTask(() nothrow{
 				try
-					writeFrame("[A", "A]");
+					writer("[AA]");
 				catch (Exception)
 				{
 				}
 			});
 			auto t2 = runTask(() nothrow{
 				try
-					writeFrame("[B", "B]");
+					writer("[BB]");
 				catch (Exception)
 				{
 				}
 			});
 			t1.join();
 			t2.join();
+			writer.close();
 		}
 		catch (Exception)
 		{
@@ -2698,10 +4469,234 @@ unittest  // legacy GET write serialization keeps concurrent SSE frames non-inte
 		exitEventLoop();
 	});
 	runEventLoop();
+	assert(sink.log == "[AA][BB]" || sink.log == "[BB][AA]", "SSE frames interleaved: " ~ sink.log);
+}
 
-	// Each frame's head and tail are adjacent (no foreign bytes between them):
-	// the only valid serializations are "[AA][BB]" or "[BB][AA]".
-	assert(log == "[AA][BB]" || log == "[BB][AA]", "legacy SSE frames interleaved: " ~ log);
+version (unittest) private final class StallingSink : OutputStream
+{
+@safe:
+	bool released;
+
+	size_t write(scope const(ubyte)[] bytes, IOMode) @safe
+	{
+		import core.time : MonoTime, msecs;
+		import vibe.core.core : sleep;
+
+		const started = MonoTime.currTime;
+		while (!released && MonoTime.currTime - started < 10.seconds)
+			sleep(10.msecs);
+		return bytes.length;
+	}
+
+	void flush()
+	{
+	}
+
+	void finalize()
+	{
+	}
+}
+
+version (unittest) private final class SlowSink : OutputStream
+{
+@safe:
+	size_t received;
+
+	size_t write(scope const(ubyte)[] bytes, IOMode) @safe
+	{
+		import core.time : msecs;
+		import vibe.core.core : sleep;
+
+		sleep((20 * (bytes.length / 16_384 + 1)).msecs);
+		received += bytes.length;
+		return bytes.length;
+	}
+
+	void flush()
+	{
+	}
+
+	void finalize()
+	{
+	}
+}
+
+unittest  // a client steadily reading a frame larger than the stall timeout's worth is kept
+{
+	import std.array : replicate;
+	import vibe.core.core : runTask, exitEventLoop, runEventLoop;
+	import vibe.http.server : createTestHTTPServerResponse, TestHTTPResponseMode;
+
+	auto sink = new SlowSink;
+	auto writer = sseFrameWriter(createTestHTTPServerResponse(sink, null,
+			TestHTTPResponseMode.bodyOnly));
+	const big = "x".replicate(2 * 1024 * 1024);
+	bool heartbeatQueued;
+	runTask(() @safe nothrow{
+		try
+		{
+			writer(big);
+			writer(": heartbeat\n\n");
+			heartbeatQueued = true;
+			writer.close(10.seconds);
+		}
+		catch (Exception)
+		{
+		}
+		exitEventLoop();
+	});
+	runEventLoop();
+	assert(heartbeatQueued, "a client making steady progress must not be deemed stalled");
+	assert(sink.received >= big.length);
+}
+
+unittest  // a stalled SSE reader blocks neither notify nor other streams, and is dropped
+{
+	import core.time : MonoTime, msecs;
+	import std.algorithm : count;
+	import std.array : replicate;
+	import vibe.core.core : runTask, sleep, exitEventLoop, runEventLoop;
+	import vibe.http.server : createTestHTTPServerResponse, TestHTTPResponseMode;
+	import vibe.stream.memory : createMemoryOutputStream;
+
+	auto stalled = new StallingSink;
+	auto slow = sseFrameWriter(createTestHTTPServerResponse(stalled, null,
+			TestHTTPResponseMode.bodyOnly));
+	auto okSink = createMemoryOutputStream();
+	auto fast = sseFrameWriter(createTestHTTPServerResponse(okSink, null,
+			TestHTTPResponseMode.bodyOnly));
+	auto ch = new ServerPushChannel(new StreamCoordinator);
+	ch.addListener((string f) @safe { slow(f); }, Json.init, ListenFilter.init, "", null, "A");
+	ch.addListener((string f) @safe { fast(f); }, Json.init, ListenFilter.init, "", null, "B");
+
+	Duration took;
+	size_t received, remaining;
+	runTask(() @safe nothrow{
+		try
+		{
+			const big = Json("x".replicate(64 * 1024));
+			const started = MonoTime.currTime;
+			foreach (_; 0 .. 40)
+				ch.notify("notifications/message", Json(["data": big]));
+			took = MonoTime.currTime - started;
+			sleep(100.msecs);
+			received = () @trusted {
+				return (cast(string) okSink.data).count("notifications/message");
+			}();
+			remaining = ch.listenerCount;
+		}
+		catch (Exception)
+		{
+		}
+		stalled.released = true;
+		exitEventLoop();
+	});
+	runEventLoop();
+	assert(took < SseWriter.queueStallTimeout + 1.seconds,
+			"a stalled reader must hold up notify only until its queue gives up on it");
+	assert(received == 40, "a healthy stream must receive every notification");
+	assert(remaining == 1, "a stream whose client stopped reading must be dropped");
+}
+
+version (unittest) private final class FailingSink : OutputStream
+{
+@safe:
+	size_t write(scope const(ubyte)[] bytes, IOMode) @safe
+	{
+		import core.time : msecs;
+		import vibe.core.core : sleep;
+
+		sleep(100.msecs);
+		throw new Exception("connection reset");
+	}
+
+	void flush()
+	{
+	}
+
+	void finalize()
+	{
+	}
+}
+
+unittest  // a write waiting on a full SSE queue fails as soon as the writer dies
+{
+	import core.time : MonoTime;
+	import vibe.core.core : runTask, exitEventLoop, runEventLoop;
+	import vibe.http.server : createTestHTTPServerResponse, TestHTTPResponseMode;
+
+	auto writer = sseFrameWriter(createTestHTTPServerResponse(new FailingSink,
+			null, TestHTTPResponseMode.bodyOnly), 10);
+	Duration took;
+	bool failed;
+	runTask(() @safe nothrow{
+		const started = MonoTime.currTime;
+		try
+		{
+			writer("aaaaaaaa");
+			writer("bbbbbbbb");
+		}
+		catch (Exception)
+			failed = true;
+		took = MonoTime.currTime - started;
+		exitEventLoop();
+	});
+	runEventLoop();
+	assert(failed, "a write to a dead stream must throw");
+	assert(took < 1.seconds, "a waiting write must wake when the writer dies");
+}
+
+unittest  // several stalled SSE readers hold up a fan-out for one stall timeout, not one each
+{
+	import core.time : MonoTime, msecs;
+	import std.array : replicate;
+	import vibe.core.core : runTask, sleep, exitEventLoop, runEventLoop;
+	import vibe.http.server : createTestHTTPServerResponse, TestHTTPResponseMode;
+
+	auto ch = new ServerPushChannel(new StreamCoordinator);
+	StallingSink[] sinks;
+	void delegate(string) @safe writerFor(StallingSink sink) @safe
+	{
+		auto w = sseFrameWriter(createTestHTTPServerResponse(sink, null,
+				TestHTTPResponseMode.bodyOnly));
+		return (string f) @safe { w(f); };
+	}
+
+	foreach (i; 0 .. 4)
+	{
+		sinks ~= new StallingSink;
+		ch.addListener(writerFor(sinks[$ - 1]), Json.init, ListenFilter.init,
+				"", null, "S" ~ cast(char)('0' + i));
+	}
+
+	Duration took;
+	size_t remaining;
+	runTask(() @safe nothrow{
+		try
+		{
+			const big = Json("x".replicate(64 * 1024));
+			const started = MonoTime.currTime;
+			foreach (_; 0 .. 40)
+				ch.notify("notifications/message", Json(["data": big]));
+			took = MonoTime.currTime - started;
+			remaining = ch.listenerCount;
+		}
+		catch (Exception)
+		{
+		}
+		foreach (s; sinks)
+			s.released = true;
+		try
+			sleep(50.msecs);
+		catch (Exception)
+		{
+		}
+		exitEventLoop();
+	});
+	runEventLoop();
+	assert(took < SseWriter.queueStallTimeout + 1.seconds,
+			"stalled readers must not each add a stall timeout to the fan-out");
+	assert(remaining == 0, "every stream whose client stopped reading must be dropped");
 }
 
 unittest  // localhost hosts are accepted, foreign hosts rejected
@@ -2711,6 +4706,27 @@ unittest  // localhost hosts are accepted, foreign hosts rejected
 	assert(hostAllowed("[::1]:8080", []));
 	assert(!hostAllowed("evil.example.com", []));
 	assert(hostAllowed("myhost", ["myhost"]));
+}
+
+unittest  // allowedHosts entries match case-insensitively
+{
+	assert(hostAllowed("MyApp.Example.com", ["myapp.example.com"]));
+	assert(hostAllowed("myapp.example.com", ["MYAPP.EXAMPLE.COM"]));
+	assert(hostAllowed("LOCALHOST:3000", []));
+}
+
+unittest  // a port-less allowedHosts entry accepts the host on any port
+{
+	assert(hostAllowed("myapp.example.com:8443", ["myapp.example.com"]));
+	assert(hostAllowed("[2001:db8::1]:8443", ["2001:db8::1"]));
+	assert(!hostAllowed("other.example.com:8443", ["myapp.example.com"]));
+}
+
+unittest  // an allowedHosts entry with a port matches only that port
+{
+	assert(hostAllowed("myapp.example.com:8443", ["myapp.example.com:8443"]));
+	assert(!hostAllowed("myapp.example.com:9000", ["myapp.example.com:8443"]));
+	assert(!hostAllowed("myapp.example.com", ["myapp.example.com:8443"]));
 }
 
 unittest  // an empty Host is rejected (closes the no-Host/no-Origin guard bypass)
@@ -2859,14 +4875,14 @@ unittest  // legacy notification skips modern header enforcement
 
 unittest  // absent MCP-Protocol-Version header is permitted (falls back to negotiated)
 {
-	assert(validateProtocolVersionHeader("") is null);
+	assert(validateProtocolVersionHeader("", supportedVersions) is null);
 }
 
 unittest  // a supported stable MCP-Protocol-Version header passes
 {
-	assert(validateProtocolVersionHeader("2025-06-18") is null);
-	assert(validateProtocolVersionHeader("2025-11-25") is null);
-	assert(validateProtocolVersionHeader("2024-11-05") is null);
+	assert(validateProtocolVersionHeader("2025-06-18", supportedVersions) is null);
+	assert(validateProtocolVersionHeader("2025-11-25", supportedVersions) is null);
+	assert(validateProtocolVersionHeader("2024-11-05", supportedVersions) is null);
 }
 
 unittest  // the tasks methods carry Mcp-Name: <taskId>, validated like a tool name
@@ -2911,13 +4927,13 @@ unittest  // a malformed-_meta rejection is 400 Bad Request on HTTP
 
 unittest  // the 2026-07-28 MCP-Protocol-Version header passes; "draft" is not a version
 {
-	assert(validateProtocolVersionHeader("2026-07-28") is null);
-	assert(validateProtocolVersionHeader("draft") !is null);
+	assert(validateProtocolVersionHeader("2026-07-28", supportedVersions) is null);
+	assert(validateProtocolVersionHeader("draft", supportedVersions) !is null);
 }
 
 unittest  // an unsupported/invalid MCP-Protocol-Version header is rejected with -32022 (HTTP 400)
 {
-	auto e = validateProtocolVersionHeader("1.0.0");
+	auto e = validateProtocolVersionHeader("1.0.0", supportedVersions);
 	assert(e !is null);
 	assert(e.code == ErrorCode.unsupportedProtocolVersion);
 	// maps to HTTP 400 in the transport
@@ -2931,7 +4947,7 @@ unittest  // an unsupported/invalid MCP-Protocol-Version header is rejected with
 
 unittest  // a garbage MCP-Protocol-Version header is rejected
 {
-	assert(validateProtocolVersionHeader("not-a-version") !is null);
+	assert(validateProtocolVersionHeader("not-a-version", supportedVersions) !is null);
 }
 
 unittest  // the version gate applies to EVERY POST kind, not just requests
@@ -2940,51 +4956,14 @@ unittest  // the version gate applies to EVERY POST kind, not just requests
 	// POST carrying an invalid/unsupported MCP-Protocol-Version MUST be rejected
 	// with 400 regardless of whether the body is a request, notification, or
 	// response.
-	auto bad = postProtocolVersionGate("1.0.0");
+	auto bad = validateProtocolVersionHeader("1.0.0", supportedVersions);
 	assert(bad !is null, "bad header must be rejected for all POST kinds");
 	assert(bad.code == ErrorCode.unsupportedProtocolVersion);
 	auto j = makeErrorResponse(Json(null), bad);
 	assert(httpStatusForResponse(j, false) == 400);
 	// a supported / absent header is fine for every kind
-	assert(postProtocolVersionGate("2025-11-25") is null);
-	assert(postProtocolVersionGate("") is null);
-}
-
-unittest  // the standalone GET stream is version-gated like a POST: bad version -> 400, not a 200 stream
-{
-	// basic/transports §Protocol Version Header: the GET that opens the
-	// standalone server->client stream is a subsequent HTTP request, so an
-	// invalid/unsupported MCP-Protocol-Version MUST yield 400 Bad Request rather
-	// than opening a 200 text/event-stream or a 405. handleGet runs
-	// postProtocolVersionGate (the same gate every POST kind runs) ahead of the
-	// mode/getOpensSseStream 405 gate and before setting Content-Type, so the
-	// rejecting McpException maps to HTTP 400 even for a stateless/modern server.
-	auto bad = postProtocolVersionGate("1.0.0");
-	assert(bad !is null, "an invalid version on the standalone GET must be rejected");
-	assert(bad.code == ErrorCode.unsupportedProtocolVersion);
-	auto j = makeErrorResponse(Json(null), bad);
-	assert(httpStatusForResponse(j, false) == 400);
-	// a supported / absent header opens the stream (gate returns null)
-	assert(postProtocolVersionGate("2025-11-25") is null);
-	assert(postProtocolVersionGate("") is null);
-}
-
-unittest  // DELETE is version-gated like POST/GET: bad version -> 400, not 204/405
-{
-	// basic/transports §Protocol Version Header: the DELETE that signals session
-	// teardown is a subsequent HTTP request, so an invalid/unsupported
-	// MCP-Protocol-Version MUST yield 400 Bad Request (a null-id JSON-RPC error)
-	// rather than proceeding to a 204 terminate or a 405. The DELETE route runs
-	// postProtocolVersionGate after the origin/auth guards and before the
-	// deleteTerminatesSession branch, so the rejecting McpException maps to 400.
-	auto bad = postProtocolVersionGate("1.0.0");
-	assert(bad !is null, "an invalid version on a DELETE must be rejected");
-	assert(bad.code == ErrorCode.unsupportedProtocolVersion);
-	auto j = makeErrorResponse(Json(null), bad);
-	assert(httpStatusForResponse(j, false) == 400);
-	// a supported / absent header lets the DELETE proceed (gate returns null)
-	assert(postProtocolVersionGate("2025-11-25") is null);
-	assert(postProtocolVersionGate("") is null);
+	assert(validateProtocolVersionHeader("2025-11-25", supportedVersions) is null);
+	assert(validateProtocolVersionHeader("", supportedVersions) is null);
 }
 
 /// True if the protocol-version header denotes a modern+ request.
@@ -3020,23 +4999,133 @@ private ProtocolVersion effectivePostVersion(string protoHeader, ProtocolVersion
 ///     and two such requests can never observe each other's state. This is the
 ///     structural "no shared state across HTTP calls" guarantee for the stateless
 ///     protocol that was designed for it.
-///   - A legacy (stable-version) stateless request belongs to the SDK's single
-///     implicit-peer model: a stable client still performs an `initialize`
-///     handshake whose negotiated capabilities the server MUST honour on the later
-///     `tools/call` over the same connection. There is no per-request `_meta`
-///     handshake to rebuild that from, so this path returns `null` and the server
-///     falls back to its single bound `activeConnection` — exactly the supported
-///     single-client-per-mount deployment (documented in `mcp.transport.session`).
-///     Isolating *distinct* stable clients still requires `stateful` mode.
+///   - A legacy (stable-version) stateless request likewise gets a fresh state:
+///     its version comes from the `MCP-Protocol-Version` header (2025-03-26 when
+///     absent) and its capabilities are empty, since stateless legacy has no
+///     session to carry an `initialize` handshake across requests. Features that
+///     need the client's capabilities or later correlation require `stateful`.
+///
+/// Every stateless state shares the mount's `statelessInFlight` registry, so a
+/// `notifications/cancelled` on a later POST can find the request it names.
 private ConnectionState postState(McpServer server, SessionManager sessions,
+		StatelessInFlight statelessInFlight,
 		string mintedSessionId, string connToken, string protoHeader, Json params) @safe
 {
-	if (sessions !is null && sessionsApply(server.negotiatedVersion))
+	if (sessions !is null)
 	{
-		const id = mintedSessionId.length ? mintedSessionId : connToken;
-		return sessions.stateFor(id);
+		if (mintedSessionId.length)
+			return sessions.stateFor(mintedSessionId, false);
+		return sessions.stateFor(connToken);
 	}
-	return freshStatelessState(protoHeader, params, server.negotiatedVersion);
+	return statelessInFlight.share(freshStatelessState(protoHeader, params));
+}
+
+/// The in-flight cancellation registry a stateless mount shares across its
+/// POSTs. Each stateless request gets a fresh `ConnectionState`, so without a
+/// shared registry a `notifications/cancelled` arriving on a later POST could
+/// never find the request it names. Every POST gets a scope of its own (see
+/// `scopeFor`), so two requests can never clobber each other's registration.
+/// An authenticated principal's `notifications/cancelled` is routed by
+/// `cancelScopeFor` to the one in-flight request of that principal carrying the
+/// named id, so one principal cannot cancel another's requests; when several of
+/// its requests (say, from two clients) share the id, the cancel is ambiguous
+/// and cancels none of them. Unauthenticated callers cannot be told apart, so
+/// no `notifications/cancelled` reaches their requests.
+private final class StatelessInFlight
+{
+	import mcp.server.context : CancellationToken;
+
+	private CancellationToken[string] tokens;
+	/// The scopes of the requests in flight, keyed by principal and request id.
+	private string[][string] scopesById;
+	private ulong nextScope;
+
+	this() @safe
+	{
+		// Allocate the table up front: an empty AA is null, and a null AA copied
+		// into a state would not alias this one. Inserting then removing a key
+		// allocates it without `new V[K]`, which DMD does not infer as @safe.
+		tokens[""] = null;
+		tokens.remove("");
+	}
+
+	/// A fresh connection token scoping one POST's requests in the registry.
+	string scopeFor(string principal) @safe
+	{
+		import std.conv : to;
+
+		const n = (nextScope++).to!string;
+		if (principal.length == 0)
+			return "\x1eanonymous\x1e" ~ n;
+		return "\x1estateless\x1e" ~ principal ~ "\x1e" ~ n;
+	}
+
+	/// Record that the request `id` of `principal` runs under `scope_`, so a later
+	/// `notifications/cancelled` naming it can find it. Pair with `untrack`.
+	void track(string principal, Json id, string scope_) @safe
+	{
+		const key = idKeyOf(principal, id);
+		if (key.length)
+			scopesById[key] ~= scope_;
+	}
+
+	/// Forget a request recorded by `track`.
+	void untrack(string principal, Json id, string scope_) @safe
+	{
+		import std.algorithm : countUntil, remove;
+
+		const key = idKeyOf(principal, id);
+		if (auto scopes = key in scopesById)
+		{
+			const i = (*scopes).countUntil(scope_);
+			if (i >= 0)
+				*scopes = (*scopes).remove(i);
+			if ((*scopes).length == 0)
+				scopesById.remove(key);
+		}
+	}
+
+	/// The scope a `notifications/cancelled` from `principal` naming `requestId`
+	/// is dispatched under: that of the principal's only in-flight request with
+	/// the id, else a fresh scope that matches nothing (no such request, several
+	/// of them, or an unauthenticated caller).
+	string cancelScopeFor(string principal, Json requestId) @safe
+	{
+		if (auto scopes = idKeyOf(principal, requestId) in scopesById)
+			if ((*scopes).length == 1)
+				return (*scopes)[0];
+		return scopeFor("");
+	}
+
+	/// The `scopesById` key for request `id` of `principal`, or "" when the
+	/// caller is unauthenticated or the id is not a string or number.
+	private static string idKeyOf(string principal, Json id) @safe
+	{
+		import std.conv : to;
+
+		if (principal.length == 0)
+			return "";
+		// The length prefix keeps every (principal, id) pair distinct whatever
+		// characters either holds.
+		const who = principal.length.to!string ~ ":" ~ principal;
+		switch (id.type)
+		{
+		case Json.Type.string:
+			return who ~ "s:" ~ id.get!string;
+		case Json.Type.int_:
+		case Json.Type.bigInt:
+			return who ~ "i:" ~ id.toString();
+		default:
+			return "";
+		}
+	}
+
+	/// Point `state`'s in-flight registry at the shared table and return it.
+	ConnectionState share(ConnectionState state) @safe
+	{
+		state.inFlight = tokens;
+		return state;
+	}
 }
 
 /// The client capabilities a `HttpStreamContext` should advertise for a request,
@@ -3044,7 +5133,7 @@ private ConnectionState postState(McpServer server, SessionManager sessions,
 /// session's negotiated caps (stateful) or the per-request `_meta` caps
 /// (modern-modern), so `ctx.clientSupports` reflects THIS connection
 /// rather than a sibling's. Falls back to the server's bound view when no state
-/// was resolved (legacy stateless single-peer / stateful fallback).
+/// was resolved.
 private ClientCapabilities clientCapsFor(McpServer server, ConnectionState reqState) @safe
 {
 	if (reqState !is null)
@@ -3052,59 +5141,78 @@ private ClientCapabilities clientCapsFor(McpServer server, ConnectionState reqSt
 	return server.clientCapabilities;
 }
 
-/// Build the FRESH per-request `ConnectionState` for a MODERN-stateless (modern /
-/// MRTR) HTTP POST, or return `null` for a legacy stateless request.
+/// Build the FRESH per-request `ConnectionState` for a stateless HTTP POST. The
+/// server retains it nowhere, so two stateless requests never observe each
+/// other's version, capabilities, or log level.
 ///
-/// Only the modern (stateless) protocol is fully self-describing — every request
-/// carries its own protocol version, capabilities, and log level in `_meta`, with
-/// no `initialize` handshake to remember — so only there can a request be served
-/// from a transient state the server retains nowhere. The fresh state is seeded
-/// from the request's `_meta` (the per-request
-/// `io.modelcontextprotocol/clientCapabilities` / `logLevel`), mirroring how the
-/// modern dispatch path already reads them.
-///
-/// For a legacy (stable-version) request this returns `null`: a stable client
-/// negotiates capabilities once at `initialize` that the server must honour on
-/// later requests over the same connection, which is the single implicit-peer
-/// model held in `activeConnection` (the server falls back to it on null). The
-/// effective version is the body `_meta.protocolVersion`, then the
-/// `MCP-Protocol-Version` header, then the server default. When both the header
-/// and `_meta.protocolVersion` are present, `validateModernHeaders` already
-/// ensures they agree, so the final overwrite is always a no-op in practice.
-private ConnectionState freshStatelessState(string protoHeader, Json params,
-		ProtocolVersion serverDefault) @safe
+/// A modern request is self-describing: its version, client capabilities, and
+/// log level come from its `_meta`. A legacy request's version comes from the
+/// `MCP-Protocol-Version` header, or 2025-03-26 when the header is absent
+/// (basic/transports §Protocol Version Header); its capabilities are empty
+/// because stateless legacy has no session to carry the `initialize` handshake.
+/// When both the header and `_meta.protocolVersion` are present,
+/// `validateModernHeaders` ensures they agree.
+private ConnectionState freshStatelessState(string protoHeader, Json params) @safe
 {
-	// Effective version: _meta.protocolVersion wins over the header when present;
-	// the header (via effectivePostVersion) is the fallback before the server
-	// default. validateModernHeaders rejects any request where both are present but
-	// disagree, so when both exist they are equal and the overwrite is benign.
 	auto meta = RequestMeta.fromParams(params);
-	ProtocolVersion eff = effectivePostVersion(protoHeader, serverDefault);
+	ProtocolVersion eff = effectivePostVersion(protoHeader, ProtocolVersion.v2025_03_26);
 	ProtocolVersion mv;
 	if (meta.protocolVersion.length && tryParseVersion(meta.protocolVersion, mv))
 		eff = mv;
-	// Legacy stateless: defer to the single implicit-peer `activeConnection`
-	// (return null) so an initialize-negotiated capability survives to tools/call.
-	if (!eff.isModern)
-		return null;
 	auto conn = new ConnectionState;
 	conn.negotiated = eff;
+	if (!eff.isModern)
+		return conn;
 	conn.clientCaps = meta.clientCapabilities;
 	if (!meta.logLevel.isNull)
 		conn.logLevel = meta.logLevel.get;
 	return conn;
 }
 
-unittest  // a legacy stateless request defers to activeConnection (null)
+unittest  // a legacy stateless request gets a fresh state versioned by its header
 {
 	import vibe.data.json : Json;
 
-	// A stable-version request has no per-request _meta handshake to rebuild a
-	// transient state from, so freshStatelessState returns null and dispatch falls
-	// back to the single bound activeConnection (the supported single-peer model).
-	assert(freshStatelessState("2025-11-25", Json.emptyObject, ProtocolVersion.v2025_11_25) is null);
-	// Absent header + no _meta version -> server default (stable) -> still null.
-	assert(freshStatelessState("", Json.emptyObject, ProtocolVersion.v2025_11_25) is null);
+	auto conn = freshStatelessState("2025-06-18", Json.emptyObject);
+	assert(conn !is null, "a legacy stateless request must not share mutable server state");
+	assert(conn.negotiated == ProtocolVersion.v2025_06_18);
+	assert(!conn.clientCaps.sampling && !conn.clientCaps.roots
+			&& !conn.clientCaps.elicitationForm, "stateless legacy requests carry no capabilities");
+}
+
+unittest  // a legacy stateless request without a version header assumes 2025-03-26
+{
+	import vibe.data.json : Json;
+
+	auto conn = freshStatelessState("", Json.emptyObject);
+	assert(conn !is null);
+	assert(conn.negotiated == ProtocolVersion.v2025_03_26);
+}
+
+unittest  // concurrent legacy stateless clients never observe each other's initialize
+{
+	import vibe.data.json : Json;
+
+	auto server = new McpServer("t", "1");
+	string initialize(string ver) @safe
+	{
+		return `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"` ~ ver
+			~ `","capabilities":{"sampling":{}},"clientInfo":{"name":"c","version":"1"}}}`;
+	}
+
+	auto a = freshStatelessState("", Json.undefined);
+	server.handleRaw(initialize("2025-03-26"), a, "", TokenInfo.invalid());
+	auto b = freshStatelessState("", Json.undefined);
+	server.handleRaw(initialize("2025-11-25"), b, "", TokenInfo.invalid());
+
+	// Client A's next request (no header, so 2025-03-26) resolves to its own
+	// state: B's initialize must not change the version or caps A is served with.
+	auto next = freshStatelessState("", Json.undefined);
+	assert(next !is a && next !is b);
+	assert(next.negotiated == ProtocolVersion.v2025_03_26);
+	assert(!next.clientCaps.sampling);
+	assert(server.negotiatedVersion == latestLegacy,
+			"a stateless HTTP initialize must not write the shared fallback state");
 }
 
 unittest  // a modern (modern/MRTR) stateless request gets a FRESH state from _meta
@@ -3117,7 +5225,7 @@ unittest  // a modern (modern/MRTR) stateless request gets a FRESH state from _m
 	auto params = parseJsonString(
 			`{"_meta":{` ~ `"io.modelcontextprotocol/clientCapabilities":{"sampling":{}},`
 			~ `"io.modelcontextprotocol/logLevel":"warning"}}`);
-	auto conn = freshStatelessState("2026-07-28", params, ProtocolVersion.v2025_11_25);
+	auto conn = freshStatelessState("2026-07-28", params);
 	assert(conn !is null);
 	assert(conn.negotiated.isModern);
 	assert(conn.clientCaps.sampling, "modern-stateless caps must come from the request _meta");
@@ -3134,11 +5242,11 @@ unittest  // two modern-stateless requests resolve to INDEPENDENT states
 			`{"_meta":{"io.modelcontextprotocol/clientCapabilities":{"sampling":{}}}}`);
 	auto pB = parseJsonString(
 			`{"_meta":{"io.modelcontextprotocol/clientCapabilities":{"elicitation":{}}}}`);
-	auto a = freshStatelessState("2026-07-28", pA, ProtocolVersion.v2025_11_25);
-	auto b = freshStatelessState("2026-07-28", pB, ProtocolVersion.v2025_11_25);
+	auto a = freshStatelessState("2026-07-28", pA);
+	auto b = freshStatelessState("2026-07-28", pB);
 	assert(a !is b, "each stateless request must get its own ConnectionState");
-	assert(a.clientCaps.sampling && !a.clientCaps.elicitation);
-	assert(b.clientCaps.elicitation && !b.clientCaps.sampling,
+	assert(a.clientCaps.sampling && !a.clientCaps.elicitationForm);
+	assert(b.clientCaps.elicitationForm && !b.clientCaps.sampling,
 			"request B must not observe request A's capabilities");
 }
 
@@ -3282,7 +5390,7 @@ version (unittest) private HTTPServerRequest makeInitPostReq(string body_,
 	import vibe.inet.url : URL;
 	import vibe.stream.memory : createMemoryStream;
 
-	auto buf = () @trusted { return cast(ubyte[]) body_.dup; }();
+	auto buf = cast(ubyte[]) body_.dup;
 	auto req = createTestHTTPServerRequest(URL("http://127.0.0.1/mcp"),
 			HTTPMethod.POST, createMemoryStream(buf, false));
 	req.headers["Host"] = "127.0.0.1";
@@ -3321,6 +5429,813 @@ unittest  // a successful stateful initialize commits the Mcp-Session-Id header
 	assert(res.headers[SessionHeader].length > 0);
 }
 
+version (unittest) private string streamedToolCall(string initVersion, string[string] callHeaders) @safe
+{
+	import vibe.http.server : createTestHTTPServerResponse, TestHTTPResponseMode;
+	import vibe.http.router : URLRouter;
+	import vibe.stream.memory : createMemoryOutputStream;
+	import mcp.protocol.types : Tool, CallToolResult;
+	import mcp.server.responses : ToolResponse;
+
+	auto server = McpServer.stateful("t", "1");
+	Tool descriptor;
+	descriptor.name = "progress";
+	server.registerTool(descriptor, (Json args, RequestContext ctx) @safe {
+		ctx.reportProgress(1);
+		CallToolResult r;
+		return ToolResponse.complete(r);
+	});
+	auto router = new URLRouter;
+	mountMcp(router, server);
+
+	auto initRes = createTestHTTPServerResponse(createMemoryOutputStream(),
+			null, TestHTTPResponseMode.bodyOnly);
+	router.handleRequest(makeInitPostReq(initializeBody(initVersion),
+			["Accept": "application/json, text/event-stream"]), initRes);
+	callHeaders["Accept"] = "application/json, text/event-stream";
+	callHeaders[SessionHeader] = initRes.headers[SessionHeader];
+
+	auto sink = createMemoryOutputStream();
+	auto res = createTestHTTPServerResponse(sink, null, TestHTTPResponseMode.bodyOnly);
+	router.handleRequest(makeInitPostReq(`{"jsonrpc":"2.0","id":2,"method":"tools/call",`
+			~ `"params":{"name":"progress","arguments":{},"_meta":{"progressToken":"p"}}}`,
+			callHeaders), res);
+	return cast(string) sink.data.idup;
+}
+
+unittest  // a 2025-03-26 session's streamed POST carries no priming event
+{
+	import std.algorithm : canFind;
+
+	string[string] headers;
+	const body_ = streamedToolCall("2025-03-26", headers);
+	assert(body_.canFind("notifications/progress"));
+	assert(!body_.canFind("data: \n\n"), "priming is a 2025-11-25-only event");
+}
+
+unittest  // a 2025-11-25 session's streamed POST leads with the priming event
+{
+	import std.algorithm : startsWith;
+	import std.string : indexOf;
+
+	const body_ = streamedToolCall("2025-11-25", [
+		"MCP-Protocol-Version": "2025-11-25"
+	]);
+	assert(body_.startsWith("id: "));
+	assert(body_.startsWith(body_[0 .. body_.indexOf("\n")] ~ "\ndata: \n\n"));
+}
+
+unittest  // the standalone GET stream writes its first bytes as soon as it opens
+{
+	import core.time : msecs;
+	import std.algorithm : canFind;
+	import vibe.core.core : runTask, sleep, exitEventLoop, runEventLoop;
+	import vibe.http.common : HTTPMethod;
+	import vibe.http.server : createTestHTTPServerResponse, TestHTTPResponseMode;
+	import vibe.http.router : URLRouter;
+	import vibe.stream.memory : createMemoryOutputStream;
+
+	auto server = McpServer.stateful("t", "1");
+	auto router = new URLRouter;
+	mountMcp(router, server);
+
+	auto initRes = createTestHTTPServerResponse(createMemoryOutputStream(),
+			null, TestHTTPResponseMode.bodyOnly);
+	router.handleRequest(makeInitPostReq(initializeBody(),
+			["Accept": "application/json, text/event-stream"]), initRes);
+	const sid = initRes.headers[SessionHeader];
+
+	auto getReq(HTTPMethod method) @safe
+	{
+		auto req = makeInitPostReq("", [
+			"Accept": "text/event-stream",
+			"MCP-Protocol-Version": "2025-11-25",
+			SessionHeader: sid
+		]);
+		req.method = method;
+		return req;
+	}
+
+	auto sink = createMemoryOutputStream();
+	bool ended;
+	runTask(() @safe nothrow{
+		try
+			router.handleRequest(getReq(HTTPMethod.GET),
+				createTestHTTPServerResponse(sink, null, TestHTTPResponseMode.bodyOnly));
+		catch (Exception)
+		{
+		}
+		ended = true;
+	});
+	string early;
+	runTask(() @safe nothrow{
+		try
+		{
+			sleep(500.msecs);
+			early = cast(string) sink.data.idup;
+			router.handleRequest(getReq(HTTPMethod.DELETE),
+				createTestHTTPServerResponse(createMemoryOutputStream(),
+				null, TestHTTPResponseMode.bodyOnly));
+			sleep(200.msecs);
+		}
+		catch (Exception)
+		{
+		}
+		exitEventLoop();
+	});
+	runEventLoop();
+	assert(early.canFind(": open\n\n"), "the GET stream must flush a first frame at once: " ~ early);
+	assert(ended, "DELETE must end the GET stream");
+}
+
+unittest  // an initialize past the cap is refused with 503 while every session holds a GET stream
+{
+	import core.time : msecs;
+	import vibe.core.core : runTask, sleep, exitEventLoop, runEventLoop;
+	import vibe.http.common : HTTPMethod;
+	import vibe.http.server : createTestHTTPServerResponse, TestHTTPResponseMode;
+	import vibe.http.router : URLRouter;
+	import vibe.stream.memory : createMemoryOutputStream;
+
+	auto server = McpServer.stateful("t", "1");
+	auto router = new URLRouter;
+	StreamableHttpOptions opts;
+	opts.sessionLimits.maxSessions = 1;
+	mountMcp(router, server, opts);
+
+	HTTPServerResponse initialize() @safe
+	{
+		auto res = createTestHTTPServerResponse(createMemoryOutputStream(),
+				null, TestHTTPResponseMode.bodyOnly);
+		router.handleRequest(makeInitPostReq(initializeBody(),
+				["Accept": "application/json, text/event-stream"]), res);
+		return res;
+	}
+
+	const sid = initialize().headers[SessionHeader];
+	bool ended;
+	runTask(() @safe nothrow{
+		try
+		{
+			auto req = makeInitPostReq("", [
+				"Accept": "text/event-stream",
+				"MCP-Protocol-Version": "2025-11-25",
+				SessionHeader: sid
+			]);
+			req.method = HTTPMethod.GET;
+			router.handleRequest(req, createTestHTTPServerResponse(createMemoryOutputStream(),
+				null, TestHTTPResponseMode.bodyOnly));
+		}
+		catch (Exception)
+		{
+		}
+		ended = true;
+	});
+	int refused;
+	bool endedAfterRefusal;
+	runTask(() @safe nothrow{
+		try
+		{
+			sleep(200.msecs);
+			refused = initialize().statusCode;
+			sleep(200.msecs);
+			endedAfterRefusal = ended;
+			router.handleRequest(sessionReq(HTTPMethod.DELETE, sid),
+				createTestHTTPServerResponse(createMemoryOutputStream(),
+				null, TestHTTPResponseMode.bodyOnly));
+			sleep(200.msecs);
+		}
+		catch (Exception)
+		{
+		}
+		exitEventLoop();
+	});
+	runEventLoop();
+	assert(refused == HTTPStatus.serviceUnavailable, "a full server must refuse a new session");
+	assert(!endedAfterRefusal, "a session holding a GET stream must never be evicted");
+	assert(ended);
+}
+
+version (unittest) private string initSession(URLRouter router, string ver = "2025-11-25") @safe
+{
+	import vibe.http.server : createTestHTTPServerResponse, TestHTTPResponseMode;
+	import vibe.stream.memory : createMemoryOutputStream;
+
+	auto res = createTestHTTPServerResponse(createMemoryOutputStream(), null,
+			TestHTTPResponseMode.bodyOnly);
+	router.handleRequest(makeInitPostReq(initializeBody(ver),
+			["Accept": "application/json, text/event-stream"]), res);
+	return res.headers.get(SessionHeader, "");
+}
+
+version (unittest) private HTTPServerRequest sessionReq(HTTPMethod method,
+		string sid, string body_ = "", string accept = "application/json, text/event-stream") @safe
+{
+	string[string] h = ["Accept": accept, "MCP-Protocol-Version": "2025-11-25"];
+	if (sid.length)
+		h[SessionHeader] = sid;
+	auto req = makeInitPostReq(body_, h);
+	req.method = method;
+	return req;
+}
+
+unittest  // a POST accepting only text/event-stream gets its non-streamed reply as an SSE event
+{
+	import std.algorithm : canFind;
+	import vibe.http.server : createTestHTTPServerResponse, TestHTTPResponseMode;
+	import vibe.stream.memory : createMemoryOutputStream;
+
+	auto router = new URLRouter;
+	mountMcp(router, McpServer.stateful("t", "1"));
+	const sid = initSession(router);
+	auto sink = createMemoryOutputStream();
+	auto res = createTestHTTPServerResponse(sink, null, TestHTTPResponseMode.bodyOnly);
+	router.handleRequest(sessionReq(HTTPMethod.POST, sid,
+			`{"jsonrpc":"2.0","id":7,"method":"ping"}`, "text/event-stream"), res);
+	assert(res.statusCode == HTTPStatus.ok);
+	assert(res.headers.get("Content-Type", "").canFind("text/event-stream"));
+	const body_ = cast(string) sink.data.idup;
+	assert(body_.canFind("data: ") && body_.canFind(`"id":7`), body_);
+}
+
+version (unittest) private HTTPServerResponse callElicitingTool(bool catchRefusal,
+		out string responseBody) @safe
+{
+	import vibe.http.server : createTestHTTPServerResponse, TestHTTPResponseMode;
+	import vibe.stream.memory : createMemoryOutputStream;
+	import mcp.protocol.types : Tool, CallToolResult;
+	import mcp.server.responses : ToolResponse;
+
+	auto server = McpServer.stateful("t", "1");
+	Tool descriptor;
+	descriptor.name = "ask";
+	server.registerTool(descriptor, (Json args, RequestContext ctx) @safe {
+		if (catchRefusal)
+		{
+			try
+				ctx.elicitRaw(Json.emptyObject);
+			catch (Exception)
+			{
+			}
+		}
+		else
+			ctx.elicitRaw(Json.emptyObject);
+		CallToolResult r;
+		return ToolResponse.complete(r);
+	});
+	auto router = new URLRouter;
+	mountMcp(router, server);
+	const sid = initSession(router);
+	auto sink = createMemoryOutputStream();
+	auto res = createTestHTTPServerResponse(sink, null, TestHTTPResponseMode.bodyOnly);
+	router.handleRequest(sessionReq(HTTPMethod.POST, sid,
+			`{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"ask","arguments":{}}}`,
+			"application/json"), res);
+	responseBody = cast(string) sink.data.idup;
+	return res;
+}
+
+unittest  // a handler that catches a refused SSE upgrade still answers 200 with its result
+{
+	import vibe.data.json : parseJsonString;
+
+	string reply;
+	auto res = callElicitingTool(true, reply);
+	assert(res.statusCode == HTTPStatus.ok, reply);
+	assert("result" in parseJsonString(reply), reply);
+}
+
+unittest  // a handler failing on a refused SSE upgrade answers 406 Not Acceptable
+{
+	import vibe.data.json : parseJsonString;
+
+	string reply;
+	auto res = callElicitingTool(false, reply);
+	assert(res.statusCode == HTTPStatus.notAcceptable, reply);
+	assert("error" in parseJsonString(reply), reply);
+}
+
+unittest  // an Accept range with q=0 excludes the media types it matches most specifically
+{
+	assert(!acceptsJson("application/json;q=0"));
+	assert(!acceptsJson("*/*, application/json; q=0"));
+	assert(!acceptsJson("application/*;q=0.0"));
+	assert(acceptsJson("application/json;q=0.5"));
+	assert(acceptsJson("*/*;q=0, application/json"));
+	assert(!acceptsEventStream("text/event-stream;q=0, application/json"));
+	assert(!postAccepted("application/json;q=0, text/event-stream;q=0"));
+	assert(postAccepted("application/json;q=0, text/event-stream"));
+}
+
+unittest  // a stateful GET whose Accept excludes text/event-stream is 406, not 405
+{
+	import vibe.http.server : createTestHTTPServerResponse, TestHTTPResponseMode;
+	import vibe.stream.memory : createMemoryOutputStream;
+
+	auto router = new URLRouter;
+	mountMcp(router, McpServer.stateful("t", "1"));
+	const sid = initSession(router);
+	auto res = createTestHTTPServerResponse(createMemoryOutputStream(), null,
+			TestHTTPResponseMode.bodyOnly);
+	router.handleRequest(sessionReq(HTTPMethod.GET, sid, "", "application/json"), res);
+	assert(res.statusCode == HTTPStatus.notAcceptable);
+	assert("Allow" !in res.headers, "GET is a supported method on a stateful mount");
+}
+
+unittest  // two mounts of one stateful server keep each session's events on its own streams
+{
+	import core.time : msecs;
+	import std.algorithm : canFind;
+	import vibe.core.core : runTask, sleep, exitEventLoop, runEventLoop;
+	import vibe.http.server : createTestHTTPServerResponse, TestHTTPResponseMode;
+	import vibe.stream.memory : createMemoryOutputStream;
+	import mcp.protocol.types : Tool, CallToolResult;
+	import mcp.server.responses : ToolResponse;
+
+	auto server = McpServer.stateful("t", "1");
+	Tool descriptor;
+	descriptor.name = "progress";
+	server.registerTool(descriptor, (Json args, RequestContext ctx) @safe {
+		ctx.reportProgress(1);
+		CallToolResult r;
+		return ToolResponse.complete(r);
+	});
+	auto routerA = new URLRouter;
+	auto routerB = new URLRouter;
+	mountMcp(routerA, server);
+	mountMcp(routerB, server);
+	const sidA = initSession(routerA);
+	const sidB = initSession(routerB);
+
+	auto sinkA = createMemoryOutputStream();
+	auto sinkB = createMemoryOutputStream();
+	runTask(() @safe nothrow{
+		try
+			routerA.handleRequest(sessionReq(HTTPMethod.GET, sidA, "", "text/event-stream"),
+				createTestHTTPServerResponse(sinkA, null, TestHTTPResponseMode.bodyOnly));
+		catch (Exception)
+		{
+		}
+	});
+	runTask(() @safe nothrow{
+		try
+		{
+			sleep(100.msecs);
+			routerB.handleRequest(sessionReq(HTTPMethod.POST, sidB,
+				`{"jsonrpc":"2.0","id":2,"method":"tools/call",`
+				~ `"params":{"name":"progress","arguments":{},"_meta":{"progressToken":"p"}}}`),
+				createTestHTTPServerResponse(sinkB, null, TestHTTPResponseMode.bodyOnly));
+			routerA.handleRequest(sessionReq(HTTPMethod.DELETE, sidA),
+				createTestHTTPServerResponse(createMemoryOutputStream(),
+				null, TestHTTPResponseMode.bodyOnly));
+			sleep(100.msecs);
+		}
+		catch (Exception)
+		{
+		}
+		exitEventLoop();
+	});
+	runEventLoop();
+	const a = cast(string) sinkA.data.idup;
+	const b = cast(string) sinkB.data.idup;
+	assert(b.canFind("notifications/progress") && b.canFind("\"id\":2"),
+			"session B's POST stream must carry its own events: " ~ b);
+	assert(!a.canFind("notifications/progress") && !a.canFind("\"id\":2"),
+			"session B's events must never reach session A's GET stream: " ~ a);
+}
+
+unittest  // the version gate rejects a version the server does not serve
+{
+	const legacyOnly = [ProtocolVersion.v2025_11_25];
+	auto e = validateProtocolVersionHeader("2026-07-28", legacyOnly);
+	assert(e !is null && e.code == ErrorCode.unsupportedProtocolVersion);
+	assert(e.data["supported"].length == 1);
+	assert(validateProtocolVersionHeader("2025-11-25", legacyOnly) is null);
+}
+
+unittest  // a GET past the per-session stream cap is refused with 429
+{
+	import core.time : msecs;
+	import vibe.core.core : runTask, sleep, exitEventLoop, runEventLoop;
+	import vibe.http.server : createTestHTTPServerResponse, TestHTTPResponseMode;
+	import vibe.stream.memory : createMemoryOutputStream;
+
+	auto server = McpServer.stateful("t", "1");
+	auto router = new URLRouter;
+	StreamableHttpOptions opts;
+	opts.streamLimits.maxGetStreamsPerSession = 1;
+	mountMcp(router, server, opts);
+	const sid = initSession(router);
+
+	HTTPServerResponse get() @safe
+	{
+		auto res = createTestHTTPServerResponse(createMemoryOutputStream(),
+				null, TestHTTPResponseMode.bodyOnly);
+		router.handleRequest(sessionReq(HTTPMethod.GET, sid, "", "text/event-stream"), res);
+		return res;
+	}
+
+	int second;
+	runTask(() @safe nothrow{
+		try
+			get();
+		catch (Exception)
+		{
+		}
+	});
+	runTask(() @safe nothrow{
+		try
+		{
+			sleep(100.msecs);
+			second = get().statusCode;
+			router.handleRequest(sessionReq(HTTPMethod.DELETE, sid),
+				createTestHTTPServerResponse(createMemoryOutputStream(),
+				null, TestHTTPResponseMode.bodyOnly));
+			sleep(100.msecs);
+		}
+		catch (Exception)
+		{
+		}
+		exitEventLoop();
+	});
+	runEventLoop();
+	assert(second == HTTPStatus.tooManyRequests);
+}
+
+unittest  // a GET past the mount-wide stream cap is refused with 503, whatever its session
+{
+	import core.time : msecs;
+	import vibe.core.core : runTask, sleep, exitEventLoop, runEventLoop;
+	import vibe.http.server : createTestHTTPServerResponse, TestHTTPResponseMode;
+	import vibe.stream.memory : createMemoryOutputStream;
+
+	auto server = McpServer.stateful("t", "1");
+	auto router = new URLRouter;
+	StreamableHttpOptions opts;
+	opts.streamLimits.maxGetStreams = 1;
+	mountMcp(router, server, opts);
+	const first = initSession(router);
+	const other = initSession(router);
+
+	HTTPServerResponse get(string sid) @safe
+	{
+		auto res = createTestHTTPServerResponse(createMemoryOutputStream(),
+				null, TestHTTPResponseMode.bodyOnly);
+		router.handleRequest(sessionReq(HTTPMethod.GET, sid, "", "text/event-stream"), res);
+		return res;
+	}
+
+	int second;
+	runTask(() @safe nothrow{
+		try
+			get(first);
+		catch (Exception)
+		{
+		}
+	});
+	runTask(() @safe nothrow{
+		try
+		{
+			sleep(100.msecs);
+			second = get(other).statusCode;
+			router.handleRequest(sessionReq(HTTPMethod.DELETE, first),
+				createTestHTTPServerResponse(createMemoryOutputStream(),
+				null, TestHTTPResponseMode.bodyOnly));
+			sleep(100.msecs);
+		}
+		catch (Exception)
+		{
+		}
+		exitEventLoop();
+	});
+	runEventLoop();
+	assert(second == HTTPStatus.serviceUnavailable);
+}
+
+unittest  // a GET past the per-principal stream cap is refused with 429
+{
+	import core.time : msecs;
+	import vibe.core.core : runTask, sleep, exitEventLoop, runEventLoop;
+	import vibe.http.server : createTestHTTPServerResponse, TestHTTPResponseMode;
+	import vibe.stream.memory : createMemoryOutputStream;
+
+	auto server = McpServer.stateful("t", "1");
+	auto router = new URLRouter;
+	StreamableHttpOptions opts;
+	opts.streamLimits.maxGetStreamsPerPrincipal = 1;
+	opts.auth.allowAnyAudience = true;
+	opts.auth.authorizationServers = ["https://auth.example.com"];
+	opts.auth.validator = (string t) @safe {
+		TokenInfo info;
+		info.valid = true;
+		info.subject = t;
+		return info;
+	};
+	mountMcp(router, server, opts);
+
+	HTTPServerResponse send(HTTPMethod method, string who, string sid, string body_ = "") @safe
+	{
+		string[string] h = [
+			"Accept": method == HTTPMethod.GET
+			? "text/event-stream" : "application/json, text/event-stream",
+			"Authorization": "Bearer " ~ who, "MCP-Protocol-Version": "2025-11-25"
+		];
+		if (sid.length)
+			h[SessionHeader] = sid;
+		auto req = makeInitPostReq(body_, h);
+		req.method = method;
+		auto res = createTestHTTPServerResponse(createMemoryOutputStream(),
+				null, TestHTTPResponseMode.bodyOnly);
+		router.handleRequest(req, res);
+		return res;
+	}
+
+	const a1 = send(HTTPMethod.POST, "alice", "", initializeBody()).headers[SessionHeader];
+	const a2 = send(HTTPMethod.POST, "alice", "", initializeBody()).headers[SessionHeader];
+	const b1 = send(HTTPMethod.POST, "bob", "", initializeBody()).headers[SessionHeader];
+	int alicesSecond;
+	string bobs;
+	runTask(() @safe nothrow{
+		try
+			send(HTTPMethod.GET, "alice", a1);
+		catch (Exception)
+		{
+		}
+	});
+	runTask(() @safe nothrow{
+		try
+			bobs = send(HTTPMethod.GET, "bob", b1).contentType;
+		catch (Exception)
+		{
+		}
+	});
+	runTask(() @safe nothrow{
+		try
+		{
+			sleep(100.msecs);
+			alicesSecond = send(HTTPMethod.GET, "alice", a2).statusCode;
+			send(HTTPMethod.DELETE, "alice", a1);
+			send(HTTPMethod.DELETE, "bob", b1);
+			sleep(100.msecs);
+		}
+		catch (Exception)
+		{
+		}
+		exitEventLoop();
+	});
+	runEventLoop();
+	assert(alicesSecond == HTTPStatus.tooManyRequests);
+	assert(bobs == "text/event-stream", "another principal still gets a stream");
+}
+
+unittest  // a subscriptions/listen past the push-stream cap is refused with 503
+{
+	import core.time : msecs;
+	import vibe.core.core : runTask, sleep, exitEventLoop, runEventLoop;
+	import vibe.http.server : createTestHTTPServerResponse, TestHTTPResponseMode;
+	import vibe.stream.memory : createMemoryOutputStream;
+
+	auto server = McpServer.stateless("t", "1");
+	server.enableToolsListChanged();
+	auto router = new URLRouter;
+	StreamableHttpOptions opts;
+	opts.streamLimits.maxPushStreams = 1;
+	mountMcp(router, server, opts);
+
+	Json meta = Json.emptyObject;
+	meta[MetaKey.protocolVersion] = "2026-07-28";
+	meta[MetaKey.clientCapabilities] = Json.emptyObject;
+	Json params = Json.emptyObject;
+	params["notifications"] = Json(["toolsListChanged": Json(true)]);
+	params["_meta"] = meta;
+	const body_ = makeRequest(Json(1), "subscriptions/listen", params).toString();
+
+	HTTPServerResponse listen() @safe
+	{
+		auto res = createTestHTTPServerResponse(createMemoryOutputStream(),
+				null, TestHTTPResponseMode.bodyOnly);
+		router.handleRequest(makeInitPostReq(body_,
+				[
+					"Accept": "application/json, text/event-stream",
+					"MCP-Protocol-Version": "2026-07-28",
+					HttpHeader.method: "subscriptions/listen",
+		]), res);
+		return res;
+	}
+
+	int second;
+	runTask(() @safe nothrow{
+		try
+			listen();
+		catch (Exception)
+		{
+		}
+	});
+	runTask(() @safe nothrow{
+		try
+		{
+			sleep(100.msecs);
+			second = listen().statusCode;
+		}
+		catch (Exception)
+		{
+		}
+		exitEventLoop();
+	});
+	runEventLoop();
+	assert(second == HTTPStatus.serviceUnavailable);
+}
+
+unittest  // one principal past its push-stream cap is refused with 429 while others still connect
+{
+	import core.time : msecs;
+	import vibe.core.core : runTask, sleep, exitEventLoop, runEventLoop;
+	import vibe.http.server : createTestHTTPServerResponse, TestHTTPResponseMode;
+	import vibe.stream.memory : createMemoryOutputStream;
+
+	auto server = McpServer.stateless("t", "1");
+	server.enableToolsListChanged();
+	auto router = new URLRouter;
+	StreamableHttpOptions opts;
+	opts.streamLimits.maxPushStreamsPerPrincipal = 1;
+	opts.auth.allowAnyAudience = true;
+	opts.auth.authorizationServers = ["https://auth.example.com"];
+	opts.auth.validator = (string t) @safe {
+		TokenInfo info;
+		info.valid = true;
+		info.subject = t;
+		return info;
+	};
+	mountMcp(router, server, opts);
+
+	Json meta = Json.emptyObject;
+	meta[MetaKey.protocolVersion] = "2026-07-28";
+	meta[MetaKey.clientCapabilities] = Json.emptyObject;
+	Json params = Json.emptyObject;
+	params["notifications"] = Json(["toolsListChanged": Json(true)]);
+	params["_meta"] = meta;
+	const body_ = makeRequest(Json(1), "subscriptions/listen", params).toString();
+
+	void listen(string who, HTTPServerResponse res) @safe
+	{
+		router.handleRequest(makeInitPostReq(body_,
+				[
+					"Accept": "application/json, text/event-stream",
+					"Authorization": "Bearer " ~ who,
+					"MCP-Protocol-Version": "2026-07-28",
+					HttpHeader.method: "subscriptions/listen",
+		]), res);
+	}
+
+	HTTPServerResponse response() @safe
+	{
+		return createTestHTTPServerResponse(createMemoryOutputStream(), null,
+				TestHTTPResponseMode.bodyOnly);
+	}
+
+	auto first = response(), second = response(), other = response();
+	runTask(() @safe nothrow{
+		try
+			listen("alice", first);
+		catch (Exception)
+		{
+		}
+	});
+	runTask(() @safe nothrow{
+		try
+			listen("bob", other);
+		catch (Exception)
+		{
+		}
+	});
+	runTask(() @safe nothrow{
+		try
+		{
+			sleep(100.msecs);
+			listen("alice", second);
+		}
+		catch (Exception)
+		{
+		}
+		exitEventLoop();
+	});
+	runEventLoop();
+	assert(second.statusCode == HTTPStatus.tooManyRequests);
+	assert(other.contentType == "text/event-stream", "another principal still gets a stream");
+}
+
+unittest  // one anonymous address past its push-stream cap is refused with 429 while others still connect
+{
+	import core.time : msecs;
+	import vibe.core.core : runTask, sleep, exitEventLoop, runEventLoop;
+	import vibe.core.net : resolveHost;
+	import vibe.http.server : createTestHTTPServerResponse, TestHTTPResponseMode;
+	import vibe.stream.memory : createMemoryOutputStream;
+
+	auto server = McpServer.stateless("t", "1");
+	server.enableToolsListChanged();
+	auto router = new URLRouter;
+	StreamableHttpOptions opts;
+	opts.streamLimits.maxPushStreamsPerAddress = 1;
+	mountMcp(router, server, opts);
+
+	Json meta = Json.emptyObject;
+	meta[MetaKey.protocolVersion] = "2026-07-28";
+	meta[MetaKey.clientCapabilities] = Json.emptyObject;
+	Json params = Json.emptyObject;
+	params["notifications"] = Json(["toolsListChanged": Json(true)]);
+	params["_meta"] = meta;
+	const body_ = makeRequest(Json(1), "subscriptions/listen", params).toString();
+
+	void listen(string from, HTTPServerResponse res) @safe
+	{
+		auto req = makeInitPostReq(body_, [
+			"Accept": "application/json, text/event-stream",
+			"MCP-Protocol-Version": "2026-07-28",
+			HttpHeader.method: "subscriptions/listen",
+		]);
+		req.clientAddress = resolveHost(from);
+		router.handleRequest(req, res);
+	}
+
+	HTTPServerResponse response() @safe
+	{
+		return createTestHTTPServerResponse(createMemoryOutputStream(), null,
+				TestHTTPResponseMode.bodyOnly);
+	}
+
+	auto first = response(), second = response(), other = response();
+	runTask(() @safe nothrow{
+		try
+			listen("10.0.0.1", first);
+		catch (Exception)
+		{
+		}
+	});
+	runTask(() @safe nothrow{
+		try
+			listen("10.0.0.2", other);
+		catch (Exception)
+		{
+		}
+	});
+	runTask(() @safe nothrow{
+		try
+		{
+			sleep(100.msecs);
+			listen("10.0.0.1", second);
+		}
+		catch (Exception)
+		{
+		}
+		exitEventLoop();
+	});
+	runEventLoop();
+	assert(second.statusCode == HTTPStatus.tooManyRequests);
+	assert(other.contentType == "text/event-stream", "another address still gets a stream");
+}
+
+unittest  // a stateful server answers a body-signalled 2026-07-28 subscriptions/listen with 400
+{
+	import vibe.data.json : parseJsonString;
+	import vibe.http.server : createTestHTTPServerResponse, TestHTTPResponseMode;
+	import vibe.http.router : URLRouter;
+	import vibe.stream.memory : createMemoryOutputStream;
+
+	auto server = McpServer.stateful("t", "1");
+	server.enableToolsListChanged();
+	auto router = new URLRouter;
+	mountMcp(router, server);
+
+	Json meta = Json.emptyObject;
+	meta[MetaKey.protocolVersion] = "2026-07-28";
+	meta[MetaKey.clientCapabilities] = Json.emptyObject;
+	Json params = Json.emptyObject;
+	params["notifications"] = Json(["toolsListChanged": Json(true)]);
+	params["_meta"] = meta;
+	auto body_ = makeRequest(Json(1), "subscriptions/listen", params).toString();
+
+	auto initSink = createMemoryOutputStream();
+	auto initRes = createTestHTTPServerResponse(initSink, null, TestHTTPResponseMode.bodyOnly);
+	router.handleRequest(makeInitPostReq(initializeBody(),
+			["Accept": "application/json, text/event-stream"]), initRes);
+	const sessionId = initRes.headers.get(SessionHeader, "");
+	assert(sessionId.length, "initialize must mint a session");
+
+	auto sink = createMemoryOutputStream();
+	auto res = createTestHTTPServerResponse(sink, null, TestHTTPResponseMode.bodyOnly);
+	auto req = makeInitPostReq(body_, [
+		"Accept": "application/json, text/event-stream",
+		HttpHeader.method: "subscriptions/listen",
+		SessionHeader: sessionId,
+	]);
+	router.handleRequest(req, res);
+
+	assert(res.statusCode == HTTPStatus.badRequest);
+	auto resp = parseJsonString(cast(string) sink.data.idup);
+	assert(resp["error"]["code"].get!int == ErrorCode.unsupportedProtocolVersion);
+}
+
 unittest  // an initialize that fails header validation mints no surviving session and no header
 {
 	import vibe.http.server : createTestHTTPServerResponse, TestHTTPResponseMode;
@@ -3331,9 +6246,8 @@ unittest  // an initialize that fails header validation mints no surviving sessi
 	auto router = new URLRouter;
 	mountMcp(router, server);
 
-	// A modern-tagged initialize whose Mcp-Method header mismatches the body method
-	// fails validatePostRequestHeaders -> 400, exercising the rollback path: the
-	// minted session must be terminated and NO Mcp-Session-Id stamped on the error.
+	// A stateful server does not serve 2026-07-28, so a modern-tagged initialize is
+	// refused with 400 and NO Mcp-Session-Id is stamped on the error.
 	auto sink = createMemoryOutputStream();
 	auto res = createTestHTTPServerResponse(sink, null, TestHTTPResponseMode.bodyOnly);
 	auto req = makeInitPostReq(initializeBody("2026-07-28"),
@@ -3370,6 +6284,229 @@ unittest  // a POST request whose Accept excludes both media types is rejected w
 	assert(SessionHeader !in res.headers);
 }
 
+version (unittest) private HTTPServerResponse postToMount(string body_,
+		string[string] headers, StreamableHttpOptions opts, out string responseBody) @safe
+{
+	import vibe.http.server : createTestHTTPServerResponse, TestHTTPResponseMode;
+	import vibe.http.router : URLRouter;
+	import vibe.stream.memory : createMemoryOutputStream;
+
+	auto router = new URLRouter;
+	mountMcp(router, new McpServer("t", "1"), opts);
+	auto sink = createMemoryOutputStream();
+	auto res = createTestHTTPServerResponse(sink, null, TestHTTPResponseMode.bodyOnly);
+	router.handleRequest(makeInitPostReq(body_, headers), res);
+	responseBody = cast(string) sink.data.idup;
+	return res;
+}
+
+unittest  // a POST body that is not valid UTF-8 is a 400 JSON-RPC parse error
+{
+	import vibe.data.json : parseJsonString;
+
+	string reply;
+	auto res = postToMount("{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\",\"x\":\"\xff\"}",
+			null, StreamableHttpOptions.init, reply);
+	assert(res.statusCode == HTTPStatus.badRequest);
+	assert(parseJsonString(reply)["error"]["code"].get!int == ErrorCode.parseError);
+}
+
+unittest  // a POSTed request with by-position params is a 400 whose error carries its id
+{
+	import vibe.data.json : parseJsonString;
+
+	string reply;
+	auto res = postToMount(`{"jsonrpc":"2.0","id":9,"method":"ping","params":[]}`,
+			null, StreamableHttpOptions.init, reply);
+	assert(res.statusCode == HTTPStatus.badRequest);
+	auto j = parseJsonString(reply);
+	assert(j["error"]["code"].get!int == ErrorCode.invalidParams);
+	assert(j["id"] == Json(9));
+}
+
+unittest  // a POST body over maxRequestBytes is a 413 with a JSON-RPC error
+{
+	import vibe.data.json : parseJsonString;
+
+	StreamableHttpOptions opts;
+	opts.maxRequestBytes = 16;
+	string reply;
+	auto res = postToMount(initializeBody(), null, opts, reply);
+	assert(res.statusCode == HTTPStatus.requestEntityTooLarge);
+	assert(parseJsonString(reply)["error"]["code"].get!int == ErrorCode.invalidRequest);
+}
+
+version (unittest) import vibe.core.stream : InputStream, IOMode;
+
+version (unittest) private final class FailingBodyStream : InputStream
+{
+@safe:
+	private bool failed;
+
+	bool empty()
+	{
+		return failed;
+	}
+
+	ulong leastSize()
+	{
+		return 8;
+	}
+
+	bool dataAvailableForRead()
+	{
+		return false;
+	}
+
+	const(ubyte)[] peek()
+	{
+		return null;
+	}
+
+	size_t read(scope ubyte[] dst, IOMode mode)
+	{
+		failed = true;
+		throw new Exception("connection reset by peer");
+	}
+}
+
+unittest  // a POST body that fails to read for a reason other than size is a 400, not a 413
+{
+	import vibe.data.json : parseJsonString;
+	import vibe.http.server : createTestHTTPServerRequest,
+		createTestHTTPServerResponse, TestHTTPResponseMode;
+	import vibe.inet.url : URL;
+	import vibe.stream.memory : createMemoryOutputStream;
+
+	auto router = new URLRouter;
+	mountMcp(router, new McpServer("t", "1"));
+	auto req = createTestHTTPServerRequest(URL("http://127.0.0.1/mcp"),
+			HTTPMethod.POST, new FailingBodyStream);
+	req.headers["Host"] = "127.0.0.1";
+	req.headers["Content-Type"] = "application/json";
+	auto sink = createMemoryOutputStream();
+	auto res = createTestHTTPServerResponse(sink, null, TestHTTPResponseMode.bodyOnly);
+	router.handleRequest(req, res);
+	assert(res.statusCode == HTTPStatus.badRequest);
+	const reply = cast(string) sink.data.idup;
+	assert(parseJsonString(reply)["error"]["code"].get!int == ErrorCode.invalidRequest);
+}
+
+unittest  // a POST body read failure answers a fixed message, not the stream's exception text
+{
+	import std.algorithm.searching : canFind;
+	import vibe.data.json : parseJsonString;
+	import vibe.http.server : createTestHTTPServerRequest,
+		createTestHTTPServerResponse, TestHTTPResponseMode;
+	import vibe.inet.url : URL;
+	import vibe.stream.memory : createMemoryOutputStream;
+
+	auto router = new URLRouter;
+	mountMcp(router, new McpServer("t", "1"));
+	auto req = createTestHTTPServerRequest(URL("http://127.0.0.1/mcp"),
+			HTTPMethod.POST, new FailingBodyStream);
+	req.headers["Host"] = "127.0.0.1";
+	req.headers["Content-Type"] = "application/json";
+	auto sink = createMemoryOutputStream();
+	auto res = createTestHTTPServerResponse(sink, null, TestHTTPResponseMode.bodyOnly);
+	router.handleRequest(req, res);
+	const reply = cast(string) sink.data.idup;
+	const message = parseJsonString(reply)["error"]["message"].get!string;
+	assert(!message.canFind("connection reset by peer"), message);
+}
+
+unittest  // a chunked POST body that grows past maxRequestBytes is a 413
+{
+	import vibe.http.server : createTestHTTPServerRequest,
+		createTestHTTPServerResponse, TestHTTPResponseMode;
+	import vibe.inet.url : URL;
+	import vibe.stream.memory : createMemoryOutputStream, createMemoryStream;
+
+	StreamableHttpOptions opts;
+	opts.maxRequestBytes = 16;
+	auto router = new URLRouter;
+	mountMcp(router, new McpServer("t", "1"), opts);
+	auto buf = cast(ubyte[]) initializeBody().dup;
+	auto req = createTestHTTPServerRequest(URL("http://127.0.0.1/mcp"),
+			HTTPMethod.POST, createMemoryStream(buf, false));
+	req.headers["Host"] = "127.0.0.1";
+	req.headers["Content-Type"] = "application/json";
+	auto res = createTestHTTPServerResponse(createMemoryOutputStream(), null,
+			TestHTTPResponseMode.bodyOnly);
+	router.handleRequest(req, res);
+	assert(res.statusCode == HTTPStatus.requestEntityTooLarge);
+}
+
+unittest  // a POST whose Content-Type is not application/json is a 415 with a JSON-RPC error
+{
+	import vibe.data.json : parseJsonString;
+
+	string reply;
+	auto res = postToMount(initializeBody(), ["Content-Type": "text/plain"],
+			StreamableHttpOptions.init, reply);
+	assert(res.statusCode == HTTPStatus.unsupportedMediaType);
+	assert(parseJsonString(reply)["error"]["code"].get!int == ErrorCode.invalidRequest);
+}
+
+unittest  // a POST Content-Type of application/json with parameters is accepted
+{
+	string reply;
+	auto res = postToMount(initializeBody(),
+			["Content-Type": "Application/JSON; charset=utf-8"], StreamableHttpOptions.init, reply);
+	assert(res.statusCode == HTTPStatus.ok);
+}
+
+unittest  // the listener's body cap sits above the transport's own limit
+{
+	StreamableHttpOptions opts;
+	opts.maxRequestBytes = 64;
+	auto settings = buildStreamableHttpSettings(opts);
+	assert(settings.maxRequestSize > opts.maxRequestBytes,
+			"vibe must not reject a body the transport would answer with a JSON-RPC 413");
+}
+
+unittest  // the listener bounds how much of a rejected body it will drain
+{
+	StreamableHttpOptions opts;
+	auto settings = buildStreamableHttpSettings(opts);
+	assert(settings.maxRequestSize < ulong.max);
+	assert(settings.maxRequestSize <= 4 * opts.maxRequestBytes);
+}
+
+unittest  // a JSON-only POST drops a handler's log/progress notifications and returns the result
+{
+	import vibe.http.server : createTestHTTPServerResponse, TestHTTPResponseMode;
+	import vibe.http.router : URLRouter;
+	import vibe.stream.memory : createMemoryOutputStream;
+	import vibe.data.json : parseJsonString;
+	import mcp.protocol.types : Tool, CallToolResult, Content;
+	import mcp.server.context : RequestContext;
+
+	auto server = new McpServer("t", "1");
+	server.enableLogging();
+	Tool noisy = {name: "noisy"};
+	server.registerTool(noisy, (Json args, RequestContext ctx) @safe {
+		ctx.log("info", Json("working"));
+		ctx.reportProgress(0.5);
+		CallToolResult r;
+		r.content = [Content.makeText("done")];
+		return r;
+	});
+	auto router = new URLRouter;
+	mountMcp(router, server);
+
+	auto sink = createMemoryOutputStream();
+	auto res = createTestHTTPServerResponse(sink, null, TestHTTPResponseMode.bodyOnly);
+	auto req = makeInitPostReq(`{"jsonrpc":"2.0","id":2,"method":"tools/call","params":`
+			~ `{"name":"noisy","_meta":{"progressToken":"p1"}}}`,
+			["Accept": "application/json", "MCP-Protocol-Version": "2025-11-25"]);
+	router.handleRequest(req, res);
+
+	assert(res.statusCode == HTTPStatus.ok);
+	auto body_ = parseJsonString(() @trusted { return cast(string) sink.data; }());
+	assert(body_["result"]["content"][0]["text"].get!string == "done");
+}
+
 unittest  // an events/stream POST whose Accept excludes text/event-stream is 406
 {
 	import vibe.http.server : createTestHTTPServerResponse, TestHTTPResponseMode;
@@ -3395,6 +6532,243 @@ unittest  // an events/stream POST whose Accept excludes text/event-stream is 40
 	]);
 	router.handleRequest(req, res);
 	assert(res.statusCode == HTTPStatus.notAcceptable);
+}
+
+unittest  // an events/stream POST without _meta client capabilities is refused with -32602
+{
+	import vibe.data.json : parseJsonString;
+	import vibe.http.server : createTestHTTPServerResponse, TestHTTPResponseMode;
+	import vibe.http.router : URLRouter;
+	import vibe.stream.memory : createMemoryOutputStream;
+	import mcp.server.event_context : EventContext;
+	import mcp.server.events_runtime : EventRegistration;
+
+	auto server = McpServer.stateless("t", "1");
+	server.enableEvents();
+	EventRegistration reg;
+	reg.descriptor.name = "n";
+	reg.emitOnly = true;
+	server.registerEventType(reg);
+	auto router = new URLRouter;
+	mountMcp(router, server);
+
+	auto sink = createMemoryOutputStream();
+	auto res = createTestHTTPServerResponse(sink, null, TestHTTPResponseMode.bodyOnly);
+	const body_ = `{"jsonrpc":"2.0","id":1,"method":"events/stream","params":{`
+		~ `"name":"n","_meta":{"protocolVersion":"2026-07-28"}}}`;
+	auto req = makeInitPostReq(body_, [
+		"Accept": "application/json, text/event-stream",
+		"MCP-Protocol-Version": "2026-07-28",
+		"Mcp-Method": "events/stream"
+	]);
+	router.handleRequest(req, res);
+	assert(res.contentType != "text/event-stream", "the stream must not open");
+	auto resp = parseJsonString(() @trusted { return cast(string) sink.data; }());
+	assert(resp["error"]["code"].get!int == ErrorCode.invalidParams);
+	assert(resp["error"]["data"]["missingMeta"][0].get!string
+			== "io.modelcontextprotocol/clientCapabilities");
+}
+
+unittest  // an events/stream POST to a server without events is -32601 naming events/stream
+{
+	import vibe.data.json : parseJsonString;
+	import vibe.http.server : createTestHTTPServerResponse, TestHTTPResponseMode;
+	import vibe.http.router : URLRouter;
+	import vibe.stream.memory : createMemoryOutputStream;
+
+	auto server = McpServer.stateless("t", "1");
+	auto router = new URLRouter;
+	mountMcp(router, server);
+
+	auto sink = createMemoryOutputStream();
+	auto res = createTestHTTPServerResponse(sink, null, TestHTTPResponseMode.bodyOnly);
+	const body_ = `{"jsonrpc":"2.0","id":1,"method":"events/stream","params":{`
+		~ `"name":"n","_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28",`
+		~ `"io.modelcontextprotocol/clientInfo":{"name":"c","version":"1"},`
+		~ `"io.modelcontextprotocol/clientCapabilities":{}}}}`;
+	auto req = makeInitPostReq(body_, [
+		"Accept": "application/json, text/event-stream",
+		"MCP-Protocol-Version": "2026-07-28",
+		"Mcp-Method": "events/stream"
+	]);
+	router.handleRequest(req, res);
+	auto resp = parseJsonString(() @trusted { return cast(string) sink.data; }());
+	assert(resp["error"]["code"].get!int == ErrorCode.methodNotFound, resp.toString());
+	assert(resp["error"]["message"].get!string == "Method not found: events/stream",
+			resp.toString());
+}
+
+unittest  // an events/stream POST with a negative maxAgeMs answers InvalidParams
+{
+	import vibe.data.json : parseJsonString;
+	import vibe.http.server : createTestHTTPServerResponse, TestHTTPResponseMode;
+	import vibe.http.router : URLRouter;
+	import vibe.stream.memory : createMemoryOutputStream;
+
+	auto server = McpServer.stateless("t", "1");
+	server.enableEvents();
+	auto router = new URLRouter;
+	mountMcp(router, server);
+
+	auto sink = createMemoryOutputStream();
+	auto res = createTestHTTPServerResponse(sink, null, TestHTTPResponseMode.bodyOnly);
+	const body_ = `{"jsonrpc":"2.0","id":1,"method":"events/stream","params":{`
+		~ `"name":"x","maxAgeMs":-1,"_meta":{"protocolVersion":"2026-07-28",`
+		~ `"io.modelcontextprotocol/clientCapabilities":{}}}}`;
+	auto req = makeInitPostReq(body_, [
+		"Accept": "application/json, text/event-stream",
+		"MCP-Protocol-Version": "2026-07-28",
+		"Mcp-Method": "events/stream"
+	]);
+	router.handleRequest(req, res);
+	auto resp = parseJsonString(() @trusted { return cast(string) sink.data; }());
+	assert(resp["error"]["code"].get!int == ErrorCode.invalidParams);
+}
+
+unittest  // an events/stream POST whose on_subscribe throws a plain Exception answers InternalError
+{
+	import vibe.data.json : parseJsonString;
+	import vibe.http.server : createTestHTTPServerResponse, TestHTTPResponseMode;
+	import vibe.http.router : URLRouter;
+	import vibe.stream.memory : createMemoryOutputStream;
+	import mcp.server.event_context : EventContext;
+	import mcp.server.events_runtime : EventRegistration;
+
+	auto server = McpServer.stateless("t", "1");
+	server.enableEvents();
+	EventRegistration reg;
+	reg.descriptor.name = "n";
+	reg.emitOnly = true;
+	reg.onSubscribe = (EventContext ctx, string id) @safe {
+		throw new Exception("upstream unavailable");
+	};
+	server.registerEventType(reg);
+	auto router = new URLRouter;
+	mountMcp(router, server);
+
+	auto sink = createMemoryOutputStream();
+	auto res = createTestHTTPServerResponse(sink, null, TestHTTPResponseMode.bodyOnly);
+	const body_ = `{"jsonrpc":"2.0","id":1,"method":"events/stream","params":{`
+		~ `"name":"n","_meta":{"protocolVersion":"2026-07-28",`
+		~ `"io.modelcontextprotocol/clientCapabilities":{}}}}`;
+	auto req = makeInitPostReq(body_, [
+		"Accept": "application/json, text/event-stream",
+		"MCP-Protocol-Version": "2026-07-28",
+		"Mcp-Method": "events/stream"
+	]);
+	router.handleRequest(req, res);
+	auto resp = parseJsonString(() @trusted { return cast(string) sink.data; }());
+	assert(resp["id"].get!long == 1);
+	assert(resp["error"]["code"].get!int == ErrorCode.internalError);
+}
+
+unittest  // an events/stream POST whose on_subscribe throws a plain Exception keeps its message server-side
+{
+	import vibe.data.json : parseJsonString;
+	import vibe.http.server : createTestHTTPServerResponse, TestHTTPResponseMode;
+	import vibe.http.router : URLRouter;
+	import vibe.stream.memory : createMemoryOutputStream;
+	import mcp.server.event_context : EventContext;
+	import mcp.server.events_runtime : EventRegistration;
+
+	string post(bool expose)
+	{
+		auto server = McpServer.stateless("t", "1");
+		if (expose)
+			server.exposeInternalErrors();
+		server.enableEvents();
+		EventRegistration reg;
+		reg.descriptor.name = "n";
+		reg.emitOnly = true;
+		reg.onSubscribe = (EventContext ctx, string id) @safe {
+			throw new Exception("db at /var/lib/secret.sqlite unavailable");
+		};
+		server.registerEventType(reg);
+		auto router = new URLRouter;
+		mountMcp(router, server);
+		auto sink = createMemoryOutputStream();
+		auto res = createTestHTTPServerResponse(sink, null, TestHTTPResponseMode.bodyOnly);
+		const body_ = `{"jsonrpc":"2.0","id":1,"method":"events/stream","params":{`
+			~ `"name":"n","_meta":{"protocolVersion":"2026-07-28",`
+			~ `"io.modelcontextprotocol/clientCapabilities":{}}}}`;
+		auto req = makeInitPostReq(body_, [
+			"Accept": "application/json, text/event-stream",
+			"MCP-Protocol-Version": "2026-07-28",
+			"Mcp-Method": "events/stream"
+		]);
+		router.handleRequest(req, res);
+		auto resp = parseJsonString(() @trusted { return cast(string) sink.data; }());
+		return resp["error"]["message"].get!string;
+	}
+
+	assert(post(false) == "Internal error");
+	assert(post(true) == "db at /var/lib/secret.sqlite unavailable");
+}
+
+unittest  // a server-terminated emit-only events/stream ends promptly, not after its heartbeat sleep
+{
+	import core.time : MonoTime, msecs, seconds;
+	import std.algorithm : canFind;
+	import vibe.core.core : runTask, sleep, exitEventLoop, runEventLoop;
+	import vibe.http.server : createTestHTTPServerResponse, TestHTTPResponseMode;
+	import vibe.http.router : URLRouter;
+	import vibe.stream.memory : createMemoryOutputStream;
+	import mcp.server.events_runtime : EventRegistration;
+
+	auto server = McpServer.stateless("t", "1");
+	server.enableEvents();
+	EventRegistration reg;
+	reg.descriptor.name = "n";
+	reg.emitOnly = true;
+	server.registerEventType(reg);
+	auto router = new URLRouter;
+	mountMcp(router, server);
+
+	auto sink = createMemoryOutputStream();
+	auto res = createTestHTTPServerResponse(sink, null, TestHTTPResponseMode.bodyOnly);
+	const body_ = `{"jsonrpc":"2.0","id":1,"method":"events/stream","params":{`
+		~ `"name":"n","_meta":{"protocolVersion":"2026-07-28",`
+		~ `"io.modelcontextprotocol/clientCapabilities":{}}}}`;
+	auto req = makeInitPostReq(body_, [
+		"Accept": "application/json, text/event-stream",
+		"MCP-Protocol-Version": "2026-07-28",
+		"Mcp-Method": "events/stream"
+	]);
+
+	bool ended;
+	Duration afterTerminate = Duration.max;
+	() @trusted {
+		runTask(() nothrow{
+			try
+				router.handleRequest(req, res);
+			catch (Exception)
+			{
+			}
+			ended = true;
+		});
+		runTask(() nothrow{
+			scope (exit)
+				exitEventLoop();
+			try
+			{
+				const opened = MonoTime.currTime;
+				while (!(cast(string) sink.data).canFind("notifications/events/active")
+					&& MonoTime.currTime - opened < 5.seconds)
+					sleep(5.msecs);
+				const t0 = MonoTime.currTime;
+				server.events().terminateEventType("n", Json.emptyObject);
+				while (!ended && MonoTime.currTime - t0 < 20.seconds)
+					sleep(5.msecs);
+				afterTerminate = MonoTime.currTime - t0;
+			}
+			catch (Exception)
+			{
+			}
+		});
+		runEventLoop();
+	}();
+	assert(ended, "the stream handler must return after a server-side termination");
+	assert(afterTerminate < 2.seconds, "the hold loop must wake on termination");
 }
 
 /// Build the leading event the transport sends when it opens a
@@ -3438,8 +6812,9 @@ unittest  // an empty agreed subset still produces an empty params.notifications
 }
 
 /// Render a primitive JSON value as its `Mcp-Param-*` header string. Per the
-/// modern `x-mcp-header` constraints, only `integer`, `string`, and `boolean` are
-/// permitted; `number` (float) and any other type are NOT mirror-able and are
+/// modern `x-mcp-header` constraints, only `integer` (including one beyond the
+/// `long` range), `string`, and `boolean` are permitted; `number` (float) and
+/// any other type are NOT mirror-able and are
 /// reported via `ok = false` so the caller can reject the request rather than
 /// silently stringify them.
 private string jsonScalarToString(Json v, out bool ok) @safe
@@ -3454,6 +6829,8 @@ private string jsonScalarToString(Json v, out bool ok) @safe
 	case Json.Type.int_:
 		return v.get!long
 			.to!string;
+	case Json.Type.bigInt:
+		return v.toString();
 	case Json.Type.bool_:
 		return v.get!bool ? "true" : "false";
 	default:
@@ -3487,9 +6864,11 @@ private Json resolveArgPath(Json args, const(string)[] path, out bool present) @
 /// carry the header. The annotation set itself is also validated against the
 /// modern value constraints (non-empty, HTTP token syntax, no CR/LF, primitive
 /// types only with `number` forbidden, case-insensitive uniqueness). Returns a
-/// `HeaderMismatch` exception on violation, else null.
+/// `HeaderMismatch` exception on violation, else null. `headerGet` returns a
+/// header's raw value, or null when the request does not carry it, so an empty
+/// string parameter matches a present but empty header.
 McpException validateParamHeaders(Json inputSchema, Json args,
-		scope string delegate(string) @safe headerGet) @safe
+		scope Nullable!string delegate(string) @safe headerGet) @safe
 {
 	import std.array : join;
 
@@ -3507,7 +6886,7 @@ McpException validateParamHeaders(Json inputSchema, Json args,
 		const pathStr = ph.path.join(".");
 		if (!present)
 		{
-			if (hv.length)
+			if (!hv.isNull)
 				return new McpException(ErrorCode.headerMismatch,
 						"Header " ~ headerName ~ " present but parameter '" ~ pathStr ~ "' absent");
 			continue;
@@ -3518,10 +6897,10 @@ McpException validateParamHeaders(Json inputSchema, Json args,
 			return new McpException(ErrorCode.headerMismatch,
 					"Parameter '" ~ pathStr ~ "' for header " ~ headerName
 					~ " is not a permitted x-mcp-header type (integer/string/boolean)");
-		if (hv.length == 0)
+		if (hv.isNull)
 			return new McpException(ErrorCode.headerMismatch,
 					"Missing required header " ~ headerName ~ " for parameter '" ~ pathStr ~ "'");
-		if (decodeHeaderValue(hv) != expected)
+		if (decodeHeaderValue(hv.get) != expected)
 			return new McpException(ErrorCode.headerMismatch,
 					"Header " ~ headerName ~ " does not match parameter '" ~ pathStr ~ "'");
 	}
@@ -3543,6 +6922,37 @@ version (unittest)
 		schema["properties"] = props;
 		return schema;
 	}
+
+	/// A header lookup result: `v`, or absent when `v` is empty.
+	private Nullable!string headerValue(string v) @safe
+	{
+		return v.length ? Nullable!string(v) : Nullable!string.init;
+	}
+}
+
+unittest  // x-mcp-header: an empty parameter value matches a present empty header
+{
+	auto schema = schemaWithHeaderParam();
+	Json args = Json(["region": Json("")]);
+	assert(validateParamHeaders(schema, args, (string h) => h == "Mcp-Param-Region"
+			? Nullable!string("") : Nullable!string.init) is null);
+	auto e = validateParamHeaders(schema, args, (string h) => Nullable!string.init);
+	assert(e !is null && e.code == ErrorCode.headerMismatch);
+}
+
+unittest  // x-mcp-header: a bigInt integer parameter is mirror-able
+{
+	import vibe.data.json : parseJsonString;
+
+	Json schema = Json.emptyObject;
+	schema["type"] = "object";
+	Json props = Json.emptyObject;
+	props["id"] = Json(["type": Json("integer"), "x-mcp-header": Json("Id")]);
+	schema["properties"] = props;
+	Json args = parseJsonString(`{"id":123456789012345678901234567890}`);
+	assert(args["id"].type == Json.Type.bigInt);
+	assert(validateParamHeaders(schema, args,
+			(string h) => headerValue("123456789012345678901234567890")) is null);
 }
 
 unittest  // x-mcp-header: matching header passes
@@ -3550,7 +6960,7 @@ unittest  // x-mcp-header: matching header passes
 	auto schema = schemaWithHeaderParam();
 	Json args = Json(["region": Json("us-west1"), "query": Json("SELECT 1")]);
 	auto e = validateParamHeaders(schema, args,
-			(string h) => h == "Mcp-Param-Region" ? "us-west1" : "");
+			(string h) => headerValue(h == "Mcp-Param-Region" ? "us-west1" : ""));
 	assert(e is null);
 }
 
@@ -3558,7 +6968,7 @@ unittest  // x-mcp-header: mismatched header is a HeaderMismatch
 {
 	auto schema = schemaWithHeaderParam();
 	Json args = Json(["region": Json("us-west1")]);
-	auto e = validateParamHeaders(schema, args, (string h) => "us-east1");
+	auto e = validateParamHeaders(schema, args, (string h) => headerValue("us-east1"));
 	assert(e !is null && e.code == ErrorCode.headerMismatch);
 }
 
@@ -3566,7 +6976,7 @@ unittest  // x-mcp-header: present param but missing header fails
 {
 	auto schema = schemaWithHeaderParam();
 	Json args = Json(["region": Json("us-west1")]);
-	auto e = validateParamHeaders(schema, args, (string h) => "");
+	auto e = validateParamHeaders(schema, args, (string h) => headerValue(""));
 	assert(e !is null && e.code == ErrorCode.headerMismatch);
 }
 
@@ -3577,7 +6987,8 @@ unittest  // x-mcp-header: non-ASCII value matched via base64-encoded header
 	auto schema = schemaWithHeaderParam();
 	Json args = Json(["region": Json("Zürich")]);
 	const enc = encodeHeaderValue("Zürich");
-	auto e = validateParamHeaders(schema, args, (string h) => h == "Mcp-Param-Region" ? enc : "");
+	auto e = validateParamHeaders(schema, args,
+			(string h) => headerValue(h == "Mcp-Param-Region" ? enc : ""));
 	assert(e is null);
 }
 
@@ -3600,10 +7011,10 @@ unittest  // x-mcp-header: nested object property is validated against header (a
 	Json args = Json(["filters": Json(["region": Json("us-west1")])]);
 	// matching nested header passes
 	auto ok = validateParamHeaders(schema, args,
-			(string h) => h == "Mcp-Param-Region" ? "us-west1" : "");
+			(string h) => headerValue(h == "Mcp-Param-Region" ? "us-west1" : ""));
 	assert(ok is null);
 	// mismatched nested header fails
-	auto bad = validateParamHeaders(schema, args, (string h) => "eu-west1");
+	auto bad = validateParamHeaders(schema, args, (string h) => headerValue("eu-west1"));
 	assert(bad !is null && bad.code == ErrorCode.headerMismatch);
 }
 
@@ -3618,7 +7029,7 @@ unittest  // x-mcp-header: number-typed annotation is rejected as a malformed sc
 	]);
 	schema["properties"] = props;
 	Json args = Json(["amount": Json(5)]);
-	auto e = validateParamHeaders(schema, args, (string h) => "5");
+	auto e = validateParamHeaders(schema, args, (string h) => headerValue("5"));
 	assert(e !is null && e.code == ErrorCode.headerMismatch);
 }
 
@@ -3631,7 +7042,7 @@ unittest  // x-mcp-header: duplicate (case-insensitive) values rejected as malfo
 	props["b"] = Json(["type": Json("string"), "x-mcp-header": Json("region")]);
 	schema["properties"] = props;
 	Json args = Json(["a": Json("x"), "b": Json("y")]);
-	auto e = validateParamHeaders(schema, args, (string h) => "");
+	auto e = validateParamHeaders(schema, args, (string h) => headerValue(""));
 	assert(e !is null && e.code == ErrorCode.headerMismatch);
 }
 
@@ -3646,7 +7057,7 @@ unittest  // x-mcp-header: CR/LF injection in annotation value rejected
 	]);
 	schema["properties"] = props;
 	Json args = Json(["region": Json("us-west1")]);
-	auto e = validateParamHeaders(schema, args, (string h) => "");
+	auto e = validateParamHeaders(schema, args, (string h) => headerValue(""));
 	assert(e !is null && e.code == ErrorCode.headerMismatch);
 }
 
@@ -3730,7 +7141,7 @@ unittest  // modern subscriptions/listen: ack first, then opted-in change notifi
 	Json listenParams = Json.emptyObject;
 	listenParams["toolsListChanged"] = true;
 	auto m = modernMsg("subscriptions/listen", listenParams);
-	auto reqState = freshStatelessState("2026-07-28", m.params, server.negotiatedVersion);
+	auto reqState = freshStatelessState("2026-07-28", m.params);
 	assert(routeListenRequest(server, m, reqState, "").isNull);
 	assert(reqState.listenFilter.toolsListChanged);
 	assert(!reqState.listenFilter.resourcesListChanged);
@@ -3745,7 +7156,8 @@ unittest  // modern subscriptions/listen: ack first, then opted-in change notifi
 	ListenFilter streamFilter;
 	streamFilter.active = true;
 	streamFilter.toolsListChanged = true;
-	const lid = push.addListener((string f) @safe { frames ~= f; }, m.id, streamFilter);
+	const lid = addListenStreamListener(push, (string f) @safe { frames ~= f; },
+			m.id, streamFilter, "");
 	push.emitTo(lid, subscriptionsAcknowledgedNotification(
 			server.acknowledgedSubsetFor(reqState.listenFilter)));
 	assert(frames.length == 1);
@@ -3755,7 +7167,7 @@ unittest  // modern subscriptions/listen: ack first, then opted-in change notifi
 	assert(frames[0].canFind("toolsListChanged"));
 	// The ack is the FIRST message and carries the subscriptionId (the listen id).
 	assert(frames[0].canFind(cast(string) MetaKey.subscriptionId));
-	assert(frames[0].canFind(rpcIdString(m.id)));
+	assert(frames[0].canFind(m.id.toString()));
 
 	// An opted-in change notification is delivered onto the open stream, also
 	// stamped with the subscriptionId.
@@ -3763,10 +7175,996 @@ unittest  // modern subscriptions/listen: ack first, then opted-in change notifi
 	assert(frames.length == 2);
 	assert(frames[1].canFind("notifications/tools/list_changed"));
 	assert(frames[1].canFind(cast(string) MetaKey.subscriptionId));
-	assert(frames[1].canFind(rpcIdString(m.id)));
+	assert(frames[1].canFind(m.id.toString()));
 
 	// A change type the client did NOT opt into is suppressed (no new frame).
 	server.enableResourcesListChanged();
 	assert(server.notifyResourcesListChanged() == 0);
 	assert(frames.length == 2);
+}
+
+unittest  // a subscriptions/listen stream's events carry no SSE id: it is never resumed
+{
+	import mcp.transport.sse_context : StreamCoordinator;
+	import std.algorithm : canFind;
+
+	auto server = new McpServer("t", "1");
+	server.enableToolsListChanged();
+	auto push = ensurePushChannel(server, new StreamCoordinator);
+	string[] frames;
+	ListenFilter filter;
+	filter.active = true;
+	filter.toolsListChanged = true;
+	cast(void) addListenStreamListener(push, (string f) @safe { frames ~= f; }, Json(1), filter, "");
+	assert(server.notifyToolsListChanged() == 1);
+	assert(frames.length == 1);
+	assert(!frames[0].canFind("id: "), frames[0]);
+}
+
+unittest  // legacy POST acknowledges before a blocking handler finishes
+{
+	import std.algorithm : canFind;
+	import vibe.core.core : runTask, yield;
+	import mcp.protocol.types : Tool, CallToolResult;
+	import mcp.server.responses : ToolResponse;
+
+	auto server = McpServer.stateful("t", "1");
+	bool release;
+	Tool descriptor;
+	descriptor.name = "slow";
+	server.registerTool(descriptor, (Json args, RequestContext ctx) @safe {
+		while (!release)
+			yield();
+		CallToolResult r;
+		return ToolResponse.complete(r);
+	});
+
+	auto ch = new LegacySseChannel("/message");
+	string[] frames;
+	const sid = ch.sessionIdFor(ch.addListener((string f) @safe { frames ~= f; }));
+
+	bool accepted;
+	bool returned;
+	runTask(() nothrow{
+		try
+			accepted = dispatchLegacyPost(server, ch, sid, `{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"slow","arguments":{}}}`) == LegacyPostOutcome
+				.accepted;
+		catch (Exception)
+		{
+		}
+		returned = true;
+	});
+	foreach (_; 0 .. 16)
+		yield();
+	assert(returned && accepted, "the POST must be acknowledged while its handler still runs");
+	assert(frames.length == 1);
+
+	release = true;
+	foreach (_; 0 .. 4096)
+	{
+		if (frames.length == 2)
+			break;
+		yield();
+	}
+	assert(frames.length == 2 && frames[1].canFind("\"id\":3"));
+}
+
+unittest  // legacy POST for an unknown stream is rejected without dispatching
+{
+	auto server = McpServer.stateful("t", "1");
+	auto ch = new LegacySseChannel("/message");
+	assert(dispatchLegacyPost(server, ch, "no-such-session",
+			initializeBody("2024-11-05")) == LegacyPostOutcome.unknownStream);
+}
+
+unittest  // legacy POST past the per-stream in-flight cap is refused, but a reply still lands
+{
+	import std.algorithm : canFind;
+	import vibe.core.core : yield;
+	import mcp.protocol.types : Tool, CallToolResult;
+	import mcp.server.responses : ToolResponse;
+
+	auto server = McpServer.stateful("t", "1");
+	bool release;
+	Tool descriptor;
+	descriptor.name = "slow";
+	server.registerTool(descriptor, (Json args, RequestContext ctx) @safe {
+		while (!release)
+			yield();
+		CallToolResult r;
+		return ToolResponse.complete(r);
+	});
+	StreamLimits limits;
+	limits.maxLegacyInFlight = 1;
+	auto ch = new LegacySseChannel("/message", limits);
+	string[] frames;
+	const sid = ch.sessionIdFor(ch.addListener((string f) @safe { frames ~= f; }));
+	string call(int id) @safe
+	{
+		import std.conv : to;
+
+		return `{"jsonrpc":"2.0","id":` ~ id.to!string
+			~ `,"method":"tools/call","params":{"name":"slow","arguments":{}}}`;
+	}
+
+	assert(dispatchLegacyPost(server, ch, sid, call(3)) == LegacyPostOutcome.accepted);
+	foreach (_; 0 .. 16)
+		yield();
+	assert(dispatchLegacyPost(server, ch, sid, call(4)) == LegacyPostOutcome.tooManyRequests);
+	assert(dispatchLegacyPost(server, ch, sid,
+			`{"jsonrpc":"2.0","id":99,"result":{}}`) == LegacyPostOutcome.accepted,
+			"a client reply must never be refused");
+
+	release = true;
+	foreach (_; 0 .. 4096)
+	{
+		if (frames.length == 2)
+			break;
+		yield();
+	}
+	assert(frames.length == 2 && frames[1].canFind("\"id\":3"));
+	assert(dispatchLegacyPost(server, ch, sid, call(5)) == LegacyPostOutcome.accepted);
+	foreach (_; 0 .. 4096)
+	{
+		if (frames.length == 3)
+			break;
+		yield();
+	}
+}
+
+unittest  // legacy notifications/cancelled is accepted while the stream's in-flight cap is reached
+{
+	import vibe.core.core : yield;
+	import mcp.protocol.types : Tool, CallToolResult;
+	import mcp.server.responses : ToolResponse;
+
+	auto server = McpServer.stateful("t", "1");
+	bool cancelled, stop;
+	scope (exit)
+		stop = true;
+	Tool descriptor;
+	descriptor.name = "slow";
+	server.registerTool(descriptor, (Json args, RequestContext ctx) @safe {
+		while (!ctx.isCancelled && !stop)
+			yield();
+		cancelled = ctx.isCancelled;
+		CallToolResult r;
+		return ToolResponse.complete(r);
+	});
+	StreamLimits limits;
+	limits.maxLegacyInFlight = 1;
+	auto ch = new LegacySseChannel("/message", limits);
+	const sid = ch.sessionIdFor(ch.addListener((string) @safe {}));
+
+	assert(dispatchLegacyPost(server, ch, sid, `{"jsonrpc":"2.0","id":3,"method":"tools/call",`
+			~ `"params":{"name":"slow","arguments":{}}}`) == LegacyPostOutcome.accepted);
+	foreach (_; 0 .. 16)
+		yield();
+	assert(dispatchLegacyPost(server, ch, sid,
+			`{"jsonrpc":"2.0","method":"notifications/cancelled",` ~ `"params":{"requestId":3}}`)
+			== LegacyPostOutcome.accepted, "a notification must never be refused");
+	foreach (_; 0 .. 4096)
+	{
+		if (cancelled)
+			break;
+		yield();
+	}
+	assert(cancelled);
+}
+
+unittest  // legacy notification POSTs wait for a slot rather than each parking a task
+{
+	import vibe.core.core : runTask, yield;
+
+	auto server = McpServer.stateful("t", "1");
+	size_t running, peak, ran;
+	bool release;
+	server.setClientNotificationHandler((string method, Json params, RequestContext ctx) @safe {
+		running++;
+		if (running > peak)
+			peak = running;
+		while (!release)
+			yield();
+		running--;
+		ran++;
+	});
+	StreamLimits limits;
+	limits.maxLegacyInFlight = 1;
+	auto ch = new LegacySseChannel("/message", limits);
+	const sid = ch.sessionIdFor(ch.addListener((string) @safe {}));
+	enum note = `{"jsonrpc":"2.0","method":"notifications/roots/list_changed"}`;
+
+	LegacyPostOutcome[] outcomes;
+	foreach (_; 0 .. 3)
+		runTask(() nothrow{
+			try
+				outcomes ~= dispatchLegacyPost(server, ch, sid, note);
+			catch (Exception)
+			{
+			}
+		});
+	foreach (_; 0 .. 64)
+		yield();
+	const peakWhileBlocked = peak;
+	release = true;
+	foreach (_; 0 .. 4096)
+	{
+		if (ran == 3)
+			break;
+		yield();
+	}
+	assert(peakWhileBlocked == 1, "notification dispatch must be bounded per stream");
+	assert(ran == 3, "every notification still runs");
+	assert(outcomes.length == 3);
+	foreach (o; outcomes)
+		assert(o == LegacyPostOutcome.accepted, "a notification must never be refused");
+}
+
+version (unittest) private HTTPServerResponse legacyRequest(URLRouter router,
+		HTTPMethod method, string path, OutputStream sink, string body_ = "") @safe
+{
+	import vibe.http.server : createTestHTTPServerRequest,
+		createTestHTTPServerResponse, TestHTTPResponseMode;
+	import vibe.inet.url : URL;
+	import vibe.stream.memory : createMemoryStream;
+
+	auto buf = cast(ubyte[]) body_.dup;
+	auto req = createTestHTTPServerRequest(URL("http://127.0.0.1" ~ path),
+			method, createMemoryStream(buf, false));
+	req.headers["Host"] = "127.0.0.1";
+	req.headers["Content-Type"] = "application/json";
+	auto res = createTestHTTPServerResponse(sink, null, TestHTTPResponseMode.bodyOnly);
+	router.handleRequest(req, res);
+	return res;
+}
+
+version (unittest) import vibe.core.stream : OutputStream;
+
+unittest  // legacy HTTP+SSE streams receive server notifications and answer server pings
+{
+	import core.time : msecs;
+	import std.algorithm : canFind;
+	import std.string : indexOf;
+	import vibe.core.core : runTask, sleep, exitEventLoop, runEventLoop;
+	import vibe.data.json : parseJsonString;
+	import vibe.stream.memory : createMemoryOutputStream;
+
+	auto server = McpServer.stateful("t", "1");
+	server.enableToolsListChanged();
+	auto router = new URLRouter;
+	StreamableHttpOptions opts;
+	mountLegacyHttpSse(router, server, opts);
+
+	auto sse = createMemoryOutputStream();
+	string text() @safe
+	{
+		return cast(string) sse.data.idup;
+	}
+
+	size_t listChanged, updates;
+	bool pinged;
+	string failure;
+	runTask(() @safe nothrow{
+		try
+			legacyRequest(router, HTTPMethod.GET, "/sse", sse);
+		catch (Exception)
+		{
+		}
+	});
+	runTask(() @safe nothrow{
+		try
+		{
+			sleep(50.msecs);
+			const marker = "sessionId=";
+			const at = text.indexOf(marker) + marker.length;
+			const sid = text[at .. text.indexOf("\n", at)];
+			legacyRequest(router, HTTPMethod.POST, "/message?sessionId=" ~ sid,
+				createMemoryOutputStream(), initializeBody("2024-11-05"));
+			sleep(50.msecs);
+			listChanged = server.notifyToolsListChanged();
+			updates = server.notifyResourceUpdated("file:///never-subscribed");
+
+			runTask(() @safe nothrow{
+				try
+				{
+					import std.algorithm : find, startsWith;
+					import std.string : lineSplitter;
+
+					sleep(50.msecs);
+					auto line = text.lineSplitter.find!(l => l.startsWith("data: ")
+					&& l.canFind(`"method":"ping"`));
+					const id = parseJsonString(line.front["data: ".length .. $])["id"];
+					legacyRequest(router, HTTPMethod.POST, "/message?sessionId=" ~ sid,
+					createMemoryOutputStream(),
+					`{"jsonrpc":"2.0","id":` ~ id.toString ~ `,"result":{}}`);
+				}
+				catch (Exception e)
+					failure = e.msg;
+			});
+			server.pingClient(sid, 2.seconds);
+			pinged = true;
+		}
+		catch (Exception e)
+			failure = e.msg;
+		exitEventLoop();
+	});
+	runEventLoop();
+	assert(listChanged == 1 && text.canFind("notifications/tools/list_changed"), text);
+	assert(updates == 0, "resources/updated reaches only a stream subscribed to the URI");
+	assert(pinged, failure);
+}
+
+unittest  // a legacy GET past the stream cap is refused with 503
+{
+	import core.time : msecs;
+	import vibe.core.core : runTask, sleep, exitEventLoop, runEventLoop;
+	import vibe.http.server : createTestHTTPServerRequest,
+		createTestHTTPServerResponse, TestHTTPResponseMode;
+	import vibe.inet.url : URL;
+	import vibe.stream.memory : createMemoryOutputStream, createMemoryStream;
+
+	auto server = McpServer.stateful("t", "1");
+	auto router = new URLRouter;
+	StreamableHttpOptions opts;
+	opts.streamLimits.maxLegacyStreams = 1;
+	mountLegacyHttpSse(router, server, opts);
+
+	HTTPServerResponse open(HTTPServerResponse res) @safe
+	{
+		auto req = createTestHTTPServerRequest(URL("http://127.0.0.1/sse"),
+				HTTPMethod.GET, createMemoryStream(null, false));
+		req.headers["Host"] = "127.0.0.1";
+		router.handleRequest(req, res);
+		return res;
+	}
+
+	auto first = createTestHTTPServerResponse(createMemoryOutputStream(), null,
+			TestHTTPResponseMode.bodyOnly);
+	int second;
+	runTask(() @safe nothrow{
+		try
+			open(first);
+		catch (Exception)
+		{
+		}
+	});
+	runTask(() @safe nothrow{
+		try
+		{
+			sleep(100.msecs);
+			second = open(createTestHTTPServerResponse(createMemoryOutputStream(),
+				null, TestHTTPResponseMode.bodyOnly)).statusCode;
+		}
+		catch (Exception)
+		{
+		}
+		exitEventLoop();
+	});
+	runEventLoop();
+	assert(second == HTTPStatus.serviceUnavailable);
+}
+
+unittest  // one anonymous address past its legacy stream cap is refused with 429
+{
+	import core.time : msecs;
+	import vibe.core.core : runTask, sleep, exitEventLoop, runEventLoop;
+	import vibe.core.net : resolveHost;
+	import vibe.http.server : createTestHTTPServerRequest,
+		createTestHTTPServerResponse, TestHTTPResponseMode;
+	import vibe.inet.url : URL;
+	import vibe.stream.memory : createMemoryOutputStream, createMemoryStream;
+
+	auto server = McpServer.stateful("t", "1");
+	auto router = new URLRouter;
+	StreamableHttpOptions opts;
+	opts.streamLimits.maxLegacyStreamsPerAddress = 1;
+	mountLegacyHttpSse(router, server, opts);
+
+	HTTPServerResponse open(string from, HTTPServerResponse res) @safe
+	{
+		auto req = createTestHTTPServerRequest(URL("http://127.0.0.1/sse"),
+				HTTPMethod.GET, createMemoryStream(null, false));
+		req.headers["Host"] = "127.0.0.1";
+		req.clientAddress = resolveHost(from);
+		router.handleRequest(req, res);
+		return res;
+	}
+
+	HTTPServerResponse response() @safe
+	{
+		return createTestHTTPServerResponse(createMemoryOutputStream(), null,
+				TestHTTPResponseMode.bodyOnly);
+	}
+
+	auto first = response(), second = response(), other = response();
+	runTask(() @safe nothrow{
+		try
+			open("10.0.0.1", first);
+		catch (Exception)
+		{
+		}
+	});
+	runTask(() @safe nothrow{
+		try
+			open("10.0.0.2", other);
+		catch (Exception)
+		{
+		}
+	});
+	runTask(() @safe nothrow{
+		try
+		{
+			sleep(100.msecs);
+			open("10.0.0.1", second);
+		}
+		catch (Exception)
+		{
+		}
+		exitEventLoop();
+	});
+	runEventLoop();
+	assert(second.statusCode == HTTPStatus.tooManyRequests);
+	assert(other.contentType == "text/event-stream", "another address still gets a stream");
+}
+
+unittest  // closing a legacy GET stream fails the server->client request awaiting it
+{
+	import core.time : MonoTime;
+	import vibe.core.core : runTask, runEventLoop, exitEventLoop;
+	import mcp.protocol.types : Tool, CallToolResult;
+	import mcp.server.responses : ToolResponse;
+
+	auto server = McpServer.stateful("t", "1");
+	bool failed;
+	Tool descriptor;
+	descriptor.name = "roottool";
+	server.registerTool(descriptor, (Json args, RequestContext ctx) @safe {
+		try
+			ctx.listRootsRaw();
+		catch (McpException)
+			failed = true;
+		CallToolResult r;
+		return ToolResponse.complete(r);
+	});
+
+	auto ch = new LegacySseChannel("/message");
+	bool asked;
+	const lid = ch.addListener((string frame) @safe {
+		import std.algorithm : canFind;
+
+		asked = asked || frame.canFind("roots/list");
+	});
+	const sid = ch.sessionIdFor(lid);
+
+	const started = MonoTime.currTime;
+	runTask(() nothrow{
+		try
+		{
+			cast(void) dispatchLegacyPost(server, ch, sid, `{"jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":"roottool","arguments":{}}}`);
+			yieldUntil(() => failed);
+		}
+		catch (Exception)
+		{
+		}
+		exitEventLoop();
+	});
+	runTask(() nothrow{
+		try
+		{
+			yieldUntil(() => asked);
+			ch.removeListener(lid);
+		}
+		catch (Exception)
+		{
+		}
+	});
+	runEventLoop();
+	assert(failed);
+	assert(MonoTime.currTime - started < 5.seconds,
+			"the waiter must fail promptly once its stream closes");
+}
+
+version (unittest) private HTTPServerResponse corsRequest(URLRouter router,
+		HTTPMethod method, string[string] headers, string body_ = "", string path = "/mcp") @safe
+{
+	import vibe.http.server : createTestHTTPServerRequest,
+		createTestHTTPServerResponse, TestHTTPResponseMode;
+	import vibe.inet.url : URL;
+	import vibe.stream.memory : createMemoryStream, createMemoryOutputStream;
+
+	auto buf = cast(ubyte[]) body_.dup;
+	auto req = createTestHTTPServerRequest(URL("http://127.0.0.1" ~ path),
+			method, createMemoryStream(buf, false));
+	req.headers["Host"] = "127.0.0.1";
+	foreach (k, v; headers)
+		req.headers[k] = v;
+	auto res = createTestHTTPServerResponse(createMemoryOutputStream(), null,
+			TestHTTPResponseMode.bodyOnly);
+	router.handleRequest(req, res);
+	return res;
+}
+
+unittest  // CORS: a preflight from an allowed origin is answered with the MCP methods and headers
+{
+	import std.algorithm : canFind;
+
+	auto server = McpServer.stateful("t", "1");
+	auto router = new URLRouter;
+	StreamableHttpOptions opts;
+	opts.allowedOrigins = ["https://app.example.com"];
+	mountMcp(router, server, opts);
+
+	auto res = corsRequest(router, HTTPMethod.OPTIONS,
+			[
+				"Origin": "https://app.example.com",
+				"Access-Control-Request-Method": "POST",
+				"Access-Control-Request-Headers": "content-type, mcp-session-id, mcp-param-city",
+	]);
+	assert(res.statusCode == 204);
+	assert(res.headers.get("Access-Control-Allow-Origin", "") == "https://app.example.com");
+	const methods = res.headers.get("Access-Control-Allow-Methods", "");
+	assert(methods.canFind("POST") && methods.canFind("GET") && methods.canFind("DELETE"));
+	const allowed = res.headers.get("Access-Control-Allow-Headers", "");
+	foreach (h; [
+		"Content-Type", "Mcp-Session-Id", "MCP-Protocol-Version",
+		"Authorization", "Last-Event-ID", "mcp-param-city"
+	])
+		assert(allowed.canFind(h), allowed);
+	assert(res.headers.get("Vary", "").canFind("Origin"));
+}
+
+unittest  // legacy POST with a non-JSON Content-Type is refused with 415
+{
+	auto server = McpServer.stateful("t", "1");
+	auto router = new URLRouter;
+	StreamableHttpOptions opts;
+	opts.legacyHttpSse = true;
+	mountMcp(router, server, opts);
+
+	auto res = corsRequest(router, HTTPMethod.POST, [
+		"Content-Type": "text/plain"
+	], `{"jsonrpc":"2.0","method":"notifications/initialized"}`,
+		opts.legacyMessagePath ~ "?sessionId=x");
+	assert(res.statusCode == HTTPStatus.unsupportedMediaType);
+}
+
+unittest  // legacy GET whose Accept excludes text/event-stream is refused with 406
+{
+	auto server = McpServer.stateful("t", "1");
+	auto router = new URLRouter;
+	StreamableHttpOptions opts;
+	opts.legacyHttpSse = true;
+	mountMcp(router, server, opts);
+
+	auto res = corsRequest(router, HTTPMethod.GET,
+			["Accept": "application/json"], "", opts.legacySsePath);
+	assert(res.statusCode == HTTPStatus.notAcceptable);
+}
+
+unittest  // CORS: a stateless mount's preflight advertises only POST
+{
+	auto server = McpServer.stateless("t", "1");
+	auto router = new URLRouter;
+	StreamableHttpOptions opts;
+	opts.allowedOrigins = ["https://app.example.com"];
+	mountMcp(router, server, opts);
+
+	auto res = corsRequest(router, HTTPMethod.OPTIONS,
+			[
+				"Origin": "https://app.example.com",
+				"Access-Control-Request-Method": "POST",
+	]);
+	assert(res.statusCode == 204);
+	assert(res.headers.get("Access-Control-Allow-Methods", "") == "POST");
+}
+
+unittest  // CORS: a response to an allowed origin exposes Mcp-Session-Id and WWW-Authenticate
+{
+	import std.algorithm : canFind;
+
+	auto server = McpServer.stateful("t", "1");
+	auto router = new URLRouter;
+	StreamableHttpOptions opts;
+	opts.allowedOrigins = ["https://app.example.com"];
+	mountMcp(router, server, opts);
+
+	auto res = corsRequest(router, HTTPMethod.POST, [
+		"Origin": "https://app.example.com",
+		"Content-Type": "application/json",
+		"Accept": "application/json, text/event-stream",
+	], initializeBody());
+	assert(res.statusCode == 200);
+	assert(res.headers.get("Access-Control-Allow-Origin", "") == "https://app.example.com");
+	const exposed = res.headers.get("Access-Control-Expose-Headers", "");
+	assert(exposed.canFind("Mcp-Session-Id") && exposed.canFind("WWW-Authenticate"));
+	assert(res.headers.get("Vary", "").canFind("Origin"));
+}
+
+unittest  // with Host validation off (behind a proxy) a foreign Origin is still refused
+{
+	auto server = McpServer.stateful("t", "1");
+	auto router = new URLRouter;
+	StreamableHttpOptions opts;
+	opts.validateHost = false;
+	mountMcp(router, server, opts);
+
+	auto proxied = corsRequest(router, HTTPMethod.POST, [
+		"Host": "mcp.example.com",
+		"Content-Type": "application/json",
+		"Accept": "application/json, text/event-stream",
+	], initializeBody());
+	assert(proxied.statusCode == 200, "an unlisted Host passes when Host validation is off");
+
+	auto rebound = corsRequest(router, HTTPMethod.POST,
+			[
+				"Host": "mcp.example.com",
+				"Origin": "https://evil.example.com",
+				"Content-Type": "application/json",
+				"Accept": "application/json, text/event-stream",
+	], initializeBody());
+	assert(rebound.statusCode == 403, "Origin validation stays on independently of Host validation");
+}
+
+unittest  // CORS: disallowed and absent origins get no CORS headers and no preflight
+{
+	auto server = McpServer.stateful("t", "1");
+	auto router = new URLRouter;
+	StreamableHttpOptions opts;
+	opts.allowedOrigins = ["https://app.example.com"];
+	mountMcp(router, server, opts);
+
+	auto foreign = corsRequest(router, HTTPMethod.OPTIONS,
+			[
+				"Origin": "https://evil.example.com",
+				"Access-Control-Request-Method": "POST",
+	]);
+	assert("Access-Control-Allow-Origin" !in foreign.headers);
+	assert(foreign.statusCode != 204);
+
+	auto none = corsRequest(router, HTTPMethod.POST, [
+		"Content-Type": "application/json",
+		"Accept": "application/json, text/event-stream",
+	], initializeBody());
+	assert(none.statusCode == 200);
+	assert("Access-Control-Allow-Origin" !in none.headers);
+	assert("Access-Control-Expose-Headers" !in none.headers);
+}
+
+unittest  // CORS: any origin may read the Protected Resource Metadata document
+{
+	auto server = McpServer.stateful("t", "1");
+	auto router = new URLRouter;
+	StreamableHttpOptions opts;
+	opts.auth.validator = (string t) @safe => TokenInfo.invalid();
+	opts.auth.resource = "https://mcp.example.com/mcp";
+	opts.auth.authorizationServers = ["https://auth.example.com"];
+	mountMcp(router, server, opts);
+
+	auto get = corsRequest(router, HTTPMethod.GET,
+			["Origin": "https://app.example.com"], "", ProtectedResourceMetadataPath ~ "/mcp");
+	assert(get.statusCode == 200);
+	assert(get.headers.get("Access-Control-Allow-Origin", "") == "*");
+
+	auto preflight = corsRequest(router, HTTPMethod.OPTIONS, [
+		"Origin": "https://app.example.com",
+		"Access-Control-Request-Method": "GET"
+	], "", ProtectedResourceMetadataPath ~ "/mcp");
+	assert(preflight.statusCode == 204);
+	assert(preflight.headers.get("Access-Control-Allow-Origin", "") == "*");
+	assert(preflight.headers.get("Access-Control-Allow-Methods", "") == "GET");
+}
+
+unittest  // the Protected Resource Metadata is served at the RFC 9728 path-inserted URL the 401 names
+{
+	import std.algorithm : canFind;
+
+	StreamableHttpOptions opts;
+	opts.auth.validator = (string t) @safe => TokenInfo.invalid();
+	opts.auth.resource = "https://mcp.example.com/tenant-a/mcp";
+	opts.auth.authorizationServers = ["https://auth.example.com"];
+	opts.path = "/tenant-a/mcp";
+	opts.allowedHosts = ["mcp.example.com"];
+	auto router = new URLRouter;
+	mountMcp(router, McpServer.stateless("t", "1"), opts);
+
+	auto doc = corsRequest(router, HTTPMethod.GET, ["Host": "mcp.example.com"],
+			"", "/.well-known/oauth-protected-resource/tenant-a/mcp");
+	assert(doc.statusCode == 200);
+	auto root = corsRequest(router, HTTPMethod.GET,
+			["Host": "mcp.example.com"], "", "/.well-known/oauth-protected-resource");
+	assert("Access-Control-Allow-Origin" !in root.headers,
+			"a resource with a path is not published at the root");
+
+	auto challenge = corsRequest(router, HTTPMethod.POST,
+			[
+				"Host": "mcp.example.com",
+				"Content-Type": "application/json",
+				"Accept": "application/json, text/event-stream",
+	], initializeBody(), "/tenant-a/mcp");
+	assert(challenge.statusCode == 401);
+	const www = challenge.headers.get("WWW-Authenticate", "");
+	assert(www.canFind(`resource_metadata="https://mcp.example.com/.well-known/oauth-protected-resource/tenant-a/mcp"`),
+			www);
+}
+
+version (unittest) private string challengeWith(bool trustProxyHeaders, string forwardedProto) @safe
+{
+	StreamableHttpOptions opts;
+	opts.auth.validator = (string t) @safe => TokenInfo.invalid();
+	opts.auth.authorizationServers = ["https://auth.example.com"];
+	opts.allowedHosts = ["mcp.example.com"];
+	opts.trustProxyHeaders = trustProxyHeaders;
+	auto router = new URLRouter;
+	mountMcp(router, McpServer.stateless("t", "1"), opts);
+	auto res = corsRequest(router, HTTPMethod.POST, [
+		"Host": "mcp.example.com",
+		"X-Forwarded-Proto": forwardedProto,
+		"Content-Type": "application/json",
+		"Accept": "application/json, text/event-stream",
+	], initializeBody());
+	assert(res.statusCode == 401);
+	return res.headers.get("WWW-Authenticate", "");
+}
+
+unittest  // X-Forwarded-Proto is ignored unless proxy headers are trusted
+{
+	import std.algorithm : canFind;
+
+	const www = challengeWith(false, "http");
+	assert(www.canFind(`resource_metadata="https://mcp.example.com/`), www);
+}
+
+unittest  // a trusted X-Forwarded-Proto sets the resource_metadata scheme
+{
+	import std.algorithm : canFind;
+
+	const www = challengeWith(true, "http");
+	assert(www.canFind(`resource_metadata="http://mcp.example.com/`), www);
+}
+
+unittest  // a trusted X-Forwarded-Proto other than http or https is ignored
+{
+	import std.algorithm : canFind;
+
+	const www = challengeWith(true, "javascript");
+	assert(www.canFind(`resource_metadata="https://mcp.example.com/`), www);
+}
+
+unittest  // an unavailable token verifier answers 503 with Retry-After, not a 401 challenge
+{
+	StreamableHttpOptions opts;
+	opts.auth.validator = (string t) @safe => TokenInfo.temporarilyUnavailable(15.seconds);
+	opts.auth.resource = "https://mcp.example.com/mcp";
+	opts.auth.authorizationServers = ["https://auth.example.com"];
+	opts.allowedHosts = ["mcp.example.com"];
+	auto router = new URLRouter;
+	mountMcp(router, McpServer.stateless("t", "1"), opts);
+
+	auto res = corsRequest(router, HTTPMethod.POST, [
+		"Host": "mcp.example.com",
+		"Authorization": "Bearer tok",
+		"Content-Type": "application/json",
+		"Accept": "application/json, text/event-stream",
+	], initializeBody(), "/mcp");
+	assert(res.statusCode == 503);
+	assert(res.headers.get("Retry-After", "") == "15");
+	assert("WWW-Authenticate" !in res.headers);
+}
+
+unittest  // a resource without a path keeps its metadata at the well-known root
+{
+	assert(protectedResourceMetadataPath("https://mcp.example.com",
+			"/mcp") == ProtectedResourceMetadataPath);
+	assert(protectedResourceMetadataPath("https://mcp.example.com/",
+			"/mcp") == ProtectedResourceMetadataPath);
+	assert(protectedResourceMetadataPath("https://mcp.example.com/mcp?x=1#f",
+			"/other") == ProtectedResourceMetadataPath ~ "/mcp");
+	// With no configured resource the MCP endpoint itself is the resource.
+	assert(protectedResourceMetadataPath("", "/mcp") == ProtectedResourceMetadataPath ~ "/mcp");
+}
+
+unittest  // stateless: notifications/cancelled reaches the same principal's in-flight request only
+{
+	import vibe.core.core : runTask, runEventLoop, exitEventLoop, yield;
+	import mcp.protocol.types : Tool, CallToolResult;
+	import mcp.server.responses : ToolResponse;
+
+	StreamableHttpOptions opts;
+	opts.auth.allowAnyAudience = true;
+	opts.auth.authorizationServers = ["https://auth.example.com"];
+	opts.auth.validator = (string t) @safe {
+		TokenInfo info;
+		info.valid = t == "tok-alice" || t == "tok-bob";
+		info.subject = t == "tok-alice" ? "alice" : "bob";
+		return info;
+	};
+	auto server = McpServer.stateless("t", "1");
+	bool cancelled, release;
+	Tool descriptor;
+	descriptor.name = "wait";
+	server.registerTool(descriptor, (Json args, RequestContext ctx) @safe {
+		while (!release && !ctx.isCancelled())
+			yield();
+		cancelled = ctx.isCancelled();
+		CallToolResult r;
+		return ToolResponse.complete(r);
+	});
+	auto router = new URLRouter;
+	mountMcp(router, server, opts);
+
+	string[string] headersFor(string bearer) @safe
+	{
+		return [
+			"Accept": "application/json, text/event-stream",
+			"Content-Type": "application/json",
+			"MCP-Protocol-Version": "2025-06-18",
+			"Authorization": "Bearer " ~ bearer,
+		];
+	}
+
+	enum cancel5 = `{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":5}}`;
+	int callStatus;
+	bool cancelledByOther;
+	runTask(() nothrow{
+		try
+			callStatus = corsRequest(router, HTTPMethod.POST, headersFor("tok-alice"), `{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"wait","arguments":{}}}`)
+				.statusCode;
+		catch (Exception)
+		{
+		}
+		exitEventLoop();
+	});
+	runTask(() nothrow{
+		try
+		{
+			foreach (_; 0 .. 8)
+				yield();
+			corsRequest(router, HTTPMethod.POST, headersFor("tok-bob"), cancel5);
+			foreach (_; 0 .. 8)
+				yield();
+			cancelledByOther = cancelled;
+			corsRequest(router, HTTPMethod.POST, headersFor("tok-alice"), cancel5);
+			foreach (_; 0 .. 64)
+				yield();
+			release = true;
+		}
+		catch (Exception)
+			release = true;
+	});
+	runEventLoop();
+	assert(!cancelledByOther, "another principal must not cancel the request");
+	assert(cancelled, "the requesting principal's notifications/cancelled must reach it");
+	assert(callStatus == 202, "a cancelled request sends no response");
+}
+
+unittest  // stateless: a cancel naming an id two of one principal's requests share cancels neither
+{
+	import vibe.core.core : runTask, runEventLoop, exitEventLoop, yield;
+	import mcp.protocol.types : Tool, CallToolResult;
+	import mcp.server.responses : ToolResponse;
+
+	StreamableHttpOptions opts;
+	opts.auth.allowAnyAudience = true;
+	opts.auth.authorizationServers = ["https://auth.example.com"];
+	opts.auth.validator = (string t) @safe {
+		TokenInfo info;
+		info.valid = true;
+		info.subject = "alice";
+		return info;
+	};
+	auto server = McpServer.stateless("t", "1");
+	bool[string] cancelled, release;
+	Tool descriptor;
+	descriptor.name = "wait";
+	server.registerTool(descriptor, (Json args, RequestContext ctx) @safe {
+		const who = args["who"].get!string;
+		while (!release.get(who, false) && !ctx.isCancelled())
+			yield();
+		cancelled[who] = ctx.isCancelled();
+		CallToolResult r;
+		return ToolResponse.complete(r);
+	});
+	auto router = new URLRouter;
+	mountMcp(router, server, opts);
+
+	string[string] headers = [
+		"Accept": "application/json, text/event-stream",
+		"Content-Type": "application/json",
+		"MCP-Protocol-Version": "2025-06-18", "Authorization": "Bearer tok",
+	];
+	enum cancel5 = `{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":5}}`;
+	void call(string who) @safe nothrow
+	{
+		try
+			corsRequest(router, HTTPMethod.POST, headers, `{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"wait","arguments":{"who":"` ~ who ~ `"}}}`);
+		catch (Exception)
+		{
+		}
+	}
+
+	bool ambiguousCancelled;
+	runTask(() nothrow{ call("a"); });
+	runTask(() nothrow{ call("b"); });
+	runTask(() nothrow{
+		try
+		{
+			foreach (_; 0 .. 8)
+				yield();
+			corsRequest(router, HTTPMethod.POST, headers, cancel5);
+			foreach (_; 0 .. 8)
+				yield();
+			ambiguousCancelled = ("a" in cancelled) !is null || ("b" in cancelled) !is null;
+			release["a"] = true;
+			foreach (_; 0 .. 16)
+				yield();
+			corsRequest(router, HTTPMethod.POST, headers, cancel5);
+			foreach (_; 0 .. 16)
+				yield();
+			release["b"] = true;
+			foreach (_; 0 .. 16)
+				yield();
+		}
+		catch (Exception)
+		{
+		}
+		exitEventLoop();
+	});
+	runEventLoop();
+	assert(!ambiguousCancelled, "an ambiguous cancel must cancel neither request");
+	assert(!cancelled["a"], "the request that finished was never cancelled");
+	assert(cancelled["b"], "once its id is unambiguous again, the remaining request is cancellable");
+}
+
+unittest  // stateless: an unauthenticated caller cannot cancel another caller's request
+{
+	import vibe.core.core : runTask, runEventLoop, exitEventLoop, yield;
+	import mcp.protocol.types : Tool, CallToolResult;
+	import mcp.server.responses : ToolResponse;
+
+	auto server = McpServer.stateless("t", "1");
+	bool cancelled, release;
+	Tool descriptor;
+	descriptor.name = "wait";
+	server.registerTool(descriptor, (Json args, RequestContext ctx) @safe {
+		while (!release && !ctx.isCancelled())
+			yield();
+		cancelled = ctx.isCancelled();
+		CallToolResult r;
+		return ToolResponse.complete(r);
+	});
+	auto router = new URLRouter;
+	mountMcp(router, server);
+
+	string[string] headers = [
+		"Accept": "application/json, text/event-stream",
+		"Content-Type": "application/json", "MCP-Protocol-Version": "2025-06-18",
+	];
+	int callStatus;
+	runTask(() nothrow{
+		try
+			callStatus = corsRequest(router, HTTPMethod.POST, headers, `{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"wait","arguments":{}}}`)
+				.statusCode;
+		catch (Exception)
+		{
+		}
+		exitEventLoop();
+	});
+	runTask(() nothrow{
+		try
+		{
+			foreach (_; 0 .. 8)
+				yield();
+			corsRequest(router, HTTPMethod.POST, headers,
+				`{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":5}}`);
+			foreach (_; 0 .. 8)
+				yield();
+		}
+		catch (Exception)
+		{
+		}
+		release = true;
+	});
+	runEventLoop();
+	assert(!cancelled, "an anonymous caller must not cancel another anonymous caller's request");
+	assert(callStatus == 200);
 }

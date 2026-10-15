@@ -5,15 +5,40 @@
 module mcp.protocol.jsonhelpers;
 
 import std.traits : isIntegral, isFloatingPoint;
+import std.bigint : BigInt;
 import std.typecons : Nullable;
 import vibe.data.json : Json;
 
 @safe:
 
+/// Whether struct `T` is (de)serialized field by field. Structs vibe serializes
+/// in a custom form (`std.datetime` types, `toJson`/`fromJson`, `toString`/
+/// `fromString`, `toRepresentation`/`fromRepresentation`) and the `Nullable` /
+/// `SumType` / `Json` wrappers are not.
+package(mcp) template isFieldwiseStruct(T)
+{
+	import std.datetime.date : Date, DateTime, TimeOfDay;
+	import std.datetime.systime : SysTime;
+	import std.sumtype : isSumType;
+	import std.traits : isInstanceOf;
+
+	static if (!is(T == struct) || is(T == Json) || isInstanceOf!(Nullable, T)
+			|| isSumType!T || is(T == SysTime) || is(T == DateTime)
+			|| is(T == Date) || is(T == TimeOfDay))
+		enum isFieldwiseStruct = false;
+	else
+		enum isFieldwiseStruct = !hasCustomRepresentation!T;
+}
+
+private enum hasCustomRepresentation(T) = __traits(hasMember, T, "fromJson")
+	|| __traits(hasMember, T, "fromString") || __traits(hasMember, T, "fromRepresentation");
+
 /// Returns true when `t` is a JSON type that can legitimately hold a value of
 /// type `T`. For integral `T`, both `Type.int_` and `Type.bigInt` are accepted:
-/// vibe.d parses JSON integers that exceed `long.max` as `Type.bigInt`, and its
-/// `get!T` already enforces range, so the type guard must not exclude them.
+/// vibe.d parses JSON integers outside `long`'s range as `Type.bigInt`, and the
+/// range check against `T` happens when the value is read. A floating `T`
+/// accepts every JSON number, since a whole number is encoded without a
+/// fraction (`3`, not `3.0`).
 private bool typeMatchesFor(T)(Json.Type t) pure nothrow @safe @nogc
 {
 	static if (is(T == string))
@@ -23,9 +48,42 @@ private bool typeMatchesFor(T)(Json.Type t) pure nothrow @safe @nogc
 	else static if (isIntegral!T)
 		return t == Json.Type.int_ || t == Json.Type.bigInt;
 	else static if (isFloatingPoint!T)
-		return t == Json.Type.float_;
+		return t == Json.Type.float_ || t == Json.Type.int_ || t == Json.Type.bigInt;
 	else
 		static assert(false, "jsonhelpers: unsupported scalar type " ~ T.stringof);
+}
+
+/// Convert an integer-typed node `v` (`Type.int_` or `Type.bigInt`) to the
+/// integral `T` when the value lies within `T`'s range, assigning it to `result`.
+/// Returns false, leaving `result` untouched, when it does not fit.
+private bool integralInRange(T)(Json v, ref T result) @safe
+{
+	import std.bigint : BigInt;
+
+	if (v.type == Json.Type.int_)
+	{
+		immutable long n = v.get!long;
+		static if (T.sizeof < long.sizeof || is(T == long))
+		{
+			if (n < T.min || n > T.max)
+				return false;
+		}
+		else
+		{
+			if (n < 0)
+				return false;
+		}
+		result = cast(T) n;
+		return true;
+	}
+	immutable BigInt b = v.get!BigInt;
+	if (b < BigInt(T.min) || b > BigInt(T.max))
+		return false;
+	static if (is(T == ulong))
+		result = b.getDigit!ulong(0);
+	else
+		result = cast(T) b.toLong;
+	return true;
 }
 
 /// Read `j[key]` as `T`, returning `fallback` when the key is absent, present
@@ -38,12 +96,15 @@ T getOr(T)(Json j, string key, T fallback) @safe
 	auto p = key in j;
 	if (p is null || !typeMatchesFor!T(p.type))
 		return fallback;
-	static if (isIntegral!T && !is(T == long) && !is(T == ulong))
+	static if (isIntegral!T)
 	{
-		long v = (*p).get!long;
-		if (v < T.min || v > T.max)
-			return fallback;
-		return cast(T) v;
+		T parsed;
+		return integralInRange(*p, parsed) ? parsed : fallback;
+	}
+	else static if (isFloatingPoint!T)
+	{
+		double d;
+		return tryNumber(*p, d) ? cast(T) d : fallback;
 	}
 	else
 	{
@@ -62,18 +123,78 @@ bool tryGet(T)(Json j, string key, ref T val) @safe if (!is(T : Nullable!U, U))
 	auto p = key in j;
 	if (p is null || !typeMatchesFor!T(p.type))
 		return false;
-	static if (isIntegral!T && !is(T == long) && !is(T == ulong))
+	static if (isIntegral!T)
 	{
-		long v = (*p).get!long;
-		if (v < T.min || v > T.max)
+		if (!integralInRange(*p, val))
 			return false;
-		val = cast(T) v;
+	}
+	else static if (isFloatingPoint!T)
+	{
+		double d;
+		if (!tryNumber(*p, d))
+			return false;
+		val = cast(T) d;
 	}
 	else
 	{
 		val = (*p).get!T;
 	}
 	return true;
+}
+
+/// Read `v` as a JSON number into `result`, widening an integer (`int_` or
+/// `bigInt`) to `double`. Returns false, leaving `result` untouched, for any
+/// other JSON type, including a numeric string. Never throws.
+bool tryNumber(Json v, ref double result) @safe
+{
+	switch (v.type)
+	{
+	case Json.Type.int_:
+		result = cast(double) v.get!long;
+		return true;
+	case Json.Type.bigInt:
+		result = cast(double) v.get!BigInt;
+		return true;
+	case Json.Type.float_:
+		result = v.get!double;
+		return true;
+	default:
+		return false;
+	}
+}
+
+/// `v` as a JSON number (integer or float), for the spec `number` field `what`.
+/// Throws -32602 for any other JSON type, including a numeric string.
+double numberOrThrow(Json v, string what) @safe
+{
+	import mcp.protocol.errors : invalidParams;
+
+	double d;
+	if (!tryNumber(v, d))
+		throw invalidParams("'" ~ what ~ "' must be a number");
+	return d;
+}
+
+/// Throw -32602 unless `j` is a JSON object. `what` names the value in the
+/// error message. Every `fromJson` for an object-shaped type calls this first,
+/// so a peer sending e.g. a number where an object belongs gets invalidParams
+/// rather than an internal JSON type error.
+void requireObject(Json j, string what) @safe
+{
+	import mcp.protocol.errors : invalidParams;
+
+	if (j.type != Json.Type.object)
+		throw invalidParams("'" ~ what ~ "' must be a JSON object");
+}
+
+/// `v` as a string, for the field `what`. Throws -32602 for any other JSON type.
+string stringOrThrow(Json v, string what) @safe
+{
+	import mcp.protocol.errors : invalidParams;
+
+	if (v.type != Json.Type.string)
+		throw invalidParams("'" ~ what ~ "' must be a string");
+	return v.get!string;
 }
 
 /// `Nullable` overload: assigns the unwrapped value into `val` (leaving it
@@ -86,6 +207,69 @@ bool tryGet(N : Nullable!T, T)(Json j, string key, ref N val) @safe
 		return false;
 	val = tmp;
 	return true;
+}
+
+/// Assign `j[key]` into the integral `val` when it is a JSON number with a whole
+/// value in `T`'s range: an integer, a bigInt, or a float such as `1024.0`
+/// (JSON draws no distinction between `1024` and `1024.0`). Leaves `val`
+/// untouched otherwise. Returns whether the assignment happened. Never throws.
+bool tryGetWhole(T)(Json j, string key, ref T val) @safe if (isIntegral!T)
+{
+	if (j.type != Json.Type.object)
+		return false;
+	auto p = key in j;
+	if (p is null)
+		return false;
+	if (p.type == Json.Type.int_ || p.type == Json.Type.bigInt)
+		return integralInRange(*p, val);
+	if (p.type != Json.Type.float_)
+		return false;
+	const d = p.get!double;
+	// `T.max + 1.0` is exact as a double even where `T.max` is not; the
+	// negated comparison also rejects NaN.
+	if (!(d >= cast(double) T.min && d < cast(double) T.max + 1.0))
+		return false;
+	const T n = cast(T) d;
+	if (n != d)
+		return false;
+	val = n;
+	return true;
+}
+
+/// `Nullable` overload of `tryGetWhole`.
+bool tryGetWhole(N : Nullable!T, T)(Json j, string key, ref N val) @safe
+{
+	T tmp;
+	if (!tryGetWhole(j, key, tmp))
+		return false;
+	val = tmp;
+	return true;
+}
+
+@safe unittest  // tryGetWhole accepts whole floats and rejects fractions, NaN and out-of-range values
+{
+	import std.bigint : BigInt;
+
+	Json j = Json.emptyObject;
+	long v;
+	j["n"] = 1024.0;
+	assert(tryGetWhole(j, "n", v) && v == 1024);
+	j["n"] = Json(BigInt(7));
+	assert(tryGetWhole(j, "n", v) && v == 7);
+	j["n"] = 1.5;
+	assert(!tryGetWhole(j, "n", v) && v == 7);
+	j["n"] = double.nan;
+	assert(!tryGetWhole(j, "n", v));
+	j["n"] = 0x1p63;
+	assert(!tryGetWhole(j, "n", v));
+	j["n"] = "3";
+	assert(!tryGetWhole(j, "n", v));
+	int i;
+	j["n"] = 3e9;
+	assert(!tryGetWhole(j, "n", i));
+	Nullable!long nl;
+	j["n"] = 5.0;
+	assert(tryGetWhole(j, "n", nl) && nl.get == 5);
 }
 
 @safe unittest  // getOr returns the value when the key is present and well-typed
@@ -117,29 +301,67 @@ bool tryGet(N : Nullable!T, T)(Json j, string key, ref N val) @safe
 	assert(j.getOr("flag", false) == true);
 }
 
-@safe unittest  // getOr accepts a bigInt-typed node for ulong and does not silently return the fallback
+@safe unittest  // getOr reads a bigInt-typed node above long.max into ulong exactly
 {
 	import vibe.data.json : parseJsonString;
 
-	// long.max + 1 = 9223372036854775808 is stored as Type.bigInt by vibe.d;
-	// the type guard must accept it so get!ulong can produce a result rather
-	// than silently discarding the value by returning the fallback.
 	Json j = parseJsonString(`{"size": 9223372036854775808}`);
-	// The fallback is 0; with the guard fixed, getOr delegates to get!ulong
-	// which returns long.max for this value (vibe.d's bigInt-to-ulong behaviour).
-	// Either way, the result must not be the fallback 0.
-	assert(j.getOr("size", 0UL) != 0UL);
+	assert(j.getOr("size", 0UL) == 9_223_372_036_854_775_808UL);
 }
 
-@safe unittest  // tryGet accepts a bigInt-typed node for ulong and returns true (does not silently leave val untouched)
+@safe unittest  // tryGet reads a bigInt-typed node above long.max into ulong exactly
 {
 	import vibe.data.json : parseJsonString;
 
-	// long.max + 1 is stored as Type.bigInt by vibe.d; tryGet must return true.
 	Json j = parseJsonString(`{"size": 9223372036854775808}`);
 	ulong val = 0;
 	assert(tryGet(j, "size", val));
-	assert(val != 0UL);
+	assert(val == 9_223_372_036_854_775_808UL);
+}
+
+@safe unittest  // getOr falls back instead of throwing when a bigInt exceeds long
+{
+	import vibe.data.json : parseJsonString;
+
+	Json j = parseJsonString(`{"n": 9223372036854775808, "m": -9223372036854775809}`);
+	assert(j.getOr("n", 3L) == 3);
+	assert(j.getOr("m", 3L) == 3);
+	assert(j.getOr("n", 3) == 3);
+}
+
+@safe unittest  // getOr falls back when a bigInt exceeds ulong.max
+{
+	import vibe.data.json : parseJsonString;
+
+	Json j = parseJsonString(`{"n": 18446744073709551616}`);
+	assert(j.getOr("n", 5UL) == 5);
+}
+
+@safe unittest  // getOr falls back on a negative value for an unsigned type
+{
+	Json j = Json.emptyObject;
+	j["n"] = -1;
+	assert(j.getOr("n", 5UL) == 5);
+	assert(j.getOr("n", 5u) == 5);
+}
+
+@safe unittest  // tryGet rejects a negative value for an unsigned type
+{
+	Json j = Json.emptyObject;
+	j["n"] = -1;
+	ulong val = 9;
+	assert(!tryGet(j, "n", val));
+	assert(val == 9);
+}
+
+@safe unittest  // tryGet leaves val untouched instead of throwing when a bigInt exceeds long
+{
+	import vibe.data.json : parseJsonString;
+
+	Json j = parseJsonString(`{"n": 9223372036854775808}`);
+	long val = 4;
+	assert(!tryGet(j, "n", val));
+	assert(val == 4);
 }
 
 @safe unittest  // tryGet assigns and reports true on a matching field
@@ -196,4 +418,59 @@ bool tryGet(N : Nullable!T, T)(Json j, string key, ref N val) @safe
 	bool assigned = tryGet(j, "code", val);
 	assert(!assigned);
 	assert(val == 99);
+}
+
+@safe unittest  // getOr and tryGet read an integer-encoded JSON number into a floating type
+{
+	import vibe.data.json : parseJsonString;
+
+	Json j = parseJsonString(`{"i": 3, "f": 2.5, "big": 18446744073709551616, "s": "1"}`);
+	assert(j.getOr("i", 0.0) == 3.0);
+	assert(j.getOr("f", 0.0) == 2.5);
+	assert(j.getOr("big", 0.0) == 18446744073709551616.0);
+	assert(j.getOr("s", -1.0) == -1.0);
+	double d = -1;
+	assert(tryGet(j, "i", d) && d == 3.0);
+	float f = -1;
+	assert(tryGet(j, "big", f) && f == 18446744073709551616.0f);
+	Nullable!double n;
+	assert(tryGet(j, "i", n) && n.get == 3.0);
+}
+
+@safe unittest  // requireObject throws -32602 naming the field for a non-object value
+{
+	import mcp.protocol.errors : ErrorCode, McpException;
+	import std.exception : collectException;
+	import std.algorithm.searching : canFind;
+
+	auto ex = cast(McpException) collectException(requireObject(Json(5), "capabilities"));
+	assert(ex !is null && ex.code == ErrorCode.invalidParams);
+	assert(ex.msg.canFind("capabilities"));
+}
+
+@safe unittest  // requireObject accepts a JSON object
+{
+	requireObject(Json.emptyObject, "x");
+}
+
+/// ASCII case-insensitive equality, for protocol tokens such as URL schemes,
+/// host names, and header names. Non-ASCII bytes compare exactly.
+package(mcp) bool asciiEqualsIgnoreCase(scope const(char)[] a, scope const(char)[] b) @safe pure nothrow @nogc
+{
+	import std.ascii : toLower;
+
+	if (a.length != b.length)
+		return false;
+	foreach (i, c; a)
+		if (toLower(c) != toLower(b[i]))
+			return false;
+	return true;
+}
+
+unittest  // asciiEqualsIgnoreCase folds ASCII case only
+{
+	assert(asciiEqualsIgnoreCase("HTTPS", "https"));
+	assert(asciiEqualsIgnoreCase("LocalHost", "localhost"));
+	assert(!asciiEqualsIgnoreCase("http", "https"));
+	assert(!asciiEqualsIgnoreCase("\xC3\x89", "\xC3\xA9"));
 }

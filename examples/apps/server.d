@@ -7,8 +7,9 @@
 ///   - `registerUiResource` to publish the linked `ui://` HTML resource with the
 ///     `text/html;profile=mcp-app` MIME type and a `_meta.ui` carrying CSP /
 ///     border hints;
-///   - `enableApps` to declare the extension capability (surfaced to modern
-///     clients via the `extensions` negotiation map).
+///   - the extension capability (surfaced to modern clients via the
+///     `extensions` negotiation map), which registering the `@ui` tool and the
+///     UI resource declares.
 ///
 /// MCP Apps is, on the server side, metadata plus a resource convention: the
 /// host fetches the `ui://` resource and renders it sandboxed, and the app talks
@@ -68,15 +69,14 @@ void main(string[] args) @safe
 	// Register the @tool/@ui free function(s) in this module.
 	registerModule!(apps_server)(server);
 
-	// Declare MCP Apps support (visible to modern clients via the extensions map).
-	enableApps(server);
-
 	// Publish the ui:// resource the tool links to, with CSP + border hints.
-	UiResourceMeta ui;
-	ui.csp.connectDomains = ["https://api.open-meteo.com"];
-	ui.prefersBorder = nullable(true);
-	registerUiResource(server, "ui://weather/dashboard", "weather_dashboard",
-			dashboardHtml, ui, "Interactive weather dashboard");
+	UiResource ui = {
+		uri: "ui://weather/dashboard", name: "weather_dashboard", html: dashboardHtml,
+		description: "Interactive weather dashboard"
+	};
+	ui.meta.csp.connectDomains = ["https://api.open-meteo.com"];
+	ui.meta.prefersBorder = nullable(true);
+	registerUiResource(server, ui);
 
 	// stdio by default, or Streamable HTTP under `--http` on `--port`/`--host`.
 	runServerFromArgs(server, args, DefaultPort);

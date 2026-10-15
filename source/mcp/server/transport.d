@@ -3,6 +3,7 @@ module mcp.server.transport;
 import std.typecons : Nullable;
 import vibe.data.json : Json;
 
+import mcp.auth.resource_server : TokenInfo;
 import mcp.protocol.jsonrpc : Message;
 
 public import mcp.server.connection : ConnectionState;
@@ -27,9 +28,10 @@ public import mcp.server.server : ServerMode;
 ///     before the request's reply is returned as the result string. The
 ///     `serverRequest` overload additionally carries the blocking
 ///     server->client request channel (`ctx.sample` / `ctx.elicit`).
-///   - `handleRaw(text, conn)` dispatches against an explicit per-request
-///     `ConnectionState` a session-multiplexing transport resolved itself
-///     (Streamable HTTP), instead of the server's single bound connection.
+///   - `handleRaw(text, conn, token, auth)` dispatches against an explicit
+///     per-request `ConnectionState` a session-multiplexing transport resolved
+///     itself (Streamable HTTP), instead of the server's single bound
+///     connection, scoping its requests' cancellation to the connection `token`.
 ///   - `handle(msg, ctx)` dispatches one already-parsed `Message` against a
 ///     caller-supplied `RequestContext`, returning the JSON-RPC response for a
 ///     request or `Nullable.init` for a notification.
@@ -49,7 +51,7 @@ public import mcp.server.server : ServerMode;
 /// `ConnectionState` are `package(mcp)`-private: server transports are
 /// supported in-package only (`mcp.transport.*`). An out-of-package transport
 /// can still drive a server through this interface — it builds its own
-/// `ConnectionState` and threads it via the `handleRaw(text, conn)` overload or
+/// `ConnectionState` and threads it via the `handleRaw(text, conn, token, auth)` overload or
 /// a `ConnectionScoped` `RequestContext` — but it cannot own the fallback
 /// connection the out-of-request notify/push path uses. See the README
 /// "implementing a custom server transport" recipe.
@@ -73,9 +75,12 @@ interface ServerCore
 	string handleRaw(string text) @safe;
 
 	/// `handleRaw` dispatched against an explicit per-request `ConnectionState`
-	/// the transport resolved (session-multiplexing transports). `null` falls
-	/// back to the no-arg behaviour.
-	string handleRaw(string text, ConnectionState conn) @safe;
+	/// the transport resolved (session-multiplexing transports), with
+	/// `connectionToken` identifying the session so a `notifications/cancelled`
+	/// on another request of it matches, and `auth` the request's validated bearer
+	/// token reported to handlers as `ctx.auth()`. `null` falls back to the no-arg
+	/// behaviour.
+	string handleRaw(string text, ConnectionState conn, string connectionToken, TokenInfo auth) @safe;
 
 	/// `handleRaw` with a server->client write `sink` for transports that deliver
 	/// out-of-band frames on the same channel (stdio). `null` sink => no
@@ -89,11 +94,6 @@ interface ServerCore
 	string handleRaw(string text, scope void delegate(string) @safe sink,
 			scope Json delegate(string, Json) @safe serverRequest) @safe;
 }
-
-/// `ServerTransport` is published as an alias for `ServerCore`: the core is the
-/// object a transport drives, named from the transport's point of view. The two
-/// names refer to the same interface so either import reads naturally.
-alias ServerTransport = ServerCore;
 
 version (unittest)
 {

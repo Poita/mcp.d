@@ -42,8 +42,6 @@ module sampling_client;
 import std.algorithm : canFind, map;
 import std.array : array;
 
-import vibe.data.json : Json;
-
 import mcp;
 import examples_common : check, runClient, connectFromArgs;
 
@@ -121,10 +119,10 @@ private int run(McpClient client) @safe
 		return CreateMessageResult.text(mockModelId, fixedSummary);
 	};
 
-	// Pin a stable (2025-era) version so the BLOCKING sampling path is exercised.
-	// (The 2026-07-28 revision would route sampling through MRTR / inputRequired
-	// instead of the synchronous server->client request this example demos.)
-	client.initialize("2025-11-25");
+	// The server is stateful, so connect() falls back to the 2025-11-25
+	// initialize handshake and the BLOCKING sampling path is exercised (2026-07-28
+	// routes sampling through MRTR / inputRequired instead).
+	client.connect();
 
 	// --- tools/list ---------------------------------------------------------
 	auto tools = client.listTools().tools;

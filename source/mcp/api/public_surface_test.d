@@ -65,6 +65,14 @@ unittest
 	static assert(visibleFromMcp!"makeErrorResponse");
 }
 
+// `Json`, which handler and client signatures use, and its parser come with
+// `import mcp;`.
+unittest
+{
+	static assert(visibleFromMcp!"Json");
+	static assert(visibleFromMcp!"parseJsonString");
+}
+
 // The UDA / reflection API stays at the top level.
 unittest
 {
@@ -74,7 +82,7 @@ unittest
 	static assert(visibleFromMcp!"RequestContext");
 }
 
-// The schema layer's `elicitationRequest!T` builder is the user-facing entry
+// The binding layer's `elicitationRequest!T` builder is the user-facing entry
 // point for deriving an elicitation request from a flat struct, so it stays
 // reachable from `import mcp;`.
 unittest
@@ -114,14 +122,13 @@ unittest
 	assert(hint.cacheScope == CacheScope.private_);
 
 	DiscoverResult r;
-	r.protocolVersions = ["2025-11-25"];
+	r.supportedVersions = ["2025-11-25"];
 	// Spec wire field is `supportedVersions` (modern DiscoverResult).
 	assert(r.toJson()["supportedVersions"][0].get!string == "2025-11-25");
 }
 
-// Handler-outcome DTOs and handler aliases are reachable from `import mcp;`.
-// server.d re-exports these from mcp.server.responses; package.d reaches them
-// transitively through `public import mcp.server.server`.
+// Handler-outcome DTOs and handler aliases are reachable from `import mcp;`,
+// which re-exports them from their one home, `mcp.server.responses`.
 unittest
 {
 	static assert(visibleFromMcp!"ToolResponse");
@@ -129,7 +136,26 @@ unittest
 	static assert(visibleFromMcp!"ToolHandler");
 	static assert(visibleFromMcp!"MrtrToolHandler");
 	static assert(visibleFromMcp!"MrtrPromptHandler");
-	static assert(visibleFromMcp!"InputRequiredPart");
+	static assert(visibleFromMcp!"PromptHandler");
+	static assert(visibleFromMcp!"ResourceReader");
+	static assert(visibleFromMcp!"TemplateReader");
+	static assert(!visibleFromMcp!"InputRequiredPart");
+}
+
+// `mcp.server.server` does not re-export the handler-outcome DTOs; each symbol
+// has one home.
+unittest
+{
+	static assert(!__traits(compiles, {
+			import mcp.server.server;
+
+			alias _ = ToolResponse;
+		}));
+	static assert(!__traits(compiles, {
+			import mcp.server.server;
+
+			alias _ = ToolHandler;
+		}));
 }
 
 // Auth verifier internals are NOT dumped at the top level.
@@ -164,14 +190,23 @@ unittest
 	static assert(!visibleFromMcp!"readRequestState");
 }
 
-// The MRTR request/response shapes live in `mcp.protocol.mrtr` and are
-// transport plumbing, not top-level public surface: they stay out of
-// `import mcp;`.
+// The MRTR shapes the public result/response API names
+// (`CallToolResult.inputRequests`, `ToolResponse.inputRequired`,
+// `McpClient.withInputResponses`) and the reserved `_meta` key names are
+// reachable from `import mcp;`.
 unittest
 {
-	static assert(!visibleFromMcp!"InputRequest");
+	static assert(visibleFromMcp!"InputRequest");
+	static assert(visibleFromMcp!"InputKind");
+	static assert(visibleFromMcp!"InputResponse");
+	static assert(visibleFromMcp!"MetaKey");
+}
+
+// The wire-level `InputRequiredResult` envelope is transport plumbing: it
+// stays out of `import mcp;`.
+unittest
+{
 	static assert(!visibleFromMcp!"InputRequiredResult");
-	static assert(!visibleFromMcp!"InputResponse");
 }
 
 // Transport wiring is reachable behind the opt-in `mcp.transport` import.
@@ -199,14 +234,50 @@ unittest
 unittest
 {
 	static assert(visibleFromTransport!"ServerCore");
-	static assert(visibleFromTransport!"ServerTransport");
 }
 
-// `ServerCore` / `ServerTransport` must NOT appear on the lean top-level surface.
+// Importing both `mcp` and `mcp.transport` leaves each `run*` entry point
+// unambiguous, including the `ServerSettings` overloads.
+unittest
+{
+	static assert(__traits(compiles, {
+			import mcp;
+			import mcp.transport;
+
+			McpServer srv;
+			ServerSettings cfg;
+			runStdio(srv);
+			runStdio(srv, cfg);
+			runStreamableHttp(srv, ushort(0));
+			runStreamableHttp(srv, cfg);
+		}));
+}
+
+// `import mcp.transport;` alone reaches the `ServerSettings` run overloads.
+unittest
+{
+	static assert(__traits(compiles, {
+			import mcp.server.server : McpServer;
+			import mcp.server.settings : ServerSettings;
+			import mcp.transport;
+
+			McpServer srv;
+			ServerSettings cfg;
+			runStdio(srv, cfg);
+			runStreamableHttp(srv, cfg);
+		}));
+}
+
+// The server-side transport seam has the single name `ServerCore`.
+unittest
+{
+	static assert(!visibleFromTransport!"ServerTransport");
+}
+
+// `ServerCore` must NOT appear on the lean top-level surface.
 unittest
 {
 	static assert(!visibleFromMcp!"ServerCore");
-	static assert(!visibleFromMcp!"ServerTransport");
 }
 
 // Auth plumbing is reachable behind the opt-in `mcp.auth` import.
@@ -264,4 +335,89 @@ unittest
 
 	static assert(__traits(getProtection, __traits(getMember, McpServer,
 			"toolInputSchema")) == "package");
+}
+
+unittest  // `import mcp;` alongside std.format leaves `format` unambiguous
+{
+	static assert(__traits(compiles, {
+			import mcp;
+			import std.format;
+
+			string s = format("%s", 1);
+		}));
+}
+
+unittest  // `import mcp;` alongside std.algorithm leaves `cache` unambiguous
+{
+	static assert(__traits(compiles, {
+			import mcp;
+			import std.algorithm;
+
+			auto r = [1, 2].cache;
+		}));
+}
+
+unittest  // `import mcp;` alongside std.parallelism leaves `task` unambiguous
+{
+	static assert(__traits(compiles, {
+			import mcp;
+			import std.parallelism;
+
+			auto t = task!((int x) => x)(1);
+		}));
+}
+
+unittest  // the task-tool UDA is `@taskTool`
+{
+	static assert(visibleFromMcp!"taskTool");
+}
+
+unittest  // the client's bearer provider settings are reachable from `import mcp;`
+{
+	static assert(visibleFromMcp!"BearerProvider");
+}
+
+unittest  // the unlimited task TTL sentinel is reachable from `import mcp;`
+{
+	static assert(visibleFromMcp!"unlimitedTaskTtl");
+}
+
+// Streamable HTTP's legacy-transport and content-negotiation helpers are
+// internal to their module.
+unittest
+{
+	static foreach (sym; [
+		"LegacySseChannel", "dispatchLegacyPost", "LegacyPostOutcome",
+		"endpointWithSession", "formatLegacyEndpointEvent",
+		"formatLegacyMessageEventRaw", "acceptsEventStream", "acceptsJson",
+		"postAccepted", "opensEventsStream", "eventStreamNotAcceptable",
+		"EventStreamTick", "eventStreamSleepMs", "eventStreamTick",
+		"eventStreamHeartbeatIntervalMs", "httpStatusForResponse",
+		"initializeSucceeded", "suppressOnDisconnect", "sessionStatus"
+	])
+		static assert(!reachableHere!("mcp.transport.streamable_http." ~ sym), sym);
+}
+
+// The OAuth proxy's per-route mounts share state only `mountOAuthProxy` wires
+// up, so they and that state are internal.
+unittest
+{
+	static foreach (sym; [
+		"mountOAuthAuthorize", "mountOAuthConsent", "mountOAuthCallback",
+		"ProxyStateStore", "ProxyAuthState", "ClientRateLimiter", "ConsentCookie"
+	])
+		static assert(!reachableHere!("mcp.transport.oauth_proxy_mount." ~ sym), sym);
+}
+
+// A route mounted on its own takes its rate limit explicitly, so leaving one
+// out cannot silently disable it.
+unittest
+{
+	static assert(!__traits(compiles, {
+			import mcp.transport.oauth_proxy_mount : mountOAuthRegister;
+			import mcp.auth.oauth_proxy : OAuthProxy;
+			import vibe.http.router : URLRouter;
+
+			mountOAuthRegister(URLRouter.init, OAuthProxy.init);
+		}));
 }

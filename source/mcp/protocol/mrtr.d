@@ -5,8 +5,9 @@ import vibe.data.json : Json;
 
 import mcp.protocol.versions : ProtocolVersion;
 import mcp.protocol.sampling : CreateMessageRequest;
-import mcp.protocol.errors : isValidElicitationUrl, invalidParams;
-import mcp.protocol.jsonhelpers : tryGet;
+import mcp.protocol.errors : isValidElicitationUrl;
+import std.ascii : isAlpha, isAlphaNum;
+import mcp.protocol.jsonhelpers : tryGet, requireObject;
 
 @safe:
 
@@ -132,16 +133,6 @@ private bool isValidMetaName(string name) @safe pure nothrow
 	return true;
 }
 
-private bool isAlpha(char c) @safe pure nothrow
-{
-	return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z');
-}
-
-private bool isAlphaNum(char c) @safe pure nothrow
-{
-	return isAlpha(c) || (c >= '0' && c <= '9');
-}
-
 /// Whether a `_meta` key's prefix is reserved for MCP use, applying the rule for
 /// the 2025-11-25 / modern revisions: the SECOND dot-separated label of the prefix
 /// is `modelcontextprotocol` or `mcp` (e.g. `io.modelcontextprotocol/`, `com.mcp/`).
@@ -230,24 +221,18 @@ bool isUserMetaKeyAllowed(string key, ProtocolVersion v) @safe pure nothrow
 /// key. `subscriptionId` is the originating `subscriptions/listen` request's
 /// JSON-RPC id, carried verbatim so its wire type is preserved (the spec types it
 /// as `RequestId = string | number`, so a numeric listen id stays numeric). An
-/// absent id — `undefined`, `null`, or an empty string — is a no-op (the
-/// notification is returned unchanged). Notifications carry their payload under
-/// `params`, so the key is nested as `params._meta.<subscriptionId>`.
+/// absent (`undefined`) or `null` id is a no-op (the notification is returned
+/// unchanged). Notifications carry their payload under `params`, so the key is
+/// stamped into `params._meta` by `withSubscriptionId`.
 Json withListenSubscriptionId(Json notification, Json subscriptionId) @safe
 {
-	if (subscriptionId.type == Json.Type.undefined
-			|| subscriptionId.type == Json.Type.null_
-			|| (subscriptionId.type == Json.Type.string && subscriptionId.get!string.length == 0))
+	import mcp.protocol.events : withSubscriptionId;
+
+	if (subscriptionId.type == Json.Type.undefined || subscriptionId.type == Json.Type.null_)
 		return notification;
 
 	Json n = notification.clone();
-	Json params = ("params" in n && n["params"].type == Json.Type.object) ? n["params"]
-		: Json.emptyObject;
-	Json meta = ("_meta" in params && params["_meta"].type == Json.Type.object) ? params["_meta"]
-		: Json.emptyObject;
-	meta[MetaKey.subscriptionId] = subscriptionId;
-	params["_meta"] = meta;
-	n["params"] = params;
+	n["params"] = withSubscriptionId(("params" in n) ? n["params"] : Json.undefined, subscriptionId);
 	return n;
 }
 
@@ -330,14 +315,24 @@ unittest  // withListenSubscriptionId preserves an existing params payload and _
 	assert(stamped["params"]["_meta"][MetaKey.subscriptionId].get!string == "id-42");
 }
 
-unittest  // withListenSubscriptionId with an empty id is a no-op
+unittest  // withListenSubscriptionId with an absent or null id is a no-op
 {
 	auto n = Json([
 		"jsonrpc": Json("2.0"),
 		"method": Json("notifications/message")
 	]);
-	auto same = withListenSubscriptionId(n, Json(""));
-	assert("params" !in same);
+	assert("params" !in withListenSubscriptionId(n, Json.undefined));
+	assert("params" !in withListenSubscriptionId(n, Json(null)));
+}
+
+unittest  // withListenSubscriptionId stamps an empty-string id, which JSON-RPC allows
+{
+	auto n = Json([
+		"jsonrpc": Json("2.0"),
+		"method": Json("notifications/message")
+	]);
+	auto stamped = withListenSubscriptionId(n, Json(""));
+	assert(stamped["params"]["_meta"][MetaKey.subscriptionId].get!string == "");
 }
 
 /// Standard Streamable HTTP request headers introduced by 2026-07-28.
@@ -379,18 +374,28 @@ string encodeHeaderValue(string value) @safe
 	}() ~ "?=";
 }
 
-/// Decode an `Mcp-Param-*` header value produced by `encodeHeaderValue`.
+/// Decode an `Mcp-Param-*` header value produced by `encodeHeaderValue`. A
+/// sentinel-framed value whose body is not valid base64, or decodes to bytes
+/// that are not valid UTF-8, is malformed and returned undecoded, so comparing
+/// it against a body value yields a clean mismatch.
 string decodeHeaderValue(string headerValue) @safe
 {
 	import std.base64 : Base64, Base64Exception;
+	import std.utf : UTFException, validate;
 
 	if (headerValue.length >= 11 && headerValue[0 .. 9] == "=?base64?"
 			&& headerValue[$ - 2 .. $] == "?=")
 	{
 		const inner = headerValue[9 .. $ - 2];
 		try
-			return () @trusted { return cast(string) Base64.decode(inner); }();
+		{
+			auto decoded = () @trusted { return cast(string) Base64.decode(inner); }();
+			validate(decoded);
+			return decoded;
+		}
 		catch (Base64Exception)
+			return headerValue;
+		catch (UTFException)
 			return headerValue;
 	}
 	return headerValue;
@@ -449,15 +454,6 @@ string validateHeaderName(string value) @safe pure nothrow
 	return null;
 }
 
-/// ASCII-lowercase a string for case-insensitive comparison of header names.
-private string asciiLowerName(string s) @safe pure nothrow
-{
-	char[] buf = new char[s.length];
-	foreach (i, char c; s)
-		buf[i] = (c >= 'A' && c <= 'Z') ? cast(char)(c + 32) : c;
-	return () @trusted { return cast(string) buf; }();
-}
-
 /// A single `x-mcp-header` annotation discovered in a tool `inputSchema`,
 /// together with the path of property keys to reach the annotated value.
 struct ParamHeader
@@ -486,23 +482,21 @@ ParamHeader[] paramHeaders(Json inputSchema) @safe
 			return;
 		if ("properties" in node && node["properties"].type == Json.Type.object)
 		{
-			() @trusted {
-				foreach (string name, Json prop; node["properties"])
+			foreach (name, prop; node["properties"].byKeyValue)
+			{
+				if (prop.type != Json.Type.object)
+					continue;
+				auto childPath = path ~ name;
+				if ("x-mcp-header" in prop && prop["x-mcp-header"].type == Json.Type.string)
 				{
-					if (prop.type != Json.Type.object)
-						continue;
-					auto childPath = path ~ name;
-					if ("x-mcp-header" in prop && prop["x-mcp-header"].type == Json.Type.string)
-					{
-						const hv = prop["x-mcp-header"].get!string;
-						const ptype = ("type" in prop && prop["type"].type == Json.Type.string) ? prop["type"]
-							.get!string : "";
-						if (validateHeaderName(hv) is null && isPrimitiveHeaderType(ptype))
-							result ~= ParamHeader(childPath, HttpHeader.paramPrefix ~ hv, hv);
-					}
-					walk(prop, childPath);
+					const hv = prop["x-mcp-header"].get!string;
+					const ptype = ("type" in prop && prop["type"].type == Json.Type.string) ? prop["type"]
+						.get!string : "";
+					if (validateHeaderName(hv) is null && isPrimitiveHeaderType(ptype))
+						result ~= ParamHeader(childPath, HttpHeader.paramPrefix ~ hv, hv);
 				}
-			}();
+				walk(prop, childPath);
+			}
 		}
 	}
 
@@ -515,9 +509,12 @@ ParamHeader[] paramHeaders(Json inputSchema) @safe
 /// syntax, no CR/LF, primitive-only (`number` forbidden), and case-insensitive
 /// uniqueness across the whole schema. The annotation MUST also sit on a property
 /// that is _statically reachable_ from the root via a chain of `properties` keys
-/// only: an annotation reachable solely through `items` (or any other array
-/// keyword), composition (`oneOf`/`anyOf`/`allOf`/`not`), conditional
-/// (`if`/`then`/`else`), or `$ref`/`$defs` makes the tool definition invalid.
+/// only: an annotation under any other keyword — `items` and the other array
+/// keywords, composition (`oneOf`/`anyOf`/`allOf`/`not`), conditional
+/// (`if`/`then`/`else`), `$ref`/`$defs`, `additionalProperties`,
+/// `patternProperties`, `dependentSchemas`, `unevaluatedProperties`,
+/// `propertyNames`, or an unknown keyword — makes the tool definition invalid.
+/// Data-valued keywords (`const`/`enum`/`default`/`examples`) are not searched.
 /// Returns a human-readable reason on the first violation, or `null` when every
 /// annotation is valid.
 string validateInputSchemaHeaders(Json inputSchema) @safe
@@ -535,131 +532,111 @@ string validateInputSchemaHeaders(Json inputSchema) @safe
 		{
 			if ("x-mcp-header" in node)
 				return true;
-			() @trusted {
-				foreach (string _, Json v; node)
-					if (containsAnnotation(v))
-					{
-						found = true;
-						break;
-					}
-			}();
+			foreach (_, v; node.byKeyValue)
+				if (containsAnnotation(v))
+				{
+					found = true;
+					break;
+				}
 		}
 		else if (node.type == Json.Type.array)
 		{
-			() @trusted {
-				foreach (Json elem; node)
-					if (containsAnnotation(elem))
-					{
-						found = true;
-						break;
-					}
-			}();
+			foreach (elem; node.byValue)
+				if (containsAnnotation(elem))
+				{
+					found = true;
+					break;
+				}
 		}
 		return found;
 	}
 
-	// Keywords whose subtrees are NOT a `properties` chain: an annotation reached
-	// only through one of these is not statically reachable (array keywords,
-	// composition, conditional, and reference/definition containers).
-	static immutable string[] nonReachableKeys = [
-		"items", "prefixItems", "additionalItems", "contains", "oneOf", "anyOf",
-		"allOf", "not", "if", "then", "else", "$defs", "definitions"
+	// Keywords whose values are JSON data rather than subschemas: an
+	// `x-mcp-header` key inside them is not an annotation.
+	static immutable string[] valueKeys = [
+		"const", "enum", "default", "examples"
 	];
 
-	void walk(Json node) @safe
+	// `isProperty` is true when `node` is a `properties` member, whose own
+	// `x-mcp-header` the caller has already validated.
+	void walk(Json node, bool isProperty) @safe
 	{
+		import std.algorithm.searching : canFind;
+
 		if (err !is null || node.type != Json.Type.object)
 			return;
 		if ("properties" in node && node["properties"].type == Json.Type.object)
 		{
-			() @trusted {
-				foreach (string name, Json prop; node["properties"])
+			foreach (name, prop; node["properties"].byKeyValue)
+			{
+				if (err !is null)
+					break;
+				if (prop.type != Json.Type.object)
+					continue;
+				if ("x-mcp-header" in prop)
 				{
-					if (err !is null)
-						return;
-					if (prop.type != Json.Type.object)
-						continue;
-					if ("x-mcp-header" in prop)
+					if (prop["x-mcp-header"].type != Json.Type.string)
 					{
-						if (prop["x-mcp-header"].type != Json.Type.string)
-						{
-							err = "x-mcp-header value on '" ~ name ~ "' MUST be a string";
-							return;
-						}
-						const hv = prop["x-mcp-header"].get!string;
-						auto nameErr = validateHeaderName(hv);
-						if (nameErr !is null)
-						{
-							err = nameErr;
-							return;
-						}
-						const ptype = ("type" in prop && prop["type"].type == Json.Type.string) ? prop["type"]
-							.get!string : "";
-						if (!isPrimitiveHeaderType(ptype))
-						{
-							err = "x-mcp-header '" ~ hv ~ "' on '" ~ name
-								~ "' may only be applied to primitive types"
-								~ " (integer/string/boolean); type '" ~ ptype ~ "' is not permitted";
-							return;
-						}
-						const lc = asciiLowerName(hv);
-						if (lc in seen)
-						{
-							err = "x-mcp-header value '" ~ hv
-								~ "' is not case-insensitively unique within the inputSchema";
-							return;
-						}
-						seen[lc] = true;
+						err = "x-mcp-header value on '" ~ name ~ "' MUST be a string";
+						break;
 					}
-					walk(prop);
+					const hv = prop["x-mcp-header"].get!string;
+					auto nameErr = validateHeaderName(hv);
+					if (nameErr !is null)
+					{
+						err = nameErr;
+						break;
+					}
+					const ptype = ("type" in prop && prop["type"].type == Json.Type.string) ? prop["type"]
+						.get!string : "";
+					if (!isPrimitiveHeaderType(ptype))
+					{
+						err = "x-mcp-header '" ~ hv ~ "' on '" ~ name
+							~ "' may only be applied to primitive types"
+							~ " (integer/string/boolean); type '" ~ ptype ~ "' is not permitted";
+						break;
+					}
+					import std.uni : toLower;
+
+					const lc = hv.toLower;
+					if (lc in seen)
+					{
+						err = "x-mcp-header value '" ~ hv
+							~ "' is not case-insensitively unique within the inputSchema";
+						break;
+					}
+					seen[lc] = true;
 				}
-			}();
+				walk(prop, true);
+			}
 		}
-		// An annotation reachable only through a non-`properties` keyword violates the
-		// statically-reachable rule and invalidates the whole tool definition.
-		foreach (key; nonReachableKeys)
+		// Only a chain of `properties` keys reaches an annotated property
+		// statically; an annotation under any other keyword (array, composition,
+		// conditional, reference, map-shaped keywords such as
+		// `additionalProperties`/`patternProperties`, or an unknown extension)
+		// invalidates the whole tool definition.
+		foreach (key, v; node.byKeyValue)
 		{
-			if (err !is null)
-				break;
-			if (key in node && containsAnnotation(node[key]))
+			if (key == "properties" || valueKeys.canFind(key) || (isProperty && key == "x-mcp-header"))
+				continue;
+			if (key == "x-mcp-header" || containsAnnotation(v))
 			{
 				err = "x-mcp-header MUST only be applied to statically reachable properties"
 					~ " (a chain of `properties` keys); an annotation under `" ~ key
 					~ "` is invalid";
-				return;
+				break;
 			}
 		}
 	}
 
-	walk(inputSchema);
+	walk(inputSchema, false);
 	return err;
-}
-
-/// Extract the `x-mcp-header` annotations from a tool `inputSchema`, returning a
-/// map of (top-level) parameter name -> header name (`Mcp-Param-{name}`).
-///
-/// Retained for backward compatibility; only top-level, primitive-typed, valid
-/// annotations appear. Nested annotations (which `validateInputSchemaHeaders`
-/// accepts and `paramHeaders` surfaces) are silently omitted, so a schema whose
-/// only annotations are nested validates yet yields an empty map. Prefer
-/// `paramHeaders` (path-aware, any nesting depth) for new code.
-deprecated("nested x-mcp-header annotations are dropped; use paramHeaders") string[string] paramHeaderMap(
-		Json inputSchema) @safe
-{
-	string[string] map;
-	foreach (ph; paramHeaders(inputSchema))
-		if (ph.path.length == 1)
-			map[ph.path[0]] = ph.header;
-	return map;
 }
 
 // ===========================================================================
 // Multi Round-Trip Requests (MRTR) — SEP-2322
 // ===========================================================================
 
-/// One unit of input the server needs from the client to continue (replacing a
-/// server-initiated `sampling/createMessage`, `elicitation/create`, or
-/// `roots/list` request).
 /// The kind of server->client request an MRTR `InputRequest` stands in for.
 /// Maps to the wire `type` discriminator (`"sampling"`/`"elicitation"`/`"roots"`).
 enum InputKind
@@ -669,6 +646,9 @@ enum InputKind
 	roots,
 }
 
+/// One unit of input the server needs from the client to continue (replacing a
+/// server-initiated `sampling/createMessage`, `elicitation/create`, or
+/// `roots/list` request).
 struct InputRequest
 {
 	string id; /// correlation id chosen by the server (the `InputRequests` map key)
@@ -700,8 +680,10 @@ struct InputRequest
 	}
 
 	/// Build a form-`elicitation` input-request from a message and an optional
-	/// JSON Schema (`requestedSchema`). For a `requestedSchema` derived from a flat
-	/// struct `T`, use `mcp.protocol.schema.elicitationRequest!T` (where
+	/// JSON Schema (`requestedSchema`). Form mode requires a `requestedSchema`, so
+	/// without one the request carries an empty object schema (a plain
+	/// confirmation). For a `requestedSchema` derived from a flat
+	/// struct `T`, use `mcp.api.binding.elicitationRequest!T` (where
 	/// reflection-driven schema generation lives, so this module stays free of any
 	/// schema/reflection dependency).
 	static InputRequest elicitation(string id, string message, Json requestedSchema = Json
@@ -711,6 +693,11 @@ struct InputRequest
 		p["message"] = message;
 		if (requestedSchema.type == Json.Type.object)
 			p["requestedSchema"] = requestedSchema;
+		else
+			p["requestedSchema"] = Json([
+			"type": Json("object"),
+			"properties": Json.emptyObject
+		]);
 		return InputRequest(id, "elicitation", p);
 	}
 
@@ -718,13 +705,16 @@ struct InputRequest
 	/// form, the client is directed to a `url` to gather input out-of-band. The
 	/// modern `ElicitRequestURLParams` is `{mode:"url", message, url}` — correlation
 	/// is the MRTR `InputRequest.id`, so the request carries no `elicitationId`
-	/// (removed from 2026-07-28). `url` MUST be a non-empty valid absolute URI.
+	/// (removed from 2026-07-28). `url` MUST be a non-empty valid absolute URI;
+	/// otherwise this throws a plain `Exception` (a local programming error, not
+	/// a peer `-32602`).
 	static InputRequest elicitationUrl(string id, string message, string url) @safe
 	{
-		if (url.length == 0)
-			throw invalidParams("URL-mode elicitation requires a non-empty url");
-		if (!isValidElicitationUrl(url))
-			throw invalidParams("URL-mode elicitation requires a valid url (absolute URI): " ~ url);
+		import std.exception : enforce;
+
+		enforce(url.length > 0, "URL-mode elicitation requires a non-empty url");
+		enforce(isValidElicitationUrl(url),
+				"URL-mode elicitation requires a valid url (absolute URI): " ~ url);
 		Json p = Json.emptyObject;
 		p["mode"] = "url";
 		p["message"] = message;
@@ -768,12 +758,21 @@ struct InputRequest
 
 	/// Read `params["url"]` as a string (`""` when absent) — the reader
 	/// counterpart to the `elicitationUrl` builder. Non-empty only for url-mode
-	/// elicitation requests (`params["mode"] == "url"`).
-	string elicitationUrl() @safe
+	/// elicitation requests (`params["mode"] == "url"`). Throws -32602 when the
+	/// url is present but not a valid http(s) URL, since the client would
+	/// otherwise navigate to a server-chosen `javascript:` or `file:` target.
+	string url() @safe
 	{
+		import mcp.protocol.errors : invalidParams;
+
 		if (params.type == Json.Type.object && "url" in params
 				&& params["url"].type == Json.Type.string)
-			return params["url"].get!string;
+		{
+			const u = params["url"].get!string;
+			if (!isValidElicitationUrl(u))
+				throw invalidParams("URL-mode elicitation requires a valid http(s) url");
+			return u;
+		}
 		return "";
 	}
 
@@ -828,6 +827,7 @@ struct InputRequest
 	/// server-assigned id).
 	static InputRequest fromJson(string key, Json j) @safe
 	{
+		requireObject(j, "inputRequests." ~ key);
 		InputRequest r;
 		r.id = key;
 		r.type = ("method" in j && j["method"].type == Json.Type.string)
@@ -863,6 +863,7 @@ struct InputRequiredResult
 
 	static InputRequiredResult fromJson(Json j) @safe
 	{
+		requireObject(j, "InputRequiredResult");
 		InputRequiredResult r;
 		parseInputRequired(j, r.inputRequests, r.requestState);
 		return r;
@@ -889,23 +890,56 @@ void emitInputRequired(ref Json j, const(InputRequest)[] requests, string reques
 /// Parse the shared MRTR (SEP-2322) `InputRequiredResult` payload from `j` into
 /// `requests` and `requestState`. Inverse of `emitInputRequired`; shared by
 /// `InputRequiredResult.fromJson` and `CallToolResult.fromJson`. Both reads are
-/// guarded, so a `j` carrying neither field leaves the outputs untouched.
+/// guarded, so a `j` carrying neither field leaves the outputs untouched. A
+/// string `resultType` other than `"input_required"` declares the result
+/// complete, so any stray MRTR fields beside it are ignored; without a
+/// `resultType` the fields alone decide. A `resultType: "input_required"`
+/// carrying neither input requests nor a `requestState` throws -32602, since it
+/// would otherwise read as an empty completed result.
 void parseInputRequired(Json j, ref InputRequest[] requests, ref string requestState) @safe
 {
+	import mcp.protocol.errors : invalidParams;
+
+	const declared = "resultType" in j && j["resultType"].type == Json.Type.string;
+	if (declared && j["resultType"].get!string != "input_required")
+		return;
 	if ("inputRequests" in j && j["inputRequests"].type == Json.Type.object)
 		requests = inputRequestsFromJson(j["inputRequests"]);
 	tryGet(j, "requestState", requestState);
+	if (declared && requests.length == 0 && requestState.length == 0)
+		throw invalidParams("an input_required result must carry inputRequests or a requestState");
 }
 
 /// Serialize a list of `InputRequest`s as a spec `InputRequests` object: a map
 /// keyed by each request's server-assigned `id`, with `{ method, params }`
 /// request objects as values (SEP-2322, 2026-07-28 basic/utilities/mrtr).
+/// Throws when two requests share an `id`, since the map would keep only one;
+/// that is a local builder mistake, so it is a plain Exception.
 Json inputRequestsToJson(const(InputRequest)[] requests) @safe
 {
+	import std.exception : enforce;
+
 	Json obj = Json.emptyObject;
 	foreach (r; requests)
+	{
+		enforce(r.id !in obj, "duplicate InputRequest id '" ~ r.id ~ "'");
 		obj[r.id] = r.toJson();
+	}
 	return obj;
+}
+
+unittest  // inputRequestsToJson rejects duplicate request ids
+{
+	import std.exception : assertThrown;
+
+	assertThrown(inputRequestsToJson([
+		InputRequest("a", "elicitation", Json.emptyObject),
+		InputRequest("a", "roots", Json.emptyObject)
+	]));
+	assert(inputRequestsToJson([
+		InputRequest("a", "elicitation", Json.emptyObject),
+		InputRequest("b", "roots", Json.emptyObject)
+	]).length == 2);
 }
 
 /// Parse a spec `InputRequests` object (map keyed by id) back into the internal
@@ -916,10 +950,8 @@ InputRequest[] inputRequestsFromJson(Json j) @safe
 	if (j.type == Json.Type.object)
 	{
 		// `Json.opApply` is `@system`; iterating a plain object is safe here.
-		() @trusted {
-			foreach (string key, Json value; j)
-				requests ~= InputRequest.fromJson(key, value);
-		}();
+		foreach (key, value; j.byKeyValue)
+			requests ~= InputRequest.fromJson(key, value);
 	}
 	return requests;
 }
@@ -958,10 +990,8 @@ Json[string] readInputResponses(Json params) @safe
 	if (map.type != Json.Type.object)
 		return out_;
 	// `Json.opApply` is `@system`; iterating a plain object is safe here.
-	() @trusted {
-		foreach (string key, Json value; map)
-			out_[key] = value;
-	}();
+	foreach (key, value; map.byKeyValue)
+		out_[key] = value;
 	return out_;
 }
 
@@ -1026,6 +1056,44 @@ unittest  // emitInputRequired/parseInputRequired round-trip the shared MRTR glu
 	assert(outReqs.length == 1);
 	assert(outReqs[0].id == "date");
 	assert(outState == "opaque-state");
+}
+
+unittest  // an input_required result carrying neither inputRequests nor requestState is rejected
+{
+	import mcp.protocol.errors : ErrorCode, McpException;
+	import std.exception : collectException;
+
+	InputRequest[] reqs;
+	string state;
+	auto ex = cast(McpException) collectException(parseInputRequired(
+			Json(["resultType": Json("input_required")]), reqs, state));
+	assert(ex !is null && ex.code == ErrorCode.invalidParams);
+}
+
+unittest  // an input_required result with an empty inputRequests map and no requestState is rejected
+{
+	import mcp.protocol.errors : ErrorCode, McpException;
+	import std.exception : collectException;
+
+	InputRequest[] reqs;
+	string state;
+	auto ex = cast(McpException) collectException(
+			parseInputRequired(Json([
+		"resultType": Json("input_required"),
+		"inputRequests": Json.emptyObject
+	]), reqs, state));
+	assert(ex !is null && ex.code == ErrorCode.invalidParams);
+}
+
+unittest  // an input_required result carrying only a requestState parses
+{
+	InputRequest[] reqs;
+	string state;
+	parseInputRequired(Json([
+		"resultType": Json("input_required"),
+		"requestState": Json("s")
+	]), reqs, state);
+	assert(reqs.length == 0 && state == "s");
 }
 
 unittest  // emitInputRequired omits an empty requestState
@@ -1128,8 +1196,31 @@ unittest  // InputRequest.requestedSchema reads back the elicitation builder sch
 
 unittest  // InputRequest.requestedSchema is undefined when no schema is present
 {
-	auto ir = InputRequest.elicitation("e1", "Just a message");
+	auto ir = InputRequest("e1", "elicitation", Json([
+		"message": Json("Just a message")
+	]));
 	assert(ir.requestedSchema().type == Json.Type.undefined);
+}
+
+unittest  // InputRequest.elicitation without a schema sends an empty object schema
+{
+	auto ir = InputRequest.elicitation("e1", "Just a message");
+	auto schema = ir.params["requestedSchema"];
+	assert(schema["type"].get!string == "object");
+	assert(schema["properties"].type == Json.Type.object);
+	assert(schema["properties"].length == 0);
+}
+
+unittest  // InputRequiredResult.fromJson rejects a non-object result with -32602
+{
+	import std.exception : collectException;
+	import mcp.protocol.errors : McpException, ErrorCode;
+
+	foreach (v; [Json(5), Json("x"), Json.emptyArray, Json(null)])
+	{
+		auto ex = cast(McpException) collectException(InputRequiredResult.fromJson(v));
+		assert(ex !is null && ex.code == ErrorCode.invalidParams);
+	}
 }
 
 unittest  // MRTR InputRequiredResult round-trips and input responses parse
@@ -1276,6 +1367,19 @@ unittest  // decodeHeaderValue tolerates sentinel-framed but invalid base64
 	// value is returned so downstream comparison yields a clean mismatch.
 	const malformed = "=?base64?@@@@?=";
 	assert(decodeHeaderValue(malformed) == malformed);
+}
+
+unittest  // decodeHeaderValue treats base64 that decodes to invalid UTF-8 as malformed
+{
+	import std.base64 : Base64;
+	import std.utf : validate;
+
+	const string bad = "=?base64?" ~ Base64.encode(cast(const(ubyte)[])[
+		0xff, 0xfe, 0x41
+	]).idup ~ "?=";
+	const decoded = decodeHeaderValue(bad);
+	assert(decoded == bad);
+	validate(decoded);
 }
 
 unittest  // encodeHeaderValue neutralises CR/LF, so an encoded value is wire-safe
@@ -1480,40 +1584,9 @@ unittest  // metaLabels splits dot-separated labels, preserving empties
 	assert(metaLabels("solo") == ["solo"]);
 }
 
-deprecated unittest  // paramHeaderMap reads x-mcp-header annotations
+unittest  // paramHeaderMap is not part of the API; paramHeaders is the one extractor
 {
-	Json schema = Json.emptyObject;
-	schema["type"] = "object";
-	Json props = Json.emptyObject;
-	props["region"] = Json([
-		"type": Json("string"),
-		"x-mcp-header": Json("Region")
-	]);
-	props["query"] = Json(["type": Json("string")]);
-	schema["properties"] = props;
-
-	auto m = paramHeaderMap(schema);
-	assert("region" in m);
-	assert(m["region"] == "Mcp-Param-Region");
-	assert("query" !in m);
-}
-
-deprecated unittest  // paramHeaderMap silently drops nested annotations (use paramHeaders)
-{
-	Json schema = Json.emptyObject;
-	schema["type"] = "object";
-	Json nested = Json.emptyObject;
-	nested["type"] = "object";
-	nested["properties"] = Json([
-		"region": Json(["type": Json("string"), "x-mcp-header": Json("Region")])
-	]);
-	schema["properties"] = Json(["filter": nested]);
-
-	// The schema is valid and the annotation is path-aware-visible, ...
-	assert(validateInputSchemaHeaders(schema) is null);
-	assert(paramHeaders(schema).length == 1);
-	// ... but the legacy map form drops the nested annotation entirely.
-	assert(paramHeaderMap(schema).length == 0);
+	static assert(!__traits(compiles, paramHeaderMap(Json.emptyObject)));
 }
 
 unittest  // validateHeaderName: empty value rejected (modern x-mcp-header MUST NOT be empty)
@@ -1564,6 +1637,37 @@ unittest  // validateInputSchemaHeaders: a valid primitive annotation passes
 		"x-mcp-header": Json("Limit")
 	]);
 	schema["properties"] = props;
+	assert(validateInputSchemaHeaders(schema) is null);
+}
+
+unittest  // validateInputSchemaHeaders rejects an annotation under any non-`properties` keyword
+{
+	import vibe.data.json : parseJsonString;
+
+	enum ann = `{"type":"string","x-mcp-header":"H"}`;
+	foreach (frag; [
+		`"additionalProperties":` ~ ann, `"patternProperties":{"^a":` ~ ann ~ `}`,
+		`"dependentSchemas":{"a":{"properties":{"b":` ~ ann ~ `}}}`,
+		`"unevaluatedProperties":` ~ ann, `"propertyNames":` ~ ann,
+		`"x-vendor":{"properties":{"b":` ~ ann ~ `}}`, `"x-mcp-header":"Root"`
+	])
+	{
+		auto schema = parseJsonString(`{"type":"object",` ~ frag ~ `}`);
+		assert(validateInputSchemaHeaders(schema) !is null, frag);
+	}
+	// The same holds below a nested object property.
+	auto nested = parseJsonString(`{"type":"object","properties":{"o":{"type":"object",`
+			~ `"additionalProperties":` ~ ann ~ `}}}`);
+	assert(validateInputSchemaHeaders(nested) !is null);
+}
+
+unittest  // validateInputSchemaHeaders ignores annotation-shaped data under value keywords
+{
+	import vibe.data.json : parseJsonString;
+
+	auto schema = parseJsonString(`{"type":"object","properties":{"o":{"type":"object",`
+			~ `"default":{"x-mcp-header":"x"},"examples":[{"x-mcp-header":"y"}]},`
+			~ `"r":{"type":"string","x-mcp-header":"Region"}}}`);
 	assert(validateInputSchemaHeaders(schema) is null);
 }
 
@@ -1861,24 +1965,59 @@ unittest  // InputRequest.elicitationUrl builds modern url-mode params (no elici
 unittest  // InputRequest.elicitationUrl readers round-trip url and message
 {
 	auto ir = InputRequest.elicitationUrl("e1", "msg", "https://example.com/consent");
-	assert(ir.elicitationUrl() == "https://example.com/consent");
+	assert(ir.url() == "https://example.com/consent");
 	assert(ir.elicitationMessage() == "msg");
 }
 
-unittest  // InputRequest.elicitationUrl rejects empty url
+unittest  // InputRequest.url rejects a server-sent url that is not a valid web URL
 {
-	import std.exception : assertThrown;
-	import mcp.protocol.errors : McpException;
+	import std.exception : collectException;
+	import mcp.protocol.errors : ErrorCode, McpException;
 
-	assertThrown!McpException(InputRequest.elicitationUrl("e", "m", ""));
+	Json p = Json.emptyObject;
+	p["mode"] = "url";
+	p["message"] = "msg";
+	p["url"] = "javascript:alert(1)";
+	auto ir = InputRequest.fromJson("e1",
+			Json(["method": Json("elicitation/create"), "params": p]));
+	auto e = collectException!McpException(ir.url());
+	assert(e !is null && e.code == ErrorCode.invalidParams);
 }
 
-unittest  // InputRequest.elicitationUrl rejects a malformed (non-absolute) url
+unittest  // InputRequest.elicitationUrl rejects empty url as a local error
 {
-	import std.exception : assertThrown;
+	import std.exception : collectException;
 	import mcp.protocol.errors : McpException;
 
-	assertThrown!McpException(InputRequest.elicitationUrl("e", "m", "not a url"));
+	auto e = collectException(InputRequest.elicitationUrl("e", "m", ""));
+	assert(e !is null);
+	assert(cast(McpException) e is null);
+}
+
+unittest  // InputRequest.elicitationUrl rejects a malformed (non-absolute) url as a local error
+{
+	import std.exception : collectException;
+	import mcp.protocol.errors : McpException;
+
+	auto e = collectException(InputRequest.elicitationUrl("e", "m", "not a url"));
+	assert(e !is null);
+	assert(cast(McpException) e is null);
+}
+
+unittest  // InputRequest.fromJson rejects a non-object request value with -32602
+{
+	import std.exception : collectException;
+	import mcp.protocol.errors : McpException, ErrorCode;
+
+	foreach (v; [Json(5), Json("x"), Json.emptyArray, Json(null)])
+	{
+		auto ex = collectException!McpException(InputRequest.fromJson("r1", v));
+		assert(ex !is null && ex.code == ErrorCode.invalidParams);
+	}
+	Json map = Json.emptyObject;
+	map["r1"] = Json(5);
+	auto ex = collectException!McpException(inputRequestsFromJson(map));
+	assert(ex !is null && ex.code == ErrorCode.invalidParams);
 }
 
 unittest  // InputRequest.fromJson: non-string "method" field is treated as unknown type

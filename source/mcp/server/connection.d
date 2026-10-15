@@ -11,9 +11,12 @@ import mcp.server.push : ListenFilter;
 ///
 /// This is the designated home for the mutable per-peer state that would
 /// otherwise leak across concurrently-served connections that share one server
-/// instance. A `McpServer`
-/// itself holds only immutable registration data, declared capabilities, the
-/// `serverInfo`, and the chosen `ServerMode`; per-peer state lives here.
+/// instance. A `McpServer` holds its registrations, declared capabilities, the
+/// `serverInfo`, the chosen `ServerMode`, and server-wide runtimes (tasks,
+/// events); per-peer state lives here. The exception is stdio, which serves a
+/// single peer per process: `McpServer` keeps that peer's stream state itself
+/// (the write sink, the `subscriptions/listen` sink and filter, the open
+/// `events/stream`s) beside the bound `activeConnection`.
 ///
 /// Ownership by mode:
 ///   - stateful: exactly one `ConnectionState` per session, owned by the
@@ -42,8 +45,11 @@ final class ConnectionState
 	/// (stateful) or the per-request `_meta` log level (modern).
 	string logLevel = "info";
 
-	/// The resource URIs this connection has subscribed to (stateful only).
-	bool[string] subscriptions;
+	/// The resource URIs this connection has subscribed to via
+	/// `resources/subscribe` (stateful only), each mapped to the server's
+	/// subscription epoch when it was made; an entry older than its resource's
+	/// removal is stale.
+	ulong[string] subscriptions;
 
 	/// The per-stream opt-in parsed from a `subscriptions/listen` request
 	/// dispatched with this state (2026-07-28 basic/utilities/subscriptions
@@ -59,8 +65,8 @@ final class ConnectionState
 	/// identically-numbered request.
 	CancellationToken[string] inFlight;
 
-	/// Whether the client has sent `notifications/initialized` for this connection
-	/// (stateful). The lifecycle gate (opt-in via `requireInitialized`) serves
+	/// Whether the client has sent `notifications/initialized` after an
+	/// `initialize` was processed on this connection (stateful). The lifecycle gate (opt-in via `requireInitialized`) serves
 	/// non-`ping` requests only once this is set.
 	bool initialized;
 

@@ -6,6 +6,9 @@ import vibe.http.common : HTTPMethod;
 import vibe.stream.operations : readAllUTF8;
 
 import mcp.protocol.errors;
+import mcp.protocol.jsonrpc : parseUntrustedJson;
+import mcp.protocol.ssrf : SsrfPolicy;
+import std.typecons : Nullable;
 import mcp.auth.oauth;
 
 @safe:
@@ -36,10 +39,61 @@ enum FetchResult
 	error
 }
 
+/// Whether a protected-resource metadata document's `resource` identifies the
+/// MCP server at `mcpEndpoint` (RFC 9728 §3.3). After canonicalizing both, the
+/// resource must equal the endpoint or be a same-origin path prefix of it ending
+/// on a `/` boundary — the latter covers a document served at the root
+/// well-known URL that names the whole origin (or a parent path) as the
+/// resource. A missing `resource` never matches.
+package bool prmResourceMatches(string prmResource, string mcpEndpoint) @safe
+{
+	import std.string : startsWith;
+
+	if (prmResource.length == 0)
+		return false;
+	const want = canonicalResourceUri(mcpEndpoint);
+	const have = canonicalResourceUri(prmResource);
+	if (have == want)
+		return true;
+	return want.length > have.length && want.startsWith(have) && want[have.length] == '/';
+}
+
+/// Where an MCP endpoint's authorization server was found
+/// (`OAuthClient.discoverIssuer`).
+struct IssuerResolution
+{
+	/// The issuer to run authorization-server metadata discovery against.
+	string issuer;
+	/// True when `issuer` came from a protected-resource metadata document (RFC
+	/// 9728); false on the 2025-03-26 origin fallback.
+	bool fromProtectedResourceMetadata;
+	/// That protected-resource metadata document (empty on the origin fallback).
+	ProtectedResourceMetadata metadata;
+}
+
+/// The `aud` an `OAuthClient` puts in a `private_key_jwt` client assertion
+/// (RFC 7523 §3). Authorization servers differ: some require their issuer
+/// identifier, others (OIDC Core §9) their token endpoint URL.
+enum AssertionAudience
+{
+	/// The authorization server's issuer identifier, falling back to the token
+	/// endpoint when the metadata names no issuer.
+	issuer,
+	/// The token endpoint URL.
+	tokenEndpoint,
+	/// Both the issuer identifier and the token endpoint URL.
+	both,
+}
+
 /// A production OAuth 2.1 client for MCP: drives protected-resource and
 /// authorization-server metadata discovery (RFC 9728 / RFC 8414), Dynamic Client
 /// Registration (RFC 7591), and the token endpoint (authorization-code + PKCE,
 /// client-credentials, refresh) with RFC 8707 resource indicators.
+///
+/// Access tokens are presented as `Bearer`, so the access-token grants reject a
+/// response whose `token_type` is anything else (such as `DPoP`);
+/// `tokenExchange` does so only when it requests an access token, since it may
+/// issue a non-access token (`N_A`).
 ///
 /// The interactive authorization-code redirect (opening a browser / running a
 /// loopback listener) is supplied by the host application via an
@@ -52,14 +106,27 @@ final class OAuthClient
 	/// authorization server advertises support, so `authorizationUrl`,
 	/// `exchangeCode`, `refresh`, `clientCredentials`, `tokenExchange`, and
 	/// `jwtBearerGrant` reject an empty value.
-	/// `useOAuth` sets this to the canonical MCP server URI automatically.
+	/// `useOAuth` sets this automatically: to the canonical `resource` named by
+	/// the server's protected-resource metadata (which may be a parent of the
+	/// endpoint), else to the canonical MCP server URI.
 	string resource;
-	/// The client's redirect URI for the auth-code flow.
-	string redirectUri = "http://localhost:8765/callback";
-	/// How to authenticate at the token endpoint.
+	/// The client's redirect URI for the auth-code flow. The default names the
+	/// `127.0.0.1` literal (RFC 8252 §8.3), as `loopbackRedirectUri` does.
+	string redirectUri = "http://127.0.0.1:8765/callback";
+	/// How to authenticate at the token endpoint. Under `none`, a client that
+	/// nevertheless holds a `clientSecret` authenticates with
+	/// `client_secret_basic`.
 	TokenEndpointAuthMethod authMethod = TokenEndpointAuthMethod.none;
-	/// EC private key (PKCS#8 PEM) for `private_key_jwt` client assertions.
+	/// RSA or EC (P-256) private key (PKCS#8 PEM) for `private_key_jwt` client
+	/// assertions. Required when `authMethod` is `privateKeyJwt`.
 	string privateKeyPem;
+	/// The URL at which this client publishes its public JWK Set. A
+	/// `private_key_jwt` Dynamic Client Registration names it as `jwks_uri`;
+	/// when empty, the registration carries the public key derived from
+	/// `privateKeyPem` as `jwks` instead.
+	string jwksUri;
+	/// The `aud` of `private_key_jwt` client assertions.
+	AssertionAudience assertionAudience = AssertionAudience.issuer;
 	/// SEP-991: this client's OAuth Client ID Metadata Document URL — an
 	/// HTTPS URL (with a path component) at which the client hosts its metadata
 	/// document. When set and the authorization server advertises
@@ -67,20 +134,96 @@ final class OAuthClient
 	/// `client_id` (no Dynamic Client Registration needed).
 	string clientIdMetadataUrl;
 
+	/// The SSRF policy for every URL this client fetches or validates during
+	/// discovery, registration and the token flows. When null, the policy is
+	/// anchored at the MCP endpoint: `allowLoopback` when that endpoint is on
+	/// an explicit loopback host, else `blockInternal`. Set it to reach an
+	/// authorization server on a private network (`allowUserConfigured`), or to
+	/// forbid loopback even for a loopback endpoint (`blockInternal`).
+	Nullable!SsrfPolicy ssrfPolicy;
+
+	/// The SSRF policy for a URL the MCP server or its authorization server
+	/// names (discovered metadata, token, registration and authorization
+	/// endpoints). Unless `ssrfPolicy` is set, plain-http loopback is permitted
+	/// only when the MCP endpoint the user configured (`resource`) is itself on
+	/// loopback, so a remote server can never steer the client — and its codes,
+	/// tokens and secrets — to a local service.
+	private SsrfPolicy namedUrlPolicy() const @safe
+	{
+		return policyAnchoredAt(resource);
+	}
+
+	/// `ssrfPolicy` when set; otherwise `allowLoopback` when `userUrl` (a URL
+	/// the user configured) targets an explicit loopback host, else
+	/// `blockInternal`.
+	private SsrfPolicy policyAnchoredAt(string userUrl) const @safe
+	{
+		import mcp.protocol.ssrf : AddressClass, classifyHostLexical;
+		import vibe.inet.url : URL;
+
+		if (!ssrfPolicy.isNull)
+			return ssrfPolicy.get;
+		try
+		{
+			if (classifyHostLexical(URL(userUrl).host) == AddressClass.loopback)
+				return SsrfPolicy.allowLoopback;
+		}
+		catch (Exception)
+		{
+		}
+		return SsrfPolicy.blockInternal;
+	}
+
 	/// Build the `client_assertion_type` + `client_assertion` form fields for
-	/// `private_key_jwt` token-endpoint authentication (RFC 7523), or "".
-	private string clientAssertionParams(string clientId, string audience) @safe
+	/// `private_key_jwt` token-endpoint authentication (RFC 7523), or "" for any
+	/// other method. Throws when `private_key_jwt` is selected without a
+	/// `privateKeyPem`, rather than sending an unauthenticated request.
+	private string clientAssertionParams(string clientId, string[] audiences) @safe
 	{
 		import std.uri : encodeComponent;
 		import std.datetime.systime : Clock;
 		import mcp.auth.jwt : makeClientAssertion, jwtBearerAssertionType;
 
-		if (authMethod != TokenEndpointAuthMethod.privateKeyJwt || privateKeyPem.length == 0)
+		if (authMethod != TokenEndpointAuthMethod.privateKeyJwt)
 			return "";
-		const now = () @trusted { return Clock.currTime().toUnixTime(); }();
-		const jwt = makeClientAssertion(clientId, audience, privateKeyPem, now);
+		if (privateKeyPem.length == 0)
+			throw invalidRequest(
+					"OAuthClient.privateKeyPem must be set when authMethod is " ~ "private_key_jwt");
+		const now = Clock.currTime().toUnixTime();
+		const jwt = makeClientAssertion(clientId, audiences, privateKeyPem, now);
 		return "&client_assertion_type=" ~ encodeComponent(
 				jwtBearerAssertionType) ~ "&client_assertion=" ~ encodeComponent(jwt);
+	}
+
+	/// The client-assertion audiences for a token request to `as_`, per
+	/// `assertionAudience`.
+	private string[] assertionAudiences(AuthorizationServerMetadata as_) const @safe
+	{
+		final switch (assertionAudience)
+		{
+		case AssertionAudience.issuer:
+			return [as_.issuer.length ? as_.issuer : as_.tokenEndpoint];
+		case AssertionAudience.tokenEndpoint:
+			return [as_.tokenEndpoint];
+		case AssertionAudience.both:
+			return as_.issuer.length && as_.issuer != as_.tokenEndpoint
+				? [as_.issuer, as_.tokenEndpoint] : [as_.tokenEndpoint];
+		}
+	}
+
+	/// The token-endpoint client-authentication form fields for grants whose
+	/// form builders do not carry them: `client_secret` under
+	/// `client_secret_post`, or a client assertion naming `audiences` under
+	/// `private_key_jwt`. `client_secret_basic` travels in the `Authorization`
+	/// header instead (see `postForm`).
+	private string clientAuthParams(RegisteredClient client, string[] audiences) @safe
+	{
+		import std.uri : encodeComponent;
+
+		string s;
+		if (authMethod == TokenEndpointAuthMethod.clientSecretPost && client.clientSecret.length)
+			s = "&client_secret=" ~ encodeComponent(client.clientSecret);
+		return s ~ clientAssertionParams(client.clientId, audiences);
 	}
 
 	/// Discover the protected-resource metadata for an MCP endpoint, using the
@@ -93,24 +236,36 @@ final class OAuthClient
 		if (wwwAuthenticateHeader.length)
 		{
 			const w = parseWwwAuthenticate(wwwAuthenticateHeader);
-			// RFC 9728: the attacker-influenced resource_metadata URL from the
-			// WWW-Authenticate challenge must be HTTPS (or loopback for dev), must
-			// not target an internal/link-local address, and its origin MUST match
-			// the MCP endpoint's origin before we fetch it.
-			if (w.resourceMetadata.length && isSecureFetchUrl(w.resourceMetadata)
-					&& originOf(w.resourceMetadata) == originOf(mcpEndpoint))
+			// RFC 9728 §5.1: the resource_metadata URL from the WWW-Authenticate
+			// challenge may live on any origin. It is attacker-influenced, so it must
+			// be HTTPS (or plain-http loopback when the endpoint itself is on
+			// loopback) and must not target an internal/link-local address; the
+			// document it yields is then bound to the endpoint by the `resource`
+			// check below.
+			if (w.resourceMetadata.length && isSecureFetchUrl(w.resourceMetadata,
+					policyAnchoredAt(mcpEndpoint)))
 				urls ~= w.resourceMetadata;
 		}
 		urls ~= protectedResourceMetadataUrls(mcpEndpoint);
+		// Every candidate is fetched under the policy the user-configured
+		// endpoint permits.
+		const prmPolicy = policyAnchoredAt(mcpEndpoint);
 
 		bool anyError;
 		foreach (u; urls)
 		{
 			Json j;
-			final switch (tryGetJson(u, j))
+			final switch (tryGetJson(u, prmPolicy, j))
 			{
 			case FetchResult.ok:
-				return ProtectedResourceMetadata.fromJson(j);
+				auto prm = ProtectedResourceMetadata.fromJson(j);
+				// RFC 9728 §3.3: a document describing some other resource MUST NOT
+				// be used (it could steer the client to an attacker's AS).
+				if (!prmResourceMatches(prm.resource, mcpEndpoint))
+					throw internalError("Protected-resource metadata names resource '"
+							~ prm.resource
+							~ "', which does not match the MCP endpoint " ~ mcpEndpoint);
+				return prm;
 			case FetchResult.error:
 				anyError = true;
 				break;
@@ -138,20 +293,36 @@ final class OAuthClient
 	/// and OpenID Connect Discovery well-known locations in order.
 	///
 	/// `enforceIssuerMatch` selects how a discovered document's `issuer` is treated;
-	/// the issuer enforcement rule is documented on `bindDiscoveredIssuer`.
+	/// the issuer enforcement rule is documented on `bindDiscoveredIssuer`. Only
+	/// the lenient path (`enforceIssuerMatch` false) falls back to synthesized
+	/// default endpoints, and only when every candidate reported no document.
 	AuthorizationServerMetadata discoverAuthServer(string issuer, bool enforceIssuerMatch = true) @safe
 	{
+		bool anyError;
 		foreach (u; authServerMetadataCandidates(issuer))
 		{
 			Json j;
-			// Both a not-found and a fetch error fall through to the next candidate
-			// and then to the 2025-03-26 default-endpoint fallback below; the
-			// synthesized endpoints derive from the already-validated issuer, not
-			// from attacker-influenced data, so the lenient fallback is safe here.
-			if (tryGetJson(u, j) == FetchResult.ok)
+			final switch (tryGetJson(u, namedUrlPolicy(), j))
+			{
+			case FetchResult.ok:
 				return bindDiscoveredIssuer(AuthorizationServerMetadata.fromJson(j),
 						issuer, enforceIssuerMatch);
+			case FetchResult.error:
+				anyError = true;
+				break;
+			case FetchResult.notFound:
+				break;
+			}
 		}
+		// Synthesized endpoints carry no PKCE or RFC 9207 metadata, so they are
+		// only acceptable for a genuine 2025-03-26 server: one reached without
+		// protected-resource metadata whose candidates all reported no document.
+		if (enforceIssuerMatch)
+			throw internalError("No authorization server metadata document for issuer " ~ issuer);
+		if (anyError)
+			throw internalError(
+					"Authorization server metadata discovery failed (a candidate could "
+					~ "not be fetched); refusing to synthesize default endpoints");
 		// 2025-03-26 fallback: no metadata document — use default endpoints
 		// derived from the issuer.
 		import std.string : endsWith;
@@ -197,34 +368,42 @@ final class OAuthClient
 	string resolveIssuer(string mcpEndpoint,
 			out bool fromProtectedResourceMetadata, string wwwAuthenticateHeader = "") @safe
 	{
+		const r = discoverIssuer(mcpEndpoint, wwwAuthenticateHeader);
+		fromProtectedResourceMetadata = r.fromProtectedResourceMetadata;
+		return r.issuer;
+	}
+
+	/// `resolveIssuer`, also returning the protected-resource metadata document
+	/// the issuer came from (for its `scopes_supported`).
+	IssuerResolution discoverIssuer(string mcpEndpoint, string wwwAuthenticateHeader = "") @safe
+	{
 		return resolveIssuerFrom(() => discoverProtectedResource(mcpEndpoint,
-				wwwAuthenticateHeader), mcpEndpoint, fromProtectedResourceMetadata);
+				wwwAuthenticateHeader), mcpEndpoint);
 	}
 
 	/// Decide the issuer from a protected-resource-metadata discovery, with the
 	/// discovery itself injected so the security-critical downgrade rule is unit
 	/// testable. Only a genuinely-absent document (`PrmAbsentException`) downgrades
 	/// to the 2025-03-26 origin-issuer fallback; any other failure (a fetch error,
-	/// an SSRF/insecure-URL rejection, a malformed document) propagates so the flow
-	/// fails closed rather than silently relaxing issuer binding.
-	private static string resolveIssuerFrom(scope ProtectedResourceMetadata delegate() @safe discover,
-			string mcpEndpoint, out bool fromProtectedResourceMetadata) @safe
+	/// an SSRF/insecure-URL rejection, a malformed document, or a document naming
+	/// no authorization server, which RFC 9728 makes the only way to locate one)
+	/// propagates so the flow fails closed rather than silently relaxing issuer
+	/// binding.
+	private static IssuerResolution resolveIssuerFrom(
+			scope ProtectedResourceMetadata delegate() @safe discover, string mcpEndpoint) @safe
 	{
 		try
 		{
 			auto prm = discover();
-			if (prm.authorizationServers.length)
-			{
-				fromProtectedResourceMetadata = true;
-				return prm.authorizationServers[0];
-			}
+			if (prm.authorizationServers.length == 0)
+				throw internalError("Protected resource metadata lists no authorization_servers");
+			return IssuerResolution(prm.authorizationServers[0], true, prm);
 		}
 		catch (PrmAbsentException)
 		{
 			// Genuine pre-RFC-9728 server: no PRM document at all -> origin fallback.
 		}
-		fromProtectedResourceMetadata = false;
-		return originOf(mcpEndpoint);
+		return IssuerResolution(urlOrigin(mcpEndpoint), false);
 	}
 
 	/// Convenience overload that discards the discovery-source signal.
@@ -234,22 +413,17 @@ final class OAuthClient
 		return resolveIssuer(mcpEndpoint, fromPrm, wwwAuthenticateHeader);
 	}
 
-	private static string originOf(string url) @safe
-	{
-		import std.string : indexOf;
-
-		const schemeEnd = url.indexOf("://");
-		if (schemeEnd < 0)
-			return url;
-		const afterScheme = schemeEnd + 3;
-		const slash = url[afterScheme .. $].indexOf('/');
-		return (slash < 0) ? url : url[0 .. afterScheme + slash];
-	}
-
 	/// Register a client dynamically (RFC 7591) at the AS registration endpoint.
+	/// The AS may assign a different `token_endpoint_auth_method` than requested
+	/// (RFC 7591 §3.2.1); this client then uses it as its `authMethod`. Throws
+	/// when the response carries no `client_id`, or assigns a method this client
+	/// cannot perform (unknown, secret-based without a `client_secret`, or
+	/// `private_key_jwt` without a `privateKeyPem`).
 	RegisteredClient register(AuthorizationServerMetadata as_, string clientName,
 			string scopeStr = "") @safe
 	{
+		import std.traits : EnumMembers;
+
 		if (as_.registrationEndpoint.length == 0)
 			throw internalError("Authorization server does not support Dynamic Client Registration");
 		ClientRegistration reg;
@@ -257,8 +431,67 @@ final class OAuthClient
 		reg.clientName = clientName;
 		reg.scope_ = scopeStr;
 		reg.tokenEndpointAuthMethod = cast(string) authMethod;
+		if (authMethod == TokenEndpointAuthMethod.privateKeyJwt)
+			publishClientKeys(reg);
 		auto resp = postJson(as_.registrationEndpoint, reg.toJson());
-		return RegisteredClient.fromJson(resp);
+		auto rc = RegisteredClient.fromJson(resp);
+		if (rc.clientId.length == 0)
+			throw internalError("Dynamic client registration response carries no client_id");
+		const assigned = resp["token_endpoint_auth_method"];
+		if (assigned.type != Json.Type.string || assigned.get!string.length == 0)
+			return rc;
+		TokenEndpointAuthMethod method;
+		bool known;
+		static foreach (m; EnumMembers!TokenEndpointAuthMethod)
+			if (assigned.get!string == m)
+				{
+				method = m;
+				known = true;
+			}
+		if (!known)
+			throw internalError("Dynamic client registration assigned unsupported "
+					~ "token_endpoint_auth_method " ~ assigned.get!string);
+		final switch (method)
+		{
+		case TokenEndpointAuthMethod.none:
+			break;
+		case TokenEndpointAuthMethod.clientSecretBasic:
+		case TokenEndpointAuthMethod.clientSecretPost:
+			if (rc.clientSecret.length == 0)
+				throw internalError(
+						"Dynamic client registration assigned " ~ cast(
+						string) method ~ " but returned no client_secret");
+			break;
+		case TokenEndpointAuthMethod.privateKeyJwt:
+			if (privateKeyPem.length == 0)
+				throw internalError(
+						"Dynamic client registration assigned private_key_jwt "
+						~ "but OAuthClient.privateKeyPem is not set");
+			break;
+		}
+		authMethod = method;
+		return rc;
+	}
+
+	/// Name this client's public key in a `private_key_jwt` registration:
+	/// `jwksUri` when set, else the public JWK derived from `privateKeyPem`.
+	/// Throws when neither is configured, since the authorization server could
+	/// then never verify the client's assertions.
+	private void publishClientKeys(ref ClientRegistration reg) const @safe
+	{
+		import mcp.auth.jwt : publicJwkFromPrivateKeyPem;
+
+		if (jwksUri.length)
+		{
+			reg.jwksUri = jwksUri;
+			return;
+		}
+		if (privateKeyPem.length == 0)
+			throw invalidRequest("OAuthClient.privateKeyPem or jwksUri must be set to "
+					~ "register a private_key_jwt client");
+		auto keys = Json.emptyObject;
+		keys["keys"] = Json([publicJwkFromPrivateKeyPem(privateKeyPem)]);
+		reg.jwks = keys;
 	}
 
 	/// Select the client-registration approach for an authorization server,
@@ -314,8 +547,8 @@ final class OAuthClient
 		const post = authMethod == TokenEndpointAuthMethod.clientSecretPost;
 		auto form = buildAuthCodeTokenForm(code, redirectUri, codeVerifier,
 				client.clientId, resource, post ? client.clientSecret : "") ~ clientAssertionParams(
-				client.clientId, as_.issuer.length ? as_.issuer : as_.tokenEndpoint);
-		return TokenSet.fromJson(postForm(as_.tokenEndpoint, form, client));
+				client.clientId, assertionAudiences(as_));
+		return requireBearer(TokenSet.fromJson(postForm(as_.tokenEndpoint, form, client)));
 	}
 
 	/// Obtain a token via the client-credentials grant (service-to-service).
@@ -325,21 +558,27 @@ final class OAuthClient
 		requireResource();
 		const post = authMethod == TokenEndpointAuthMethod.clientSecretPost;
 		auto form = buildClientCredentialsForm(client.clientId, scopeStr,
-				resource, post ? client.clientSecret : "") ~ clientAssertionParams(client.clientId,
-				as_.issuer.length ? as_.issuer : as_.tokenEndpoint);
-		return TokenSet.fromJson(postForm(as_.tokenEndpoint, form, client));
+				resource, post ? client.clientSecret : "") ~ clientAssertionParams(
+				client.clientId, assertionAudiences(as_));
+		return requireBearer(TokenSet.fromJson(postForm(as_.tokenEndpoint, form, client)));
 	}
 
 	/// RFC 8693 token exchange: swap a subject token (e.g. an IdP id_token) for
 	/// a requested token type (e.g. an ID-JAG assertion) at `tokenEndpoint`.
 	/// Rejects an empty `resource` — see the class docstring for the rationale.
-	TokenSet tokenExchange(string tokenEndpoint, string subjectToken,
-			string subjectTokenType, string requestedTokenType, string audience, string clientId) @safe
+	/// The request authenticates as `client` under the configured `authMethod`.
+	/// A requested access token must come back as `Bearer`; any other requested
+	/// type (such as an ID-JAG, issued with `token_type` `N_A`) is returned as is.
+	TokenSet tokenExchange(string tokenEndpoint, string subjectToken, string subjectTokenType,
+			string requestedTokenType, string audience, RegisteredClient client) @safe
 	{
 		requireResource();
 		auto form = buildTokenExchangeForm(subjectToken, subjectTokenType,
-				requestedTokenType, audience, resource, clientId);
-		return TokenSet.fromJson(postForm(tokenEndpoint, form, RegisteredClient(clientId, "")));
+				requestedTokenType, audience, resource, client.clientId) ~ clientAuthParams(client,
+				[tokenEndpoint]);
+		auto ts = TokenSet.fromJson(postForm(tokenEndpoint, form, client));
+		return requestedTokenType == "urn:ietf:params:oauth:token-type:access_token" ? requireBearer(
+				ts) : ts;
 	}
 
 	/// RFC 7523 JWT-bearer grant: exchange an assertion JWT for an access token.
@@ -347,8 +586,9 @@ final class OAuthClient
 			RegisteredClient client, string assertion, string scopeStr) @safe
 	{
 		requireResource();
-		auto form = buildJwtBearerForm(assertion, scopeStr, resource, client.clientId);
-		return TokenSet.fromJson(postForm(as_.tokenEndpoint, form, client));
+		auto form = buildJwtBearerForm(assertion, scopeStr, resource, client.clientId)
+			~ clientAuthParams(client, assertionAudiences(as_));
+		return requireBearer(TokenSet.fromJson(postForm(as_.tokenEndpoint, form, client)));
 	}
 
 	/// Refresh an access token.
@@ -357,9 +597,9 @@ final class OAuthClient
 		requireResource();
 		const post = authMethod == TokenEndpointAuthMethod.clientSecretPost;
 		auto form = buildRefreshTokenForm(refreshToken, client.clientId,
-				resource, post ? client.clientSecret : "") ~ clientAssertionParams(client.clientId,
-				as_.issuer.length ? as_.issuer : as_.tokenEndpoint);
-		return TokenSet.fromJson(postForm(as_.tokenEndpoint, form, client));
+				resource, post ? client.clientSecret : "") ~ clientAssertionParams(
+				client.clientId, assertionAudiences(as_));
+		return requireBearer(TokenSet.fromJson(postForm(as_.tokenEndpoint, form, client)));
 	}
 
 	/// Build the authorization-request URL the host should open (browser/loopback).
@@ -371,7 +611,7 @@ final class OAuthClient
 		// SSRF guard at the source: the authorization endpoint comes from discovered
 		// AS metadata; reject a plaintext-http (non-loopback) or internal/link-local
 		// endpoint before constructing a URL any consumer might fetch.
-		requireSecureUrl(as_.authorizationEndpoint);
+		requireSecureUrl(as_.authorizationEndpoint, namedUrlPolicy());
 		return buildAuthorizationUrl(as_.authorizationEndpoint, client.clientId,
 				redirectUri, pkce.challenge, scopeStr, resource, state);
 	}
@@ -472,7 +712,8 @@ final class OAuthClient
 		string www;
 		try
 		{
-			secureRequestHTTP(mcpEndpoint, (scope HTTPClientRequest req) {
+			secureRequestHTTP(mcpEndpoint, policyAnchoredAt(mcpEndpoint),
+					(scope HTTPClientRequest req) {
 				req.method = HTTPMethod.POST;
 				req.contentType = "application/json";
 				req.headers["Accept"] = "application/json, text/event-stream";
@@ -501,20 +742,22 @@ final class OAuthClient
 	/// GET an authorization URL (without following redirects) and extract the
 	/// `code` query parameter from the `Location` response header.
 	///
-	/// When `expectedState` is non-empty, the `state` parameter returned in the
-	/// redirect is verified against it (MCP authorization "Open Redirection":
-	/// "MCP clients SHOULD use and verify state parameters in the authorization
-	/// code flow and discard any results that do not include or have a mismatch
-	/// with the original state"). The authorization code is NOT returned (empty
-	/// string) when the returned state is missing or does not match. Passing an
-	/// empty `expectedState` (the default) skips state verification.
-	string authorizeAndGetCode(string authzUrl, string expectedState = "") @safe
+	/// The `state` parameter returned in the redirect is verified against
+	/// `expectedState` (MCP authorization "Open Redirection": "MCP clients SHOULD
+	/// use and verify state parameters in the authorization code flow and discard
+	/// any results that do not include or have a mismatch with the original
+	/// state"); a missing or mismatched state throws. An empty `expectedState` is
+	/// refused, since it would accept any response. This overload has no issuer to
+	/// check RFC 9207 `iss` against; prefer the overload taking the authorization
+	/// server metadata, which also validates `iss`.
+	string authorizeAndGetCode(string authzUrl, string expectedState) @safe
 	{
+		requireExpectedState(expectedState);
 		// SSRF guard: never issue the outbound GET to a plaintext-http (non-loopback)
 		// or internal/link-local authorization endpoint; the connect is pinned to a
 		// pre-vetted resolved address.
 		string code, state;
-		secureRequestHTTP(authzUrl, (scope HTTPClientRequest req) {
+		secureRequestHTTP(authzUrl, namedUrlPolicy(), (scope HTTPClientRequest req) {
 			req.method = HTTPMethod.GET;
 		}, (scope HTTPClientResponse res) {
 			const loc = res.headers.get("Location", "");
@@ -523,8 +766,17 @@ final class OAuthClient
 			res.dropBody();
 		});
 		if (!validateAuthorizationResponseState(state, expectedState))
-			return "";
+			throw invalidRequest(
+					"Authorization response failed 'state' validation (missing or mismatched state)");
 		return code;
+	}
+
+	private static void requireExpectedState(string expectedState) @safe
+	{
+		if (expectedState.length == 0)
+			throw invalidRequest(
+					"authorizeAndGetCode requires the state sent in the authorization "
+					~ "request, so the response can be verified");
 	}
 
 	/// GET an authorization URL (without following redirects), extract the
@@ -535,19 +787,20 @@ final class OAuthClient
 	/// `authorization_response_iss_parameter_supported` is true, or when it does
 	/// not match the recorded issuer (simple string comparison, no
 	/// normalization). The authorization code is NOT returned on rejection.
-	/// When `expectedState` is non-empty, the redirect `state` parameter is also
-	/// verified against it and the authorization code is discarded (a throw)
-	/// when it is missing or mismatched, per the MCP "Open Redirection" guidance
-	/// ("MCP clients SHOULD use and verify state parameters ... and discard any
-	/// results that do not include or have a mismatch with the original state").
-	/// Passing an empty `expectedState` (the default) skips state verification.
+	/// The redirect `state` parameter is also verified against `expectedState`
+	/// and the authorization code is discarded (a throw) when it is missing or
+	/// mismatched, per the MCP "Open Redirection" guidance ("MCP clients SHOULD
+	/// use and verify state parameters ... and discard any results that do not
+	/// include or have a mismatch with the original state"). An empty
+	/// `expectedState` is refused.
 	string authorizeAndGetCode(AuthorizationServerMetadata as_, string authzUrl,
-			string expectedState = "") @safe
+			string expectedState) @safe
 	{
+		requireExpectedState(expectedState);
 		// SSRF guard (see overload above); the connect is pinned to a pre-vetted
 		// resolved address.
 		string code, iss, state;
-		secureRequestHTTP(authzUrl, (scope HTTPClientRequest req) {
+		secureRequestHTTP(authzUrl, namedUrlPolicy(), (scope HTTPClientRequest req) {
 			req.method = HTTPMethod.GET;
 		}, (scope HTTPClientResponse res) {
 			const loc = res.headers.get("Location", "");
@@ -568,11 +821,12 @@ final class OAuthClient
 
 	// --- HTTP helpers --------------------------------------------------------
 
-	private FetchResult tryGetJson(string url, out Json result) @safe
+	private FetchResult tryGetJson(string url, SsrfPolicy policy, out Json result) @safe
 	{
-		// Never fetch a discovery URL that is not HTTPS (or loopback for dev) or
-		// that targets an internal/link-local address — including a hostname that
-		// resolves to one (DNS-rebinding SSRF mitigation, pinned at connect time).
+		// Never fetch a discovery URL that `policy` rejects: not HTTPS (plain-http
+		// loopback aside, under `allowLoopback`), or targeting an internal/link-local
+		// address — including a hostname that resolves to one (DNS-rebinding SSRF
+		// mitigation, pinned at connect time).
 		Json parsed;
 		// A reachable response that is not a usable 2xx-with-body means "no document
 		// here"; an exception (SSRF block, TLS/DNS/network failure, or a malformed
@@ -581,14 +835,14 @@ final class OAuthClient
 		auto outcome = FetchResult.notFound;
 		try
 		{
-			secureRequestHTTP(url, (scope HTTPClientRequest req) {
+			secureRequestHTTP(url, policy, (scope HTTPClientRequest req) {
 				req.method = HTTPMethod.GET;
 				req.headers["Accept"] = "application/json";
 			}, (scope HTTPClientResponse res) {
-				auto body = res.bodyReader.readAllUTF8();
+				auto body = res.bodyReader.readAllUTF8(false, maxAuthResponseBytes);
 				if (res.statusCode / 100 == 2 && body.length)
 				{
-					parsed = parseJsonString(body); // a throw here is a fetch error, caught below
+					parsed = parseUntrustedJson(body); // a throw here is a fetch error, caught below
 					outcome = FetchResult.ok;
 				}
 			});
@@ -607,15 +861,17 @@ final class OAuthClient
 
 	// Secure POST a body to `url` with the given content type, optionally adding
 	// an Authorization header, and parse the response as JSON (empty body -> {}).
-	// Throws when the response status is not 2xx, surfacing the error body if
-	// present (consistent with tryGetJson which guards status the same way).
-	private Json postParse(string url, string contentType,
+	// Throws when the response status is not 2xx, naming `endpoint` (e.g.
+	// "Token endpoint") and surfacing the error body if present (consistent with
+	// tryGetJson which guards status the same way); an OAuth `error` code in the
+	// body is carried for `oauthErrorCode`.
+	private Json postParse(string endpoint, string url, string contentType,
 			scope const(ubyte)[] payload, string authHeader = null) @safe
 	{
 		import std.conv : to;
 
 		Json result;
-		secureRequestHTTP(url, (scope HTTPClientRequest req) {
+		secureRequestHTTP(url, namedUrlPolicy(), (scope HTTPClientRequest req) {
 			req.method = HTTPMethod.POST;
 			req.contentType = contentType;
 			req.headers["Accept"] = "application/json";
@@ -623,26 +879,35 @@ final class OAuthClient
 				req.headers["Authorization"] = authHeader;
 			req.writeBody(payload);
 		}, (scope HTTPClientResponse res) {
-			auto body = res.bodyReader.readAllUTF8();
+			auto body = res.bodyReader.readAllUTF8(false, maxAuthResponseBytes);
 			if (res.statusCode / 100 != 2)
-				throw internalError("Token endpoint returned HTTP " ~ res.statusCode.to!string ~ (
-					body.length ? ": " ~ body : ""));
-			result = body.length ? parseJsonString(body) : Json.emptyObject;
+				throw internalError(endpoint ~ " returned HTTP " ~ res.statusCode.to!string ~ (
+					body.length ? ": " ~ body : ""), oauthErrorData(body));
+			result = body.length ? parseUntrustedJson(body) : Json.emptyObject;
 		});
 		return result;
 	}
 
 	private Json postJson(string url, Json payload) @safe
 	{
-		return postParse(url, "application/json", cast(const(ubyte)[]) payload.toString());
+		return postParse("Dynamic client registration endpoint", url,
+				"application/json", cast(const(ubyte)[]) payload.toString());
 	}
 
+	// A client holding a secret authenticates with it even when `authMethod` was
+	// left at `none`: `client_secret_basic` is the RFC 6749 §2.3.1 default every
+	// AS must support, and dropping a supplied secret would silently downgrade a
+	// confidential client to a public one.
 	private Json postForm(string url, string form, RegisteredClient client) @safe
 	{
-		const useBasic = authMethod == TokenEndpointAuthMethod.clientSecretBasic
-			&& client.clientSecret.length;
+		const useBasic = client.clientSecret.length
+			&& (authMethod == TokenEndpointAuthMethod.clientSecretBasic
+					|| authMethod == TokenEndpointAuthMethod.none);
 		const auth = useBasic ? basicAuthHeader(client.clientId, client.clientSecret) : "";
-		return postParse(url, "application/x-www-form-urlencoded", cast(const(ubyte)[]) form, auth);
+		auto j = postParse("Token endpoint", url,
+				"application/x-www-form-urlencoded", cast(const(ubyte)[]) form, auth);
+		throwIfOAuthError("Token endpoint", j);
+		return j;
 	}
 }
 
@@ -859,36 +1124,58 @@ unittest  // exhausted PRM discovery distinguishes genuine absence from a fetch 
 
 unittest  // resolveIssuerFrom downgrades to the origin only when the PRM document is genuinely absent
 {
-	bool fromPrm;
-	const issuer = OAuthClient.resolveIssuerFrom(() @safe {
+	const r = OAuthClient.resolveIssuerFrom(() @safe {
 		throw new PrmAbsentException("no PRM");
 		return ProtectedResourceMetadata.init;
-	}, "https://mcp.example.com/sse", fromPrm);
-	assert(!fromPrm);
-	assert(issuer == "https://mcp.example.com");
+	}, "https://mcp.example.com/sse");
+	assert(!r.fromProtectedResourceMetadata);
+	assert(r.issuer == "https://mcp.example.com");
+}
+
+unittest  // the origin fallback ends the authority at a query or fragment
+{
+	foreach (endpoint; [
+		"https://mcp.example.com?tenant=x", "https://mcp.example.com#frag"
+	])
+	{
+		const r = OAuthClient.resolveIssuerFrom(() @safe {
+			throw new PrmAbsentException("no PRM");
+			return ProtectedResourceMetadata.init;
+		}, endpoint);
+		assert(r.issuer == "https://mcp.example.com", r.issuer);
+	}
 }
 
 unittest  // resolveIssuerFrom does NOT silently downgrade on a fetch/security error — it propagates
 {
 	import std.exception : assertThrown;
 
-	bool fromPrm;
 	assertThrown!McpException(OAuthClient.resolveIssuerFrom(() @safe {
 			throw internalError("Refusing to fetch URL with no parseable host");
 			return ProtectedResourceMetadata.init;
-		}, "https://mcp.example.com/sse", fromPrm));
+		}, "https://mcp.example.com/sse"));
+}
+
+unittest  // resolveIssuerFrom refuses a PRM document that names no authorization server
+{
+	import std.exception : assertThrown;
+
+	assertThrown!McpException(OAuthClient.resolveIssuerFrom(() @safe {
+			return ProtectedResourceMetadata.init;
+		}, "https://mcp.example.com/sse"));
 }
 
 unittest  // resolveIssuerFrom returns the PRM-advertised authorization server on the modern path
 {
-	bool fromPrm;
-	const issuer = OAuthClient.resolveIssuerFrom(() @safe {
+	const r = OAuthClient.resolveIssuerFrom(() @safe {
 		ProtectedResourceMetadata prm;
 		prm.authorizationServers = ["https://as.example.com"];
+		prm.scopesSupported = ["mcp:read"];
 		return prm;
-	}, "https://mcp.example.com/sse", fromPrm);
-	assert(fromPrm);
-	assert(issuer == "https://as.example.com");
+	}, "https://mcp.example.com/sse");
+	assert(r.fromProtectedResourceMetadata);
+	assert(r.issuer == "https://as.example.com");
+	assert(r.metadata.scopesSupported == ["mcp:read"]);
 }
 
 unittest  // 2025-03-26 backcompat path: a sub-path issuer mismatch is tolerated
@@ -978,6 +1265,45 @@ unittest  // discovered AS document advertising S256 -> proceeds
 	auto pkce = makePkce(new ubyte[32]);
 	auto url = c.authorizationUrl(as_, RegisteredClient("cid", ""), pkce, "mcp:read", "st");
 	assert(url.canFind("code_challenge_method=S256"));
+}
+
+unittest  // an explicit ssrfPolicy admits a private-network authorization endpoint
+{
+	auto c = new OAuthClient();
+	c.resource = "https://mcp.example.com/mcp";
+	c.ssrfPolicy = SsrfPolicy.allowUserConfigured;
+	AuthorizationServerMetadata as_;
+	as_.authorizationEndpoint = "http://10.0.0.5/authorize";
+	as_.codeChallengeMethodsSupported = ["S256"];
+	auto pkce = makePkce(new ubyte[32]);
+	cast(void) c.authorizationUrl(as_, RegisteredClient("cid", ""), pkce, "mcp:read", "st");
+}
+
+unittest  // an explicit ssrfPolicy overrides the loopback allowance of a loopback endpoint
+{
+	import std.exception : assertThrown;
+
+	auto c = new OAuthClient();
+	c.resource = "http://127.0.0.1:9000/mcp";
+	c.ssrfPolicy = SsrfPolicy.blockInternal;
+	AuthorizationServerMetadata as_;
+	as_.authorizationEndpoint = "http://127.0.0.1:9000/authorize";
+	as_.codeChallengeMethodsSupported = ["S256"];
+	auto pkce = makePkce(new ubyte[32]);
+	assertThrown(c.authorizationUrl(as_, RegisteredClient("cid", ""), pkce, "mcp:read", "st"));
+}
+
+unittest  // without an explicit ssrfPolicy a private-network authorization endpoint is refused
+{
+	import std.exception : assertThrown;
+
+	auto c = new OAuthClient();
+	c.resource = "https://mcp.example.com/mcp";
+	AuthorizationServerMetadata as_;
+	as_.authorizationEndpoint = "http://10.0.0.5/authorize";
+	as_.codeChallengeMethodsSupported = ["S256"];
+	auto pkce = makePkce(new ubyte[32]);
+	assertThrown(c.authorizationUrl(as_, RegisteredClient("cid", ""), pkce, "mcp:read", "st"));
 }
 
 unittest  // authorizationUrl refuses when the RFC 8707 resource indicator is unset
@@ -1081,29 +1407,14 @@ unittest  // authorizeAndGetCode refuses an internal/plaintext authorize URL bef
 
 	auto c = new OAuthClient();
 	// Both overloads must guard the outbound GET.
-	assertThrown(c.authorizeAndGetCode("http://169.254.169.254/authorize?x=1"));
-	assertThrown(c.authorizeAndGetCode("http://as.example.com/authorize?x=1"));
-	assertThrown(c.authorizeAndGetCode("https://[fd00::1]/authorize?x=1"));
+	assertThrown(c.authorizeAndGetCode("http://169.254.169.254/authorize?x=1", "st"));
+	assertThrown(c.authorizeAndGetCode("http://as.example.com/authorize?x=1", "st"));
+	assertThrown(c.authorizeAndGetCode("https://[fd00::1]/authorize?x=1", "st"));
 
 	AuthorizationServerMetadata as_;
 	as_.issuer = "https://as.example.com";
-	assertThrown(c.authorizeAndGetCode(as_, "http://169.254.169.254/authorize?x=1"));
-	assertThrown(c.authorizeAndGetCode(as_, "https://[::ffff:10.0.0.1]/authorize?x=1"));
-}
-
-unittest  // discoverProtectedResource ignores a cross-origin resource_metadata URL
-{
-	// RFC 9728: a resource_metadata URL from WWW-Authenticate whose origin does
-	// not match the MCP endpoint origin must not be fetched. With no reachable
-	// well-known document either, discovery fails (rather than fetching the
-	// attacker-supplied URL).
-	import std.exception : assertThrown;
-
-	auto c = new OAuthClient();
-	const www = `Bearer resource_metadata="https://evil.example.com/.well-known/oauth-protected-resource"`;
-	// The MCP endpoint origin (loopback) differs from the challenge's origin, and
-	// the loopback well-known URLs are unreachable in the test, so discovery throws.
-	assertThrown(c.discoverProtectedResource("http://127.0.0.1:1/mcp", www));
+	assertThrown(c.authorizeAndGetCode(as_, "http://169.254.169.254/authorize?x=1", "st"));
+	assertThrown(c.authorizeAndGetCode(as_, "https://[::ffff:10.0.0.1]/authorize?x=1", "st"));
 }
 
 unittest  // postParse treats a non-2xx token-endpoint response as an error
@@ -1117,26 +1428,64 @@ unittest  // postParse treats a non-2xx token-endpoint response as an error
 	auto settings = new HTTPServerSettings();
 	settings.bindAddresses = ["127.0.0.1"];
 	settings.port = 0;
-	auto listener = () @trusted {
-		return listenHTTP(settings, (scope HTTPServerRequest req, scope HTTPServerResponse res) @safe {
-			res.statusCode = 400;
-			res.writeBody(`{"error":"invalid_client","error_description":"bad credentials"}`,
-				"application/json");
-		});
-	}();
+	auto listener = listenHTTP(settings, (scope HTTPServerRequest req,
+			scope HTTPServerResponse res) @safe {
+		res.statusCode = 400;
+		res.writeBody(`{"error":"invalid_client","error_description":"bad credentials"}`,
+			"application/json");
+	});
 	scope (exit)
-		() @trusted { listener.stopListening(); }();
+		listener.stopListening();
 
 	const port = listener.bindAddresses[0].port;
 	const tokenUrl = "http://127.0.0.1:" ~ port.to!string ~ "/token";
 
 	auto c = new OAuthClient();
-	c.resource = "https://mcp.example.com/mcp";
+	c.resource = "http://127.0.0.1:3000/mcp";
 	AuthorizationServerMetadata as_;
 	as_.tokenEndpoint = tokenUrl;
 	// A non-2xx response from the token endpoint must surface as an exception,
 	// not silently return an empty TokenSet.
 	assertThrown(c.refresh(as_, RegisteredClient("cid", ""), "rt"));
+}
+
+unittest  // a failed dynamic registration names the registration endpoint, not the token endpoint
+{
+	import std.algorithm : canFind;
+	import std.conv : to;
+	import vibe.http.server : HTTPServerRequest, HTTPServerResponse,
+		HTTPServerSettings, listenHTTP;
+
+	auto settings = new HTTPServerSettings();
+	settings.bindAddresses = ["127.0.0.1"];
+	settings.port = 0;
+	auto listener = listenHTTP(settings, (scope HTTPServerRequest req,
+			scope HTTPServerResponse res) @safe {
+		res.statusCode = 400;
+		res.writeBody(`{"error":"invalid_client_metadata"}`, "application/json");
+	});
+	scope (exit)
+		listener.stopListening();
+
+	AuthorizationServerMetadata as_;
+	as_.registrationEndpoint = "http://127.0.0.1:"
+		~ listener.bindAddresses[0].port.to!string ~ "/register";
+	auto c = new OAuthClient();
+	c.resource = "http://127.0.0.1:3000/mcp";
+	string msg;
+	try
+		cast(void) c.register(as_, "client");
+	catch (Exception e)
+		msg = e.msg;
+	assert(msg.canFind("registration endpoint returned HTTP 400"), msg);
+	assert(!msg.canFind("Token endpoint"), msg);
+}
+
+unittest  // the default redirect URI names the 127.0.0.1 literal, not localhost (RFC 8252 §8.3)
+{
+	import std.algorithm : startsWith;
+
+	assert(new OAuthClient().redirectUri.startsWith("http://127.0.0.1:"));
 }
 
 unittest  // tokenExchange refuses when the RFC 8707 resource indicator is unset
@@ -1151,7 +1500,7 @@ unittest  // tokenExchange refuses when the RFC 8707 resource indicator is unset
 	try
 		c.tokenExchange("https://as.example.com/token", "subj_token",
 				"urn:ietf:params:oauth:token-type:id_token",
-				"urn:ietf:params:oauth:token-type:access_token", "aud", "cid");
+				"urn:ietf:params:oauth:token-type:access_token", "aud", RegisteredClient("cid"));
 	catch (McpException e)
 	{
 		caught = e.msg.indexOf("resource indicator") >= 0;
@@ -1177,21 +1526,20 @@ unittest  // refresh() sends client_secret in the POST body for client_secret_po
 	auto settings = new HTTPServerSettings();
 	settings.bindAddresses = ["127.0.0.1"];
 	settings.port = 0;
-	auto listener = () @trusted {
-		return listenHTTP(settings, (scope HTTPServerRequest req, scope HTTPServerResponse res) @safe {
-			capturedBody = req.bodyReader.readAllUTF8();
-			res.statusCode = 200;
-			res.writeBody(`{"access_token":"at","token_type":"bearer"}`, "application/json");
-		});
-	}();
+	auto listener = listenHTTP(settings, (scope HTTPServerRequest req,
+			scope HTTPServerResponse res) @safe {
+		capturedBody = req.bodyReader.readAllUTF8();
+		res.statusCode = 200;
+		res.writeBody(`{"access_token":"at","token_type":"bearer"}`, "application/json");
+	});
 	scope (exit)
-		() @trusted { listener.stopListening(); }();
+		listener.stopListening();
 
 	const port = listener.bindAddresses[0].port;
 	const tokenUrl = "http://127.0.0.1:" ~ port.to!string ~ "/token";
 
 	auto c = new OAuthClient();
-	c.resource = "https://mcp.example.com/mcp";
+	c.resource = "http://127.0.0.1:3000/mcp";
 	c.authMethod = TokenEndpointAuthMethod.clientSecretPost;
 	AuthorizationServerMetadata as_;
 	as_.tokenEndpoint = tokenUrl;
@@ -1202,11 +1550,62 @@ unittest  // refresh() sends client_secret in the POST body for client_secret_po
 			~ capturedBody);
 }
 
+unittest  // a remote MCP server cannot steer the client to a plain-http loopback token endpoint
+{
+	import std.conv : to;
+	import std.exception : assertThrown;
+	import vibe.http.server : HTTPServerRequest, HTTPServerResponse,
+		HTTPServerSettings, listenHTTP;
+
+	int hits;
+	auto settings = new HTTPServerSettings();
+	settings.bindAddresses = ["127.0.0.1"];
+	settings.port = 0;
+	auto listener = listenHTTP(settings, (scope HTTPServerRequest req,
+			scope HTTPServerResponse res) @safe {
+		hits++;
+		res.writeBody(`{"access_token":"at","token_type":"bearer"}`, "application/json");
+	});
+	scope (exit)
+		listener.stopListening();
+
+	auto c = new OAuthClient();
+	c.resource = "https://mcp.example.com/mcp";
+	AuthorizationServerMetadata as_;
+	as_.tokenEndpoint = "http://127.0.0.1:" ~ listener.bindAddresses[0].port.to!string ~ "/token";
+	assertThrown!McpException(c.refresh(as_, RegisteredClient("cid", "secret"), "rt"));
+	assert(hits == 0, "the refresh token must never reach a loopback service");
+}
+
+unittest  // a loopback MCP server may name a plain-http loopback authorization server (local dev)
+{
+	import std.conv : to;
+	import vibe.http.server : HTTPServerRequest, HTTPServerResponse,
+		HTTPServerSettings, listenHTTP;
+
+	auto settings = new HTTPServerSettings();
+	settings.bindAddresses = ["127.0.0.1"];
+	settings.port = 0;
+	auto listener = listenHTTP(settings, (scope HTTPServerRequest req,
+			scope HTTPServerResponse res) @safe {
+		res.writeBody(`{"access_token":"at","token_type":"bearer"}`, "application/json");
+	});
+	scope (exit)
+		listener.stopListening();
+
+	auto c = new OAuthClient();
+	c.resource = "http://localhost:3000/mcp";
+	AuthorizationServerMetadata as_;
+	as_.tokenEndpoint = "http://127.0.0.1:" ~ listener.bindAddresses[0].port.to!string ~ "/token";
+	assert(c.refresh(as_, RegisteredClient("cid", ""), "rt").accessToken == "at");
+}
+
 // ===========================================================================
 // Loopback-server tests for the HTTP-network discovery / registration / token /
-// probe / redirect paths. secureRequestHTTP permits a loopback (127.0.0.1) host
-// over plaintext http for local development, so a bound `listenHTTP` on
-// 127.0.0.1 exercises the real fetch/parse code that pure in-memory tests cannot.
+// probe / redirect paths. With a loopback `resource` (MCP endpoint) the client
+// permits a loopback (127.0.0.1) authorization server over plaintext http, so a
+// bound `listenHTTP` on 127.0.0.1 exercises the real fetch/parse code that pure
+// in-memory tests cannot.
 // ===========================================================================
 
 version (unittest)
@@ -1222,7 +1621,7 @@ version (unittest)
 		ushort port;
 		void stop() @safe
 		{
-			() @trusted { listener.stopListening(); }();
+			listener.stopListening();
 		}
 		// The loopback base URL ("http://127.0.0.1:<port>").
 		string base() @safe const
@@ -1239,7 +1638,7 @@ version (unittest)
 		auto settings = new HTTPServerSettings();
 		settings.bindAddresses = ["127.0.0.1"];
 		settings.port = 0;
-		auto l = () @trusted { return listenHTTP(settings, handler); }();
+		auto l = listenHTTP(settings, handler);
 		return LoopbackServer(l, l.bindAddresses[0].port);
 	}
 }
@@ -1277,6 +1676,7 @@ unittest  // discovery: protected-resource (well-known + same-origin WWW-Authent
 
 	auto c = new OAuthClient();
 	const endpoint = srv.base ~ "/mcp";
+	c.resource = endpoint;
 
 	// Well-known RFC 9728 discovery (no WWW-Authenticate hint).
 	auto prm = c.discoverProtectedResource(endpoint);
@@ -1303,6 +1703,151 @@ unittest  // discovery: protected-resource (well-known + same-origin WWW-Authent
 	assert(c.resolveIssuer(endpoint) == srv.base);
 }
 
+unittest  // discoverProtectedResource rejects a PRM document whose resource names another server (RFC 9728 §3.3)
+{
+	import std.algorithm : canFind;
+	import std.exception : assertThrown;
+
+	LoopbackServer srv;
+	srv = startLoopback((scope HTTPServerRequest req, scope HTTPServerResponse res) @safe {
+		if (req.path.canFind("oauth-protected-resource"))
+			res.writeBody(`{"resource":"https://other.example/mcp",`
+				~ `"authorization_servers":["https://attacker-as.example"]}`, "application/json");
+		else
+		{
+			res.statusCode = 404;
+			res.writeBody("", "text/plain");
+		}
+	});
+	scope (exit)
+		srv.stop();
+
+	auto c = new OAuthClient();
+	assertThrown(c.discoverProtectedResource(srv.base ~ "/mcp"));
+	bool fromPrm;
+	assertThrown(c.resolveIssuer(srv.base ~ "/mcp", fromPrm));
+}
+
+unittest  // discoverProtectedResource fetches a cross-origin resource_metadata URL from the challenge
+{
+	import std.algorithm : canFind;
+
+	// The MCP server publishes no well-known document; its PRM lives on another
+	// origin, named only by the WWW-Authenticate challenge.
+	auto mcp = startLoopback((scope HTTPServerRequest req, scope HTTPServerResponse res) @safe {
+		res.statusCode = 404;
+		res.writeBody("", "text/plain");
+	});
+	scope (exit)
+		mcp.stop();
+	const endpoint = mcp.base ~ "/mcp";
+
+	auto meta = startLoopback((scope HTTPServerRequest req, scope HTTPServerResponse res) @safe {
+		if (req.requestURI == "/prm")
+			res.writeBody(
+				`{"resource":"` ~ endpoint ~ `","authorization_servers":["https://as.example"]}`,
+				"application/json");
+		else
+		{
+			res.statusCode = 404;
+			res.writeBody("", "text/plain");
+		}
+	});
+	scope (exit)
+		meta.stop();
+
+	auto c = new OAuthClient();
+	const www = `Bearer resource_metadata="` ~ meta.base ~ `/prm"`;
+	auto prm = c.discoverProtectedResource(endpoint, www);
+	assert(prm.resource == endpoint);
+	assert(prm.authorizationServers == ["https://as.example"]);
+}
+
+unittest  // a cross-origin resource_metadata document naming another resource is rejected
+{
+	import std.exception : assertThrown;
+
+	auto mcp = startLoopback((scope HTTPServerRequest req, scope HTTPServerResponse res) @safe {
+		res.statusCode = 404;
+		res.writeBody("", "text/plain");
+	});
+	scope (exit)
+		mcp.stop();
+
+	auto meta = startLoopback((scope HTTPServerRequest req, scope HTTPServerResponse res) @safe {
+		res.writeBody(`{"resource":"https://other.example/mcp",`
+			~ `"authorization_servers":["https://attacker-as.example"]}`, "application/json");
+	});
+	scope (exit)
+		meta.stop();
+
+	auto c = new OAuthClient();
+	const www = `Bearer resource_metadata="` ~ meta.base ~ `/prm"`;
+	assertThrown(c.discoverProtectedResource(mcp.base ~ "/mcp", www));
+}
+
+unittest  // prmResourceMatches accepts the endpoint itself or a path prefix of it on the same origin
+{
+	assert(prmResourceMatches("https://mcp.example.com/mcp", "https://mcp.example.com/mcp"));
+	assert(prmResourceMatches("https://MCP.example.com/mcp/", "https://mcp.example.com/mcp"));
+	assert(prmResourceMatches("https://mcp.example.com", "https://mcp.example.com/mcp"));
+	assert(prmResourceMatches("https://mcp.example.com/", "https://mcp.example.com/mcp"));
+	assert(prmResourceMatches("https://mcp.example.com/tenant",
+			"https://mcp.example.com/tenant/mcp"));
+}
+
+unittest  // prmResourceMatches rejects another origin, a sibling path, and a missing resource
+{
+	assert(!prmResourceMatches("https://other.example/mcp", "https://mcp.example.com/mcp"));
+	assert(!prmResourceMatches("https://mcp.example.com:8443/mcp", "https://mcp.example.com/mcp"));
+	assert(!prmResourceMatches("http://mcp.example.com/mcp", "https://mcp.example.com/mcp"));
+	assert(!prmResourceMatches("https://mcp.example.com/mc", "https://mcp.example.com/mcp"));
+	assert(!prmResourceMatches("https://mcp.example.com/mcp/admin", "https://mcp.example.com/mcp"));
+	assert(!prmResourceMatches("", "https://mcp.example.com/mcp"));
+}
+
+unittest  // discovery refuses an oversized metadata document instead of buffering it
+{
+	import std.algorithm : canFind;
+	import std.array : replicate;
+	import std.exception : assertThrown;
+
+	LoopbackServer srv;
+	srv = startLoopback((scope HTTPServerRequest req, scope HTTPServerResponse res) @safe {
+		if (req.path.canFind("oauth-protected-resource"))
+			res.writeBody(`{"resource":"` ~ srv.base ~ `/mcp","authorization_servers":["` ~ srv.base
+				~ `"],"pad":"` ~ "x".replicate(maxAuthResponseBytes) ~ `"}`, "application/json");
+		else
+		{
+			res.statusCode = 404;
+			res.writeBody("", "text/plain");
+		}
+	});
+	scope (exit)
+		srv.stop();
+
+	assertThrown(new OAuthClient().discoverProtectedResource(srv.base ~ "/mcp"));
+}
+
+unittest  // a registration/token response larger than the cap is refused
+{
+	import std.array : replicate;
+	import std.exception : assertThrown;
+
+	auto srv = startLoopback((scope HTTPServerRequest req, scope HTTPServerResponse res) @safe {
+		res.writeBody(`{"client_id":"cid","pad":"` ~ "x".replicate(maxAuthResponseBytes) ~ `"}`,
+			"application/json");
+	});
+	scope (exit)
+		srv.stop();
+
+	AuthorizationServerMetadata as_;
+	as_.registrationEndpoint = srv.base ~ "/register";
+	auto c = new OAuthClient();
+	c.resource = srv.base ~ "/mcp";
+	assertThrown(c.register(as_, "client"));
+}
+
 unittest  // discoverAuthServer falls back to synthesized endpoints when no document exists
 {
 	// Every AS metadata candidate is reachable but reports no document (404), so
@@ -1316,12 +1861,44 @@ unittest  // discoverAuthServer falls back to synthesized endpoints when no docu
 		srv.stop();
 
 	auto c = new OAuthClient();
-	auto as_ = c.discoverAuthServer(srv.base ~ "/");
+	c.resource = srv.base ~ "/mcp";
+	auto as_ = c.discoverAuthServer(srv.base ~ "/", false);
 	assert(as_.issuer == srv.base ~ "/");
 	assert(as_.authorizationEndpoint == srv.base ~ "/authorize");
 	assert(as_.tokenEndpoint == srv.base ~ "/token");
 	assert(as_.registrationEndpoint == srv.base ~ "/register");
 	assert(!as_.metadataDocumentDiscovered);
+}
+
+unittest  // discoverAuthServer on the PRM path refuses to synthesize endpoints when no document exists
+{
+	import std.exception : assertThrown;
+
+	auto srv = startLoopback((scope HTTPServerRequest req, scope HTTPServerResponse res) @safe {
+		res.statusCode = 404;
+		res.writeBody("", "text/plain");
+	});
+	scope (exit)
+		srv.stop();
+
+	auto c = new OAuthClient();
+	c.resource = srv.base ~ "/mcp";
+	assertThrown(c.discoverAuthServer(srv.base, true));
+}
+
+unittest  // discoverAuthServer on the legacy path refuses to synthesize endpoints after a fetch error
+{
+	import std.exception : assertThrown;
+
+	auto srv = startLoopback((scope HTTPServerRequest req, scope HTTPServerResponse res) @safe {
+		res.writeBody("{not json", "application/json");
+	});
+	scope (exit)
+		srv.stop();
+
+	auto c = new OAuthClient();
+	c.resource = srv.base ~ "/mcp";
+	assertThrown(c.discoverAuthServer(srv.base, false));
 }
 
 unittest  // register() POSTs an RFC 7591 request and parses the returned credentials
@@ -1338,6 +1915,7 @@ unittest  // register() POSTs an RFC 7591 request and parses the returned creden
 		srv.stop();
 
 	auto c = new OAuthClient();
+	c.resource = srv.base ~ "/mcp";
 	c.redirectUri = "http://localhost:8765/callback";
 	AuthorizationServerMetadata as_;
 	as_.registrationEndpoint = srv.base ~ "/register";
@@ -1355,6 +1933,63 @@ unittest  // register() POSTs an RFC 7591 request and parses the returned creden
 	assertThrown(c.register(none, "x"));
 }
 
+version (unittest) private OAuthClient registerAgainst(string response,
+		out RegisteredClient rc, out Exception error) @safe
+{
+	import std.exception : collectException;
+
+	auto srv = startLoopback((scope HTTPServerRequest req, scope HTTPServerResponse res) @safe {
+		res.writeBody(response, "application/json");
+	});
+	scope (exit)
+		srv.stop();
+	auto c = new OAuthClient();
+	c.resource = srv.base ~ "/mcp";
+	AuthorizationServerMetadata as_;
+	as_.registrationEndpoint = srv.base ~ "/register";
+	error = collectException(rc = c.register(as_, "dlang-mcp"));
+	return c;
+}
+
+unittest  // register() rejects a registration response without a client_id
+{
+	RegisteredClient rc;
+	Exception error;
+	cast(void) registerAgainst(`{"client_secret":"s"}`, rc, error);
+	assert(error !is null);
+	cast(void) registerAgainst(`{"client_id":""}`, rc, error);
+	assert(error !is null);
+}
+
+unittest  // register() adopts the token_endpoint_auth_method the AS assigned
+{
+	RegisteredClient rc;
+	Exception error;
+	auto c = registerAgainst(`{"client_id":"cid","client_secret":"s",`
+			~ `"token_endpoint_auth_method":"client_secret_post"}`, rc, error);
+	assert(error is null);
+	assert(c.authMethod == TokenEndpointAuthMethod.clientSecretPost);
+
+	c = registerAgainst(`{"client_id":"cid"}`, rc, error);
+	assert(error is null);
+	assert(c.authMethod == TokenEndpointAuthMethod.none);
+}
+
+unittest  // register() refuses an assigned token_endpoint_auth_method the client cannot use
+{
+	RegisteredClient rc;
+	Exception error;
+	cast(void) registerAgainst(
+			`{"client_id":"cid","token_endpoint_auth_method":"tls_client_auth"}`, rc, error);
+	assert(error !is null);
+	cast(void) registerAgainst(
+			`{"client_id":"cid","token_endpoint_auth_method":"client_secret_basic"}`, rc, error);
+	assert(error !is null, "a secret-based method needs a client_secret");
+	cast(void) registerAgainst(
+			`{"client_id":"cid","token_endpoint_auth_method":"private_key_jwt"}`, rc, error);
+	assert(error !is null, "private_key_jwt needs a configured privateKeyPem");
+}
+
 unittest  // token grants POST their forms and parse the token response (loopback)
 {
 	import std.algorithm : canFind;
@@ -1369,7 +2004,7 @@ unittest  // token grants POST their forms and parse the token response (loopbac
 		srv.stop();
 
 	auto c = new OAuthClient();
-	c.resource = "https://mcp.example.com/mcp";
+	c.resource = "http://127.0.0.1:3000/mcp";
 	AuthorizationServerMetadata as_;
 	as_.issuer = "https://as.example.com";
 	as_.tokenEndpoint = srv.base ~ "/token";
@@ -1395,7 +2030,7 @@ unittest  // token grants POST their forms and parse the token response (loopbac
 	assert(lastForm.canFind("assertion=the-assertion"));
 
 	auto t5 = c.tokenExchange(srv.base ~ "/token", "subj", "urn:t:id_token",
-			"urn:t:access_token", "aud", "cid");
+			"urn:t:access_token", "aud", client);
 	assert(t5.accessToken == "at-123");
 	assert(lastForm.canFind(
 			"grant_type=" ~ "urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Atoken-exchange"));
@@ -1406,6 +2041,31 @@ unittest  // token grants POST their forms and parse the token response (loopbac
 	auto t6 = c.clientCredentials(as_, RegisteredClient("cid", "shh"), "mcp:read");
 	assert(t6.accessToken == "at-123");
 	assert(!lastForm.canFind("client_secret="));
+}
+
+unittest  // a client secret supplied without an auth method is sent as client_secret_basic
+{
+	string lastAuth;
+	auto srv = startLoopback((scope HTTPServerRequest req, scope HTTPServerResponse res) @safe {
+		lastAuth = req.headers.get("Authorization", "");
+		res.writeBody(`{"access_token":"at","token_type":"bearer"}`, "application/json");
+	});
+	scope (exit)
+		srv.stop();
+
+	auto c = new OAuthClient();
+	c.resource = "http://127.0.0.1:3000/mcp";
+	AuthorizationServerMetadata as_;
+	as_.issuer = "https://as.example.com";
+	as_.tokenEndpoint = srv.base ~ "/token";
+	assert(c.authMethod == TokenEndpointAuthMethod.none);
+
+	c.clientCredentials(as_, RegisteredClient("cid", "shh"), "mcp:read");
+	assert(lastAuth == basicAuthHeader("cid", "shh"));
+
+	// A public client (no secret) still sends no credentials.
+	c.clientCredentials(as_, RegisteredClient("cid", ""), "mcp:read");
+	assert(lastAuth.length == 0);
 }
 
 unittest  // private_key_jwt: token requests carry a client_assertion (RFC 7523)
@@ -1428,7 +2088,7 @@ unittest  // private_key_jwt: token requests carry a client_assertion (RFC 7523)
 		~ "-----END PRIVATE KEY-----\n";
 
 	auto c = new OAuthClient();
-	c.resource = "https://mcp.example.com/mcp";
+	c.resource = "http://127.0.0.1:3000/mcp";
 	c.authMethod = TokenEndpointAuthMethod.privateKeyJwt;
 	c.privateKeyPem = pem;
 	AuthorizationServerMetadata as_;
@@ -1439,6 +2099,283 @@ unittest  // private_key_jwt: token requests carry a client_assertion (RFC 7523)
 	c.exchangeCode(as_, RegisteredClient("cid", ""), "code", "verifier");
 	assert(lastForm.canFind("client_assertion_type="));
 	assert(lastForm.canFind("client_assertion="));
+}
+
+version (unittest)
+{
+	// A throwaway P-256 PKCS#8 key (shared with the jwt module's own test).
+	private enum testEcPem = "-----BEGIN PRIVATE KEY-----\n"
+		~ "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQg7K6+stITLYsQjC9o\n"
+		~ "hyL925dgd6gNWRcGOl5RPvIpye+hRANCAATSBYPkHq12VDW5un1kub6zkBc4ieZ9\n"
+		~ "nurGMu+tLzJ6+6syOZsQCGlazcSOGsopLyl1QZMIFh9atUYaDfUjJxMq\n"
+		~ "-----END PRIVATE KEY-----\n";
+}
+
+unittest  // a private_key_jwt registration publishes the public key derived from privateKeyPem
+{
+	import vibe.data.json : parseJsonString;
+
+	string captured;
+	auto srv = startLoopback((scope HTTPServerRequest req, scope HTTPServerResponse res) @safe {
+		captured = req.bodyReader.readAllUTF8();
+		res.writeBody(`{"client_id":"cid"}`, "application/json");
+	});
+	scope (exit)
+		srv.stop();
+
+	auto c = new OAuthClient();
+	c.resource = srv.base ~ "/mcp";
+	c.authMethod = TokenEndpointAuthMethod.privateKeyJwt;
+	c.privateKeyPem = testEcPem;
+	AuthorizationServerMetadata as_;
+	as_.registrationEndpoint = srv.base ~ "/register";
+	cast(void) c.register(as_, "dlang-mcp");
+	auto sent = parseJsonString(captured);
+	assert(sent["token_endpoint_auth_method"].get!string == "private_key_jwt");
+	auto keys = sent["jwks"]["keys"];
+	assert(keys.length == 1);
+	assert(keys[0]["kty"].get!string == "EC");
+	assert("d" !in keys[0]);
+}
+
+unittest  // a private_key_jwt registration names jwksUri instead of an inline key when set
+{
+	import vibe.data.json : parseJsonString;
+
+	string captured;
+	auto srv = startLoopback((scope HTTPServerRequest req, scope HTTPServerResponse res) @safe {
+		captured = req.bodyReader.readAllUTF8();
+		res.writeBody(`{"client_id":"cid"}`, "application/json");
+	});
+	scope (exit)
+		srv.stop();
+
+	auto c = new OAuthClient();
+	c.resource = srv.base ~ "/mcp";
+	c.authMethod = TokenEndpointAuthMethod.privateKeyJwt;
+	c.privateKeyPem = testEcPem;
+	c.jwksUri = "https://client.example.com/jwks.json";
+	AuthorizationServerMetadata as_;
+	as_.registrationEndpoint = srv.base ~ "/register";
+	cast(void) c.register(as_, "dlang-mcp");
+	auto sent = parseJsonString(captured);
+	assert(sent["jwks_uri"].get!string == "https://client.example.com/jwks.json");
+	assert("jwks" !in sent);
+}
+
+unittest  // a private_key_jwt registration without a key is refused before any request
+{
+	import std.exception : assertThrown;
+
+	int calls;
+	auto srv = startLoopback((scope HTTPServerRequest req, scope HTTPServerResponse res) @safe {
+		calls++;
+		res.writeBody(`{"client_id":"cid"}`, "application/json");
+	});
+	scope (exit)
+		srv.stop();
+
+	auto c = new OAuthClient();
+	c.resource = srv.base ~ "/mcp";
+	c.authMethod = TokenEndpointAuthMethod.privateKeyJwt;
+	AuthorizationServerMetadata as_;
+	as_.registrationEndpoint = srv.base ~ "/register";
+	assertThrown(c.register(as_, "dlang-mcp"));
+	assert(calls == 0);
+}
+
+unittest  // private_key_jwt without a configured key refuses instead of sending no client auth
+{
+	import std.algorithm : canFind;
+	import std.exception : collectExceptionMsg;
+
+	auto c = new OAuthClient();
+	c.resource = "https://mcp.example.com/mcp";
+	c.authMethod = TokenEndpointAuthMethod.privateKeyJwt;
+	AuthorizationServerMetadata as_;
+	as_.issuer = "https://as.example.com";
+	as_.tokenEndpoint = "https://as.example.com/token";
+	as_.codeChallengeMethodsSupported = ["S256"];
+	const msg = collectExceptionMsg(c.clientCredentials(as_, RegisteredClient("cid", ""), ""));
+	assert(msg.canFind("privateKeyPem"), msg);
+}
+
+unittest  // private_key_jwt: the JWT-bearer grant carries a client_assertion
+{
+	import std.algorithm : canFind;
+
+	string lastForm;
+	auto srv = startLoopback((scope HTTPServerRequest req, scope HTTPServerResponse res) @safe {
+		lastForm = req.bodyReader.readAllUTF8();
+		res.writeBody(`{"access_token":"at","token_type":"bearer"}`, "application/json");
+	});
+	scope (exit)
+		srv.stop();
+
+	auto c = new OAuthClient();
+	c.resource = "http://127.0.0.1:3000/mcp";
+	c.authMethod = TokenEndpointAuthMethod.privateKeyJwt;
+	c.privateKeyPem = testEcPem;
+	AuthorizationServerMetadata as_;
+	as_.issuer = "https://as.example.com";
+	as_.tokenEndpoint = srv.base ~ "/token";
+	c.jwtBearerGrant(as_, RegisteredClient("cid", ""), "the-assertion", "");
+	assert(lastForm.canFind("client_assertion="));
+}
+
+unittest  // private_key_jwt: assertionAudience picks the issuer, the token endpoint, or both as aud
+{
+	import std.algorithm : find, startsWith;
+	import std.array : split;
+	import std.uri : decodeComponent;
+	import vibe.data.json : Json, parseJsonString;
+	import mcp.auth.jwt_verifier : base64UrlDecode;
+
+	string lastForm;
+	auto srv = startLoopback((scope HTTPServerRequest req, scope HTTPServerResponse res) @safe {
+		lastForm = req.bodyReader.readAllUTF8();
+		res.writeBody(`{"access_token":"at","token_type":"bearer"}`, "application/json");
+	});
+	scope (exit)
+		srv.stop();
+
+	Json sentAud(AssertionAudience mode) @safe
+	{
+		auto c = new OAuthClient();
+		c.resource = "http://127.0.0.1:3000/mcp";
+		c.authMethod = TokenEndpointAuthMethod.privateKeyJwt;
+		c.privateKeyPem = testEcPem;
+		c.assertionAudience = mode;
+		AuthorizationServerMetadata as_;
+		as_.issuer = "https://as.example.com";
+		as_.tokenEndpoint = srv.base ~ "/token";
+		c.clientCredentials(as_, RegisteredClient("cid", ""), "");
+		const field = lastForm.split('&').find!(f => f.startsWith("client_assertion="));
+		const jwt = decodeComponent(field[0]["client_assertion=".length .. $]);
+		const payload = (cast(const(char)[]) base64UrlDecode(jwt.split('.')[1])).idup;
+		return parseJsonString(payload)["aud"];
+	}
+
+	assert(sentAud(AssertionAudience.issuer) == Json("https://as.example.com"));
+	assert(sentAud(AssertionAudience.tokenEndpoint) == Json(srv.base ~ "/token"));
+	const both = sentAud(AssertionAudience.both);
+	assert(both.type == Json.Type.array && both.length == 2);
+	assert(both[0] == Json("https://as.example.com") && both[1] == Json(srv.base ~ "/token"));
+}
+
+unittest  // a rejected refresh carries the OAuth error code for oauthErrorCode
+{
+	import std.exception : collectException;
+	import mcp.auth.oauth : oauthErrorCode;
+
+	auto srv = startLoopback((scope HTTPServerRequest req, scope HTTPServerResponse res) @safe {
+		res.statusCode = 400;
+		res.writeBody(`{"error":"invalid_grant"}`, "application/json");
+	});
+	scope (exit)
+		srv.stop();
+
+	auto c = new OAuthClient();
+	c.resource = "http://127.0.0.1:3000/mcp";
+	AuthorizationServerMetadata as_;
+	as_.issuer = "https://as.example.com";
+	as_.tokenEndpoint = srv.base ~ "/token";
+	auto e = collectException(c.refresh(as_, RegisteredClient("cid", ""), "dead-rt"));
+	assert(e !is null);
+	assert(oauthErrorCode(e) == "invalid_grant");
+}
+
+unittest  // OAuthClient refuses an access token whose token_type is not Bearer
+{
+	import std.exception : assertThrown;
+
+	auto srv = startLoopback((scope HTTPServerRequest req, scope HTTPServerResponse res) @safe {
+		res.writeBody(`{"access_token":"at","token_type":"DPoP"}`, "application/json");
+	});
+	scope (exit)
+		srv.stop();
+
+	auto c = new OAuthClient();
+	c.resource = "http://127.0.0.1:3000/mcp";
+	AuthorizationServerMetadata as_;
+	as_.issuer = "https://as.example.com";
+	as_.tokenEndpoint = srv.base ~ "/token";
+	assertThrown(c.refresh(as_, RegisteredClient("cid", ""), "rt"));
+	assertThrown(c.clientCredentials(as_, RegisteredClient("cid", "shh"), ""));
+}
+
+unittest  // token exchange accepts an N_A token_type for a non-access token
+{
+	auto srv = startLoopback((scope HTTPServerRequest req, scope HTTPServerResponse res) @safe {
+		res.writeBody(`{"access_token":"jag","token_type":"N_A"}`, "application/json");
+	});
+	scope (exit)
+		srv.stop();
+
+	auto c = new OAuthClient();
+	c.resource = "http://127.0.0.1:3000/mcp";
+	assert(c.tokenExchange(srv.base ~ "/token", "subj", "urn:t:id_token",
+			"urn:t:id-jag", "aud", RegisteredClient("cid", "")).accessToken == "jag");
+}
+
+unittest  // token exchange requesting an access token rejects a non-Bearer token_type
+{
+	import std.exception : assertThrown;
+
+	auto srv = startLoopback((scope HTTPServerRequest req, scope HTTPServerResponse res) @safe {
+		res.writeBody(`{"access_token":"at","token_type":"DPoP"}`, "application/json");
+	});
+	scope (exit)
+		srv.stop();
+
+	auto c = new OAuthClient();
+	c.resource = "http://127.0.0.1:3000/mcp";
+	assertThrown(c.tokenExchange(srv.base ~ "/token", "subj", "urn:t:id_token",
+			"urn:ietf:params:oauth:token-type:access_token", "aud", RegisteredClient("cid", "")));
+}
+
+unittest  // a 2xx token response carrying an OAuth error surfaces that error
+{
+	import std.algorithm : canFind;
+	import std.exception : collectException;
+
+	auto srv = startLoopback((scope HTTPServerRequest req, scope HTTPServerResponse res) @safe {
+		res.writeBody(`{"error":"bad_verification_code",`
+			~ `"error_description":"The code passed is incorrect or expired."}`, "application/json");
+	});
+	scope (exit)
+		srv.stop();
+
+	auto c = new OAuthClient();
+	c.resource = "http://127.0.0.1:3000/mcp";
+	AuthorizationServerMetadata as_;
+	as_.tokenEndpoint = srv.base ~ "/token";
+	as_.codeChallengeMethodsSupported = ["S256"];
+	auto e = collectException(c.exchangeCode(as_, RegisteredClient("cid", ""), "code", "verifier"));
+	assert(e !is null);
+	assert(e.msg.canFind("bad_verification_code"), e.msg);
+	assert(e.msg.canFind("incorrect or expired"), e.msg);
+	assert(oauthErrorCode(e) == "bad_verification_code");
+}
+
+unittest  // client_secret_post: token exchange carries the client secret
+{
+	import std.algorithm : canFind;
+
+	string lastForm;
+	auto srv = startLoopback((scope HTTPServerRequest req, scope HTTPServerResponse res) @safe {
+		lastForm = req.bodyReader.readAllUTF8();
+		res.writeBody(`{"access_token":"at","token_type":"bearer"}`, "application/json");
+	});
+	scope (exit)
+		srv.stop();
+
+	auto c = new OAuthClient();
+	c.resource = "http://127.0.0.1:3000/mcp";
+	c.authMethod = TokenEndpointAuthMethod.clientSecretPost;
+	c.tokenExchange(srv.base ~ "/token", "subj", "urn:t:id_token",
+			"urn:t:access_token", "aud", RegisteredClient("cid", "shh"));
+	assert(lastForm.canFind("client_secret=shh"));
 }
 
 unittest  // probeUnauthorized / probeOperation return the WWW-Authenticate challenge on 401
@@ -1478,12 +2415,11 @@ unittest  // authorizeAndGetCode extracts the code from the redirect Location he
 		srv.stop();
 
 	auto c = new OAuthClient();
+	c.resource = srv.base ~ "/mcp";
 	const authzUrl = srv.base ~ "/authorize?client_id=cid";
 
-	// Overload 1: state is verified when expectedState is non-empty.
+	// Overload 1: state is verified.
 	assert(c.authorizeAndGetCode(authzUrl, "st-1") == "auth-code-xyz");
-	// A mismatched expected state discards the code.
-	assert(c.authorizeAndGetCode(authzUrl, "wrong") == "");
 
 	// Overload 2: validates the RFC 9207 iss against the recorded issuer.
 	AuthorizationServerMetadata as_;
@@ -1501,4 +2437,86 @@ unittest  // authorizeAndGetCode extracts the code from the redirect Location he
 	assertThrown(c.authorizeAndGetCode(wrongIss, authzUrl, "st-1"));
 	// A state mismatch on the validating overload is likewise rejected.
 	assertThrown(c.authorizeAndGetCode(as_, authzUrl, "wrong-state"));
+}
+
+unittest  // authorizeAndGetCode throws on a mismatched state rather than returning an empty code
+{
+	import std.exception : assertThrown;
+
+	auto srv = startLoopback((scope HTTPServerRequest req, scope HTTPServerResponse res) @safe {
+		res.statusCode = 302;
+		res.headers["Location"] = "http://localhost:8765/callback?code=auth-code-xyz&state=st-1";
+		res.writeBody("", "text/plain");
+	});
+	scope (exit)
+		srv.stop();
+
+	auto c = new OAuthClient();
+	c.resource = srv.base ~ "/mcp";
+	assertThrown(c.authorizeAndGetCode(srv.base ~ "/authorize?client_id=cid", "wrong"));
+}
+
+unittest  // authorizeAndGetCode refuses to skip state verification (an empty expected state)
+{
+	import std.exception : assertThrown;
+
+	auto srv = startLoopback((scope HTTPServerRequest req, scope HTTPServerResponse res) @safe {
+		res.statusCode = 302;
+		res.headers["Location"] = "http://localhost:8765/callback?code=injected-code";
+		res.writeBody("", "text/plain");
+	});
+	scope (exit)
+		srv.stop();
+
+	auto c = new OAuthClient();
+	c.resource = srv.base ~ "/mcp";
+	const authzUrl = srv.base ~ "/authorize?client_id=cid";
+	assertThrown(c.authorizeAndGetCode(authzUrl, ""));
+	AuthorizationServerMetadata as_;
+	as_.issuer = "https://as.example.com";
+	assertThrown(c.authorizeAndGetCode(as_, authzUrl, ""));
+}
+
+unittest  // discovery treats a protected-resource document nested past the depth cap as a fetch error
+{
+	import std.algorithm : canFind;
+	import std.array : replicate;
+	import std.exception : collectException;
+
+	const deep = "[".replicate(1000) ~ "]".replicate(1000);
+	LoopbackServer srv;
+	srv = startLoopback((scope HTTPServerRequest req, scope HTTPServerResponse res) @safe {
+		res.writeBody(`{"resource":"` ~ srv.base ~ `/mcp","authorization_servers":["`
+			~ srv.base ~ `"],"x":` ~ deep ~ `}`, "application/json");
+	});
+	scope (exit)
+		srv.stop();
+
+	auto c = new OAuthClient();
+	c.resource = srv.base ~ "/mcp";
+	auto e = collectException(c.discoverProtectedResource(srv.base ~ "/mcp"));
+	assert(e !is null && e.msg.canFind("discovery failed"));
+}
+
+unittest  // a token response nested past the depth cap is rejected
+{
+	import std.algorithm : canFind;
+	import std.array : replicate;
+	import std.exception : collectException;
+	import vibe.data.json : JSONException;
+
+	const deep = "[".replicate(1000) ~ "]".replicate(1000);
+	auto srv = startLoopback((scope HTTPServerRequest req, scope HTTPServerResponse res) @safe {
+		res.writeBody(`{"access_token":"at","token_type":"bearer","x":` ~ deep ~ `}`,
+			"application/json");
+	});
+	scope (exit)
+		srv.stop();
+
+	auto c = new OAuthClient();
+	c.resource = srv.base ~ "/mcp";
+	AuthorizationServerMetadata as_;
+	as_.tokenEndpoint = srv.base ~ "/token";
+	auto e = collectException!JSONException(c.refresh(as_, RegisteredClient("cid", ""), "rt"));
+	assert(e !is null && e.msg.canFind("nesting deeper"));
 }

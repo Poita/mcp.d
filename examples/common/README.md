@@ -33,14 +33,17 @@ to exit code 1.
 - otherwise → `McpClient.spawnSibling(siblingServerName)` (stdio, spawning
   the named sibling binary next to the running executable)
 
-The returned client is not yet initialized; call `.initialize()` before use.
+The returned client is not yet connected; call `.connect()` before use. Against
+a stateful server (elicitation, sampling, stickynotes) `connect()` falls back to
+the 2025-11-25 `initialize` handshake; against a stateless one it negotiates
+2026-07-28.
 
 ### Server transport selector — `runServerFromArgs`
 
 `runServerFromArgs(server, args, defaultPort)` mirrors the client helper for
 servers:
 
-- `--http` → `runStreamableHttp(server, port, host)` using `--port` (default
+- `--http` → `runStreamableHttp(server, opts)` using `--port` (default
   `defaultPort`) and `--host` (default `127.0.0.1`)
 - otherwise → `runStdio(server)`
 
@@ -50,11 +53,12 @@ For examples that serve over **HTTP only** (e.g. the auth example, which must
 never silently degrade to an unauthenticated stdio transport):
 
 - `parseHttpServerArgs(args, defaultPort, opts, port, host)` — parses
-  `--port`/`-p` and `--host`/`-h` from `args`, updates `opts.bindAddresses`
-  from the parsed host unless the caller pinned a non-default set, and writes
-  the resolved values back through `port`/`host` out-params.
+  `--port`/`-p` and `--host`/`-h` from `args`, sets `opts.port`, updates
+  `opts.bindAddresses` from the parsed host unless the caller pinned a
+  non-default set, and writes the resolved values back through `port`/`host`
+  out-params.
 - `runHttpServerFromArgs(server, args, defaultPort, opts, port, host)` — calls
-  `parseHttpServerArgs` then `runStreamableHttp(server, port, opts)`.
+  `parseHttpServerArgs` then `runStreamableHttp(server, opts)`.
 
 ### Shared wire type — `WhoamiResult`
 

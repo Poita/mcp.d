@@ -79,11 +79,12 @@ void main(string[] args)
 	});
 
 	StreamableHttpOptions opts;
+	opts.port = port;
 	opts.bindAddresses = [host];
 	() @trusted {
 		stderr.writefln("conformance-server listening on http://%s:%d/mcp", host, port);
 	}();
-	runStreamableHttp(server, port, opts);
+	runStreamableHttp(server, opts);
 }
 
 /// A tool that echoes its `text` argument back as text content.
@@ -243,6 +244,14 @@ private void registerResourceFixtures(McpServer server) @safe
 	};
 	server.registerResource(staticBinary, () @safe => ResourceContents.makeBlob(
 			"test://static-binary", "image/png", onePixelPng));
+
+	// The resources-subscribe/-unsubscribe scenarios subscribe to this URI.
+	Resource watched = {
+		uri: "test://watched-resource", name: "Watched Resource", description: nullable("A resource clients subscribe to for update notifications"),
+		mimeType: nullable("text/plain")
+	};
+	server.registerResource(watched, () @safe => ResourceContents.makeText(
+			"test://watched-resource", "text/plain", "Watched resource content."));
 
 	ResourceTemplate tpl = {
 		uriTemplate: "test://template/{id}/data", name: "Template Data", description: nullable(
@@ -956,10 +965,12 @@ private void registerTaskFixtures(McpServer server) @safe
 	Tool failing = {
 		name: "failing_job", description: nullable("Always fails as a tool error")
 	};
+	TaskToolOptions required;
+	required.support = TaskSupport.required;
 	server.registerTaskTool(failing, (TaskContext tc) @safe {
 		sleep(1000.msecs);
 		return taskText("the job failed", true);
-	}, Nullable!Duration.init, Nullable!Duration.init, TaskSupport.required);
+	}, required);
 
 	// protocol_error_job: a protocol-level failure (status failed + error).
 	Tool protoErr = {

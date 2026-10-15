@@ -7,7 +7,7 @@ import vibe.data.json : Json;
 
 import mcp.protocol.capabilities;
 import mcp.protocol.mrtr : MetaKey;
-import mcp.protocol.jsonhelpers : tryGet;
+import mcp.protocol.jsonhelpers : tryGet, requireObject;
 
 @safe:
 
@@ -113,7 +113,7 @@ unittest  // RequestMeta.fromParams records whether clientCapabilities was prese
 /// and identity so a client can select a version up front (stateless lifecycle).
 struct DiscoverResult
 {
-	string[] protocolVersions;
+	string[] supportedVersions;
 	ServerCapabilities capabilities;
 	/// Server identity. Serialised into `_meta` under
 	/// `io.modelcontextprotocol/serverInfo` (the schema has no top-level
@@ -129,14 +129,9 @@ struct DiscoverResult
 	Json toJson() const @safe
 	{
 		Json j = Json.emptyObject;
-		// The 2026-07-28 base Result mandates a `resultType` discriminator on every
-		// result; a complete discover response uses "complete".
-		j["resultType"] = "complete";
 		Json pv = Json.emptyArray;
-		foreach (v; protocolVersions)
+		foreach (v; supportedVersions)
 			pv ~= Json(v);
-		// Spec wire field name is `supportedVersions` (2026-07-28 server/discover
-		// Response Fields table), even though the D member is `protocolVersions`.
 		j["supportedVersions"] = pv;
 		j["capabilities"] = capabilities.toJson();
 		if (serverInfo.name.length || serverInfo.version_.length)
@@ -154,16 +149,14 @@ struct DiscoverResult
 
 	static DiscoverResult fromJson(Json j) @safe
 	{
+		requireObject(j, "DiscoverResult");
 		DiscoverResult r;
-		// Spec wire field is `supportedVersions`; accept the legacy
-		// `protocolVersions` name as a fallback for older peers.
-		auto verKey = ("supportedVersions" in j) ? "supportedVersions" : "protocolVersions";
-		if (verKey in j && j[verKey].type == Json.Type.array)
+		if ("supportedVersions" in j && j["supportedVersions"].type == Json.Type.array)
 		{
-			auto arr = j[verKey];
+			auto arr = j["supportedVersions"];
 			foreach (i; 0 .. arr.length)
 				if (arr[i].type == Json.Type.string)
-					r.protocolVersions ~= arr[i].get!string;
+					r.supportedVersions ~= arr[i].get!string;
 		}
 		if ("capabilities" in j)
 			r.capabilities = ServerCapabilities.fromJson(j["capabilities"]);
@@ -179,7 +172,7 @@ struct DiscoverResult
 	import core.time : msecs;
 
 	DiscoverResult r;
-	r.protocolVersions = ["2026-07-28"];
+	r.supportedVersions = ["2026-07-28"];
 	r.cache = CacheHint(60_000.msecs, CacheScope.private_);
 	auto j = r.toJson();
 	assert(j["ttlMs"].get!long == 60_000);
@@ -193,7 +186,7 @@ struct DiscoverResult
 @safe unittest  // a DiscoverResult with no hint emits no cache fields and parses back null
 {
 	DiscoverResult r;
-	r.protocolVersions = ["2026-07-28"];
+	r.supportedVersions = ["2026-07-28"];
 	auto j = r.toJson();
 	assert("ttlMs" !in j);
 	assert("cacheScope" !in j);
@@ -222,7 +215,9 @@ struct CacheHint
 /// untouched (matching the sibling `withCache`/`withSubscriptionId`). Every
 /// modern result identifies its server, so this runs at one dispatch chokepoint
 /// rather than per result type. An identity-less `info` and a non-object result
-/// pass through unchanged; an existing key is never overwritten.
+/// pass through unchanged. The key is reserved for MCP and owned by the SDK, so
+/// a value already present (e.g. one a handler put in its result `_meta`) is
+/// replaced: a handler cannot impersonate another server.
 Json withServerInfo(Json result, Implementation info) @safe
 {
 	if (result.type != Json.Type.object)
@@ -232,8 +227,6 @@ Json withServerInfo(Json result, Implementation info) @safe
 	Json out_ = result.clone();
 	Json meta = ("_meta" in out_ && out_["_meta"].type == Json.Type.object) ? out_["_meta"]
 		: Json.emptyObject;
-	if (MetaKey.serverInfo in meta)
-		return result;
 	meta[MetaKey.serverInfo] = info.toJson();
 	out_["_meta"] = meta;
 	return out_;
@@ -279,34 +272,47 @@ Json withCache(Json result, CacheHint hint) @safe
 }
 
 /// Parse a modern `CacheableResult` freshness hint from a result object. Reads
-/// `ttlMs` (accepting an integer or a float) and `cacheScope` (a string mapped to
-/// the `CacheScope` enum, defaulting to `public`). Returns null when no `ttlMs`
-/// field is present.
+/// `ttlMs` (accepting an integer, bigInt or float) and `cacheScope` (`public`
+/// when absent or `"public"`, `private` for any other value). Returns null when
+/// no `ttlMs` field is present.
 Nullable!CacheHint parseCacheHint(Json result) @safe
 {
 	if (result.type != Json.Type.object || "ttlMs" !in result)
 		return Nullable!CacheHint.init;
 	auto ttl = result["ttlMs"];
 	CacheHint hint;
-	long ttlMs;
-	if (ttl.type == Json.Type.int_)
-		ttlMs = ttl.get!long;
-	else if (ttl.type == Json.Type.float_)
-		ttlMs = cast(long) ttl.get!double;
-	else
-		return Nullable!CacheHint.init;
 	// Spec (`CacheableResult`): `ttlMs` MUST be >= 0; clamp defensively on read
 	// so values round-tripped through this SDK honour the constraint even if a
-	// non-conforming peer emitted a negative value. The wire field is
-	// milliseconds; store as a typed Duration.
-	if (ttlMs < 0)
-		ttlMs = 0;
-	hint.ttl = ttlMs.msecs;
-	if ("cacheScope" in result && result["cacheScope"].type == Json.Type.string)
+	// non-conforming peer emitted a negative value. The upper clamp keeps the
+	// millisecond-to-Duration conversion from overflowing into a negative TTL.
+	enum long maxTtlMs = Duration.max.total!"msecs";
+	long ttlMs;
+	if (ttl.type == Json.Type.int_)
 	{
-		const s = result["cacheScope"].get!string;
-		hint.cacheScope = (s == "private") ? CacheScope.private_ : CacheScope.public_;
+		const v = ttl.get!long;
+		ttlMs = v < 0 ? 0 : v > maxTtlMs ? maxTtlMs : v;
 	}
+	else if (ttl.type == Json.Type.float_)
+	{
+		const v = ttl.get!double;
+		// `!(v > 0)` also catches NaN.
+		ttlMs = !(v > 0) ? 0 : v >= maxTtlMs ? maxTtlMs : cast(long) v;
+	}
+	else if (ttl.type == Json.Type.bigInt)
+	{
+		import std.bigint : BigInt;
+
+		// vibe parses only out-of-`long`-range integers as bigInt.
+		ttlMs = ttl.get!BigInt < 0 ? 0 : maxTtlMs;
+	}
+	else
+		return Nullable!CacheHint.init;
+	hint.ttl = ttlMs.msecs;
+	// Fail closed: a scope other than an absent field or "public" keeps the
+	// result out of shared caches.
+	if (auto s = "cacheScope" in result)
+		hint.cacheScope = (s.type == Json.Type.string
+				&& s.get!string == "public") ? CacheScope.public_ : CacheScope.private_;
 	return nullable(hint);
 }
 
@@ -348,14 +354,61 @@ unittest  // RequestMeta.fromParams ignores non-object clientInfo and clientCapa
 	assert(!m.clientCapabilities.roots);
 }
 
+unittest  // RequestMeta.fromParams drops malformed clientInfo icons and keeps the rest
+{
+	import vibe.data.json : parseJsonString;
+
+	foreach (icons; [`[42]`, `[{"src":"a","sizes":[1]}]`])
+	{
+		auto params = parseJsonString(
+				`{"_meta":{"` ~ MetaKey.clientInfo
+				~ `":{"name":"c","version":"1","icons":` ~ icons ~ `}}}`);
+		const m = RequestMeta.fromParams(params);
+		assert(m.clientInfo.name == "c");
+		assert(m.clientInfo.version_ == "1");
+		assert(m.clientInfo.icons.length == 0);
+	}
+}
+
+unittest  // readServerInfo drops malformed serverInfo icons and keeps the rest
+{
+	import vibe.data.json : parseJsonString;
+
+	auto result = parseJsonString(`{"_meta":{"` ~ MetaKey.serverInfo
+			~ `":{"name":"s","version":"2","icons":[42,{"src":"ok"},{"src":"b","sizes":[1]}]}}}`);
+	const info = readServerInfo(result);
+	assert(info.name == "s" && info.version_ == "2");
+	assert(info.icons.length == 1 && info.icons[0].src == "ok");
+}
+
+unittest  // withServerInfo replaces a handler-supplied serverInfo with the server's identity
+{
+	import vibe.data.json : parseJsonString;
+
+	auto spoofed = parseJsonString(`{"content":[],"_meta":{"` ~ MetaKey.serverInfo
+			~ `":{"name":"evil","version":"6.6.6"},"com.example/trace":"t1"}}`);
+	auto j = withServerInfo(spoofed, Implementation("srv", "1.0"));
+	assert(j["_meta"][MetaKey.serverInfo]["name"].get!string == "srv");
+	assert(j["_meta"][MetaKey.serverInfo]["version"].get!string == "1.0");
+	// Unreserved user keys survive, and the input is left untouched.
+	assert(j["_meta"]["com.example/trace"].get!string == "t1");
+	assert(spoofed["_meta"][MetaKey.serverInfo]["name"].get!string == "evil");
+}
+
+unittest  // withServerInfo stamps serverInfo into a result with no _meta
+{
+	auto j = withServerInfo(Json(["content": Json.emptyArray]), Implementation("srv", "1.0"));
+	assert(j["_meta"][MetaKey.serverInfo]["name"].get!string == "srv");
+}
+
 unittest  // DiscoverResult round-trips
 {
 	DiscoverResult d;
-	d.protocolVersions = ["2026-07-28", "2025-11-25"];
+	d.supportedVersions = ["2026-07-28", "2025-11-25"];
 	d.serverInfo = Implementation("srv", "1.0");
 	d.capabilities.logging = true;
 	auto back = DiscoverResult.fromJson(d.toJson());
-	assert(back.protocolVersions.length == 2);
+	assert(back.supportedVersions.length == 2);
 	assert(back.serverInfo.name == "srv");
 	assert(back.capabilities.logging);
 }
@@ -363,7 +416,7 @@ unittest  // DiscoverResult round-trips
 unittest  // server identity travels in result `_meta`, not a top-level `serverInfo`
 {
 	DiscoverResult d;
-	d.protocolVersions = ["2026-07-28"];
+	d.supportedVersions = ["2026-07-28"];
 	d.serverInfo = Implementation("srv", "1.0");
 	auto j = d.toJson();
 	// `DiscoverResult` has no `serverInfo` member in the schema; identity is a
@@ -376,7 +429,7 @@ unittest  // server identity travels in result `_meta`, not a top-level `serverI
 unittest  // an identity-less DiscoverResult emits no `_meta` serverInfo
 {
 	DiscoverResult d;
-	d.protocolVersions = ["2026-07-28"];
+	d.supportedVersions = ["2026-07-28"];
 	auto j = d.toJson();
 	assert("_meta" !in j || MetaKey.serverInfo !in j["_meta"]);
 }
@@ -395,15 +448,28 @@ unittest  // DiscoverResult.fromJson reads serverInfo out of `_meta`
 unittest  // DiscoverResult.toJson emits the spec wire field `supportedVersions`
 {
 	DiscoverResult d;
-	d.protocolVersions = ["2026-07-28", "2025-11-25"];
+	d.supportedVersions = ["2026-07-28", "2025-11-25"];
 	d.serverInfo = Implementation("srv", "1.0");
 	auto j = d.toJson();
-	// 2026-07-28 server/discover Response Fields table requires `supportedVersions`,
-	// not the internal name `protocolVersions`.
+	// 2026-07-28 server/discover Response Fields table requires `supportedVersions`.
 	assert("supportedVersions" in j);
 	assert("protocolVersions" !in j);
 	assert(j["supportedVersions"].length == 2);
 	assert(j["supportedVersions"][0].get!string == "2026-07-28");
+}
+
+unittest  // DiscoverResult names its versions member after the supportedVersions wire field
+{
+	static assert(__traits(hasMember, DiscoverResult, "supportedVersions"));
+	static assert(!__traits(hasMember, DiscoverResult, "protocolVersions"));
+}
+
+unittest  // DiscoverResult.fromJson reads versions only from the spec supportedVersions field
+{
+	import vibe.data.json : parseJsonString;
+
+	auto r = DiscoverResult.fromJson(parseJsonString(`{"protocolVersions": ["2026-07-28"]}`));
+	assert(r.supportedVersions.length == 0);
 }
 
 unittest  // DiscoverResult.fromJson skips non-string entries in supportedVersions
@@ -414,20 +480,16 @@ unittest  // DiscoverResult.fromJson skips non-string entries in supportedVersio
 
 	auto j = parseJsonString(`{"supportedVersions": ["2026-07-28", 42, null, true, "2025-11-25"]}`);
 	auto r = DiscoverResult.fromJson(j);
-	assert(r.protocolVersions.length == 2);
-	assert(r.protocolVersions[0] == "2026-07-28");
-	assert(r.protocolVersions[1] == "2025-11-25");
+	assert(r.supportedVersions.length == 2);
+	assert(r.supportedVersions[0] == "2026-07-28");
+	assert(r.supportedVersions[1] == "2025-11-25");
 }
 
-unittest  // DiscoverResult.toJson carries the required resultType discriminator
+unittest  // DiscoverResult.toJson leaves resultType to the server's dispatch path
 {
 	DiscoverResult d;
-	d.protocolVersions = ["2026-07-28"];
-	auto j = d.toJson();
-	// The 2026-07-28 base Result mandates a resultType discriminator on every result;
-	// a complete discover response uses "complete".
-	assert("resultType" in j);
-	assert(j["resultType"].get!string == "complete");
+	d.supportedVersions = ["2026-07-28"];
+	assert("resultType" !in d.toJson());
 }
 
 unittest  // DiscoverResult.fromJson reads the spec wire field `supportedVersions`
@@ -439,8 +501,8 @@ unittest  // DiscoverResult.fromJson reads the spec wire field `supportedVersion
 	j["resultType"] = Json("complete");
 	j["supportedVersions"] = sv;
 	auto r = DiscoverResult.fromJson(j);
-	assert(r.protocolVersions.length == 2);
-	assert(r.protocolVersions[0] == "2026-07-28");
+	assert(r.supportedVersions.length == 2);
+	assert(r.supportedVersions[0] == "2026-07-28");
 }
 
 unittest  // withCache attaches ttlMs (ms) and cacheScope from a CacheHint Duration
@@ -487,6 +549,24 @@ unittest  // parseCacheHint clamps a negative ttlMs to a zero Duration on read
 	assert(h.get.ttl == Duration.zero);
 }
 
+unittest  // parseCacheHint clamps a huge integer ttlMs to the largest Duration
+{
+	Json r = Json.emptyObject;
+	r["ttlMs"] = long.max;
+	auto h = parseCacheHint(r);
+	assert(!h.isNull);
+	assert(h.get.ttl > Duration.zero);
+}
+
+unittest  // parseCacheHint clamps a huge float ttlMs to the largest Duration
+{
+	Json r = Json.emptyObject;
+	r["ttlMs"] = 1e30;
+	auto h = parseCacheHint(r);
+	assert(!h.isNull);
+	assert(h.get.ttl > Duration.zero);
+}
+
 unittest  // parseCacheHint clamps a negative float ttlMs to a zero Duration on read
 {
 	Json r = Json.emptyObject;
@@ -517,6 +597,23 @@ unittest  // parseCacheHint accepts a float ttlMs (ms) and defaults cacheScope t
 	assert(h.get.cacheScope == CacheScope.public_);
 }
 
+unittest  // parseCacheHint reads an unrecognized or non-string cacheScope as private
+{
+	foreach (scope_; [
+		Json("PRIVATE"), Json("shared"), Json(""), Json(1), Json(null)
+	])
+	{
+		Json r = Json.emptyObject;
+		r["ttlMs"] = 1000;
+		r["cacheScope"] = scope_;
+		assert(parseCacheHint(r).get.cacheScope == CacheScope.private_, scope_.toString);
+	}
+	Json r = Json.emptyObject;
+	r["ttlMs"] = 1000;
+	r["cacheScope"] = "public";
+	assert(parseCacheHint(r).get.cacheScope == CacheScope.public_);
+}
+
 unittest  // round-trip: CacheHint(5.seconds) -> wire ttlMs:5000 -> 5.seconds
 {
 	Json r = Json.emptyObject;
@@ -527,9 +624,35 @@ unittest  // round-trip: CacheHint(5.seconds) -> wire ttlMs:5000 -> 5.seconds
 	assert(h.get.ttl == 5.seconds);
 }
 
+unittest  // parseCacheHint clamps a bigInt ttlMs to the maximum Duration
+{
+	import vibe.data.json : parseJsonString;
+
+	auto h = parseCacheHint(`{"ttlMs":99999999999999999999}`.parseJsonString);
+	assert(!h.isNull);
+	assert(h.get.ttl == Duration.max.total!"msecs".msecs);
+}
+
+unittest  // parseCacheHint clamps a negative bigInt ttlMs to zero
+{
+	import vibe.data.json : parseJsonString;
+
+	auto h = parseCacheHint(`{"ttlMs":-99999999999999999999}`.parseJsonString);
+	assert(!h.isNull);
+	assert(h.get.ttl == Duration.zero);
+}
+
 unittest  // parseCacheHint returns null when ttlMs is absent
 {
 	Json r = Json.emptyObject;
 	r["tools"] = Json.emptyArray;
 	assert(parseCacheHint(r).isNull);
+}
+
+unittest  // DiscoverResult.fromJson rejects a non-object value with -32602
+{
+	import std.exception : collectException;
+
+	auto ex = cast(McpException) collectException(DiscoverResult.fromJson(Json(5)));
+	assert(ex !is null && ex.code == ErrorCode.invalidParams);
 }

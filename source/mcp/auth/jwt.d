@@ -7,6 +7,8 @@ import deimos.openssl.pem;
 import deimos.openssl.evp;
 import deimos.openssl.ecdsa;
 import deimos.openssl.bn;
+import deimos.openssl.ec;
+import deimos.openssl.obj_mac;
 
 // deimos/openssl gates EVP_DigestSign on OPENSSL_VERSION_AT_LEAST(1,1,1), which
 // requires the auto-detect binding. On Windows the posix-only preGenerateCommands
@@ -61,9 +63,11 @@ ubyte[] signRs256(string privateKeyPem, const(ubyte)[] data) @trusted
 }
 
 /// Detect the JWS algorithm to use for the given PKCS#8 private key PEM.
-/// Returns "RS256" for RSA keys and "ES256" for EC keys. Throws for unsupported
-/// key types. This drives the algorithm selection in makeClientAssertion so that
-/// callers do not have to specify the algorithm separately.
+/// Returns "RS256" for RSA keys and "ES256" for EC P-256 keys. Throws for
+/// unsupported key types and for EC keys on any other curve, since ES256 is
+/// defined only over P-256 (RFC 7518 §3.4). This drives the algorithm selection
+/// in makeClientAssertion so that callers do not have to specify the algorithm
+/// separately.
 private string detectKeyAlg(string privateKeyPem) @trusted
 {
 	auto bio = BIO_new_mem_buf(cast(void*) privateKeyPem.ptr, cast(int) privateKeyPem.length);
@@ -82,7 +86,18 @@ private string detectKeyAlg(string privateKeyPem) @trusted
 	if (baseId == EVP_PKEY_RSA)
 		return "RS256";
 	if (baseId == EVP_PKEY_EC)
+	{
+		auto ec = EVP_PKEY_get1_EC_KEY(pkey);
+		if (ec is null)
+			throw new Exception("openssl: failed to read EC private key");
+		scope (exit)
+			EC_KEY_free(ec);
+		auto group = EC_KEY_get0_group(ec);
+		if (group is null || EC_GROUP_get_curve_name(group) != NID_X9_62_prime256v1)
+			throw new Exception(
+					"makeClientAssertion: unsupported curve; EC keys must be on P-256 (ES256)");
 		return "ES256";
+	}
 	throw new Exception(
 			"makeClientAssertion: unsupported key type; only RSA and EC keys are supported");
 }
@@ -154,6 +169,72 @@ private void bnToFixed(const(BIGNUM)* bn, ubyte[] dst) @trusted
 	dst[$ - n .. $] = tmp[0 .. n];
 }
 
+/// The public JWK (RFC 7517) of a PKCS#8 RSA or EC P-256 private key (PEM),
+/// as a `private_key_jwt` client publishes in its `jwks` so the authorization
+/// server can verify its assertions. Carries `alg` (`RS256` or `ES256`) and
+/// `use: "sig"`, and never any private component. Throws for any other key.
+Json publicJwkFromPrivateKeyPem(string privateKeyPem) @trusted
+{
+	import deimos.openssl.rsa : RSA_free, RSA_get0_key;
+
+	const alg = detectKeyAlg(privateKeyPem);
+	auto bio = BIO_new_mem_buf(cast(void*) privateKeyPem.ptr, cast(int) privateKeyPem.length);
+	if (bio is null)
+		throw new Exception("openssl: BIO_new_mem_buf failed");
+	scope (exit)
+		BIO_free(bio);
+	auto pkey = PEM_read_bio_PrivateKey(bio, null, null, null);
+	if (pkey is null)
+		throw new Exception("openssl: failed to parse private key");
+	scope (exit)
+		EVP_PKEY_free(pkey);
+
+	auto jwk = Json.emptyObject;
+	if (alg == "RS256")
+	{
+		auto rsa = EVP_PKEY_get1_RSA(pkey);
+		if (rsa is null)
+			throw new Exception("openssl: failed to read RSA private key");
+		scope (exit)
+			RSA_free(rsa);
+		BIGNUM* n, e;
+		RSA_get0_key(rsa, &n, &e, null);
+		jwk["kty"] = "RSA";
+		jwk["n"] = base64UrlNoPad(bnToBytes(n));
+		jwk["e"] = base64UrlNoPad(bnToBytes(e));
+	}
+	else
+	{
+		auto ec = EVP_PKEY_get1_EC_KEY(pkey);
+		if (ec is null)
+			throw new Exception("openssl: failed to read EC private key");
+		scope (exit)
+			EC_KEY_free(ec);
+		// The uncompressed point encoding is 0x04 || X || Y, 32 bytes each on P-256.
+		ubyte[65] point;
+		const len = EC_POINT_point2oct(EC_KEY_get0_group(ec), EC_KEY_get0_public_key(ec),
+				point_conversion_form_t.POINT_CONVERSION_UNCOMPRESSED,
+				point.ptr, point.length, null);
+		if (len != point.length || point[0] != 0x04)
+			throw new Exception("openssl: failed to encode EC public key");
+		jwk["kty"] = "EC";
+		jwk["crv"] = "P-256";
+		jwk["x"] = base64UrlNoPad(point[1 .. 33]);
+		jwk["y"] = base64UrlNoPad(point[33 .. 65]);
+	}
+	jwk["alg"] = alg;
+	jwk["use"] = "sig";
+	return jwk;
+}
+
+/// The unsigned big-endian bytes of `bn`.
+private ubyte[] bnToBytes(const(BIGNUM)* bn) @trusted
+{
+	auto buf = new ubyte[BN_num_bytes(bn)];
+	BN_bn2bin(bn, buf.ptr);
+	return buf;
+}
+
 /// Whether `s` contains any C0 control character (U+0000..U+001F) or DEL.
 private bool containsControlChar(string s) @safe pure nothrow
 {
@@ -163,16 +244,30 @@ private bool containsControlChar(string s) @safe pure nothrow
 	return false;
 }
 
-/// Build a signed ES256 JWT client assertion (RFC 7523) for OAuth client
-/// authentication: `iss`/`sub` = client id, `aud` = the token endpoint.
+/// Build a signed JWT client assertion (RFC 7523) for OAuth client
+/// authentication, signed RS256 or ES256 according to the key type:
+/// `iss`/`sub` = client id, `aud` = `audience`.
 string makeClientAssertion(string clientId, string audience, string privateKeyPem,
 		long now, long lifetimeSeconds = 300, string jti = "") @safe
 {
+	return makeClientAssertion(clientId, [audience], privateKeyPem, now, lifetimeSeconds, jti);
+}
+
+/// As above, naming every one of `audiences` in `aud` (a single audience is
+/// sent as a string, several as an array). `OAuthClient` chooses them per its
+/// `assertionAudience`.
+string makeClientAssertion(string clientId, string[] audiences,
+		string privateKeyPem, long now, long lifetimeSeconds = 300, string jti = "") @safe
+{
+	import std.algorithm : any, map;
+	import std.array : array;
 	import std.conv : to;
 
+	if (audiences.length == 0)
+		throw new Exception("makeClientAssertion: no audience");
 	if (containsControlChar(clientId))
 		throw new Exception("makeClientAssertion: clientId contains control characters");
-	if (containsControlChar(audience))
+	if (audiences.any!(a => containsControlChar(a)))
 		throw new Exception("makeClientAssertion: audience contains control characters");
 	if (jti.length && containsControlChar(jti))
 		throw new Exception("makeClientAssertion: jti contains control characters");
@@ -190,14 +285,15 @@ string makeClientAssertion(string clientId, string audience, string privateKeyPe
 		// Append 8 random bytes (base64url, no padding) so the JTI is unique
 		// even when two assertions are generated within the same wall-clock second.
 		// RFC 7523 §3 requires each jti to be unique per assertion.
-		auto randomSuffix = () @trusted { return cryptoRandomBytes(8); }();
+		auto randomSuffix = cryptoRandomBytes(8);
 		theJti = "jti-" ~ now.to!string ~ "-" ~ Base64URLNoPadding.encode(randomSuffix).idup;
 	}
 
 	auto payloadJson = Json.emptyObject;
 	payloadJson["iss"] = clientId;
 	payloadJson["sub"] = clientId;
-	payloadJson["aud"] = audience;
+	payloadJson["aud"] = audiences.length == 1
+		? Json(audiences[0]) : Json(audiences.map!(a => Json(a)).array);
 	payloadJson["jti"] = theJti;
 	payloadJson["iat"] = now;
 	payloadJson["exp"] = now + lifetimeSeconds;
@@ -226,8 +322,8 @@ enum jwtBearerAssertionType = "urn:ietf:params:oauth:client-assertion-type:jwt-b
 /// is fixed to RFC 7523 client-assertion shape with iss==sub==clientId), this
 /// lets the issuer, subject, audience and scope vary independently. String
 /// claims are populated into the payload via `Json`, so they are escaped rather
-/// than interpolated. Empty `iss`/`aud`/`sub`/`scope`/`kid` are omitted; the
-/// time claims (`iat`/`nbf`/`exp`) are emitted only when non-zero.
+/// than interpolated. Empty `iss`/`aud`/`sub`/`scope`/`kid` are omitted, as
+/// are `iat`/`nbf` when zero; `exp` is required.
 struct JwtClaims
 {
 	string iss; /// `iss` — token issuer (omitted if empty).
@@ -236,8 +332,13 @@ struct JwtClaims
 	string scope_; /// `scope` — space-delimited granted scopes (omitted if empty).
 	long iat; /// `iat` — issued-at (seconds since epoch; omitted if 0).
 	long nbf; /// `nbf` — not-before (seconds since epoch; omitted if 0).
-	long exp; /// `exp` — expiry (seconds since epoch; omitted if 0).
+	long exp; /// `exp` — expiry (seconds since epoch; required, must be positive).
+	string jti; /// `jti` — unique token identifier (omitted if empty).
+	string clientId; /// `client_id` — the OAuth client the token was issued to (omitted if empty).
 	string kid; /// JWS `kid` header parameter (omitted if empty).
+	/// JWS `typ` header parameter. Defaults to `at+jwt`, the RFC 9068 type
+	/// that lets a resource server tell an access token from an OIDC id_token.
+	string typ = "at+jwt";
 }
 
 /// Build a signed ES256 JWT carrying the given `claims`, using the supplied
@@ -245,15 +346,23 @@ struct JwtClaims
 /// `makeClientAssertion`: the payload is assembled with `Json` (so string claims
 /// are JSON-escaped, never interpolated) and string claims are rejected up front
 /// if they contain control characters, reusing the same injection-hardening.
+/// Throws when `claims.exp` is not positive: a token without an expiry would be
+/// valid forever, and the SDK's `jwtVerifier` rejects one.
 string mintJwtEs256(string privateKeyPem, JwtClaims claims) @safe
 {
-	foreach (s; [claims.iss, claims.aud, claims.sub, claims.scope_, claims.kid])
+	if (claims.exp <= 0)
+		throw new Exception("mintJwtEs256: exp must be set to a positive expiry time");
+	foreach (s; [
+		claims.iss, claims.aud, claims.sub, claims.scope_, claims.jti,
+		claims.clientId, claims.kid, claims.typ
+	])
 		if (containsControlChar(s))
 			throw new Exception("mintJwtEs256: claim contains control characters");
 
 	auto headerJson = Json.emptyObject;
 	headerJson["alg"] = "ES256";
-	headerJson["typ"] = "JWT";
+	if (claims.typ.length)
+		headerJson["typ"] = claims.typ;
 	if (claims.kid.length)
 		headerJson["kid"] = claims.kid;
 
@@ -270,8 +379,11 @@ string mintJwtEs256(string privateKeyPem, JwtClaims claims) @safe
 		payloadJson["iat"] = claims.iat;
 	if (claims.nbf != 0)
 		payloadJson["nbf"] = claims.nbf;
-	if (claims.exp != 0)
-		payloadJson["exp"] = claims.exp;
+	payloadJson["exp"] = claims.exp;
+	if (claims.jti.length)
+		payloadJson["jti"] = claims.jti;
+	if (claims.clientId.length)
+		payloadJson["client_id"] = claims.clientId;
 
 	const header = headerJson.toString();
 	const payload = payloadJson.toString();
@@ -302,9 +414,7 @@ unittest  // ES256 JWT client assertion has 3 parts and a 64-byte (raw) signatur
 	// Payload contains the expected claims.
 	import std.string : indexOf;
 
-	auto payloadJson = () @trusted {
-		return (cast(char[]) Base64URLNoPadding.decode(parts[1])).idup;
-	}();
+	auto payloadJson = (cast(char[]) Base64URLNoPadding.decode(parts[1])).idup;
 	assert(payloadJson.indexOf(`"iss":"client-1"`) >= 0);
 	assert(payloadJson.indexOf(`"aud":"https://as.example.com/token"`) >= 0);
 }
@@ -325,9 +435,7 @@ unittest  // A clientId containing a quote is JSON-escaped, not injected as raw 
 	auto jwt = makeClientAssertion(evil, "https://as.example.com/token", pem, 1_700_000_000);
 	auto parts = jwt.split('.');
 	assert(parts.length == 3);
-	auto payloadStr = () @trusted {
-		return (cast(char[]) Base64URLNoPadding.decode(parts[1])).idup;
-	}();
+	auto payloadStr = (cast(char[]) Base64URLNoPadding.decode(parts[1])).idup;
 	auto j = parseJsonString(payloadStr);
 	// The literal string is preserved verbatim in iss/sub, not split into claims.
 	assert(j["iss"].get!string == evil);
@@ -350,9 +458,7 @@ unittest  // iat/exp are emitted as JSON numbers, not strings
 	auto jwt = makeClientAssertion("client-1", "https://as.example.com/token",
 			pem, 1_700_000_000, 300);
 	auto parts = jwt.split('.');
-	auto payloadStr = () @trusted {
-		return (cast(char[]) Base64URLNoPadding.decode(parts[1])).idup;
-	}();
+	auto payloadStr = (cast(char[]) Base64URLNoPadding.decode(parts[1])).idup;
 	auto j = parseJsonString(payloadStr);
 	assert(j["iat"].get!long == 1_700_000_000);
 	assert(j["exp"].get!long == 1_700_000_300);
@@ -389,6 +495,37 @@ version (unittest) private enum testEcPem = "-----BEGIN PRIVATE KEY-----\n"
 	~ "hyL925dgd6gNWRcGOl5RPvIpye+hRANCAATSBYPkHq12VDW5un1kub6zkBc4ieZ9\n"
 	~ "nurGMu+tLzJ6+6syOZsQCGlazcSOGsopLyl1QZMIFh9atUYaDfUjJxMq\n" ~ "-----END PRIVATE KEY-----\n";
 
+version (unittest) private Json jwtSegment(string jwt, size_t index) @safe
+{
+	import std.array : split;
+	import std.base64 : Base64URLNoPadding;
+	import vibe.data.json : parseJsonString;
+
+	return parseJsonString((cast(char[]) Base64URLNoPadding.decode(jwt.split('.')[index])).idup);
+}
+
+unittest  // mintJwtEs256 types the token as an RFC 9068 at+jwt access token by default
+{
+	JwtClaims claims;
+	claims.exp = 1_700_003_600;
+	assert(jwtSegment(mintJwtEs256(testEcPem, claims), 0)["typ"].get!string == "at+jwt");
+	claims.typ = "JWT";
+	assert(jwtSegment(mintJwtEs256(testEcPem, claims), 0)["typ"].get!string == "JWT");
+}
+
+unittest  // mintJwtEs256 emits jti and client_id when set and omits them otherwise
+{
+	JwtClaims claims;
+	claims.exp = 1_700_003_600;
+	auto bare = jwtSegment(mintJwtEs256(testEcPem, claims), 1);
+	assert("jti" !in bare && "client_id" !in bare);
+	claims.jti = "token-1";
+	claims.clientId = "client-1";
+	auto j = jwtSegment(mintJwtEs256(testEcPem, claims), 1);
+	assert(j["jti"].get!string == "token-1");
+	assert(j["client_id"].get!string == "client-1");
+}
+
 unittest  // mintJwtEs256 emits the supplied claims with iss/sub/aud varying independently
 {
 	import std.array : split;
@@ -408,16 +545,12 @@ unittest  // mintJwtEs256 emits the supplied claims with iss/sub/aud varying ind
 	auto parts = jwt.split('.');
 	assert(parts.length == 3);
 
-	auto headerStr = () @trusted {
-		return (cast(char[]) Base64URLNoPadding.decode(parts[0])).idup;
-	}();
+	auto headerStr = (cast(char[]) Base64URLNoPadding.decode(parts[0])).idup;
 	auto h = parseJsonString(headerStr);
 	assert(h["alg"].get!string == "ES256");
 	assert(h["kid"].get!string == "as-1");
 
-	auto payloadStr = () @trusted {
-		return (cast(char[]) Base64URLNoPadding.decode(parts[1])).idup;
-	}();
+	auto payloadStr = (cast(char[]) Base64URLNoPadding.decode(parts[1])).idup;
 	auto j = parseJsonString(payloadStr);
 	assert(j["iss"].get!string == "https://auth.example.com");
 	assert(j["aud"].get!string == "https://rs.example.com/mcp");
@@ -437,17 +570,16 @@ unittest  // mintJwtEs256 JSON-escapes a subject containing a quote rather than 
 	JwtClaims claims;
 	claims.iss = "https://auth.example.com";
 	claims.sub = `x","admin":"true`;
+	claims.exp = 1_700_003_600;
 	auto jwt = mintJwtEs256(testEcPem, claims);
 	auto parts = jwt.split('.');
-	auto payloadStr = () @trusted {
-		return (cast(char[]) Base64URLNoPadding.decode(parts[1])).idup;
-	}();
+	auto payloadStr = (cast(char[]) Base64URLNoPadding.decode(parts[1])).idup;
 	auto j = parseJsonString(payloadStr);
 	assert(j["sub"].get!string == `x","admin":"true`);
 	assert(j["admin"].type == Json.Type.undefined);
 }
 
-unittest  // mintJwtEs256 omits empty string claims and zero time claims
+unittest  // mintJwtEs256 omits empty string claims and zero iat/nbf
 {
 	import std.array : split;
 	import std.base64 : Base64URLNoPadding;
@@ -456,23 +588,32 @@ unittest  // mintJwtEs256 omits empty string claims and zero time claims
 	JwtClaims claims;
 	claims.iss = "https://auth.example.com";
 	claims.sub = "user-42";
+	claims.exp = 1_700_003_600;
 	auto jwt = mintJwtEs256(testEcPem, claims);
 	auto parts = jwt.split('.');
-	auto payloadStr = () @trusted {
-		return (cast(char[]) Base64URLNoPadding.decode(parts[1])).idup;
-	}();
+	auto payloadStr = (cast(char[]) Base64URLNoPadding.decode(parts[1])).idup;
 	auto j = parseJsonString(payloadStr);
 	assert(j["aud"].type == Json.Type.undefined);
 	assert(j["scope"].type == Json.Type.undefined);
 	assert(j["iat"].type == Json.Type.undefined);
 	assert(j["nbf"].type == Json.Type.undefined);
-	assert(j["exp"].type == Json.Type.undefined);
+	assert(j["exp"].get!long == 1_700_003_600);
 
-	auto headerStr = () @trusted {
-		return (cast(char[]) Base64URLNoPadding.decode(parts[0])).idup;
-	}();
+	auto headerStr = (cast(char[]) Base64URLNoPadding.decode(parts[0])).idup;
 	auto h = parseJsonString(headerStr);
 	assert(h["kid"].type == Json.Type.undefined);
+}
+
+unittest  // mintJwtEs256 refuses claims without a positive exp
+{
+	import std.exception : assertThrown;
+
+	JwtClaims claims;
+	claims.iss = "https://auth.example.com";
+	claims.sub = "user-42";
+	assertThrown(mintJwtEs256(testEcPem, claims));
+	claims.exp = -1;
+	assertThrown(mintJwtEs256(testEcPem, claims));
 }
 
 unittest  // mintJwtEs256 fails closed on control characters in a claim
@@ -482,10 +623,11 @@ unittest  // mintJwtEs256 fails closed on control characters in a claim
 	JwtClaims claims;
 	claims.iss = "https://auth.example.com";
 	claims.sub = "bad\nsub";
+	claims.exp = 1_700_003_600;
 	assertThrown(mintJwtEs256(testEcPem, claims));
 }
 
-unittest  // auto-generated jti values are unique even when now is identical across calls (#1160)
+unittest  // auto-generated jti values are unique even when now is identical across calls
 {
 	import std.algorithm : startsWith;
 	import std.array : split;
@@ -502,12 +644,8 @@ unittest  // auto-generated jti values are unique even when now is identical acr
 	const now = 1_700_000_000L;
 	auto jwt1 = makeClientAssertion("client-1", "https://as.example.com/token", pem, now);
 	auto jwt2 = makeClientAssertion("client-1", "https://as.example.com/token", pem, now);
-	auto payload1 = () @trusted {
-		return (cast(char[]) Base64URLNoPadding.decode(jwt1.split('.')[1])).idup;
-	}();
-	auto payload2 = () @trusted {
-		return (cast(char[]) Base64URLNoPadding.decode(jwt2.split('.')[1])).idup;
-	}();
+	auto payload1 = (cast(char[]) Base64URLNoPadding.decode(jwt1.split('.')[1])).idup;
+	auto payload2 = (cast(char[]) Base64URLNoPadding.decode(jwt2.split('.')[1])).idup;
 	auto j1 = parseJsonString(payload1);
 	auto j2 = parseJsonString(payload2);
 	// Each jti must include the timestamp prefix so an AS can bound its replay window.
@@ -566,13 +704,56 @@ unittest  // makeClientAssertion emits RS256 when given an RSA private key
 	assert(parts.length == 3);
 
 	// Header must declare RS256.
-	auto headerStr = () @trusted {
-		return (cast(char[]) Base64URLNoPadding.decode(parts[0])).idup;
-	}();
+	auto headerStr = (cast(char[]) Base64URLNoPadding.decode(parts[0])).idup;
 	auto h = parseJsonString(headerStr);
 	assert(h["alg"].get!string == "RS256", "RSA key must produce RS256, not ES256");
 
 	// RSA-2048 signature is 256 bytes.
 	auto sig = Base64URLNoPadding.decode(parts[2]);
 	assert(sig.length == 256, "RS256 signature must be 256 bytes for RSA-2048");
+}
+
+// A throwaway EC P-384 PKCS#8 private key, a curve ES256 does not permit.
+version (unittest) private enum testEcP384Pem = "-----BEGIN PRIVATE KEY-----\n"
+	~ "MIG2AgEAMBAGByqGSM49AgEGBSuBBAAiBIGeMIGbAgEBBDCxzjiPD+SeE/9yrhty\n"
+	~ "P0ziLjVvPcDrwPU5GpZwrLyTIvfRY/Fhs+OD3SdmBTD8r52hZANiAAQnbKnjd/3U\n"
+	~ "CfxAJY7GFYKOxWKmtzecL1FO5/ZhGRTj77sT495rhl4ZAUzUWHoLNUP3elguADjk\n"
+	~ "tzh53CdJ+j1rzOgvXv4cN4AZgcuJtLRdpu8H8CLKadnPx/PJXgCUTls=\n" ~ "-----END PRIVATE KEY-----\n";
+
+unittest  // makeClientAssertion rejects an EC key on a curve other than P-256 with a clear error
+{
+	import std.algorithm : canFind;
+	import std.exception : collectException;
+
+	auto e = collectException(makeClientAssertion("client-p384",
+			"https://as.example.com/token", testEcP384Pem, 1_700_000_000));
+	assert(e !is null, "a P-384 key must be rejected");
+	assert(e.msg.canFind("unsupported curve"), e.msg);
+}
+
+unittest  // publicJwkFromPrivateKeyPem derives the P-256 public coordinates of an EC key
+{
+	const pem = "-----BEGIN PRIVATE KEY-----\n"
+		~ "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgy5nLkurotTseFLEh\n"
+		~ "TcetOpmlWQKsY10kx9Dcg6b7m02hRANCAARdpXuunF3oDfCSUKOtGkybZPpwLUPF\n"
+		~ "lCYgn/nxuirfH7L2jXQ/brpaEHPPPTMZgp6p33PDD6VGlbXVXCchEIe0\n"
+		~ "-----END PRIVATE KEY-----\n";
+	auto jwk = publicJwkFromPrivateKeyPem(pem);
+	assert(jwk["kty"].get!string == "EC");
+	assert(jwk["crv"].get!string == "P-256");
+	assert(jwk["alg"].get!string == "ES256");
+	assert(jwk["x"].get!string == "XaV7rpxd6A3wklCjrRpMm2T6cC1DxZQmIJ_58boq3x8");
+	assert(jwk["y"].get!string == "svaNdD9uuloQc889MxmCnqnfc8MPpUaVtdVcJyEQh7Q");
+	assert("d" !in jwk);
+}
+
+unittest  // publicJwkFromPrivateKeyPem derives the modulus and exponent of an RSA key
+{
+	const pem = "-----BEGIN PRIVATE KEY-----\n" ~ "MIICdwIBADANBgkqhkiG9w0BAQEFAASCAmEwggJdAgEAAoGBAMo2lXCzplosNMg6\n" ~ "vK9oDmpYfQlRVgrhYVQQ+dnHzGeG3kdfhcqYp6YHkkwsTYIcT07bqPycmf6X53cS\n" ~ "DQ2x7+sb5/DF24p1rX2qitb/I1N5XCRtSf/piB20mIuo0chotn9TPVsJbjlNSxmD\n" ~ "GwHPH1Iv69l3FHNYHVhzCIH1shpJAgMBAAECgYEArtE1rPODM53YG+q7ySE6pTHP\n" ~ "F0kcC9gBXr42YtLaof31GNs6PYZwGZeeIQCEGaID5nb8xzdT4sjMsSIH6vkUIjLT\n" ~ "UTRxqihpD+RVTNMFmA/kINoptKFSvC7cr1te9PKfVPzv8awv9nQ4FjvPfurhxR0E\n" ~ "8a4IyFDj9dmQM8W9dmkCQQDmun9mZsP+HPLehsm2IyeSjqsvcHWboojVZTopQKS5\n" ~ "Ve+RqFKMyHWfdTWFaaYa30GT63X73Q5SqjZ3uK22QmOnAkEA4FyIaI+qarfOH3bS\n" ~ "TSM4SL3DticLU0bIQZjO6weZiMVwkcPQMmURYnVJVnhn4kMMCIN/oprsSKLcclVq\n" ~ "sM4QjwJANpjjFMQ0lKkc/3M9wA/JiXChKXSfH9jyMCzn+mMFl6WyLvF5tz6oNrdx\n" ~ "lsRNPgaeafZJ0POaNA17HhFhacOD+QJBALysE+oaJm1n9GZxPZiwrXw+WH6thtCZ\n" ~ "DX5cSmVLFsn1fxyVVleKtnvdtbaJupKDX3MpYgQT0++hRVDAk9/q6fECQH695tXX\n" ~ "MNtm5zG7KTSiNHIqwkTYK3O/fJZca8I0SpoaWJrBegJZOg6Yj3kK420xq2XRUDIx\n" ~ "bAmjh6f1ntky/Wk=\n" ~ "-----END PRIVATE KEY-----\n";
+	auto jwk = publicJwkFromPrivateKeyPem(pem);
+	assert(jwk["kty"].get!string == "RSA");
+	assert(jwk["alg"].get!string == "RS256");
+	assert(jwk["e"].get!string == "AQAB");
+	assert(jwk["n"].get!string == "yjaVcLOmWiw0yDq8r2gOalh9CVFWCuFhVBD52cfMZ4beR1-FypinpgeSTCxNghxPTtuo_JyZ_pfndxINDbHv6xvn8MXbinWtfaqK1v8jU3lcJG1J_-mIHbSYi6jRyGi2f1M9WwluOU1LGYMbAc8fUi_r2XcUc1gdWHMIgfWyGkk");
+	assert("d" !in jwk);
 }

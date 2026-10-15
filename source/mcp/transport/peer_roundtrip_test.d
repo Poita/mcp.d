@@ -84,7 +84,7 @@ unittest
 		{
 			auto listener = listenHTTP(settings, router);
 			scope (exit)
-				() @trusted { listener.stopListening(); }();
+				listener.stopListening();
 			const port = listener.bindAddresses[0].port;
 			auto url = "http://127.0.0.1:" ~ port.to!string ~ "/mcp";
 
@@ -160,7 +160,7 @@ unittest
 		{
 			auto listener = listenHTTP(settings, router);
 			scope (exit)
-				() @trusted { listener.stopListening(); }();
+				listener.stopListening();
 			const port = listener.bindAddresses[0].port;
 			auto url = "http://127.0.0.1:" ~ port.to!string ~ "/mcp";
 
@@ -169,7 +169,6 @@ unittest
 				closeQuietly(client);
 			// Advertise form-mode elicitation explicitly (the client validates inbound
 			// requests against its declared capabilities, not the auto-derived set).
-			client.capabilities.elicitation = true;
 			client.capabilities.elicitationForm = true;
 			client.onElicitation = (ElicitParams params) @safe {
 				Json content = Json.emptyObject;

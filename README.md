@@ -1,19 +1,50 @@
 # mcp.d
 
-[![Dub version](https://img.shields.io/dub/v/mcp-d.svg)](https://code.dlang.org/packages/mcp-d)
+[![Latest release](https://img.shields.io/dub/v/mcp-d.svg?label=latest%20release)](https://code.dlang.org/packages/mcp-d)
 [![CI](https://github.com/Poita/mcp.d/actions/workflows/ci.yml/badge.svg)](https://github.com/Poita/mcp.d/actions/workflows/ci.yml)
 [![codecov](https://codecov.io/gh/Poita/mcp.d/branch/main/graph/badge.svg)](https://codecov.io/gh/Poita/mcp.d)
 [![License: Apache 2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
-[![API docs](https://img.shields.io/badge/docs-API%20reference-blue.svg)](https://poita.github.io/mcp.d/)
+[![API docs (main)](https://img.shields.io/badge/docs-API%20reference%20%28main%29-blue.svg)](https://poita.github.io/mcp.d/)
 
 A feature-complete [Model Context Protocol](https://modelcontextprotocol.io) (MCP) SDK for
 the D programming language — client and server, built on [vibe-d](https://vibed.org).
 
+## Contents
+
+- [Quickstart](#quickstart)
+- [Installation](#installation)
+- [Goals](#goals)
+- [Status](#status)
+- [Requirements](#requirements)
+- [Build & test](#build--test)
+- [Deploying](#deploying)
+- [API documentation](#api-documentation)
+- [Statefulness](#statefulness)
+- [Implementing a custom server transport](#implementing-a-custom-server-transport)
+- [Client response cache](#client-response-cache)
+- [TLS](#tls)
+- [Client authentication (OAuth login)](#client-authentication-oauth-login)
+- [Examples](#examples)
+- [MCP Apps (interactive UI)](#mcp-apps-interactive-ui)
+- [MCP Tasks (asynchronous execution)](#mcp-tasks-asynchronous-execution)
+- [MCP Events (triggers)](#mcp-events-triggers)
+- [Skills](#skills)
+- [Concurrency model](#concurrency-model)
+- [Running the conformance suite](#running-the-conformance-suite)
+- [Contributing](#contributing)
+- [License](#license)
+
 ## Quickstart
 
-A server is a handful of annotated functions plus `runStdio`:
+A server is a handful of annotated functions plus `runStdio`. Save it as
+`server.d`; the comment at the top makes it a single-file dub package (see
+[Installation](#installation) for the dependency line):
 
 ```d
+/+ dub.sdl:
+    name "demo-server"
+    dependency "mcp-d" repository="git+https://github.com/Poita/mcp.d.git" version="~main"
++/
 module demo;
 
 import mcp;
@@ -33,12 +64,16 @@ void main()
 A client spawns that server over stdio, negotiates the protocol (any era — legacy
 or modern) with `connect()`, calls the tool, and checks the result. Wrap the work
 in `runWithEventLoop` — it drives vibe's event loop for you and hands back the
-scenario's value (see [Concurrency model](#concurrency-model)):
+scenario's value (see [Concurrency model](#concurrency-model)). Save it as
+`client.d` next to `server.d`:
 
 ```d
-// client.d — build server.d as ./demo-server first
+/+ dub.sdl:
+    name "demo-client"
+    dependency "mcp-d" repository="git+https://github.com/Poita/mcp.d.git" version="~main"
++/
 import mcp;
-import vibe.data.json : parseJsonString;
+import std.stdio : writeln;
 
 void main()
 {
@@ -50,19 +85,85 @@ void main()
         return client.callTool("add", parseJsonString(`{"a": 2, "b": 3}`));
     });
     assert(result.structuredContent["result"].get!long == 5);
+    writeln("2 + 3 = ", result.structuredContent["result"].get!long);
 }
 ```
 
-## Installation
-
-Add mcp.d to your project with dub:
+Build the server, then run the client from the same directory (it spawns
+`./demo-server`, relative to the working directory). To launch a server binary
+that ships next to the client executable regardless of the working directory,
+use `McpClient.spawnSibling("demo-server")` instead.
 
 ```bash
-dub add mcp-d
+ulimit -n 65536                 # see Build & test
+dub build --single server.d     # produces ./demo-server
+dub run --single client.d       # prints "2 + 3 = 5"
 ```
 
-This always pulls the latest release (see the Dub version badge above). Then
-`import mcp;` in your source files.
+### Serving over HTTP
+
+The same server speaks Streamable HTTP by swapping `runStdio` for
+`runStreamableHttp`, which blocks serving `http://127.0.0.1:8080/mcp`:
+
+```d
+import mcp;
+import mcp.transport : runStreamableHttp, StreamableHttpOptions;
+
+void main()
+{
+    auto server = new McpServer("demo", "1.0.0");
+    registerModule!demo(server);
+
+    StreamableHttpOptions opts;
+    opts.port = 8080;               // binds 127.0.0.1 by default
+    runStreamableHttp(server, opts);
+}
+```
+
+A client reaches it with `McpClient.http("http://127.0.0.1:8080/mcp")` in place
+of `McpClient.spawn`; the rest of `client.d` is unchanged. To listen on a public
+interface, also set `opts.bindAddresses` and `opts.allowedHosts` (see
+[Deploying](#deploying)). [`examples/hello`](examples/hello/) is a complete
+server/client pair that does both transports from one binary.
+
+## Installation
+
+This README documents the `main` branch. Tagged releases on
+[code.dlang.org](https://code.dlang.org/packages/mcp-d) (see the latest release
+badge above) can lag well behind it, so to build against the API described here,
+depend on `main` through git in your `dub.sdl`:
+
+```sdl
+dependency "mcp-d" repository="git+https://github.com/Poita/mcp.d.git" version="~main"
+```
+
+or in `dub.json`:
+
+```json
+"dependencies": {
+    "mcp-d": { "repository": "git+https://github.com/Poita/mcp.d.git", "version": "~main" }
+}
+```
+
+**dub caches a `~main` checkout and does not refresh it.** The first build clones
+`main` into `~/.dub/packages/mcp-d/~main`, and later builds (and `dub upgrade`)
+keep using that copy, so newer commits on `main` never arrive on their own;
+`dub.selections.json` records only the branch name, not the commit. Two ways to
+control which `main` you build against:
+
+- **Pin a commit (recommended).** Replace `~main` with a full commit hash, e.g.
+  `version="711d9fc447140f2d95992a6e57276d2a88c81a7c"`. Builds are reproducible,
+  and moving to a newer `main` is an explicit edit of that hash.
+- **Track `main`.** Keep `~main` and, when you want the latest commit, drop the
+  cached copy with `dub remove mcp-d` (it removes every cached mcp-d version);
+  the next `dub build` / `dub upgrade` clones `main` afresh.
+
+A local checkout works too: `dependency "mcp-d" path="../mcp.d"`.
+
+To use the latest tagged release instead, run `dub add mcp-d` and read the README
+at that release's tag, since its API may differ from `main`.
+
+Then `import mcp;` in your source files.
 
 ## Goals
 
@@ -101,7 +202,7 @@ the one remaining check is the harness's own wire-schema validator rejecting any
   offline-access, DCR, pre-registration, resource-mismatch, **cross-app access**
   (token-exchange → JWT-bearer); **elicitation** with schema defaults; and **SSE
   resumption** (`retry:` + `Last-Event-ID`).
-- ✅ **FastMCP-style UDA API** — `@tool` / `@resource` / `@prompt` / `@task` / `@skill` with auto JSON-Schema.
+- ✅ **FastMCP-style UDA API** — `@tool` / `@resource` / `@prompt` / `@taskTool` / `@skill` with auto JSON-Schema.
 - ✅ **2026-07-28 (modern)** — stateless per-request `_meta`, `server/discover`,
   `subscriptions/listen`, `CacheableResult` (`ttlMs`/`cacheScope`), MRTR types, the standard
   request headers (`Mcp-Method`/`Mcp-Name`/`MCP-Protocol-Version`) with `HeaderMismatch`
@@ -120,16 +221,21 @@ the one remaining check is the harness's own wire-schema validator rejecting any
   registration mechanism now that DCR is deprecated. The **client** advertises and uses an
   HTTPS-URL `client_id` when the AS supports it; the **server-side OAuth proxy** opts in via
   `OAuthProxyConfig.clientIdMetadataDocumentSupported`, advertising
-  `client_id_metadata_document_supported`, then fetching (SSRF-guarded, size-capped) and
-  validating the hosted document at `/authorize` — exact `client_id` match, required fields
+  `client_id_metadata_document_supported`, then fetching (SSRF-guarded, size-capped, cached —
+  failures included — and rate limited per host) and validating the hosted document at `/authorize` — exact `client_id` match, required fields
   (`client_id`, `client_name`, `redirect_uris`), and a redirect-URI allowlist sourced from the
   document — with confused-deputy consent keyed on the stable `client_id` URL. The consent
-  screen surfaces the verified `client_name` and the redirect-URI hostname. DCR remains as the
-  deprecated fallback.
+  screen surfaces the `client_name`, the `client_id` host, the redirect-URI hostname and the
+  requested scopes; consent is recorded per scope set, so a request for broader access re-prompts,
+  and only scopes listed in `OAuthProxyConfig.scopesSupported` (when set) are forwarded upstream.
+  DCR remains as the deprecated fallback.
 
-Optional follow-ups (not required for conformance): a built-in loopback redirect listener for
-the interactive auth-code flow, and a localhost-redirect impersonation warning on the proxy's
-CIMD consent screen (a spec `SHOULD`).
+- ✅ **Interactive client login** — `useOAuth` runs the full browser authorization-code flow
+  with a loopback redirect listener, persists tokens, and refreshes them transparently. See
+  [Client authentication](#client-authentication-oauth-login).
+
+Optional follow-up (not required for conformance): a localhost-redirect impersonation warning
+on the proxy's CIMD consent screen (a spec `SHOULD`).
 
 ## Requirements
 
@@ -145,24 +251,29 @@ CIMD consent screen (a spec `SHOULD`).
 
 ### Platform support
 
-Linux, macOS, and Windows are all supported and exercised in CI (Linux/macOS with
-DMD and LDC, Windows with LDC). The stdio transport, the OS CSPRNG, and the OAuth
+Linux, macOS, and Windows are all supported and exercised in CI (Linux with DMD
+and LDC, macOS and Windows with LDC). The stdio transport, the OS CSPRNG, and the OAuth
 token store each have native Windows code paths; on Windows the token store
 tightens file permissions via ACLs rather than POSIX modes.
+
+On Windows, build executables that depend on mcp.d with `dub build --combined`
+(likewise `dub run --combined`). LDC on Windows can leave D template
+instantiations split across static-library objects unresolved at the final
+link; `--combined` compiles all dependency sources in one pass and avoids it.
 
 ## Build & test
 
 ```bash
 ulimit -n 65536        # required: dub misbehaves under ghostty's `ulimit -n unlimited`
 dub build              # build the library
-dub test               # run all unit tests (42 modules, ~1900 tests)
+dub test               # run all unit tests
 ```
 
-Formatting and linting:
+Formatting and linting (the same gates CI runs; `just fmt` / `just lint` wrap them):
 
 ```bash
-dub run dfmt -- --inplace source/
-dub run dscanner -- --styleCheck source/
+dub run dfmt -- --inplace source/ conformance/ examples/ bench/ deploy/ci-smoke/
+./scripts/dscanner-lint.sh     # D-Scanner with the project config and documented filters
 ```
 
 ## Deploying
@@ -194,17 +305,18 @@ Open `docs/index.html` in a browser when it finishes. The generated `docs/`
 directory is a build artifact and is git-ignored.
 
 CI builds the docs on every push/PR (`.github/workflows/docs.yml`) so doc
-generation can never silently break, and publishes them to GitHub Pages on a
-published **release** (or a manual `workflow_dispatch`), not on every push to
-`main` (best-effort: the publish step is skipped if Pages is not enabled for the
-repository).
+generation can never silently break, and publishes them to
+[GitHub Pages](https://poita.github.io/mcp.d/) on every push to `main` (or a
+manual `workflow_dispatch`), so the published reference documents the same
+`main` API as this README (best-effort: the publish step is skipped if Pages is
+not enabled for the repository). For a tagged release, generate the docs locally
+from that tag with `scripts/gen-docs.sh`.
 
 ## Statefulness
 
 A server chooses one of two statefulness models at construction. **Stateless is
-the default.** The author picks the mode via factories; the existing
-`new McpServer(name, version)` constructors keep working and default to
-stateless.
+the default.** The author picks the mode via factories; the
+`new McpServer(name, version)` constructors build a stateless server.
 
 ```d
 auto s1 = McpServer.stateless("my-server", "1.0.0"); // default; same as `new McpServer(...)`
@@ -249,10 +361,15 @@ delivery is decoupled from `publish` via a pluggable `DeliveryQueue`
 subscription, and the periodic worker `enableEvents` starts (every
 `EventsOptions.workerInterval`) leases/delivers/acks — the same pass also expires
 poll leases, sweeps lapsed webhook subscriptions, and runs poll-driven webhook
-delivery for fetch-handler types. The in-memory default is single-node; injecting
-a shared, durable queue (Redis/SQS/DB) plus a `SubscriptionStore` makes webhook
+delivery for fetch-handler types. `McpServer.shutdown()` stops this worker and the
+Tasks TTL sweeper. The in-memory default is single-node; injecting
+a shared, durable queue (Redis/SQS/DB) plus a `WebhookSubscriptionStore` makes webhook
 delivery node-agnostic (any node's worker delivers; a crashed node's leased job
-is re-leased) — mirroring the `TaskStore`/`TaskDispatcher` split.
+is re-leased) — mirroring the `TaskStore`/`TaskDispatcher` split. Like
+`TaskStore`, a shared `WebhookSubscriptionStore` implements `compareAndSwap` on the
+record's `revision` as one atomic conditional write: every update to a stored
+subscription (watermark, verification, delivery health, refresh) is a
+read-modify-write retried on a lost race, so nodes never overwrite each other.
 
 > **Guidance:** if your tools initiate elicitation/sampling/roots, or use the
 > 2025-era `resources/subscribe` push over HTTP, construct the server with
@@ -289,13 +406,17 @@ is resolved.
 | Per-request `_meta` version/caps | yes | n/a (header + empty caps) | n/a (session-negotiated) |
 | Standalone GET SSE stream | forbidden (405) | forbidden (405) | yes |
 | `resources/subscribe` / `unsubscribe` | forbidden (-32601) | forbidden (-32601) | yes |
-| `subscriptions/listen` (2026-07-28) | yes (self-contained stream) | n/a (modern-only) | yes |
+| `subscriptions/listen` (2026-07-28) | yes (self-contained stream) | n/a (modern-only) | no (2026-07-28 refused with -32022) |
 | Server->client `elicit`/`sample`/`roots` | forbidden (error; MRTR instead) | forbidden (error) | yes |
-| `logging/setLevel` | n/a (per-request `_meta`) | forbidden (-32601) | yes (session-scoped) |
+| `logging/setLevel` | n/a (per-request `_meta`) | forbidden (-32601); the `logging` capability stays advertised because `ctx.log` still reaches the request's own response stream at the default `info` level | yes (session-scoped) |
+| `listChanged` in capabilities | yes (via `subscriptions/listen`) | never advertised (no channel to notify on) | yes |
 | Session id minted | never | never | yes |
 
 The `subscribe` capability advertisement follows the same rule: a stateless server
-does **not** advertise the resources `subscribe` capability. Calling
+does **not** advertise the resources `subscribe` capability on a 2025-era session. On
+2026-07-28 its `server/discover` advertises `resources.subscribe` whenever it
+advertises `resources`, meaning `subscriptions/listen` accepts `resourceSubscriptions`
+(a server without resources acknowledges no `resourceSubscriptions`). Calling
 `enableResourceSubscriptions()` on a stateless server **throws** rather than
 silently doing nothing — it names `McpServer.stateful()` as the remedy — so the
 mistake surfaces at construction instead of as a missing capability at runtime. The
@@ -309,7 +430,7 @@ The Streamable HTTP transport derives session minting purely from
 ## Implementing a custom server transport
 
 The server side has a named transport seam symmetric to the client's
-`ClientTransport`: the `ServerCore` interface (also exported as `ServerTransport`)
+`ClientTransport`: the `ServerCore` interface
 in `mcp.server.transport`, reachable from `import mcp.transport;`. `McpServer`
 implements it, so a transport can hold its server through the interface and drive
 it without depending on the concrete class.
@@ -322,7 +443,7 @@ Two directions make up the contract:
   notification):
 
   ```d
-  import mcp.transport; // ServerCore / ServerTransport + the wire transports
+  import mcp.transport; // ServerCore + the wire transports
 
   void pump(ServerCore core, string requestText, void delegate(string) @safe reply)
   {
@@ -345,7 +466,7 @@ Two directions make up the contract:
   and issue server->client requests. A transport that multiplexes many sessions
   over one server also implements `ConnectionScoped` on its `RequestContext` so
   the core scopes per-connection state (the cancellation registry) per session,
-  and threads each request's own `ConnectionState` via `handleRaw(text, conn)`.
+  and threads each request's own `ConnectionState` via `handleRaw(text, conn, token, auth)`.
 
 **Connection / session ownership is in-package only.** The fallback
 `ConnectionState` hook the out-of-request notify/push path uses
@@ -355,7 +476,7 @@ This is a deliberate pre-1.0 choice: the seam stays narrow rather than exposing
 connection internals that would be hard to evolve. An out-of-package transport can
 fully drive request/response and per-request state through `ServerCore` +
 `RequestContext` (building its own `ConnectionState` and passing it to
-`handleRaw(text, conn)`), but it cannot own the fallback connection the
+`handleRaw(text, conn, token, auth)`), but it cannot own the fallback connection the
 out-of-request notify/push path reads. Transports that need that ownership belong
 in `mcp.transport.*`.
 
@@ -392,8 +513,8 @@ s.defaultCacheTtl = 30.seconds; // cache even responses the server left unhinted
 auto c = McpClient.http(url, s);
 ```
 
-A `CacheStore` is a small `get`/`put`/`invalidate`/`invalidateMethod`/
-`invalidatePartition`/`clear` interface; supply your own to pre-seed entries and
+A `CacheStore` is a small `get`/`put`/`invalidate`/`invalidatePartition`/`clear`
+interface; supply your own to pre-seed entries and
 skip round-trips, or share one across clients. The default `InMemoryCacheStore`
 is per-client and bounded by an LRU-style size cap. `client.setCache`,
 `setDefaultCacheTtl`, and `clearCache` adjust this at runtime; `cache()` exposes
@@ -405,8 +526,11 @@ share one backend. A `public` result lives under a shared key, so **every client
 hits the same entry** — the point of a shared cache. A `private` result is
 namespaced under the requesting client's `cachePartition` (a stable principal /
 tenant id you set in `ClientSettings`), so it is never served to another
-identity. The default per-client store leaves `cachePartition` empty and the
-distinction is moot.
+identity. A `cacheScope` the client does not recognize is treated as `private`.
+A client with no `cachePartition` keeps its `private` results under a
+partition unique to itself. Every entry is also keyed by server (`CacheKey.server`: the
+endpoint URL, the `spawn` command, or `ClientSettings.cacheServer`), so clients of
+different servers sharing one store never read each other's results.
 
 ```d
 auto store = new MyRedisStore;
@@ -417,9 +541,9 @@ ClientSettings sb; sb.cache = store; sb.cachePartition = "tenant-b";
 ```
 
 On `setBearerToken`, the client evicts only its **own** partition (the previous
-identity's `private` entries), sparing shared `public` entries and other
-principals' partitions; for the default per-client store that empty partition
-holds everything, so it behaves as a full clear.
+identity's `private` entries) from a store you supplied, sparing shared `public`
+entries and other principals' partitions; the default per-client store also drops
+its `public` entries, so it behaves as a full clear.
 
 **Per-call modes** via `RequestOptions.cacheMode`:
 
@@ -443,15 +567,103 @@ also fires a typed callback (`onToolsListChanged`, `onPromptsListChanged`,
 `onNotification`. `setBearerToken` evicts the client's own partition so a
 re-authenticated session never reads the previous identity's `private` results.
 
+## TLS
+
+Every outbound `https` connection the SDK makes (the HTTP client
+transport, OAuth discovery/token/JWKS/introspection fetches, webhook delivery)
+requires a server certificate that chains to a trusted CA and matches the host
+name. The system CA bundle is used by default (`SSL_CERT_FILE` overrides it; on
+platforms without a PEM bundle, such as Windows, set it or `caFile`). For the
+client transport, `ClientSettings.tls` trusts a private CA or a local
+server's self-signed certificate, or — for local development only — disables
+verification:
+
+```d
+ClientSettings s;
+s.tls.caFile = "dev-ca.pem";        // trust this CA in place of the system store
+// s.tls.insecureSkipVerify = true; // development only: no certificate checks
+auto c = McpClient.http("https://localhost:8443/mcp", s);
+```
+
+## Client authentication (OAuth login)
+
+`useOAuth(client, endpoint, opts)` (from `import mcp.auth;`) logs an HTTP client in
+to an OAuth-protected MCP server interactively and attaches the result as the
+client's bearer provider. Call it before `connect()`:
+
+```d
+import mcp;
+import mcp.auth : useOAuth, OAuthLogin;
+
+runWithEventLoop(() @safe {
+    enum endpoint = "https://mcp.example.com/mcp";
+    auto client = McpClient.http(endpoint);
+    scope (exit) client.close();
+
+    OAuthLogin login;
+    login.scopes = ["mcp:read"];
+    useOAuth(client, endpoint, login);
+
+    client.connect();
+    auto tools = client.listTools();
+});
+```
+
+It discovers the protected-resource and authorization-server metadata, then:
+
+- **Picks the scopes**: `OAuthLogin.scopes` when set, otherwise the `scope` of
+  the 401 challenge passed as `OAuthLogin.wwwAuthenticate`, otherwise the
+  protected-resource metadata's `scopes_supported`.
+
+- **Reuses a stored token** for the endpoint when one is still valid, or redeems
+  its refresh token, without opening a browser — unless it lacks one of the
+  scopes named by `OAuthLogin.scopes` or the challenge (a step-up after
+  `insufficient_scope`), which needs a new authorization. A token granted only
+  part of the fallback `scopes_supported` is still reused.
+- Otherwise **registers the client** — a pre-registered `OAuthLogin.clientId`, a
+  Client ID Metadata Document (`clientIdMetadataUrl`, when the AS supports it), or
+  Dynamic Client Registration — and **runs authorization-code + PKCE** in the system
+  browser. The redirect is captured on a loopback listener at
+  `http://127.0.0.1:<callbackPort><callbackPath>` (an ephemeral port by default);
+  `state` and RFC 9207 `iss` are verified, and the wait is bounded by
+  `callbackTimeout` (5 minutes by default).
+- **Persists tokens** through `OAuthLogin.store`. The default is a `FileTokenStore`
+  at `$XDG_CONFIG_HOME/dlang-mcp/tokens.json` (or `~/.config/dlang-mcp/tokens.json`;
+  `%APPDATA%\dlang-mcp\tokens.json`, else `%LOCALAPPDATA%`, on Windows),
+  written owner-only. With no per-user directory `useOAuth` throws rather than
+  writing tokens to the working directory. Subclass it and override `serialize`/`deserialize` to encrypt
+  at rest, or supply `MemoryTokenStore` or your own `TokenStore`.
+- **Refreshes transparently**: every request asks the returned `OAuthSession` for
+  its bearer, which runs the refresh-token grant when the access token is within
+  30 seconds of expiry and saves the new token. Concurrent refreshes are
+  single-flighted, and a session first re-reads the store, so processes sharing
+  one token file adopt each other's refreshed tokens instead of replaying a
+  rotated refresh token. A refresh the AS answers with `invalid_grant` drops the
+  refresh token, so later requests fail fast until `useOAuth` signs in again. A
+  request the server rejects with `401 invalid_token` is
+  refreshed and retried once; with no refresh token, or when the refreshed token
+  is rejected too, the 401 (an `HttpStatusException` carrying the
+  `WWW-Authenticate` challenge) reaches the caller, who can pass the challenge
+  to `useOAuth` as `OAuthLogin.wwwAuthenticate` to sign in again.
+
+`OAuthLogin.openBrowser` replaces the platform browser launcher (for example, to
+print the URL instead). For non-interactive flows (client credentials, token
+exchange) use the lower-level `OAuthClient` and `setBearerToken`.
+
 ## Examples
 
-The repository ships fourteen runnable, self-verifying server/client pairs in
-[`examples/`](examples/). Each `client.d` is an end-to-end test that asserts the
-matching server's behaviour, and CI runs every pair over **both** stdio and
-Streamable HTTP.
+The repository ships sixteen runnable, self-verifying server/client pairs in
+[`examples/`](examples/) (plus `examples/common`, a small shared helper package).
+[`examples/hello`](examples/hello/) is the standalone one to copy into a new
+project; the others use the repo-only `examples/common` scaffold, and
+[`examples/README.md`](examples/README.md) lists the SDK calls that replace it.
+Each `client.d` is an end-to-end test that asserts the matching server's
+behaviour, and CI runs every pair over **both** stdio and Streamable HTTP, except
+Auth, which is HTTP-only.
 
 | Example | What it shows | Server | Client |
 | --- | --- | --- | --- |
+| Hello | minimal standalone server + client (no shared scaffold) | [server](examples/hello/server.d) | [client](examples/hello/client.d) |
 | Tools | `@tool` handlers with typed args/results | [server](examples/tools/server.d) | [client](examples/tools/client.d) |
 | Prompts | `@prompt` templates | [server](examples/prompts/server.d) | [client](examples/prompts/client.d) |
 | Resources | resources + templates + `subscriptions/listen` push | [server](examples/resources/server.d) | [client](examples/resources/client.d) |
@@ -459,13 +671,12 @@ Streamable HTTP.
 | Modern | the 2026-07-28 protocol end to end (`server/discover`, per-request `_meta`, `connect()`) | [server](examples/modern/server.d) | [client](examples/modern/client.d) |
 | Streaming | progress notifications from a long-running tool | [server](examples/streaming/server.d) | [client](examples/streaming/client.d) |
 | MRTR | multi-round-trip tool input (carried in the result) | [server](examples/mrtr/server.d) | [client](examples/mrtr/client.d) |
-| Tasks | async `@task` tools (progress, cancellation, mid-task input) | [server](examples/tasks/server.d) | [client](examples/tasks/client.d) |
+| Tasks | MCP Tasks extension (SEP-2663): async `@taskTool` tools with progress, cancellation, and `input_required` | [server](examples/tasks/server.d) | [client](examples/tasks/client.d) |
 | Sampling | server-initiated LLM sampling (`ctx.sample`) | [server](examples/sampling/server.d) | [client](examples/sampling/client.d) |
 | Elicitation | server-initiated, typed user input (`ctx.elicit!T`) | [server](examples/elicitation/server.d) | [client](examples/elicitation/client.d) |
 | Sticky notes | stateful tools + a resource per note + elicitation-confirmed clear | [server](examples/stickynotes/server.d) | [client](examples/stickynotes/client.d) |
 | Auth | OAuth 2.1 protected HTTP resource server (HTTP only) | [server](examples/auth/server.d) | [client](examples/auth/client.d) |
 | Apps | MCP Apps extension: `@ui` tool link + a `ui://` HTML resource | [server](examples/apps/server.d) | [client](examples/apps/client.d) |
-| Tasks | MCP Tasks extension (SEP-2663): `@task` async tasks with progress, cancellation, and `input_required` | [server](examples/tasks/server.d) | [client](examples/tasks/client.d) |
 | Skills | MCP Skills extension: `@skill` / `@skillDir` / dynamic Agent Skills served as resources, `skills/list` / `skills/get` discovery with digest + size manifests | [server](examples/skills/server.d) | [client](examples/skills/client.d) |
 | Events | MCP Events extension: `@event` types delivered over poll, push, **and** server-signed webhook (to a client `WebhookReceiver`) | [server](examples/events/server.d) | [client](examples/events/client.d) |
 
@@ -474,9 +685,39 @@ a whole module with `registerModule!(my.module)(server)` — the input schema (f
 the parameter types) and output schema (from the return type) are derived at
 compile time, and arguments/results are marshalled for you. A handler may take a
 trailing `RequestContext` parameter to report progress, log, or call back to the
-client (sampling/elicitation). For tools whose schema is only known at runtime,
+client (sampling/elicitation). Registration is all or nothing: when one handler
+fails to register (a name already taken, a missing `@skillDir` directory), the
+handlers that same call already registered are removed again before the exception
+propagates. For tools whose schema is only known at runtime,
 drop to `server.registerTool(Tool, delegate)` / `registerResource` /
-`registerPrompt`, which receive the raw `Json`.
+`registerPrompt`, which receive the raw `Json`; `argsAs!T(arguments)` binds that
+`Json` into a typed struct with the same rules the UDA layer uses, throwing a
+`ToolError` (an `isError` result) for a malformed argument.
+
+A tool reports a failure the model should see by throwing `ToolError` (or
+returning `CallToolResult.error(msg)`): the client receives a result with
+`isError: true` and that message as its text. Any other exception a tool handler
+throws is logged server-side and reaches the client as an `isError` result whose
+text is just `Internal error`, since its message may carry file paths, SQL, or
+other internals; `server.exposeInternalErrors()` (or
+`ServerSettings.exposeInternalErrors`) sends the real message instead, which is
+useful in development. An `McpException` becomes a JSON-RPC error.
+
+A prompt has no `isError` result, so its failures are JSON-RPC errors: throwing
+`PromptError` from a prompt handler sends an Internal error (-32603) carrying
+that message, while any other non-`McpException` is logged and masked as
+`Internal error` in the same way (throw an `McpException` such as
+`invalidParams` for a different code).
+
+```d
+@tool("weather", "Current weather for a city")
+string weather(string city) @safe
+{
+    if (city !in forecasts)
+        throw new ToolError("unknown city: " ~ city);
+    return forecasts[city];
+}
+```
 
 ### D type → JSON Schema mapping
 
@@ -486,25 +727,53 @@ is predictable when porting a hand-built server):
 | D type | JSON Schema |
 | --- | --- |
 | `bool` | `{"type": "boolean"}` |
-| `int` / `long` / `short` / `byte` (and `uint`/`ulong`/… ) | `{"type": "integer"}` (unsigned also gets `"minimum": 0`) |
-| `float` / `double` | `{"type": "number"}` |
+| `int` / `long` / `short` / `byte` (and `uint`/`ulong`/… ) | `{"type": "integer"}`; `byte`/`ubyte`/`short`/`ushort`/`uint` also get their type's `minimum` and `maximum`, and `ulong` gets `"minimum": 0`; an argument also binds from a whole JSON number such as `2.0` |
+| `float` / `double` | `{"type": "number"}`; in an output schema `{"type": ["number", "null"]}`, since vibe writes a NaN (an unset value's `.init`) as `null` |
 | `string` | `{"type": "string"}` |
 | `enum` | `{"type": "string", "enum": [members…]}` |
 | `T[]` | `{"type": "array", "items": <T>}` |
 | `V[string]` | `{"type": "object", "additionalProperties": <V>}` |
-| `struct` | `{"type": "object", "properties": …, "required": […]}` |
-| `std.datetime` `SysTime`/`DateTime`/`Date`/`TimeOfDay` | `{"type": "string", "format": "date-time"/"date"/"time"}` |
-| `SumType!(A, B, …)` | `{"anyOf": [<A>, <B>, …]}` |
-| `Nullable!T` (tool parameter) | `<T>`, made optional by omission from `required` |
-| `Nullable!T` (output / elicitation schema) | `{"anyOf": [<T>, {"type": "null"}]}` |
+| `struct` | `{"type": "object", "properties": …, "required": […]}`, keyed by the serialized field name (vibe's `@name`, else the field name minus one trailing `_`); a `Nullable`, vibe-`@optional`, or defaulted field (an initializer differing from the type's `.init`, which an input schema also advertises as its `"default"`) is not required, and `@allOptional` on the struct makes every field optional |
+| `Json` | `{}` (any JSON value) |
+| `std.datetime` `SysTime` / `Date` | `{"type": "string", "format": "date-time"/"date"}` |
+| `std.datetime` `DateTime` / `TimeOfDay` | `{"type": "string", "pattern": …}` matching `YYYY-MM-DDTHH:MM:SS` / `HH:MM:SS` (no UTC offset, so not the RFC 3339 `date-time`/`time` formats) |
+| `SumType!(A, B, …)` | `{"anyOf": [<A>, <B>, …]}`; an argument binds to the member its JSON type natively matches (an integer to `int` over `double`), else the first member that accepts it; a result is written as the value it holds |
+| `Nullable!T` (tool parameter / input field) | `<T>` widened to admit `null` (`"type": [<T's type>, "null"]`, plus `null` in an `enum`), made optional by omission from `required`; an explicit `null` binds as unset |
+| `Nullable!T` (elicitation field) | `<T>`, made optional by omission from `required` |
+| `Nullable!T` (output schema) | `{"anyOf": [<T>, {"type": "null"}]}` |
+
+A parameter, field, or return type with no JSON form — a class, pointer,
+delegate, `char`, `std.typecons.Tuple`, an associative array keyed by a
+non-string, or a `real` parameter (use `double`) — is rejected at compile time
+with a message naming the handler and parameter, as is a `@schemaDefault` whose
+value is not exactly a value of the parameter's type: it must convert implicitly,
+an integer must be within the parameter's range (`@schemaDefault(300) ubyte` is
+rejected), and an enum parameter's default must be a member of that enum
+(`@schemaDefault(Mode.dark)`, not `"dark"` or `1`).
 
 Integer types map to `"integer"` (not `"number"`) deliberately — it is the more
 precise constraint; use `double` for a field that should accept fractional values.
-An optional tool parameter is modelled as a bare type left out of `required` (the
-convention used by the MCP reference servers); declare it `Nullable!T` or give it a
-D default value (`int page = 1`). Field/parameter constraints are added with UDAs:
-`@minimum` / `@maximum`, `@minLength` / `@maxLength`, `@pattern`, `@minItems` /
-`@maxItems`, `@format`, `@title`, `@schemaDefault`, and `@fieldDescription`.
+An optional tool parameter is left out of `required`; declare it `Nullable!T` (whose
+schema also admits an explicit `null`, as LLM clients often send one) or give it a
+D default value (`int page = 1`), which is also emitted as the property's
+`"default"`. A `@schemaDefault(v)` parameter is optional too: `v` is advertised
+as its `"default"` and is what an omitted argument binds to, over any D default
+(likewise for a struct field). A `Nullable` parameter mirrored into a header with `@mcpHeader` keeps
+the bare primitive type `x-mcp-header` requires. A parameter is named on the wire
+like a struct field, minus one trailing `_`, so `string version_` is the `version`
+argument (and `@describeParam` / `@mcpHeader` name it `"version"`).
+Field/parameter constraints are added with UDAs: `@minimum` / `@maximum`,
+`@minLength` / `@maxLength`, `@pattern`, `@minItems` / `@maxItems`,
+`@schemaFormat` (JSON Schema `format`), `@title`, `@schemaDefault`, and
+`@fieldDescription`. A constraint that cannot apply to its type (`@minLength`
+on an `int`, `@minimum` on a `string`, `@minItems` on a scalar) is a compile
+error, as is a method-level UDA on a handler kind that does not read it (such as
+`@cacheable` on a `@tool`, `@readOnly` on a `@prompt`, or `@taskTtl` on a plain
+`@tool`). A prompt argument has no JSON Schema, so on a `@prompt` parameter only
+`@fieldDescription` and `@title` (its `description` and `title`) and
+`@schemaDefault` apply, and a URI template variable takes no constraint UDA at
+all; any other placement is a compile error. An argument a tool does not declare is ignored; mark the
+method `@strictArgs` to advertise `"additionalProperties": false` and reject one.
 
 ## MCP Apps (interactive UI)
 
@@ -516,18 +785,22 @@ resource convention, and `import mcp;` brings in the helpers (`mcp.api.apps`):
 ```d
 auto server = new McpServer("weather", "1.0.0");
 registerModule!(my.module)(server);     // a @tool tagged @ui("ui://weather/dashboard", "model", "app")
-enableApps(server);               // declare the extension capability
 
-UiResourceMeta ui;
-ui.csp.connectDomains = ["https://api.open-meteo.com"];
-ui.prefersBorder = nullable(true);
-registerUiResource(server, "ui://weather/dashboard", "weather_dashboard",
-        dashboardHtml, ui);             // serve the ui:// HTML with text/html;profile=mcp-app
+UiResource ui = {uri: "ui://weather/dashboard", name: "weather_dashboard", html: dashboardHtml};
+ui.meta.csp.connectDomains = ["https://api.open-meteo.com"];
+ui.meta.prefersBorder = nullable(true);
+registerUiResource(server, ui);         // serve the ui:// HTML with text/html;profile=mcp-app
 ```
+
+Set `UiResource.htmlProvider` instead of `html` to generate the document on each
+read.
 
 A `@tool` carries its UI link via `@ui(resourceUri, visibility…)` (folded into the
 tool's `_meta.ui`); the dynamic path uses `setUiToolMeta(tool, UiToolMeta(...))`.
-`clientSupportsApps(server)` reports whether the connected client opted into the
+Registering a `@ui` tool or a UI resource advertises the extension; call
+`server.enableApps(mimeTypes)` only to declare content types other than
+`text/html;profile=mcp-app` (before or after registering).
+`clientSupportsApps(ctx)` reports whether the calling client opted into the
 extension. The runnable [Apps example](examples/apps/) verifies the whole surface
 over both transports.
 
@@ -542,17 +815,17 @@ The [MCP Tasks extension](https://modelcontextprotocol.io/extensions/tasks/overv
 (`io.modelcontextprotocol/tasks`, [SEP-2663](https://modelcontextprotocol.io/seps/2663-tasks-extension))
 lets a server answer a long-running `tools/call` with a durable task handle
 instead of blocking — the client polls `tasks/get` until it completes, and may
-`tasks/update` (mid-flight input) or `tasks/cancel`. Mark a function `@task` and it
+`tasks/update` (mid-flight input) or `tasks/cancel`. Mark a function `@taskTool` and it
 becomes one of these tools: the call returns a handle at once, the body runs
 asynchronously, and its return value becomes the result; the injected `TaskContext`
 reports progress, observes cancellation, and elicits input mid-task.
 
 ```d
-auto rt = server.enableTasks();   // keep the runtime; pass a TaskStore for durability
+auto rt = server.enableTasks();   // keep the runtime; set TaskOptions.store for durability
 
 struct Approval { bool deploy; }
 
-@task("deploy", "Deploy a build, confirming first; finishes when the deploy signals back.")
+@taskTool("deploy", "Deploy a build, confirming first; finishes when the deploy signals back.")
 @taskTtl(10.minutes) @taskPollInterval(2.seconds)
 string deploy(string gitRef, TaskContext tc) @safe
 {
@@ -564,6 +837,8 @@ string deploy(string gitRef, TaskContext tc) @safe
     return tc.detach("deploying " ~ gitRef);    // leave it working; the webhook below completes it
 }
 
+registerModule!deployments(server);   // the module declaring `deploy`
+
 // The deploy system's callback — runs on any node, holds no fiber:
 void onDeployFinished(string taskId, bool ok) @safe
 {
@@ -574,21 +849,44 @@ void onDeployFinished(string taskId, bool ok) @safe
 }
 ```
 
+Registering a task tool enables the extension with default `TaskOptions` when
+`enableTasks()` has not been called; calling `enableTasks(opts)` afterwards
+replaces those options and keeps the registered task tools. A stateful server
+never speaks 2026-07-28, so registering a task tool on one throws.
+
 The three exits cover the lifecycle: `return` a value completes the task,
 `tc.requireInput(...)` suspends it for a client answer (delivered via `tasks/update`),
 and `tc.detach(...)` leaves it `working` for `onDeployFinished` to complete out of
 band via `rt.complete` / `rt.fail` — no fiber held, so it works on any node. See
 [`examples/tasks`](examples/tasks/) for cancellation, durable stores, and the client side.
 
-On the client, `callToolAwait` hides the whole flow — it drives the poll loop and
-returns the final `CallToolResult`, so task and non-task tools look identical. When
+A task's TTL (`@taskTtl`, else `TaskOptions.defaultTtl`, 10 minutes) is how long
+its record is kept after it settles, so the client has that long to collect the
+result (`unlimitedTaskTtl` keeps it forever). A task that is still working or
+awaiting input does not expire by TTL; instead `TaskOptions.maxUnsettledAge`
+(24 hours; zero disables it) fails one still unsettled that long after creation —
+so a detached task whose callback never arrives is failed then, unless you
+`rt.fail` or cancel it first.
+
+On the client, `callToolAwait(name, args, opts, onInputRequired)` hides the whole
+flow — it drives the poll loop and returns the final `CallToolResult`, so task and
+non-task tools look identical. Like `callTool` and every other request verb, it
+takes its `RequestOptions` (progress, log level, cancellation) after the call's own
+arguments. When
 you need to survive a restart, call plain `callTool` instead: if the server made a
 task the result is the handle (`result.isTask`, with the seed `Task` in
 `result.task`). Persist `result.task.taskId`, then resume any time — even in a fresh
-process — with `awaitTask(taskId)`, which polls to completion (and surfaces mid-task
-input requests to an optional callback).
+process — with `awaitTask(taskId, opts, onInputRequired)`, which polls to completion
+(cancellable through `opts.cancellation`, and surfacing mid-task input requests
+to the optional callback).
+
+The client must declare the extension before connecting; otherwise the server
+runs an optional task tool inline (or rejects a required one with -32021):
 
 ```d
+client.enableTasks();                        // advertise io.modelcontextprotocol/tasks
+client.connect();
+
 auto r = client.callTool("deploy", args);   // sync or task — you needn't know
 if (r.isTask)
 {
@@ -636,14 +934,21 @@ incidents.publish(Incident("INC-1", "P1"));   // fans out to streams/poll + the 
 
 `publish(P)` is the single push verb; its reach is the scope of the injected
 registries (stream/poll are always node-local; webhook is as wide as the
-`SubscriptionStore`). The handle also carries typed `onSubscribe`/`onUnsubscribe`
-lifecycle hooks (`SubContext.runUntilUnsubscribe` hosts an author-owned live source
-loop) and `pollInterval`. The hooks fire **exactly once per `(principal, name,
-arguments)` per node**: the lifecycle refcount is node-local, so on a multi-node
-deployment (where webhook subscriptions are shared via the `SubscriptionStore`) the
-hooks fire once per node that first/last sees the key, not once cluster-wide — write
-them to be idempotent across nodes. A cluster-coherent shared-store atomic refcount
-is future work.
+`WebhookSubscriptionStore`). Poll sees published events only on a type without a
+fetch handler: once `onFetch` is set, poll reads from the handler, so `publish`
+reaches live streams and webhook subscribers but never a poller. The handle also carries typed `onSubscribe`/`onUnsubscribe`
+lifecycle hooks (start an author-owned live source task in `onSubscribe` that
+`publish`es, and stop it in `onUnsubscribe`) and `pollInterval`. A poller's lease
+lasts `EventsOptions.pollLeaseTtl` or two poll intervals, whichever is longer, so
+`onUnsubscribe` fires only once a poller stops polling. A poll that sets no
+`maxEvents` returns at most `EventsOptions.pollDefaultMaxEvents` (100) events, and
+a larger request is clamped to `pollMaxEvents` (1000). The hooks fire **exactly once per `(principal, name,
+arguments)` per node**: the lifecycle refcount is node-local. A webhook subscription
+fires `onSubscribe` on the node that creates it and on every node that registers the
+hook while the subscription is in the `WebhookSubscriptionStore`, so a node restarted
+over a durable store provisions its upstream sources again; it does not fire on a node
+for a webhook subscription another node creates later. Write the hooks to be
+idempotent across nodes.
 
 A **pull** source (a cursor-addressable upstream — Gmail history, Kafka offsets)
 supplies a fetch handler instead, declared with the `@event` UDA — `EventBatch!P
@@ -655,9 +960,19 @@ stream/webhook via its loop:
 EventBatch!Email checkEmail(EmailArgs args, FetchContext ctx) @safe
 {
     if (ctx.isBootstrap) return EventBatch!Email.empty(currentCursor());
-    return EventBatch!Email.of(fetchSince(ctx.cursor, args), newCursor());
+    return EventBatch!Email.of(fetchSince(ctx.cursor.get, args), newCursor());
 }
 ```
+
+`ctx.cursor` is a `Nullable!string`: null means the client asked to start from
+now (`isBootstrap`), so read it with `.get` only after that check.
+
+Registering an `@event` (or a `registerEventType`) enables the extension with
+default options when `enableEvents()` has not been called. To pass a webhook
+store or `EventsOptions`, call `enableEvents(store, opts)` before registering any
+event type: afterwards it throws rather than discard the registered types. A
+stateful server never speaks 2026-07-28, so registering an event type on one
+throws.
 
 The dynamic `server.registerEventType(EventRegistration(...))` path (raw `Json`)
 remains for runtime-defined types.
@@ -695,9 +1010,13 @@ Fetch-handler types are served over webhook by the periodic worker `enableEvents
 starts, which also sweeps lapsed subscriptions and expires poll leases. The
 watermark advances to a position only once every earlier in-flight delivery has
 settled. Delivery is suspended on a sustained failure rate (`WebhookSuspension`:
-95 % over a 60-minute window with a 100-attempt minimum), events emitted while
-suspended queue until the refresh that reactivates it, retries are 5 attempts over
-about 7.5 minutes, and bodies over 256 KiB are abandoned with a `gap` envelope.
+95 % over a 60-minute window with a 20-attempt minimum); events emitted while
+suspended are not queued, and the refresh that reactivates it sends a `gap`
+envelope for the missed positions. A subscription's backlog is bounded
+(`webhookMaxPendingPerSubscription`, default 1000) with the overflow likewise
+signalled by a `gap`; deliveries to an endpoint that never verifies are dropped
+after the attempt bound. Retries are 5 attempts over about 7.5 minutes, and bodies
+over 256 KiB are abandoned with a `gap` envelope.
 
 **Webhook security** is implemented in full: `https`-only callback URLs;
 delivery-time SSRF hardening (the resolved IP is validated against the IANA
@@ -706,13 +1025,16 @@ HMAC (`v1,`) signing with the client-supplied secret and a secret-rotation
 dual-signing grace window; mandatory **endpoint verification** before delivery
 (a receiver-published `/.well-known/mcp-webhook-receiver.json`, the challenge
 handshake, server allowlist, or out-of-band) cached per `(principal, url)`;
-bounded retry with exponential backoff (`410`/`413` are non-retryable) and a
-safe-to-persist watermark cursor; and `deliveryStatus` surfaced on refresh.
+bounded retry with exponential backoff (a `410` ends the subscription; a `413`
+skips the event with a gap) and a safe-to-persist watermark cursor; and
+`deliveryStatus` surfaced on refresh.
 
 **Termination.** `rt.unregister(name)` removes a type and ends every subscription
 to it with `NotFound {kind: "event"}`; re-registering a type whose schema changed
 non-additively ends them with `Unsupported {reason: "schema_changed"}` (additive
-changes keep them); both send `notifications/events/list_changed`.
+changes keep them). The extension is advertised without `listChanged`: no
+`subscriptions/listen` filter key carries `notifications/events/list_changed`,
+so clients re-call `events/list` to see type changes.
 `rt.terminatePrincipal(principal, name, error)` ends a principal's subscriptions
 once access is revoked. Push streams receive `notifications/events/terminated`
 followed by the final `StreamEventsResult`; webhook subscriptions a signed
@@ -766,7 +1088,12 @@ capability), and publishes a conformant entry — the SKILL.md `uri`, the verbat
 skill with the `sha256` digest and byte `size` of the content it serves — via
 `skills/list` and `skills/get`. The skill path's final segment is the skill
 name; a leading prefix (`acme/billing/refunds`) is an optional organizational
-namespace.
+namespace. The description must be 1..1024 characters; the optional `license`,
+`compatibility` (at most 500 characters), and `allowedTools` (`allowed-tools`)
+frontmatter fields follow it — `@skill("x", "…", "MIT")` — or are set on a
+`Skill` / `DynamicSkill`. The method runs once, at `registerHandlers`, and its
+body is served for the server's lifetime (use `registerDynamicSkill` for a body
+generated per read).
 
 ```d
 final class Skills
@@ -842,19 +1169,30 @@ registerSkillDir(server, "skills/release-helper", SkillDirOptions(
 ));
 ```
 
-The directory's final path segment must equal the frontmatter `name`
+A relative directory is resolved against the server process's current working
+directory, not the source file or the executable, so a server launched from
+elsewhere (e.g. spawned over stdio by a host) will not find it. Return an
+absolute path when the working directory is not fixed, for example one built
+from `std.file.thisExePath`.
+
+The directory's name, and the final segment of the skill path, must equal the
+frontmatter `name`, as the Agent Skills specification requires
 ([dyaml](https://code.dlang.org/packages/dyaml) parses the frontmatter). A
-symlink or exceeding `maxFiles`/`maxTotalBytes` is rejected. Skills may nest: a
+symlink or exceeding `maxFiles`/`maxTotalBytes` is rejected. Dot-prefixed files
+and directories (`.git/`, `.DS_Store`) are skipped unless you supply
+`SkillDirOptions.include`, which then decides for every file, dot-prefixed or
+not. Skills may nest: a
 `SKILL.md` in a descendant directory is ordinary supporting content of the
 enclosing skill (its files appear in the enclosing `resources` manifest too),
 and `SkillDirOptions.publishNested` (the default) additionally publishes each
 nested skill as its own flat entry — authored frontmatter, `resources` covering
 exactly its subtree — validated by the same rules as a top-level skill.
 
-On the client, `listSkills(client)` calls `skills/list` (paginating to
-completion) and returns the typed entries; `getSkill(client, uri)` calls
-`skills/get` to fetch one skill's entry by its `SKILL.md` URI — including skills
-absent from the listing, which MAY be empty or partial. A `SkillEntry` exposes
+On the client, `client.skillsList()` calls `skills/list` (paginating to
+completion) and `.entries` gives the typed entries; `client.skillsGet(uri)` calls
+`skills/get` to fetch one skill's entry (`.entry`) by its `SKILL.md` URI —
+including skills absent from the listing, which MAY be empty or partial. Both
+results also carry the server's `cache` hint. A `SkillEntry` exposes
 its `resources` manifest, `isDynamic` for a `"dynamic"` entry, and `isValid`
 (an entry with neither shape is malformed and must not be loaded).
 `readSkill(client, "git-workflow")` / `readSkillUri(client, uri)` read a
@@ -865,9 +1203,10 @@ frontmatter comparison); `checkSkillLimits` decides from the entry alone whether
 a skill exceeds the fixed per-skill limits. Note that no URI scheme marks a
 resource as a skill — a resource is known to be a skill only through a
 `skills/list` entry or a `skills/get` answer. When a skill's instructions point
-at a directory ("pick a template from `templates/`"), `readDirectory(client,
-uri)` scope-lists that directory's direct children via
-`resources/directory/read` (files plus `inode/directory` subdirectories) —
+at a directory ("pick a template from `templates/`"),
+`client.readDirectory(uri)` scope-lists that directory's direct children via
+`resources/directory/read` (files plus subdirectories, whose `mimeType` is
+`skillDirectoryMimeType`, `inode/directory`) —
 enabled automatically by `enableSkills`, which advertises `directoryRead: true`.
 
 The stable specification is written against protocol revision 2026-07-28, where
@@ -902,13 +1241,20 @@ stdio. The server side is `runStreamableHttp(server, port)` or `runStdio(server)
 
 **Running concurrent calls.** Every verb must run inside a task under a running
 event loop. Spawn each concurrent call as its own `runTask` and let the loop
-interleave their I/O:
+interleave their I/O. vibe requires a task body to be `nothrow`, so catch
+exceptions inside it:
 
 ```d
 import vibe.core.core : runTask;
 
-runTask({ auto a = client.callTool("one", argsA); /* ... */ });
-runTask({ auto b = client.callTool("two", argsB); /* ... */ });
+runTask(() nothrow {
+    try { auto a = client.callTool("one", argsA); /* ... */ }
+    catch (Exception e) { /* report e.msg */ }
+});
+runTask(() nothrow {
+    try { auto b = client.callTool("two", argsB); /* ... */ }
+    catch (Exception e) { /* report e.msg */ }
+});
 ```
 
 **Entering the loop from a non-vibe process.** If your process is not otherwise
@@ -940,7 +1286,7 @@ thread and hand results to the rest of the app over your own channel, rather tha
 entering and exiting the loop per call.
 
 **Long-running work** belongs to `RequestOptions.onProgress` and the
-[Tasks extension](#mcp-tasks-asynchronous-execution) (`@task` / `awaitTask`), not
+[Tasks extension](#mcp-tasks-asynchronous-execution) (`@taskTool` / `awaitTask`), not
 to a blocked thread.
 
 **No sync wrapper, by design.** There is deliberately no blocking cross-thread

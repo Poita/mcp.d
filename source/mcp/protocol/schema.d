@@ -1,131 +1,209 @@
 module mcp.protocol.schema;
 
-import std.traits : isInstanceOf, isArray, isSomeString, isIntegral, isFloatingPoint;
-import std.typecons : Nullable;
-
 import vibe.data.json : Json;
 
 import jsonschema : Validator;
 
 @safe:
 
-/// Generate a JSON Schema (2020-12) fragment describing the D type `T`, rendered
-/// as a vibe `Json`.
+/// vibe.data serialization policy that maps any `enum` leaf to / from its
+/// member *name* (string), rather than vibe's default numeric base value.
 ///
-/// Delegates to the `jsonschema` package's compile-time generator — the canonical
-/// home for D-type → JSON Schema mapping and the constraint UDAs (`@minimum`,
-/// `@pattern`, …) re-exported from `mcp.api.attributes`. `inlineSubschemas` is set
-/// so the schema is fully self-contained (no `$defs`/`$ref`): MCP embeds tool
-/// `inputSchema`/`outputSchema` and elicitation `requestedSchema` directly, and
-/// not every client resolves `$ref` within an embedded schema. The compile-time
-/// settings overload rejects a directly or mutually recursive `T` with a
-/// `static assert`, so recursive types fail at the instantiation site rather than
-/// silently producing an incomplete schema.
-Json jsonSchemaOf(T)()
+/// Derived schemas describe enums as `{type:"string", enum:[names…]}`, so both
+/// directions of marshalling must agree: struct params/returns and bare-enum
+/// values are (de)serialized by-name. The policy only defines
+/// `toRepresentation`/`fromRepresentation` for enums and `SumType`s (see the
+/// `SumType` arm below), so vibe's `isPolicySerializable` is false for every
+/// other type and the default behaviour is preserved (it still recurses into
+/// nested struct/array fields, applying this rule at any depth).
+template EnumByNamePolicy(T) if (is(T == enum))
 {
-	import jsonschema : generate = jsonSchemaOf, GeneratorSettings;
-	import jsonschema.vibejson : nodeToVibeJson;
+	import std.conv : to;
 
-	// A `Json` member is arbitrary, unconstrained JSON (e.g. a pass-through event
-	// payload or tool field whose shape is the upstream system's, not ours). The
-	// generator can't reflect vibe's `Json`, so map it to the empty schema, which
-	// validates every JSON value.
-	static if (is(T == Json))
-		return Json.emptyObject;
-	else
+	static string toRepresentation(T v) @safe
 	{
-		enum GeneratorSettings settings = {inlineSubschemas: true};
-		return nodeToVibeJson(generate!(T, settings)());
+		return v.to!string;
+	}
+
+	static T fromRepresentation(string s) @safe
+	{
+		return s.to!T;
 	}
 }
 
-/// True when `F` is a scalar permitted as an elicitation form field: a
-/// bool/integer/floating/string/enum, a `Nullable` of one, or a flat array of a
-/// primitive enum (a multi-select). No nested objects or arrays of objects.
-template isElicitScalar(F)
+/// The `std.sumtype.SumType` arm of `EnumByNamePolicy`: a `SumType` is written
+/// as the value it currently holds (serialized under this same policy), matching
+/// the `anyOf` of its member schemas that derived schemas advertise. Reading
+/// prefers a member whose serialized form has the JSON value's own type (an
+/// integer reads as `int`, not `double`), else takes the first member that
+/// accepts the value. Among members that read a JSON object, the one whose
+/// serialized form keeps the most of the object's keys wins, ties going to the
+/// one adding the fewest keys of its own, so a struct that silently drops
+/// fields loses to one that holds them all.
+template EnumByNamePolicy(T) if (isSumType!T)
 {
-	static if (isInstanceOf!(Nullable, F))
-		enum isElicitScalar = isElicitScalar!(typeof(F.init.get()));
-	else static if (isArray!F && !isSomeString!F) // a multi-select array of enum members (a flat array of a primitive
-		// enum), e.g. `Color[]`, is a permitted form field (array items enum).
-		enum isElicitScalar = is(typeof(F.init[0]) == enum);
-	else
-		enum isElicitScalar = is(F == bool) || isIntegral!F
-			|| isFloatingPoint!F || isSomeString!F || is(F == enum);
-}
-
-/// True when `T` is a flat struct whose every field is an `isElicitScalar`, i.e. a
-/// valid type to derive an elicitation form `requestedSchema` from (via
-/// `jsonSchemaOf!T`). Used by `RequestContext.elicit!T` and `elicitationRequest!T`
-/// to reject nested/array structs at compile time.
-template isFlatElicitationStruct(T)
-{
-	import std.meta : allSatisfy;
-
-	static if (is(T == struct))
-		enum isFlatElicitationStruct = allSatisfy!(isElicitScalar, typeof(T.tupleof));
-	else
-		enum isFlatElicitationStruct = false;
-}
-
-/// Build a form-`elicitation` `InputRequest` whose `requestedSchema` is derived
-/// from the flat struct `T` via `jsonSchemaOf!T` (same compile-time flat-struct
-/// restriction as `RequestContext.elicit!T`). This convenience lives beside
-/// `jsonSchemaOf` because deriving a schema from a D type is reflection work; the
-/// `InputRequest.elicitation(string, string, Json)` overload in `mcp.protocol.mrtr`
-/// takes a ready-made schema and so stays free of any schema/reflection dependency.
-auto elicitationRequest(T)(string id, string message) @safe
-{
-	import mcp.protocol.mrtr : InputRequest;
-
-	static assert(isFlatElicitationStruct!T, "elicitationRequest!T requires a flat struct of scalar fields (string/number/integer/boolean/enum); " ~ T
-			.stringof ~ " has a nested or non-scalar field");
-	return InputRequest.elicitation(id, message, jsonSchemaOf!T);
-}
-
-@safe unittest  // elicitationRequest!T derives requestedSchema from a flat struct
-{
-	import vibe.data.json : Json;
-
-	static struct Details
+	static Json toRepresentation(T v)
 	{
-		int travelers;
-		bool insurance;
+		import std.sumtype : match;
+		import vibe.data.json : JsonSerializer;
+		import vibe.data.serialization : serializeWithPolicy;
+
+		return v.match!(held => serializeWithPolicy!(JsonSerializer, EnumByNamePolicy)(held));
 	}
 
-	auto ir = elicitationRequest!Details("e2", "Details?");
-	assert(ir.type == "elicitation");
-	assert(ir.params["message"].get!string == "Details?");
-	assert(ir.params["requestedSchema"] == jsonSchemaOf!Details);
+	static T fromRepresentation(Json j)
+	{
+		import std.traits : TemplateArgsOf;
+		import vibe.data.json : JsonSerializer;
+		import vibe.data.serialization : deserializeWithPolicy, serializeWithPolicy;
+
+		T[] best;
+		size_t bestKept, bestAdded;
+		static foreach (V; TemplateArgsOf!T)
+		{
+			try
+			{
+				auto v = deserializeWithPolicy!(JsonSerializer, EnumByNamePolicy, V)(j);
+				auto back = serializeWithPolicy!(JsonSerializer, EnumByNamePolicy)(v);
+				if (back.type == j.type)
+				{
+					if (j.type != Json.Type.object)
+						return T(v);
+					const kept = sharedKeyCount(j, back);
+					const added = back.length - kept;
+					if (!best.length || kept > bestKept || (kept == bestKept && added < bestAdded))
+					{
+						best = [T(v)];
+						bestKept = kept;
+						bestAdded = added;
+					}
+				}
+			}
+			catch (Exception)
+			{
+			}
+		}
+		if (best.length)
+			return best[0];
+		static foreach (V; TemplateArgsOf!T)
+		{
+			try
+				return T(deserializeWithPolicy!(JsonSerializer, EnumByNamePolicy, V)(j));
+			catch (Exception)
+			{
+			}
+		}
+		throw new Exception("JSON value matches none of the types in " ~ T.stringof);
+	}
 }
 
-@safe unittest  // elicitationRequest!T rejects a non-flat struct at compile time
+/// How many of object `a`'s keys object `b` also has.
+private size_t sharedKeyCount(Json a, Json b) @safe
 {
-	static struct Inner
+	size_t n;
+	foreach (key; a.get!(Json[string]).byKey)
+		if (key in b)
+			n++;
+	return n;
+}
+
+private enum isSumType(T) = imported!"std.sumtype".isSumType!T;
+
+unittest  // a SumType is written as the value it holds, at any depth
+{
+	import std.sumtype : SumType;
+	import vibe.data.json : JsonSerializer;
+	import vibe.data.serialization : serializeWithPolicy;
+
+	alias U = SumType!(int, string);
+	static struct S
+	{
+		U u;
+		U[] us;
+	}
+
+	auto j = serializeWithPolicy!(JsonSerializer, EnumByNamePolicy)(S(U("a"), [
+		U(1), U("b")
+	]));
+	assert(j["u"] == Json("a"), j.toString);
+	assert(j["us"] == Json([Json(1), Json("b")]), j.toString);
+}
+
+unittest  // a SumType reads back as the member matching the JSON value's own type
+{
+	import std.sumtype : SumType, has;
+	import vibe.data.json : JsonSerializer;
+	import vibe.data.serialization : deserializeWithPolicy;
+
+	alias N = SumType!(double, int);
+	auto n = deserializeWithPolicy!(JsonSerializer, EnumByNamePolicy, N)(Json(3));
+	assert(n.has!int);
+}
+
+unittest  // a SumType of structs reads an object as the member that keeps every key
+{
+	import std.sumtype : SumType, has, match;
+	import vibe.data.json : JsonSerializer, parseJsonString;
+	import vibe.data.serialization : deserializeWithPolicy;
+
+	static struct A
 	{
 		int x;
 	}
 
-	static struct Nested
+	static struct B
 	{
-		Inner inner;
+		int x;
+		int y;
 	}
 
-	static assert(!__traits(compiles, elicitationRequest!Nested("e", "m")));
+	alias U = SumType!(A, B);
+	auto u = deserializeWithPolicy!(JsonSerializer, EnumByNamePolicy, U)(
+			parseJsonString(`{"x":1,"y":2}`));
+	assert(u.has!B);
+	assert(u.match!((B b) => b.y, (A a) => -1) == 2);
+}
+
+unittest  // a SumType of structs prefers the member with no keys beyond the input's
+{
+	import std.sumtype : SumType, has;
+	import vibe.data.json : JsonSerializer, parseJsonString;
+	import vibe.data.serialization : deserializeWithPolicy, optional;
+
+	static struct B
+	{
+		int x;
+		@optional int y;
+	}
+
+	static struct A
+	{
+		int x;
+	}
+
+	alias U = SumType!(B, A);
+	auto u = deserializeWithPolicy!(JsonSerializer, EnumByNamePolicy, U)(parseJsonString(`{"x":1}`));
+	assert(u.has!A);
 }
 
 /// Compile a vibe `Json` schema document into a reusable `Validator`, or `null`
-/// when `schema` is not a JSON object (and so imposes no constraint). Throws a
-/// `jsonschema.SchemaException` when the schema is a malformed object or declares
-/// an unsupported `$schema` dialect, surfacing a bad schema where the tool is
-/// registered rather than silently under-validating each request.
+/// when `schema` is not a JSON object (and so imposes no constraint). Throws
+/// -32602 (`McpException`) when the schema is a malformed object or declares an
+/// unsupported `$schema` dialect, surfacing a bad schema where the tool is
+/// registered rather than silently under-validating each request, and keeping a
+/// peer-supplied schema's failure inside the MCP error model.
 Validator makeValidator(Json schema)
 {
+	import jsonschema : SchemaException;
 	import jsonschema.vibejson : compileSchema;
+	import mcp.protocol.errors : invalidParams;
 
 	if (schema.type != Json.Type.object)
 		return null;
-	return compileSchema(schema);
+	try
+		return compileSchema(schema);
+	catch (SchemaException e)
+		throw invalidParams("invalid JSON Schema: " ~ e.msg);
 }
 
 /// Validate a vibe `Json` `value` against a pre-compiled `validator` (a `null`
@@ -149,72 +227,14 @@ string validateAgainstSchema(Json value, Json schema)
 	return validationError(makeValidator(schema), value);
 }
 
-unittest  // jsonSchemaOf maps a scalar to its primitive type
-{
-	auto s = jsonSchemaOf!int;
-	assert(s["type"].get!string == "integer");
-}
-
-unittest  // jsonSchemaOf!Json is a permissive schema accepting any JSON value
-{
-	import vibe.data.json : parseJsonString;
-
-	auto s = jsonSchemaOf!Json;
-	// An empty schema imposes no constraint — any JSON value conforms.
-	assert(s.type == Json.Type.object);
-	assert(validateAgainstSchema(Json("anything"), s) == "");
-	assert(validateAgainstSchema(Json(42), s) == "");
-	assert(validateAgainstSchema(parseJsonString(`{"a": 1}`), s) == "");
-}
-
-unittest  // jsonSchemaOf maps a struct to an object with properties and required
-{
-	struct Args
-	{
-		string name;
-		Nullable!int count;
-	}
-
-	auto s = jsonSchemaOf!Args;
-	assert(s["type"].get!string == "object");
-	assert("name" in s["properties"]);
-	assert("count" in s["properties"]);
-	// `name` is required; the Nullable `count` is optional.
-	import std.algorithm : canFind;
-	import std.array : array;
-
-	auto req = s["required"][].array;
-	assert(req.canFind(Json("name")));
-	assert(!req.canFind(Json("count")));
-}
-
-unittest  // jsonSchemaOf inlines a shared nested struct rather than emitting $ref
-{
-	struct Inner
-	{
-		int a;
-	}
-
-	struct Outer
-	{
-		Inner first;
-		Inner second;
-	}
-
-	auto s = jsonSchemaOf!Outer;
-	// inlineSubschemas: the shared `Inner` is expanded at both use sites and the
-	// document carries no $defs/$ref that an MCP client would have to resolve.
-	assert("$defs" !in s);
-	assert(s["properties"]["first"]["type"].get!string == "object");
-	assert(s["properties"]["second"]["properties"]["a"]["type"].get!string == "integer");
-}
-
 unittest  // validateAgainstSchema accepts a conforming object, rejects a wrong type
 {
 	struct Args
 	{
 		string name;
 	}
+
+	import mcp.api.binding : jsonSchemaOf;
 
 	auto schema = jsonSchemaOf!Args;
 	assert(validateAgainstSchema(Json(["name": Json("ok")]), schema) == "");
@@ -227,6 +247,8 @@ unittest  // validateAgainstSchema reports a missing required property
 	{
 		string name;
 	}
+
+	import mcp.api.binding : jsonSchemaOf;
 
 	auto schema = jsonSchemaOf!Args;
 	assert(validateAgainstSchema(Json.emptyObject, schema).length > 0);
@@ -255,15 +277,28 @@ unittest  // full 2020-12: a $ref/$defs schema is now resolved and enforced
 	assert(validateAgainstSchema(parseJsonString(`{}`), schema).length > 0);
 }
 
-unittest  // an unsupported $schema dialect is rejected (MCP "reject unknown dialects")
+unittest  // an unsupported $schema dialect is rejected with -32602 (MCP "reject unknown dialects")
 {
 	import vibe.data.json : parseJsonString;
-	import jsonschema : SchemaException;
-	import std.exception : assertThrown;
+	import mcp.protocol.errors : ErrorCode, McpException;
+	import std.exception : collectException;
 
 	auto schema = parseJsonString(
 			`{"$schema": "http://json-schema.org/draft-04/schema#", "type": "string"}`);
-	assertThrown!SchemaException(makeValidator(schema));
+	auto e = collectException!McpException(makeValidator(schema));
+	assert(e !is null && e.code == ErrorCode.invalidParams);
+}
+
+unittest  // validateAgainstSchema reports a malformed schema as -32602
+{
+	import vibe.data.json : parseJsonString;
+	import mcp.protocol.errors : ErrorCode, McpException;
+	import std.exception : collectException;
+
+	auto schema = parseJsonString(
+			`{"$schema": "http://json-schema.org/draft-04/schema#", "type": "string"}`);
+	auto e = collectException!McpException(validateAgainstSchema(Json("x"), schema));
+	assert(e !is null && e.code == ErrorCode.invalidParams);
 }
 
 unittest  // a draft-07 dialect schema is accepted and enforced (not rejected)
@@ -293,26 +328,10 @@ unittest  // a precompiled validator validates repeatedly with independent resul
 		int n;
 	}
 
+	import mcp.api.binding : jsonSchemaOf;
+
 	auto v = makeValidator(jsonSchemaOf!Args);
 	assert(validationError(v, Json(["n": Json(1)])) == "");
 	assert(validationError(v, Json(["n": Json("bad")])).length > 0);
 	assert(validationError(v, Json(["n": Json(2)])) == "");
-}
-
-unittest  // isFlatElicitationStruct accepts a flat scalar struct, rejects nesting
-{
-	struct Flat
-	{
-		string s;
-		int n;
-		Nullable!bool b;
-	}
-
-	struct Nested
-	{
-		Flat inner;
-	}
-
-	static assert(isFlatElicitationStruct!Flat);
-	static assert(!isFlatElicitationStruct!Nested);
 }

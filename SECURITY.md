@@ -46,8 +46,11 @@ to remain anonymous.
 
 ## Supported Versions
 
-Security fixes are applied to the latest release on the default branch. The SDK
-implements the following MCP protocol revisions; the wire dates are listed for
+Security fixes land on the default branch (`main`) and ship in the next tagged
+release; earlier releases are not patched. Track `main` or upgrade to that
+release promptly when an advisory is published.
+
+The SDK implements the following MCP protocol revisions; the wire dates are listed for
 reference:
 
 | MCP protocol revision | Wire identifier | Status                    |
@@ -57,10 +60,6 @@ reference:
 | `2025-06-18`          | `2025-06-18`    | Supported                 |
 | `2025-11-25`          | `2025-11-25`    | Supported (latest legacy) |
 | `2026-07-28`          | `2026-07-28`    | Supported (latest stable) |
-
-Only the most recent commit on the default branch (`main`) receives security
-updates. Users are encouraged to track `main` and update promptly when an
-advisory is published.
 
 ## Scope
 

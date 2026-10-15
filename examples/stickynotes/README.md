@@ -27,9 +27,10 @@ a server→client elicitation needs a session to correlate its reply over HTTP
 
 ## Run it
 
-**stdio** (the client spawns the server):
+**stdio** (the client spawns the server binary, so build it first):
 
 ```bash
+dub build -c server
 dub run -c client
 ```
 

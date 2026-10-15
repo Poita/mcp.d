@@ -28,14 +28,19 @@ import mcp.protocol.modern : CacheScope;
 /// both global and per-principal results without collision: a `public` result is
 /// stored under the empty partition (every client hits the same key — the point
 /// of a shared cache), while a `private` result is stored under the owning
-/// client's `cachePartition` (its principal id) so it is never served to another
-/// identity. A per-client store leaves `partition` empty and the distinction is
-/// moot. The whole struct is used directly as an associative-array key.
+/// client's `cachePartition` (its principal id), or a partition unique to that
+/// client when it names none, so it is never served to another identity.
+///
+/// `server` names the server the response came from (the client's endpoint URL,
+/// spawn command, or `ClientSettings.cacheServer`), so clients of different
+/// servers sharing one store never read each other's entries. The whole struct
+/// is used directly as an associative-array key.
 struct CacheKey
 {
 	string method;
 	string key;
 	string partition;
+	string server;
 }
 
 /// A stored response plus the freshness metadata needed to decide a hit.
@@ -66,15 +71,13 @@ interface CacheStore
 	/// Drop the single entry under `key` (no-op if absent).
 	void invalidate(CacheKey key) @safe;
 
-	/// Drop every entry whose `CacheKey.method` equals `method` (e.g. all
-	/// `resources/read` URIs at once).
-	void invalidateMethod(string method) @safe;
-
-	/// Drop every entry whose `CacheKey.partition` equals `partition` — i.e. one
-	/// principal's slice of a shared cache, leaving the shared (`""`) public
-	/// entries and other principals' entries intact. The client uses this on
-	/// `setBearerToken` to evict just its own private results on an identity change.
-	void invalidatePartition(string partition) @safe;
+	/// Drop every entry whose `CacheKey.server` equals `server` and whose
+	/// `CacheKey.partition` equals `partition` — one principal's slice of one
+	/// server's entries in a shared cache, leaving the shared (`""`) public
+	/// entries, other principals' entries, and other servers' entries intact. The
+	/// client uses this on `setBearerToken` to evict just its own private results
+	/// on an identity change.
+	void invalidatePartition(string server, string partition) @safe;
 
 	/// Drop every entry.
 	void clear() @safe;
@@ -86,11 +89,27 @@ interface CacheStore
 /// access means no locking is needed.
 final class InMemoryCacheStore : CacheStore
 {
-	private CacheEntry[CacheKey] entries_;
-	// Insertion order of live keys, used to evict the oldest when at capacity.
-	// May name keys already removed by `invalidate`/`invalidateMethod`; those
-	// are skipped during eviction.
-	private CacheKey[] order_;
+	// Each live entry with the insertion stamp of its current incarnation.
+	private struct Slot
+	{
+		CacheEntry entry;
+		ulong stamp;
+	}
+
+	// One insertion in `order_`: the key and the stamp it was inserted with. It
+	// is stale once the key is removed or re-inserted under a newer stamp.
+	private struct Insertion
+	{
+		CacheKey key;
+		ulong stamp;
+	}
+
+	private Slot[CacheKey] entries_;
+	// Insertion order used to evict the oldest live entry when at capacity. Only
+	// kept when the store is bounded; stale insertions are skipped on eviction and
+	// reclaimed once they outnumber the live entries.
+	private Insertion[] order_;
+	private ulong nextStamp_;
 	private size_t cap_;
 
 	/// `capacity` bounds the number of held entries (0 disables the bound). The
@@ -104,38 +123,37 @@ final class InMemoryCacheStore : CacheStore
 	override Nullable!CacheEntry get(CacheKey key) @safe
 	{
 		if (auto e = key in entries_)
-			return nullable(*e);
+			return nullable(e.entry);
 		return Nullable!CacheEntry.init;
 	}
 
 	override void put(CacheKey key, CacheEntry entry) @safe
 	{
-		const isNew = (key in entries_) is null;
-		if (isNew)
+		if (auto e = key in entries_)
 		{
-			evictIfNeeded();
-			order_ ~= key;
+			e.entry = entry;
+			return;
 		}
-		entries_[key] = entry;
+		evictIfNeeded();
+		const stamp = ++nextStamp_;
+		if (cap_ != 0)
+			order_ ~= Insertion(key, stamp);
+		entries_[key] = Slot(entry, stamp);
+		compactOrder();
 	}
 
 	override void invalidate(CacheKey key) @safe
 	{
 		entries_.remove(key);
+		compactOrder();
 	}
 
-	override void invalidateMethod(string method) @safe
+	override void invalidatePartition(string server, string partition) @safe
 	{
 		foreach (k; entries_.keys)
-			if (k.method == method)
+			if (k.server == server && k.partition == partition)
 				entries_.remove(k);
-	}
-
-	override void invalidatePartition(string partition) @safe
-	{
-		foreach (k; entries_.keys)
-			if (k.partition == partition)
-				entries_.remove(k);
+		compactOrder();
 	}
 
 	override void clear() @safe
@@ -144,9 +162,14 @@ final class InMemoryCacheStore : CacheStore
 		order_ = null;
 	}
 
-	/// Evict the oldest still-present entry when adding a new key would exceed
-	/// the cap. Stale names left in `order_` by prior removals are discarded
-	/// until a live one is found and dropped.
+	private bool isLive(Insertion i) @safe
+	{
+		auto e = i.key in entries_;
+		return e !is null && e.stamp == i.stamp;
+	}
+
+	/// Evict the oldest live entry when adding a new key would exceed the cap,
+	/// discarding stale insertions on the way.
 	private void evictIfNeeded() @safe
 	{
 		if (cap_ == 0 || entries_.length < cap_)
@@ -155,12 +178,23 @@ final class InMemoryCacheStore : CacheStore
 		{
 			const oldest = order_[0];
 			order_ = order_[1 .. $];
-			if (oldest in entries_)
+			if (isLive(oldest))
 			{
-				entries_.remove(oldest);
+				entries_.remove(oldest.key);
 				break;
 			}
 		}
+	}
+
+	/// Drop stale insertions once they outnumber the live entries, keeping
+	/// `order_` proportional to the store's size.
+	private void compactOrder() @safe
+	{
+		import std.algorithm : filter;
+		import std.array : array;
+
+		if (order_.length > 2 * entries_.length + 16)
+			order_ = order_.filter!(i => isLive(i)).array;
 	}
 }
 
@@ -182,11 +216,7 @@ final class NullCacheStore : CacheStore
 	{
 	}
 
-	override void invalidateMethod(string) @safe
-	{
-	}
-
-	override void invalidatePartition(string) @safe
+	override void invalidatePartition(string, string) @safe
 	{
 	}
 
@@ -231,18 +261,6 @@ CacheStore noCache() @safe nothrow
 	assert(!s.get(CacheKey("resources/read", "b")).isNull);
 }
 
-@safe unittest  // invalidateMethod drops every entry for that method, leaving siblings
-{
-	auto s = new InMemoryCacheStore();
-	s.put(CacheKey("resources/read", "a"), CacheEntry(Json("a")));
-	s.put(CacheKey("resources/read", "b"), CacheEntry(Json("b")));
-	s.put(CacheKey("tools/list", ""), CacheEntry(Json("t")));
-	s.invalidateMethod("resources/read");
-	assert(s.get(CacheKey("resources/read", "a")).isNull);
-	assert(s.get(CacheKey("resources/read", "b")).isNull);
-	assert(!s.get(CacheKey("tools/list", "")).isNull);
-}
-
 @safe unittest  // clear empties the store
 {
 	auto s = new InMemoryCacheStore();
@@ -277,7 +295,7 @@ CacheStore noCache() @safe nothrow
 {
 	auto s = new InMemoryCacheStore(0);
 	foreach (i; 0 .. 1000)
-		s.put(CacheKey("resources/read", () @trusted {
+		s.put(CacheKey("resources/read", () {
 				import std.conv : to;
 
 				return i.to!string;
@@ -302,10 +320,58 @@ CacheStore noCache() @safe nothrow
 	s.put(CacheKey("tools/list", "", ""), CacheEntry(Json("shared")));
 	s.put(CacheKey("tools/list", "", "alice"), CacheEntry(Json("alice")));
 	s.put(CacheKey("tools/list", "", "bob"), CacheEntry(Json("bob")));
-	s.invalidatePartition("alice");
+	s.invalidatePartition("", "alice");
 	assert(s.get(CacheKey("tools/list", "", "alice")).isNull);
 	assert(!s.get(CacheKey("tools/list", "", "")).isNull, "shared public entry survives");
 	assert(!s.get(CacheKey("tools/list", "", "bob")).isNull, "other principal survives");
+}
+
+@safe unittest  // invalidatePartition spares the same principal's entries for other servers
+{
+	auto s = new InMemoryCacheStore();
+	s.put(CacheKey("tools/list", "", "alice", "a"), CacheEntry(Json("a")));
+	s.put(CacheKey("tools/list", "", "alice", "b"), CacheEntry(Json("b")));
+	s.invalidatePartition("a", "alice");
+	assert(s.get(CacheKey("tools/list", "", "alice", "a")).isNull);
+	assert(!s.get(CacheKey("tools/list", "", "alice", "b")).isNull);
+}
+
+@safe unittest  // eviction never drops a re-put key through the stale order slot of its earlier incarnation
+{
+	auto s = new InMemoryCacheStore(2);
+	s.put(CacheKey("resources/read", "a"), CacheEntry(Json("a1")));
+	s.invalidate(CacheKey("resources/read", "a"));
+	s.put(CacheKey("resources/read", "b"), CacheEntry(Json("b")));
+	s.put(CacheKey("resources/read", "a"), CacheEntry(Json("a2")));
+	s.put(CacheKey("resources/read", "c"), CacheEntry(Json("c")));
+	// 'b' is the oldest live entry; the re-put 'a' is newer than it.
+	assert(s.get(CacheKey("resources/read", "b")).isNull, "the oldest live entry is evicted");
+	assert(!s.get(CacheKey("resources/read", "a")).isNull, "the re-put entry survives");
+	assert(!s.get(CacheKey("resources/read", "c")).isNull);
+}
+
+@safe unittest  // put/invalidate churn does not grow the eviction bookkeeping without bound
+{
+	auto s = new InMemoryCacheStore(4);
+	foreach (i; 0 .. 1000)
+	{
+		s.put(CacheKey("resources/read", "x"), CacheEntry(Json(i)));
+		s.invalidate(CacheKey("resources/read", "x"));
+	}
+	assert(s.order_.length <= 64, "stale order slots must be reclaimed");
+}
+
+@safe unittest  // an unbounded store keeps no eviction bookkeeping
+{
+	auto s = new InMemoryCacheStore(0);
+	foreach (i; 0 .. 100)
+		s.put(CacheKey("tools/list", ""), CacheEntry(Json(i)));
+	foreach (i; 0 .. 100)
+	{
+		s.put(CacheKey("prompts/list", ""), CacheEntry(Json(i)));
+		s.invalidate(CacheKey("prompts/list", ""));
+	}
+	assert(s.order_.length == 0);
 }
 
 @safe unittest  // noCache stores nothing and returns the same singleton

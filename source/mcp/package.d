@@ -4,13 +4,16 @@
  * Importing `mcp` re-exports the curated, stable public API:
  *
  *   - the protocol types (`mcp.protocol.*`: versions, errors, JSON-RPC,
- *     capabilities, core types, sampling),
+ *     capabilities, core types, sampling, and the user-facing MRTR types
+ *     such as `InputRequest`),
  *   - the server / client entry points (`McpServer`, `McpClient`,
  *     `RequestContext`),
  *   - the declarative UDA / reflection layer (`@tool`, `@resource`,
- *     `@prompt`, `registerModule`, schema generation), and
+ *     `@prompt`, `registerModule`, schema generation),
  *   - the error builders (`McpException`, `ErrorCode`, `toErrorJson`,
- *     `makeErrorResponse`).
+ *     `makeErrorResponse`), and
+ *   - vibe's `Json` value type and `parseJsonString`, which the handler and
+ *     client signatures use.
  *
  * Transport wiring and auth plumbing are deliberately kept out of the
  * top-level surface to avoid name collisions and to signal stable-public-API
@@ -22,6 +25,9 @@
  *     resource-server / OAuth proxy.
  */
 module mcp;
+
+// --- JSON value type used throughout the public signatures ---
+public import vibe.data.json : Json, parseJsonString;
 
 // --- Protocol types ---
 public import mcp.protocol.versions;
@@ -36,7 +42,8 @@ public import mcp.protocol.events;
 
 // --- Server / client entry points ---
 public import mcp.server.task_store;
-public import mcp.server.task_runtime : TaskOptions, TaskRuntime;
+public import mcp.server.task_runtime : TaskOptions, TaskCreateOptions,
+	TaskRuntime, unlimitedTaskTtl;
 public import mcp.server.task_context : TaskContext, TaskExecutor, TaskDispatcher,
 	InProcessTaskDispatcher, SyncTaskDispatcher, TaskSuspended, TaskDetached;
 public import mcp.server.event_store;
@@ -47,17 +54,23 @@ public import mcp.server.events_runtime : EventsRuntime, EventsOptions,
 	EventCheck, EventMatch, EventTransform, EventLifecycle, PushHandle, PushStream;
 public import mcp.server.context;
 public import mcp.server.server;
+public import mcp.server.responses;
 public import mcp.server.settings;
 public import mcp.client.client;
 public import mcp.client.runner;
 public import mcp.client.subscription;
 public import mcp.client.cache;
+public import mcp.client.http_transport : HttpStatusException, SessionExpiredException;
+public import mcp.client.transport : BearerProvider;
+public import mcp.protocol.ssrf : TlsTrust;
 public import mcp.client.events : WebhookReceiver, ReceiverResponse, generateWhsecSecret;
 public import mcp.client.event_subscription : EventSubscription;
 
 // --- Declarative UDA / reflection API ---
 public import mcp.api.attributes;
 public import mcp.api.reflection;
+public import mcp.api.binding : jsonSchemaOf, SchemaUse, elicitationSchemaOf,
+	elicitationRequest, isFlatElicitationStruct, isElicitScalar;
 
 // --- MCP Apps extension (interactive UI resources) ---
 public import mcp.api.apps;
@@ -72,9 +85,16 @@ public import mcp.api.skill_dir;
 // hint codec). They are referenced by members already on the lean public
 // surface — `McpServer.setListCacheHint(string, CacheHint)` and
 // `McpClient.discover()` returning `DiscoverResult` — so the whole module is
-// safe to re-export. The transport/wire plumbing now lives in
-// `mcp.protocol.mrtr`, reachable via `import mcp.transport;`.
+// safe to re-export.
 public import mcp.protocol.modern;
+
+// --- User-facing MRTR (multi-round-trip request) types ---
+// Named by the public result/response API: `CallToolResult.inputRequests`,
+// `ToolResponse`/`PromptResponse.inputRequired` and
+// `McpClient.withInputResponses` take these, and `MetaKey` names the reserved
+// `_meta` keys. The rest of `mcp.protocol.mrtr` (header codecs, wire helpers)
+// is transport plumbing, reachable via `import mcp.transport;`.
+public import mcp.protocol.mrtr : InputKind, InputRequest, InputResponse, MetaKey;
 
 // --- Opt-in MRTR requestState security ---
 // Referenced by `McpServer.secureRequestState(RequestStateSecurity)`. The codec

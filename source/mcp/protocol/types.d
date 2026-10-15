@@ -3,9 +3,9 @@ module mcp.protocol.types;
 import std.typecons : Nullable, nullable;
 import vibe.data.json : Json, parseJsonString, deserializeJson, serializeToJson;
 import mcp.protocol.capabilities;
-import mcp.protocol.errors : ErrorCode, McpException;
+import mcp.protocol.errors : ErrorCode, McpException, invalidParams, isValidElicitationUrl;
 import mcp.protocol.versions : ProtocolVersion, toWire;
-import mcp.protocol.jsonhelpers : getOr, tryGet;
+import mcp.protocol.jsonhelpers : getOr, tryGet, tryGetWhole, requireObject, tryNumber;
 import mcp.protocol.tasks : Task, makeCreateTaskResult, isCreateTaskResult;
 import mcp.protocol.mrtr : InputRequest, emitInputRequired, parseInputRequired;
 import mcp.protocol.modern : CacheHint, parseCacheHint, withCache;
@@ -39,21 +39,21 @@ enum ContentKind
 /// per-kind duplication or "meaningless on this kind" footgun.
 mixin template ContentMetaFields()
 {
-	Json annotations = Json.undefined; /// optional annotations (audience/priority/lastModified)
+	Annotations annotations; /// optional annotations (audience/priority/lastModified)
 	Json meta = Json.undefined; /// optional `_meta` object
 
 	private void emitMeta(ref Json j) const @safe
 	{
-		if (annotations.type != Json.Type.undefined)
-			j["annotations"] = annotations;
+		if (!annotations.empty)
+			j["annotations"] = annotations.toJson();
 		if (meta.type == Json.Type.object)
 			j["_meta"] = meta;
 	}
 
 	private void parseMeta(Json j) @safe
 	{
-		if ("annotations" in j)
-			annotations = j["annotations"];
+		if ("annotations" in j && j["annotations"].type == Json.Type.object)
+			annotations = Annotations.fromJson(j["annotations"]);
 		if ("_meta" in j && j["_meta"].type == Json.Type.object)
 			meta = j["_meta"];
 	}
@@ -75,6 +75,7 @@ mixin template MetaField()
 
 	private void parseMetaField(Json j) @safe
 	{
+		requireObject(j, typeof(this).stringof);
 		if ("_meta" in j && j["_meta"].type == Json.Type.object)
 			meta = j["_meta"];
 	}
@@ -141,6 +142,7 @@ struct ResourceLink
 	Nullable!string description; /// optional human-readable description
 	Nullable!string title; /// optional human-readable display name
 	Nullable!long size; /// optional size in bytes of the linked resource
+	Icon[] icons; /// optional icons for display in user interfaces (2025-11-25+)
 	mixin ContentMetaFields;
 
 	Json toJson() const @safe
@@ -148,8 +150,7 @@ struct ResourceLink
 		Json j = Json.emptyObject;
 		j["type"] = "resource_link";
 		j["uri"] = uri;
-		if (name.length)
-			j["name"] = name;
+		j["name"] = name; // required (`ResourceLink` extends `Resource`)
 		if (!title.isNull)
 			j["title"] = title.get;
 		if (!description.isNull)
@@ -158,20 +159,32 @@ struct ResourceLink
 			j["mimeType"] = mimeType;
 		if (!size.isNull)
 			j["size"] = size.get;
+		if (icons.length)
+		{
+			Json arr = Json.emptyArray;
+			foreach (icon; icons)
+				arr ~= icon.toJson();
+			j["icons"] = arr;
+		}
 		emitMeta(j);
 		return j;
 	}
 }
 
 /// `resource` content block (`EmbeddedResource`): wraps a resource contents
-/// object under `resource`.
+/// object under `resource`, which the wire format requires.
 struct EmbeddedResource
 {
 	Json resource = Json.undefined;
 	mixin ContentMetaFields;
 
+	/// Throws when `resource` is not an object: the block is malformed without it.
 	Json toJson() const @safe
 	{
+		import std.exception : enforce;
+
+		enforce(resource.type == Json.Type.object,
+				"EmbeddedResource.resource must be a resource contents object");
 		Json j = Json.emptyObject;
 		j["type"] = "resource";
 		j["resource"] = resource;
@@ -376,6 +389,17 @@ struct Content
 		return payload.match!((const ref ResourceLink c) => c.size, _ => Nullable!long.init);
 	}
 
+	/// The `icons` of a `resource_link` block (empty for every other kind).
+	Icon[] icons() const @safe
+	{
+		return payload.match!((const ref ResourceLink c) {
+			Icon[] dup;
+			foreach (icon; c.icons)
+				dup ~= icon.dup();
+			return dup;
+		}, _ => Icon[].init);
+	}
+
 	string id() const @safe
 	{
 		return payload.match!((const ref ToolUseContent c) => c.id, _ => "");
@@ -413,9 +437,9 @@ struct Content
 	}
 
 	/// The shared `annotations` value (any kind may carry it).
-	Json annotations() const @safe
+	Annotations annotations() const @safe
 	{
-		return payload.match!(c => c.annotations);
+		return payload.match!(c => c.annotations.dup);
 	}
 
 	/// The shared `_meta` value (any kind may carry it).
@@ -434,16 +458,33 @@ struct Content
 				t.content ~= b.dupSelf();
 			t.structuredContent = c.structuredContent;
 			t.isError = c.isError;
-			t.annotations = c.annotations;
+			t.annotations = c.annotations.dup;
 			t.meta = c.meta;
 			return Content(t);
-		}, (const ref c) => Content(c));
+		}, (const ref c) {
+			import std.traits : Unqual;
+
+			Unqual!(typeof(c)) x;
+			static foreach (i; 0 .. x.tupleof.length)
+			{
+				static if (is(typeof(x.tupleof[i]) == Annotations))
+					x.tupleof[i] = c.tupleof[i].dup;
+				else static if (is(typeof(x.tupleof[i]) == Icon[]))
+				{
+					foreach (icon; c.tupleof[i])
+						x.tupleof[i] ~= icon.dup();
+				}
+				else
+					x.tupleof[i] = c.tupleof[i];
+			}
+			return Content(x);
+		});
 	}
 
 	/// Attach optional annotations (audience/priority/lastModified) to this
 	/// content block. Returns a copy so calls can be chained, e.g.
 	/// `Content.makeText("hi").withAnnotations(a)`. Valid on every kind.
-	Content withAnnotations(Json a) const @safe
+	Content withAnnotations(Annotations a) const @safe
 	{
 		Content c = dupSelf();
 		c.payload.match!((ref x) { x.annotations = a; });
@@ -457,8 +498,7 @@ struct Content
 	{
 		Content c = dupSelf();
 		c.payload.match!((ref ResourceLink x) { x.description = d; }, (ref _) {
-			throw new McpException(ErrorCode.invalidParams,
-				"withDescription is only valid on resource_link content");
+			throw new Exception("withDescription is only valid on resource_link content");
 		});
 		return c;
 	}
@@ -470,8 +510,19 @@ struct Content
 	{
 		Content c = dupSelf();
 		c.payload.match!((ref ResourceLink x) { x.title = t; }, (ref _) {
-			throw new McpException(ErrorCode.invalidParams,
-				"withTitle is only valid on resource_link content");
+			throw new Exception("withTitle is only valid on resource_link content");
+		});
+		return c;
+	}
+
+	/// Attach optional `icons` to a `resource_link` content block (`ResourceLink`
+	/// extends `Resource`, which carries icons from 2025-11-25). Returns a copy.
+	/// Only valid for the `resourceLink` kind.
+	Content withIcons(Icon[] icons) const @safe
+	{
+		Content c = dupSelf();
+		c.payload.match!((ref ResourceLink x) { x.icons = icons; }, (ref _) {
+			throw new Exception("withIcons is only valid on resource_link content");
 		});
 		return c;
 	}
@@ -483,8 +534,7 @@ struct Content
 	{
 		Content c = dupSelf();
 		c.payload.match!((ref ResourceLink x) { x.size = s; }, (ref _) {
-			throw new McpException(ErrorCode.invalidParams,
-				"withSize is only valid on resource_link content");
+			throw new Exception("withSize is only valid on resource_link content");
 		});
 		return c;
 	}
@@ -504,8 +554,7 @@ struct Content
 	{
 		Content c = dupSelf();
 		c.payload.match!((ref ToolResultContent x) { x.isError = e; }, (ref _) {
-			throw new McpException(ErrorCode.invalidParams,
-				"withIsError is only valid on tool_result content");
+			throw new Exception("withIsError is only valid on tool_result content");
 		});
 		return c;
 	}
@@ -516,8 +565,7 @@ struct Content
 	{
 		Content c = dupSelf();
 		c.payload.match!((ref ToolResultContent x) { x.structuredContent = sc; }, (ref _) {
-			throw new McpException(ErrorCode.invalidParams,
-				"withStructuredContent is only valid on tool_result content");
+			throw new Exception("withStructuredContent is only valid on tool_result content");
 		});
 		return c;
 	}
@@ -617,7 +665,8 @@ struct Content
 	/// - Shared FIELDS: content-level `_meta` and `Annotations.lastModified` were
 	///   both introduced in v2025-06-18, so for any older peer (v2024-11-05 or
 	///   v2025-03-26) the `_meta` key is dropped and `annotations.lastModified`
-	///   is stripped.
+	///   is stripped. An embedded resource's own `_meta` is dropped likewise.
+	///   A resource link's `icons` (2025-11-25) are dropped for older peers.
 	///
 	/// Mirrors the `Tool.forVersion` field-stripping pattern.
 	Content forVersion(ProtocolVersion v) const @safe
@@ -627,20 +676,33 @@ struct Content
 		{
 			auto placeholder = TextContent("[unsupported content of kind '" ~ kindWire()
 					~ "' omitted for protocol version " ~ v.toWire ~ "]");
-			placeholder.annotations = projectAnnotations(annotations, v);
+			placeholder.annotations = annotations.forVersion(v);
 			if (v >= ProtocolVersion.v2025_06_18)
 				placeholder.meta = meta;
 			return Content(placeholder);
 		}
 		// In-schema kind: copy, then strip shared fields the peer cannot accept.
 		Content c = dupSelf();
-		auto projAnn = projectAnnotations(c.annotations, v);
+		auto projAnn = c.annotations.forVersion(v);
 		c.payload.match!((ref x) {
 			x.annotations = projAnn;
 			// Content-level `_meta` is not in-schema before v2025-06-18; strip it for older peers.
 			if (v < ProtocolVersion.v2025_06_18)
 				x.meta = Json.undefined;
 		});
+		// The embedded `resource` (ResourceContents) gained `_meta` in the same
+		// revision. It is held as raw Json shared with the source block, so strip
+		// a copy rather than mutating the original.
+		if (v < ProtocolVersion.v2025_11_25)
+			c.payload.match!((ref ResourceLink l) { l.icons = null; }, (ref _) {});
+		if (v < ProtocolVersion.v2025_06_18)
+			c.payload.match!((ref EmbeddedResource e) {
+				if (e.resource.type == Json.Type.object && "_meta" in e.resource)
+				{
+					e.resource = e.resource.clone;
+					e.resource.remove("_meta");
+				}
+			}, (ref _) {});
 		return c;
 	}
 
@@ -674,23 +736,18 @@ struct Content
 		return payload.match!((const ref UnknownContent c) => c.raw, _ => Json.emptyObject);
 	}
 
-	/// Strip `Annotations.lastModified` (2025-06-18+) from a raw annotations Json
-	/// when projecting for an older peer; leave audience/priority untouched.
-	private static Json projectAnnotations(Json ann, ProtocolVersion v) @safe
-	{
-		if (ann.type != Json.Type.object)
-			return ann;
-		if (v >= ProtocolVersion.v2025_06_18)
-			return ann;
-		Json copy = ann.clone;
-		if ("lastModified" in copy)
-			copy.remove("lastModified");
-		return copy;
-	}
-
+	/// Throws -32602 when `j` is not an object or its REQUIRED `type` is absent
+	/// or not a string.
 	static Content fromJson(Json j) @safe
 	{
-		const t = ("type" in j) ? j["type"].get!string : "text";
+		import mcp.protocol.errors : invalidParams;
+		import mcp.protocol.jsonhelpers : stringOrThrow;
+
+		if (j.type != Json.Type.object)
+			throw invalidParams("a content block must be an object");
+		if ("type" !in j)
+			throw invalidParams("a content block requires a 'type'");
+		const t = stringOrThrow(j["type"], "type");
 		switch (t)
 		{
 		case "text":
@@ -717,8 +774,8 @@ struct Content
 			c.mimeType = j.getOr("mimeType", "");
 			tryGet(j, "title", c.title);
 			tryGet(j, "description", c.description);
-			if ("size" in j && j["size"].type == Json.Type.int_)
-				c.size = j["size"].get!long;
+			tryGetWhole(j, "size", c.size);
+			c.icons = readIcons(j);
 			c.parseMeta(j);
 			return Content(c);
 		case "resource":
@@ -760,11 +817,6 @@ struct Content
 	}
 }
 
-// `Icon` is defined in mcp.protocol.capabilities (a shared BaseMetadata building
-// block used by `Implementation` there and by `Tool`/`Resource`/etc. here) and
-// re-exported below so existing `Icon` references in this module resolve.
-public import mcp.protocol.capabilities : Icon;
-
 /// Optional annotations attached to resources, resource templates, and content
 /// blocks, per the MCP spec's `Annotations` shape. All fields are optional and
 /// advisory; a field left unset is omitted from the serialized form.
@@ -803,6 +855,7 @@ struct Annotations
 
 	static Annotations fromJson(Json j) @safe
 	{
+		requireObject(j, "Annotations");
 		Annotations a;
 		if ("audience" in j && j["audience"].type == Json.Type.array)
 			foreach (i; 0 .. j["audience"].length)
@@ -827,6 +880,16 @@ struct Annotations
 	bool empty() const @safe
 	{
 		return audience.length == 0 && priority.isNull && lastModified.isNull;
+	}
+
+	/// A mutable copy.
+	Annotations dup() const @safe
+	{
+		Annotations a;
+		a.audience = audience.dup;
+		a.priority = priority;
+		a.lastModified = lastModified;
+		return a;
 	}
 
 	/// Return a copy projected for the negotiated protocol version. `audience` and
@@ -874,6 +937,7 @@ struct ToolAnnotations
 
 	static ToolAnnotations fromJson(Json j) @safe
 	{
+		requireObject(j, "ToolAnnotations");
 		ToolAnnotations a;
 		tryGet(j, "title", a.title);
 		if ("readOnlyHint" in j && j["readOnlyHint"].type == Json.Type.bool_)
@@ -933,6 +997,7 @@ struct Tool
 
 	static Tool fromJson(Json j) @safe
 	{
+		requireObject(j, "Tool");
 		Tool t;
 		t.name = j.getOr("name", "");
 		tryGet(j, "title", t.title);
@@ -943,9 +1008,7 @@ struct Tool
 			t.outputSchema = j["outputSchema"];
 		if ("annotations" in j)
 			t.annotations = j["annotations"];
-		if ("icons" in j && j["icons"].type == Json.Type.array)
-			foreach (i; 0 .. j["icons"].length)
-				t.icons ~= Icon.fromJson(j["icons"][i]);
+		t.icons = readIcons(j);
 		t.parseMetaField(j);
 		return t;
 	}
@@ -1022,13 +1085,12 @@ Json emptyObjectSchema() @safe
 /// serializes a whole-valued `double` (e.g. `5.0`) as a JSON integer, so a value
 /// the producer intended as a number can arrive as `Json.Type.int_`; clients that
 /// expect a `double` would otherwise have to re-derive this widening themselves.
-/// Returns `j.get!double` for a float, `cast(double) j.get!long` for an integer,
-/// and throws for any non-numeric `Json`.
+/// Throws `McpException(invalidParams)` for any non-numeric `Json`.
 double asNumber(Json j) @safe
 {
-	if (j.type == Json.Type.int_)
-		return cast(double) j.get!long;
-	return j.get!double;
+	import mcp.protocol.jsonhelpers : numberOrThrow;
+
+	return numberOrThrow(j, "value");
 }
 
 unittest  // asNumber reads a float-encoded JSON number
@@ -1041,11 +1103,19 @@ unittest  // asNumber widens an integer-encoded JSON number to double
 	assert(asNumber(Json(5)) == 5.0);
 }
 
-unittest  // asNumber throws on a non-numeric JSON value
+unittest  // asNumber throws invalidParams on a non-numeric JSON value
 {
-	import std.exception : assertThrown;
+	import std.exception : collectException;
 
-	assertThrown(asNumber(Json("not a number")));
+	auto ex = cast(McpException) collectException(asNumber(Json("not a number")));
+	assert(ex !is null && ex.code == ErrorCode.invalidParams);
+}
+
+unittest  // asNumber reads an integer too large for long
+{
+	import vibe.data.json : parseJsonString;
+
+	assert(asNumber(parseJsonString("100000000000000000000")) == 1e20);
 }
 
 /// Result of `tools/call`.
@@ -1084,13 +1154,15 @@ struct CallToolResult
 		// as such so the carrier round-trips.
 		if (isTask())
 			return makeCreateTaskResult(task);
-		// An `InputRequiredResult` is a distinct result shape (only `inputRequests`),
-		// not a `CallToolResult` with content — serialise it as such. The
-		// `resultType` discriminator is stamped at the server's response layer, so
-		// emit only the shared MRTR glue here.
-		if (inputRequests.length)
+		// An `InputRequiredResult` is a distinct result shape (`inputRequests` and
+		// `requestState` only), not a `CallToolResult` with content — serialise it
+		// as such, tagged with its `resultType` discriminator like the other
+		// input-required results.
+		if (isInputRequired())
 		{
+			j["resultType"] = "input_required";
 			emitInputRequired(j, inputRequests, requestState);
+			emitMetaField(j);
 			return j;
 		}
 		Json arr = Json.emptyArray;
@@ -1107,6 +1179,7 @@ struct CallToolResult
 
 	static CallToolResult fromJson(Json j) @safe
 	{
+		requireObject(j, "CallToolResult");
 		CallToolResult r;
 		// SEP-2663: the server returned a task handle (`CreateTaskResult`) instead
 		// of a final result. Capture the seed `Task`; `content`/`structuredContent`
@@ -1134,11 +1207,12 @@ struct CallToolResult
 	}
 
 	/// Whether this result is an MRTR `InputRequiredResult`: the server needs the
-	/// client to gather input (`inputRequests`) and retry the original `tools/call`
-	/// with matching `inputResponses`, rather than a completed tool result.
+	/// client to gather input (`inputRequests`) and/or echo its `requestState`,
+	/// retrying the original `tools/call`, rather than a completed tool result.
+	/// Either field alone marks the result as input-required.
 	bool isInputRequired() const @safe nothrow
 	{
-		return inputRequests.length > 0;
+		return inputRequests.length > 0 || requestState.length > 0;
 	}
 
 	/// Whether this result is a SEP-2663 task handle (`CreateTaskResult`): the
@@ -1201,7 +1275,10 @@ struct CallToolResult
 	/// untrusted/possibly non-conforming server, so — mirroring the inbound
 	/// `argsAs!T` accessor — a deserialization failure on a shape that does not
 	/// match `T` is likewise mapped to `invalidParams` (rather than leaking a raw
-	/// vibe exception); an `McpException` propagates unchanged.
+	/// vibe exception); an `McpException` propagates unchanged. Enum fields are
+	/// read by member name, as `structured` and the reflection layer write them.
+	/// A `T` that is not a fieldwise-serialized struct is read from the `result`
+	/// member, matching the wrapping `structured` applies.
 	T structuredContentAs(T)() const @safe
 	{
 		import mcp.protocol.errors : invalidParams;
@@ -1210,8 +1287,17 @@ struct CallToolResult
 			throw invalidParams("structuredContent: expected a JSON object, got " ~ (
 					structuredContent.type == Json.Type.undefined
 					? "no structuredContent" : "a non-object value"));
+		import mcp.protocol.jsonhelpers : isFieldwiseStruct;
+		import mcp.protocol.schema : EnumByNamePolicy;
+		import vibe.data.json : JsonSerializer;
+		import vibe.data.serialization : deserializeWithPolicy;
+
+		static if (isFieldwiseStruct!T)
+			const Json src = structuredContent;
+		else
+			const Json src = structuredContent["result"];
 		try
-			return () @trusted { return deserializeJson!T(structuredContent); }();
+			return deserializeWithPolicy!(JsonSerializer, EnumByNamePolicy, T)(src);
 		catch (McpException e)
 			throw e;
 		catch (Exception e)
@@ -1229,11 +1315,11 @@ struct CallToolResult
 	/// not the expected path. The value is untrusted, so a malformed payload throws.
 	T requestStateAs(T)() const @safe
 	{
+		import mcp.protocol.jsonrpc : parseUntrustedJson;
+
 		if (requestState.length == 0)
 			return T.init;
-		return () @trusted {
-			return deserializeJson!T(parseJsonString(requestState));
-		}();
+		return deserializeJson!T(parseUntrustedJson(requestState));
 	}
 
 	/// Assert this is a success result. Returns normally when `!isError`; when
@@ -1262,15 +1348,30 @@ struct CallToolResult
 				: "Tool call returned an error result");
 	}
 
-	/// Build a `CallToolResult` whose `structuredContent` is `value` serialized via
-	/// vibe's `serializeToJson`. When `content` is null it defaults to a single
-	/// text block carrying the JSON string of `value`, mirroring the reflection
-	/// layer's `toToolResult` behaviour so a structured result also has a
+	/// Build a `CallToolResult` whose `structuredContent` is `value` serialized
+	/// with enums written by member name, matching the reflected output schema and
+	/// `structuredContentAs!T`. `structuredContent` must be an object, so a
+	/// fieldwise-serialized struct is emitted as itself and every other value
+	/// (scalars, arrays, `Nullable`, `Json`, `SumType`, custom-serialized structs)
+	/// is wrapped as `{"result": value}`. A `SumType`, at any depth, is written as
+	/// the value it holds. When `content` is null it defaults to a single
+	/// text block carrying that JSON, so a structured result also has a
 	/// human-readable content fallback for clients that ignore `structuredContent`.
 	static CallToolResult structured(T)(T value, Content[] content = null) @safe
 	{
+		import mcp.protocol.jsonhelpers : isFieldwiseStruct;
+		import mcp.protocol.schema : EnumByNamePolicy;
+		import vibe.data.json : JsonSerializer;
+		import vibe.data.serialization : serializeWithPolicy;
+
 		CallToolResult r;
-		auto sc = () @trusted { return serializeToJson(value); }();
+		Json sc = serializeWithPolicy!(JsonSerializer, EnumByNamePolicy)(value);
+		static if (!isFieldwiseStruct!T)
+		{
+			Json wrapped = Json.emptyObject;
+			wrapped["result"] = sc;
+			sc = wrapped;
+		}
 		r.structuredContent = sc;
 		r.content = content !is null ? content : [
 			Content.makeText(sc.toString())
@@ -1341,6 +1442,33 @@ unittest  // CallToolResult.structured!T round-trips via structuredContentAs!T
 	assert(back.tempC == 18);
 }
 
+version (unittest)
+{
+	private enum StructuredLevel
+	{
+		low,
+		high
+	}
+
+	private struct LevelReport
+	{
+		StructuredLevel lv;
+	}
+}
+
+unittest  // CallToolResult.structured!T emits enum fields by member name
+{
+	auto r = CallToolResult.structured(LevelReport(StructuredLevel.high));
+	assert(r.structuredContent["lv"].get!string == "high");
+}
+
+unittest  // structuredContentAs!T decodes enum fields from their member names
+{
+	CallToolResult r;
+	r.structuredContent = parseJsonString(`{"lv":"high"}`);
+	assert(r.structuredContentAs!LevelReport.lv == StructuredLevel.high);
+}
+
 unittest  // CallToolResult.structured!T defaults content to a JSON text block
 {
 	struct Weather
@@ -1371,6 +1499,14 @@ unittest  // CallToolResult.structured!T honours an explicit content override
 	assert(r.content.length == 1);
 	assert(r.content[0].text == "18C in Paris");
 	assert(r.structuredContent["city"].get!string == "Paris");
+}
+
+unittest  // CallToolResult.structured!T wraps a non-struct value under `result` and structuredContentAs!T unwraps it
+{
+	auto r = CallToolResult.structured([1, 2, 3]);
+	assert(r.structuredContent.type == Json.Type.object);
+	assert(r.structuredContent["result"].length == 3);
+	assert(r.structuredContentAs!(int[]) == [1, 2, 3]);
 }
 
 /// Result of `tools/list` (paginated).
@@ -1405,6 +1541,7 @@ struct ListToolsResult
 
 	static ListToolsResult fromJson(Json j) @safe
 	{
+		requireObject(j, "ListToolsResult");
 		ListToolsResult r;
 		if ("tools" in j && j["tools"].type == Json.Type.array)
 		{
@@ -1524,6 +1661,7 @@ struct InitializeParams
 	string protocolVersion;
 	ClientCapabilities capabilities;
 	Implementation clientInfo;
+	mixin MetaField;
 
 	Json toJson() const @safe
 	{
@@ -1531,12 +1669,14 @@ struct InitializeParams
 		j["protocolVersion"] = protocolVersion;
 		j["capabilities"] = capabilities.toJson();
 		j["clientInfo"] = clientInfo.toJson();
+		emitMetaField(j);
 		return j;
 	}
 
 	static InitializeParams fromJson(Json j) @safe
 	{
 		InitializeParams p;
+		p.parseMetaField(j);
 		p.protocolVersion = j.getOr("protocolVersion", "");
 		if ("capabilities" in j)
 			p.capabilities = ClientCapabilities.fromJson(j["capabilities"]);
@@ -1553,6 +1693,7 @@ struct InitializeResult
 	ServerCapabilities capabilities;
 	Implementation serverInfo;
 	Nullable!string instructions;
+	mixin MetaField;
 
 	Json toJson() const @safe
 	{
@@ -1562,12 +1703,14 @@ struct InitializeResult
 		j["serverInfo"] = serverInfo.toJson();
 		if (!instructions.isNull)
 			j["instructions"] = instructions.get;
+		emitMetaField(j);
 		return j;
 	}
 
 	static InitializeResult fromJson(Json j) @safe
 	{
 		InitializeResult r;
+		r.parseMetaField(j);
 		r.protocolVersion = j.getOr("protocolVersion", "");
 		if ("capabilities" in j)
 			r.capabilities = ServerCapabilities.fromJson(j["capabilities"]);
@@ -1576,6 +1719,26 @@ struct InitializeResult
 		tryGet(j, "instructions", r.instructions);
 		return r;
 	}
+}
+
+unittest  // InitializeResult round-trips _meta and omits it when unset
+{
+	InitializeResult r;
+	r.protocolVersion = "2025-11-25";
+	assert("_meta" !in r.toJson());
+	r.meta = Json(["x.example/k": Json("v")]);
+	auto back = InitializeResult.fromJson(r.toJson());
+	assert(back.meta["x.example/k"].get!string == "v");
+}
+
+unittest  // InitializeParams round-trips _meta and omits it when unset
+{
+	InitializeParams p;
+	p.protocolVersion = "2025-11-25";
+	assert("_meta" !in p.toJson());
+	p.meta = Json(["progressToken": Json(7)]);
+	auto back = InitializeParams.fromJson(p.toJson());
+	assert(back.meta["progressToken"].get!long == 7);
 }
 
 unittest  // text content round-trips
@@ -1625,27 +1788,31 @@ unittest  // resource link omits description/title/size when unset
 	assert("size" !in j);
 }
 
-unittest  // withIsError on a non-tool_result kind throws a recoverable error
-{
-	import std.exception : assertThrown;
-
-	assertThrown!McpException(Content.makeText("x").withIsError(true));
-}
-
-unittest  // withStructuredContent on a non-tool_result kind throws a recoverable error
-{
-	import std.exception : assertThrown;
-
-	assertThrown!McpException(Content.makeText("x").withStructuredContent(Json.emptyObject));
-}
-
-unittest  // the misuse error carries the invalidParams code
+unittest  // withIsError on a non-tool_result kind throws a recoverable local error
 {
 	import std.exception : collectException;
 
-	auto e = collectException!McpException(Content.makeText("x").withSize(10));
+	auto e = collectException(Content.makeText("x").withIsError(true));
 	assert(e !is null);
-	assert(e.code == ErrorCode.invalidParams);
+	assert(cast(McpException) e is null);
+}
+
+unittest  // withStructuredContent on a non-tool_result kind throws a recoverable local error
+{
+	import std.exception : collectException;
+
+	auto e = collectException(Content.makeText("x").withStructuredContent(Json.emptyObject));
+	assert(e !is null);
+	assert(cast(McpException) e is null);
+}
+
+unittest  // the misuse error is a plain Exception, not a -32602 McpException
+{
+	import std.exception : collectException;
+
+	auto e = collectException(Content.makeText("x").withSize(10));
+	assert(e !is null);
+	assert(cast(McpException) e is null);
 }
 
 unittest  // resource link emits description (matches spec tools example)
@@ -1680,6 +1847,34 @@ unittest  // resource link round-trips description/title/size through fromJson
 	assert(!back.description.isNull && back.description.get == "d");
 	assert(!back.title.isNull && back.title.get == "t");
 	assert(!back.size.isNull && back.size.get == 7);
+}
+
+unittest  // resource link round-trips icons through fromJson and toJson
+{
+	auto j = parseJsonString(`{"type":"resource_link","uri":"file:///a","name":"a",
+		"icons":[{"src":"https://example.com/a.png","mimeType":"image/png","sizes":["16x16"]}]}`);
+	auto out_ = Content.fromJson(j).toJson();
+	assert("icons" in out_);
+	assert(out_["icons"].length == 1);
+	assert(out_["icons"][0]["src"].get!string == "https://example.com/a.png");
+	assert(out_["icons"][0]["sizes"][0].get!string == "16x16");
+}
+
+unittest  // withIcons attaches icons that the icons accessor returns
+{
+	Icon icon = {src: "https://example.com/a.png"};
+	auto c = Content.makeResourceLink("file:///a", "a").withIcons([icon]);
+	assert(c.icons.length == 1 && c.icons[0].src == "https://example.com/a.png");
+	assert(Content.makeText("t").icons.length == 0);
+}
+
+unittest  // resource link icons are stripped for peers older than 2025-11-25
+{
+	auto j = parseJsonString(`{"type":"resource_link","uri":"file:///a","name":"a",
+		"icons":[{"src":"https://example.com/a.png"}]}`);
+	auto c = Content.fromJson(j);
+	assert("icons" !in c.forVersion(ProtocolVersion.v2025_06_18).toJson());
+	assert("icons" in c.forVersion(ProtocolVersion.v2025_11_25).toJson());
 }
 
 unittest  // resource link emits and parses _meta
@@ -1737,6 +1932,14 @@ unittest  // embedded resource emits and parses _meta (spec: EmbeddedResource._m
 	assert(back.meta["x.example/k"].get!string == "v");
 }
 
+unittest  // EmbeddedResource.toJson rejects an unset resource
+{
+	import std.exception : assertThrown;
+
+	assertThrown(Content(EmbeddedResource()).toJson());
+	assertThrown(EmbeddedResource(Json("x")).toJson());
+}
+
 unittest  // content omits _meta when none is set
 {
 	auto j = Content.makeText("hello").toJson();
@@ -1747,11 +1950,17 @@ unittest  // withDescription/withTitle/withSize reject non-resourceLink kinds
 {
 	// They are valid only on resource_link content. Applying them to another
 	// kind is a recoverable error that survives -release (not a process abort).
-	import std.exception : assertThrown;
+	import std.exception : collectException;
 
-	assertThrown!McpException(Content.makeText("hi").withDescription("x"));
-	assertThrown!McpException(Content.makeImage("d", "image/png").withTitle("t"));
-	assertThrown!McpException(Content.makeAudio("d", "audio/wav").withSize(5L));
+	foreach (e; [
+		collectException(Content.makeText("hi").withDescription("x")),
+		collectException(Content.makeImage("d", "image/png").withTitle("t")),
+		collectException(Content.makeAudio("d", "audio/wav").withSize(5L))
+	])
+	{
+		assert(e !is null);
+		assert(cast(McpException) e is null);
+	}
 }
 
 unittest  // image content uses data + mimeType
@@ -1774,9 +1983,7 @@ unittest  // content omits annotations key when none are set
 
 unittest  // content emits annotations when present
 {
-	Json a = Json.emptyObject;
-	a["audience"] = Json([Json("user")]);
-	a["priority"] = Json(0.9);
+	Annotations a = {audience: ["user"], priority: 0.9};
 	auto c = Content.makeImage("YWJj", "image/png").withAnnotations(a);
 	auto j = c.toJson();
 	assert(j["annotations"]["audience"][0].get!string == "user");
@@ -1845,14 +2052,23 @@ unittest  // tool_result content round-trips nested content/isError/structured
 
 unittest  // inbound content annotations are preserved on fromJson
 {
-	Json a = Json.emptyObject;
-	a["audience"] = Json([Json("assistant")]);
-	a["lastModified"] = Json("2025-01-01T00:00:00Z");
+	Annotations a = {
+		audience: ["assistant"], lastModified: "2025-01-01T00:00:00Z"
+	};
 	auto orig = Content.makeText("hi").withAnnotations(a);
 	auto back = Content.fromJson(orig.toJson());
-	assert(back.annotations.type == Json.Type.object);
-	assert(back.annotations["audience"][0].get!string == "assistant");
-	assert(back.annotations["lastModified"].get!string == "2025-01-01T00:00:00Z");
+	assert(back.annotations.audience == ["assistant"]);
+	assert(back.annotations.lastModified.get == "2025-01-01T00:00:00Z");
+}
+
+unittest  // inbound content annotations parse into the typed Annotations
+{
+	import vibe.data.json : parseJsonString;
+
+	auto c = Content.fromJson(
+			`{"type":"text","text":"x","annotations":{"priority":0.25}}`.parseJsonString);
+	assert(c.annotations.priority.get == 0.25);
+	assert(c.annotations.audience.length == 0);
 }
 
 unittest  // Content is a SumType over per-kind structs
@@ -2616,6 +2832,25 @@ unittest  // CallToolResult.fromJson detects an MRTR InputRequiredResult
 	assert(r.inputRequests[0].params["message"].get!string == "When?");
 }
 
+unittest  // input-required tool, resource and prompt results carry _meta both ways
+{
+	import std.meta : AliasSeq;
+
+	static foreach (T; AliasSeq!(CallToolResult, ReadResourceResult, GetPromptResult))
+	{
+		{
+			T r;
+			r.requestState = "s";
+			r.meta = Json(["x.example/k": Json("v")]);
+			auto j = r.toJson();
+			assert(j["_meta"]["x.example/k"].get!string == "v", T.stringof);
+			auto back = T.fromJson(j);
+			assert(back.isInputRequired(), T.stringof);
+			assert(back.meta["x.example/k"].get!string == "v", T.stringof);
+		}
+	}
+}
+
 unittest  // CallToolResult.toJson serializes inputRequests as a map keyed by id
 {
 	CallToolResult r;
@@ -2632,6 +2867,45 @@ unittest  // CallToolResult.toJson serializes inputRequests as a map keyed by id
 	assert(back.isInputRequired());
 	assert(back.inputRequests[0].id == "date");
 	assert(back.inputRequests[0].type == "elicitation");
+}
+
+unittest  // an input-required CallToolResult serialises with the input_required discriminator
+{
+	CallToolResult r;
+	r.inputRequests = [
+		InputRequest("date", "elicitation", Json(["message": Json("When?")]))
+	];
+	assert(r.toJson()["resultType"].get!string == "input_required");
+}
+
+unittest  // a requestState-only CallToolResult is input-required and round-trips its state
+{
+	import vibe.data.json : parseJsonString;
+
+	auto r = CallToolResult.fromJson(
+			parseJsonString(`{"resultType":"input_required","requestState":"s"}`));
+	assert(r.isInputRequired());
+	assert(r.requestState == "s");
+	auto j = r.toJson();
+	assert(j["resultType"].get!string == "input_required");
+	assert(j["requestState"].get!string == "s");
+	assert("content" !in j);
+}
+
+unittest  // a result whose resultType is not input_required ignores stray MRTR fields
+{
+	import vibe.data.json : parseJsonString;
+
+	enum stray = `"inputRequests":{"r":{"method":"roots/list"}},"requestState":"s"`;
+	auto c = CallToolResult.fromJson(
+			parseJsonString(`{"resultType":"complete","content":[],` ~ stray ~ `}`));
+	assert(!c.isInputRequired());
+	auto rr = ReadResourceResult.fromJson(
+			parseJsonString(`{"resultType":"complete","contents":[],` ~ stray ~ `}`));
+	assert(!rr.isInputRequired);
+	auto gp = GetPromptResult.fromJson(
+			parseJsonString(`{"resultType":"complete","messages":[],` ~ stray ~ `}`));
+	assert(!gp.isInputRequired);
 }
 
 unittest  // a completed CallToolResult is not an InputRequiredResult
@@ -2692,6 +2966,27 @@ unittest  // a task-handle CallToolResult round-trips through toJson
 
 	auto back = CallToolResult.fromJson(j);
 	assert(back.isTask() && back.task.taskId == "t9");
+}
+
+unittest  // ListToolsResult.fromJson skips malformed icons instead of failing the list
+{
+	auto j = parseJsonString(`{"tools":[{"name":"a","inputSchema":{"type":"object"},
+		"icons":[7,{"src":"ok"},{"src":"b","sizes":[false]}]}]}`);
+	auto r = ListToolsResult.fromJson(j);
+	assert(r.tools.length == 1);
+	assert(r.tools[0].icons.length == 1 && r.tools[0].icons[0].src == "ok");
+}
+
+unittest  // Resource, ResourceTemplate, Prompt and resource_link skip malformed icons
+{
+	enum icons = `"icons":["x",{"src":"ok"}]`;
+	assert(Resource.fromJson(parseJsonString(`{"uri":"u","name":"n",` ~ icons ~ `}`))
+			.icons.length == 1);
+	assert(ResourceTemplate.fromJson(parseJsonString(
+			`{"uriTemplate":"u{x}","name":"n",` ~ icons ~ `}`)).icons.length == 1);
+	assert(Prompt.fromJson(parseJsonString(`{"name":"n",` ~ icons ~ `}`)).icons.length == 1);
+	assert(Content.fromJson(parseJsonString(
+			`{"type":"resource_link","uri":"u","name":"n",` ~ icons ~ `}`)).icons.length == 1);
 }
 
 unittest  // ListToolsResult carries tools and optional cursor
@@ -2777,6 +3072,7 @@ struct Resource
 
 	static Resource fromJson(Json j) @safe
 	{
+		requireObject(j, "Resource");
 		Resource r;
 		r.uri = j.getOr("uri", "");
 		r.name = j.getOr("name", "");
@@ -2785,11 +3081,8 @@ struct Resource
 		tryGet(j, "mimeType", r.mimeType);
 		if ("annotations" in j && j["annotations"].type == Json.Type.object)
 			r.annotations = Annotations.fromJson(j["annotations"]);
-		if ("size" in j && j["size"].type == Json.Type.int_)
-			r.size = j["size"].get!long;
-		if ("icons" in j && j["icons"].type == Json.Type.array)
-			foreach (i; 0 .. j["icons"].length)
-				r.icons ~= Icon.fromJson(j["icons"][i]);
+		tryGetWhole(j, "size", r.size);
+		r.icons = readIcons(j);
 		r.parseMetaField(j);
 		return r;
 	}
@@ -2797,9 +3090,9 @@ struct Resource
 	/// Return a copy of this `Resource` with any fields newer than the
 	/// negotiated protocol version stripped, so the wire output stays valid for
 	/// the peer's version. The 2024-11-05 `Resource` type carried only
-	/// `uri`/`name`/`description`/`mimeType`/`annotations`/`_meta`. Later fields
-	/// are version-gated: `BaseMetadata.title` and `Resource.size` were introduced
-	/// by 2025-06-18 / 2025-03-26 respectively (both absent from 2024-11-05), and
+	/// `uri`/`name`/`description`/`mimeType`/`annotations`. Later fields are
+	/// version-gated: `BaseMetadata.title` and `_meta` were introduced by
+	/// 2025-06-18, `Resource.size` by 2025-03-26, and
 	/// `Resource.icons` by 2025-11-25 (absent from every earlier version, present
 	/// in the modern protocol which is >= 2025-11-25). Annotation sub-fields are themselves
 	/// version-gated: `audience`/`priority` existed in 2024-11-05 but
@@ -2816,13 +3109,15 @@ struct Resource
 		// Annotation sub-fields are themselves version-gated (lastModified is
 		// 2025-06-18+), so project them rather than copying verbatim.
 		projected.annotations = annotations.forVersion(v);
-		projected.meta = meta;
 		// `Resource.size` was introduced by 2025-03-26 (absent from 2024-11-05).
 		if (v >= ProtocolVersion.v2025_03_26)
 			projected.size = size;
-		// `BaseMetadata.title` was introduced by 2025-06-18.
+		// `BaseMetadata.title` and `Resource._meta` were introduced by 2025-06-18.
 		if (v >= ProtocolVersion.v2025_06_18)
+		{
 			projected.title = title;
+			projected.meta = meta;
+		}
 		// `Resource.icons` was introduced by 2025-11-25.
 		if (v >= ProtocolVersion.v2025_11_25)
 		{
@@ -2871,6 +3166,7 @@ struct ResourceTemplate
 
 	static ResourceTemplate fromJson(Json j) @safe
 	{
+		requireObject(j, "ResourceTemplate");
 		ResourceTemplate t;
 		t.uriTemplate = j.getOr("uriTemplate", "");
 		t.name = j.getOr("name", "");
@@ -2879,19 +3175,17 @@ struct ResourceTemplate
 		tryGet(j, "mimeType", t.mimeType);
 		if ("annotations" in j && j["annotations"].type == Json.Type.object)
 			t.annotations = Annotations.fromJson(j["annotations"]);
-		if ("icons" in j && j["icons"].type == Json.Type.array)
-			foreach (i; 0 .. j["icons"].length)
-				t.icons ~= Icon.fromJson(j["icons"][i]);
+		t.icons = readIcons(j);
 		t.parseMetaField(j);
 		return t;
 	}
 
 	/// Return a copy of this `ResourceTemplate` with any fields newer than the
-	/// negotiated protocol version stripped. `BaseMetadata.title` was
-	/// introduced by 2025-06-18; `ResourceTemplate.icons` was introduced by
+	/// negotiated protocol version stripped. `BaseMetadata.title` and `_meta`
+	/// were introduced by 2025-06-18; `ResourceTemplate.icons` was introduced by
 	/// 2025-11-25 (present in the modern protocol which is >= 2025-11-25).
-	/// `uriTemplate`/`name`/`description`/`mimeType`/`annotations`/`_meta` all
-	/// existed in 2024-11-05 and are preserved unchanged. Mirrors
+	/// `uriTemplate`/`name`/`description`/`mimeType`/`annotations` all existed
+	/// in 2024-11-05 and are preserved unchanged. Mirrors
 	/// `Tool.forVersion` / `Prompt.forVersion`.
 	ResourceTemplate forVersion(ProtocolVersion v) const @safe
 	{
@@ -2901,10 +3195,13 @@ struct ResourceTemplate
 		projected.description = description;
 		projected.mimeType = mimeType;
 		projected.annotations = annotations.forVersion(v);
-		projected.meta = meta;
-		// `BaseMetadata.title` was introduced by 2025-06-18.
+		// `BaseMetadata.title` and `ResourceTemplate._meta` were introduced by
+		// 2025-06-18.
 		if (v >= ProtocolVersion.v2025_06_18)
+		{
 			projected.title = title;
+			projected.meta = meta;
+		}
 		// `ResourceTemplate.icons` was introduced by 2025-11-25.
 		if (v >= ProtocolVersion.v2025_11_25)
 		{
@@ -2960,6 +3257,7 @@ struct ResourceContents
 
 	static ResourceContents fromJson(Json j) @safe
 	{
+		requireObject(j, "ResourceContents");
 		ResourceContents c;
 		c.uri = j.getOr("uri", "");
 		tryGet(j, "mimeType", c.mimeType);
@@ -3138,6 +3436,7 @@ struct ListResourcesResult
 
 	static ListResourcesResult fromJson(Json j) @safe
 	{
+		requireObject(j, "ListResourcesResult");
 		ListResourcesResult r;
 		if ("resources" in j && j["resources"].type == Json.Type.array)
 		{
@@ -3152,9 +3451,110 @@ struct ListResourcesResult
 	}
 }
 
+/// One `{uri, digest, size}` entry from a skill entry's `resources` manifest: a
+/// file the skill serves, the sha256 of the bytes it serves, and how many bytes
+/// those are.
+struct SkillResourceRef
+{
+	string uri; /// resource URI of the file
+	string digest; /// `sha256:<hex>` digest of the file's raw bytes
+	long size; /// byte length of the file's raw content (the bytes `digest` covers)
+
+	static SkillResourceRef fromJson(Json j) @safe
+	{
+		requireObject(j, "SkillResourceRef");
+		SkillResourceRef r;
+		if ("uri" in j && j["uri"].type == Json.Type.string)
+			r.uri = j["uri"].get!string;
+		if ("digest" in j && j["digest"].type == Json.Type.string)
+			r.digest = j["digest"].get!string;
+		tryGetWhole(j, "size", r.size);
+		return r;
+	}
+}
+
+unittest  // size fields accept a whole-valued float or in-range bigInt
+{
+	import std.bigint : BigInt;
+	import vibe.data.json : parseJsonString;
+
+	auto link = Content.fromJson(parseJsonString(
+			`{"type":"resource_link","uri":"file:///a","name":"a","size":1024.0}`));
+	assert(link.size.get == 1024);
+	auto res = Resource.fromJson(parseJsonString(`{"uri":"file:///a","name":"a","size":2048.0}`));
+	assert(res.size.get == 2048);
+	Json ref_ = parseJsonString(`{"uri":"file:///a","digest":"sha256:00"}`);
+	ref_["size"] = Json(BigInt(4096));
+	assert(SkillResourceRef.fromJson(ref_).size == 4096);
+	ref_["size"] = 1.5;
+	assert(SkillResourceRef.fromJson(ref_).size == 0);
+}
+
+/// One skill entry, as carried by `skills/list` and `skills/get`. `name` and
+/// `description` are read from the verbatim `frontmatter` object (always present
+/// per the Agent Skills spec); `uri` addresses the `SKILL.md` directly, and
+/// `resources` is the complete per-file manifest a host verifies reads against.
+/// A dynamically generated skill publishes the string `"dynamic"` in place of a
+/// manifest: `isDynamic` is set and `resources` is empty, and the skill offers
+/// no content integrity. An entry with neither (`!isValid`) is malformed and
+/// must not be loaded. Within the frontmatter's `metadata` object, keys prefixed
+/// `io.modelcontextprotocol/` are reserved for MCP extensions; ignore
+/// unrecognized keys under that prefix.
+struct SkillEntry
+{
+	string uri; /// resource URI of the `SKILL.md`
+	Json frontmatter; /// verbatim `SKILL.md` frontmatter as JSON
+	SkillResourceRef[] resources; /// complete `{uri, digest, size}` manifest of the skill's files
+	bool isDynamic; /// `resources` was the string `"dynamic"`: generated content, no digests
+
+	/// Whether `resources` took one of the two shapes the extension allows: a
+	/// manifest array (never legitimately empty, as it always lists `SKILL.md`)
+	/// or the string `"dynamic"`. A host must not load an entry that is not valid.
+	bool isValid() const @safe pure nothrow
+	{
+		return isDynamic || resources.length > 0;
+	}
+
+	/// The skill `name` from the frontmatter, or empty if absent.
+	string name() const @safe
+	{
+		if (frontmatter.type == Json.Type.object && "name" in frontmatter
+				&& frontmatter["name"].type == Json.Type.string)
+			return frontmatter["name"].get!string;
+		return null;
+	}
+
+	/// The skill `description` from the frontmatter, or empty if absent.
+	string description() const @safe
+	{
+		if (frontmatter.type == Json.Type.object && "description" in frontmatter
+				&& frontmatter["description"].type == Json.Type.string)
+			return frontmatter["description"].get!string;
+		return null;
+	}
+
+	static SkillEntry fromJson(Json j) @safe
+	{
+		requireObject(j, "SkillEntry");
+		SkillEntry e;
+		if ("uri" in j && j["uri"].type == Json.Type.string)
+			e.uri = j["uri"].get!string;
+		if ("frontmatter" in j)
+			e.frontmatter = j["frontmatter"];
+		if ("resources" in j && j["resources"].type == Json.Type.array)
+			foreach (i; 0 .. j["resources"].length)
+				e.resources ~= SkillResourceRef.fromJson(j["resources"][i]);
+		else if ("resources" in j && j["resources"].type == Json.Type.string
+						&& j["resources"].get!string == "dynamic")
+					e.isDynamic = true;
+		return e;
+	}
+}
+
 /// Result of the Skills extension's `skills/list` method. Entries are carried
 /// as raw `Json`: their shape (`{uri, frontmatter, resources}`) is defined by
-/// the extension and passed through verbatim. `ListSkillsResult extends
+/// the extension and passed through verbatim; `entries` reads them as
+/// `SkillEntry`s. `ListSkillsResult extends
 /// PaginatedResult, CacheableResult`, so on the modern protocol it carries the
 /// same required `ttlMs`/`cacheScope` as `tools/list` and `resources/list`: a
 /// freshness hint for the listing, never an integrity property.
@@ -3186,6 +3586,7 @@ struct ListSkillsResult
 
 	static ListSkillsResult fromJson(Json j) @safe
 	{
+		requireObject(j, "ListSkillsResult");
 		ListSkillsResult r;
 		if ("skills" in j && j["skills"].type == Json.Type.array)
 		{
@@ -3197,6 +3598,15 @@ struct ListSkillsResult
 		r.cache = parseCacheHint(j);
 		r.parseMetaField(j);
 		return r;
+	}
+
+	/// The listed skills, typed.
+	SkillEntry[] entries() @safe
+	{
+		SkillEntry[] out_;
+		foreach (s; skills)
+			out_ ~= SkillEntry.fromJson(s);
+		return out_;
 	}
 }
 
@@ -3229,6 +3639,7 @@ struct GetSkillResult
 
 	static GetSkillResult fromJson(Json j) @safe
 	{
+		requireObject(j, "GetSkillResult");
 		GetSkillResult r;
 		if ("skill" in j)
 			r.skill = j["skill"];
@@ -3236,6 +3647,42 @@ struct GetSkillResult
 		r.parseMetaField(j);
 		return r;
 	}
+
+	/// The skill's entry, typed.
+	SkillEntry entry() @safe
+	{
+		return SkillEntry.fromJson(skill);
+	}
+}
+
+unittest  // ListSkillsResult.entries rejects a non-object skill entry with -32602
+{
+	import std.exception : collectException;
+
+	auto r = ListSkillsResult.fromJson(Json(["skills": Json([Json("x")])]));
+	auto ex = cast(McpException) collectException(r.entries());
+	assert(ex !is null && ex.code == ErrorCode.invalidParams);
+}
+
+unittest  // SkillEntry.fromJson rejects a non-object manifest entry with -32602
+{
+	import std.exception : collectException;
+
+	auto j = Json([
+		"uri": Json("skill://a/SKILL.md"),
+		"resources": Json([Json(1)])
+	]);
+	auto ex = cast(McpException) collectException(SkillEntry.fromJson(j));
+	assert(ex !is null && ex.code == ErrorCode.invalidParams);
+}
+
+unittest  // GetSkillResult.entry rejects a result with no skill object with -32602
+{
+	import std.exception : collectException;
+
+	auto r = GetSkillResult.fromJson(Json.emptyObject);
+	auto ex = cast(McpException) collectException(r.entry());
+	assert(ex !is null && ex.code == ErrorCode.invalidParams);
 }
 
 /// Result of `resources/templates/list`.
@@ -3270,6 +3717,7 @@ struct ListResourceTemplatesResult
 
 	static ListResourceTemplatesResult fromJson(Json j) @safe
 	{
+		requireObject(j, "ListResourceTemplatesResult");
 		ListResourceTemplatesResult r;
 		if ("resourceTemplates" in j && j["resourceTemplates"].type == Json.Type.array)
 		{
@@ -3307,6 +3755,7 @@ struct Root
 
 	static Root fromJson(Json j) @safe
 	{
+		requireObject(j, "Root");
 		Root r;
 		r.uri = j.getOr("uri", "");
 		tryGet(j, "name", r.name);
@@ -3370,6 +3819,10 @@ struct ElicitParams
 			p.requestedSchema = j["requestedSchema"];
 		tryGet(j, "url", p.url);
 		tryGet(j, "elicitationId", p.elicitationId);
+		// A URL-mode request drives browser navigation, so a non-web or
+		// malformed `url` from the server is refused before any handler sees it.
+		if (p.isUrl && !isValidElicitationUrl(p.url))
+			throw invalidParams("URL-mode elicitation requires a valid http(s) url");
 		return p;
 	}
 }
@@ -3390,7 +3843,9 @@ enum ElicitAction
 /// omitted for `decline`/`cancel`.
 struct ElicitResult
 {
-	ElicitAction action; /// the user's decision
+	/// The user's decision. Defaults to `cancel` so an unset result never
+	/// reads as consent.
+	ElicitAction action = ElicitAction.cancel;
 	Json content = Json.undefined; /// accept: the collected `{name: value}` map
 	mixin MetaField;
 
@@ -3406,12 +3861,17 @@ struct ElicitResult
 	/// Convenience constructor for an `accept` whose collected `content` is built
 	/// by serializing a typed struct `T` (symmetric with `contentAs!T`). The struct
 	/// fields become the `{name: value}` content map, so `accept!T(v).contentAs!T`
-	/// round-trips.
+	/// round-trips. Enum fields are written by member name, matching the string
+	/// `enum` schema the reflection layer derives for them.
 	static ElicitResult accept(T)(T value) @safe
 	{
+		import mcp.protocol.schema : EnumByNamePolicy;
+		import vibe.data.json : JsonSerializer;
+		import vibe.data.serialization : serializeWithPolicy;
+
 		ElicitResult r;
 		r.action = ElicitAction.accept;
-		r.content = () @trusted { return serializeToJson(value); }();
+		r.content = serializeWithPolicy!(JsonSerializer, EnumByNamePolicy)(value);
 		return r;
 	}
 
@@ -3456,12 +3916,10 @@ struct ElicitResult
 
 	static ElicitResult fromJson(Json j) @safe
 	{
+		// `action` starts as `cancel`, so a missing/non-string/unknown `action`
+		// is never treated as an `accept` (which would consume input the user
+		// never agreed to). Only an explicit, recognized action string changes it.
 		ElicitResult r;
-		// Fail closed: default to `cancel` so a missing/non-string/unknown
-		// `action` is never treated as an `accept` (which would consume input
-		// the user never agreed to). Only an explicit, recognized action string
-		// changes this.
-		r.action = ElicitAction.cancel;
 		if (j.type != Json.Type.object)
 			return r;
 		if ("action" in j && j["action"].type == Json.Type.string)
@@ -3496,12 +3954,24 @@ struct ElicitResult
 	/// into a typed struct `T`. Pairs with `RequestContext.elicit!T`, whose
 	/// `requestedSchema` is derived from the same `T`. Only meaningful for an
 	/// `accept`; on a `decline`/`cancel` (no content) this returns `T.init`, so
-	/// callers should branch on `action` first.
+	/// callers should branch on `action` first. Fields are read by the rules
+	/// `elicitationSchemaOf!T` advertises: keyed by wire name, enums by member
+	/// name, and an omitted optional field keeps its default. The content comes
+	/// from the peer, so a value that does not fit `T` throws
+	/// `McpException(invalidParams)`.
 	T contentAs(T)() const @safe
 	{
+		import mcp.api.binding : bindJson;
+		import mcp.protocol.errors : invalidParams;
+
 		if (content.type != Json.Type.object)
 			return T.init;
-		return () @trusted { return deserializeJson!T(content); }();
+		try
+			return bindJson!T(content);
+		catch (McpException e)
+			throw e;
+		catch (Exception e)
+			throw invalidParams("elicitation content: " ~ e.msg);
 	}
 }
 
@@ -3524,6 +3994,7 @@ struct ListRootsResult
 
 	static ListRootsResult fromJson(Json j) @safe
 	{
+		requireObject(j, "ListRootsResult");
 		ListRootsResult r;
 		if ("roots" in j && j["roots"].type == Json.Type.array)
 		{
@@ -3577,6 +4048,29 @@ unittest  // Root preserves _meta
 	assert(back.meta["k"].get!string == "v");
 }
 
+unittest  // Root.fromJson rejects a non-object value with -32602
+{
+	import std.exception : collectException;
+
+	foreach (v; [Json(5), Json("file:///a"), Json.emptyArray, Json(null)])
+	{
+		auto ex = collectException!McpException(Root.fromJson(v));
+		assert(ex !is null && ex.code == ErrorCode.invalidParams);
+	}
+	auto ex = collectException!McpException(
+			ListRootsResult.fromJson(parseJsonString(`{"roots":["file:///a"]}`)));
+	assert(ex !is null && ex.code == ErrorCode.invalidParams);
+}
+
+unittest  // parseMetaField rejects a non-object value with -32602
+{
+	import std.exception : collectException;
+
+	Root r;
+	auto ex = collectException!McpException(r.parseMetaField(Json(5)));
+	assert(ex !is null && ex.code == ErrorCode.invalidParams);
+}
+
 unittest  // ListRootsResult serializes roots envelope
 {
 	ListRootsResult res;
@@ -3628,6 +4122,21 @@ unittest  // ElicitParams parses a url-mode request and preserves raw
 	assert("requestedSchema" !in parsed.raw); // raw is the original params
 }
 
+unittest  // ElicitParams rejects a url-mode request whose url is not a valid web URL
+{
+	import std.exception : collectException;
+
+	foreach (url; ["javascript:alert(1)", "file:///etc/passwd", "not a url", ""])
+	{
+		Json p = Json.emptyObject;
+		p["mode"] = "url";
+		p["message"] = "Approve";
+		p["url"] = url;
+		auto e = collectException!McpException(ElicitParams.fromJson(p));
+		assert(e !is null && e.code == ErrorCode.invalidParams, url);
+	}
+}
+
 unittest  // ElicitParams.toJson omits mode for the form default
 {
 	ElicitParams p;
@@ -3648,6 +4157,13 @@ unittest  // ElicitParams.toJson emits mode for url variant
 	assert(j["mode"].get!string == "url");
 	assert(j["url"].get!string == "https://example.com");
 	assert(j["elicitationId"].get!string == "e1");
+}
+
+unittest  // a default-initialised ElicitResult is a cancel, never an accept
+{
+	ElicitResult r;
+	assert(r.action == ElicitAction.cancel);
+	assert(r.toJson()["action"].get!string == "cancel");
 }
 
 unittest  // ElicitResult.accept emits {action, content}
@@ -3748,6 +4264,64 @@ unittest  // ElicitResult.accept!T serializes a struct and contentAs!T round-tri
 	assert(r.action == ElicitAction.accept);
 	auto back = r.contentAs!Booking;
 	assert(back == orig);
+}
+
+unittest  // a resource_link always carries its required name, even when empty
+{
+	auto j = Content.makeResourceLink("file:///a", "").toJson();
+	assert("name" in j && j["name"].get!string == "");
+}
+
+unittest  // ElicitResult.accept!T writes enum fields by member name
+{
+	enum Seat
+	{
+		aisle,
+		window
+	}
+
+	static struct Pref
+	{
+		Seat seat;
+	}
+
+	auto r = ElicitResult.accept(Pref(Seat.window));
+	assert(r.content["seat"].type == Json.Type.string);
+	assert(r.content["seat"].get!string == "window");
+}
+
+unittest  // ElicitResult.contentAs!T reads enum fields by member name
+{
+	enum Seat
+	{
+		aisle,
+		window
+	}
+
+	static struct Pref
+	{
+		Seat seat;
+	}
+
+	auto r = ElicitResult.accept(`{"seat":"window"}`.parseJsonString);
+	assert(r.contentAs!Pref.seat == Seat.window);
+}
+
+unittest  // ElicitResult.contentAs!T maps malformed peer content to invalidParams
+{
+	static struct Pref
+	{
+		int count;
+	}
+
+	auto r = ElicitResult.accept(`{"count":"lots"}`.parseJsonString);
+	try
+	{
+		cast(void) r.contentAs!Pref;
+		assert(false, "expected McpException");
+	}
+	catch (McpException e)
+		assert(e.code == ErrorCode.invalidParams);
 }
 
 unittest  // CallToolResult.structuredContentAs!T decodes structuredContent into a struct
@@ -3878,6 +4452,17 @@ unittest  // CallToolResult.requestStateAs!T returns T.init when no requestState
 
 	CallToolResult r;
 	assert(r.requestStateAs!State.topic == "");
+}
+
+unittest  // CallToolResult.requestStateAs!T rejects a requestState nested past the depth cap
+{
+	import std.array : replicate;
+	import std.exception : assertThrown;
+	import vibe.data.json : JSONException;
+
+	CallToolResult r;
+	r.requestState = "[".replicate(1000) ~ "]".replicate(1000);
+	assertThrown!JSONException(r.requestStateAs!Json);
 }
 
 unittest  // Resource emits annotations (audience/priority/lastModified)
@@ -4035,10 +4620,10 @@ struct ReadResourceResult
 	Nullable!CacheHint cache;
 
 	/// Returns `true` when the server responded with an `InputRequiredResult`
-	/// instead of the resource contents.
+	/// (`inputRequests` and/or `requestState`) instead of the resource contents.
 	bool isInputRequired() const @safe nothrow
 	{
-		return inputRequests.length > 0;
+		return inputRequests.length > 0 || requestState.length > 0;
 	}
 
 	Json toJson() const @safe
@@ -4048,6 +4633,7 @@ struct ReadResourceResult
 			Json j = Json.emptyObject;
 			j["resultType"] = "input_required";
 			emitInputRequired(j, inputRequests, requestState);
+			emitMetaField(j);
 			return j;
 		}
 		Json j = Json.emptyObject;
@@ -4063,9 +4649,11 @@ struct ReadResourceResult
 
 	static ReadResourceResult fromJson(Json j) @safe
 	{
+		requireObject(j, "ReadResourceResult");
 		ReadResourceResult r;
 		// An InputRequiredResult carries `inputRequests` instead of `contents`.
 		parseInputRequired(j, r.inputRequests, r.requestState);
+		r.parseMetaField(j);
 		if (r.isInputRequired)
 			return r;
 		if ("contents" in j && j["contents"].type == Json.Type.array)
@@ -4074,7 +4662,6 @@ struct ReadResourceResult
 			foreach (i; 0 .. arr.length)
 				r.contents ~= ResourceContents.fromJson(arr[i]);
 		}
-		r.parseMetaField(j);
 		r.cache = parseCacheHint(j);
 		return r;
 	}
@@ -4115,6 +4702,34 @@ unittest  // an input-required ReadResourceResult serialises with the input_requ
 	assert("contents" !in j);
 }
 
+unittest  // a requestState-only ReadResourceResult is input-required and round-trips its state
+{
+	import vibe.data.json : parseJsonString;
+
+	auto r = ReadResourceResult.fromJson(
+			parseJsonString(`{"resultType":"input_required","requestState":"s"}`));
+	assert(r.isInputRequired);
+	assert(r.requestState == "s");
+	auto j = r.toJson();
+	assert(j["resultType"].get!string == "input_required");
+	assert(j["requestState"].get!string == "s");
+	assert("contents" !in j);
+}
+
+unittest  // a requestState-only GetPromptResult is input-required and round-trips its state
+{
+	import vibe.data.json : parseJsonString;
+
+	auto r = GetPromptResult.fromJson(
+			parseJsonString(`{"resultType":"input_required","requestState":"s"}`));
+	assert(r.isInputRequired);
+	assert(r.requestState == "s");
+	auto j = r.toJson();
+	assert(j["resultType"].get!string == "input_required");
+	assert(j["requestState"].get!string == "s");
+	assert("messages" !in j);
+}
+
 unittest  // a plain ReadResourceResult is not input-required
 {
 	ReadResourceResult r;
@@ -4150,6 +4765,7 @@ struct PromptArgument
 
 	static PromptArgument fromJson(Json j) @safe
 	{
+		requireObject(j, "PromptArgument");
 		PromptArgument a;
 		a.name = j.getOr("name", "");
 		tryGet(j, "title", a.title);
@@ -4254,6 +4870,7 @@ struct Prompt
 
 	static Prompt fromJson(Json j) @safe
 	{
+		requireObject(j, "Prompt");
 		Prompt p;
 		p.name = j.getOr("name", "");
 		tryGet(j, "title", p.title);
@@ -4264,17 +4881,15 @@ struct Prompt
 			foreach (i; 0 .. arr.length)
 				p.arguments ~= PromptArgument.fromJson(arr[i]);
 		}
-		if ("icons" in j && j["icons"].type == Json.Type.array)
-			foreach (i; 0 .. j["icons"].length)
-				p.icons ~= Icon.fromJson(j["icons"][i]);
+		p.icons = readIcons(j);
 		p.parseMetaField(j);
 		return p;
 	}
 
 	/// Return a copy of this `Prompt` with any fields newer than the negotiated
 	/// protocol version stripped, so the wire output stays valid for the peer's
-	/// version. `BaseMetadata.title` was introduced by 2025-06-18 (absent from
-	/// 2025-03-26 and 2024-11-05); `Prompt.icons` was introduced by 2025-11-25
+	/// version. `BaseMetadata.title` and `_meta` were introduced by 2025-06-18
+	/// (absent from 2025-03-26 and 2024-11-05); `Prompt.icons` was introduced by 2025-11-25
 	/// (absent from every earlier version, present in the modern protocol which is
 	/// >= 2025-11-25). Mirrors `Tool.forVersion`.
 	Prompt forVersion(ProtocolVersion v) const @safe
@@ -4284,9 +4899,11 @@ struct Prompt
 		projected.description = description;
 		foreach (a; arguments)
 			projected.arguments ~= a.forVersion(v);
-		projected.meta = meta;
 		if (v >= ProtocolVersion.v2025_06_18)
+		{
 			projected.title = title;
+			projected.meta = meta;
+		}
 		if (v >= ProtocolVersion.v2025_11_25)
 		{
 			foreach (icon; icons)
@@ -4294,6 +4911,33 @@ struct Prompt
 		}
 		return projected;
 	}
+}
+
+unittest  // Resource.forVersion keeps _meta only from 2025-06-18
+{
+	Resource r = {uri: "file:///a", name: "a"};
+	r.meta = Json(["k": Json("v")]);
+	assert("_meta" !in r.forVersion(ProtocolVersion.v2024_11_05).toJson());
+	assert("_meta" !in r.forVersion(ProtocolVersion.v2025_03_26).toJson());
+	assert(r.forVersion(ProtocolVersion.v2025_06_18).toJson()["_meta"]["k"].get!string == "v");
+}
+
+unittest  // ResourceTemplate.forVersion keeps _meta only from 2025-06-18
+{
+	ResourceTemplate t = {uriTemplate: "file:///{x}", name: "t"};
+	t.meta = Json(["k": Json("v")]);
+	assert("_meta" !in t.forVersion(ProtocolVersion.v2024_11_05).toJson());
+	assert("_meta" !in t.forVersion(ProtocolVersion.v2025_03_26).toJson());
+	assert(t.forVersion(ProtocolVersion.v2025_06_18).toJson()["_meta"]["k"].get!string == "v");
+}
+
+unittest  // Prompt.forVersion keeps _meta only from 2025-06-18
+{
+	Prompt p = {name: "greet"};
+	p.meta = Json(["k": Json("v")]);
+	assert("_meta" !in p.forVersion(ProtocolVersion.v2024_11_05).toJson());
+	assert("_meta" !in p.forVersion(ProtocolVersion.v2025_03_26).toJson());
+	assert(p.forVersion(ProtocolVersion.v2025_06_18).toJson()["_meta"]["k"].get!string == "v");
 }
 
 unittest  // Prompt.forVersion strips title for 2024-11-05 (BaseMetadata.title introduced 2025-06-18)
@@ -4436,6 +5080,7 @@ struct PromptMessage
 
 	static PromptMessage fromJson(Json j) @safe
 	{
+		requireObject(j, "PromptMessage");
 		PromptMessage m;
 		m.role = j.getOr("role", "");
 		if ("content" in j)
@@ -4487,6 +5132,7 @@ struct ListPromptsResult
 
 	static ListPromptsResult fromJson(Json j) @safe
 	{
+		requireObject(j, "ListPromptsResult");
 		ListPromptsResult r;
 		if ("prompts" in j && j["prompts"].type == Json.Type.array)
 		{
@@ -4520,7 +5166,7 @@ struct GetPromptResult
 	/// instead of a final prompt result. Mirrors `CallToolResult.isInputRequired`.
 	bool isInputRequired() const @safe nothrow
 	{
-		return inputRequests.length > 0;
+		return inputRequests.length > 0 || requestState.length > 0;
 	}
 
 	Json toJson() const @safe
@@ -4530,6 +5176,7 @@ struct GetPromptResult
 			Json j = Json.emptyObject;
 			j["resultType"] = "input_required";
 			emitInputRequired(j, inputRequests, requestState);
+			emitMetaField(j);
 			return j;
 		}
 		Json j = Json.emptyObject;
@@ -4545,9 +5192,11 @@ struct GetPromptResult
 
 	static GetPromptResult fromJson(Json j) @safe
 	{
+		requireObject(j, "GetPromptResult");
 		GetPromptResult r;
 		// An InputRequiredResult carries `inputRequests` instead of `messages`.
 		parseInputRequired(j, r.inputRequests, r.requestState);
+		r.parseMetaField(j);
 		if (r.isInputRequired)
 			return r;
 		tryGet(j, "description", r.description);
@@ -4557,7 +5206,6 @@ struct GetPromptResult
 			foreach (i; 0 .. arr.length)
 				r.messages ~= PromptMessage.fromJson(arr[i]);
 		}
-		r.parseMetaField(j);
 		return r;
 	}
 
@@ -4571,8 +5219,9 @@ struct GetPromptResult
 	/// Return a copy with each message's content projected for the negotiated
 	/// protocol version (see `PromptMessage.forVersion` / `Content.forVersion`),
 	/// so newer content kinds and post-2024-11-05 content `_meta` /
-	/// `Annotations.lastModified` do not leak to an older peer. Mirrors
-	/// `CallToolResult.forVersion`.
+	/// `Annotations.lastModified` do not leak to an older peer. The MRTR
+	/// `inputRequests`/`requestState` survive only on the modern protocol.
+	/// Mirrors `CallToolResult.forVersion`.
 	GetPromptResult forVersion(ProtocolVersion v) const @safe
 	{
 		GetPromptResult r;
@@ -4580,8 +5229,36 @@ struct GetPromptResult
 		r.meta = meta;
 		foreach (m; messages)
 			r.messages ~= m.forVersion(v);
+		// `inputRequests`/`requestState` form the modern-only MRTR
+		// `InputRequiredResult` shape; a legacy `GetPromptResult` schema has no
+		// such fields, so drop them when projecting below 2026-07-28.
+		if (v >= ProtocolVersion.v2026_07_28)
+		{
+			r.inputRequests = inputRequests.dup;
+			r.requestState = requestState;
+		}
 		return r;
 	}
+}
+
+unittest  // GetPromptResult.forVersion keeps MRTR fields on the modern protocol
+{
+	GetPromptResult r;
+	r.inputRequests = [InputRequest("q1", "elicitation", Json.emptyObject)];
+	r.requestState = "s1";
+	auto modern = r.forVersion(ProtocolVersion.v2026_07_28);
+	assert(modern.isInputRequired);
+	assert(modern.inputRequests.length == 1);
+	assert(modern.requestState == "s1");
+}
+
+unittest  // GetPromptResult.forVersion drops MRTR fields below the modern protocol
+{
+	GetPromptResult r;
+	r.inputRequests = [InputRequest("q1", "elicitation", Json.emptyObject)];
+	r.requestState = "s1";
+	auto legacy = r.forVersion(ProtocolVersion.v2025_11_25);
+	assert(!legacy.isInputRequired);
 }
 
 unittest  // Content.forVersion downgrades audio to a text placeholder pre-2025-03-26
@@ -4625,11 +5302,24 @@ unittest  // Content.forVersion drops content-level _meta for 2024-11-05, keeps 
 	assert("_meta" in keep && keep["_meta"]["x.example/k"].get!string == "v");
 }
 
+unittest  // Content.forVersion strips an embedded resource's _meta pre-2025-06-18
+{
+	import vibe.data.json : parseJsonString;
+
+	auto c = Content.fromJson(parseJsonString(
+			`{"type":"resource","resource":{"uri":"file://x",` ~ `"text":"hi","_meta":{"k":"v"}}}`));
+	auto old = c.forVersion(ProtocolVersion.v2025_03_26).toJson();
+	assert("_meta" !in old["resource"]);
+	assert(old["resource"]["text"].get!string == "hi");
+	auto keep = c.forVersion(ProtocolVersion.v2025_06_18).toJson();
+	assert(keep["resource"]["_meta"]["k"].get!string == "v");
+	// The source block is not mutated by the projection.
+	assert("_meta" in c.toJson()["resource"]);
+}
+
 unittest  // Content.forVersion strips Annotations.lastModified pre-2025-06-18
 {
-	Json ann = Json.emptyObject;
-	ann["audience"] = Json([Json("user")]);
-	ann["lastModified"] = Json("2025-01-01T00:00:00Z");
+	Annotations ann = {audience: ["user"], lastModified: "2025-01-01T00:00:00Z"};
 	auto c = Content.makeText("hi").withAnnotations(ann);
 
 	auto old = c.forVersion(ProtocolVersion.v2024_11_05).toJson();
@@ -5069,13 +5759,22 @@ struct ProgressNotification
 
 	Json toJson() const @safe
 	{
+		// `progressToken` is REQUIRED by the schema and is a string or number;
+		// an unset or otherwise-typed token cannot correlate the update with
+		// any request, so it is refused rather than emitted. This is a local
+		// builder mistake, so it is a plain Exception rather than a -32602.
+		switch (progressToken.type)
+		{
+		case Json.Type.string:
+		case Json.Type.int_:
+		case Json.Type.bigInt:
+		case Json.Type.float_:
+			break;
+		default:
+			throw new Exception("progress notification requires a string or number progressToken");
+		}
 		Json j = Json.emptyObject;
-		// `progressToken` is REQUIRED by the schema. Guard against a
-		// default-constructed (unset) token so we never silently drop the key
-		// (vibe omits `Json.undefined` values); mirror LogMessageNotification's
-		// data guard. The authoritative emit path (`reportProgress`) always sets
-		// the token, so this only hardens against misuse / parse-side reuse.
-		j["progressToken"] = progressToken.type == Json.Type.undefined ? Json(null) : progressToken;
+		j["progressToken"] = progressToken;
 		j["progress"] = progress;
 		if (!total.isNull)
 			j["total"] = total.get;
@@ -5095,22 +5794,13 @@ struct ProgressNotification
 		if ("progressToken" in params)
 			n.progressToken = params["progressToken"];
 		if ("progress" in params)
-			n.progress = toDouble(params["progress"]);
-		if ("total" in params && (params["total"].type == Json.Type.int_
-				|| params["total"].type == Json.Type.float_))
-			n.total = toDouble(params["total"]);
+			tryNumber(params["progress"], n.progress);
+		double totalValue;
+		if ("total" in params && tryNumber(params["total"], totalValue))
+			n.total = totalValue;
 		if ("message" in params && params["message"].type == Json.Type.string)
 			n.message = params["message"].get!string;
 		return n;
-	}
-
-	private static double toDouble(Json v) @safe
-	{
-		if (v.type == Json.Type.float_)
-			return v.get!double;
-		if (v.type == Json.Type.int_)
-			return cast(double) v.get!long;
-		return 0;
 	}
 
 	/// The progress token rendered as a string, or `""` when it is absent or not a
@@ -5198,12 +5888,26 @@ unittest  // ProgressNotification.matches an integer ProgressToken
 	assert(!n.matches(ProgressToken("42")));
 }
 
-unittest  // ProgressNotification.toJson always emits the REQUIRED progressToken
+unittest  // ProgressNotification.toJson throws a plain Exception when the REQUIRED progressToken is unset or not a string/number
 {
-	ProgressNotification n; // default-constructed: progressToken is unset
-	auto j = n.toJson();
-	assert("progressToken" in j); // never silently dropped (was Json.undefined)
-	assert(j["progressToken"].type == Json.Type.null_);
+	import std.exception : collectException;
+
+	foreach (tok; [Json.undefined, Json(null), Json(true), Json.emptyObject])
+	{
+		ProgressNotification n;
+		n.progressToken = tok;
+		auto ex = collectException(n.toJson());
+		assert(ex !is null && cast(McpException) ex is null);
+	}
+}
+
+unittest  // ProgressNotification.toJson emits a string or integer progressToken
+{
+	ProgressNotification n;
+	n.progressToken = Json("t");
+	assert(n.toJson()["progressToken"].get!string == "t");
+	n.progressToken = Json(7);
+	assert(n.toJson()["progressToken"].get!long == 7);
 }
 
 /// The severity of a `notifications/message`, per server/utilities/logging. The
@@ -5829,4 +6533,59 @@ unittest  // ListResourceTemplatesResult.fromJson tolerates a missing array
 	ListResourceTemplatesResult back = ListResourceTemplatesResult.fromJson(Json.emptyObject);
 	assert(back.resourceTemplates.length == 0);
 	assert(back.nextCursor.isNull);
+}
+
+unittest  // Content.fromJson rejects a non-string type with -32602
+{
+	import std.exception : collectException;
+
+	auto ex = cast(McpException) collectException(Content.fromJson(Json([
+		"type": Json(1)
+	])));
+	assert(ex !is null && ex.code == ErrorCode.invalidParams);
+}
+
+unittest  // Content.fromJson rejects a block with no type with -32602
+{
+	import std.exception : collectException;
+
+	auto ex = collectException!McpException(Content.fromJson(Json([
+		"text": Json("hi")
+	])));
+	assert(ex !is null && ex.code == ErrorCode.invalidParams);
+}
+
+unittest  // Content.fromJson rejects a non-object block with -32602
+{
+	import std.exception : collectException;
+
+	auto ex = cast(McpException) collectException(Content.fromJson(Json("text")));
+	assert(ex !is null && ex.code == ErrorCode.invalidParams);
+}
+
+unittest  // initialize with a non-object capabilities value is rejected with -32602
+{
+	import std.exception : collectException;
+
+	auto ex = cast(McpException) collectException(InitializeParams.fromJson(
+			`{"protocolVersion":"2025-11-25","capabilities":5}`.parseJsonString));
+	assert(ex !is null && ex.code == ErrorCode.invalidParams);
+}
+
+unittest  // every object-shaped fromJson rejects a non-object value with -32602
+{
+	import std.exception : collectException;
+	import std.meta : AliasSeq;
+
+	static foreach (T; AliasSeq!(Annotations, ToolAnnotations, Tool, CallToolResult,
+			ListToolsResult, InitializeParams, InitializeResult, Resource, ResourceTemplate,
+			ResourceContents, ListResourcesResult, ListSkillsResult, GetSkillResult,
+			ListResourceTemplatesResult, ListRootsResult, ReadResourceResult,
+			PromptArgument, Prompt, PromptMessage, ListPromptsResult, GetPromptResult))
+	{
+		{
+			auto ex = cast(McpException) collectException(T.fromJson(Json(5)));
+			assert(ex !is null && ex.code == ErrorCode.invalidParams, T.stringof);
+		}
+	}
 }

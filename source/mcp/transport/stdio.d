@@ -1,9 +1,15 @@
 module mcp.transport.stdio;
 
+import core.time : Duration, seconds;
 import vibe.data.json : Json;
 
+import mcp.protocol.jsonrpc : Message, takeBatchReplies;
+import mcp.protocol.versions : ProtocolVersion;
 import mcp.server.server;
+import mcp.server.settings : ServerSettings;
+import mcp.transport.coordinator : defaultServerRequestTimeout;
 import mcp.transport.duplex : DuplexChannel, defaultMaxLineBytes;
+import mcp.transport.lines : FrameHead, LineReader;
 
 @safe:
 
@@ -30,7 +36,8 @@ private __gshared bool _ranStdio;
 ///     `ctx.isCancelled` does not stall the read loop. Notifications the handler
 ///     emits (`notifications/message`, `notifications/progress`) and the request's
 ///     reply are written through `channel.send` (serialized against other
-///     writers);
+///     writers). At most `opts.maxInFlight` requests and batches run at once;
+///     further ones wait for a slot, and the read loop keeps reading meanwhile;
 ///   - a *notification* (e.g. `notifications/cancelled`, `notifications/initialized`)
 ///     is handled inline; an inbound `notifications/cancelled` flips the matching
 ///     in-flight request's `CancellationToken` concurrently with its running
@@ -42,31 +49,37 @@ private __gshared bool _ranStdio;
 ///     `channel.send`).
 ///
 /// Requires a running vibe event loop; `serveStdio` runs the read loop on the
-/// CURRENT task and blocks until end-of-input.
+/// CURRENT task and blocks until end-of-input, then waits up to
+/// `opts.drainTimeout` for request handlers still running to write their replies.
+///
+/// `readLine` owns line framing, so `opts.maxLineBytes` is not applied here: a
+/// caller reading an untrusted stream bounds its own lines (`runStdio` does).
 void serveStdio(McpServer server, string delegate() @safe readLine,
-		void delegate(string) @safe writeLine)
+		void delegate(string) @safe writeLine, StdioOptions opts = StdioOptions.init)
 {
-	import vibe.core.core : runTask, yield;
+	import vibe.core.core : runTask;
 	import vibe.data.json : Json;
 	import mcp.protocol.jsonrpc : Message, MessageKind;
 	import mcp.server.connection : ConnectionState;
+	import mcp.server.context : StdioContext, StdioContextOptions;
 
 	// stdio is single-connection (one implicit peer per process), so this
 	// transport owns exactly one `ConnectionState`, which the server core threads
 	// through dispatch and reads back for the notify path. Binding it here (before
 	// the read loop starts) makes it the state for every request on this process;
 	// HTTP instead resolves per-session state per request.
-	server.bindConnection(new ConnectionState);
+	auto conn = new ConnectionState;
+	server.bindConnection(conn);
 
 	DuplexChannel channel;
 
-	// Count of dispatched-but-not-yet-finished request handler tasks. Cooperative
+	// Count of dispatched-but-not-yet-finished handler tasks. Cooperative
 	// vibe tasks on one thread never preempt each other between yield points, so a
-	// plain counter (incremented before runTask, decremented in the handler's
-	// finally) needs no atomics. After the read loop ends at EOF we drain this to
+	// plain counter (incremented when a handler starts, decremented when it ends)
+	// needs no atomics. After the read loop ends at EOF we drain this to
 	// zero under a bounded grace period so an already-computed reply still flushes
 	// through channel.sendRaw before the loop tears down.
-	size_t inflight;
+	auto inflight = new InflightCount;
 
 	// The server->client write sink and request channel both go through the one
 	// serialized writer on `channel`.
@@ -77,7 +90,160 @@ void serveStdio(McpServer server, string delegate() @safe readLine,
 
 	Json serverRequest(string method, Json params) @safe
 	{
-		return channel.request(method, params);
+		return channel.request(method, params, opts.serverRequestTimeout);
+	}
+
+	// A server->client request channel for the handler of inbound request `id`:
+	// cancelling that request also releases the server->client request it awaits.
+	Json delegate(string, Json) @safe cancellableServerRequest(Json id) @safe nothrow
+	{
+		return (string method, Json params) @safe {
+			auto token = McpServer.inFlightKey("", id) in conn.inFlight;
+			return channel.request(method, params, opts.serverRequestTimeout,
+					token is null ? null : *token);
+		};
+	}
+
+	// Background ticker for modern `events/stream` push: poll-driven event types and
+	// per-stream heartbeats are advanced here (emit-only types deliver live via the
+	// sink). Started when the first stream opens, so events enabled after the
+	// transport starts are still ticked; stops when the read loop ends.
+	bool tickerStarted;
+	bool readLoopDone;
+	void startTicker() @safe
+	{
+		if (tickerStarted)
+			return;
+		tickerStarted = true;
+		runTask(() nothrow{
+			import vibe.core.core : sleep;
+			import core.time : seconds;
+			import mcp.server.event_store : nowUnixMs;
+
+			while (!readLoopDone)
+			{
+				try
+				{
+					sleep(1.seconds);
+					server.tickStdioEventStreams(nowUnixMs());
+				}
+				catch (Exception)
+					break;
+			}
+		});
+	}
+
+	// Admission control: at most `maxInFlight` requests and batches are handled
+	// at once. The read loop never waits for a slot, so replies to server->client
+	// requests, cancellations and end-of-input are always seen; a request or batch
+	// arriving while every slot is busy waits in `backlog` (in arrival order, up
+	// to `maxInFlight` entries) and is run by the next slot to free up. One
+	// arriving while the backlog is full is refused with an error.
+	size_t running;
+	Admitted[] backlog;
+
+	void runAdmitted(Admitted item) @safe nothrow
+	{
+		if (item.batch is null)
+		{
+			Json delegate(string, Json) @safe requester = &serverRequest;
+			try
+				requester = cancellableServerRequest(item.request.id);
+			catch (Exception)
+			{
+			}
+			replyToRequest(server, &sink, requester, item.request, channel);
+			return;
+		}
+		try
+		{
+			auto reply = server.handleRaw(item.batch, &sink, &serverRequest);
+			if (reply.length)
+				channel.sendRaw(reply);
+		}
+		catch (Exception e)
+			channel.reportError("batch: " ~ e.msg);
+	}
+
+	// Answer every request in `item` with an error: the server is saturated.
+	void refuse(Admitted item) @safe nothrow
+	{
+		import mcp.protocol.errors : internalError;
+		import mcp.protocol.jsonrpc : makeErrorResponse, parseAny;
+		import std.conv : to;
+
+		try
+		{
+			auto err = internalError("server busy: " ~ opts.maxInFlight.to!string
+					~ " requests are in flight and " ~ backlog.length.to!string ~ " are queued");
+			if (item.batch is null)
+			{
+				channel.post(makeErrorResponse(item.request.id, err));
+				return;
+			}
+			Json[] replies;
+			foreach (msg; parseAny(item.batch).messages)
+				if (msg.kind == MessageKind.request)
+					replies ~= makeErrorResponse(msg.id, err);
+			// Posted: a refused batch is refused on the read loop, which must not
+			// wait on a peer that is not draining stdout.
+			if (replies.length)
+				channel.post(Json(replies));
+		}
+		catch (Exception e)
+			channel.reportError("refusing a request: " ~ e.msg);
+	}
+
+	// Whether `item` may run now. Otherwise it is queued or refused.
+	bool admit(Admitted item) @safe
+	{
+		inflight.start();
+		if (opts.maxInFlight == 0 || running < opts.maxInFlight)
+		{
+			++running;
+			return true;
+		}
+		if (backlog.length < opts.maxInFlight)
+		{
+			backlog ~= item;
+			return false;
+		}
+		inflight.finish();
+		refuse(item);
+		return false;
+	}
+
+	// Run `first`, then whatever the backlog holds, on the current task. The
+	// caller holds one slot (see `admit`), released on return.
+	void runSlot(Admitted first) @safe nothrow
+	{
+		scope (exit)
+			--running;
+		for (auto item = first;;)
+		{
+			runAdmitted(item);
+			inflight.finish();
+			if (backlog.length == 0)
+				break;
+			item = backlog[0];
+			backlog = backlog[1 .. $];
+		}
+	}
+
+	// Drop the queued request a `notifications/cancelled` names: it has not
+	// started, so it is never run and, per the cancellation rules, gets no reply.
+	void withdrawQueued(Json params) @safe
+	{
+		if (params.type != Json.Type.object || "requestId" !in params)
+			return;
+		const id = params["requestId"];
+		foreach (i, item; backlog)
+			if (item.batch is null && item.request.id == id)
+			{
+				backlog = backlog[0 .. i] ~ backlog[i + 1 .. $];
+				inflight.finish();
+				return;
+			}
 	}
 
 	void onInbound(Message m) @safe
@@ -100,31 +266,35 @@ void serveStdio(McpServer server, string delegate() @safe readLine,
 			// `notifications/events/*` to the same sink (demuxed by the request id
 			// in `_meta`). A background ticker advances poll-driven types + heartbeats.
 			if (server.tryServeStdioEventsStream(m, &sink))
+			{
+				if (server.hasStdioEventStreams())
+					startTicker();
 				return;
-			// Dispatch the request in its own task so a blocking/long-running handler
-			// (server->client request, cancellation poll loop) does not stall the
-			// read loop. The handler's notifications + reply ride `channel.send`.
-			// Track it as in-flight so EOF cannot abandon a handler that has computed
-			// its reply but not yet written it.
-			++inflight;
-			runTask((Message msg) nothrow{
-				try
-				{
-					auto ctx = new StdioContextFactoryReply(server, &sink, &serverRequest, msg);
-					ctx.run(channel);
-				}
-				catch (Exception)
-				{
-				}
-				finally
-					--inflight;
-			}, m);
+			}
+			// The channel already runs this on its own task, so a blocking or
+			// long-running handler (server->client request, cancellation poll loop)
+			// does not stall the read loop. The handler's notifications + reply ride
+			// `channel.send`.
+			if (admit(Admitted(m)))
+				runSlot(Admitted(m));
 			break;
 		case MessageKind.notification:
-			// Notifications (initialized / cancelled / roots-changed / progress) are
-			// handled inline; they are quick and a cancellation must flip its token
-			// promptly for any concurrently-running handler task to observe.
-			server.handle(m);
+			// The channel already runs this on its own task, started immediately, so
+			// initialized / cancelled take effect before the next line is read while
+			// an observer that blocks (e.g. re-listing roots) does not stall the loop.
+			// Notifications bypass `maxInFlight`: a cancellation must reach a running
+			// handler, and one for a request still waiting for a slot withdraws it.
+			// The channel bounds them itself (`DuplexChannel.maxNotificationTasks`).
+			if (m.method == "notifications/cancelled")
+				withdrawQueued(m.params);
+			inflight.start();
+			scope (exit)
+				inflight.finish();
+			// Dispatched with the channel-bound context so an observer can issue
+			// server->client requests (e.g. `ctx.listRoots()`) directly.
+			server.handle(m, new StdioContext(&sink, StdioContextOptions(&serverRequest,
+					server.clientCapabilities, Json.undefined,
+					server.negotiatedVersion, server.mode == ServerMode.stateless)));
 			break;
 		case MessageKind.response:
 		case MessageKind.errorResponse:
@@ -145,87 +315,136 @@ void serveStdio(McpServer server, string delegate() @safe readLine,
 	// stall the read loop, and `handleRaw` returns the one aggregated array frame.
 	void onInboundBatch(string raw) @safe
 	{
-		++inflight;
-		runTask((string text) nothrow{
-			try
-			{
-				auto reply = server.handleRaw(text, &sink, &serverRequest);
-				if (reply.length)
-					channel.sendRaw(reply);
-			}
-			catch (Exception)
-			{
-			}
-			finally
-				--inflight;
-		}, raw);
+		// Client replies in a batch the version gate admits wake their waiters
+		// here, on the read loop, and only the rest goes to `handleRaw`.
+		if (server.negotiatedVersion < ProtocolVersion.v2025_06_18)
+			raw = takeBatchReplies(raw, &channel.resolveReply);
+		if (raw is null)
+			return;
+		Admitted batch;
+		batch.batch = raw;
+		if (admit(batch))
+			runTask((Admitted first) nothrow{ runSlot(first); }, batch);
 	}
 
 	channel = new DuplexChannel(readLine, writeLine, &onInbound, &onInboundBatch);
-
-	// Background ticker for modern `events/stream` push: poll-driven event types and
-	// per-stream heartbeats are advanced here (emit-only types deliver live via the
-	// sink). Runs only while events are enabled; stops when the read loop ends.
-	bool tickerRunning = server.hasStdioEventStreams();
-	if (tickerRunning)
-		runTask(() nothrow{
-			import vibe.core.core : sleep;
-			import core.time : seconds;
-			import mcp.server.event_store : nowUnixMs;
-
-			while (tickerRunning)
-			{
-				try
-				{
-					sleep(1.seconds);
-					server.tickStdioEventStreams(nowUnixMs());
-				}
-				catch (Exception)
-					break;
-			}
-		});
+	channel.onError = opts.onError;
+	channel.answersMalformed = true;
+	// Change notifications for a 2025-era client ride the same serialized writer.
+	server.attachStdioSink(&sink);
+	scope (exit)
+		server.detachStdio();
 
 	channel.runReadLoop();
-	tickerRunning = false;
+	readLoopDone = true;
 
 	// The read loop has ended at stdin EOF. failPending (inside runReadLoop) already
 	// released any handler blocked in a server->client request, but a handler that
-	// has computed its reply still needs to be scheduled so its sendRaw runs. Yield
-	// until every dispatched handler task has finished, bounded so a handler stuck
-	// in unbounded local work cannot hold the process open forever.
-	enum size_t drainYields = 4096;
-	for (size_t i = 0; i < drainYields && inflight > 0; ++i)
-		yield();
+	// has computed its reply still needs to be scheduled so its sendRaw runs. Wait
+	// until every dispatched handler task has finished, bounded by
+	// `opts.drainTimeout` so a stuck handler cannot hold the process open forever.
+	inflight.awaitIdle(opts.drainTimeout);
 }
 
-/// Helper that dispatches one inbound stdio request through the server with a
-/// `StdioContext`, then writes the reply (if any) on the channel. Kept as a small
-/// class so the per-request closure captured by `runTask` has a stable `this`.
-private final class StdioContextFactoryReply
+/// An inbound request, or a batch line (`batch` non-null), admitted for handling
+/// under `StdioOptions.maxInFlight`.
+private struct Admitted
 {
-	import vibe.data.json : Json;
-	import mcp.protocol.jsonrpc : Message;
+	Message request;
+	string batch;
+}
 
-	private McpServer server;
-	private void delegate(string) @safe sink;
-	private Json delegate(string, Json) @safe serverRequest;
-	private Message msg;
+/// Count of running request handler tasks, signalling each time it returns to
+/// zero so the EOF drain can wait for it. A class so the handler tasks that
+/// outlive a timed-out drain still reference live state.
+private final class InflightCount
+{
+	import vibe.core.sync : LocalManualEvent, createManualEvent;
 
-	this(McpServer server, void delegate(string) @safe sink, Json delegate(string,
-			Json) @safe serverRequest, Message msg) @safe
+	private size_t count;
+	private LocalManualEvent finished;
+
+	this() @safe
 	{
-		this.server = server;
-		this.sink = sink;
-		this.serverRequest = serverRequest;
-		this.msg = msg;
+		finished = createManualEvent();
 	}
 
-	void run(DuplexChannel channel) @safe
+	void start() @safe nothrow
 	{
-		auto reply = server.handleRaw(msg.raw.toString(), sink, serverRequest);
-		if (reply.length)
-			channel.sendRaw(reply);
+		++count;
 	}
+
+	void finish() @safe nothrow
+	{
+		--count;
+		finished.emit();
+	}
+
+	/// Wait until no handler is running or `timeout` elapses.
+	void awaitIdle(Duration timeout) @safe
+	{
+		import core.time : MonoTime;
+
+		const deadline = MonoTime.currTime + timeout;
+		while (count > 0)
+		{
+			const now = MonoTime.currTime;
+			if (now >= deadline)
+				break;
+			const ec = finished.emitCount;
+			finished.wait(deadline - now, ec);
+		}
+	}
+}
+
+/// Dispatch one inbound stdio request `msg` through `server` with a
+/// `StdioContext`, then write its reply (if any) on `channel`. A dispatch that
+/// throws is reported and answered with a -32603 error so the peer does not wait
+/// forever; a reply that cannot be written is reported.
+private void replyToRequest(McpServer server, void delegate(string) @safe sink,
+		Json delegate(string, Json) @safe serverRequest, Message msg, DuplexChannel channel) @safe nothrow
+{
+	import std.typecons : Nullable;
+	import mcp.protocol.errors : internalError;
+	import mcp.protocol.jsonrpc : makeErrorResponse;
+	import mcp.server.context : StdioContext, StdioContextOptions;
+	import mcp.transport.sse_context : extractProgressToken;
+
+	string idText() @safe nothrow
+	{
+		try
+			return msg.id.toString();
+		catch (Exception)
+			return "?";
+	}
+
+	Nullable!Json reply;
+	try
+	{
+		// The channel has already parsed and classified `msg`, so it is dispatched
+		// directly against the bound connection rather than re-serialised for
+		// `handleRaw` to parse again.
+		auto ctx = new StdioContext(sink, StdioContextOptions(serverRequest,
+				server.clientCapabilities,
+				extractProgressToken(msg.params),
+				server.negotiatedVersion, server.mode == ServerMode.stateless));
+		reply = server.handle(msg, ctx);
+	}
+	catch (Exception e)
+	{
+		channel.reportError("request " ~ idText() ~ ": " ~ e.msg);
+		try
+			reply = makeErrorResponse(msg.id, internalError("request handling failed"));
+		catch (Exception)
+		{
+		}
+	}
+	if (reply.isNull)
+		return;
+	try
+		channel.sendRaw(reply.get.toString());
+	catch (Exception e)
+		channel.reportError("request " ~ idText() ~ ": reply write failed: " ~ e.msg);
 }
 
 /// Static options for the stdio server transport, bundled into one value so
@@ -233,17 +452,41 @@ private final class StdioContextFactoryReply
 /// `StreamableHttpOptions` for the HTTP transport.
 struct StdioOptions
 {
-	/// Bounds a single inbound line; an oversized frame is dropped (its bytes are
-	/// skipped up to the next newline) so one misbehaving frame cannot exhaust
-	/// memory.
+	/// Bounds a single inbound stdin line in `runStdio`; an oversized frame is
+	/// dropped (its bytes are skipped up to the next newline) so one misbehaving
+	/// frame cannot exhaust memory. `serveStdio` leaves framing to its `readLine`.
 	size_t maxLineBytes = defaultMaxLineBytes;
+
+	/// How long the transport waits, once stdin reaches end-of-input, for request
+	/// handlers still running to finish and write their replies before it returns.
+	Duration drainTimeout = 5.seconds;
+
+	/// The most inbound requests and batches handled at once (`0`: unbounded),
+	/// so a client cannot spawn handler tasks without bound. Up to this many more
+	/// wait, in arrival order, for a running one to finish; a request arriving
+	/// while that queue is full is answered with a -32603 "server busy" error.
+	/// stdin is always read, so replies to server->client requests,
+	/// `notifications/cancelled` (which also withdraws a queued request) and
+	/// end-of-input are seen however many handlers run. Notifications are not
+	/// counted; the channel runs at most 64 notification handlers at once
+	/// (`notifications/cancelled` always runs).
+	size_t maxInFlight = 64;
+
+	/// How long a server->client request (elicitation, sampling, roots) waits for
+	/// the client's reply before it fails with `RequestTimeoutException` and is
+	/// cancelled toward the client with `notifications/cancelled`.
+	Duration serverRequestTimeout = defaultServerRequestTimeout;
+
+	/// Receives a description of each failure the transport survives: a request
+	/// whose handling or reply write threw, an unreadable input. stdout carries
+	/// only MCP messages, so this defaults to stderr when null.
+	void delegate(string) @safe nothrow onError;
 }
 
-/// Serve `server` over stdio with the options in `opts`. The single-struct form
-/// of `runStdio`, used by the `ServerSettings`-based entry point.
-void runStdio(McpServer server, StdioOptions opts)
+/// Serve `server` over stdio using `settings.stdio`. Blocks until stdin closes.
+void runStdio(McpServer server, ServerSettings settings)
 {
-	runStdio(server, opts.maxLineBytes);
+	runStdio(server, settings.stdio);
 }
 
 /// Serve `server` over the process's standard input/output: read JSON-RPC
@@ -263,6 +506,12 @@ void runStdio(McpServer server, StdioOptions opts)
 /// and never closed, so a caller that keeps running after `runStdio` returns
 /// inherits an open, blocking stdin/stdout.
 ///
+/// While the transport runs, fd 1 points at stderr (the transport writes through
+/// its own dup; on Windows the process standard output handle is redirected too),
+/// so a stray `writeln` or a stdout logger in a handler shows up on stderr rather
+/// than corrupting the JSON-RPC stream. fd 1 is pointed back at the real stdout on
+/// return.
+///
 /// stdin (fd 0) and stdout (fd 1) are adopted as vibe-async pipes
 /// (`eventDriver.pipes.adopt`, the same mechanism `vibe.core.process` uses for a
 /// spawned child), so the read loop is a plain cooperative vibe task — there is
@@ -271,61 +520,120 @@ void runStdio(McpServer server, StdioOptions opts)
 /// and concurrent tool handlers work because every write goes through the
 /// channel's serialized writer.
 ///
-/// `maxLineBytes` bounds a single inbound line; an oversized frame is dropped (its
-/// bytes are skipped up to the next newline) and the loop continues so one
-/// misbehaving frame neither exhausts memory nor kills the server.
-void runStdio(McpServer server, size_t maxLineBytes = defaultMaxLineBytes)
+/// `opts.maxLineBytes` bounds a single inbound line; an oversized frame is dropped
+/// (its bytes are skipped up to the next newline) and the loop continues, so one
+/// misbehaving frame neither exhausts memory nor kills the server. A dropped
+/// request is answered with a -32600 error carrying its id when one is found in
+/// the line (else null); a dropped notification gets no reply; a dropped
+/// response to a server->client request fails that request at once instead.
+/// At end-of-input, handlers still running get up to `opts.drainTimeout` to reply.
+///
+/// On POSIX, vibe-core's default signal handlers apply: SIGPIPE is caught (a write
+/// to a closed stdout fails instead of killing the process), and SIGINT/SIGTERM
+/// stop the event loop, so `runStdio` returns at once without the
+/// `opts.drainTimeout` drain and replies still being computed are lost. Call
+/// `vibe.core.core.disableDefaultSignalHandlers` before `runStdio` to handle
+/// these signals yourself; SIGPIPE must then be ignored or handled, since its
+/// default action terminates the process.
+///
+/// Called outside any vibe task (typically straight from `main`), `runStdio`
+/// runs the event loop itself (`runEventLoop`) and exits it once the server
+/// stops, so other tasks the program started end with it; a failure that ends
+/// the server is reported on stderr. Called from within a task, it serves on
+/// that task inside the already-running event loop, leaves the loop running
+/// when it returns, and lets such a failure propagate to the caller.
+void runStdio(McpServer server, StdioOptions opts = StdioOptions.init)
 {
+	const maxLineBytes = opts.maxLineBytes;
 	import vibe.core.core : runTask, runEventLoop, exitEventLoop;
+	import vibe.core.sync : TaskMutex;
+	import vibe.core.task : Task;
 
 	// Enforce the documented "at most once per process" invariant explicitly, so it
 	// holds for both a concurrent second call and a sequential one and does not
-	// depend on eventcore's adopt()/refCount side effects.
+	// depend on eventcore's adopt()/refCount side effects. The guard is set only
+	// once fd 0/1 are adopted, so a failed start leaves runStdio callable.
+	AdoptedStdio adopted;
 	synchronized
 	{
 		if (()@trusted { return _ranStdio; }())
 			throw new Exception("runStdio: must be called at most once per process");
+		// dup-then-adopt fd 0/1 and save their flags; restored + released on scope exit.
+		adopted = AdoptedStdio.acquire();
 		() @trusted { _ranStdio = true; }();
 	}
-
-	// dup-then-adopt fd 0/1 and save their flags; restored + released on scope exit.
-	auto adopted = AdoptedStdio.acquire();
 	scope (exit)
 		adopted.release();
 	auto inFD = adopted.inFD;
 	auto outFD = adopted.outFD;
 
-	auto reader = StdinLineReader(inFD, maxLineBytes);
-
-	string readLine() @safe
+	auto reader = LineReader(maxLineBytes);
+	size_t readStdin(ubyte[] dst) @safe
 	{
-		return reader.next();
+		return readAvailable(&inFD.readOnce, dst);
 	}
+
+	// Serializes whole-frame writes: the channel's writer and the read loop's
+	// over-long-line error reply both write stdout.
+	auto writeMtx = new TaskMutex;
 
 	void writeLine(string s) @safe
 	{
+		writeMtx.lock();
+		scope (exit)
+			writeMtx.unlock();
 		auto bytes = cast(const(ubyte)[])(s ~ "\n");
 		// Write the whole frame (IOMode.all loops internally until done). Inspect
 		// the result symmetrically with readLine: a status that is neither ok nor
 		// wouldBlock, or a short write, means the peer closed its read end (EPIPE /
 		// IOStatus.error) and the channel is broken. Throw so DuplexChannel.send
 		// observes the failure instead of producing replies that are silently lost.
-		// On POSIX a broken-pipe write may also raise SIGPIPE; a server using this
-		// transport should ignore SIGPIPE (signal(SIGPIPE, SIG_IGN)) so the failure
-		// surfaces here as IOStatus.error rather than terminating the process.
+		// On POSIX the SIGPIPE such a write raises is caught by the handler vibe-core
+		// installs on the first `runEventLoop`, so the failure surfaces here as
+		// IOStatus.error rather than terminating the process.
 		auto res = outFD.writeAll(bytes);
 		if (writeFailed(res.status, res.nbytes, bytes.length))
 			throw new Exception("runStdio: write to stdout failed (peer closed its read end?)");
 	}
 
+	string readLine() @safe
+	{
+		for (;;)
+		{
+			auto line = reader.next(&readStdin);
+			FrameHead head;
+			if (!reader.takeOversized(head))
+				return line;
+			auto substitute = answerOversized(head, maxLineBytes, &writeLine);
+			if (substitute !is null)
+				return substitute;
+			if (line is null)
+				return null;
+		}
+	}
+
+	if (Task.getThis() != Task.init)
+	{
+		serveStdio(server, &readLine, &writeLine, opts);
+		return;
+	}
 	() @trusted {
 		runTask(() nothrow{
 			scope (exit)
 				exitEventLoop();
 			try
-				serveStdio(server, &readLine, &writeLine);
-			catch (Exception)
+				serveStdio(server, &readLine, &writeLine, opts);
+			catch (Exception e)
 			{
+				// stdout carries only MCP messages, so a failure that ends the
+				// server is reported on stderr.
+				import std.stdio : stderr;
+
+				try
+					stderr.writeln("[mcp.transport.stdio] runStdio: fatal: ", e.msg);
+				catch (Exception)
+				{
+				}
 			}
 		});
 		runEventLoop();
@@ -376,9 +684,9 @@ version (Posix)
 			return fstat(fd, &st) == 0 && S_ISSOCK(st.st_mode);
 		}();
 		if (e.isSocket_)
-			e.sock_ = () @trusted { return eventDriver.sockets.adoptStream(fd); }();
+			e.sock_ = eventDriver.sockets.adoptStream(fd);
 		else
-			e.pipe_ = () @trusted { return eventDriver.pipes.adopt(fd); }();
+			e.pipe_ = eventDriver.pipes.adopt(fd);
 		return e;
 	}
 
@@ -388,8 +696,8 @@ version (Posix)
 		import eventcore.core : eventDriver;
 
 		if (isSocket_)
-			return () @trusted { return eventDriver.sockets.isValid(sock_); }();
-		return () @trusted { return eventDriver.pipes.isValid(pipe_); }();
+			return eventDriver.sockets.isValid(sock_);
+		return eventDriver.pipes.isValid(pipe_);
 	}
 
 	/// Release the adopted handle (closes the dup'd fd eventcore owns).
@@ -398,9 +706,9 @@ version (Posix)
 		import eventcore.core : eventDriver;
 
 		if (isSocket_)
-			() @trusted { eventDriver.sockets.releaseRef(sock_); }();
+			eventDriver.sockets.releaseRef(sock_);
 		else
-			() @trusted { eventDriver.pipes.releaseRef(pipe_); }();
+			eventDriver.pipes.releaseRef(pipe_);
 	}
 
 	/// Read whatever is currently available into `buf` (`IOMode.once`), blocking
@@ -413,18 +721,14 @@ version (Posix)
 
 		if (isSocket_)
 		{
-			auto res = () @trusted {
-				return asyncAwaitUninterruptible!(IOCallback, (cb) {
-					eventDriver.sockets.read(sock_, buf, IOMode.once, cb);
-				});
-			}();
+			auto res = asyncAwaitUninterruptible!(IOCallback, (cb) {
+				eventDriver.sockets.read(sock_, buf, IOMode.once, cb);
+			});
 			return IoResult(res[1], res[2]);
 		}
-		auto res = () @trusted {
-			return asyncAwaitUninterruptible!(PipeIOCallback, (cb) {
-				eventDriver.pipes.read(pipe_, buf, IOMode.once, cb);
-			});
-		}();
+		auto res = asyncAwaitUninterruptible!(PipeIOCallback, (cb) {
+			eventDriver.pipes.read(pipe_, buf, IOMode.once, cb);
+		});
 		return IoResult(res[1], res[2]);
 	}
 
@@ -437,18 +741,14 @@ version (Posix)
 
 		if (isSocket_)
 		{
-			auto res = () @trusted {
-				return asyncAwaitUninterruptible!(IOCallback, (cb) {
-					eventDriver.sockets.write(sock_, bytes, IOMode.all, cb);
-				});
-			}();
+			auto res = asyncAwaitUninterruptible!(IOCallback, (cb) {
+				eventDriver.sockets.write(sock_, bytes, IOMode.all, cb);
+			});
 			return IoResult(res[1], res[2]);
 		}
-		auto res = () @trusted {
-			return asyncAwaitUninterruptible!(PipeIOCallback, (cb) {
-				eventDriver.pipes.write(pipe_, bytes, IOMode.all, cb);
-			});
-		}();
+		auto res = asyncAwaitUninterruptible!(PipeIOCallback, (cb) {
+			eventDriver.pipes.write(pipe_, bytes, IOMode.all, cb);
+		});
 		return IoResult(res[1], res[2]);
 	}
 }
@@ -459,8 +759,10 @@ version (Posix)
 /// hands byte chunks to the cooperative read loop through a thread-safe vibe
 /// `Channel`; `readOnce` drains that channel, yielding the calling fiber (not the
 /// event-loop thread) until a chunk arrives or stdin reaches end-of-input. The
-/// write end issues a blocking `WriteFile` inline -- MCP frames are small and the
-/// host drains stdout promptly, so the brief loop stall is acceptable.
+/// write end mirrors it: a dedicated daemon thread does the blocking `WriteFile`
+/// for each frame handed to it through a channel, and `writeAll` parks only the
+/// calling fiber until that frame is written, so a host slow to drain stdout
+/// never stalls the event loop.
 else version (Windows)
 	private struct StdioEnd
 {
@@ -474,6 +776,8 @@ else version (Windows)
 	private bool isRead_;
 	// Read end only: the chunk channel fed by the reader thread.
 	private Channel!(immutable(ubyte)[]) chan_;
+	// Write end only: the thread doing the blocking writes.
+	private StdoutWriter writer_;
 
 	/// Adopt `h` (the process's stdin) and start pumping it on a daemon thread.
 	static StdioEnd adoptRead(HANDLE h) @safe
@@ -494,13 +798,22 @@ else version (Windows)
 		return e;
 	}
 
-	/// Adopt `h` (the process's stdout) for blocking writes; no thread needed.
+	/// Adopt `h` (the process's stdout) and start its writer thread.
 	static StdioEnd adoptWrite(HANDLE h) @safe
 	{
 		StdioEnd e;
 		e.handle_ = h;
 		e.valid_ = isValidHandle(h);
+		if (e.valid_)
+			e.writer_ = new StdoutWriter(h);
 		return e;
+	}
+
+	/// Whether no frame is being written or waiting to be, so the stdout handle
+	/// can be closed without pulling it from under the writer thread.
+	bool writerIdle() @safe
+	{
+		return writer_ is null || writer_.idle();
 	}
 
 	/// Whether the adopted handle is usable.
@@ -516,6 +829,8 @@ else version (Windows)
 	{
 		if (isRead_ && valid_)
 			() @trusted { chan_.close(); }();
+		if (writer_ !is null)
+			writer_.close();
 	}
 
 	/// Drain the next chunk the reader thread produced into `buf`, blocking the
@@ -534,10 +849,21 @@ else version (Windows)
 		return IoResult(IOStatus.ok, n);
 	}
 
-	/// Write the whole `bytes` frame with a blocking `WriteFile` loop. A failed or
-	/// short write surfaces as `IOStatus.error` so `DuplexChannel.send` observes the
+	/// Write the whole `bytes` frame on the writer thread, parking the calling
+	/// fiber (not the event-loop thread) until it is written. A failed or short
+	/// write surfaces as `IOStatus.error` so `DuplexChannel.send` observes the
 	/// broken channel rather than silently dropping replies.
 	IoResult writeAll(const(ubyte)[] bytes) @safe
+	{
+		import eventcore.driver : IOStatus;
+
+		if (writer_ is null)
+			return IoResult(IOStatus.error, 0);
+		return writer_.write(bytes);
+	}
+
+	/// Write all of `bytes` to `h` with a blocking `WriteFile` loop.
+	private static IoResult writeBlocking(HANDLE h, const(ubyte)[] bytes) @system nothrow
 	{
 		import eventcore.driver : IOStatus;
 
@@ -545,15 +871,85 @@ else version (Windows)
 		while (off < bytes.length)
 		{
 			DWORD wrote;
-			const ok = () @trusted {
-				return WriteFile(handle_, cast(const(void)*)(bytes.ptr + off),
-						cast(DWORD)(bytes.length - off), &wrote, null) != 0;
-			}();
+			const ok = WriteFile(h, cast(const(void)*)(bytes.ptr + off),
+					cast(DWORD)(bytes.length - off), &wrote, null) != 0;
 			if (!ok || wrote == 0)
 				return IoResult(IOStatus.error, off);
 			off += wrote;
 		}
 		return IoResult(IOStatus.ok, off);
+	}
+
+	/// The stdout writer thread: frames arrive through `jobs`, each is written
+	/// with a blocking `WriteFile`, and its result goes back through `results`.
+	/// Frames are written one at a time in order; `mtx` keeps a caller's frame
+	/// paired with its own result.
+	private static final class StdoutWriter
+	{
+		import core.atomic : atomicLoad, atomicOp;
+		import vibe.core.sync : TaskMutex;
+
+		private HANDLE handle;
+		private Channel!(immutable(ubyte)[]) jobs;
+		private Channel!IoResult results;
+		private TaskMutex mtx;
+		/// Frames handed to the thread and not yet written.
+		private shared int pending;
+
+		this(HANDLE h) @trusted
+		{
+			handle = h;
+			jobs = createChannel!(immutable(ubyte)[])();
+			results = createChannel!IoResult();
+			mtx = new TaskMutex;
+			auto t = new Thread(&pump);
+			t.isDaemon = true;
+			t.start();
+		}
+
+		IoResult write(const(ubyte)[] bytes) @trusted
+		{
+			import eventcore.driver : IOStatus;
+
+			synchronized (mtx)
+			{
+				atomicOp!"+="(pending, 1);
+				try
+					jobs.put(bytes.idup);
+				catch (Exception)
+				{
+					atomicOp!"-="(pending, 1);
+					return IoResult(IOStatus.error, 0);
+				}
+				IoResult r;
+				if (!results.tryConsumeOne(r))
+					return IoResult(IOStatus.error, 0);
+				return r;
+			}
+		}
+
+		bool idle() @trusted
+		{
+			return atomicLoad(pending) == 0;
+		}
+
+		/// Stop accepting frames; the thread exits once the queued ones are written.
+		void close() @trusted
+		{
+			jobs.close();
+		}
+
+		private void pump() @system
+		{
+			immutable(ubyte)[] bytes;
+			while (jobs.tryConsumeOne(bytes))
+			{
+				const r = writeBlocking(handle, bytes);
+				atomicOp!"-="(pending, 1);
+				results.put(r);
+			}
+			results.close();
+		}
 	}
 
 	private static bool isValidHandle(HANDLE h) @safe
@@ -580,6 +976,116 @@ else version (Windows)
 	}
 }
 
+/// Points a descriptor at another open file for the duration of the transport and
+/// puts it back afterwards. runStdio diverts fd 1 to fd 2 once it holds its own
+/// dup of stdout, so any stray stdout write (a logger, a `writeln` in a handler)
+/// lands on stderr instead of corrupting the JSON-RPC stream.
+version (Posix) private struct FdDiversion
+{
+	private int fd = -1;
+	private int saved = -1;
+
+	/// Save a dup of `fd`, then make `fd` refer to the file `to` refers to.
+	static FdDiversion divert(int fd, int to) @safe
+	{
+		import core.sys.posix.unistd : dup, dup2, close;
+
+		FdDiversion d;
+		const saved = dup(fd);
+		if (saved == -1)
+			return d;
+		if (dup2(to, fd) == -1)
+		{
+			close(saved);
+			return d;
+		}
+		d.fd = fd;
+		d.saved = saved;
+		return d;
+	}
+
+	/// Point the diverted descriptor back at its original file.
+	void restore() @safe
+	{
+		import core.sys.posix.unistd : dup2, close;
+
+		if (saved == -1)
+			return;
+		dup2(saved, fd);
+		close(saved);
+		saved = -1;
+	}
+}
+
+// The C runtime's descriptor calls, declared at module scope so they get C linkage.
+version (Windows)
+{
+	private extern (C) nothrow @nogc
+	{
+		int _dup(int fd) @trusted;
+		int _dup2(int fd1, int fd2) @trusted;
+		int _close(int fd) @trusted;
+		ptrdiff_t _get_osfhandle(int fd) @trusted;
+	}
+}
+
+/// Windows counterpart of the POSIX `FdDiversion`: points C runtime descriptor
+/// `fd` at the file `to` refers to and updates the matching process standard
+/// handle, so both CRT writes (`writeln`, loggers) and `GetStdHandle` users are
+/// diverted. `restore` points both back at the original file.
+version (Windows) private struct FdDiversion
+{
+	private int fd = -1;
+	private int saved = -1;
+
+	/// Save a dup of `fd`, then make `fd` refer to the file `to` refers to.
+	static FdDiversion divert(int fd, int to) @safe
+	{
+		FdDiversion d;
+		const saved = _dup(fd);
+		if (saved == -1)
+			return d;
+		if (_dup2(to, fd) == -1)
+		{
+			cast(void) _close(saved);
+			return d;
+		}
+		d.fd = fd;
+		d.saved = saved;
+		syncStdHandle(fd);
+		return d;
+	}
+
+	/// Point the diverted descriptor back at its original file.
+	void restore() @safe
+	{
+		if (saved == -1)
+			return;
+		cast(void) _dup2(saved, fd);
+		cast(void) _close(saved);
+		saved = -1;
+		syncStdHandle(fd);
+	}
+
+	/// Make the process standard handle for CRT descriptor `fd` (0-2) match the
+	/// OS handle the descriptor now holds.
+	private static void syncStdHandle(int fd) @safe
+	{
+		import core.sys.windows.windef : HANDLE, DWORD;
+		import core.sys.windows.winbase : SetStdHandle, STD_INPUT_HANDLE,
+			STD_OUTPUT_HANDLE, STD_ERROR_HANDLE;
+
+		if (fd < 0 || fd > 2)
+			return;
+		const DWORD[3] ids = [
+			STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE
+		];
+		const h = _get_osfhandle(fd);
+		if (h != -1)
+			() @trusted { SetStdHandle(ids[fd], cast(HANDLE) h); }();
+	}
+}
+
 /// Owns the dup()'d, vibe-adopted copies of fd 0/1 plus the saved descriptor flags
 /// of the real fd 0/1, encapsulating runStdio's fd lifecycle ceremony.
 ///
@@ -594,6 +1100,7 @@ version (Posix)
 	StdioEnd outFD;
 	private int inFlags;
 	private int outFlags;
+	private FdDiversion stdoutDiversion;
 
 	/// Adopt dup()'d copies of fd 0/1 rather than fd 0/1 themselves. `releaseRef`
 	/// close()s the adopted fd on return; by adopting dups we close only the dups,
@@ -604,16 +1111,14 @@ version (Posix)
 		import core.sys.posix.unistd : dup, close;
 		import core.sys.posix.fcntl : fcntl, F_GETFL;
 
-		const in2 = () @trusted { return dup(0); }();
-		const out2 = () @trusted { return dup(1); }();
+		const in2 = dup(0);
+		const out2 = dup(1);
 		if (in2 == -1 || out2 == -1)
 		{
-			() @trusted {
-				if (in2 != -1)
-					close(in2);
-				if (out2 != -1)
-					close(out2);
-			}();
+			if (in2 != -1)
+				close(in2);
+			if (out2 != -1)
+				close(out2);
 			throw new Exception("runStdio: dup(stdin/stdout) failed");
 		}
 
@@ -641,13 +1146,20 @@ version (Posix)
 			if (a.inFD.valid())
 				a.inFD.releaseRef();
 			else
-				() @trusted { close(in2); }();
+				close(in2);
 			if (a.outFD.valid())
 				a.outFD.releaseRef();
 			else
-				() @trusted { close(out2); }();
+				close(out2);
 			throw new Exception("runStdio: failed to adopt stdin/stdout dups");
 		}
+
+		// The transport now writes through its own dup of stdout; everything else
+		// that writes to fd 1 goes to stderr so it cannot corrupt the stream.
+		() { import core.stdc.stdio : fflush, stdout;
+
+		fflush(stdout); }();
+		a.stdoutDiversion = FdDiversion.divert(1, 2);
 		return a;
 	}
 
@@ -659,6 +1171,12 @@ version (Posix)
 	{
 		import core.sys.posix.fcntl : fcntl, F_SETFL;
 
+		{
+			import core.stdc.stdio : fflush, stdout;
+
+			fflush(stdout);
+		}
+		stdoutDiversion.restore();
 		() @trusted {
 			if (inFlags != -1)
 				fcntl(0, F_SETFL, inFlags);
@@ -676,149 +1194,134 @@ version (Posix)
 /// pump thread); `release` closes the read channel so the read loop ends. The
 /// real stdin/stdout handles are never closed, so code running after `runStdio`
 /// still inherits them.
+///
+/// The transport writes through its own duplicate of the stdout handle while
+/// stdout itself (CRT fd 1 and the process standard handle) points at stderr, so
+/// a stray `writeln` or a stdout logger in a handler shows up on stderr rather
+/// than corrupting the JSON-RPC stream. Both are pointed back on `release`.
 else version (Windows)
 	private struct AdoptedStdio
 {
+	import core.sys.windows.windef : HANDLE;
+
 	StdioEnd inFD;
 	StdioEnd outFD;
+	private HANDLE outDup;
+	private FdDiversion stdoutDiversion;
 
 	static AdoptedStdio acquire() @safe
 	{
-		import core.sys.windows.winbase : GetStdHandle, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE;
+		import core.sys.windows.windef : FALSE;
+		import core.sys.windows.winbase : GetStdHandle, GetCurrentProcess,
+			DuplicateHandle, CloseHandle, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE;
+		import core.sys.windows.winnt : DUPLICATE_SAME_ACCESS;
 
 		AdoptedStdio a;
 		auto hIn = () @trusted { return GetStdHandle(STD_INPUT_HANDLE); }();
 		auto hOut = () @trusted { return GetStdHandle(STD_OUTPUT_HANDLE); }();
+		// Diverting fd 1 closes the handle it held, which is `hOut` itself, so
+		// the transport needs its own duplicate to keep writing to the real stdout.
+		const duplicated = () @trusted {
+			auto proc = GetCurrentProcess();
+			return DuplicateHandle(proc, hOut, proc, &a.outDup, 0, FALSE, DUPLICATE_SAME_ACCESS) != 0;
+		}();
 		a.inFD = StdioEnd.adoptRead(hIn);
-		a.outFD = StdioEnd.adoptWrite(hOut);
+		a.outFD = StdioEnd.adoptWrite(duplicated ? a.outDup : hOut);
 		if (!a.inFD.valid() || !a.outFD.valid())
 		{
 			a.inFD.releaseRef();
+			if (duplicated)
+				() @trusted { CloseHandle(a.outDup); }();
 			throw new Exception("runStdio: failed to acquire Windows stdin/stdout handles");
 		}
+		if (duplicated)
+		{
+			() @trusted { import core.stdc.stdio : fflush, stdout;
+
+			fflush(stdout); }();
+			a.stdoutDiversion = FdDiversion.divert(1, 2);
+		}
+		else
+			a.outDup = null;
 		return a;
 	}
 
 	void release() @safe
 	{
+		import core.sys.windows.winbase : CloseHandle;
+
+		() @trusted { import core.stdc.stdio : fflush, stdout;
+
+		fflush(stdout); }();
+		stdoutDiversion.restore();
 		inFD.releaseRef();
 		outFD.releaseRef();
+		// A frame still being written (a host that stopped reading) keeps the
+		// writer thread in WriteFile on the duplicate, so it is left open then.
+		if (outDup !is null && outFD.writerIdle())
+			() @trusted { CloseHandle(outDup); }();
+		outDup = null;
 	}
 }
 
-/// Buffered, cooperative line reader over a vibe-adopted stdin pipe, extracted from
-/// runStdio so its CR-strip and over-long-drop edge cases are unit-testable.
-///
-/// A small persistent buffer so stdin is read in 64 KiB chunks (IOMode.once) rather
-/// than one syscall + fiber suspend/resume per byte: `next` scans the filled region
-/// for '\n', returns the line up to it, and retains the bytes after the newline for
-/// the next call.
-private struct StdinLineReader
+/// Respond to an over-long frame the reader dropped, from what its bytes
+/// reveal. A request (or an id-bearing frame with no `"result"`/`"error"`) is
+/// answered with a -32600 error carrying its id, and a frame of unknown kind
+/// with a null-id one. A notification gets no reply. A response is never
+/// answered: the returned error-response line stands in for it so the request it
+/// replies to fails at once. Returns null when nothing stands in for the frame.
+private string answerOversized(FrameHead head, size_t maxLineBytes,
+		void delegate(string) @safe writeLine) @safe
 {
-	private StdioEnd inEnd;
-	private size_t maxLineBytes;
-	private enum size_t chunk = 64 * 1024;
-	private ubyte[] buf; // bytes read but not yet consumed
-	private size_t bufPos; // index of the next unconsumed byte in `buf`
+	import std.conv : to;
+	import vibe.core.core : runTask;
+	import mcp.protocol.errors : internalError, invalidRequest;
+	import mcp.protocol.jsonrpc : makeErrorResponse;
 
-	this(StdioEnd inEnd, size_t maxLineBytes) @safe
-	{
-		this.inEnd = inEnd;
-		this.maxLineBytes = maxLineBytes;
-	}
-
-	// Refill `buf` from stdin (IOMode.once into a chunk-sized buffer): return
-	// false on EOF/error (a 0-byte or non-ok/non-wouldBlock read) with `buf` cleared,
-	// else true with `buf` trimmed to the bytes read and `bufPos` reset to 0.
-	private bool refill() @safe
-	{
-		import eventcore.driver : IOStatus;
-
-		if (buf.length < chunk)
-			buf.length = chunk;
-		bufPos = 0;
-		auto res = inEnd.readOnce(buf);
-		if (res.nbytes == 0 || (res.status != IOStatus.ok && res.status != IOStatus.wouldBlock))
+	const limit = maxLineBytes.to!string ~ "-byte line limit";
+	const hasId = head.id.type != Json.Type.null_;
+	if (head.hasResult)
+		return hasId ? makeErrorResponse(head.id,
+				internalError("the peer's response exceeds the " ~ limit)).toString() : null;
+	if (head.hasMethod && !hasId)
+		return null;
+	// Written on a task of its own: the caller is the read loop, which must keep
+	// reading while a peer that is not draining stdout holds the write.
+	runTask((string line) nothrow{
+		try
+			writeLine(line);
+		catch (Exception)
 		{
-			buf = null;
-			bufPos = 0;
-			return false;
 		}
-		buf = buf[0 .. res.nbytes];
-		return true;
-	}
+	}, makeErrorResponse(head.id, invalidRequest("message exceeds the " ~ limit)).toString());
+	return null;
+}
 
-	// Async, cooperative line read over stdin: return the next line (without its
-	// '\n', stripping a trailing '\r'); a 0-byte read (disconnected) is EOF -> null.
-	// A partial, unterminated fragment accumulated before EOF is unrecoverable and
-	// is discarded (null is returned) rather than forwarded as a malformed line.
-	// An over-long line (> maxLineBytes) is dropped and reading resumes after the
-	// next newline.
-	string next() @safe
-	{
-		return nextWith(&refill);
-	}
+/// Read what `readOnce` has available into `dst`, returning the byte count or 0
+/// at end-of-input. A read that would block with nothing read is retried; a
+/// failed read throws, so the read loop reports it rather than taking it for
+/// end-of-input.
+private size_t readAvailable(scope IoResult delegate(ubyte[]) @safe readOnce, ubyte[] dst) @safe
+{
+	import eventcore.driver : IOStatus;
+	import std.conv : to;
+	import vibe.core.core : yield;
 
-	// The pure line-assembly state machine, parameterised on the buffer-refill
-	// source so the CR-strip and over-long-drop paths are unit-testable with a fake
-	// refill (no real eventcore pipe I/O). `refillFn` fills `buf`/`bufPos` and
-	// returns false at EOF, exactly as `refill` does.
-	private string nextWith(scope bool delegate() @safe refillFn) @safe
+	for (;;)
 	{
-		ubyte[] acc;
-		bool dropping; // true once `acc` exceeded maxLineBytes: skip to next '\n'
-		for (;;)
+		const res = readOnce(dst);
+		switch (res.status)
 		{
-			if (bufPos >= buf.length)
-			{
-				// Refill from the pipe.
-				if (!refillFn())
-					return null; // EOF — partial fragment is unrecoverable
-			}
-
-			// Scan the filled region for a newline.
-			const rest = buf[bufPos .. $];
-			size_t nl = size_t.max;
-			foreach (i, b; rest)
-				if (b == '\n')
-				{
-					nl = i;
-					break;
-				}
-
-			if (nl == size_t.max)
-			{
-				// No newline yet: accumulate (unless dropping) and refill.
-				if (!dropping)
-				{
-					acc ~= rest;
-					if (acc.length > maxLineBytes)
-					{
-						acc = null;
-						dropping = true;
-					}
-				}
-				bufPos = buf.length;
-				continue;
-			}
-
-			// Found a newline at rest[nl]; consume through it.
-			if (!dropping)
-				acc ~= rest[0 .. nl];
-			bufPos += nl + 1;
-			// Enforce the size cap here too: when the line and its newline land in the
-			// same chunk the no-newline accumulation path above never runs, so the cap
-			// must also be checked on the newline-found path. An over-long line (already
-			// dropping, or only now over the cap) is discarded and a fresh one started.
-			if (dropping || acc.length > maxLineBytes)
-			{
-				dropping = false;
-				acc = null;
-				continue;
-			}
-			if (acc.length && acc[$ - 1] == '\r')
-				acc = acc[0 .. $ - 1];
-			return () @trusted { return cast(string) acc.idup; }();
+		case IOStatus.ok:
+		case IOStatus.disconnected:
+			return res.nbytes;
+		case IOStatus.wouldBlock:
+			if (res.nbytes)
+				return res.nbytes;
+			yield();
+			continue;
+		default:
+			throw new Exception("stdin read failed: " ~ res.status.to!string);
 		}
 	}
 }
@@ -847,88 +1350,132 @@ unittest  // writeFailed flags a non-ok status and a short write, accepts a full
 	assert(writeFailed(IOStatus.ok, 4, 10));
 }
 
-version (unittest)
+version (unittest) private size_t readScripted(IoResult[] script, out size_t calls) @safe
 {
-	// Drive StdinLineReader.nextWith over an in-memory byte feed (no real pipe / no
-	// event loop): each refill hands the reader the next pre-chunked slice, and
-	// returns false (EOF) once the chunks are exhausted -- exactly the contract
-	// StdinLineReader.refill has. Lets the line-assembly edge cases be unit-tested.
-	private string[] drainLineReader(size_t maxLineBytes, ubyte[][] chunks) @safe
-	{
-		auto reader = StdinLineReader.init;
-		reader.maxLineBytes = maxLineBytes;
-		size_t ci;
-		bool refill() @safe
+	size_t next;
+	auto n = readAvailable((ubyte[] dst) @safe { ++calls; return script[next++]; }, new ubyte[16]);
+	return n;
+}
+
+unittest  // readAvailable throws on a read error instead of reporting end-of-input
+{
+	import eventcore.driver : IOStatus;
+	import std.exception : collectException;
+
+	size_t calls;
+	assert(collectException(readScripted([IoResult(IOStatus.error, 0)], calls)) !is null);
+}
+
+unittest  // readAvailable retries a read that would block with no bytes
+{
+	import eventcore.driver : IOStatus;
+
+	size_t calls;
+	const n = readScripted([
+		IoResult(IOStatus.wouldBlock, 0), IoResult(IOStatus.ok, 5)
+	], calls);
+	assert(n == 5 && calls == 2);
+}
+
+unittest  // readAvailable reports end-of-input when the peer disconnects
+{
+	import eventcore.driver : IOStatus;
+
+	size_t calls;
+	assert(readScripted([IoResult(IOStatus.disconnected, 0)], calls) == 0);
+}
+
+version (unittest) private string[] oversizedReplies(FrameHead head, out string substitute) @safe
+{
+	import vibe.core.core : runTask, runEventLoop, exitEventLoop, yield;
+
+	string[] written;
+	string sub;
+	runTask(() nothrow{
+		scope (exit)
+			exitEventLoop();
+		try
 		{
-			if (ci >= chunks.length)
-			{
-				reader.buf = null;
-				reader.bufPos = 0;
-				return false;
-			}
-			reader.buf = chunks[ci++];
-			reader.bufPos = 0;
-			return true;
+			sub = answerOversized(head, 16, (string s) @safe { written ~= s; });
+			yield(); // let the posted reply's writer task run
 		}
-
-		string[] lines;
-		for (;;)
+		catch (Exception)
 		{
-			auto s = reader.nextWith(&refill);
-			if (s is null)
-				break;
-			lines ~= s;
 		}
-		return lines;
-	}
+	});
+	runEventLoop();
+	substitute = sub;
+	return written;
 }
 
-unittest  // StdinLineReader strips a trailing CR on a CRLF-terminated line
+unittest  // an over-long request is answered with a -32600 error carrying its id
 {
-	auto lines = drainLineReader(64, [cast(ubyte[]) "ok\r\n".dup]);
-	assert(lines.length == 1);
-	assert(lines[0] == "ok", "trailing CR must be stripped");
+	import vibe.data.json : parseJsonString;
+
+	string substitute;
+	auto written = oversizedReplies(FrameHead(Json(5), true, false), substitute);
+	assert(substitute is null);
+	assert(written.length == 1);
+	auto reply = parseJsonString(written[0]);
+	assert(reply["id"].get!long == 5);
+	assert(reply["error"]["code"].get!long == -32600);
 }
 
-unittest  // StdinLineReader drops an over-long line and resumes reading after the next newline
+unittest  // an over-long response is not answered but fails the pending request it replies to
 {
-	// maxLineBytes = 8. The middle line's bytes arrive newline-free across refills so
-	// the accumulator crosses maxLineBytes (the over-long drop path) before its
-	// terminating newline; the surrounding short lines still come through. The drop is
-	// triggered while accumulating without a newline, mirroring a real chunked pipe.
-	auto lines = drainLineReader(8, [
-		cast(ubyte[]) "a\n11111".dup, cast(ubyte[]) "1111".dup,
-		cast(ubyte[]) "1111\ntail\n".dup
-	]);
-	assert(lines == ["a", "tail"], "over-long line dropped, reading resumes after its newline");
+	import vibe.data.json : parseJsonString;
+
+	string substitute;
+	auto written = oversizedReplies(FrameHead(Json("srv-3"), false, true), substitute);
+	assert(written.length == 0, "a response must never be answered");
+	assert(substitute !is null, "the dropped response is replaced by an error response");
+	auto replaced = parseJsonString(substitute);
+	assert(replaced["id"].get!string == "srv-3");
+	assert("error" in replaced && "result" !in replaced);
 }
 
-unittest  // StdinLineReader drops an over-long line whose terminating newline shares its chunk
+unittest  // an over-long notification is dropped without a reply
 {
-	// maxLineBytes = 8. The over-long line and its newline arrive in the SAME chunk,
-	// so the no-newline accumulation path (which enforces the cap) is never taken.
-	// The size cap must still be enforced on the newline-found path: the over-long
-	// line is dropped and the following short line still comes through.
-	auto lines = drainLineReader(8, [cast(ubyte[]) "aaaaaaaaaaaa\ntail\n".dup]);
-	assert(lines == ["tail"], "over-long line with same-chunk newline must still be dropped");
+	string substitute;
+	auto written = oversizedReplies(FrameHead(Json(null), true, false), substitute);
+	assert(written.length == 0);
+	assert(substitute is null);
 }
 
-unittest  // StdinLineReader reassembles a line split across two refills
+unittest  // an over-long frame of unknown kind is answered with a null-id error
 {
-	auto lines = drainLineReader(64, [
-		cast(ubyte[]) "hel".dup, cast(ubyte[]) "lo\nworld\n".dup
-	]);
-	assert(lines == ["hello", "world"], "a line spanning two refills is reassembled");
+	import vibe.data.json : parseJsonString;
+
+	string substitute;
+	auto written = oversizedReplies(FrameHead(Json(null), false, false), substitute);
+	assert(substitute is null);
+	assert(written.length == 1);
+	assert(parseJsonString(written[0])["id"].type == Json.Type.null_);
 }
 
-unittest  // StdinLineReader discards a partial (unterminated) fragment at EOF and returns null
+unittest  // answering an over-long request does not wait for a stdout the peer is not draining
 {
-	// A newline-less fragment at EOF is unrecoverable: passing it to the line
-	// dispatcher would trigger a malformed-JSON parse error and a spurious
-	// null-id error-response write to the already-closed peer. null is returned
-	// to signal end-of-input cleanly.
-	auto lines = drainLineReader(64, [cast(ubyte[]) "noeol".dup]);
-	assert(lines == [], "a trailing line without a newline must be discarded at EOF");
+	import vibe.core.core : runTask, runEventLoop, exitEventLoop;
+	import vibe.core.sync : createManualEvent;
+
+	auto never = createManualEvent();
+	bool returned;
+	runTask(() nothrow{
+		scope (exit)
+			exitEventLoop();
+		try
+		{
+			answerOversized(FrameHead(Json(5), true, false), 16, (string) @safe {
+				never.wait(never.emitCount);
+			});
+			returned = true;
+		}
+		catch (Exception)
+		{
+		}
+	});
+	runEventLoop();
+	assert(returned, "the read loop is not held by the error reply's write");
 }
 
 version (Posix) unittest  // runStdio's adopt/releaseRef cycle leaves the original fd open with its O_NONBLOCK bit unchanged
@@ -944,22 +1491,24 @@ version (Posix) unittest  // runStdio's adopt/releaseRef cycle leaves the origin
 	import core.sys.posix.fcntl : fcntl, F_GETFL, F_SETFL, O_NONBLOCK;
 
 	int[2] fds;
-	assert(() @trusted { return pipe(fds); }() == 0, "pipe() failed");
+	assert(pipe(fds) == 0, "pipe() failed");
 	const readEnd = fds[0];
 	const writeEnd = fds[1];
 	scope (exit)
-		() @trusted { close(readEnd); close(writeEnd); }();
+	{
+		close(readEnd);
+		close(writeEnd);
+	}
 
 	const preFlags = () @trusted { return fcntl(readEnd, F_GETFL); }();
 	assert(preFlags != -1, "pre-adopt fcntl(F_GETFL) failed");
 	const preNonBlock = (preFlags & O_NONBLOCK) != 0;
 
 	// dup-then-adopt, exactly as runStdio does for fd 0/1.
-	const dupFd = () @trusted { return dup(readEnd); }();
+	const dupFd = dup(readEnd);
 	assert(dupFd != -1, "dup() failed");
-	auto handle = () @trusted { return eventDriver.pipes.adopt(dupFd); }();
-	assert(() @trusted { return eventDriver.pipes.isValid(handle); }(),
-			"adopt() of the dup should yield a valid handle");
+	auto handle = eventDriver.pipes.adopt(dupFd);
+	assert(eventDriver.pipes.isValid(handle), "adopt() of the dup should yield a valid handle");
 	// Restore the saved flags on the original fd FIRST (clearing the O_NONBLOCK that
 	// adopt set on the shared open file description), THEN release the adopted dup.
 	() @trusted {
@@ -977,6 +1526,145 @@ version (Posix) unittest  // runStdio's adopt/releaseRef cycle leaves the origin
 			"original fd's O_NONBLOCK bit changed across the adopt/releaseRef cycle");
 }
 
+version (Posix) unittest  // FdDiversion sends writes on the diverted fd elsewhere, then restores it
+{
+	import core.sys.posix.unistd : close, dup, pipe, read, write;
+
+	int[2] protocol, diag;
+	assert(pipe(protocol) == 0 && pipe(diag) == 0);
+	// `fd` models fd 1: a descriptor that initially writes to the protocol pipe.
+	const fd = dup(protocol[1]);
+	scope (exit)
+	{
+		close(fd);
+		close(protocol[0]);
+		close(protocol[1]);
+		close(diag[0]);
+		close(diag[1]);
+	}
+
+	string readSome(int from) @trusted
+	{
+		char[16] buf;
+		const n = read(from, buf.ptr, buf.length);
+		return n > 0 ? buf[0 .. n].idup : "";
+	}
+
+	auto diversion = FdDiversion.divert(fd, diag[1]);
+	() @trusted { write(fd, "stray".ptr, 5); }();
+	assert(readSome(diag[0]) == "stray", "a diverted write must reach the diagnostic fd");
+
+	diversion.restore();
+	() @trusted { write(fd, "frame".ptr, 5); }();
+	assert(readSome(protocol[0]) == "frame", "restore must point the fd back at its original");
+}
+
+version (Windows) version (unittest)
+{
+	private extern (C) nothrow @nogc
+	{
+		int _pipe(int* pfds, uint psize, int textmode);
+		int _read(int fd, void* buf, uint count);
+		int _write(int fd, const(void)* buf, uint count);
+	}
+}
+
+version (Windows) unittest  // FdDiversion sends writes on the diverted fd elsewhere, then restores it
+{
+	enum O_BINARY = 0x8000;
+	int[2] protocol, diag;
+	assert(() @trusted {
+		return _pipe(protocol.ptr, 256, O_BINARY) == 0 && _pipe(diag.ptr, 256, O_BINARY) == 0;
+	}());
+	// `fd` models fd 1: a descriptor that initially writes to the protocol pipe.
+	const fd = _dup(protocol[1]);
+	scope (exit)
+	{
+		cast(void) _close(fd);
+		cast(void) _close(protocol[0]);
+		cast(void) _close(protocol[1]);
+		cast(void) _close(diag[0]);
+		cast(void) _close(diag[1]);
+	}
+
+	string readSome(int from) @trusted
+	{
+		char[16] buf;
+		const n = _read(from, buf.ptr, cast(uint) buf.length);
+		return n > 0 ? buf[0 .. n].idup : "";
+	}
+
+	auto diversion = FdDiversion.divert(fd, diag[1]);
+	assert(() @trusted { return _write(fd, "stray".ptr, 5); }() == 5);
+	assert(readSome(diag[0]) == "stray", "a diverted write must reach the diagnostic fd");
+
+	diversion.restore();
+	assert(() @trusted { return _write(fd, "frame".ptr, 5); }() == 5);
+	assert(readSome(protocol[0]) == "frame", "restore must point the fd back at its original");
+}
+
+version (Windows) unittest  // a stdout write the host has not drained does not stall the event loop
+{
+	import core.sys.windows.windef : HANDLE, DWORD;
+	import core.sys.windows.winbase : CreatePipe, ReadFile, CloseHandle;
+	import core.thread : Thread;
+	import core.time : msecs;
+	import eventcore.driver : IOStatus;
+	import vibe.core.core : runTask, runEventLoop, exitEventLoop, sleep;
+
+	HANDLE r, w;
+	assert(() @trusted { return CreatePipe(&r, &w, null, 4096) != 0; }());
+	scope (exit)
+		() @trusted { CloseHandle(r); CloseHandle(w); }();
+	auto end = StdioEnd.adoptWrite(w);
+	scope (exit)
+		end.releaseRef();
+	auto payload = new ubyte[](256 * 1024);
+	payload[] = 'x';
+
+	// The host starts draining stdout only after a delay, so the write is
+	// pending meanwhile.
+	auto drainer = new Thread({
+		Thread.sleep(300.msecs);
+		ubyte[4096] buf;
+		size_t total;
+		DWORD got;
+		while (total < payload.length && ReadFile(r, buf.ptr,
+			cast(DWORD) buf.length, &got, null) != 0 && got > 0)
+			total += got;
+	});
+	() @trusted { drainer.start(); }();
+
+	bool wrote, tickedWhilePending;
+	IoResult res;
+	runTask(() nothrow{
+		try
+			res = end.writeAll(payload);
+		catch (Exception)
+		{
+		}
+		wrote = true;
+	});
+	runTask(() nothrow{
+		try
+		{
+			foreach (_; 0 .. 5)
+				sleep(10.msecs);
+			tickedWhilePending = !wrote;
+			while (!wrote)
+				sleep(10.msecs);
+		}
+		catch (Exception)
+		{
+		}
+		exitEventLoop();
+	});
+	runEventLoop();
+	() @trusted { drainer.join(); }();
+	assert(tickedWhilePending, "the event loop must keep running while stdout is not drained");
+	assert(res.status == IOStatus.ok && res.nbytes == payload.length);
+}
+
 version (Posix) unittest  // StdioEnd.adopt routes a socket fd through the sockets driver, a pipe fd through pipes
 {
 	// A libuv/Node host (the MCP Inspector, Claude Desktop, …) hands the child a
@@ -988,11 +1676,13 @@ version (Posix) unittest  // StdioEnd.adopt routes a socket fd through the socke
 	import core.sys.posix.unistd : dup, pipe, close;
 
 	int[2] sp;
-	assert(() @trusted { return socketpair(AF_UNIX, SOCK_STREAM, 0, sp); }() == 0,
-			"socketpair() failed");
+	assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sp) == 0, "socketpair() failed");
 	scope (exit)
-		() @trusted { close(sp[0]); close(sp[1]); }();
-	const sdup = () @trusted { return dup(sp[0]); }();
+	{
+		close(sp[0]);
+		close(sp[1]);
+	}
+	const sdup = dup(sp[0]);
 	auto sockEnd = StdioEnd.adopt(sdup);
 	scope (exit)
 		sockEnd.releaseRef();
@@ -1000,15 +1690,46 @@ version (Posix) unittest  // StdioEnd.adopt routes a socket fd through the socke
 	assert(sockEnd.isSocket_, "a socketpair fd must be detected and adopted as a socket");
 
 	int[2] pp;
-	assert(() @trusted { return pipe(pp); }() == 0, "pipe() failed");
+	assert(pipe(pp) == 0, "pipe() failed");
 	scope (exit)
-		() @trusted { close(pp[0]); close(pp[1]); }();
-	const pdup = () @trusted { return dup(pp[0]); }();
+	{
+		close(pp[0]);
+		close(pp[1]);
+	}
+	const pdup = dup(pp[0]);
 	auto pipeEnd = StdioEnd.adopt(pdup);
 	scope (exit)
 		pipeEnd.releaseRef();
 	assert(pipeEnd.valid(), "adopting a pipe end should yield a valid handle");
 	assert(!pipeEnd.isSocket_, "a pipe fd must be detected and adopted as a pipe");
+}
+
+version (Posix) unittest  // a runStdio whose stdio adoption fails does not use up the once-per-process guard
+{
+	import core.sys.posix.sys.resource : getrlimit, setrlimit, rlimit, RLIMIT_NOFILE;
+
+	const saved = () @trusted { return _ranStdio; }();
+	scope (exit)
+		() @trusted { _ranStdio = saved; }();
+	() @trusted { _ranStdio = false; }();
+
+	// With the descriptor limit at 3, fd 0-2 are the only slots, so dup(0) fails.
+	rlimit lim;
+	() @trusted { getrlimit(RLIMIT_NOFILE, &lim); }();
+	auto low = lim;
+	low.rlim_cur = 3;
+	bool threw;
+	{
+		() @trusted { setrlimit(RLIMIT_NOFILE, &low); }();
+		scope (exit)
+			() @trusted { setrlimit(RLIMIT_NOFILE, &lim); }();
+		try
+			runStdio(new McpServer("dup-fail", "1.0"));
+		catch (Exception)
+			threw = true;
+	}
+	assert(threw, "runStdio must fail when it cannot dup stdin/stdout");
+	assert(!(() @trusted => _ranStdio)(), "a failed start must leave runStdio callable again");
 }
 
 unittest  // runStdio enforces its "at most once per process" invariant via the module guard
@@ -1031,11 +1752,65 @@ unittest  // runStdio enforces its "at most once per process" invariant via the 
 	assert(threw, "a second runStdio call must throw the at-most-once guard");
 }
 
+version (Posix) unittest  // runStdio called from a task serves on that task within the running event loop
+{
+	import core.sys.posix.unistd : close, dup, dup2, pipe;
+	import core.time : msecs;
+	import vibe.core.core : runTask, runEventLoop, exitEventLoop, sleep;
+
+	const saved = () @trusted { return _ranStdio; }();
+	scope (exit)
+		() @trusted { _ranStdio = saved; }();
+	() @trusted { _ranStdio = false; }();
+
+	// Point fd 0 at a pipe already at end-of-input and fd 1 at a pipe nobody
+	// reads, so runStdio returns at once without touching the real stdio.
+	int[2] inPipe, outPipe;
+	const savedIn = () @trusted { return dup(0); }();
+	const savedOut = () @trusted { return dup(1); }();
+	() @trusted {
+		pipe(inPipe);
+		pipe(outPipe);
+		close(inPipe[1]);
+		dup2(inPipe[0], 0);
+		dup2(outPipe[1], 1);
+		close(inPipe[0]);
+		close(outPipe[1]);
+	}();
+	scope (exit)
+		() @trusted {
+		dup2(savedIn, 0);
+		dup2(savedOut, 1);
+		close(savedIn);
+		close(savedOut);
+		close(outPipe[0]);
+	}();
+
+	bool returned, loopKeptRunning;
+	runTask(() nothrow{
+		scope (exit)
+			exitEventLoop();
+		try
+		{
+			runStdio(new McpServer("in-task", "1.0"));
+			returned = true;
+			sleep(5.msecs); // needs the outer event loop to still be running
+			loopKeptRunning = true;
+		}
+		catch (Exception)
+		{
+		}
+	});
+	runEventLoop();
+	assert(returned, "runStdio returns at end-of-input when called from a task");
+	assert(loopKeptRunning, "runStdio does not stop the event loop it was called within");
+}
+
 version (unittest)
 {
 	import std.typecons : nullable;
 	import vibe.data.json : parseJsonString;
-	import mcp.protocol.types : Tool, CallToolResult, Content;
+	import mcp.protocol.types : Tool, CallToolResult, Content, Resource, ResourceContents;
 	import mcp.server.context : RequestContext;
 	import mcp.client.client : McpClient;
 	import vibe.core.core : runTask, runEventLoop, exitEventLoop, yield;
@@ -1074,7 +1849,7 @@ version (unittest) private final class ServerLink
 		while (inPos >= inbound.length && !inClosed)
 		{
 			auto ec = inEvt.emitCount;
-			() @trusted { inEvt.wait(ec); }();
+			inEvt.wait(ec);
 		}
 		if (inPos >= inbound.length)
 			return null; // EOF
@@ -1091,12 +1866,12 @@ version (unittest) private final class ServerLink
 // asserts. `serveStdio` runs as its own task; `drive` as another; the loop exits
 // when `drive` returns and the server task is told to stop (closeInput).
 version (unittest) private void withServer(McpServer server,
-		scope void delegate(ServerLink) @safe drive) @trusted
+		scope void delegate(ServerLink) @safe drive, StdioOptions opts = StdioOptions.init) @safe
 {
 	auto link = new ServerLink;
 	runTask(() nothrow{
 		try
-			serveStdio(server, &link.readLine, &link.writeLine);
+			serveStdio(server, &link.readLine, &link.writeLine, opts);
 		catch (Exception)
 		{
 		}
@@ -1293,6 +2068,153 @@ unittest  // stdio: a tool calling ctx.elicit is answered over the same stdio ch
 	assert(sawResult, "tools/call reply with the elicited value was never produced");
 }
 
+unittest  // stdio: cancelling a request releases its pending ctx.elicit and cancels it toward the client
+{
+	import core.time : seconds;
+
+	auto s = McpServer.stateful("stdio-peer", "1.0");
+	Tool ask = {name: "ask"};
+	bool handlerReleased;
+	s.registerTool(ask, (Json args, RequestContext ctx) @safe {
+		scope (exit)
+			handlerReleased = true;
+		ctx.elicit("What is your name?", Json(["type": Json("object")]));
+		return CallToolResult.init;
+	});
+
+	StdioOptions opts;
+	opts.serverRequestTimeout = 60.seconds;
+	long elicitId = -1;
+	bool released;
+	string[] outputs;
+	withServer(s, (ServerLink link) @safe {
+		link.feed(`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{"elicitation":{}},"clientInfo":{"name":"t","version":"1"}}}`);
+		link.feed(`{"jsonrpc":"2.0","method":"notifications/initialized"}`);
+		link.feed(`{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"ask"}}`);
+		foreach (_; 0 .. 12)
+			yield();
+		foreach (o; link.outbound)
+		{
+			auto j = parseJsonString(o);
+			if ("method" in j && j["method"].get!string == "elicitation/create")
+				elicitId = j["id"].get!long;
+		}
+		link.feed(`{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":2}}`);
+		foreach (_; 0 .. 12)
+			yield();
+		released = handlerReleased;
+		outputs = link.outbound.dup;
+	}, opts);
+
+	assert(elicitId >= 0, "the handler's elicitation/create was never sent");
+	assert(released, "the cancelled request's handler is released from its pending elicit");
+	bool sawCancel;
+	foreach (o; outputs)
+	{
+		auto j = parseJsonString(o);
+		if ("method" in j && j["method"].get!string == "notifications/cancelled"
+				&& j["params"]["requestId"].get!long == elicitId)
+			sawCancel = true;
+	}
+	assert(sawCancel, "the client is told the elicitation was cancelled");
+}
+
+unittest  // stdio: a roots/list_changed observer can re-list roots on its own context
+{
+	import mcp.server.context : RequestContext;
+
+	auto s = McpServer.stateful("stdio-peer", "1.0");
+	string[] roots;
+	s.setRootsListChangedHandler((RequestContext ctx) @safe {
+		foreach (r; ctx.listRoots().roots)
+			roots ~= r.uri;
+	});
+
+	withServer(s, (ServerLink link) @safe {
+		link.feed(`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{"roots":{"listChanged":true}},"clientInfo":{"name":"t","version":"1"}}}`);
+		link.feed(`{"jsonrpc":"2.0","method":"notifications/initialized"}`);
+		link.feed(`{"jsonrpc":"2.0","method":"notifications/roots/list_changed"}`);
+		foreach (_; 0 .. 12)
+			yield();
+		long listId = -1;
+		foreach (o; link.outbound)
+		{
+			auto j = parseJsonString(o);
+			if ("method" in j && j["method"].get!string == "roots/list" && "id" in j)
+				listId = j["id"].get!long;
+		}
+		assert(listId >= 0, "the observer never sent roots/list");
+		link.feed(`{"jsonrpc":"2.0","id":` ~ () {
+			import std.conv : to;
+
+			return listId.to!string;
+		}() ~ `,"result":{"roots":[{"uri":"file:///work"}]}}`);
+		foreach (_; 0 .. 12)
+			yield();
+	});
+	assert(roots == ["file:///work"]);
+}
+
+unittest  // stdio: a client reply inside a batch wakes the handler awaiting it
+{
+	import mcp.protocol.types : ElicitAction;
+
+	auto s = McpServer.stateful("stdio-peer", "1.0");
+	Tool ask = {name: "ask"};
+	s.registerTool(ask, (Json args, RequestContext ctx) @safe {
+		auto reply = ctx.elicit("What is your name?", Json([
+			"type": Json("object")
+		]));
+		CallToolResult r;
+		r.content = [
+			Content.makeText(reply.action == ElicitAction.accept
+				? "hi:" ~ reply.content["name"].get!string : "(declined)")
+		];
+		return r;
+	});
+
+	string[] outputs;
+	withServer(s, (ServerLink link) @safe {
+		link.feed(`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{"elicitation":{}},"clientInfo":{"name":"t","version":"1"}}}`);
+		link.feed(`{"jsonrpc":"2.0","method":"notifications/initialized"}`);
+		link.feed(`{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"ask"}}`);
+		foreach (_; 0 .. 12)
+			yield();
+		long elicitId = -1;
+		foreach (o; link.outbound)
+		{
+			auto j = parseJsonString(o);
+			if (j.type == Json.Type.object && "method" in j
+				&& j["method"].get!string == "elicitation/create")
+				elicitId = j["id"].get!long;
+		}
+		assert(elicitId >= 0, "server never emitted elicitation/create");
+		Json reply = Json.emptyObject;
+		reply["jsonrpc"] = "2.0";
+		reply["id"] = elicitId;
+		reply["result"] = Json([
+			"action": Json("accept"),
+			"content": Json(["name": Json("Ada")])
+		]);
+		link.feed(`[` ~ reply.toString() ~ `,{"jsonrpc":"2.0","id":3,"method":"ping"}]`);
+		foreach (_; 0 .. 16)
+			yield();
+		outputs = link.outbound.dup;
+	});
+
+	bool sawResult, sawPingArray;
+	foreach (o; outputs)
+	{
+		auto j = parseJsonString(o);
+		if (j.type == Json.Type.array)
+			sawPingArray = j.length == 1 && j[0]["id"].get!int == 3;
+		else if ("id" in j && j["id"].get!int == 2 && "result" in j)
+			sawResult = j["result"]["content"][0]["text"].get!string == "hi:Ada";
+	}
+	assert(sawResult, "the batched elicitation reply never reached the waiting handler");
+	assert(sawPingArray, "the batch's request members must still be answered as an array");
+}
+
 unittest  // stdio: notifications/cancelled mid-handler is observed via the in-flight token
 {
 	auto s = new McpServer("stdio-cancel", "1.0");
@@ -1322,7 +2244,7 @@ unittest  // stdio: notifications/cancelled mid-handler is observed via the in-f
 		link.feed(`{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"slow"}}`);
 		// Wait until the handler is actually running, then cancel it.
 		auto ec = entered.emitCount;
-		() @trusted { entered.wait(ec); }();
+		entered.wait(ec);
 		link.feed(`{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":2}}`);
 		foreach (_; 0 .. 16)
 			yield();
@@ -1356,6 +2278,46 @@ unittest  // serveStdio stops at end-of-input (null line) after servicing pendin
 	assert(outCount == 1);
 }
 
+unittest  // a request reply that fails to write is reported through StdioOptions.onError
+{
+	import std.algorithm.searching : canFind;
+
+	auto s = new McpServer("t", "1");
+	auto link = new ServerLink;
+	string[] errors;
+	StdioOptions opts;
+	opts.onError = (string msg) @safe nothrow{ errors ~= msg; };
+	void failingWrite(string line) @safe
+	{
+		throw new Exception("stdout gone");
+	}
+
+	runTask(() nothrow{
+		scope (exit)
+			exitEventLoop();
+		try
+			serveStdio(s, &link.readLine, &failingWrite, opts);
+		catch (Exception)
+		{
+		}
+	});
+	runTask(() nothrow{
+		try
+		{
+			link.feed(`{"jsonrpc":"2.0","id":1,"method":"ping"}`);
+			foreach (_; 0 .. 8)
+				yield();
+			link.closeInput();
+		}
+		catch (Exception)
+		{
+		}
+	});
+	runEventLoop();
+	assert(errors.canFind!(e => e.canFind("stdout gone")),
+			"a failed reply write must be reported, not swallowed");
+}
+
 unittest  // a handler still running when stdin EOFs is drained: its reply is not dropped
 {
 	// Reproduces the EOF/in-flight race: a tool handler blocks until after stdin
@@ -1368,7 +2330,7 @@ unittest  // a handler still running when stdin EOFs is drained: its reply is no
 	s.registerTool(slow, (Json args, RequestContext ctx) @safe {
 		entered.emit();
 		auto ec = release.emitCount;
-		() @trusted { release.wait(ec); }();
+		release.wait(ec);
 		CallToolResult r;
 		r.content = [Content.makeText("late")];
 		return r;
@@ -1376,44 +2338,141 @@ unittest  // a handler still running when stdin EOFs is drained: its reply is no
 
 	auto link = new ServerLink;
 	string[] outputs;
-	() @trusted {
-		runTask(() nothrow{
-			scope (exit)
-				exitEventLoop();
-			try
-				serveStdio(s, &link.readLine, &link.writeLine);
-			catch (Exception)
-			{
-			}
-		});
-		runTask(() nothrow{
-			try
-			{
-				link.feed(
-					`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"slow"}}`);
-				// Wait until the handler is actually running, then EOF stdin while it
-				// is still blocked (reply not yet computed or written).
-				auto ec = entered.emitCount;
-				entered.wait(ec);
-				link.closeInput();
-				foreach (_; 0 .. 4)
-					yield();
-				// Now let the handler finish: its reply must still flush during the
-				// post-EOF drain rather than being abandoned.
-				release.emit();
-			}
-			catch (Exception)
-			{
-			}
-		});
-		runEventLoop();
-		outputs = link.outbound.dup;
-	}();
+	runTask(() nothrow{
+		scope (exit)
+			exitEventLoop();
+		try
+			serveStdio(s, &link.readLine, &link.writeLine);
+		catch (Exception)
+		{
+		}
+	});
+	runTask(() nothrow{
+		try
+		{
+			link.feed(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"slow"}}`);
+			// Wait until the handler is actually running, then EOF stdin while it
+			// is still blocked (reply not yet computed or written).
+			auto ec = entered.emitCount;
+			entered.wait(ec);
+			link.closeInput();
+			foreach (_; 0 .. 4)
+				yield();
+			// Now let the handler finish: its reply must still flush during the
+			// post-EOF drain rather than being abandoned.
+			release.emit();
+		}
+		catch (Exception)
+		{
+		}
+	});
+	runEventLoop();
+	outputs = link.outbound.dup;
 
 	assert(outputs.length == 1, "the in-flight handler's reply must survive stdin EOF");
 	auto resp = parseJsonString(outputs[0]);
 	assert(resp["id"].get!int == 1);
 	assert(resp["result"]["content"][0]["text"].get!string == "late");
+}
+
+unittest  // the EOF drain waits for a handler that finishes on a timer after stdin closes
+{
+	import core.time : msecs;
+	import vibe.core.core : sleep;
+
+	auto s = new McpServer("eof-drain-timer", "1.0");
+	auto entered = createManualEvent();
+	Tool slow = {name: "slow"};
+	s.registerTool(slow, (Json args, RequestContext ctx) @safe {
+		entered.emit();
+		sleep(1500.msecs);
+		CallToolResult r;
+		r.content = [Content.makeText("late")];
+		return r;
+	});
+
+	auto link = new ServerLink;
+	string[] outputs;
+	runTask(() nothrow{
+		scope (exit)
+			exitEventLoop();
+		try
+			serveStdio(s, &link.readLine, &link.writeLine);
+		catch (Exception)
+		{
+		}
+	});
+	runTask(() nothrow{
+		try
+		{
+			link.feed(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"slow"}}`);
+			auto ec = entered.emitCount;
+			entered.wait(ec);
+			link.closeInput();
+		}
+		catch (Exception)
+		{
+		}
+	});
+	runEventLoop();
+	outputs = link.outbound.dup;
+
+	assert(outputs.length == 1, "a handler finishing shortly after EOF must still reply");
+}
+
+unittest  // the EOF drain gives up on a stuck handler once its deadline passes
+{
+	import core.time : msecs, seconds, MonoTime;
+
+	auto s = new McpServer("eof-drain-stuck", "1.0");
+	auto never = createManualEvent();
+	auto entered = createManualEvent();
+	Tool stuck = {name: "stuck"};
+	s.registerTool(stuck, (Json args, RequestContext ctx) @safe {
+		entered.emit();
+		auto ec = never.emitCount;
+		never.wait(ec);
+		return CallToolResult.init;
+	});
+
+	auto link = new ServerLink;
+	StdioOptions opts;
+	opts.drainTimeout = 200.msecs;
+	MonoTime eofAt;
+	Duration drained;
+	bool returned;
+	runTask(() nothrow{
+		try
+		{
+			link.feed(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"stuck"}}`);
+			auto ec = entered.emitCount;
+			entered.wait(ec);
+			eofAt = MonoTime.currTime;
+			link.closeInput();
+		}
+		catch (Exception)
+		{
+		}
+	});
+	runTask(() nothrow{
+		scope (exit)
+			exitEventLoop();
+		try
+		{
+			serveStdio(s, &link.readLine, &link.writeLine, opts);
+			drained = MonoTime.currTime - eofAt;
+			returned = true;
+		}
+		catch (Exception)
+		{
+		}
+		// Release the stuck handler so its task does not outlive the test.
+		never.emit();
+	});
+	runEventLoop();
+	assert(returned, "serveStdio must return despite a stuck handler");
+	assert(drained >= 150.msecs, "the drain must wait for in-flight handlers");
+	assert(drained < 5.seconds, "the drain must stop at its deadline");
 }
 
 unittest  // a tool handler's ctx.log() is delivered as a notifications/message frame over stdio
@@ -1557,6 +2616,150 @@ unittest  // background push: notify* with no request in flight reaches a stdio 
 	auto note = parseJsonString(outputs[1]);
 	assert(note["method"].get!string == "notifications/tools/list_changed");
 	assert("id" !in note);
+}
+
+version (unittest)
+{
+	// Feed a 2025-11-25 initialize + notifications/initialized handshake.
+	private void legacyHandshake(ServerLink link) @safe
+	{
+		link.feed(`{"jsonrpc":"2.0","id":1,"method":"initialize","params":` ~ `{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"t","version":"1"}}}`);
+		link.feed(`{"jsonrpc":"2.0","method":"notifications/initialized"}`);
+		foreach (_; 0 .. 8)
+			yield();
+	}
+}
+
+unittest  // a 2025-era stdio client that subscribed to a resource receives notifications/resources/updated
+{
+	auto s = McpServer.stateful("legacy-srv", "1.0");
+	s.enableResourceSubscriptions();
+	s.registerResource(Resource("test://w", "w"), () @safe => ResourceContents.init);
+
+	string[] outputs;
+	size_t delivered, unsubscribed;
+	withServer(s, (ServerLink link) @safe {
+		legacyHandshake(link);
+		unsubscribed = s.notifyResourceUpdated("test://w");
+		link.feed(
+			`{"jsonrpc":"2.0","id":2,"method":"resources/subscribe","params":{"uri":"test://w"}}`);
+		foreach (_; 0 .. 8)
+			yield();
+		delivered = s.notifyResourceUpdated("test://w");
+		foreach (_; 0 .. 8)
+			yield();
+		outputs = link.outbound.dup;
+	});
+
+	assert(unsubscribed == 0, "an unsubscribed URI must not be delivered");
+	assert(delivered == 1);
+	// initialize result, subscribe result, then the update.
+	assert(outputs.length == 3);
+	auto note = parseJsonString(outputs[2]);
+	assert(note["method"].get!string == "notifications/resources/updated");
+	assert(note["params"]["uri"].get!string == "test://w");
+	assert("_meta" !in note["params"], "a 2025-era notification carries no subscriptionId");
+}
+
+unittest  // a 2025-era stdio client receives list-changed notifications the server advertises
+{
+	auto s = McpServer.stateful("legacy-srv", "1.0");
+	s.enableToolsListChanged();
+
+	string[] outputs;
+	size_t tools, prompts;
+	withServer(s, (ServerLink link) @safe {
+		legacyHandshake(link);
+		tools = s.notifyToolsListChanged();
+		prompts = s.notifyPromptsListChanged();
+		foreach (_; 0 .. 8)
+			yield();
+		outputs = link.outbound.dup;
+	});
+
+	assert(tools == 1);
+	assert(prompts == 0, "prompts.listChanged is not advertised");
+	assert(outputs.length == 2);
+	assert(parseJsonString(outputs[1])["method"].get!string == "notifications/tools/list_changed");
+}
+
+unittest  // notify() and notifyElicitationComplete reach a 2025-era stdio client
+{
+	auto s = McpServer.stateful("legacy-srv", "1.0");
+
+	string[] outputs;
+	size_t custom, complete;
+	withServer(s, (ServerLink link) @safe {
+		legacyHandshake(link);
+		Json p = Json.emptyObject;
+		p["x"] = 1;
+		custom = s.notify("notifications/custom", p);
+		complete = s.notifyElicitationComplete("", "e-1");
+		foreach (_; 0 .. 8)
+			yield();
+		outputs = link.outbound.dup;
+	});
+
+	assert(custom == 1);
+	assert(complete == 1);
+	assert(outputs.length == 3);
+	assert(parseJsonString(outputs[1])["method"].get!string == "notifications/custom");
+	auto done = parseJsonString(outputs[2]);
+	assert(done["method"].get!string == "notifications/elicitation/complete");
+	assert(done["params"]["elicitationId"].get!string == "e-1");
+}
+
+unittest  // stdio listen and events streams do not outlive serveStdio
+{
+	import mcp.server.events_runtime : EventRegistration;
+	import mcp.protocol.events : EventOccurrence;
+	import mcp.protocol.jsonrpc : makeRequest;
+
+	auto s = new McpServer("listen-srv", "1.0");
+	s.enableToolsListChanged();
+	auto rt = s.enableEvents();
+	EventRegistration reg;
+	reg.descriptor.name = "incident.created";
+	reg.emitOnly = true;
+	s.registerEventType(reg);
+
+	ServerLink served;
+	withServer(s, (ServerLink link) @safe {
+		link.feed(modernListenLine(5, Json(["toolsListChanged": Json(true)])));
+		Json meta = Json.emptyObject;
+		meta[MetaKey.protocolVersion] = "2026-07-28";
+		meta[MetaKey.clientCapabilities] = Json.emptyObject;
+		link.feed(makeRequest(Json(6), "events/stream",
+			Json(["name": Json("incident.created"), "_meta": meta])).toString());
+		foreach (_; 0 .. 8)
+			yield();
+		assert(s.hasStdioEventStreams());
+		served = link;
+	});
+
+	const before = served.outbound.length;
+	assert(s.notifyToolsListChanged() == 0, "the listen stream must close with serveStdio");
+	assert(!s.hasStdioEventStreams(), "events streams must close with serveStdio");
+	rt.emit(EventOccurrence("evt_1", "incident.created", "", Json.emptyObject));
+	assert(served.outbound.length == before);
+}
+
+unittest  // a stdio server writes no plain notifications before the 2025-era handshake
+{
+	auto s = McpServer.stateful("legacy-srv", "1.0");
+	s.enableToolsListChanged();
+
+	string[] outputs;
+	size_t delivered;
+	withServer(s, (ServerLink link) @safe {
+		delivered = s.notifyToolsListChanged();
+		foreach (_; 0 .. 8)
+			yield();
+		outputs = link.outbound.dup;
+	});
+
+	assert(delivered == 0);
+	assert(outputs.length == 0);
 }
 
 version (unittest)
@@ -1722,18 +2925,16 @@ unittest  // two tool handlers overlap concurrently over the duplex (barrier pro
 		// Each handler increments the entered count, signals, then waits until
 		// BOTH have entered. If handlers were serialized the second would never
 		// enter and this would hang (the test's event loop would time out).
-		() @trusted { import core.atomic : atomicOp;
+		() { import core.atomic : atomicOp;
 
 		atomicOp!"+="(entered, 1); }();
 		barrier.emit();
-		while (()@trusted {
-				import core.atomic : atomicLoad;
+		while (() { import core.atomic : atomicLoad;
 
-				return atomicLoad(entered);
-			}() < 2)
+			return atomicLoad(entered); }() < 2)
 		{
 			auto ec = barrier.emitCount;
-			() @trusted { barrier.wait(ec); }();
+			barrier.wait(ec);
 		}
 		CallToolResult r;
 		r.content = [Content.makeText("done")];
@@ -1795,7 +2996,7 @@ version (unittest) private final class DuplexLink
 		while (pos >= queue.length && !closed)
 		{
 			auto ec = evt.emitCount;
-			() @trusted { evt.wait(ec); }();
+			evt.wait(ec);
 		}
 		if (pos >= queue.length)
 			return null;
@@ -1818,7 +3019,7 @@ unittest  // END-TO-END: McpClient over stdio drives an McpServer; two concurren
 	auto s2c = new DuplexLink; // server -> client
 
 	string got1, got2;
-	() @trusted {
+	() {
 		// Server task.
 		runTask(() nothrow{
 			try
@@ -1910,7 +3111,7 @@ unittest  // END-TO-END: a server tool's ctx.sample round-trips to the client's 
 	auto s2c = new DuplexLink;
 
 	string toolText;
-	() @trusted {
+	() {
 		runTask(() nothrow{
 			try
 				serveStdio(s, () @safe { return c2s.take(); }, (string line) @safe {
@@ -1949,4 +3150,178 @@ unittest  // END-TO-END: a server tool's ctx.sample round-trips to the client's 
 
 	assert(toolText == "got:sampled",
 			"server ctx.sample must round-trip to the client's onSampling over stdio");
+}
+
+unittest  // serveStdio runs at most maxInFlight requests, queues as many more and refuses the rest
+{
+	auto s = new McpServer("inflight-cap", "1.0");
+	bool release;
+	size_t running, peak;
+	Tool slow = {name: "slow"};
+	s.registerTool(slow, (Json args, RequestContext ctx) @safe {
+		running++;
+		if (running > peak)
+			peak = running;
+		while (!release)
+			yield();
+		running--;
+		return CallToolResult.init;
+	});
+
+	auto link = new ServerLink;
+	StdioOptions opts;
+	opts.maxInFlight = 2;
+	foreach (i; 0 .. 5)
+		link.feed(`{"jsonrpc":"2.0","id":` ~ cast(char)(
+				'1' + i) ~ `,"method":"tools/call","params":{"name":"slow"}}`);
+	size_t readWhileBlocked, peakWhileBlocked;
+	string[] repliedWhileBlocked;
+	runTask(() nothrow{
+		try
+			serveStdio(s, &link.readLine, &link.writeLine, opts);
+		catch (Exception)
+		{
+		}
+	});
+	runTask(() nothrow{
+		scope (exit)
+			exitEventLoop();
+		try
+		{
+			foreach (_; 0 .. 64)
+				yield();
+			readWhileBlocked = link.inPos;
+			peakWhileBlocked = peak;
+			repliedWhileBlocked = link.outbound.dup;
+			release = true;
+			foreach (_; 0 .. 256)
+				yield();
+			link.closeInput();
+			foreach (_; 0 .. 64)
+				yield();
+		}
+		catch (Exception)
+		{
+		}
+	});
+	runEventLoop();
+	assert(peakWhileBlocked == 2, "no more than maxInFlight handlers run at once");
+	assert(readWhileBlocked == 5, "reading continues while maxInFlight handlers run");
+	assert(repliedWhileBlocked.length == 1, "only the request beyond the queue is answered early");
+	auto refused = parseJsonString(repliedWhileBlocked[0]);
+	assert(refused["id"] == Json(5) && refused["error"]["code"].get!int == -32603);
+	assert(link.outbound.length == 5, "every queued request is answered once slots free");
+}
+
+unittest  // notifications/cancelled withdraws a request still waiting for an in-flight slot
+{
+	auto s = new McpServer("inflight-withdraw", "1.0");
+	bool release;
+	Tool slow = {name: "slow"};
+	s.registerTool(slow, (Json args, RequestContext ctx) @safe {
+		while (!release)
+			yield();
+		return CallToolResult.init;
+	});
+
+	StdioOptions opts;
+	opts.maxInFlight = 1;
+	string[] outputs;
+	withServer(s, (ServerLink link) @safe {
+		link.feed(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"slow"}}`);
+		link.feed(`{"jsonrpc":"2.0","id":2,"method":"ping"}`);
+		link.feed(`{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":2}}`);
+		foreach (_; 0 .. 32)
+			yield();
+		release = true;
+		foreach (_; 0 .. 32)
+			yield();
+		outputs = link.outbound.dup;
+	}, opts);
+	assert(outputs.length == 1, "the withdrawn request must not be answered");
+	assert(parseJsonString(outputs[0])["id"] == Json(1));
+}
+
+unittest  // a handler awaiting a client reply while maxInFlight handlers run still receives it
+{
+	import mcp.protocol.types : ElicitAction;
+
+	auto s = McpServer.stateful("stdio-cap-elicit", "1.0");
+	Tool ask = {name: "ask"};
+	s.registerTool(ask, (Json args, RequestContext ctx) @safe {
+		auto reply = ctx.elicit("Name?", Json(["type": Json("object")]));
+		CallToolResult r;
+		r.content = [
+			Content.makeText(reply.action == ElicitAction.accept
+				? reply.content["name"].get!string : "(declined)")
+		];
+		return r;
+	});
+
+	StdioOptions opts;
+	opts.maxInFlight = 1;
+	opts.serverRequestTimeout = 3.seconds;
+	string[] outputs;
+	withServer(s, (ServerLink link) @safe {
+		link.feed(`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{"elicitation":{}},"clientInfo":{"name":"t","version":"1"}}}`);
+		link.feed(`{"jsonrpc":"2.0","method":"notifications/initialized"}`);
+		link.feed(`{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"ask"}}`);
+		foreach (_; 0 .. 16)
+			yield();
+		long elicitId = -1;
+		foreach (o; link.outbound)
+		{
+			auto j = parseJsonString(o);
+			if ("method" in j && j["method"].get!string == "elicitation/create")
+				elicitId = j["id"].get!long;
+		}
+		assert(elicitId >= 0, "the handler never sent elicitation/create");
+		link.feed(`{"jsonrpc":"2.0","id":` ~ Json(elicitId)
+			.toString() ~ `,"result":{"action":"accept","content":{"name":"Ada"}}}`);
+		foreach (_; 0 .. 16)
+			yield();
+		outputs = link.outbound.dup;
+	}, opts);
+
+	bool answered;
+	foreach (o; outputs)
+	{
+		auto j = parseJsonString(o);
+		if ("id" in j && j["id"] == Json(2) && "result" in j)
+			answered = j["result"]["content"][0]["text"].get!string == "Ada";
+	}
+	assert(answered, "the elicitation reply must be read while the in-flight cap is reached");
+}
+
+unittest  // notifications/cancelled reaches a running handler while maxInFlight handlers run
+{
+	auto s = new McpServer("stdio-cap-cancel", "1.0");
+	auto entered = createManualEvent();
+	bool observedCancel;
+	Tool slow = {name: "slow"};
+	s.registerTool(slow, (Json args, RequestContext ctx) @safe {
+		entered.emit();
+		foreach (i; 0 .. 1000)
+		{
+			if (ctx.isCancelled)
+			{
+				observedCancel = true;
+				break;
+			}
+			yield();
+		}
+		return CallToolResult.init;
+	});
+
+	StdioOptions opts;
+	opts.maxInFlight = 1;
+	withServer(s, (ServerLink link) @safe {
+		link.feed(`{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"slow"}}`);
+		auto ec = entered.emitCount;
+		entered.wait(ec);
+		link.feed(`{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":2}}`);
+		foreach (_; 0 .. 16)
+			yield();
+	}, opts);
+	assert(observedCancel, "a cancellation must be read while the in-flight cap is reached");
 }

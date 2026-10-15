@@ -4,6 +4,8 @@ import std.typecons : Nullable;
 import vibe.data.json : Json;
 import vibe.http.client : HTTPClientRequest, HTTPClientResponse;
 
+import mcp.protocol.ssrf : SsrfPolicy;
+
 @safe:
 
 // ===========================================================================
@@ -89,63 +91,113 @@ struct WwwAuthenticate
 }
 
 /// Parse a `WWW-Authenticate` header value such as
-/// `Bearer resource_metadata="https://...", scope="a b"`.
+/// `Bearer resource_metadata="https://...", scope="a b"` and return its
+/// `Bearer` challenge (matched case-insensitively), or the first challenge when
+/// none is `Bearer`. See `parseWwwAuthenticateChallenges`.
 WwwAuthenticate parseWwwAuthenticate(string header) @safe
 {
-	import std.string : strip, indexOf;
+	import std.uni : sicmp;
 
-	WwwAuthenticate w;
-	auto h = header.strip;
-	const sp = h.indexOf(' ');
-	if (sp < 0)
-	{
-		w.scheme = h;
-		return w;
-	}
-	w.scheme = h[0 .. sp];
-	auto rest = h[sp + 1 .. $].strip;
+	auto challenges = parseWwwAuthenticateChallenges(header);
+	foreach (c; challenges)
+		if (sicmp(c.scheme, "Bearer") == 0)
+			return c;
+	return challenges.length ? challenges[0] : WwwAuthenticate.init;
+}
 
-	// Split into key="value" or key=value pairs separated by commas (commas
-	// inside quotes are not expected for these params).
+/// Parse every challenge in a `WWW-Authenticate` header value (RFC 9110
+/// §11.6.1): `challenge = auth-scheme [ 1*SP ( token68 / #auth-param ) ]`,
+/// with challenges and auth-params sharing one comma-separated list. A token
+/// followed by `=` is an auth-param of the current challenge; any other token
+/// starts a new challenge. Quoted-string values are unescaped (RFC 9110
+/// §5.6.4) and parameter names are lowercased, as they are case-insensitive.
+/// A token68 credential is skipped.
+WwwAuthenticate[] parseWwwAuthenticateChallenges(string header) @safe
+{
+	import std.ascii : isWhite;
+	import std.uni : toLower;
+
+	WwwAuthenticate[] challenges;
 	size_t i;
-	while (i < rest.length)
+
+	void skipWhite()
 	{
-		const eq = rest[i .. $].indexOf('=');
-		if (eq < 0)
-			break;
-		auto key = rest[i .. i + eq].strip;
-		i += eq + 1;
-		string value;
-		if (i < rest.length && rest[i] == '"')
-		{
-			i++;
-			const end = rest[i .. $].indexOf('"');
-			if (end < 0)
-				break;
-			value = rest[i .. i + end];
-			i += end + 1;
-		}
-		else
-		{
-			const comma = rest[i .. $].indexOf(',');
-			if (comma < 0)
-			{
-				value = rest[i .. $].strip;
-				i = rest.length;
-			}
-			else
-			{
-				value = rest[i .. i + comma].strip;
-				i += comma;
-			}
-		}
-		if (key.length)
-			w.params[key] = value;
-		// skip a following comma and spaces
-		while (i < rest.length && (rest[i] == ',' || rest[i] == ' '))
+		while (i < header.length && (header[i] == ' ' || header[i] == '\t'))
 			i++;
 	}
-	return w;
+
+	bool isDelimiter(char c)
+	{
+		return c == ',' || c == '=' || c == '"' || isWhite(c);
+	}
+
+	string readToken()
+	{
+		const start = i;
+		while (i < header.length && !isDelimiter(header[i]))
+			i++;
+		return header[start .. i];
+	}
+
+	string readQuoted()
+	{
+		string value;
+		i++; // opening quote
+		while (i < header.length && header[i] != '"')
+		{
+			if (header[i] == '\\' && i + 1 < header.length)
+				i++;
+			value ~= header[i];
+			i++;
+		}
+		if (i < header.length)
+			i++; // closing quote
+		return value;
+	}
+
+	while (i < header.length)
+	{
+		skipWhite();
+		if (i < header.length && header[i] == ',')
+		{
+			i++;
+			continue;
+		}
+		const token = readToken();
+		if (token.length == 0)
+		{
+			// A stray delimiter: step over it so parsing always advances.
+			if (i < header.length)
+				i++;
+			continue;
+		}
+		skipWhite();
+		const isParam = challenges.length && i < header.length
+			&& header[i] == '=' && !(i + 1 < header.length && header[i + 1] == '=');
+		if (!isParam)
+		{
+			WwwAuthenticate c;
+			c.scheme = token;
+			challenges ~= c;
+			// A token68 credential (e.g. `abc==`) directly after the scheme.
+			if (i < header.length && header[i] != ',')
+			{
+				const save = i;
+				readToken();
+				while (i < header.length && header[i] == '=')
+					i++;
+				skipWhite();
+				if (i < header.length && header[i] != ',')
+					i = save; // not a token68: it was the first auth-param
+			}
+			continue;
+		}
+		i++; // '='
+		skipWhite();
+		const value = i < header.length && header[i] == '"' ? readQuoted() : readToken();
+		challenges[$ - 1].params[token.toLower] = value;
+	}
+	return challenges;
 }
 
 // ===========================================================================
@@ -170,7 +222,7 @@ struct ProtectedResourceMetadata
 	}
 
 	/// Serialize to the RFC 9728 metadata document a protected resource server
-	/// publishes at `/.well-known/oauth-protected-resource`. `resource` and
+	/// publishes under `/.well-known/oauth-protected-resource`. `resource` and
 	/// `authorization_servers` are always present; `scopes_supported` is emitted
 	/// only when non-empty.
 	Json toJson() const @safe
@@ -311,6 +363,21 @@ private string[] stringArray(Json j, string key) @safe
 	return out_;
 }
 
+/// The `scheme://authority` prefix of `url`: everything before the first `/`,
+/// `?` or `#` after the scheme separator. A string without `://` is returned
+/// unchanged.
+package string urlOrigin(string url) @safe
+{
+	import std.string : indexOf, indexOfAny;
+
+	const schemeEnd = url.indexOf("://");
+	if (schemeEnd < 0)
+		return url;
+	const afterScheme = schemeEnd + 3;
+	const end = url[afterScheme .. $].indexOfAny("/?#");
+	return end < 0 ? url : url[0 .. afterScheme + end];
+}
+
 /// Build the ordered list of well-known protected-resource-metadata URLs to try
 /// for an MCP endpoint URL, per RFC 9728: the path-scoped URL first, then root.
 string[] protectedResourceMetadataUrls(string mcpEndpoint) @safe
@@ -318,14 +385,10 @@ string[] protectedResourceMetadataUrls(string mcpEndpoint) @safe
 	import std.algorithm : min;
 	import std.string : indexOf;
 
-	// Split scheme://host[/path]
-	auto schemeEnd = mcpEndpoint.indexOf("://");
-	if (schemeEnd < 0)
+	if (mcpEndpoint.indexOf("://") < 0)
 		return [mcpEndpoint];
-	const afterScheme = schemeEnd + 3;
-	const slash = mcpEndpoint[afterScheme .. $].indexOf('/');
-	string origin = (slash < 0) ? mcpEndpoint : mcpEndpoint[0 .. afterScheme + slash];
-	string path = (slash < 0) ? "" : mcpEndpoint[afterScheme + slash .. $];
+	const origin = urlOrigin(mcpEndpoint);
+	string path = mcpEndpoint[origin.length .. $];
 
 	// RFC 9728 uses scheme+host+path only; strip query string and fragment.
 	auto cut = path.length;
@@ -401,10 +464,12 @@ string selectScope(string wwwAuthScope, const string[] scopesSupported) @safe
 }
 
 /// The canonical resource indicator (RFC 8707) for an MCP server: the endpoint
-/// URL with a lowercased scheme+authority, any fragment dropped, and a single
+/// URL with a lowercased scheme+authority, the scheme's default port (`:443`
+/// for https, `:80` for http) removed, any fragment dropped, and a single
 /// trailing slash stripped. The MCP "Canonical Server URI" rules prefer the
-/// no-trailing-slash form. ASCII case is folded in place (rather than via
-/// `toLower`) to keep this `pure nothrow`.
+/// no-trailing-slash form. The authority ends at the first `/` or `?`, so a
+/// query directly after the host keeps its case. ASCII case is folded in place
+/// (rather than via `toLower`) to keep this `pure nothrow`.
 string canonicalResourceUri(string mcpEndpoint) @safe pure nothrow
 {
 	import std.string : indexOf;
@@ -418,8 +483,13 @@ string canonicalResourceUri(string mcpEndpoint) @safe pure nothrow
 	if (schemeEnd < 0)
 		return s;
 	const afterScheme = schemeEnd + 3;
-	const slash = s[afterScheme .. $].indexOf('/');
-	const hostEnd = (slash < 0) ? s.length : afterScheme + slash;
+	size_t hostEnd = s.length;
+	foreach (i; afterScheme .. s.length)
+		if (s[i] == '/' || s[i] == '?')
+		{
+			hostEnd = i;
+			break;
+		}
 	char[] buf = new char[s.length];
 	foreach (i, ch; s)
 	{
@@ -427,6 +497,21 @@ string canonicalResourceUri(string mcpEndpoint) @safe pure nothrow
 		if (i < hostEnd && c >= 'A' && c <= 'Z')
 			c = cast(char)(c + 32);
 		buf[i] = c;
+	}
+	// The port follows the last ':' that comes after any IPv6 literal's ']'.
+	const authority = buf[afterScheme .. hostEnd];
+	ptrdiff_t colon = -1;
+	foreach (i, c; authority)
+		if (c == ':')
+			colon = i;
+		else if (c == ']')
+			colon = -1;
+	if (colon >= 0)
+	{
+		const scheme = buf[0 .. schemeEnd];
+		const port = authority[colon + 1 .. $];
+		if ((scheme == "https" && port == "443") || (scheme == "http" && port == "80"))
+			buf = buf[0 .. afterScheme + colon] ~ buf[hostEnd .. $];
 	}
 	return () @trusted { return cast(string) buf; }();
 }
@@ -459,10 +544,9 @@ unittest  // generatePkce produces a valid, unique pair from the OS CSPRNG
 
 unittest  // generatePkce's entropy source is the OS CSPRNG, not the default rndGen
 {
-	// The old implementation drew verifier bytes from a default-seeded
-	// std.random Mersenne Twister. Reproduce that exact predictable sequence and
-	// assert the real generator does not reproduce it (it would, with
-	// overwhelming probability, if it had regressed to rndGen).
+	// Reproduce the predictable sequence a default-seeded std.random Mersenne
+	// Twister yields and assert the real generator does not reproduce it (it
+	// would, with overwhelming probability, if it drew from rndGen).
 	import std.random : rndGen, uniform;
 
 	auto gen = rndGen;
@@ -491,6 +575,43 @@ unittest  // WWW-Authenticate exposes typed error()/errorDescription() accessors
 	assert(w.errorDescription == "needs more scope");
 }
 
+unittest  // WWW-Authenticate unescapes backslash escapes inside a quoted-string (RFC 9110 §5.6.4)
+{
+	auto w = parseWwwAuthenticate(
+			`Bearer error_description="say \"hi\", then \\ leave", scope="read"`);
+	assert(w.errorDescription == `say "hi", then \ leave`);
+	assert(w.scope_ == "read");
+}
+
+unittest  // WWW-Authenticate selects the Bearer challenge when several are present
+{
+	auto w = parseWwwAuthenticate(`Basic realm="api", scope="basic-scope", `
+			~ `Bearer resource_metadata="https://mcp.example.com/prm", scope="read"`);
+	assert(w.scheme == "Bearer");
+	assert(w.resourceMetadata == "https://mcp.example.com/prm");
+	assert(w.scope_ == "read");
+	assert("realm" !in w.params);
+}
+
+unittest  // WWW-Authenticate keeps a later challenge's params out of the Bearer challenge
+{
+	auto w = parseWwwAuthenticate(`Bearer scope="read", DPoP algs="ES256", error="use_dpop_nonce"`);
+	assert(w.scheme == "Bearer");
+	assert(w.scope_ == "read");
+	assert(w.error is null);
+	assert("algs" !in w.params);
+}
+
+unittest  // WWW-Authenticate skips a token68 challenge and parses a bare scheme
+{
+	auto all = parseWwwAuthenticateChallenges(`Negotiate abc+/9==, Bearer, Basic realm=api`);
+	assert(all.length == 3);
+	assert(all[0].scheme == "Negotiate" && all[0].params.length == 0);
+	assert(all[1].scheme == "Bearer" && all[1].params.length == 0);
+	assert(all[2].scheme == "Basic" && all[2].params["realm"] == "api");
+	assert(parseWwwAuthenticate(`Negotiate abc+/9==, Bearer scope="x"`).scope_ == "x");
+}
+
 unittest  // WWW-Authenticate error()/errorDescription() are null when absent
 {
 	auto w = parseWwwAuthenticate(`Bearer scope="read"`);
@@ -516,6 +637,23 @@ unittest  // protectedResourceMetadataUrls strips query string from path per RFC
 	assert(urls.length == 2);
 	assert(urls[0] == "https://api.example.com/.well-known/oauth-protected-resource/mcp");
 	assert(urls[1] == "https://api.example.com/.well-known/oauth-protected-resource");
+}
+
+unittest  // protectedResourceMetadataUrls ends the origin at a query or fragment with no path
+{
+	assert(protectedResourceMetadataUrls("https://h.example.com?tenant=x")
+			== ["https://h.example.com/.well-known/oauth-protected-resource"]);
+	assert(protectedResourceMetadataUrls("https://h.example.com#frag")
+			== ["https://h.example.com/.well-known/oauth-protected-resource"]);
+}
+
+unittest  // urlOrigin keeps scheme and authority only
+{
+	assert(urlOrigin("https://h.example.com:8443/a/b?q#f") == "https://h.example.com:8443");
+	assert(urlOrigin("https://h.example.com?tenant=x") == "https://h.example.com");
+	assert(urlOrigin("https://h.example.com#f") == "https://h.example.com");
+	assert(urlOrigin("https://h.example.com") == "https://h.example.com");
+	assert(urlOrigin("not-a-url") == "not-a-url");
 }
 
 unittest  // protectedResourceMetadataUrls strips fragment from path per RFC 9728
@@ -577,6 +715,28 @@ unittest  // canonical resource URI lowercases scheme+host, drops fragment + tra
 	assert(canonicalResourceUri("https://mcp.example.com") == "https://mcp.example.com");
 }
 
+unittest  // canonical resource URI drops the scheme's default port
+{
+	assert(canonicalResourceUri("https://mcp.example.com:443/mcp") == "https://mcp.example.com/mcp");
+	assert(canonicalResourceUri("http://localhost:80/mcp") == "http://localhost/mcp");
+	assert(canonicalResourceUri("HTTPS://MCP.Example.com:443") == "https://mcp.example.com");
+	assert(canonicalResourceUri("https://[::1]:443/mcp") == "https://[::1]/mcp");
+	// A non-default port, or another scheme's default, is kept.
+	assert(canonicalResourceUri(
+			"http://mcp.example.com:443/mcp") == "http://mcp.example.com:443/mcp");
+	assert(canonicalResourceUri(
+			"https://mcp.example.com:80/mcp") == "https://mcp.example.com:80/mcp");
+	assert(canonicalResourceUri("https://[::1]:8443/mcp") == "https://[::1]:8443/mcp");
+}
+
+unittest  // canonical resource URI ends the authority at a query, leaving the query's case intact
+{
+	assert(canonicalResourceUri(
+			"https://MCP.Example.com?Tenant=ABC") == "https://mcp.example.com?Tenant=ABC");
+	assert(canonicalResourceUri(
+			"https://mcp.example.com:443?Tenant=ABC") == "https://mcp.example.com?Tenant=ABC");
+}
+
 version (unittest) private Json parseJson(string s) @safe
 {
 	import vibe.data.json : parseJsonString;
@@ -611,6 +771,12 @@ struct ClientRegistration
 	/// `"web"` and then rejects the loopback redirect URIs native clients use.
 	/// Empty infers it from the first redirect URI (`applicationTypeFor`).
 	string applicationType;
+	/// The client's public JWK Set (RFC 7591 §2), by value. A `private_key_jwt`
+	/// client sends this or `jwksUri` so the authorization server can verify
+	/// its assertions. Omitted when undefined.
+	Json jwks = Json.undefined;
+	/// The URL of the client's public JWK Set (RFC 7591 §2). Omitted when empty.
+	string jwksUri;
 
 	Json toJson() const @safe
 	{
@@ -634,6 +800,10 @@ struct ClientRegistration
 			j["client_name"] = clientName;
 		if (scope_.length)
 			j["scope"] = scope_;
+		if (jwks.type == Json.Type.object)
+			j["jwks"] = jwks.clone();
+		if (jwksUri.length)
+			j["jwks_uri"] = jwksUri;
 		return j;
 	}
 }
@@ -676,14 +846,59 @@ struct RegisteredClient
 {
 	string clientId;
 	string clientSecret;
+	/// RFC 7591 `client_secret_expires_at` (absolute unix seconds); 0 means the
+	/// secret does not expire.
+	long clientSecretExpiresAt;
 
 	static RegisteredClient fromJson(Json j) @safe
 	{
 		RegisteredClient c;
 		c.clientId = strField(j, "client_id");
 		c.clientSecret = strField(j, "client_secret");
+		if (auto p = "client_secret_expires_at" in j)
+			c.clientSecretExpiresAt = p.type == Json.Type.int_ ? p.get!long : 0;
 		return c;
 	}
+}
+
+unittest  // RegisteredClient parses client_secret_expires_at from a registration response
+{
+	import vibe.data.json : parseJsonString;
+
+	auto rc = RegisteredClient.fromJson(parseJsonString(
+			`{"client_id":"cid","client_secret":"s","client_secret_expires_at":1900000000}`));
+	assert(rc.clientSecret == "s");
+	assert(rc.clientSecretExpiresAt == 1_900_000_000);
+}
+
+unittest  // a registration request carries jwks and jwks_uri when set
+{
+	import vibe.data.json : parseJsonString;
+
+	ClientRegistration reg;
+	reg.redirectUris = ["http://127.0.0.1:8765/callback"];
+	reg.jwksUri = "https://client.example.com/jwks.json";
+	reg.jwks = parseJsonString(`{"keys":[{"kty":"EC"}]}`);
+	auto j = reg.toJson();
+	assert(j["jwks_uri"].get!string == "https://client.example.com/jwks.json");
+	assert(j["jwks"]["keys"][0]["kty"].get!string == "EC");
+	ClientRegistration bare;
+	assert("jwks" !in bare.toJson() && "jwks_uri" !in bare.toJson());
+}
+
+unittest  // a Client ID Metadata Document round-trips jwks and jwks_uri
+{
+	import vibe.data.json : parseJsonString;
+
+	ClientIdMetadataDocument d;
+	d.clientId = "https://client.example.com/meta";
+	d.redirectUris = ["http://127.0.0.1:8765/callback"];
+	d.tokenEndpointAuthMethod = "private_key_jwt";
+	d.jwksUri = "https://client.example.com/jwks.json";
+	d.jwks = parseJsonString(`{"keys":[{"kty":"EC"}]}`);
+	auto back = ClientIdMetadataDocument.fromJson(d.toJson());
+	assert(back.jwksUri == "https://client.example.com/jwks.json");
+	assert(back.jwks["keys"][0]["kty"].get!string == "EC");
 }
 
 unittest  // a registration request always names its application_type
@@ -723,8 +938,11 @@ unittest  // an explicit applicationType wins over the redirect-URI inference
 // Client ID Metadata Documents (SEP-991)
 // ===========================================================================
 
-/// Validate an OAuth Client ID Metadata Document `client_id` URL (SEP-991):
-/// it MUST use the `https` scheme and contain a non-empty path component.
+/// Validate an OAuth Client ID Metadata Document `client_id` URL (SEP-991 /
+/// draft-ietf-oauth-client-id-metadata-document §3): it MUST use the `https`
+/// scheme, name a host, and contain a non-empty path component, and it MUST NOT
+/// contain a fragment, a username or password, or a `.`/`..` path segment
+/// (including their percent-encoded forms). A query component is tolerated.
 bool isValidClientIdMetadataUrl(string clientId) @safe pure nothrow @nogc
 {
 	import std.string : indexOf;
@@ -733,29 +951,64 @@ bool isValidClientIdMetadataUrl(string clientId) @safe pure nothrow @nogc
 	if (clientId.length < 8 || clientId[0 .. 8] != "https://")
 		return false;
 	auto rest = clientId[8 .. $];
-	// A path component must exist after the host: a '/' that is followed by at
-	// least one more character (a bare trailing '/' is not a path component).
-	const slash = rest.indexOf('/');
-	if (slash < 0)
+	if (rest.indexOf('#') >= 0)
 		return false;
-	return slash + 1 < rest.length;
+
+	// The authority runs up to the first '/' or '?'; a path must follow it.
+	size_t authorityEnd = 0;
+	while (authorityEnd < rest.length && rest[authorityEnd] != '/' && rest[authorityEnd] != '?')
+		++authorityEnd;
+	if (authorityEnd == 0 || authorityEnd == rest.length || rest[authorityEnd] != '/')
+		return false;
+	if (rest[0 .. authorityEnd].indexOf('@') >= 0)
+		return false;
+
+	auto path = rest[authorityEnd .. $];
+	const query = path.indexOf('?');
+	if (query >= 0)
+		path = path[0 .. query];
+	// A bare trailing '/' is not a path component.
+	if (path.length < 2)
+		return false;
+
+	size_t segStart = 1;
+	foreach (i; 1 .. path.length + 1)
+	{
+		if (i < path.length && path[i] != '/')
+			continue;
+		if (isDotSegment(path[segStart .. i]))
+			return false;
+		segStart = i + 1;
+	}
+	return true;
 }
 
-/// Whether `url` is safe to fetch for OAuth/discovery: it MUST use the `https`
-/// scheme, OR target an explicit loopback host (`localhost`, `127.0.0.1`,
-/// `[::1]`, and their numeric encodings) over `http` for local development.
-/// Plaintext `http` to any other host is rejected, as are URLs whose host is a
-/// private/link-local IPv4 or IPv6 literal (including alternate numeric IPv4
-/// encodings and IPv4-mapped/compatible IPv6). Purely lexical (no DNS): it is a
-/// coarse pre-filter on the attacker-influenced `resource_metadata` URL. The
-/// authoritative, TOCTOU-safe SSRF guard for an actual fetch is
-/// `secureRequestHTTP`, which resolves, classifies and pins via the connector.
-bool isSecureFetchUrl(string url) @safe
+/// Whether a path segment is `.` or `..`, with any dot possibly written as the
+/// percent-encoding `%2e` / `%2E` (RFC 3986 §2.3 equivalence).
+private bool isDotSegment(string seg) @safe pure nothrow @nogc
 {
-	import mcp.protocol.ssrf : classifyHostLexical, AddressClass;
+	size_t dots;
+	size_t i;
+	while (i < seg.length)
+	{
+		if (seg[i] == '.')
+			++i;
+		else if (i + 2 < seg.length && seg[i] == '%' && seg[i + 1] == '2'
+				&& (seg[i + 2] == 'e' || seg[i + 2] == 'E'))
+			i += 3;
+		else
+			return false;
+		++dots;
+	}
+	return dots == 1 || dots == 2;
+}
+
+/// Parse `url` with vibe's parser (the one the connector uses) into its
+/// scheme and host; false when it does not parse or carries no host.
+private bool parseSchemeHost(string url, out string scheme, out string host) @safe
+{
 	import vibe.inet.url : URL;
 
-	string scheme, host;
 	try
 	{
 		auto u = URL(url);
@@ -763,192 +1016,142 @@ bool isSecureFetchUrl(string url) @safe
 		host = u.host;
 	}
 	catch (Exception)
-	{
 		return false;
-	}
-	if (host.length == 0)
-		return false;
-
-	// Lexical pre-filter only (no DNS): IP-literal/loopback ranges are classified,
-	// a registered name is treated as public. The resolve-and-pin connector makes
-	// the authoritative call when the URL is actually fetched.
-	const cls = classifyHostLexical(host);
-
-	bool eqScheme(string sc) @safe nothrow @nogc
-	{
-		if (scheme.length != sc.length)
-			return false;
-		foreach (k, ch; scheme)
-		{
-			char c = ch;
-			if (c >= 'A' && c <= 'Z')
-				c = cast(char)(c + 32);
-			if (c != sc[k])
-				return false;
-		}
-		return true;
-	}
-
-	if (cls == AddressClass.privateOrLinkLocal)
-		return false;
-	if (eqScheme("https"))
-		return true;
-	if (eqScheme("http") && cls == AddressClass.loopback)
-		return true;
-	return false;
+	return host.length != 0;
 }
 
-/// Throw `invalidRequest` when `url` is not safe to fetch under the
-/// block-internal policy. Parses with vibe's own parser (the single source of
-/// truth) and classifies the host once. A check-time scheme/host gate (no
-/// fetch) suitable for paths that VALIDATE a URL without fetching it (e.g.
-/// building the authorization-request URL the host will open). The TOCTOU-safe
-/// resolve-and-pin connect for an actual fetch is performed by
-/// `secureRequestHTTP`.
-void requireSecureUrl(string url) @safe
+/// Case-insensitive ASCII scheme compare.
+private bool isScheme(string scheme, string want) @safe pure nothrow @nogc
+{
+	if (scheme.length != want.length)
+		return false;
+	foreach (k, ch; scheme)
+	{
+		char c = ch;
+		if (c >= 'A' && c <= 'Z')
+			c = cast(char)(c + 32);
+		if (c != want[k])
+			return false;
+	}
+	return true;
+}
+
+/// The lexical (no DNS) scheme/host gate of `policy`: `https` to a host that is
+/// not a private/link-local literal (`blockInternal` also rejects loopback),
+/// plus plain `http` to an explicit loopback host under `allowLoopback`, and
+/// either scheme to any host under `allowUserConfigured`.
+private bool passesLexicalGate(string scheme, string host, SsrfPolicy policy) @safe
+{
+	import mcp.protocol.ssrf : classifyHostLexical, AddressClass;
+
+	const https = isScheme(scheme, "https");
+	const http = isScheme(scheme, "http");
+	const cls = classifyHostLexical(host);
+	final switch (policy)
+	{
+	case SsrfPolicy.blockInternal:
+		return https && cls == AddressClass.public_;
+	case SsrfPolicy.allowLoopback:
+		if (cls == AddressClass.privateOrLinkLocal)
+			return false;
+		return https || (http && cls == AddressClass.loopback);
+	case SsrfPolicy.allowUserConfigured:
+		return https || http;
+	}
+}
+
+/// Whether `url` passes `policy`'s scheme/host gate for an OAuth/discovery
+/// fetch: `https` to a public host, plus (under `allowLoopback`) plain `http`
+/// to an explicit loopback host (`localhost`, `127.0.0.1`, `[::1]`, and their
+/// numeric encodings). Private/link-local literals — including alternate
+/// numeric IPv4 encodings and IPv4-mapped/compatible IPv6 — are rejected.
+/// Purely lexical (no DNS): a coarse pre-filter on an attacker-influenced URL.
+/// The authoritative, TOCTOU-safe SSRF guard for an actual fetch is
+/// `secureRequestHTTP`, which resolves, classifies and pins via the connector.
+bool isSecureFetchUrl(string url, SsrfPolicy policy) @safe
+{
+	string scheme, host;
+	return parseSchemeHost(url, scheme, host) && passesLexicalGate(scheme, host, policy);
+}
+
+/// Throw `invalidRequest` when `url` fails `policy`'s scheme/host gate (see
+/// `isSecureFetchUrl`). A check-time gate (no fetch) for paths that VALIDATE a
+/// URL without fetching it (e.g. building the authorization-request URL the
+/// host will open). The TOCTOU-safe resolve-and-pin connect for an actual fetch
+/// is performed by `secureRequestHTTP`.
+void requireSecureUrl(string url, SsrfPolicy policy) @safe
 {
 	import mcp.protocol.errors : invalidRequest;
-	import mcp.protocol.ssrf : classifyHostLexical, AddressClass;
-	import vibe.inet.url : URL;
 
 	string scheme, host;
-	try
-	{
-		auto u = URL(url);
-		scheme = u.schema;
-		host = u.host;
-	}
-	catch (Exception)
+	if (!parseSchemeHost(url, scheme, host))
 		throw invalidRequest("Refusing to fetch URL with no parseable host: " ~ url);
-
-	// A URL that parsed but carries no host is just as unfetchable; report it as
-	// such rather than letting it fall through to the misleading "insecure" branch.
-	if (host.length == 0)
-		throw invalidRequest("Refusing to fetch URL with no parseable host: " ~ url);
-
-	// Lexical only (no DNS): a registered name is treated as public here; the
-	// resolve-and-pin connector enforces the resolved-address policy at fetch.
-	const cls = classifyHostLexical(host);
-
-	bool eqScheme(string sc) @safe nothrow @nogc
-	{
-		if (scheme.length != sc.length)
-			return false;
-		foreach (k, ch; scheme)
-		{
-			char c = ch;
-			if (c >= 'A' && c <= 'Z')
-				c = cast(char)(c + 32);
-			if (c != sc[k])
-				return false;
-		}
-		return true;
-	}
-
-	bool secure;
-	if (cls == AddressClass.privateOrLinkLocal)
-		secure = false;
-	else if (eqScheme("https"))
-		secure = true;
-	else if (eqScheme("http") && cls == AddressClass.loopback)
-		secure = true;
-	else
-		secure = false;
-
-	if (!secure)
-		throw invalidRequest(
-				"Refusing to fetch insecure OAuth/discovery URL (must be https, or http to an "
-				~ "explicit loopback host; private/link-local addresses are rejected): " ~ url);
+	if (!passesLexicalGate(scheme, host, policy))
+		throw invalidRequest(policy == SsrfPolicy.blockInternal
+				? "Refusing to fetch insecure OAuth/discovery URL (must be https to a public host): "
+				~ url : "Refusing to fetch insecure OAuth/discovery URL (must be https, or http to "
+				~ "an explicit loopback host; private/link-local addresses are rejected): " ~ url);
 }
 
-/// Non-throwing scheme/host + resolution gate (block-internal policy). Returns
-/// true only when the vibe-parsed scheme/host pass the lexical guard AND the
-/// host resolves only to safe addresses (fail CLOSED on a resolution error).
+/// Non-throwing scheme/host + resolution gate. Returns true only when the
+/// vibe-parsed scheme/host pass `policy`'s lexical gate AND the host resolves
+/// only to addresses `policy` permits (fail CLOSED on a resolution error).
 /// Loopback and IP-literal hosts short-circuit without resolving. `@safe`.
-bool isSecureFetchUrlResolved(string url) @safe
+bool isSecureFetchUrlResolved(string url, SsrfPolicy policy) @safe
 {
-	import mcp.protocol.ssrf : classifyHostLexical, AddressClass,
-		pinnedConnectAddress, SsrfPolicy;
-	import vibe.inet.url : URL;
+	import mcp.protocol.ssrf : pinnedConnectAddress;
 
 	string scheme, host;
-	try
-	{
-		auto u = URL(url);
-		scheme = u.schema;
-		host = u.host;
-	}
-	catch (Exception)
-	{
+	if (!parseSchemeHost(url, scheme, host) || !passesLexicalGate(scheme, host, policy))
 		return false;
-	}
-	if (host.length == 0)
-		return false;
-
-	bool eqScheme(string sc) @safe nothrow @nogc
-	{
-		if (scheme.length != sc.length)
-			return false;
-		foreach (k, ch; scheme)
-		{
-			char c = ch;
-			if (c >= 'A' && c <= 'Z')
-				c = cast(char)(c + 32);
-			if (c != sc[k])
-				return false;
-		}
-		return true;
-	}
-
-	const isHttps = eqScheme("https");
-	const isHttp = eqScheme("http");
-	if (!isHttps && !isHttp)
-		return false;
-
-	// Scheme gate: https to any host, or http only to an explicit loopback host
-	// (matches the connector's block-internal scheme policy). Use the lexical
-	// class so http-to-a-registered-name is rejected without a DNS round-trip.
-	const lex = classifyHostLexical(host);
-	if (isHttp && lex != AddressClass.loopback)
-		return false;
-
-	// Resolve + classify + pin under the block-internal policy; the connector's
-	// verdict is the single source of truth for the resolved address.
-	const pin = pinnedConnectAddress(host, isHttps, SsrfPolicy.blockInternal);
-	return pin.ok;
+	return pinnedConnectAddress(host, isScheme(scheme, "https"), policy).ok;
 }
 
 /// Consolidated SSRF-safe HTTP fetch used by every outbound OAuth/discovery
-/// request. Delegates to the connector's `secureRequestHTTP` with the
-/// block-internal policy: parse once with vibe's `URL`, classify the host once,
-/// resolve + pin to a vetted numeric address (preserving Host header + TLS SNI),
-/// and fail CLOSED on any internal/unresolvable target. Throws `invalidRequest`
-/// when the URL is unsafe.
-void secureRequestHTTP(string url, scope void delegate(scope HTTPClientRequest) requester,
-		scope void delegate(scope HTTPClientResponse) responder) @safe
+/// request. Delegates to the connector's `secureRequestHTTP` under `policy`:
+/// parse once with vibe's `URL`, classify the host once, resolve + pin to a
+/// vetted numeric address (preserving Host header + TLS SNI), and fail CLOSED
+/// on any target `policy` rejects. Throws `invalidRequest` when the URL is
+/// unsafe.
+void secureRequestHTTP(string url, SsrfPolicy policy,
+		scope void delegate(scope HTTPClientRequest) @safe requester,
+		scope void delegate(scope HTTPClientResponse) @safe responder) @safe
 {
-	import mcp.protocol.ssrf : connectorRequest = secureRequestHTTP, SsrfPolicy;
+	import mcp.protocol.ssrf : connectorRequest = secureRequestHTTP;
 
-	connectorRequest(url, SsrfPolicy.blockInternal, requester, responder);
+	connectorRequest(url, policy, requester, responder);
 }
 
 unittest  // requireSecureUrl throws on an insecure URL and passes a secure loopback one
 {
 	import std.exception : assertThrown;
 
-	assertThrown(requireSecureUrl("http://as.example.com/token"));
-	assertThrown(requireSecureUrl("https://169.254.169.254/"));
+	assertThrown(requireSecureUrl("http://as.example.com/token", SsrfPolicy.allowLoopback));
+	assertThrown(requireSecureUrl("https://169.254.169.254/", SsrfPolicy.allowLoopback));
 	// Loopback hosts skip DNS resolution, so these are network-independent.
-	requireSecureUrl("https://127.0.0.1/token"); // does not throw
-	requireSecureUrl("http://127.0.0.1:8765/callback"); // loopback dev ok
+	requireSecureUrl("https://127.0.0.1/token", SsrfPolicy.allowLoopback); // does not throw
+	requireSecureUrl("http://127.0.0.1:8765/callback", SsrfPolicy.allowLoopback); // loopback dev ok
+}
+
+unittest  // blockInternal gates admit only https to a public host
+{
+	import std.exception : assertThrown;
+
+	assert(isSecureFetchUrl("https://as.example.com/token", SsrfPolicy.blockInternal));
+	assert(!isSecureFetchUrl("http://127.0.0.1:8765/token", SsrfPolicy.blockInternal));
+	assert(!isSecureFetchUrl("http://localhost/token", SsrfPolicy.blockInternal));
+	assert(!isSecureFetchUrl("https://127.0.0.1/token", SsrfPolicy.blockInternal));
+	assert(!isSecureFetchUrlResolved("http://127.0.0.1:8765/jwks", SsrfPolicy.blockInternal));
+	assertThrown(requireSecureUrl("http://127.0.0.1:8765/authorize", SsrfPolicy.blockInternal));
+	assertThrown(requireSecureUrl("https://[::1]/authorize", SsrfPolicy.blockInternal));
 }
 
 unittest  // requireSecureUrl rejects the '?@' / '#@' authority differential (SSRF)
 {
 	import std.exception : assertThrown;
 
-	assertThrown(requireSecureUrl("https://public?@169.254.169.254/jwks"));
-	assertThrown(requireSecureUrl("https://public#@10.0.0.5/jwks"));
+	assertThrown(requireSecureUrl("https://public?@169.254.169.254/jwks", SsrfPolicy.allowLoopback));
+	assertThrown(requireSecureUrl("https://public#@10.0.0.5/jwks", SsrfPolicy.allowLoopback));
 }
 
 unittest  // requireSecureUrl reports an unparseable URL accurately, not as merely "insecure"
@@ -958,7 +1161,7 @@ unittest  // requireSecureUrl reports an unparseable URL accurately, not as mere
 	bool threw;
 	string msg;
 	try
-		requireSecureUrl("http://");
+		requireSecureUrl("http://", SsrfPolicy.allowLoopback);
 	catch (Exception e)
 	{
 		threw = true;
@@ -970,128 +1173,144 @@ unittest  // requireSecureUrl reports an unparseable URL accurately, not as mere
 
 unittest  // isSecureFetchUrl accepts https and rejects plaintext http to a remote host
 {
-	assert(isSecureFetchUrl("https://as.example.com/.well-known/oauth-authorization-server"));
-	assert(!isSecureFetchUrl("http://as.example.com/.well-known/oauth-authorization-server"));
+	assert(isSecureFetchUrl("https://as.example.com/.well-known/oauth-authorization-server",
+			SsrfPolicy.allowLoopback));
+	assert(!isSecureFetchUrl("http://as.example.com/.well-known/oauth-authorization-server",
+			SsrfPolicy.allowLoopback));
 }
 
 unittest  // isSecureFetchUrl permits http only to explicit loopback hosts (dev)
 {
-	assert(isSecureFetchUrl("http://localhost:8765/jwks"));
-	assert(isSecureFetchUrl("http://127.0.0.1/jwks"));
-	assert(isSecureFetchUrl("http://[::1]:9000/jwks"));
-	assert(!isSecureFetchUrl("http://internal.local/jwks"));
+	assert(isSecureFetchUrl("http://localhost:8765/jwks", SsrfPolicy.allowLoopback));
+	assert(isSecureFetchUrl("http://127.0.0.1/jwks", SsrfPolicy.allowLoopback));
+	assert(isSecureFetchUrl("http://[::1]:9000/jwks", SsrfPolicy.allowLoopback));
+	assert(!isSecureFetchUrl("http://internal.local/jwks", SsrfPolicy.allowLoopback));
 }
 
 unittest  // isSecureFetchUrl rejects private/link-local IPv4 literals (SSRF)
 {
-	assert(!isSecureFetchUrl("https://169.254.169.254/latest/meta-data"));
-	assert(!isSecureFetchUrl("https://10.0.0.5/x"));
-	assert(!isSecureFetchUrl("https://192.168.1.1/x"));
-	assert(!isSecureFetchUrl("https://172.16.0.1/x"));
-	assert(!isSecureFetchUrl("http://169.254.169.254/x"));
+	assert(!isSecureFetchUrl("https://169.254.169.254/latest/meta-data", SsrfPolicy.allowLoopback));
+	assert(!isSecureFetchUrl("https://10.0.0.5/x", SsrfPolicy.allowLoopback));
+	assert(!isSecureFetchUrl("https://192.168.1.1/x", SsrfPolicy.allowLoopback));
+	assert(!isSecureFetchUrl("https://172.16.0.1/x", SsrfPolicy.allowLoopback));
+	assert(!isSecureFetchUrl("http://169.254.169.254/x", SsrfPolicy.allowLoopback));
 }
 
 unittest  // isSecureFetchUrl rejects private/ULA/link-local IPv6 literals (SSRF)
 {
-	assert(!isSecureFetchUrl("https://[fd00::1]/x"));
-	assert(!isSecureFetchUrl("https://[fc00::1]/x"));
-	assert(!isSecureFetchUrl("https://[fe80::1]/x"));
-	assert(!isSecureFetchUrl("https://[::]/x"));
-	assert(!isSecureFetchUrl("https://[::ffff:169.254.169.254]/latest/meta-data"));
-	assert(!isSecureFetchUrl("https://[::ffff:10.0.0.5]/x"));
-	assert(!isSecureFetchUrl("https://[::ffff:127.0.0.1]/x"));
-	assert(!isSecureFetchUrl("https://[::ffff:0a00:0001]/x"));
-	assert(!isSecureFetchUrl("https://[fe80::1]:443/x"));
+	assert(!isSecureFetchUrl("https://[fd00::1]/x", SsrfPolicy.allowLoopback));
+	assert(!isSecureFetchUrl("https://[fc00::1]/x", SsrfPolicy.allowLoopback));
+	assert(!isSecureFetchUrl("https://[fe80::1]/x", SsrfPolicy.allowLoopback));
+	assert(!isSecureFetchUrl("https://[::]/x", SsrfPolicy.allowLoopback));
+	assert(!isSecureFetchUrl("https://[::ffff:169.254.169.254]/latest/meta-data",
+			SsrfPolicy.allowLoopback));
+	assert(!isSecureFetchUrl("https://[::ffff:10.0.0.5]/x", SsrfPolicy.allowLoopback));
+	// IPv4-mapped loopback is gated exactly like the IPv4 loopback literal.
+	assert(isSecureFetchUrl("https://[::ffff:127.0.0.1]/x",
+			SsrfPolicy.allowLoopback) == isSecureFetchUrl("https://127.0.0.1/x",
+			SsrfPolicy.allowLoopback));
+	assert(!isSecureFetchUrl("https://[::ffff:127.0.0.1]/x", SsrfPolicy.blockInternal));
+	assert(!isSecureFetchUrl("https://[::ffff:0a00:0001]/x", SsrfPolicy.allowLoopback));
+	assert(!isSecureFetchUrl("https://[fe80::1]:443/x", SsrfPolicy.allowLoopback));
 }
 
 unittest  // isSecureFetchUrl accepts a public/global-unicast IPv6 literal
 {
-	assert(isSecureFetchUrl("https://[2606:4700:4700::1111]/x"));
-	assert(isSecureFetchUrl("https://[2606:4700::1]/x"));
-	assert(isSecureFetchUrl("http://[::1]:9000/jwks"));
+	assert(isSecureFetchUrl("https://[2606:4700:4700::1111]/x", SsrfPolicy.allowLoopback));
+	assert(isSecureFetchUrl("https://[2606:4700::1]/x", SsrfPolicy.allowLoopback));
+	assert(isSecureFetchUrl("http://[::1]:9000/jwks", SsrfPolicy.allowLoopback));
 }
 
 unittest  // isSecureFetchUrl rejects schemeless / file / non-loopback http
 {
-	assert(!isSecureFetchUrl("as.example.com/x"));
-	assert(!isSecureFetchUrl("file:///etc/passwd"));
-	assert(!isSecureFetchUrl(""));
+	assert(!isSecureFetchUrl("as.example.com/x", SsrfPolicy.allowLoopback));
+	assert(!isSecureFetchUrl("file:///etc/passwd", SsrfPolicy.allowLoopback));
+	assert(!isSecureFetchUrl("", SsrfPolicy.allowLoopback));
 }
 
 unittest  // isSecureFetchUrl strips userinfo before private IPv4 literal checks (SSRF)
 {
-	assert(!isSecureFetchUrl("https://user@169.254.169.254/"));
-	assert(!isSecureFetchUrl("https://x@10.0.0.1/"));
-	assert(!isSecureFetchUrl("https://user:pass@192.168.1.1/x"));
+	assert(!isSecureFetchUrl("https://user@169.254.169.254/", SsrfPolicy.allowLoopback));
+	assert(!isSecureFetchUrl("https://x@10.0.0.1/", SsrfPolicy.allowLoopback));
+	assert(!isSecureFetchUrl("https://user:pass@192.168.1.1/x", SsrfPolicy.allowLoopback));
 }
 
 unittest  // isSecureFetchUrl strips userinfo before bracketed IPv6 literal checks (SSRF)
 {
-	assert(!isSecureFetchUrl("https://a@[fe80::1]/"));
-	assert(!isSecureFetchUrl("https://a@[fd00::1]/x"));
-	assert(!isSecureFetchUrl("https://user@[::ffff:169.254.169.254]/latest/meta-data"));
+	assert(!isSecureFetchUrl("https://a@[fe80::1]/", SsrfPolicy.allowLoopback));
+	assert(!isSecureFetchUrl("https://a@[fd00::1]/x", SsrfPolicy.allowLoopback));
+	assert(!isSecureFetchUrl("https://user@[::ffff:169.254.169.254]/latest/meta-data",
+			SsrfPolicy.allowLoopback));
 }
 
 unittest  // isSecureFetchUrl still accepts a public host carrying userinfo
 {
-	assert(isSecureFetchUrl("https://user@public.example.com/"));
-	assert(isSecureFetchUrl("https://user:pass@as.example.com/token"));
-	assert(isSecureFetchUrl("https://user@[2606:4700:4700::1111]/x"));
+	assert(isSecureFetchUrl("https://user@public.example.com/", SsrfPolicy.allowLoopback));
+	assert(isSecureFetchUrl("https://user:pass@as.example.com/token", SsrfPolicy.allowLoopback));
+	assert(isSecureFetchUrl("https://user@[2606:4700:4700::1111]/x", SsrfPolicy.allowLoopback));
 }
 
 unittest  // isSecureFetchUrl treats numeric loopback encodings as loopback (https + dev http)
 {
-	assert(isSecureFetchUrl("https://2130706433/x")); // 127.0.0.1
-	assert(isSecureFetchUrl("https://127.1/x"));
-	assert(isSecureFetchUrl("https://0x7f000001/x"));
-	assert(isSecureFetchUrl("https://0177.0.0.1/x"));
+	assert(isSecureFetchUrl("https://2130706433/x", SsrfPolicy.allowLoopback)); // 127.0.0.1
+	assert(isSecureFetchUrl("https://127.1/x", SsrfPolicy.allowLoopback));
+	assert(isSecureFetchUrl("https://0x7f000001/x", SsrfPolicy.allowLoopback));
+	// A leading-zero part is ambiguous (octal or decimal by resolver) and fails closed.
+	assert(!isSecureFetchUrl("https://0177.0.0.1/x", SsrfPolicy.allowLoopback));
 }
 
 unittest  // isSecureFetchUrl rejects numeric encodings of the cloud metadata address (SSRF)
 {
-	assert(!isSecureFetchUrl("https://0xa9fea9fe/latest/meta-data")); // 169.254.169.254
-	assert(!isSecureFetchUrl("https://2852039166/latest/meta-data"));
-	assert(!isSecureFetchUrl("https://169.254.169.254/latest/meta-data"));
+	assert(!isSecureFetchUrl("https://0xa9fea9fe/latest/meta-data", SsrfPolicy.allowLoopback)); // 169.254.169.254
+	assert(!isSecureFetchUrl("https://2852039166/latest/meta-data", SsrfPolicy.allowLoopback));
+	assert(!isSecureFetchUrl("https://169.254.169.254/latest/meta-data", SsrfPolicy.allowLoopback));
 }
 
 unittest  // isSecureFetchUrl rejects octal/hex encodings of RFC1918 ranges (SSRF)
 {
-	assert(!isSecureFetchUrl("https://0xa000005/x")); // 10.0.0.5
-	assert(!isSecureFetchUrl("https://192.0xa8.0.1/x")); // 192.168.0.1
-	assert(!isSecureFetchUrl("https://10.0/x")); // 10.0.0.0
+	assert(!isSecureFetchUrl("https://0xa000005/x", SsrfPolicy.allowLoopback)); // 10.0.0.5
+	assert(!isSecureFetchUrl("https://192.0xa8.0.1/x", SsrfPolicy.allowLoopback)); // 192.168.0.1
+	assert(!isSecureFetchUrl("https://10.0/x", SsrfPolicy.allowLoopback)); // 10.0.0.0
 }
 
 unittest  // isSecureFetchUrl permits http loopback via numeric encodings (dev)
 {
-	assert(isSecureFetchUrl("http://2130706433/jwks")); // 127.0.0.1
-	assert(isSecureFetchUrl("http://127.1/jwks"));
-	assert(isSecureFetchUrl("http://0x7f000001/jwks"));
+	assert(isSecureFetchUrl("http://2130706433/jwks", SsrfPolicy.allowLoopback)); // 127.0.0.1
+	assert(isSecureFetchUrl("http://127.1/jwks", SsrfPolicy.allowLoopback));
+	assert(isSecureFetchUrl("http://0x7f000001/jwks", SsrfPolicy.allowLoopback));
 }
 
 unittest  // isSecureFetchUrl still accepts genuine public numeric IPv4 literals
 {
-	assert(isSecureFetchUrl("https://8.8.8.8/x"));
-	assert(isSecureFetchUrl("https://1.1.1.1/x"));
+	assert(isSecureFetchUrl("https://8.8.8.8/x", SsrfPolicy.allowLoopback));
+	assert(isSecureFetchUrl("https://1.1.1.1/x", SsrfPolicy.allowLoopback));
 }
 
 unittest  // isSecureFetchUrlResolved rejects what the lexical guard rejects (GET-path SSRF)
 {
-	assert(!isSecureFetchUrlResolved("http://as.example.com/.well-known/jwks"));
-	assert(!isSecureFetchUrlResolved("https://169.254.169.254/latest/meta-data"));
-	assert(!isSecureFetchUrlResolved("https://10.0.0.5/jwks"));
+	assert(!isSecureFetchUrlResolved("http://as.example.com/.well-known/jwks",
+			SsrfPolicy.allowLoopback));
+	assert(!isSecureFetchUrlResolved("https://169.254.169.254/latest/meta-data",
+			SsrfPolicy.allowLoopback));
+	assert(!isSecureFetchUrlResolved("https://10.0.0.5/jwks", SsrfPolicy.allowLoopback));
 }
 
 unittest  // isSecureFetchUrlResolved rejects the '?@' / '#@' authority differential (SSRF)
 {
-	assert(!isSecureFetchUrlResolved("https://public?@169.254.169.254/jwks"));
-	assert(!isSecureFetchUrlResolved("https://public#@10.0.0.5/jwks"));
+	assert(!isSecureFetchUrlResolved("https://public?@169.254.169.254/jwks",
+			SsrfPolicy.allowLoopback));
+	assert(!isSecureFetchUrlResolved("https://public#@10.0.0.5/jwks", SsrfPolicy.allowLoopback));
 }
 
-unittest  // isSecureFetchUrlResolved accepts lexically-safe loopback without resolving (dev)
+unittest  // isSecureFetchUrlResolved accepts plain-http loopback without resolving (dev)
 {
-	assert(isSecureFetchUrlResolved("https://127.0.0.1/jwks"));
-	assert(isSecureFetchUrlResolved("http://127.0.0.1:8765/jwks"));
-	assert(isSecureFetchUrlResolved("http://[::1]:9000/jwks"));
+	assert(isSecureFetchUrlResolved("http://127.0.0.1:8765/jwks", SsrfPolicy.allowLoopback));
+	assert(isSecureFetchUrlResolved("http://[::1]:9000/jwks", SsrfPolicy.allowLoopback));
+}
+
+unittest  // isSecureFetchUrlResolved rejects loopback over https (local TLS services)
+{
+	assert(!isSecureFetchUrlResolved("https://127.0.0.1/jwks", SsrfPolicy.allowLoopback));
 }
 
 unittest  // valid CIMD client_id: https with a path component
@@ -1111,6 +1330,35 @@ unittest  // CIMD client_id must use https
 	assert(!isValidClientIdMetadataUrl("app.example.com/oauth/client.json"));
 }
 
+unittest  // CIMD client_id must not carry a fragment
+{
+	assert(!isValidClientIdMetadataUrl("https://app.example.com/client.json#frag"));
+	assert(!isValidClientIdMetadataUrl("https://app.example.com/client.json#"));
+}
+
+unittest  // CIMD client_id must not carry a username or password
+{
+	assert(!isValidClientIdMetadataUrl("https://user@app.example.com/client.json"));
+	assert(!isValidClientIdMetadataUrl("https://user:pw@app.example.com/client.json"));
+}
+
+unittest  // CIMD client_id must not contain dot path segments
+{
+	assert(!isValidClientIdMetadataUrl("https://app.example.com/./client.json"));
+	assert(!isValidClientIdMetadataUrl("https://app.example.com/a/../client.json"));
+	assert(!isValidClientIdMetadataUrl("https://app.example.com/a/.."));
+	assert(!isValidClientIdMetadataUrl("https://app.example.com/a/%2e%2E/client.json"));
+	// A segment merely containing dots is an ordinary name.
+	assert(isValidClientIdMetadataUrl("https://app.example.com/.well-known/client..json"));
+}
+
+unittest  // CIMD client_id must name a host and a path before any query
+{
+	assert(!isValidClientIdMetadataUrl("https:///client.json"));
+	assert(!isValidClientIdMetadataUrl("https://app.example.com?x=/client.json"));
+	assert(isValidClientIdMetadataUrl("https://app.example.com:8443/client.json?v=1"));
+}
+
 /// An OAuth Client ID Metadata Document (SEP-991) a client hosts at its
 /// HTTPS-URL `client_id`. The authorization server fetches this document to
 /// learn the client's metadata (name, redirect URIs, auth method) without any
@@ -1125,6 +1373,12 @@ struct ClientIdMetadataDocument
 	string[] responseTypes = ["code"];
 	string tokenEndpointAuthMethod = "none";
 	string scope_;
+	/// The client's public JWK Set by value, for `private_key_jwt`. Omitted
+	/// when undefined.
+	Json jwks = Json.undefined;
+	/// The URL of the client's public JWK Set, for `private_key_jwt`. Omitted
+	/// when empty.
+	string jwksUri;
 
 	/// Serialize to the JSON document hosted at the `client_id` URL. `client_id`
 	/// and `redirect_uris` are always present (per SEP-991 minimum fields);
@@ -1152,6 +1406,10 @@ struct ClientIdMetadataDocument
 		j["token_endpoint_auth_method"] = tokenEndpointAuthMethod;
 		if (scope_.length)
 			j["scope"] = scope_;
+		if (jwks.type == Json.Type.object)
+			j["jwks"] = jwks.clone();
+		if (jwksUri.length)
+			j["jwks_uri"] = jwksUri;
 		return j;
 	}
 
@@ -1172,6 +1430,10 @@ struct ClientIdMetadataDocument
 		if (am.length)
 			d.tokenEndpointAuthMethod = am;
 		d.scope_ = strField(j, "scope");
+		if (auto p = "jwks" in j)
+			if (p.type == Json.Type.object)
+				d.jwks = p.clone();
+		d.jwksUri = strField(j, "jwks_uri");
 		return d;
 	}
 }
@@ -1474,33 +1736,128 @@ string basicAuthHeader(string clientId, string clientSecret) @safe
 }
 
 /// Parse a token-endpoint HTTP response: a non-2xx status is an error (the body,
-/// when present, is surfaced for diagnostics), otherwise decode the JSON body
-/// into a `TokenSet`.
+/// when present, is surfaced for diagnostics, and an RFC 6749 §5.2 `error` code
+/// is carried in the exception's `data` for `oauthErrorCode`), otherwise decode
+/// the JSON body into a `TokenSet`.
 private TokenSet parseTokenResponse(int status, string responseBody) @safe
 {
 	import std.conv : to;
-	import vibe.data.json : parseJsonString;
 	import mcp.protocol.errors : invalidRequest;
+	import mcp.protocol.jsonrpc : parseUntrustedJson;
 
 	if (status < 200 || status >= 300)
 		throw invalidRequest("token endpoint returned HTTP " ~ status.to!string ~ (
-				responseBody.length ? ": " ~ responseBody : ""));
-	return TokenSet.fromJson(parseJsonString(responseBody));
+				responseBody.length ? ": " ~ responseBody : ""), oauthErrorData(responseBody));
+	auto j = parseUntrustedJson(responseBody);
+	throwIfOAuthError("token endpoint", j);
+	return requireBearer(TokenSet.fromJson(j));
 }
 
+/// Throw when a successful (2xx) token response nevertheless carries an RFC 6749
+/// §5.2 `error` member, as GitHub sends for a bad or expired code. The message
+/// names the `error` and any `error_description`, and the exception's `data`
+/// carries the code for `oauthErrorCode`.
+package(mcp) void throwIfOAuthError(string endpoint, Json response) @safe
+{
+	import mcp.protocol.errors : invalidRequest;
+
+	if (response.type != Json.Type.object || response["error"].type != Json.Type.string)
+		return;
+	const code = response["error"].get!string;
+	const desc = response["error_description"];
+	throw invalidRequest(endpoint ~ " returned error " ~ code ~ (desc.type == Json.Type.string
+			&& desc.get!string.length ? ": " ~ desc.get!string : ""), Json([
+		"error": Json(code)
+	]));
+}
+
+unittest  // parseTokenResponse surfaces an OAuth error carried in a 2xx response
+{
+	import std.algorithm : canFind;
+	import std.exception : collectException;
+
+	auto e = collectException(parseTokenResponse(200,
+			`{"error":"bad_verification_code","error_description":"expired"}`));
+	assert(e !is null);
+	assert(e.msg.canFind("bad_verification_code") && e.msg.canFind("expired"), e.msg);
+	assert(oauthErrorCode(e) == "bad_verification_code");
+}
+
+/// Return `ts` when its `token_type` is `Bearer` (compared case-insensitively,
+/// RFC 6749 §5.1) or absent; otherwise throw. The SDK presents access tokens
+/// only as `Authorization: Bearer`, so a DPoP or other token type would be sent
+/// under the wrong scheme.
+package(mcp) TokenSet requireBearer(TokenSet ts) @safe
+{
+	import std.uni : sicmp;
+	import mcp.protocol.errors : invalidRequest;
+
+	if (ts.tokenType.length && sicmp(ts.tokenType, "Bearer") != 0)
+		throw invalidRequest("token endpoint issued token_type \""
+				~ ts.tokenType ~ "\"; only Bearer tokens are supported");
+	return ts;
+}
+
+/// The exception `data` for an OAuth error response body: `{"error": code}`
+/// when the body is a JSON object with a string `error` (RFC 6749 §5.2), else
+/// `Json.undefined`. `oauthErrorCode` reads it back.
+package(mcp) Json oauthErrorData(string responseBody) @safe nothrow
+{
+	import mcp.protocol.jsonrpc : parseUntrustedJson;
+
+	try
+	{
+		auto err = parseUntrustedJson(responseBody);
+		if (err.type == Json.Type.object && err["error"].type == Json.Type.string)
+		{
+			auto data = Json.emptyObject;
+			data["error"] = err["error"];
+			return data;
+		}
+	}
+	catch (Exception)
+	{
+	}
+	return Json.undefined;
+}
+
+/// The RFC 6749 §5.2 `error` code of a failed token request (for example
+/// `invalid_grant`), or empty when `e` did not come from an OAuth error response.
+string oauthErrorCode(const Exception e) @safe nothrow
+{
+	import mcp.protocol.errors : McpException;
+
+	auto me = cast(const McpException) e;
+	if (me is null || me.data.type != Json.Type.object)
+		return null;
+	try
+	{
+		auto code = me.data["error"];
+		return code.type == Json.Type.string ? code.get!string : null;
+	}
+	catch (Exception)
+		return null;
+}
+
+/// Upper bound on an OAuth/discovery response body (metadata documents, DCR and
+/// token responses) read from the network. A larger response is refused rather
+/// than buffered, so a hostile or misbehaving endpoint cannot exhaust memory.
+package(mcp) enum size_t maxAuthResponseBytes = 256 * 1024;
+
 /// POST an `application/x-www-form-urlencoded` body to a token endpoint over the
-/// SDK's SSRF-safe transport (https, or http to loopback for dev) and return the
-/// parsed `TokenSet`. `authHeader`, when non-empty, is sent as `Authorization`.
-private TokenSet postTokenRequest(string tokenEndpoint, string body_, string authHeader) @safe
+/// SDK's SSRF-safe transport under `policy` and return the parsed `TokenSet`.
+/// `authHeader`, when non-empty, is sent as `Authorization`.
+private TokenSet postTokenRequest(string tokenEndpoint, string body_,
+		string authHeader, SsrfPolicy policy) @safe
 {
 	int status = 502;
 	string responseBody;
-	() @trusted {
+	{
 		import vibe.http.client : HTTPClientResponse;
 		import vibe.http.common : HTTPMethod;
 		import vibe.stream.operations : readAllUTF8;
 
-		secureRequestHTTP(tokenEndpoint, (scope HTTPClientRequest creq) {
+		secureRequestHTTP(tokenEndpoint, policy, (scope HTTPClientRequest creq) {
 			creq.method = HTTPMethod.POST;
 			creq.headers["Content-Type"] = "application/x-www-form-urlencoded";
 			creq.headers["Accept"] = "application/json";
@@ -1509,9 +1866,9 @@ private TokenSet postTokenRequest(string tokenEndpoint, string body_, string aut
 			creq.writeBody(cast(const(ubyte)[]) body_);
 		}, (scope HTTPClientResponse cres) {
 			status = cres.statusCode;
-			responseBody = cres.bodyReader.readAllUTF8();
+			responseBody = cres.bodyReader.readAllUTF8(false, maxAuthResponseBytes);
 		});
-	}();
+	}
 	return parseTokenResponse(status, responseBody);
 }
 
@@ -1519,27 +1876,30 @@ private TokenSet postTokenRequest(string tokenEndpoint, string body_, string aut
 /// (RFC 6749 §4.1.3 + PKCE RFC 7636). Use when an MCP server acts as an OAuth
 /// client to an upstream API; unlike `OAuthClient` this carries no RFC 8707
 /// `resource`. An empty `clientSecret` denotes a public client, so no
-/// credentials are sent; otherwise they go via HTTP Basic. Throws on an unsafe
-/// endpoint or a non-2xx response.
-TokenSet exchangeAuthCode(string tokenEndpoint, string code, string redirectUri,
-		string clientId, string clientSecret, string codeVerifier) @safe
+/// credentials are sent; otherwise they go via HTTP Basic. `policy` governs
+/// which hosts the endpoint may name (`SsrfPolicy.allowUserConfigured` for a
+/// token endpoint on a private network). Throws on an endpoint `policy` rejects
+/// or a non-2xx response.
+TokenSet exchangeAuthCode(string tokenEndpoint, string code, string redirectUri, string clientId,
+		string clientSecret, string codeVerifier, SsrfPolicy policy = SsrfPolicy.allowLoopback) @safe
 {
 	const body_ = buildAuthCodeTokenForm(code, redirectUri, codeVerifier, clientId, "");
 	const authHeader = clientSecret.length ? basicAuthHeader(clientId, clientSecret) : "";
-	return postTokenRequest(tokenEndpoint, body_, authHeader);
+	return postTokenRequest(tokenEndpoint, body_, authHeader, policy);
 }
 
 /// Refresh an access token at a third-party token endpoint (RFC 6749 §6). Use
 /// when an MCP server acts as an OAuth client to an upstream API; carries no
 /// RFC 8707 `resource`. An empty `clientSecret` denotes a public client, so no
-/// credentials are sent; otherwise they go via HTTP Basic. Throws on an unsafe
-/// endpoint or a non-2xx response.
+/// credentials are sent; otherwise they go via HTTP Basic. `policy` is as for
+/// `exchangeAuthCode`. Throws on an endpoint `policy` rejects or a non-2xx
+/// response.
 TokenSet refreshAccessToken(string tokenEndpoint, string refreshToken,
-		string clientId, string clientSecret) @safe
+		string clientId, string clientSecret, SsrfPolicy policy = SsrfPolicy.allowLoopback) @safe
 {
 	const body_ = buildRefreshTokenForm(refreshToken, clientId, "");
 	const authHeader = clientSecret.length ? basicAuthHeader(clientId, clientSecret) : "";
-	return postTokenRequest(tokenEndpoint, body_, authHeader);
+	return postTokenRequest(tokenEndpoint, body_, authHeader, policy);
 }
 
 unittest  // DCR request + responses round-trip
@@ -1673,6 +2033,29 @@ unittest  // parseTokenResponse rejects a non-2xx status (RFC 6749 token error)
 	assertThrown!McpException(parseTokenResponse(500, ""));
 }
 
+unittest  // parseTokenResponse carries the OAuth error code of a rejected token request
+{
+	import std.exception : collectException;
+
+	assert(oauthErrorCode(collectException(parseTokenResponse(400,
+			`{"error":"invalid_grant"}`))) == "invalid_grant");
+	assert(oauthErrorCode(collectException(parseTokenResponse(502, "<html>"))) == "");
+	assert(oauthErrorCode(new Exception("network down")) == "");
+}
+
+unittest  // parseTokenResponse rejects a token_type other than Bearer
+{
+	import std.algorithm : canFind;
+	import std.exception : collectExceptionMsg;
+
+	const msg = collectExceptionMsg(parseTokenResponse(200,
+			`{"access_token":"AT","token_type":"DPoP"}`));
+	assert(msg.canFind("DPoP"), msg);
+	assert(parseTokenResponse(200,
+			`{"access_token":"AT","token_type":"bearer"}`).accessToken == "AT");
+	assert(parseTokenResponse(200, `{"access_token":"AT"}`).accessToken == "AT");
+}
+
 unittest  // parseTokenResponse decodes a 2xx body into a populated TokenSet
 {
 	const ts = parseTokenResponse(200, `{"access_token":"AT","token_type":"Bearer","expires_in":3600,"refresh_token":"RT","scope":"a b"}`);
@@ -1681,6 +2064,40 @@ unittest  // parseTokenResponse decodes a 2xx body into a populated TokenSet
 	assert(ts.expiresIn == 3600);
 	assert(ts.refreshToken == "RT");
 	assert(ts.scope_ == "a b");
+}
+
+unittest  // parseTokenResponse rejects a 2xx body nested past the depth cap
+{
+	import std.array : replicate;
+	import std.exception : assertThrown;
+
+	const deep = "[".replicate(1000) ~ "]".replicate(1000);
+	assertThrown(parseTokenResponse(200,
+			`{"access_token":"AT","token_type":"Bearer","x":` ~ deep ~ `}`));
+}
+
+unittest  // exchangeAuthCode refuses a token response larger than maxAuthResponseBytes
+{
+	import std.array : replicate;
+	import std.conv : to;
+	import std.exception : assertThrown;
+	import vibe.http.server : HTTPServerRequest, HTTPServerResponse,
+		HTTPServerSettings, listenHTTP;
+
+	auto settings = new HTTPServerSettings;
+	settings.bindAddresses = ["127.0.0.1"];
+	settings.port = 0;
+	auto listener = listenHTTP(settings, (scope HTTPServerRequest req,
+			scope HTTPServerResponse res) @safe {
+		res.writeBody(`{"access_token":"at","token_type":"Bearer","pad":"` ~ "x".replicate(
+			maxAuthResponseBytes) ~ `"}`, "application/json");
+	});
+	scope (exit)
+		listener.stopListening();
+	const endpoint = "http://127.0.0.1:" ~ listener.bindAddresses[0].port.to!string ~ "/token";
+
+	assertThrown(exchangeAuthCode(endpoint, "CODE", "http://127.0.0.1:1/cb",
+			"client1", "", "VERIFIER"));
 }
 
 unittest  // exchangeAuthCode refuses a plaintext (non-loopback) token endpoint
@@ -1727,7 +2144,7 @@ package string extractQueryParam(string url, string key) @safe
 		const end = (amp < 0) ? query.length : i + amp;
 		auto pair = query[i .. end];
 		if (pair.length >= needle.length && pair[0 .. needle.length] == needle)
-			return () @trusted { return decodeComponent(pair[needle.length .. $]); }();
+			return decodeComponent(pair[needle.length .. $]);
 		i = end + 1;
 	}
 	return "";
@@ -1837,7 +2254,7 @@ bool validateAuthorizationResponseState(string responseState, string expectedSta
 /// Length-independent constant-time byte comparison. The running time depends
 /// only on the longer input's length, never on the position of the first
 /// differing byte, so it leaks no information through a timing side channel.
-private bool constantTimeEquals(scope const(char)[] a, scope const(char)[] b) @safe pure nothrow @nogc
+package(mcp) bool constantTimeEquals(scope const(char)[] a, scope const(char)[] b) @safe pure nothrow @nogc
 {
 	const n = a.length > b.length ? a.length : b.length;
 	uint diff = cast(uint)(a.length ^ b.length);

@@ -3,16 +3,24 @@ name: Deploy Dockerfile
 # Validate deploy/Dockerfile so the documented container recipe can't silently
 # rot (a new transitive dependency needing a system library, an LDC bump, a base
 # image change, etc.). Builds the reference Dockerfile against a minimal fixture
-# server (deploy/ci-smoke), with the fixture pinned to this commit's SDK.
+# server (deploy/ci-smoke), with the fixture pinned to this commit's SDK. SDK
+# source and dependency changes trigger it too, since they can pull in a new
+# system library the image lacks.
 
 on:
   push:
     paths:
       - "deploy/**"
+      - "source/**"
+      - "dub.json"
+      - "dub.selections.json"
       - ".github/workflows/deploy-dockerfile.yml"
   pull_request:
     paths:
       - "deploy/**"
+      - "source/**"
+      - "dub.json"
+      - "dub.selections.json"
       - ".github/workflows/deploy-dockerfile.yml"
 
 jobs:
