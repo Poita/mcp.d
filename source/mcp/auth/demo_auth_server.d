@@ -31,11 +31,12 @@ import vibe.data.json : Json;
 
 import mcp.auth.oauth : base64UrlNoPad;
 import mcp.auth.csprng : cryptoRandomBytes;
-import mcp.auth.reference_token : IssuedToken, ReferenceTokenStore, referenceTokenValidator;
+import mcp.auth.reference_token : IssuedToken, ReferenceTokenStore,
+	ReferenceTokenStoreOptions, referenceTokenValidator;
 import mcp.auth.resource_server : ResourceServerConfig, TokenValidator;
 import mcp.auth.oauth_proxy : InMemoryRedirectUriRegistry, RedirectUriRegistry,
 	maxRedirectUrisPerRegistration;
-import mcp.transport.session : BoundedExpiringMap;
+import mcp.internal.expiring_map : BoundedExpiringMap;
 
 @safe:
 
@@ -152,8 +153,11 @@ final class DemoAuthServer
 		if (cfg_.nowUnixSeconds is null)
 			cfg_.nowUnixSeconds = () => systemNowUnixSeconds();
 		registry_ = registry !is null ? registry : new InMemoryRedirectUriRegistry();
-		tokens_ = tokens !is null ? tokens : new ReferenceTokenStore(cfg_.accessTokenTtl,
-				maxRefreshGrants, null);
+		// Each minted token carries its own `expiresAt` (now + accessTokenTtl),
+		// so the store needs only the entry cap.
+		ReferenceTokenStoreOptions topts;
+		topts.maxEntries = maxRefreshGrants;
+		tokens_ = tokens !is null ? tokens : new ReferenceTokenStore(topts);
 		codes_ = BoundedExpiringMap!PendingCode(cfg_.codeTtl, maxPendingCodes, null);
 		refreshes_ = BoundedExpiringMap!RefreshGrant(cfg_.refreshTokenTtl, maxRefreshGrants, null);
 	}
