@@ -10276,10 +10276,10 @@ unittest  // a push terminated control is delivered typed and drops the stream's
 	}, (EventControl ctrl) @safe { gotCtrl = ctrl; gotControl = true; });
 
 	c.dispatchInbound(Message(makeNotification(eventsTerminatedNotification,
-			withSubscriptionId(Json(["error": Json(["code": Json(-32012)])]), Json(1)))));
+			withSubscriptionId(Json(["error": Json(["code": Json(-32024)])]), Json(1)))));
 	assert(gotControl);
 	assert(gotCtrl.kind == EventControlKind.terminated);
-	assert(gotCtrl.error.get.code == -32012);
+	assert(gotCtrl.error.get.code == -32024);
 
 	// Handlers are gone after termination: a later occurrence for sub 1 is dropped.
 	c.dispatchInbound(Message(makeNotification(eventsEventNotification,
@@ -10811,7 +10811,7 @@ unittest  // subscribeStream tracks the cursor and ends the handle on a terminat
 	assert(sub.active);
 
 	c.dispatchInbound(Message(makeNotification(eventsTerminatedNotification,
-			withSubscriptionId(Json(["error": Json(["code": Json(-32012)])]), Json(1)))));
+			withSubscriptionId(Json(["error": Json(["code": Json(-32024)])]), Json(1)))));
 	assert(!sub.active);
 }
 
@@ -10834,7 +10834,7 @@ unittest  // a terminated managed push subscription releases its stream
 	auto sub = c.subscribeStream(StreamParams("incident.created"), (EventOccurrence o) @safe {
 	});
 	c.dispatchInbound(Message(makeNotification(eventsTerminatedNotification,
-			withSubscriptionId(Json(["error": Json(["code": Json(-32012)])]), Json(1)))));
+			withSubscriptionId(Json(["error": Json(["code": Json(-32024)])]), Json(1)))));
 	assert(!sub.active);
 	assert(c.managedStreams_.length == 0, "a terminated subscription must leave the registry");
 	assert(t.streams[0].ended, "a terminated subscription must close its stream");
@@ -11527,7 +11527,7 @@ unittest  // a webhook `terminated` envelope ends the managed subscription
 	auto h = webhookHarness();
 	assert(h.sub.active);
 	h.deliver(terminatedEnvelope(Json([
-		"code": Json(-32012),
+		"code": Json(-32024),
 		"message": Json("revoked")
 	])), "m1");
 	assert(h.controls.length == 1 && h.controls[0].kind == EventControlKind.terminated);
@@ -11540,7 +11540,7 @@ unittest  // a terminated webhook subscription unregisters from the receiver
 
 	auto h = webhookHarness();
 	h.deliver(terminatedEnvelope(Json([
-		"code": Json(-32012),
+		"code": Json(-32024),
 		"message": Json("revoked")
 	])), "m1");
 	assert(h.rx.processDelivery("{}", ["X-MCP-Subscription-Id": "sub_x"]).status == 503,
@@ -11561,7 +11561,7 @@ unittest  // the webhook refresh loop stops once the subscription is terminated
 		return r.toJson();
 	};
 	h.deliver(terminatedEnvelope(Json([
-		"code": Json(-32012),
+		"code": Json(-32024),
 		"message": Json("revoked")
 	])), "m1");
 	SubscribeResult first;

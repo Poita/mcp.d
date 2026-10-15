@@ -543,7 +543,7 @@ struct UnsubscribeParams
 
 /// A fixed category describing why a webhook delivery (or verification) failed.
 /// Surfaced both as `deliveryStatus.lastError` and as `data.reason` on a
-/// `-32015 CallbackEndpointError`. Never carries raw endpoint bodies/headers, so
+/// `-32027 CallbackEndpointError`. Never carries raw endpoint bodies/headers, so
 /// it cannot serve as a response oracle for attacker-chosen URLs.
 enum DeliveryErrorCategory
 {
@@ -1380,7 +1380,7 @@ unittest  // control envelopes carry the right discriminator
 {
 	assert(gapEnvelope(nullable("c"))["type"].get!string == "gap");
 	assert(gapEnvelope(nullable("c"))["cursor"].get!string == "c");
-	assert(terminatedEnvelope(Json(["code": Json(-32012)]))["type"].get!string == "terminated");
+	assert(terminatedEnvelope(Json(["code": Json(-32024)]))["type"].get!string == "terminated");
 	assert(verificationEnvelope("nonce")["challenge"].get!string == "nonce");
 }
 
@@ -1402,8 +1402,8 @@ unittest  // activeParams / heartbeatParams emit cursor:null when null
 
 unittest  // terminatedParams nests the error like an error frame, without an envelope type
 {
-	auto p = terminatedParams(Json(["code": Json(-32011)]));
-	assert(p["error"]["code"].get!int == -32011);
+	auto p = terminatedParams(Json(["code": Json(-32023)]));
+	assert(p["error"]["code"].get!int == -32023);
 	assert("type" !in p);
 }
 
@@ -1448,11 +1448,11 @@ unittest  // withSubscriptionId stamps an empty-string id, which JSON-RPC allows
 unittest  // EventError round-trips code/message/data and tolerates a non-object
 {
 	auto err = EventError.fromJson(Json([
-		"code": Json(-32012),
+		"code": Json(-32024),
 		"message": Json("revoked"),
 		"data": Json(["reason": Json("challenge_failed")])
 	]));
-	assert(err.code == -32012);
+	assert(err.code == -32024);
 	assert(err.message == "revoked");
 	assert(err.data["reason"].get!string == "challenge_failed");
 	assert(EventError.fromJson(Json("nope")).code == 0);
@@ -1480,11 +1480,11 @@ unittest  // a push `terminated` frame carries its typed error
 {
 	EventControl c;
 	auto params = Json([
-		"error": Json(["code": Json(-32012), "message": Json("gone")])
+		"error": Json(["code": Json(-32024), "message": Json("gone")])
 	]);
 	assert(controlFromPushNotification(eventsTerminatedNotification, params, c));
 	assert(c.kind == EventControlKind.terminated);
-	assert(c.error.get.code == -32012);
+	assert(c.error.get.code == -32024);
 	assert(c.error.get.message == "gone");
 }
 
@@ -1518,10 +1518,10 @@ unittest  // a webhook terminated envelope carries its typed error
 {
 	EventControl c;
 	assert(controlFromWebhookEnvelope(terminatedEnvelope(Json([
-		"code": Json(-32012)
+		"code": Json(-32024)
 	])), c));
 	assert(c.kind == EventControlKind.terminated);
-	assert(c.error.get.code == -32012);
+	assert(c.error.get.code == -32024);
 }
 
 unittest  // a webhook verification envelope is not surfaced as control
