@@ -49,7 +49,7 @@ struct TaskOptions
 	Duration sweepInterval = 30.seconds;
 	Duration maxUnsettledAge = 24.hours;
 	/// Most unsettled (working or input_required) tasks one authenticated
-	/// principal may hold; creating another fails with `-32013` (0 = unlimited).
+	/// principal may hold; creating another fails with `-32025` (0 = unlimited).
 	size_t maxUnsettledPerPrincipal = 100;
 	/// Most unsettled tasks all unbound (unauthenticated) creators may hold
 	/// together, since they cannot be told apart (0 = unlimited).

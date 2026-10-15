@@ -858,7 +858,7 @@ final class EventsRuntime
 			throw invalidParams("arguments do not match inputSchema: " ~ msg);
 	}
 
-	/// Remove an event type: every subscription to it ends with `-32011 NotFound
+	/// Remove an event type: every subscription to it ends with `-32023 NotFound
 	/// {kind: "event"}` (push streams get `notifications/events/terminated`,
 	/// webhook subscriptions a `terminated` envelope), its poll leases are dropped,
 	/// `on_unsubscribe` fires for every key still subscribed, the type leaves
@@ -891,7 +891,7 @@ final class EventsRuntime
 
 	// End the subscriptions of every delivery mode `name` offered (`before`) but
 	// no longer offers: push streams and webhook subscriptions are terminated
-	// with `-32014 Unsupported` naming the mode, and poll leases are dropped.
+	// with `-32026 Unsupported` naming the mode, and poll leases are dropped.
 	private void endDisabledModes(string name, const DeliveryMode[] before) @safe
 	{
 		import std.algorithm : canFind;
@@ -922,7 +922,7 @@ final class EventsRuntime
 		}
 	}
 
-	// The `-32014 Unsupported` a subscription ends with when its event type's
+	// The `-32026 Unsupported` a subscription ends with when its event type's
 	// schema changed incompatibly in place: `data.feature` names the schema and
 	// `data.reason` is `schema_changed`, so a client distinguishes it from an
 	// authorization failure.
@@ -1423,7 +1423,7 @@ final class EventsRuntime
 	}
 
 	/// End every subscription `principal` holds — to event type `name`, or to
-	/// every type when `name` is empty — with `error` (typically `-32012 Forbidden`
+	/// every type when `name` is empty — with `error` (typically `-32024 Forbidden`
 	/// once access is revoked).
 	void terminatePrincipal(string principal, string name, Json error) @safe
 	{
@@ -1638,7 +1638,7 @@ final class EventsRuntime
 		return r;
 	}
 
-	// Throw `-32013` when `principal` already holds its cap of live webhook
+	// Throw `-32025` when `principal` already holds its cap of live webhook
 	// subscriptions.
 	private void enforceWebhookCap(string principal, long now) @safe
 	{
@@ -2941,7 +2941,7 @@ final class EventsRuntime
 	/// Ensure the `(principal, url)` endpoint is verified before delivering.
 	/// Verification is delivery-time-lazy: `events/subscribe` accepts a syntactically
 	/// valid callback without a synchronous pre-flight, so it never raises the
-	/// reserved `-32015 callbackEndpointError` itself. A callback that fails to verify
+	/// reserved `-32027 callbackEndpointError` itself. A callback that fails to verify
 	/// or becomes unreachable is reflected after the fact in the subscription's
 	/// `deliveryStatus` (`lastError`/`failedSince`, and `active=false` once suspended)
 	/// — the delivery-time category surfaced to the client on its next refresh.
@@ -4475,7 +4475,7 @@ unittest  // a push stream that falls too far behind is terminated as a slow con
 	for (size_t i = 0; i < jobs.length; i++)
 		jobs[i]();
 	assert(methods == [eventsTerminatedNotification]);
-	assert(params[0]["error"]["code"].get!int == -32013);
+	assert(params[0]["error"]["code"].get!int == -32025);
 	assert(handle.stream.terminated && unsubs == 1);
 }
 
@@ -4640,7 +4640,7 @@ unittest  // terminatePush sends a terminated frame, releases the subscription, 
 	handle.stream.onTerminated = () @safe { hooked = true; };
 	rt.terminatePush(handle.stream, toErrorJson(forbidden("Access revoked")));
 	assert(methods == [eventsTerminatedNotification]);
-	assert(params[0]["error"]["code"].get!int == -32012);
+	assert(params[0]["error"]["code"].get!int == -32024);
 	assert(params[0]["_meta"][MetaKey.subscriptionId].get!int == 3);
 	assert(unsubs == 1 && hooked && handle.stream.terminated);
 	rt.emit(EventOccurrence("evt", "incident.created", "t"));
@@ -5454,7 +5454,7 @@ unittest  // unregister ends every subscription with NotFound{kind:event} and no
 	rt.markVerified(r.id);
 	assert(rt.unregister("n"));
 	assert(methods == [eventsTerminatedNotification]);
-	assert(params[0]["error"]["code"].get!int == -32011);
+	assert(params[0]["error"]["code"].get!int == -32023);
 	assert(params[0]["error"]["data"]["kind"].get!string == "event");
 	assert(rt.webhookStore().get(r.id).isNull);
 	assert(controlPostsOf(ft, "terminated").length == 1);
@@ -5495,7 +5495,7 @@ unittest  // re-registering with an incompatible payloadSchema terminates with U
 			`{"type":"object","properties":{"a":{"type":"integer"}}}`);
 	rt.register(reg);
 	assert(methods == [eventsTerminatedNotification]);
-	assert(params[0]["error"]["code"].get!int == -32014);
+	assert(params[0]["error"]["code"].get!int == -32026);
 	assert(params[0]["error"]["data"]["feature"].get!string == "payloadSchema");
 	assert(params[0]["error"]["data"]["reason"].get!string == "schema_changed");
 	assert(changed == 2);

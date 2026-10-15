@@ -19,9 +19,10 @@ enum ErrorCode : int
 	resourceNotFound = -32002,
 	requestCancelled = -32800,
 	// MCP-allocated codes sit in JSON-RPC's implementation-defined server range
-	// [-32000,-32099]. Core modern-protocol codes are allocated sequentially from
-	// -32020 and are emitted only to modern peers; the Events extension's
-	// general-purpose codes below use -32011..-32015.
+	// [-32000,-32099]: [-32000,-32019] is left to implementations and never
+	// defined by the spec, and specification codes are allocated sequentially
+	// from -32020 (emitted only to modern peers). The Events extension's
+	// general-purpose codes below take -32023..-32027 (SEP-3415).
 	// Streamable HTTP: header/body validation failure.
 	headerMismatch = -32020,
 	// basic/lifecycle (MissingRequiredClientCapabilityError): processing a request
@@ -43,11 +44,11 @@ enum ErrorCode : int
 	// family of conditions, conveying the specifics through a typed `data`
 	// payload (the -32004 pattern). Named for reuse across MCP rather than scoped
 	// to events.
-	notFound = -32011, /// referenced entity does not exist (data.kind disambiguates)
-	forbidden = -32012, /// principal not permitted, or access revoked
-	resourceExhausted = -32013, /// a server-imposed limit/quota was reached
-	unsupported = -32014, /// well-formed but an option is not supported here
-	callbackEndpointError = -32015 /// webhook callback failed verification/reachability
+	notFound = -32023, /// referenced entity does not exist (data.kind disambiguates)
+	forbidden = -32024, /// principal not permitted, or access revoked
+	resourceExhausted = -32025, /// a server-imposed limit/quota was reached
+	unsupported = -32026, /// well-formed but an option is not supported here
+	callbackEndpointError = -32027 /// webhook callback failed verification/reachability
 }
 
 /// An error that maps onto a JSON-RPC error object.
@@ -118,7 +119,7 @@ McpException internalError(string message, Json data = Json.undefined) @safe pur
 	return new McpException(ErrorCode.internalError, message, data);
 }
 
-/// Build a `-32011 NotFound`: a referenced entity (an event name, a
+/// Build a `-32023 NotFound`: a referenced entity (an event name, a
 /// subscription) does not exist. `kind` (`"event"` | `"subscription"`) MAY
 /// disambiguate via `data.kind`; pass `null` to omit it.
 McpException notFound(string message, string kind = null) @safe
@@ -132,14 +133,14 @@ McpException notFound(string message, string kind = null) @safe
 	return new McpException(ErrorCode.notFound, message, data);
 }
 
-/// Build a `-32012 Forbidden`: the authenticated principal is not permitted for
+/// Build a `-32024 Forbidden`: the authenticated principal is not permitted for
 /// this operation, or its access was revoked.
 McpException forbidden(string message, Json data = Json.undefined) @safe pure nothrow
 {
 	return new McpException(ErrorCode.forbidden, message, data);
 }
 
-/// Build a `-32013 ResourceExhausted`: a server-imposed limit or quota was
+/// Build a `-32025 ResourceExhausted`: a server-imposed limit or quota was
 /// reached. `limit` names it (e.g. `"subscriptions"`) via `data.limit`; a
 /// non-negative `max` adds `data.max`, the ceiling.
 McpException resourceExhausted(string message, string limit = null, long max = -1) @safe
@@ -156,7 +157,7 @@ McpException resourceExhausted(string message, string limit = null, long max = -
 	return new McpException(ErrorCode.resourceExhausted, message, data);
 }
 
-/// Build a `-32014 Unsupported`: the request is well-formed but a requested
+/// Build a `-32026 Unsupported`: the request is well-formed but a requested
 /// capability or option is not supported here (e.g. a delivery mode the event
 /// type does not offer). `feature`/`value` identify it via `data`.
 McpException unsupported(string message, string feature = null, string value = null) @safe
@@ -173,7 +174,7 @@ McpException unsupported(string message, string feature = null, string value = n
 	return new McpException(ErrorCode.unsupported, message, data);
 }
 
-/// Build a `-32015 CallbackEndpointError`: a client-supplied webhook callback
+/// Build a `-32027 CallbackEndpointError`: a client-supplied webhook callback
 /// endpoint failed verification or could not be reached. `reason` is one of the
 /// `DeliveryErrorCategory` wire strings, surfaced via `data.reason`.
 McpException callbackEndpointError(string message, string reason) @safe
@@ -657,13 +658,24 @@ unittest  // urlElicitationRequired accepts a valid absolute url
 	assert(e.data["elicitations"][0]["url"].get!string == "https://example.com/connect");
 }
 
-unittest  // the Events general-purpose codes have the spec's values
+unittest  // the Events general-purpose codes have the SEP-3415 values
 {
-	assert(ErrorCode.notFound == -32011);
-	assert(ErrorCode.forbidden == -32012);
-	assert(ErrorCode.resourceExhausted == -32013);
-	assert(ErrorCode.unsupported == -32014);
-	assert(ErrorCode.callbackEndpointError == -32015);
+	assert(ErrorCode.notFound == -32023);
+	assert(ErrorCode.forbidden == -32024);
+	assert(ErrorCode.resourceExhausted == -32025);
+	assert(ErrorCode.unsupported == -32026);
+	assert(ErrorCode.callbackEndpointError == -32027);
+}
+
+unittest  // the Events codes sit in the spec-allocated range, after the core codes
+{
+	// [-32000,-32019] is left to implementations and never defined by the spec;
+	// specification codes are allocated sequentially from -32020.
+	foreach (c; [
+		ErrorCode.notFound, ErrorCode.forbidden, ErrorCode.resourceExhausted,
+		ErrorCode.unsupported, ErrorCode.callbackEndpointError
+	])
+		assert(c <= -32020 && c >= -32099 && c < ErrorCode.unsupportedProtocolVersion);
 }
 
 unittest  // notFound omits data by default and attaches data.kind when given
@@ -674,7 +686,7 @@ unittest  // notFound omits data by default and attaches data.kind when given
 	assert(e.data["kind"].get!string == "subscription");
 }
 
-unittest  // forbidden uses -32012
+unittest  // forbidden uses -32024
 {
 	auto e = forbidden("access revoked");
 	assert(e.code == ErrorCode.forbidden && e.msg == "access revoked");

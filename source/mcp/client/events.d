@@ -734,7 +734,7 @@ unittest  // a terminated control envelope is routed to onControl
 		got = true;
 	});
 	const 
-	body = terminatedEnvelope(Json(["code": Json(-32012)])).toString();
+	body = terminatedEnvelope(Json(["code": Json(-32024)])).toString();
 	DeliverySigning signing = {
 		secret: testSecret, messageId: "msg_term", timestamp: 1700, subscriptionId: "sub_1"
 	};
@@ -742,5 +742,5 @@ unittest  // a terminated control envelope is routed to onControl
 	assert(rx.processDelivery(body, headers).status == 200);
 	assert(got);
 	assert(gotControl.kind == EventControlKind.terminated);
-	assert(gotControl.error.get.code == -32012);
+	assert(gotControl.error.get.code == -32024);
 }

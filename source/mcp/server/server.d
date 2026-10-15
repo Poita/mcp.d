@@ -1463,8 +1463,9 @@ final class McpServer : ServerCore
 	/// with default options, so call this first to choose them: once a type is
 	/// registered it throws rather than replace the runtime holding that type.
 	/// The periodic delivery worker runs until `shutdown`. The extension is
-	/// advertised without `listChanged`, so clients re-call `events/list` rather
-	/// than wait for `notifications/events/list_changed`.
+	/// advertised with `listChanged: true` (SEP-3415): a change to the registered
+	/// event types sends `notifications/events/list_changed` to every
+	/// `subscriptions/listen` stream that opted in with `eventsListChanged`.
 	EventsRuntime enableEvents(WebhookSubscriptionStore store = null,
 			EventsOptions opts = EventsOptions.init) @safe
 	{
@@ -1494,10 +1495,12 @@ final class McpServer : ServerCore
 				eventsRuntime_.startDeliveryWorker(opts.workerInterval);
 		}
 		eventsEnabled_ = true;
-		// No `listChanged`: a modern client receives list-changed notifications
-		// only through a `subscriptions/listen` filter key, and the extension
-		// defines none for `notifications/events/list_changed`.
-		advertiseExtension(eventsExtensionKey, Json.emptyObject);
+		// The listen filter delivers the notification only to streams that set
+		// `eventsListChanged`, so it is safe to broadcast on every type change.
+		eventsRuntime_.onListChanged(() @safe {
+			notify(eventsListChangedNotification);
+		});
+		advertiseExtension(eventsExtensionKey, Json(["listChanged": Json(true)]));
 		return eventsRuntime_;
 	}
 
@@ -3251,6 +3254,11 @@ final class McpServer : ServerCore
 				}
 			}
 
+			if (auto e = "eventsListChanged" in filter)
+				if (e.type == Json.Type.bool_ && e.get!bool
+						&& supportsListenType("eventsListChanged"))
+					perStream.eventsListChanged = true;
+
 			if (auto ids = "taskIds" in filter)
 				if (tasksEnabled_ && ids.type == Json.Type.array && ids.length)
 				{
@@ -3300,6 +3308,10 @@ final class McpServer : ServerCore
 			return resourcesListChangedEnabled;
 		case "resourceSubscriptions":
 			return listenResourceSubscriptions();
+		case "eventsListChanged":
+			// SEP-3415: honoured when the Events extension is enabled, which is
+			// what declares `listChanged: true` in its settings.
+			return eventsEnabled_;
 		default:
 			return false;
 		}
@@ -3347,6 +3359,8 @@ final class McpServer : ServerCore
 				ids ~= Json(id);
 			subset["taskIds"] = ids;
 		}
+		if (f.eventsListChanged)
+			subset["eventsListChanged"] = true;
 		return subset;
 	}
 
@@ -8142,13 +8156,14 @@ unittest  // enableEvents advertises the events extension under the modern proto
 	assert("io.modelcontextprotocol/events" in caps["extensions"]);
 }
 
-unittest  // the events extension does not advertise listChanged, which no listen filter can carry
+unittest  // server/discover advertises listChanged:true in the events extension settings
 {
+	// SEP-3415: listChanged pairs with the eventsListChanged listen filter key.
 	auto s = new McpServer("t", "1");
 	s.enableEvents();
 	auto resp = s.handle(modernReq(1, "server/discover")).get;
 	auto settings = resp["result"]["capabilities"]["extensions"]["io.modelcontextprotocol/events"];
-	assert("listChanged" !in settings);
+	assert(settings["listChanged"].get!bool);
 }
 
 unittest  // events/* are -32601 when the server never enabled events
@@ -8216,7 +8231,7 @@ unittest  // events/poll bootstraps then drains an emitted event
 	assert(next["result"]["events"][0]["data"]["severity"].get!string == "P1");
 }
 
-unittest  // events/poll on an unknown event type is -32011 NotFound
+unittest  // events/poll on an unknown event type is -32023 NotFound
 {
 	auto s = new McpServer("t", "1");
 	s.enableEvents();
@@ -8224,7 +8239,7 @@ unittest  // events/poll on an unknown event type is -32011 NotFound
 	assert(resp["error"]["code"].get!int == ErrorCode.notFound);
 }
 
-unittest  // events/subscribe without an authenticated principal is -32012 Forbidden
+unittest  // events/subscribe without an authenticated principal is -32024 Forbidden
 {
 	auto s = new McpServer("t", "1");
 	s.enableEvents();
@@ -8499,7 +8514,7 @@ unittest  // a server-terminated stdio stream gets the terminated frame, then th
 	rt.terminatePrincipal("", "n", toErrorJson(forbidden("Access revoked")));
 	assert(lines.length == opened + 2);
 	assert(lines[opened].canFind("notifications/events/terminated")
-			&& lines[opened].canFind("-32012"));
+			&& lines[opened].canFind("-32024"));
 	auto fin = parseJsonString(lines[opened + 1]);
 	assert(fin["id"].get!int == 1 && fin["result"]["_meta"].type == Json.Type.object);
 	// The stream is gone: a later tick sends it no heartbeat.
@@ -11963,6 +11978,95 @@ unittest  // a listen stream receives only the notification types its filter req
 	assert(!frames.canFind!(fr => fr.canFind("notifications/events/list_changed")));
 	s.notify("notifications/tools/list_changed");
 	assert(frames.canFind!(fr => fr.canFind("notifications/tools/list_changed")));
+}
+
+version (unittest)
+{
+	// Open a stdio `subscriptions/listen` stream on `s` with `filter` as the
+	// notifications filter; every frame the server sends goes to `sink`.
+	private void openEventsListen(McpServer s, Json filter, void delegate(string) @safe sink) @safe
+	{
+		Json meta = Json.emptyObject;
+		meta[MetaKey.protocolVersion] = "2026-07-28";
+		meta[MetaKey.clientCapabilities] = Json([
+			"extensions": Json([eventsExtensionKey: Json.emptyObject])
+		]);
+		Json params = Json.emptyObject;
+		params["notifications"] = filter;
+		params["_meta"] = meta;
+		assert(s.tryServeStdioListen(Message(makeRequest(Json(1),
+				"subscriptions/listen", params)), sink));
+	}
+
+	private struct ListChangedArgs
+	{
+		string k;
+	}
+
+	private struct ListChangedPayload
+	{
+		string v;
+	}
+}
+
+unittest  // enableEvents advertises listChanged:true in the events extension settings
+{
+	auto s = new McpServer("t", "1");
+	s.enableEvents();
+	auto ext = s.capabilities().toJson()["extensions"][eventsExtensionKey];
+	assert(ext["listChanged"].get!bool, "SEP-3415: the server declares listChanged");
+}
+
+unittest  // a listen stream opting into eventsListChanged gets it echoed in the ack
+{
+	import std.algorithm : canFind;
+
+	auto s = new McpServer("t", "1");
+	s.enableEvents();
+	string[] frames;
+	openEventsListen(s, Json(["eventsListChanged": Json(true)]), (string f) @safe {
+		frames ~= f;
+	});
+	assert(frames.canFind!(fr => fr.canFind("acknowledged") && fr.canFind("eventsListChanged")));
+}
+
+unittest  // registering an event type sends events/list_changed to an opted-in stream
+{
+	import std.algorithm : canFind;
+
+	auto s = new McpServer("t", "1");
+	auto rt = s.enableEvents();
+	string[] frames;
+	openEventsListen(s, Json(["eventsListChanged": Json(true)]), (string f) @safe {
+		frames ~= f;
+	});
+	rt.define!(ListChangedArgs, ListChangedPayload)("late.type", "registered after listen");
+	assert(frames.canFind!(fr => fr.canFind("notifications/events/list_changed")));
+}
+
+unittest  // a stream that did not opt into eventsListChanged never receives it
+{
+	import std.algorithm : canFind;
+
+	auto s = new McpServer("t", "1");
+	auto rt = s.enableEvents();
+	string[] frames;
+	openEventsListen(s, Json.emptyObject, (string f) @safe { frames ~= f; });
+	rt.define!(ListChangedArgs, ListChangedPayload)("late.type", "registered after listen");
+	assert(!frames.canFind!(fr => fr.canFind("notifications/events/list_changed")));
+}
+
+unittest  // without the Events extension, eventsListChanged is dropped from the ack
+{
+	import std.algorithm : canFind;
+
+	auto s = new McpServer("t", "1");
+	string[] frames;
+	openEventsListen(s, Json(["eventsListChanged": Json(true)]), (string f) @safe {
+		frames ~= f;
+	});
+	assert(frames.canFind!(fr => fr.canFind("acknowledged")));
+	assert(!frames.canFind!(fr => fr.canFind("eventsListChanged")));
 }
 
 unittest  // tools listChanged is not advertised by default
