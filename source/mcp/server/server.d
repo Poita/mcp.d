@@ -8216,7 +8216,7 @@ unittest  // events/poll bootstraps then drains an emitted event
 	assert(next["result"]["events"][0]["data"]["severity"].get!string == "P1");
 }
 
-unittest  // events/poll on an unknown event type is -32011 NotFound
+unittest  // events/poll on an unknown event type is -32023 NotFound
 {
 	auto s = new McpServer("t", "1");
 	s.enableEvents();
@@ -8224,7 +8224,7 @@ unittest  // events/poll on an unknown event type is -32011 NotFound
 	assert(resp["error"]["code"].get!int == ErrorCode.notFound);
 }
 
-unittest  // events/subscribe without an authenticated principal is -32012 Forbidden
+unittest  // events/subscribe without an authenticated principal is -32024 Forbidden
 {
 	auto s = new McpServer("t", "1");
 	s.enableEvents();
@@ -8499,7 +8499,7 @@ unittest  // a server-terminated stdio stream gets the terminated frame, then th
 	rt.terminatePrincipal("", "n", toErrorJson(forbidden("Access revoked")));
 	assert(lines.length == opened + 2);
 	assert(lines[opened].canFind("notifications/events/terminated")
-			&& lines[opened].canFind("-32012"));
+			&& lines[opened].canFind("-32024"));
 	auto fin = parseJsonString(lines[opened + 1]);
 	assert(fin["id"].get!int == 1 && fin["result"]["_meta"].type == Json.Type.object);
 	// The stream is gone: a later tick sends it no heartbeat.
