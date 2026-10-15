@@ -39,6 +39,9 @@ struct ListenFilter
 	/// The task ids opted into for `notifications/tasks` (the Tasks extension's
 	/// `notifications.taskIds` listen filter key).
 	string[] taskIds;
+	/// Opted into `notifications/events/list_changed` (the Events extension's
+	/// `notifications.eventsListChanged` listen filter key, SEP-3415).
+	bool eventsListChanged;
 
 	/// Whether a notification with this JSON-RPC `method` and filter `key` (see
 	/// `listenFilterKey`: the resource URI of `notifications/resources/updated`, the
@@ -64,6 +67,8 @@ struct ListenFilter
 			return resourceSubscriptions && resourceUris.canFind(key);
 		case "notifications/tasks":
 			return key.length && taskIds.canFind(key);
+		case "notifications/events/list_changed":
+			return eventsListChanged;
 		default:
 			return false;
 		}
