@@ -5,15 +5,16 @@
 /// entry points stay stable as options accumulate instead of growing a positional
 /// argument per knob. Build the server from the settings with `newServer`, then
 /// serve it with the `ServerSettings` overloads of `runStreamableHttp` / `runStdio`
-/// (which read the nested `http` / `stdio` options).
+/// from `mcp.transport` (which read the nested `http` / `stdio` options).
 module mcp.server.settings;
 
 import std.typecons : Nullable;
 
 import mcp.protocol.capabilities : Implementation;
+import mcp.server.request_state : RequestStateSecurity;
 import mcp.server.server : McpServer, ServerMode;
-import mcp.transport.streamable_http : StreamableHttpOptions, runStreamableHttp;
-import mcp.transport.stdio : StdioOptions, runStdio;
+import mcp.transport.streamable_http : StreamableHttpOptions;
+import mcp.transport.stdio : StdioOptions;
 
 /// Static configuration for an MCP server, and the primary documented path for
 /// declaring it. `newServer` constructs an `McpServer` from the identity + mode
@@ -52,9 +53,12 @@ struct ServerSettings
 	/// `enablePromptsListChanged`). Off by default.
 	bool promptsListChanged;
 
-	/// Advertise the `logging` capability and accept `logging/setLevel` (calls
-	/// `enableLogging`). Off by default. Valid in either statefulness mode (the
-	/// modern per-request `_meta` logging path uses it on a stateless server).
+	/// Advertise the `logging` capability so handlers' `ctx.log` emits
+	/// `notifications/message` (calls `enableLogging`). Off by default. Valid in
+	/// either statefulness mode, but only a stateful server accepts
+	/// `logging/setLevel`: a stateless server has no session to hold the level,
+	/// so it answers that RPC with -32601 and logs at the default `info` minimum
+	/// (or the modern request's `_meta` log level).
 	bool logging;
 
 	/// Advertise the resources `subscribe` capability (calls
@@ -68,12 +72,30 @@ struct ServerSettings
 	/// `enableOutputSchemaValidation`). Off by default, matching the method.
 	bool outputSchemaValidation;
 
-	/// Tri-state control of input-schema validation, which is **on by default** on
-	/// the server. `null` (the default) leaves that default untouched; `true` calls
-	/// `enableInputSchemaValidation`; `false` calls `disableInputSchemaValidation`.
-	/// The tri-state lets the settings express "leave default" as well as an
-	/// explicit on/off, since the underlying default is enabled.
-	Nullable!bool inputSchemaValidation;
+	/// Validate each tool call's `arguments` against the tool's `inputSchema`
+	/// before its handler runs. On by default, since the spec says servers MUST
+	/// validate tool inputs; `false` calls `disableInputSchemaValidation`.
+	bool inputSchemaValidation = true;
+
+	/// Reject a stateful session's requests (other than `ping`) that arrive before
+	/// its `notifications/initialized` with -32600 (calls `requireInitialized`).
+	/// Off by default: the lifecycle rule is a SHOULD. Setting it on a
+	/// `stateless` server makes `newServer()` throw.
+	bool requireInitialized;
+
+	/// Send an unexpected handler exception's message to the client instead of a
+	/// generic "Internal error" (calls `exposeInternalErrors`). Off by default,
+	/// since such messages can leak internals; useful in development.
+	bool exposeInternalErrors;
+
+	/// The most items one page of a paginated list method returns (calls
+	/// `setPageSize`). `0` (the default) returns every item in a single page.
+	size_t pageSize;
+
+	/// When set, protect the MRTR `requestState` with the secure codec (calls
+	/// `secureRequestState`). Null (the default) passes it through as plaintext.
+	/// Stateless mode only: `newServer` throws when it is set on a `stateful` mode.
+	Nullable!RequestStateSecurity requestStateSecurity;
 
 	/// Advertise the MCP Apps extension capability (calls `enableApps` from
 	/// `mcp.api.apps` with its default mime types). Off by default.
@@ -89,8 +111,8 @@ struct ServerSettings
 	/// Construct a fresh `McpServer` from this settings' identity and mode, then
 	/// apply the capability/validation flags via the matching `enable*`/`disable*`
 	/// methods. Tools, resources, and prompts are registered on the returned server
-	/// before serving. Throws when `resourceSubscriptions` is set on a `stateless`
-	/// mode (the loud error from `enableResourceSubscriptions()`).
+	/// before serving. Throws when `resourceSubscriptions` or `requireInitialized`
+	/// is set on a `stateless` mode, or `requestStateSecurity` on a `stateful` one.
 	McpServer newServer() @safe
 	{
 		import mcp.api.apps : enableApps;
@@ -116,33 +138,24 @@ struct ServerSettings
 			server.enableLogging();
 		if (outputSchemaValidation)
 			server.enableOutputSchemaValidation();
-		if (!inputSchemaValidation.isNull)
-		{
-			if (inputSchemaValidation.get)
-				server.enableInputSchemaValidation();
-			else
-				server.disableInputSchemaValidation();
-		}
+		if (!inputSchemaValidation)
+			server.disableInputSchemaValidation();
+		if (requireInitialized)
+			server.requireInitialized();
+		if (exposeInternalErrors)
+			server.exposeInternalErrors();
+		if (pageSize > 0)
+			server.setPageSize(pageSize);
+		if (!requestStateSecurity.isNull)
+			server.secureRequestState(requestStateSecurity.get);
 		if (apps)
-			enableApps(server);
+			server.enableApps();
 		// Last: a stateless-mode resourceSubscriptions opt-in throws here, exactly
 		// as a direct enableResourceSubscriptions() call would.
 		if (resourceSubscriptions)
 			server.enableResourceSubscriptions();
 		return server;
 	}
-}
-
-/// Serve `server` over Streamable HTTP using `settings.http`. Blocks until exit.
-void runStreamableHttp(McpServer server, ServerSettings settings) @safe
-{
-	runStreamableHttp(server, settings.http);
-}
-
-/// Serve `server` over stdio using `settings.stdio`. Blocks until exit.
-void runStdio(McpServer server, ServerSettings settings)
-{
-	runStdio(server, settings.stdio);
 }
 
 @safe unittest
@@ -166,17 +179,13 @@ void runStdio(McpServer server, ServerSettings settings)
 
 @safe unittest
 {
-	// The nested transport options carry through and the run overloads are callable.
+	// The nested transport options carry through.
 	ServerSettings s;
 	s.serverInfo = Implementation("settings-srv", "1.0");
 	s.http.port = 9100;
 	s.stdio.maxLineBytes = 4096;
 	assert(s.http.port == 9100);
 	assert(s.stdio.maxLineBytes == 4096);
-	static assert(__traits(compiles, (McpServer srv, ServerSettings cfg) {
-			runStreamableHttp(srv, cfg);
-			runStdio(srv, cfg);
-		}));
 }
 
 version (unittest)
@@ -250,7 +259,7 @@ version (unittest)
 @safe unittest
 {
 	// resourceSubscriptions on a STATELESS server makes newServer() throw the same
-	// loud error enableResourceSubscriptions() raises directly (PR 2.2 interaction).
+	// loud error enableResourceSubscriptions() raises directly.
 	import std.algorithm.searching : canFind;
 
 	ServerSettings s;
@@ -270,8 +279,25 @@ version (unittest)
 
 @safe unittest
 {
+	// requestStateSecurity on a STATEFUL server makes newServer() throw, exactly
+	// as a direct secureRequestState() call would.
+	import std.exception : assertThrown;
+	import std.typecons : nullable;
+	import mcp.server.request_state : RequestStateSecurity;
+
+	ServerSettings s;
+	s.serverInfo = Implementation("settings-srv", "1.0");
+	s.mode = ServerMode.stateful;
+	RequestStateSecurity sec;
+	sec.key = new ubyte[32];
+	s.requestStateSecurity = nullable(sec);
+	assertThrown(s.newServer());
+}
+
+@safe unittest
+{
 	// apps surfaces the MCP Apps extension capability.
-	import mcp.api.apps : mcpAppsExtensionKey;
+	import mcp.api.apps : appsExtensionKey;
 	import vibe.data.json : Json;
 
 	ServerSettings s;
@@ -279,14 +305,14 @@ version (unittest)
 	s.apps = true;
 	auto caps = s.newServer().capabilities();
 	assert(caps.extensions.type == Json.Type.object);
-	assert((mcpAppsExtensionKey in caps.extensions) !is null);
+	assert((appsExtensionKey in caps.extensions) !is null);
 }
 
 @safe unittest
 {
 	// outputSchemaValidation enforces a tool's declared outputSchema: a handler that
 	// omits structuredContent for an outputSchema'd tool surfaces an internal error.
-	import mcp.protocol.schema : jsonSchemaOf;
+	import mcp.api.binding : jsonSchemaOf, SchemaUse;
 	import mcp.protocol.types : Tool, CallToolResult, Content;
 	import std.typecons : nullable;
 	import vibe.data.json : Json;
@@ -301,7 +327,8 @@ version (unittest)
 	s.outputSchemaValidation = true;
 	auto server = s.newServer();
 	Tool t = {
-		name: "add", description: nullable("Add"), outputSchema: jsonSchemaOf!Out
+		name: "add", description: nullable("Add"), outputSchema: jsonSchemaOf!(Out,
+				SchemaUse.output)
 	};
 	// Handler returns plain text content, NO structuredContent — invalid under the
 	// declared outputSchema, so validation must reject it.
@@ -319,9 +346,9 @@ version (unittest)
 
 @safe unittest
 {
-	// inputSchemaValidation defaults to null = leave the server default (ON), so a
-	// call with arguments missing a required field is rejected (isError content).
-	import mcp.protocol.schema : jsonSchemaOf;
+	// inputSchemaValidation defaults to on, so a call with arguments missing a
+	// required field is rejected (isError content).
+	import mcp.api.binding : jsonSchemaOf;
 	import mcp.protocol.types : Tool, CallToolResult, Content;
 	import std.typecons : nullable;
 	import vibe.data.json : Json;
@@ -334,7 +361,6 @@ version (unittest)
 
 	ServerSettings s;
 	s.serverInfo = Implementation("settings-srv", "1.0");
-	// inputSchemaValidation left null -> default (ON).
 	auto server = s.newServer();
 	Tool add = {
 		name: "add", description: nullable("Add"), inputSchema: jsonSchemaOf!Args
@@ -355,9 +381,9 @@ version (unittest)
 @safe unittest
 {
 	// inputSchemaValidation = false disables validation: the same call now succeeds.
-	import mcp.protocol.schema : jsonSchemaOf;
+	import mcp.api.binding : jsonSchemaOf;
 	import mcp.protocol.types : Tool, CallToolResult, Content;
-	import std.typecons : nullable, Nullable;
+	import std.typecons : nullable;
 	import vibe.data.json : Json;
 
 	struct Args
@@ -368,7 +394,7 @@ version (unittest)
 
 	ServerSettings s;
 	s.serverInfo = Implementation("settings-srv", "1.0");
-	s.inputSchemaValidation = Nullable!bool(false);
+	s.inputSchemaValidation = false;
 	auto server = s.newServer();
 	Tool add = {
 		name: "add", description: nullable("Add"), inputSchema: jsonSchemaOf!Args
@@ -384,4 +410,95 @@ version (unittest)
 	auto resp = server.handle(callReq(1, params)).get;
 	assert("error" !in resp);
 	assert(resp["result"]["content"][0]["text"].get!string == "ok");
+}
+
+@safe unittest
+{
+	// inputSchemaValidation is a plain bool, on by default.
+	ServerSettings s;
+	assert(s.inputSchemaValidation);
+}
+
+@safe unittest
+{
+	// requireInitialized gates a stateful request sent before notifications/initialized.
+	import vibe.data.json : Json;
+
+	ServerSettings s;
+	s.serverInfo = Implementation("settings-srv", "1.0");
+	s.mode = ServerMode.stateful;
+	s.requireInitialized = true;
+	auto server = s.newServer();
+	Json init = Json.emptyObject;
+	init["protocolVersion"] = "2025-11-25";
+	init["capabilities"] = Json.emptyObject;
+	init["clientInfo"] = Json(["name": Json("c"), "version": Json("1")]);
+	server.handle(Message(makeRequest(Json(1), "initialize", init)));
+	auto early = server.handle(Message(makeRequest(Json(2), "tools/list", Json.emptyObject))).get;
+	assert(early["error"]["code"].get!int == -32600);
+}
+
+@safe unittest
+{
+	// requireInitialized on a STATELESS server makes newServer() throw.
+	import std.exception : assertThrown;
+
+	ServerSettings s;
+	s.serverInfo = Implementation("settings-srv", "1.0");
+	s.requireInitialized = true;
+	assertThrown(s.newServer());
+}
+
+@safe unittest
+{
+	// pageSize paginates the list methods.
+	import mcp.protocol.types : Tool, CallToolResult;
+	import vibe.data.json : Json;
+
+	ServerSettings s;
+	s.serverInfo = Implementation("settings-srv", "1.0");
+	s.pageSize = 1;
+	auto server = s.newServer();
+	foreach (name; ["a", "b"])
+	{
+		Tool t = {name: name};
+		server.registerTool(t, (Json) @safe => CallToolResult.init);
+	}
+	auto list = server.handle(Message(makeRequest(Json(1), "tools/list", Json.emptyObject))).get;
+	assert(list["result"]["tools"].length == 1);
+	assert("nextCursor" in list["result"]);
+}
+
+@safe unittest
+{
+	// requestStateSecurity installs the secure requestState codec.
+	import std.algorithm.searching : startsWith;
+	import std.typecons : nullable;
+	import mcp.protocol.mrtr : InputRequest, MetaKey;
+	import mcp.protocol.types : Tool;
+	import mcp.server.context : RequestContext;
+	import mcp.server.request_state : RequestStateSecurity;
+	import mcp.server.responses : ToolResponse;
+	import vibe.data.json : Json;
+
+	ServerSettings s;
+	s.serverInfo = Implementation("settings-srv", "1.0");
+	RequestStateSecurity sec;
+	sec.key = new ubyte[32];
+	s.requestStateSecurity = nullable(sec);
+	auto server = s.newServer();
+	Tool t = {name: "ask"};
+	server.registerTool(t, (Json, RequestContext) @safe => ToolResponse.inputRequired(
+			[InputRequest.elicitation("q", "Why?")], "plain"));
+
+	Json meta = Json.emptyObject;
+	meta[MetaKey.protocolVersion] = "2026-07-28";
+	meta[MetaKey.clientCapabilities] = Json(["elicitation": Json.emptyObject]);
+	Json params = Json.emptyObject;
+	params["name"] = "ask";
+	params["arguments"] = Json.emptyObject;
+	params["_meta"] = meta;
+	auto resp = server.handle(callReq(1, params)).get;
+	const state = resp["result"]["requestState"].get!string;
+	assert(state != "plain" && state.startsWith("v1"), state);
 }

@@ -15,9 +15,10 @@ module mcp.api.skill_dir;
 import vibe.data.json : Json;
 
 import mcp.server.server : McpServer;
-import mcp.api.skills : SkillFile, SkillEntry, registerSkillResources,
-	addSkillEntry, skillName, skillFileUri, isValidSkillPath,
-	isValidSkillName, skillDigest,
+import mcp.protocol.types : SkillEntry;
+import mcp.api.skills : SkillFile, registerSkillResources, addSkillEntry,
+	skillName, skillFileUri, isValidSkillPath, isValidSkillName,
+	skillDigest, skillFieldProblem,
 	verifyResourceDigest, resourceRef, maxSkillResources, maxSkillTotalBytes;
 
 @safe:
@@ -35,7 +36,15 @@ struct SkillDirOptions
 	/// supporting file only — readable, but nothing marks it as a skill.
 	bool publishNested = true;
 	/// Optional filter: return `false` to exclude a file by its skill-relative
-	/// path (e.g. drop `.git/…` or `*.pyc`). `null` includes everything. Note a
+	/// path (e.g. drop `*.pyc`). `null` includes everything except dot-prefixed
+	/// files and directories (`.git/`, `.DS_Store`). A filter replaces that
+	/// default: it is consulted for every file, dot-prefixed ones included, so it
+	/// can opt them back in and must exclude any it does not want. Directories
+	/// are offered too, as their path with a trailing `/` (`node_modules/`):
+	/// returning `false` prunes the whole tree unread, so a filter that keeps
+	/// only some files must still accept the directories holding them. An
+	/// excluded symlink is skipped; an included one is rejected (the root
+	/// `SKILL.md` must be a regular file whatever the filter says). Note a
 	/// filtered-out nested `SKILL.md` is neither served nor published as a
 	/// nested skill.
 	bool delegate(string relPath) @safe include;
@@ -59,12 +68,16 @@ struct SkillDirOptions
 /// published as its own flat entry whose `resources` cover exactly its subtree.
 ///
 /// Throws if `dir` is not a directory, has no `SKILL.md`, the frontmatter lacks
-/// a string `name`, the resolved skill path is invalid or its final segment does
-/// not match the frontmatter `name`, a symlink is encountered, the file count /
+/// a string `name` or has a `description` / `compatibility` outside the Agent
+/// Skills limits (see `skillFieldProblem`), the directory's own name does not match the frontmatter
+/// `name`, the resolved skill path is invalid or its final segment does not
+/// match the frontmatter `name`, a symlink is encountered, the file count /
 /// total size exceeds the configured caps, or (`publishNested`) a nested
 /// `SKILL.md` fails the same frontmatter/naming validation as a top-level one.
 /// Validation runs before registration, so a throw leaves the server unchanged.
-void registerSkillDir(McpServer server, string dir, SkillDirOptions options = SkillDirOptions.init) @safe
+/// Returns the skill path the directory was registered under.
+string registerSkillDir(McpServer server, string dir, SkillDirOptions options = SkillDirOptions
+		.init) @safe
 {
 	import std.base64 : Base64;
 
@@ -73,17 +86,33 @@ void registerSkillDir(McpServer server, string dir, SkillDirOptions options = Sk
 	const skillMdPath = joinPath(dir, "SKILL.md");
 	if (!pathExists(skillMdPath))
 		throw new Exception("registerSkillDir: missing SKILL.md in " ~ dir);
+	// Checked before reading, and regardless of the include filter, which the
+	// walk consults first and so could otherwise exclude it from the walk's
+	// symlink rejection.
+	if (!isPlainFile(skillMdPath))
+		throw new Exception(
+				"registerSkillDir: SKILL.md must be a regular file, not a symlink: " ~ skillMdPath);
 
-	const skillMd = readTextFile(skillMdPath);
-	Json frontmatter = parseSkillFrontmatter(skillMd);
-	if (!(frontmatter.type == Json.Type.object && "name" in frontmatter
-			&& frontmatter["name"].type == Json.Type.string))
-		throw new Exception("registerSkillDir: SKILL.md frontmatter must define a string 'name'");
+	const skillMd = readTextFile(skillMdPath, options.maxTotalBytes);
+	Json frontmatter;
+	try
+		frontmatter = parseSkillFrontmatter(skillMd);
+	catch (Exception e)
+		throw new Exception("registerSkillDir: " ~ e.msg);
+	if (const problem = frontmatterNameProblem(frontmatter))
+		throw new Exception("registerSkillDir: SKILL.md frontmatter " ~ problem);
 	// The Agent Skills spec requires both name and description.
 	if (!("description" in frontmatter && frontmatter["description"].type == Json.Type.string))
 		throw new Exception(
 				"registerSkillDir: SKILL.md frontmatter must define a string 'description'");
+	if (const problem = frontmatterFieldProblem(frontmatter))
+		throw new Exception("registerSkillDir: SKILL.md frontmatter: " ~ problem);
 	const fmName = frontmatter["name"].get!string;
+	// The Agent Skills spec requires the name to match the skill's directory.
+	const dirName = directoryName(dir);
+	if (dirName != fmName)
+		throw new Exception("registerSkillDir: the skill directory name '"
+				~ dirName ~ "' must equal the SKILL.md frontmatter name '" ~ fmName ~ "'");
 
 	const path = options.path.length ? options.path : fmName;
 	if (!isValidSkillPath(path))
@@ -121,6 +150,44 @@ void registerSkillDir(McpServer server, string dir, SkillDirOptions options = Sk
 	registerSkillResources(server, path, skillMd, frontmatter, files);
 	foreach (entry; nestedEntries)
 		addSkillEntry(server, entry);
+	return path;
+}
+
+/// Why `frontmatter` lacks a usable string `name`, or `null` when it has one. A
+/// `name` YAML reads as another type (`yes`, `null`, `123`, a date) gets a hint
+/// to quote it.
+private string frontmatterNameProblem(const Json frontmatter) @safe
+{
+	if (frontmatter.type != Json.Type.object || "name" !in frontmatter)
+		return "must define a string 'name'";
+	if (frontmatter["name"].type != Json.Type.string)
+		return "'name' must be a string, but YAML reads it as "
+			~ frontmatter["name"].toString ~ "; quote it (name: \"...\")";
+	return null;
+}
+
+/// Why the string `description` and optional `compatibility` of `frontmatter`
+/// fall outside the Agent Skills limits (see `skillFieldProblem`), or `null`
+/// when they are within them. A `compatibility` must be a string.
+private string frontmatterFieldProblem(const Json frontmatter) @safe
+{
+	string compatibility;
+	if (auto c = "compatibility" in frontmatter)
+	{
+		if (c.type != Json.Type.string)
+			return "'compatibility' must be a string";
+		compatibility = c.get!string;
+	}
+	return skillFieldProblem(frontmatter["description"].get!string, compatibility);
+}
+
+/// The name of the directory `dir` refers to, with `.`/`..` segments and
+/// trailing separators resolved against the working directory.
+private string directoryName(string dir) @safe
+{
+	import std.path : absolutePath, baseName, buildNormalizedPath;
+
+	return baseName(buildNormalizedPath(absolutePath(dir)));
 }
 
 /// One flat entry per nested skill found in `raws` (any `SKILL.md` below the
@@ -145,13 +212,20 @@ private Json[] buildNestedEntries(McpServer server, string path, RawFile[] raws)
 		if (!r.isText)
 			throw new Exception(
 					"registerSkillDir: nested SKILL.md is not valid UTF-8 text: " ~ r.path);
-		Json fm = parseSkillFrontmatter(cast(string) r.bytes);
-		if (!(fm.type == Json.Type.object && "name" in fm && fm["name"].type == Json.Type.string))
-			throw new Exception("registerSkillDir: nested SKILL.md frontmatter must "
-					~ "define a string 'name': " ~ r.path);
+		Json fm;
+		try
+			fm = parseSkillFrontmatter(cast(string) r.bytes);
+		catch (Exception e)
+			throw new Exception("registerSkillDir: nested " ~ e.msg ~ ": " ~ r.path);
+		if (const problem = frontmatterNameProblem(fm))
+			throw new Exception(
+					"registerSkillDir: nested SKILL.md frontmatter " ~ problem ~ ": " ~ r.path);
 		if (!("description" in fm && fm["description"].type == Json.Type.string))
 			throw new Exception("registerSkillDir: nested SKILL.md frontmatter must "
 					~ "define a string 'description': " ~ r.path);
+		if (const problem = frontmatterFieldProblem(fm))
+			throw new Exception(
+					"registerSkillDir: nested SKILL.md frontmatter: " ~ problem ~ ": " ~ r.path);
 		if (!isValidSkillName(basename))
 			throw new Exception("registerSkillDir: nested skill directory name '"
 					~ basename ~ "' is not a valid skill name (" ~ r.path ~ ")");
@@ -186,10 +260,10 @@ private Json[] buildNestedEntries(McpServer server, string path, RawFile[] raws)
 
 /// Parse the leading `---`-delimited YAML frontmatter of a `SKILL.md` into a
 /// JSON object (the verbatim `frontmatter` SEP-2640 puts in a skill entry). The
-/// fence is matched a line at a time: the file must open with a line that is
-/// exactly `---`, and the frontmatter ends at the next line that is exactly
-/// `---` or `...` — so a `---` appearing inside a value does not close it early,
-/// and CRLF line endings work. Hosts use this to compare a fetched `SKILL.md`'s
+/// fence is matched a line at a time, ignoring trailing whitespace: the file
+/// must open (after an optional UTF-8 byte order mark) with a `---` line, and
+/// the frontmatter ends at the next `---` or `...` line — so a `---` appearing
+/// inside a value does not close it early, and CRLF line endings work. Hosts use this to compare a fetched `SKILL.md`'s
 /// frontmatter against its entry (see `verifySkillMarkdown`).
 Json parseSkillFrontmatter(string md) @safe
 {
@@ -200,8 +274,12 @@ Json parseSkillFrontmatter(string md) @safe
 	// also breaks on U+2028 / U+2029 / vertical tab and would corrupt a value
 	// containing one. Normalizing first means the reconstructed YAML carries no
 	// stray \r either.
+	import std.algorithm.searching : skipOver;
+
+	// Editors commonly save a UTF-8 byte order mark ahead of the opening fence.
+	md.skipOver("﻿");
 	auto lines = md.replace("\r\n", "\n").split('\n');
-	if (lines.length == 0 || lines[0] != "---")
+	if (lines.length == 0 || lines[0].stripRight != "---")
 		throw new Exception("SKILL.md must begin with a '---' frontmatter line");
 	size_t end = size_t.max;
 	foreach (i; 1 .. lines.length)
@@ -219,7 +297,11 @@ Json parseSkillFrontmatter(string md) @safe
 }
 
 /// Convert a YAML document (dyaml) to a vibe `Json` value, preserving scalar
-/// types so the index frontmatter mirrors the authored YAML.
+/// types so the index frontmatter mirrors the authored YAML. The conversion
+/// expands every alias in place, so a few hundred bytes of nested aliases (a
+/// "billion laughs" document) could otherwise grow exponentially; it is bounded
+/// by a budget of nodes plus string bytes proportional to the document's size,
+/// which alias-free YAML always fits within.
 private Json yamlToJson(string yaml) @safe
 {
 	import dyaml : Loader;
@@ -227,29 +309,43 @@ private Json yamlToJson(string yaml) @safe
 	try
 	{
 		auto root = Loader.fromString(yaml).load();
-		return nodeToJson(root);
+		size_t budget = 4 * yaml.length + 4096;
+		return nodeToJson(root, budget);
 	}
 	catch (Exception e)
-		throw new Exception("registerSkillDir: invalid SKILL.md frontmatter YAML: " ~ e.msg);
+		throw new Exception("invalid SKILL.md frontmatter YAML: " ~ e.msg);
+}
+
+/// Charge `cost` against the conversion `budget`, throwing once it runs out.
+private void spend(ref size_t budget, size_t cost) @safe
+{
+	if (cost > budget)
+		throw new Exception("the frontmatter expands too far through aliases");
+	budget -= cost;
 }
 
 // Templated on dyaml's Node so the converter need not name the type; recursion
 // re-deduces it. Scalars keep their YAML-inferred type (bool/int/float/null/string).
-private Json nodeToJson(N)(N node) @safe
+// Each node costs one unit of `budget`, and each key or string value its length.
+private Json nodeToJson(N)(N node, ref size_t budget) @safe
 {
 	import dyaml : NodeID, NodeType;
 
+	spend(budget, 1);
 	final switch (node.nodeID)
 	{
 	case NodeID.mapping:
 		Json o = Json.emptyObject;
 		foreach (string key, N value; node)
-			o[key] = nodeToJson(value);
+		{
+			spend(budget, key.length);
+			o[key] = nodeToJson(value, budget);
+		}
 		return o;
 	case NodeID.sequence:
 		Json a = Json.emptyArray;
 		foreach (N value; node)
-			a ~= nodeToJson(value);
+			a ~= nodeToJson(value, budget);
 		return a;
 	case NodeID.scalar:
 		switch (node.type)
@@ -259,7 +355,15 @@ private Json nodeToJson(N)(N node) @safe
 		case NodeType.integer:
 			return Json(node.as!long);
 		case NodeType.decimal:
-			return Json(node.as!double);
+			import std.math : isInfinity, isNaN;
+
+			const d = node.as!double;
+			// JSON has no non-finite numbers; keep YAML's spelling as a string.
+			if (isNaN(d))
+				return Json(".nan");
+			if (isInfinity(d))
+				return Json(d > 0 ? ".inf" : "-.inf");
+			return Json(d);
 		case NodeType.null_:
 			return Json(null);
 		case NodeType.timestamp:
@@ -276,7 +380,9 @@ private Json nodeToJson(N)(N node) @safe
 			// A bare merge key has no value of its own.
 			return Json(null);
 		default:
-			return Json(node.as!string);
+			const str = node.as!string;
+			spend(budget, str.length);
+			return Json(str);
 		}
 	case NodeID.invalid:
 		return Json(null);
@@ -301,12 +407,58 @@ string verifySkillMarkdown(const SkillEntry entry, string skillMd) @safe
 		parsed = parseSkillFrontmatter(skillMd);
 	catch (Exception e)
 		return "the fetched SKILL.md has no parseable frontmatter: " ~ e.msg;
-	// vibe Json equality is deep, so one comparison covers every field the
-	// author wrote, in both directions (a missing field and an added field are
-	// both discrepancies).
-	if (parsed != entry.frontmatter)
+	// One deep comparison covers every field the author wrote, in both
+	// directions (a missing field and an added field are both discrepancies).
+	if (!sameJsonContent(parsed, entry.frontmatter))
 		return "the fetched SKILL.md frontmatter does not match the entry's frontmatter";
 	return null;
+}
+
+/// Deep JSON equality that compares numbers by value: a whole-number YAML float
+/// such as `1.0` is serialized as `1` and parsed back as an integer, so an
+/// integer and a float of equal value must match.
+private bool sameJsonContent(const Json a, const Json b) @safe
+{
+	static bool isNumber(const Json j)
+	{
+		return j.type == Json.Type.int_ || j.type == Json.Type.float_;
+	}
+
+	static double asDouble(const Json j)
+	{
+		return j.type == Json.Type.int_ ? cast(double) j.get!long : j.get!double;
+	}
+
+	if (isNumber(a) && isNumber(b))
+	{
+		if (a.type == Json.Type.int_ && b.type == Json.Type.int_)
+			return a.get!long == b.get!long;
+		return asDouble(a) == asDouble(b);
+	}
+	if (a.type != b.type)
+		return false;
+	if (a.type == Json.Type.object)
+	{
+		if (a.length != b.length)
+			return false;
+		foreach (kv; a.byKeyValue)
+		{
+			const other = kv.key in b;
+			if (other is null || !sameJsonContent(kv.value, *other))
+				return false;
+		}
+		return true;
+	}
+	if (a.type == Json.Type.array)
+	{
+		if (a.length != b.length)
+			return false;
+		foreach (i; 0 .. a.length)
+			if (!sameJsonContent(a[i], b[i]))
+				return false;
+		return true;
+	}
+	return a == b;
 }
 
 // --- Filesystem walk -------------------------------------------------------
@@ -346,6 +498,18 @@ private void walkInto(string base, string rel, ref RawFile[] files, ref size_t t
 	foreach (entry; listDir(here))
 	{
 		const childRel = rel.length ? rel ~ "/" ~ entry.name : entry.name;
+		// The filter runs before anything else, so an excluded directory is
+		// pruned unwalked and an excluded symlink is skipped rather than
+		// rejected. Without an include filter, dot-prefixed entries (.git/,
+		// .DS_Store) are skipped whole; a filter sees them and decides for
+		// itself, a directory as its path with a trailing `/`.
+		if (include is null)
+		{
+			if (entry.name.length && entry.name[0] == '.')
+				continue;
+		}
+		else if (!include(entry.isDir && !entry.isSymlink ? childRel ~ "/" : childRel))
+			continue;
 		if (entry.isSymlink)
 			throw new Exception(
 					"registerSkillDir: symlinks are not allowed in a skill "
@@ -364,18 +528,11 @@ private void walkInto(string base, string rel, ref RawFile[] files, ref size_t t
 		// `buildNestedEntries`).
 		if (entry.name == "SKILL.md" && rel.length == 0)
 			continue;
-		if (include !is null && !include(childRel))
-			continue;
 
 		// `files` excludes the root SKILL.md, which counts as a resource too.
 		if (files.length + 2 > maxFiles)
 			throw new Exception("registerSkillDir: skill directory exceeds maxFiles");
-		const fullPath = joinPath(base, childRel);
-		// Check the size against the cap BEFORE reading, so a single oversized
-		// file cannot be slurped into memory just to be rejected afterward.
-		if (total + fileSize(fullPath) > maxTotalBytes)
-			throw new Exception("registerSkillDir: skill directory exceeds maxTotalBytes");
-		const bytes = readBytes(fullPath);
+		const bytes = readWithinBudget(joinPath(base, childRel), maxTotalBytes - total);
 		total += bytes.length;
 
 		RawFile r;
@@ -502,35 +659,73 @@ private string joinPath(string a, string b) @safe pure
 	return a.length && a[$ - 1] == '/' ? a ~ b : a ~ "/" ~ b;
 }
 
-private bool pathExists(string p) @trusted
+private bool pathExists(string p) @safe
 {
 	import std.file : exists;
 
 	return exists(p);
 }
 
-private bool pathIsDir(string p) @trusted
+/// Whether `p` is itself a regular file: a symlink, even to one, is not.
+private bool isPlainFile(string p) @safe
+{
+	import std.file : attrIsFile, getLinkAttributes;
+
+	return attrIsFile(getLinkAttributes(p));
+}
+
+private bool pathIsDir(string p) @safe
 {
 	import std.file : exists, isDir;
 
 	return exists(p) && isDir(p);
 }
 
-private string readTextFile(string p) @trusted
+/// The contents of the file `p`, at most `budget` bytes (see
+/// `readWithinBudget`), as UTF-8 text. Throws, naming `p`, when they are not
+/// valid UTF-8.
+private string readTextFile(string p, size_t budget) @safe
 {
-	import std.file : readText;
+	import std.utf : UTFException, validate;
 
-	return readText(p);
+	auto text = cast(string) readWithinBudget(p, budget);
+	try
+		validate(text);
+	catch (UTFException)
+		throw new Exception("registerSkillDir: " ~ p ~ " is not valid UTF-8 text");
+	return text;
 }
 
-private immutable(ubyte)[] readBytes(string p) @trusted
+/// Called with each path just before it is read, so a test can change the file
+/// between its size check and its read.
+version (unittest) private void delegate(string path) @safe beforeReadHook;
+
+/// The contents of the file `p`, reading at most `upTo` bytes.
+private immutable(ubyte)[] readBytes(string p, size_t upTo = size_t.max) @trusted
 {
 	import std.file : read;
 
-	return cast(immutable(ubyte)[]) read(p);
+	version (unittest)
+		if (beforeReadHook !is null)
+			beforeReadHook(p);
+	return cast(immutable(ubyte)[]) read(p, upTo);
 }
 
-private ulong fileSize(string p) @trusted
+/// The contents of the file `p`, which may add at most `budget` bytes to a
+/// skill's total. The size is checked before the read, so an oversized file is
+/// never slurped into memory, and again after it, since the file may have grown
+/// in between; the read stops one byte past the budget.
+private immutable(ubyte)[] readWithinBudget(string p, size_t budget) @safe
+{
+	if (fileSize(p) > budget)
+		throw new Exception("registerSkillDir: skill directory exceeds maxTotalBytes");
+	auto bytes = readBytes(p, budget == size_t.max ? budget : budget + 1);
+	if (bytes.length > budget)
+		throw new Exception("registerSkillDir: skill directory exceeds maxTotalBytes");
+	return bytes;
+}
+
+private ulong fileSize(string p) @safe
 {
 	import std.file : getSize;
 
@@ -563,7 +758,7 @@ version (unittest)
 
 	// A throwaway skill directory: SKILL.md with authored frontmatter (mixed
 	// scalar types) plus one supporting file in a subdirectory.
-	private void writeSkillFixture(string root) @trusted
+	private void writeSkillFixture(string root) @safe
 	{
 		import std.file : mkdirRecurse, write, rmdirRecurse, exists;
 
@@ -576,14 +771,14 @@ version (unittest)
 		write(root ~ "/references/FORMS.md", "# Form Fields\n- applicant_name\n");
 	}
 
-	private void writeFile(string path, string content) @trusted
+	private void writeFile(string path, string content) @safe
 	{
 		import std.file : write;
 
 		write(path, content);
 	}
 
-	private void writeNestedDir(string path) @trusted
+	private void writeNestedDir(string path) @safe
 	{
 		import std.file : mkdirRecurse;
 
@@ -591,7 +786,7 @@ version (unittest)
 	}
 
 	// A skill directory with a single, caller-supplied SKILL.md and no other files.
-	private void writeRawSkill(string root, string skillMd) @trusted
+	private void writeRawSkill(string root, string skillMd) @safe
 	{
 		import std.file : mkdirRecurse, write, rmdirRecurse, exists;
 
@@ -601,20 +796,24 @@ version (unittest)
 		write(root ~ "/SKILL.md", skillMd);
 	}
 
-	private void removeTree(string root) @trusted
+	// Removes a `tmpRoot` skill directory together with its per-test parent.
+	private void removeTree(string root) @safe
 	{
 		import std.file : rmdirRecurse, exists;
+		import std.path : dirName;
 
-		if (exists(root))
-			rmdirRecurse(root);
+		if (exists(root.dirName))
+			rmdirRecurse(root.dirName);
 	}
 
-	private string tmpRoot(string suffix) @trusted
+	// A skill directory named `name` (the Agent Skills convention requires it to
+	// match the frontmatter name) inside a per-test temporary parent.
+	private string tmpRoot(string suffix, string name) @safe
 	{
 		import std.path : buildPath;
 		import std.file : tempDir;
 
-		return buildPath(tempDir, "mcp_d_skilldir_" ~ suffix);
+		return buildPath(tempDir, "mcp_d_skilldir_" ~ suffix, name);
 	}
 
 	private Message modernRequest(long id, string method, Json params) @safe
@@ -649,7 +848,7 @@ unittest  // registerSkillDir serves SKILL.md verbatim with authored, type-prese
 {
 	import std.algorithm : canFind;
 
-	const root = tmpRoot("verbatim");
+	const root = tmpRoot("verbatim", "pdf-forms");
 	writeSkillFixture(root);
 	scope (exit)
 		removeTree(root);
@@ -677,7 +876,7 @@ unittest  // registerSkillDir serves SKILL.md verbatim with authored, type-prese
 
 unittest  // a directory skill's manifest carries each file's byte length
 {
-	const root = tmpRoot("sizes");
+	const root = tmpRoot("sizes", "pdf-forms");
 	writeSkillFixture(root);
 	scope (exit)
 		removeTree(root);
@@ -706,7 +905,7 @@ unittest  // maxFiles counts SKILL.md itself as one of the skill's resources
 {
 	import std.exception : assertThrown, assertNotThrown;
 
-	const root = tmpRoot("maxfiles");
+	const root = tmpRoot("maxfiles", "pdf-forms");
 	writeSkillFixture(root); // SKILL.md + references/FORMS.md = 2 resources
 	scope (exit)
 		removeTree(root);
@@ -722,7 +921,7 @@ unittest  // maxFiles counts SKILL.md itself as one of the skill's resources
 
 unittest  // registerSkillDir exposes supporting files as sibling resources
 {
-	const root = tmpRoot("files");
+	const root = tmpRoot("files", "pdf-forms");
 	writeSkillFixture(root);
 	scope (exit)
 		removeTree(root);
@@ -738,7 +937,7 @@ unittest  // registerSkillDir exposes supporting files as sibling resources
 
 unittest  // registerSkillDir auto-exposes subdirectories via resources/directory/read
 {
-	const root = tmpRoot("dirread");
+	const root = tmpRoot("dirread", "pdf-forms");
 	writeSkillFixture(root);
 	scope (exit)
 		removeTree(root);
@@ -766,7 +965,7 @@ version (unittest)
 {
 	// A skill directory containing a nested skill two levels down, plus an
 	// ordinary supporting file at each level.
-	private void writeNestedFixture(string root) @trusted
+	private void writeNestedFixture(string root) @safe
 	{
 		import std.file : mkdirRecurse, write, rmdirRecurse, exists;
 
@@ -783,7 +982,7 @@ version (unittest)
 
 unittest  // nested files are supporting content: the enclosing manifest lists them all
 {
-	const root = tmpRoot("nest-encl");
+	const root = tmpRoot("nest-encl", "outer");
 	writeNestedFixture(root);
 	scope (exit)
 		removeTree(root);
@@ -806,7 +1005,7 @@ unittest  // nested files are supporting content: the enclosing manifest lists t
 
 unittest  // a nested skill is additionally published as its own flat entry
 {
-	const root = tmpRoot("nest-flat");
+	const root = tmpRoot("nest-flat", "outer");
 	writeNestedFixture(root);
 	scope (exit)
 		removeTree(root);
@@ -836,7 +1035,7 @@ unittest  // a nested skill is additionally published as its own flat entry
 
 unittest  // skills/get answers for a nested skill's uri
 {
-	const root = tmpRoot("nest-get");
+	const root = tmpRoot("nest-get", "outer");
 	writeNestedFixture(root);
 	scope (exit)
 		removeTree(root);
@@ -854,7 +1053,7 @@ unittest  // a nested directory whose name mismatches its frontmatter rejects th
 {
 	import std.exception : assertThrown;
 
-	const root = tmpRoot("nest-bad");
+	const root = tmpRoot("nest-bad", "outer");
 	writeNestedFixture(root);
 	scope (exit)
 		removeTree(root);
@@ -874,7 +1073,7 @@ unittest  // publishNested=false serves the nested SKILL.md as a plain file only
 {
 	import std.algorithm : canFind;
 
-	const root = tmpRoot("nest-off");
+	const root = tmpRoot("nest-off", "outer");
 	writeNestedFixture(root);
 	scope (exit)
 		removeTree(root);
@@ -897,7 +1096,7 @@ unittest  // nested files are registered once and serve their authored bytes
 {
 	import std.algorithm : canFind;
 
-	const root = tmpRoot("nest-once");
+	const root = tmpRoot("nest-once", "outer");
 	writeNestedFixture(root);
 	scope (exit)
 		removeTree(root);
@@ -921,7 +1120,7 @@ unittest  // nested files are registered once and serve their authored bytes
 
 unittest  // a doubly-nested skill publishes three flat entries with subtree manifests
 {
-	const root = tmpRoot("nest-deep");
+	const root = tmpRoot("nest-deep", "outer");
 	writeNestedFixture(root);
 	scope (exit)
 		removeTree(root);
@@ -956,7 +1155,7 @@ unittest  // a doubly-nested skill publishes three flat entries with subtree man
 
 unittest  // registerSkillDir honours an explicit prefixed path matching the frontmatter name
 {
-	const root = tmpRoot("prefix");
+	const root = tmpRoot("prefix", "pdf-forms");
 	writeSkillFixture(root);
 	scope (exit)
 		removeTree(root);
@@ -973,7 +1172,7 @@ unittest  // registerSkillDir rejects a path whose final segment != frontmatter 
 {
 	import std.exception : assertThrown;
 
-	const root = tmpRoot("mismatch");
+	const root = tmpRoot("mismatch", "pdf-forms");
 	writeSkillFixture(root);
 	scope (exit)
 		removeTree(root);
@@ -984,9 +1183,161 @@ unittest  // registerSkillDir rejects a path whose final segment != frontmatter 
 	assertThrown!Exception(registerSkillDir(s, root, opts));
 }
 
+version (unittest)
+{
+	import std.conv : text;
+
+	// The skill-relative paths of every file in the first listed skill's manifest.
+	private string[] manifestPaths(McpServer s) @safe
+	{
+		import std.algorithm : findSplitAfter;
+
+		string[] paths;
+		auto res = listedSkill(s, 99, 0)["resources"];
+		foreach (i; 0 .. res.length)
+			paths ~= res[i]["uri"].get!string.findSplitAfter("skill://pdf-forms/")[1];
+		return paths;
+	}
+}
+
+unittest  // dot-prefixed files and directories are skipped by default
+{
+	const root = tmpRoot("hidden", "pdf-forms");
+	writeSkillFixture(root);
+	scope (exit)
+		removeTree(root);
+	writeFile(root ~ "/.DS_Store", "junk");
+	writeNestedDir(root ~ "/.git");
+	writeFile(root ~ "/.git/config", "[core]\n");
+	writeFile(root ~ "/references/.hidden.md", "# Hidden\n");
+
+	auto s = new McpServer("t", "1");
+	registerSkillDir(s, root);
+	assert(manifestPaths(s) == ["SKILL.md", "references/FORMS.md"], manifestPaths(s).text);
+}
+
+unittest  // an include filter opts dot-prefixed paths back in
+{
+	import std.algorithm : canFind;
+
+	const root = tmpRoot("hidden-in", "pdf-forms");
+	writeSkillFixture(root);
+	scope (exit)
+		removeTree(root);
+	writeNestedDir(root ~ "/.config");
+	writeFile(root ~ "/.config/settings.json", "{}");
+	writeFile(root ~ "/.DS_Store", "junk");
+
+	auto s = new McpServer("t", "1");
+	SkillDirOptions opts;
+	opts.include = (string p) @safe => !p.canFind(".DS_Store");
+	registerSkillDir(s, root, opts);
+	assert(manifestPaths(s) == [
+		"SKILL.md", ".config/settings.json", "references/FORMS.md"
+	], manifestPaths(s).text);
+}
+
+version (unittest) version (Posix) private void makeSymlink(string target, string link) @safe
+{
+	import std.file : symlink;
+
+	symlink(target, link);
+}
+
+version (Posix) unittest  // an include filter that excludes a directory prunes it unwalked
+{
+	import std.algorithm : canFind, startsWith;
+
+	const root = tmpRoot("prune", "pdf-forms");
+	writeSkillFixture(root);
+	scope (exit)
+		removeTree(root);
+	writeNestedDir(root ~ "/node_modules/.bin");
+	makeSymlink(root ~ "/references/FORMS.md", root ~ "/node_modules/.bin/tool");
+
+	string[] offered;
+	auto s = new McpServer("t", "1");
+	SkillDirOptions opts;
+	opts.include = (string p) @safe {
+		offered ~= p;
+		return !p.startsWith("node_modules");
+	};
+	registerSkillDir(s, root, opts);
+	assert(manifestPaths(s) == ["SKILL.md", "references/FORMS.md"], manifestPaths(s).text);
+	assert(offered.canFind("node_modules/"), offered.text);
+	assert(!offered.canFind!(p => p.startsWith("node_modules/.bin")), offered.text);
+}
+
+version (Posix) unittest  // a symlinked root SKILL.md is rejected even when the include filter excludes it
+{
+	import std.exception : assertThrown;
+	import std.path : dirName;
+
+	const root = tmpRoot("rootlink", "pdf-forms");
+	writeSkillFixture(root);
+	scope (exit)
+		removeTree(root);
+	const outside = root.dirName ~ "/outside.md";
+	{
+		import std.file : rename;
+
+		rename(root ~ "/SKILL.md", outside);
+	}
+	makeSymlink(outside, root ~ "/SKILL.md");
+
+	auto s = new McpServer("t", "1");
+	SkillDirOptions opts;
+	opts.include = (string p) @safe => p != "SKILL.md";
+	assertThrown!Exception(registerSkillDir(s, root, opts));
+}
+
+version (Posix) unittest  // a symlink the include filter excludes is skipped rather than rejected
+{
+	import std.algorithm : endsWith;
+
+	const root = tmpRoot("skiplink", "pdf-forms");
+	writeSkillFixture(root);
+	scope (exit)
+		removeTree(root);
+	makeSymlink(root ~ "/references/FORMS.md", root ~ "/references/link.md");
+
+	auto s = new McpServer("t", "1");
+	SkillDirOptions opts;
+	opts.include = (string p) @safe => !p.endsWith("link.md");
+	registerSkillDir(s, root, opts);
+	assert(manifestPaths(s) == ["SKILL.md", "references/FORMS.md"], manifestPaths(s).text);
+}
+
+unittest  // registerSkillDir rejects a directory whose name != frontmatter name
+{
+	import std.exception : assertThrown;
+
+	const root = tmpRoot("dirname", "not-pdf-forms");
+	writeSkillFixture(root);
+	scope (exit)
+		removeTree(root);
+
+	auto s = new McpServer("t", "1");
+	assertThrown!Exception(registerSkillDir(s, root));
+	SkillDirOptions opts;
+	opts.path = "office/pdf-forms";
+	assertThrown!Exception(registerSkillDir(s, root, opts));
+}
+
+unittest  // registerSkillDir accepts a matching directory given with a trailing slash or dot segment
+{
+	const root = tmpRoot("dirslash", "pdf-forms");
+	writeSkillFixture(root);
+	scope (exit)
+		removeTree(root);
+
+	registerSkillDir(new McpServer("t", "1"), root ~ "/");
+	registerSkillDir(new McpServer("t", "1"), root ~ "/.");
+}
+
 unittest  // a '---' inside a frontmatter value does not close the frontmatter early
 {
-	const root = tmpRoot("fence");
+	const root = tmpRoot("fence", "fence-skill");
 	// `notes` is a block scalar that itself contains a `---` line; `trailing`
 	// comes after it and must survive into the parsed frontmatter.
 	writeRawSkill(root,
@@ -1004,7 +1355,7 @@ unittest  // a '---' inside a frontmatter value does not close the frontmatter e
 
 unittest  // a CRLF SKILL.md parses (fence and values carry trailing \r)
 {
-	const root = tmpRoot("crlf");
+	const root = tmpRoot("crlf", "crlf-skill");
 	writeRawSkill(root, "---\r\nname: crlf-skill\r\ndescription: a value\r\n---\r\n\r\n# Body\r\n");
 	scope (exit)
 		removeTree(root);
@@ -1021,7 +1372,7 @@ unittest  // registerSkillDir requires a string description in the frontmatter
 {
 	import std.exception : assertThrown;
 
-	const root = tmpRoot("nodesc");
+	const root = tmpRoot("nodesc", "x");
 	writeRawSkill(root, "---\nname: x\n---\n\n# Body\n");
 	scope (exit)
 		removeTree(root);
@@ -1030,11 +1381,82 @@ unittest  // registerSkillDir requires a string description in the frontmatter
 	assertThrown!Exception(registerSkillDir(s, root));
 }
 
+unittest  // registerSkillDir holds the frontmatter description and compatibility to the skill limits
+{
+	import std.algorithm.searching : canFind;
+	import std.array : replicate;
+	import std.exception : collectException;
+
+	const cases = [
+		["description: \"\"", "must not be empty"],
+		["description: " ~ "a".replicate(1025), "at most 1024"],
+		["description: d\ncompatibility: " ~ "c".replicate(501), "at most 500"],
+		["description: d\ncompatibility: 5", "'compatibility' must be a string"],
+	];
+	foreach (c; cases)
+	{
+		const root = tmpRoot("limits", "x");
+		writeRawSkill(root, "---\nname: x\n" ~ c[0] ~ "\n---\n\n# Body\n");
+		scope (exit)
+			removeTree(root);
+
+		auto e = collectException(registerSkillDir(new McpServer("t", "1"), root));
+		assert(e !is null && e.msg.canFind(c[1]), e is null ? c[1] : e.msg);
+	}
+}
+
+unittest  // a nested skill's frontmatter description is held to the skill limits
+{
+	import std.algorithm.searching : canFind;
+	import std.exception : collectException;
+
+	const root = tmpRoot("nest-limits", "outer");
+	writeNestedFixture(root);
+	scope (exit)
+		removeTree(root);
+	writeFile(root ~ "/references/sub-skill/SKILL.md",
+			"---\nname: sub-skill\ndescription: \"\"\n---\n\n# Sub\n");
+
+	auto e = collectException(registerSkillDir(new McpServer("t", "1"), root));
+	assert(e !is null && e.msg.canFind("must not be empty"), e is null ? "" : e.msg);
+}
+
+unittest  // a synthesized SKILL.md keeps a YAML-ambiguous name a string
+{
+	import mcp.api.skills : SkillFrontmatter, skillMarkdown;
+
+	foreach (name; ["yes", "on", "null", "123", "2024-01-01"])
+	{
+		auto fm = SkillFrontmatter(name, "d");
+		auto parsed = parseSkillFrontmatter(skillMarkdown(fm, "# Body\n"));
+		assert(parsed["name"].type == Json.Type.string, name);
+		assert(parsed == fm.toJson(), name);
+	}
+}
+
+unittest  // registerSkillDir names the fix when YAML reads the name as a non-string
+{
+	import std.algorithm : canFind;
+
+	const root = tmpRoot("yesname", "yes");
+	writeRawSkill(root, "---\nname: yes\ndescription: d\n---\n\n# Body\n");
+	scope (exit)
+		removeTree(root);
+
+	try
+	{
+		registerSkillDir(new McpServer("t", "1"), root);
+		assert(false, "expected registerSkillDir to throw");
+	}
+	catch (Exception e)
+		assert(e.msg.canFind("quote"), e.msg);
+}
+
 unittest  // an extension-less text file is served as text/plain, not an opaque blob
 {
 	import std.algorithm : canFind;
 
-	const root = tmpRoot("license");
+	const root = tmpRoot("license", "pdf-forms");
 	writeSkillFixture(root);
 	writeFile(root ~ "/LICENSE", "MIT License\n\nPermission is hereby granted...\n");
 	scope (exit)
@@ -1052,7 +1474,7 @@ unittest  // a YAML timestamp in frontmatter is rendered as an ISO-8601 string
 {
 	import std.algorithm : canFind;
 
-	const root = tmpRoot("timestamp");
+	const root = tmpRoot("timestamp", "ts-skill");
 	writeRawSkill(root, "---\nname: ts-skill\ndescription: d\ncreated: 2021-01-02\n---\n\n# Body\n");
 	scope (exit)
 		removeTree(root);
@@ -1069,7 +1491,7 @@ unittest  // registerSkillDir rejects a directory whose files exceed maxTotalByt
 {
 	import std.exception : assertThrown;
 
-	const root = tmpRoot("toobig");
+	const root = tmpRoot("toobig", "pdf-forms");
 	writeSkillFixture(root);
 	scope (exit)
 		removeTree(root);
@@ -1078,6 +1500,64 @@ unittest  // registerSkillDir rejects a directory whose files exceed maxTotalByt
 	SkillDirOptions opts;
 	opts.maxTotalBytes = 4; // smaller than the fixture's FORMS.md
 	assertThrown!Exception(registerSkillDir(s, root, opts));
+}
+
+version (unittest) private void growBeforeRead(string root, string name) @safe
+{
+	import std.algorithm.searching : endsWith;
+	import std.array : replicate;
+	import std.file : append;
+
+	beforeReadHook = (string p) @safe {
+		if (p.endsWith(name))
+			append(p, "x".replicate(4096));
+	};
+}
+
+unittest  // a file that grows past maxTotalBytes between its size check and its read is rejected
+{
+	import std.algorithm.searching : canFind;
+
+	const root = tmpRoot("grows", "pdf-forms");
+	writeSkillFixture(root);
+	scope (exit)
+	{
+		beforeReadHook = null;
+		removeTree(root);
+	}
+	growBeforeRead(root, "FORMS.md");
+	auto s = new McpServer("t", "1");
+	SkillDirOptions opts;
+	opts.maxTotalBytes = 1024;
+	string msg;
+	try
+		registerSkillDir(s, root, opts);
+	catch (Exception e)
+		msg = e.msg;
+	assert(msg.canFind("maxTotalBytes"), msg);
+}
+
+unittest  // a SKILL.md that grows past maxTotalBytes before its read is rejected by size
+{
+	import std.algorithm.searching : canFind;
+
+	const root = tmpRoot("grows-md", "pdf-forms");
+	writeSkillFixture(root);
+	scope (exit)
+	{
+		beforeReadHook = null;
+		removeTree(root);
+	}
+	growBeforeRead(root, "SKILL.md");
+	auto s = new McpServer("t", "1");
+	SkillDirOptions opts;
+	opts.maxTotalBytes = 1024;
+	string msg;
+	try
+		registerSkillDir(s, root, opts);
+	catch (Exception e)
+		msg = e.msg;
+	assert(msg.canFind("maxTotalBytes"), msg);
 }
 
 version (unittest) private string skillDigestOf(string s) @safe
@@ -1094,7 +1574,7 @@ unittest  // parseSkillFrontmatter is public: hosts parse fetched SKILL.md front
 
 version (unittest)
 {
-	import mcp.api.skills : SkillResourceRef;
+	import mcp.protocol.types : SkillResourceRef;
 
 	// A well-formed SKILL.md and the entry a server would publish for it.
 	private enum verifyMd = "---\nname: x\ndescription: d\n---\n\n# Body\n";
@@ -1148,4 +1628,172 @@ unittest  // verifySkillMarkdown reports entry frontmatter that diverges from th
 	import std.algorithm : canFind;
 
 	assert(reason.canFind("frontmatter"));
+}
+
+version (unittest)
+{
+	private SkillEntry wireEntryFor(string md) @safe
+	{
+		import vibe.data.json : parseJsonString;
+
+		SkillEntry e;
+		e.uri = "skill://x/SKILL.md";
+		// The entry's frontmatter as a client sees it: serialized onto the wire
+		// and parsed back.
+		e.frontmatter = parseJsonString(parseSkillFrontmatter(md).toString());
+		e.resources = [
+			SkillResourceRef("skill://x/SKILL.md", skillDigestOf(md), md.length)
+		];
+		return e;
+	}
+}
+
+unittest  // verifySkillMarkdown accepts a whole-number YAML float that crossed the wire as an integer
+{
+	enum md = "---\nname: x\ndescription: d\nversion: 1.0\n---\n\n# Body\n";
+	const reason = verifySkillMarkdown(wireEntryFor(md), md);
+	assert(reason is null, reason);
+}
+
+unittest  // non-finite YAML floats in frontmatter render as valid JSON strings
+{
+	import vibe.data.json : parseJsonString;
+
+	auto fm = parseSkillFrontmatter(
+			"---\nname: x\ndescription: d\nhi: .inf\nlo: -.inf\nnope: .nan\n---\n");
+	auto wire = parseJsonString(fm.toString());
+	assert(wire["hi"].get!string == ".inf");
+	assert(wire["lo"].get!string == "-.inf");
+	assert(wire["nope"].get!string == ".nan");
+}
+
+unittest  // verifySkillMarkdown still rejects a numerically different frontmatter value
+{
+	enum md = "---\nname: x\ndescription: d\nversion: 1.5\n---\n\n# Body\n";
+	auto e = wireEntryFor(md);
+	e.frontmatter["version"] = Json(2);
+	assert(verifySkillMarkdown(e, md) !is null);
+}
+
+unittest  // parseSkillFrontmatter reports invalid YAML without naming registerSkillDir
+{
+	import std.algorithm.searching : canFind, startsWith;
+	import std.exception : collectException;
+
+	auto e = collectException(parseSkillFrontmatter("---\nname: [unclosed\n---\n"));
+	assert(e !is null && e.msg.startsWith("invalid SKILL.md frontmatter YAML: "), e.msg);
+	const reason = verifySkillMarkdown(verifyEntry(), "---\nname: [unclosed\n---\n");
+	assert(reason !is null && !reason.canFind("registerSkillDir"), reason);
+}
+
+unittest  // registerSkillDir prefixes a SKILL.md frontmatter parse error with its name
+{
+	import std.algorithm.searching : startsWith;
+	import std.file : write;
+
+	const root = tmpRoot("bad-yaml", "pdf-forms");
+	writeSkillFixture(root);
+	scope (exit)
+		removeTree(root);
+	write(root ~ "/SKILL.md", "---\nname: [unclosed\n---\n");
+	auto s = new McpServer("t", "1");
+	string msg;
+	try
+		registerSkillDir(s, root);
+	catch (Exception e)
+		msg = e.msg;
+	assert(msg.startsWith("registerSkillDir: invalid SKILL.md frontmatter YAML: "), msg);
+}
+
+unittest  // parseSkillFrontmatter accepts a SKILL.md opening with a UTF-8 byte order mark
+{
+	auto fm = parseSkillFrontmatter("﻿---\nname: x\ndescription: d\n---\n\n# Body\n");
+	assert(fm["name"].get!string == "x", fm.toString);
+}
+
+unittest  // parseSkillFrontmatter accepts trailing whitespace after the opening fence
+{
+	auto fm = parseSkillFrontmatter("--- \t\r\nname: x\r\ndescription: d\r\n---\r\n\r\n# Body\r\n");
+	assert(fm["name"].get!string == "x", fm.toString);
+}
+
+unittest  // parseSkillFrontmatter rejects nested aliases that expand far beyond the document
+{
+	import std.exception : assertThrown;
+
+	enum md = "---\nname: x\ndescription: d\n" ~ "a: &a [x, x, x, x, x, x, x, x, x, x]\n"
+		~ "b: &b [*a, *a, *a, *a, *a, *a, *a, *a, *a, *a]\n"
+		~ "c: &c [*b, *b, *b, *b, *b, *b, *b, *b, *b, *b]\n"
+		~ "d: &d [*c, *c, *c, *c, *c, *c, *c, *c, *c, *c]\n"
+		~ "e: [*d, *d, *d, *d, *d, *d, *d, *d, *d, *d]\n---\n";
+	assertThrown(parseSkillFrontmatter(md));
+}
+
+unittest  // parseSkillFrontmatter rejects a long string repeated through aliases
+{
+	import std.array : replicate;
+	import std.exception : assertThrown;
+
+	const md = "---\nname: x\ndescription: d\nbig: &s " ~ "y".replicate(
+			4096) ~ "\nmany: [" ~ "*s, ".replicate(64) ~ "*s]\n---\n";
+	assertThrown(parseSkillFrontmatter(md));
+}
+
+unittest  // parseSkillFrontmatter still resolves a modest alias
+{
+	auto fm = parseSkillFrontmatter("---\nname: x\ndescription: &d hi\nagain: *d\n---\n");
+	assert(fm["again"].get!string == "hi", fm.toString);
+}
+
+version (unittest) private void writeSkillBytes(string root, const(ubyte)[] bytes) @safe
+{
+	import std.file : exists, mkdirRecurse, rmdirRecurse, write;
+
+	if (exists(root))
+		rmdirRecurse(root);
+	mkdirRecurse(root);
+	write(root ~ "/SKILL.md", bytes);
+}
+
+unittest  // a SKILL.md over maxTotalBytes is rejected by its size before it is read
+{
+	import std.algorithm.searching : canFind;
+	import std.array : replicate;
+
+	const root = tmpRoot("oversize-md", "big-skill");
+	scope (exit)
+		removeTree(root);
+	// Invalid UTF-8 past the cap: a read before the size check fails on decoding.
+	writeSkillBytes(root,
+			cast(const(ubyte)[])("---\nname: big-skill\n".replicate(8)) ~ [
+				ubyte(0xFF)
+	]);
+	auto s = new McpServer("t", "1");
+	SkillDirOptions o;
+	o.maxTotalBytes = 16;
+	string msg;
+	try
+		registerSkillDir(s, root, o);
+	catch (Exception e)
+		msg = e.msg;
+	assert(msg.canFind("maxTotalBytes"), msg);
+}
+
+unittest  // a SKILL.md that is not UTF-8 is rejected with a message naming its path
+{
+	import std.algorithm.searching : canFind;
+
+	const root = tmpRoot("binary-md", "bin-skill");
+	scope (exit)
+		removeTree(root);
+	writeSkillBytes(root, cast(const(ubyte)[]) "---\nname: bin-skill\n" ~ [
+		ubyte(0xFF), ubyte(0xFE)
+	]);
+	auto s = new McpServer("t", "1");
+	string msg;
+	try
+		registerSkillDir(s, root);
+	catch (Exception e)
+		msg = e.msg;
+	assert(msg.canFind("SKILL.md") && msg.canFind("bin-skill") && msg.canFind("UTF-8"), msg);
 }

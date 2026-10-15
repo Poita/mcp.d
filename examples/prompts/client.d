@@ -68,7 +68,7 @@ int main(string[] args) @safe
 /// is transport-agnostic, so the SAME checks verify stdio and HTTP.
 int run(McpClient client) @safe
 {
-	client.initialize();
+	client.connect();
 
 	// --- 1. prompts/list: exact names, titles, and argument descriptors. ---
 	ListPromptsResult listed = client.listPrompts();

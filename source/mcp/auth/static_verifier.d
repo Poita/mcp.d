@@ -22,23 +22,24 @@ import mcp.auth.resource_server : TokenInfo, TokenValidator;
 /// fixed in-memory table. A token present in `tokens` returns its associated
 /// `TokenInfo` (with `valid` forced true so callers cannot accidentally register
 /// a "valid" entry that fails authorization); any unknown token returns
-/// `TokenInfo.invalid()`.
+/// `TokenInfo.invalid()`. Each call returns its own deep copy, so a handler
+/// mutating the result cannot change what later requests see.
 ///
 /// NOT for production — see the module docs.
 TokenValidator staticVerifier(TokenInfo[string] tokens) @safe
 {
-	// Copy the table so later mutation by the caller cannot change behavior.
+	// Copy the table deeply so later mutation by the caller cannot change behavior.
 	TokenInfo[string] table;
 	foreach (k, v; tokens)
 	{
-		auto info = v;
+		auto info = v.dup;
 		info.valid = true;
 		table[k] = info;
 	}
 
 	return (string token) @safe {
 		if (auto p = token in table)
-			return *p;
+			return p.dup;
 		return TokenInfo.invalid();
 	};
 }
@@ -58,6 +59,31 @@ unittest  // a known token returns its TokenInfo
 	assert(got.hasScope("mcp:read"));
 	assert(got.hasScope("mcp:write"));
 	assert(got.hasAudience("https://mcp.example.com/mcp"));
+}
+
+unittest  // mutating a returned TokenInfo, or the caller's table entry, never changes later results
+{
+	import vibe.data.json : Json;
+
+	TokenInfo alice;
+	alice.subject = "alice";
+	alice.scopes = ["mcp:read"];
+	alice.audience = ["https://mcp.example.com/mcp"];
+	alice.claims = Json.emptyObject;
+	alice.claims["role"] = "user";
+	auto verify = staticVerifier(["tok-alice": alice]);
+
+	alice.scopes[0] = "mcp:admin";
+	alice.claims["role"] = "admin";
+	auto first = verify("tok-alice");
+	first.scopes[0] = "mcp:admin";
+	first.audience[0] = "https://evil.example";
+	first.claims["role"] = "admin";
+
+	auto second = verify("tok-alice");
+	assert(second.scopes == ["mcp:read"]);
+	assert(second.audience == ["https://mcp.example.com/mcp"]);
+	assert(second.claims["role"].get!string == "user");
 }
 
 unittest  // an unknown token returns TokenInfo.invalid()

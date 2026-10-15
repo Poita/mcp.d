@@ -33,13 +33,17 @@ static if (!is(typeof(EVP_DigestVerify)))
 	extern (C) @system nothrow @nogc int EVP_DigestVerify(EVP_MD_CTX* ctx,
 			const(ubyte)* sig, size_t siglen, const(ubyte)* tbs, size_t tbslen);
 
-import mcp.auth.resource_server : TokenInfo, TokenValidator;
+import mcp.auth.resource_server : TokenInfo, TokenValidator, TokenVerifierUnavailableException;
+import mcp.protocol.jsonrpc : parseUntrustedJson;
+import mcp.protocol.ssrf : SsrfPolicy, redactUrl;
 
 @safe:
 
 /// Configuration for `jwtVerifier`. Provide either a `jwksUri` (the verifier
 /// fetches and caches the issuer's JWKS, selecting the key by `kid`) or one or
 /// more `staticPublicKeysPem` (PEM SubjectPublicKeyInfo blobs pinned directly).
+/// `jwtVerifier` refuses a config with neither. Each rejected token is logged at
+/// diagnostic level with the reason (never the token).
 struct JwtVerifierConfig
 {
 	/// The JWKS endpoint to fetch verification keys from (kid-selected). When
@@ -47,18 +51,36 @@ struct JwtVerifierConfig
 	string jwksUri;
 
 	/// PEM-encoded public keys (`-----BEGIN PUBLIC KEY-----`) pinned directly,
-	/// tried in order. An alternative to `jwksUri` for static deployments.
+	/// tried in order. An alternative to `jwksUri` for static deployments. RSA
+	/// keys shorter than 2048 bits never verify a token.
 	string[] staticPublicKeysPem;
 
-	/// The required token issuer (`iss`). When set, a token whose `iss` differs
-	/// is rejected.
+	/// The required token issuer (`iss`). A token whose `iss` differs is
+	/// rejected. Required unless `allowAnyIssuer` is set: with neither, every
+	/// token is rejected and `jwtVerifier` refuses the config.
 	string issuer;
 
-	/// The required audience (`aud`, the RFC 8707 resource). When set, a token
-	/// that does not list it among its audiences is rejected.
+	/// Accept a token from any issuer, skipping the `iss` check. Only for a
+	/// verifier whose caller checks `iss` itself (e.g. against a list of allowed
+	/// issuers) or whose pinned keys belong to exactly one issuer.
+	bool allowAnyIssuer;
+
+	/// The required audience (`aud`, the RFC 8707 resource). A token that does
+	/// not list it among its audiences is rejected. Required unless
+	/// `allowAnyAudience` is set: with neither, every token is rejected and
+	/// `jwtVerifier` refuses the config.
 	string audience;
 
+	/// Accept a token for any audience, skipping the `aud` check. Only for a
+	/// verifier whose caller binds the audience itself (e.g. `authorize`'s
+	/// RFC 8707 resource check); otherwise a token the same issuer minted for
+	/// another service would be accepted.
+	bool allowAnyAudience;
+
 	/// Scopes the token must carry (from `scope` or `scp`). All must be present.
+	/// A token missing one is rejected as invalid (401 `invalid_token`); to answer
+	/// with 403 `insufficient_scope` so the client can step up, require the scopes
+	/// via `ResourceServerConfig.requiredScopes` instead (as `resourceServer` does).
 	string[] requiredScopes;
 
 	/// JOSE `typ` header values accepted for a bearer access token, compared
@@ -68,9 +90,17 @@ struct JwtVerifierConfig
 	/// whose `typ` does not match the expected type, defeating type-confusion
 	/// attacks (e.g. an OIDC `id_token` signed with the same key replayed as an
 	/// access token). The default also accepts the bare `JWT` that many issuers
-	/// (including this SDK's own token signer) emit. A token whose `typ` is
+	/// emit. A token whose `typ` is
 	/// absent or not listed here is rejected; set this empty to disable the
 	/// check for legacy issuers.
+	///
+	/// Accepting `JWT` means `typ` alone cannot tell an access token from an OIDC
+	/// `id_token`, whose `aud` is the client id. The verifier therefore also
+	/// rejects any token carrying the id_token-only claims `nonce`, `at_hash` or
+	/// `c_hash`, but an id_token without them would still pass when `audience`
+	/// is a client id. Prefer `["at+jwt"]` for an issuer that emits RFC 9068
+	/// tokens, and never set `audience` to an OAuth client id that also receives
+	/// id_tokens from the same issuer.
 	string[] acceptedTokenTypes = ["at+jwt", "JWT"];
 
 	/// Leeway applied to `exp`/`nbf` to tolerate clock skew.
@@ -78,6 +108,19 @@ struct JwtVerifierConfig
 
 	/// How long a fetched JWKS document is cached before being refetched.
 	Duration jwksCacheTtl = 300.seconds;
+
+	/// How long cached JWKS keys keep verifying tokens after the last
+	/// successful fetch while refetches fail. Past it the keys are dropped and
+	/// every token is rejected until the endpoint answers again, so a key the
+	/// IdP has revoked is not trusted indefinitely during an outage. Must be
+	/// at least `jwksCacheTtl`.
+	Duration jwksMaxStaleness = 3600.seconds;
+
+	/// The SSRF policy applied to the `jwksUri` fetch. The default requires
+	/// `https` to a public host (plain `http` only to loopback); an IdP on a
+	/// private network (e.g. `keycloak.internal` resolving to `10.x`) needs
+	/// `SsrfPolicy.allowUserConfigured`.
+	SsrfPolicy ssrfPolicy = SsrfPolicy.allowLoopback;
 }
 
 // ===========================================================================
@@ -91,29 +134,50 @@ struct JwtVerifierConfig
 /// Concurrency: the returned validator and its internal `JwksCache` hold
 /// unsynchronized mutable state (the cached PEM keys and fetch timestamp). Like
 /// the rest of the SDK they are bound to vibe.d's default single-threaded event
-/// loop, where the only fiber yield is the JWKS network fetch (which completes
-/// before the cache is mutated), so concurrent fibers never corrupt the cache.
+/// loop, where the only fiber yield is the JWKS network fetch (run inline or as
+/// a background refresh task, and completed before the cache is mutated), so
+/// concurrent fibers never corrupt the cache.
 /// Do not share the validator across worker threads; running the router with
 /// `HTTPServerOption.distribute` or worker threads is unsupported (see the
 /// concurrency contract in `mcp.transport.session`).
 TokenValidator jwtVerifier(JwtVerifierConfig cfg) @safe
 {
-	auto cache = new JwksCache(cfg.jwksUri, cfg.jwksCacheTtl);
+	import std.exception : enforce;
+
+	enforce(cfg.issuer.length || cfg.allowAnyIssuer,
+			"jwtVerifier: set JwtVerifierConfig.issuer (or allowAnyIssuer to skip the iss check)");
+	enforce(cfg.audience.length || cfg.allowAnyAudience,
+			"jwtVerifier: set JwtVerifierConfig.audience (or allowAnyAudience to skip the aud check)");
+	enforce(cfg.jwksUri.length || cfg.staticPublicKeysPem.length, "jwtVerifier: set JwtVerifierConfig.jwksUri or staticPublicKeysPem; with neither, no token can verify");
+	enforce(cfg.jwksMaxStaleness >= cfg.jwksCacheTtl,
+			"jwtVerifier: JwtVerifierConfig.jwksMaxStaleness must be at least jwksCacheTtl");
+	auto cache = new JwksCache(cfg.jwksUri, cfg.jwksCacheTtl, cfg.ssrfPolicy);
+	cache.maxStaleness = cfg.jwksMaxStaleness;
+	auto pinned = parsePinnedKeys(cfg.staticPublicKeysPem);
 	return (string token) @safe {
-		return verifyOrInvalid(() @safe => verifyToken(cfg, token, cache, currentUnixTime()));
+		return verifyOrInvalid(() @safe => verifyToken(cfg, token, cache,
+				currentUnixTime(), pinned));
 	};
 }
 
-/// Run `verify` fail-closed: any exception (a JWKS-fetch outage, a key-parse
-/// error, an OpenSSL-internal failure) yields an invalid token rather than
-/// propagating, so an exception can never be mistaken for a valid credential.
-/// The exception is logged first — otherwise a verifier-side outage is
+/// Run `verify` fail-closed: any exception (a key-parse error, an
+/// OpenSSL-internal failure) yields an invalid token rather than propagating,
+/// so an exception can never be mistaken for a valid credential. A
+/// `TokenVerifierUnavailableException` yields `TokenInfo.temporarilyUnavailable`.
+/// The exception is logged first — otherwise a verifier-side fault is
 /// indistinguishable from a flood of genuinely-bad-token rejections. The token
 /// itself is never logged (it is a bearer credential).
 package TokenInfo verifyOrInvalid(scope TokenInfo delegate() @safe verify) @safe
 {
 	try
 		return verify();
+	catch (TokenVerifierUnavailableException e)
+	{
+		import vibe.core.log : logWarn;
+
+		logWarn("jwtVerifier: verification keys are unavailable: %s", e.msg);
+		return TokenInfo.temporarilyUnavailable(e.retryAfter);
+	}
 	catch (Exception e)
 	{
 		import vibe.core.log : logWarn;
@@ -128,67 +192,126 @@ package TokenInfo verifyOrInvalid(scope TokenInfo delegate() @safe verify) @safe
 // Verification core (pure of HTTP / clock; unit-testable)
 // ===========================================================================
 
-/// A source of candidate verification keys. `keysFor(kid)` returns the PEM
-/// public keys to try for a token bearing the given `kid` (empty `kid` means the
-/// header had none).
+/// A source of candidate verification keys. `keysFor(kid, alg)` returns the
+/// parsed public keys to try for a token bearing the given `kid` (empty `kid`
+/// means the header had none), restricted to the key family `alg` verifies with
+/// (empty `alg` means any family).
 package interface KeySource
 {
-	string[] keysFor(string kid) @safe;
+	PublicKey[] keysFor(string kid, string alg = null) @safe;
+
+	/// Whether the source holds no keys because fetching them failed, so a
+	/// token it cannot verify may still be good. `retryAfter` is set to when
+	/// the next fetch may be attempted.
+	bool unavailable(out Duration retryAfter) @safe;
+}
+
+/// Reject a token, logging `reason` at diagnostic level so a misconfigured
+/// verifier (wrong audience, issuer or accepted `typ`) can be diagnosed. The
+/// token itself is never logged (it is a bearer credential).
+private TokenInfo reject(string reason) @safe
+{
+	import vibe.core.log : logDiagnostic;
+
+	logDiagnostic("jwtVerifier: token rejected: %s", reason);
+	return TokenInfo.invalid();
+}
+
+/// Answer a token that cannot be judged because the JWKS could not be fetched:
+/// the verifier, not the token, is at fault.
+private TokenInfo keysOutage(Duration retryAfter) @safe
+{
+	import vibe.core.log : logDiagnostic;
+
+	logDiagnostic("jwtVerifier: token not judged: the JWKS is unavailable");
+	return TokenInfo.temporarilyUnavailable(retryAfter);
 }
 
 /// Verify `token` against `cfg` at wall-clock time `now` (unix seconds), drawing
 /// JWKS keys from `keys`. Separated from clock/HTTP so tests can drive it
-/// deterministically.
+/// deterministically. This overload parses `cfg.staticPublicKeysPem` on every
+/// call; `jwtVerifier` parses them once and passes them as `pinned`.
 package TokenInfo verifyToken(JwtVerifierConfig cfg, string token, KeySource keys, long now) @safe
+{
+	return verifyToken(cfg, token, keys, now, parsePinnedKeys(cfg.staticPublicKeysPem));
+}
+
+/// As above, with the pinned keys already parsed.
+package TokenInfo verifyToken(JwtVerifierConfig cfg, string token, KeySource keys,
+		long now, PublicKey[] pinned) @safe
 {
 	auto parts = token.split('.');
 	if (parts.length != 3)
-		return TokenInfo.invalid();
+		return reject("not a three-part JWS");
 
 	const headerJson = decodeSegmentJson(parts[0]);
 	const payloadJson = decodeSegmentJson(parts[1]);
 	if (headerJson.type != Json.Type.object || payloadJson.type != Json.Type.object)
-		return TokenInfo.invalid();
+		return reject("header or payload is not a JSON object");
 
 	const alg = jsonStr(headerJson, "alg");
 	const kid = jsonStr(headerJson, "kid");
 	if (alg != "RS256" && alg != "ES256")
-		return TokenInfo.invalid();
+		return reject("unsupported alg");
 
 	// RFC 7515 4.1.11: a `crit` header lists extensions the recipient MUST
 	// understand. This verifier implements none, so any token carrying a
 	// `crit` member MUST be rejected rather than silently accepted.
 	if ("crit" in headerJson)
-		return TokenInfo.invalid();
+		return reject("crit header present");
 
 	// RFC 9068 4.1: reject a token whose `typ` is not an expected access-token
 	// type, so a token of another type (e.g. an OIDC `id_token`) signed with the
 	// same key cannot be replayed as an access token.
 	if (!typAccepted(cfg.acceptedTokenTypes, jsonStr(headerJson, "typ")))
-		return TokenInfo.invalid();
+		return reject("typ header is absent or not an accepted token type");
 
-	// Gather candidate keys: pinned PEM keys plus any JWKS keys for this kid.
-	string[] candidates = cfg.staticPublicKeysPem.dup;
-	candidates ~= keys.keysFor(kid);
+	// Gather candidate keys: the JWKS keys for this kid (every JWKS key when it
+	// names none or an unknown one), then the pinned keys.
+	PublicKey[] candidates = keys.keysFor(kid, alg) ~ pinned;
+	Duration retryAfter;
+	const keysUnavailable = keys.unavailable(retryAfter);
 	if (candidates.length == 0)
-		return TokenInfo.invalid();
+		return keysUnavailable ? keysOutage(retryAfter) : reject("no verification key available");
 
 	const signingInput = parts[0] ~ "." ~ parts[1];
-	const sig = base64UrlDecode(parts[2]);
+	// A malformed signature segment is an ordinary bad token, not a verifier
+	// fault, so it is rejected here rather than raised and logged.
+	ubyte[] sig;
+	try
+		sig = base64UrlDecode(parts[2]);
+	catch (Exception)
+		return reject("malformed signature segment");
 
 	bool sigOk = false;
-	foreach (pem; candidates)
+	foreach (key; candidates)
 	{
-		if (verifyJws(alg, cast(const(ubyte)[]) signingInput, sig, pem))
+		if (key.verify(alg, cast(const(ubyte)[]) signingInput, sig))
 		{
 			sigOk = true;
 			break;
 		}
 	}
 	if (!sigOk)
-		return TokenInfo.invalid();
+		return keysUnavailable ? keysOutage(retryAfter) : reject(
+				"signature does not verify against any candidate key");
 
 	return validateClaims(cfg, payloadJson, now);
+}
+
+/// Read a JSON NumericDate (RFC 7519 §2: integer or fractional seconds) into
+/// `seconds`. Returns false for any other value, including a non-finite float.
+private bool numericDate(Json v, out double seconds) @safe
+{
+	import std.math : isFinite;
+
+	if (v.type == Json.Type.int_)
+		seconds = v.get!long;
+	else if (v.type == Json.Type.float_)
+		seconds = v.get!double;
+	else
+		return false;
+	return isFinite(seconds);
 }
 
 /// Validate the registered claims of an already-signature-verified payload.
@@ -196,32 +319,48 @@ package TokenInfo validateClaims(JwtVerifierConfig cfg, Json payload, long now) 
 {
 	const skew = cast(long) cfg.clockSkew.total!"seconds";
 
-	// A JWT access token without an integer `exp` cannot be validated as
-	// unexpired, so it MUST be rejected (OAuth 2.1 §5.2 token validation,
-	// RFC 9068 §2.2/§4). An absent or non-integer `exp` is treated as invalid.
-	if (payload["exp"].type != Json.Type.int_)
-		return TokenInfo.invalid();
-	const e = jsonLong(payload, "exp");
+	// A JWT access token without a NumericDate `exp` (RFC 7519 §2: integer or
+	// fractional seconds) cannot be validated as unexpired, so it MUST be
+	// rejected (OAuth 2.1 §5.2 token validation, RFC 9068 §2.2/§4). An absent,
+	// non-numeric or non-finite `exp` is treated as invalid.
+	double e;
+	if (!numericDate(payload["exp"], e))
+		return reject("exp claim is absent or not a NumericDate");
 	// RFC 7519 4.1.4: the token is expired once the current time is no longer
 	// before `exp`. With `clockSkew` the grace boundary is `now <= exp + skew`,
 	// so reject at the boundary (`>=`) rather than one second past it.
 	if (now >= e + skew)
-		return TokenInfo.invalid();
-	const nbf = jsonLong(payload, "nbf");
-	if (nbf != 0 && now + skew < nbf)
-		return TokenInfo.invalid();
+		return reject("token is expired (exp)");
+	// `nbf` is optional, but when present it must be a NumericDate; any other
+	// value is rejected so a malformed claim cannot switch the not-before check
+	// off.
+	const nbfClaim = payload["nbf"];
+	if (nbfClaim.type != Json.Type.undefined)
+	{
+		double nbf;
+		if (!numericDate(nbfClaim, nbf) || now + skew < nbf)
+			return reject("token is not yet valid or nbf is malformed");
+	}
 
-	if (cfg.issuer.length && jsonStr(payload, "iss") != cfg.issuer)
-		return TokenInfo.invalid();
+	// Claims only an OIDC id_token carries. An id_token is typed `JWT` like many
+	// access tokens, and its `aud` is the client id, so without this check one
+	// could be replayed as an access token wherever the configured audience is
+	// that client id.
+	foreach (idTokenClaim; ["nonce", "at_hash", "c_hash"])
+		if (payload[idTokenClaim].type != Json.Type.undefined)
+			return reject("payload carries an OIDC id_token-only claim");
+
+	if (!cfg.allowAnyIssuer && (cfg.issuer.length == 0 || jsonStr(payload, "iss") != cfg.issuer))
+		return reject("iss does not match the configured issuer");
 
 	auto auds = audiences(payload);
-	if (cfg.audience.length && !auds.canFind(cfg.audience))
-		return TokenInfo.invalid();
+	if (!cfg.allowAnyAudience && (cfg.audience.length == 0 || !includesAudience(auds, cfg.audience)))
+		return reject("aud does not include the configured audience");
 
 	auto scopes = tokenScopes(payload);
 	foreach (req; cfg.requiredScopes)
 		if (!scopes.canFind(req))
-			return TokenInfo.invalid();
+			return reject("a required scope is missing");
 
 	TokenInfo ti;
 	ti.valid = true;
@@ -236,18 +375,76 @@ package TokenInfo validateClaims(JwtVerifierConfig cfg, Json payload, long now) 
 // JWS signature verification (OpenSSL EVP)
 // ===========================================================================
 
+/// The smallest RSA modulus, in bits, accepted for RS256 verification.
+private enum int minRsaKeyBits = 2048;
+
 /// Verify a JWS signature over `signingInput` for the given `alg` using the PEM
 /// public key. For ES256 the signature is the raw 64-byte R||S form (RFC 7518
 /// §3.4), converted to DER before handing to OpenSSL.
 package bool verifyJws(string alg, const(ubyte)[] signingInput,
-		const(ubyte)[] sig, string publicKeyPem) @trusted
+		const(ubyte)[] sig, string publicKeyPem) @safe
 {
-	auto pkey = parsePublicKeyPem(publicKeyPem);
-	if (pkey is null)
-		return false;
-	scope (exit)
-		EVP_PKEY_free(pkey);
+	auto key = PublicKey.fromPem(publicKeyPem);
+	return key !is null && key.verify(alg, signingInput, sig);
+}
 
+/// A public key parsed once into an OpenSSL `EVP_PKEY` and reused for every
+/// verification, rather than re-parsing its PEM per token.
+package final class PublicKey
+{
+	/// "RSA" or "EC".
+	immutable string kty;
+	private EVP_PKEY* pkey;
+
+	private this(EVP_PKEY* pkey, string kty) @safe
+	{
+		this.pkey = pkey;
+		this.kty = kty;
+	}
+
+	~this() @trusted nothrow
+	{
+		if (pkey !is null)
+			EVP_PKEY_free(pkey);
+	}
+
+	/// Parse a PEM SubjectPublicKeyInfo, or null when it is not an RSA or EC
+	/// public key.
+	static PublicKey fromPem(string pem) @trusted
+	{
+		auto pkey = parsePublicKeyPem(pem);
+		if (pkey is null)
+			return null;
+		const baseId = EVP_PKEY_base_id(pkey);
+		if (baseId != EVP_PKEY_RSA && baseId != EVP_PKEY_EC)
+		{
+			EVP_PKEY_free(pkey);
+			return null;
+		}
+		return new PublicKey(pkey, baseId == EVP_PKEY_RSA ? "RSA" : "EC");
+	}
+
+	/// Verify a JWS signature over `signingInput` for `alg` (see `verifyJws`).
+	bool verify(string alg, const(ubyte)[] signingInput, const(ubyte)[] sig) @safe
+	{
+		return verifyWithPkey(alg, signingInput, sig, pkey);
+	}
+}
+
+/// Parse each pinned PEM key, skipping any that do not parse (they can never
+/// verify a token).
+package PublicKey[] parsePinnedKeys(const string[] pems) @safe
+{
+	PublicKey[] keys;
+	foreach (pem; pems)
+		if (auto k = PublicKey.fromPem(pem))
+			keys ~= k;
+	return keys;
+}
+
+private bool verifyWithPkey(string alg, const(ubyte)[] signingInput,
+		const(ubyte)[] sig, EVP_PKEY* pkey) @trusted
+{
 	// Bind the token-header `alg` to the key type rather than relying on OpenSSL
 	// to reject a cross-type attempt: RS256 requires an RSA key, ES256 an EC key.
 	// This keeps a future symmetric/other alg from introducing an alg-confusion
@@ -255,12 +452,14 @@ package bool verifyJws(string alg, const(ubyte)[] signingInput,
 	const baseId = EVP_PKEY_base_id(pkey);
 	if (alg == "RS256")
 	{
-		if (baseId != EVP_PKEY_RSA)
+		// The same 2048-bit floor JWKS keys are held to (NIST SP 800-131A), so a
+		// weak pinned PEM key is not a way around it.
+		if (baseId != EVP_PKEY_RSA || EVP_PKEY_bits(pkey) < minRsaKeyBits)
 			return false;
 	}
 	else if (alg == "ES256")
 	{
-		if (baseId != EVP_PKEY_EC)
+		if (baseId != EVP_PKEY_EC || !isP256Key(pkey))
 			return false;
 	}
 	else
@@ -287,6 +486,19 @@ package bool verifyJws(string alg, const(ubyte)[] signingInput,
 	const rc = EVP_DigestVerify(ctx, derSig.ptr, derSig.length,
 			signingInput.ptr, signingInput.length);
 	return rc == 1;
+}
+
+/// Whether the EC public key `pkey` lies on P-256, the only curve ES256 permits
+/// (RFC 7518 §3.4).
+private bool isP256Key(EVP_PKEY* pkey) @trusted
+{
+	auto ec = EVP_PKEY_get1_EC_KEY(pkey);
+	if (ec is null)
+		return false;
+	scope (exit)
+		EC_KEY_free(ec);
+	auto group = EC_KEY_get0_group(ec);
+	return group !is null && EC_GROUP_get_curve_name(group) == NID_X9_62_prime256v1;
 }
 
 /// Convert a raw 64-byte ECDSA P-256 signature (R||S) to the DER encoding
@@ -375,13 +587,13 @@ package struct Jwk
 package Jwk[] parseJwks(string jwksJson) @safe
 {
 	Jwk[] result;
-	auto root = parseJsonString(jwksJson);
+	auto root = parseUntrustedJson(jwksJson);
 	if (root.type != Json.Type.object)
 		return result;
 	auto keys = root["keys"];
 	if (keys.type != Json.Type.array)
 		return result;
-	foreach (k; ()@trusted { return keys.get!(Json[]); }())
+	foreach (k; keys.get!(Json[]))
 	{
 		if (k.type != Json.Type.object)
 			continue;
@@ -401,27 +613,38 @@ package Jwk[] parseJwks(string jwksJson) @safe
 	return result;
 }
 
-/// Whether a JWK may be used to verify signatures (RFC 7517 4.2/4.3): a key
-/// declaring `use` must declare `use=="sig"`, and a key declaring `key_ops` must
-/// include `"verify"`. Keys that declare neither are usable (the members are
-/// optional). Keys declaring an incompatible use/op are excluded as candidates.
+/// Whether a JWK may be used to verify signatures (RFC 7517 4.2/4.3/4.4): a key
+/// declaring `use` must declare `use=="sig"`, a key declaring `key_ops` must
+/// include `"verify"`, and a key declaring `alg` must name a supported algorithm
+/// of its own family (RS256 for RSA, ES256 for EC). Keys that declare none of
+/// these are usable (the members are optional).
 package bool jwkUsableForSig(Jwk jwk) @safe
 {
 	if (jwk.use.length && jwk.use != "sig")
 		return false;
 	if (jwk.keyOps.length && !jwk.keyOps.canFind("verify"))
 		return false;
+	if (jwk.alg.length && !(jwk.alg == "RS256" && jwk.kty == "RSA")
+			&& !(jwk.alg == "ES256" && jwk.kty == "EC"))
+		return false;
 	return true;
 }
 
 /// Convert a JWK to a PEM SubjectPublicKeyInfo public key. Supports RSA (n/e)
-/// and EC P-256/P-384/P-521 (crv/x/y, RFC 7518). Returns null for unsupported keys.
-package string jwkToPem(Jwk jwk) @trusted
+/// and EC P-256 (crv/x/y, RFC 7518), the key types RS256 and ES256 verify with.
+/// Returns null for unsupported keys and for key material that is not valid
+/// base64url, so one malformed key never invalidates the rest of a JWKS.
+package string jwkToPem(Jwk jwk) @safe
 {
-	if (jwk.kty == "RSA")
-		return rsaJwkToPem(jwk);
-	if (jwk.kty == "EC")
-		return ecJwkToPem(jwk);
+	try
+	{
+		if (jwk.kty == "RSA")
+			return rsaJwkToPem(jwk);
+		if (jwk.kty == "EC")
+			return ecJwkToPem(jwk);
+	}
+	catch (Exception)
+		return null;
 	return null;
 }
 
@@ -442,7 +665,7 @@ private string rsaJwkToPem(Jwk jwk) @trusted
 		return null;
 	}
 	// Reject keys shorter than 2048 bits (NIST SP 800-131A / RFC 8017).
-	if (BN_num_bits(n) < 2048)
+	if (BN_num_bits(n) < minRsaKeyBits)
 	{
 		BN_free(n);
 		BN_free(e);
@@ -481,15 +704,9 @@ private string ecJwkToPem(Jwk jwk) @trusted
 {
 	if (jwk.x.length == 0 || jwk.y.length == 0)
 		return null;
-	int nid;
-	if (jwk.crv == "P-256")
-		nid = NID_X9_62_prime256v1;
-	else if (jwk.crv == "P-384")
-		nid = NID_secp384r1;
-	else if (jwk.crv == "P-521")
-		nid = NID_secp521r1;
-	else
+	if (jwk.crv != "P-256")
 		return null;
+	const nid = NID_X9_62_prime256v1;
 	auto eckey = EC_KEY_new_by_curve_name(nid);
 	if (eckey is null)
 		return null;
@@ -558,51 +775,199 @@ private string pkeyToPem(EVP_PKEY* pkey) @trusted
 
 /// A TTL cache for a JWKS document, refetched on demand. Selects keys by `kid`;
 /// when a token's `kid` is unknown, every JWKS key is offered as a candidate.
+///
+/// Once the TTL lapses the cached keys keep verifying tokens while a background
+/// task refetches the document (stale-while-revalidate), so an IdP outage never
+/// stalls requests whose keys are already cached. A request blocks on a fetch
+/// only when no usable keys are held (never loaded, or older than
+/// `maxStaleness`) or when its token names a `kid` the cache does not hold (the
+/// IdP may have rotated in a new key). Fetch attempts, successful or not, are
+/// spaced at least `minRefetchInterval` apart, measured from when the previous
+/// attempt finished, and single-flighted, so neither an unreachable IdP nor a
+/// stream of tokens with made-up `kid`s can turn every request into an outbound
+/// fetch.
 package final class JwksCache : KeySource
 {
+	import vibe.core.sync : TaskMutex;
+
+	/// Minimum spacing between JWKS fetch attempts. Also how long a failed fetch
+	/// is remembered before the next attempt.
+	enum Duration minRefetchInterval = 10.seconds;
+
+	/// The default for `maxStaleness`.
+	enum Duration defaultMaxStaleness = 3600.seconds;
+
+	/// How long after the last successful fetch the cached keys stay usable
+	/// while refetches keep failing. Past it the keys are dropped, so a key the
+	/// IdP has revoked stops verifying tokens even if the JWKS endpoint stays
+	/// unreachable.
+	package Duration maxStaleness = defaultMaxStaleness;
+
 	private string uri;
 	private Duration ttl;
-	private string[string] pemByKid; // kid -> PEM
-	private string[] allPems;
-	private long fetchedAt = -1;
-	private bool loaded = false;
+	private SsrfPolicy policy;
+	private static struct Key
+	{
+		string kty;
+		PublicKey key;
+	}
 
-	this(string uri, Duration ttl) @safe
+	// RFC 7517 4.5 lets keys of different types share a kid, so each kid maps
+	// to every key carrying it.
+	private Key[][string] keysByKid;
+	private Key[] allKeys;
+	private long fetchedAt = -1;
+	private long lastAttemptAt = -1; // when the last fetch attempt finished
+	private bool loaded = false;
+	private bool refreshQueued = false;
+	private TaskMutex fetchLock;
+
+	/// Fetches the JWKS document at a URI, returning its body or null on
+	/// failure. Null selects the SSRF-guarded HTTP fetch; tests script it.
+	package string delegate(string uri) @safe fetcher;
+
+	/// The current Unix time in seconds. Null selects the wall clock; tests
+	/// drive it by hand.
+	package long delegate() @safe clock;
+
+	/// Starts a background refresh. Null selects `vibe.core.core.runTask`;
+	/// tests queue the refresh and run it by hand.
+	package void delegate(void delegate() @safe nothrow) @safe spawn;
+
+	this(string uri, Duration ttl, SsrfPolicy policy = SsrfPolicy.allowLoopback) @safe
 	{
 		this.uri = uri;
 		this.ttl = ttl;
+		this.policy = policy;
+		this.fetchLock = new TaskMutex;
 	}
 
-	/// Candidate PEM keys for a `kid`. Triggers a (re)fetch when stale.
-	string[] keysFor(string kid) @safe
+	/// Candidate PEM keys for a `kid`. Blocks on a (rate-limited) fetch when no
+	/// usable keys are held or `kid` is unknown; when the keys are merely past
+	/// their TTL, returns them and refreshes in the background.
+	PublicKey[] keysFor(string kid, string alg = null) @safe
 	{
 		if (uri.length == 0)
 		{
 			if (loaded)
-				return kidKeys(kid);
+				return kidKeys(kid, alg);
 			return null;
 		}
-		refreshIfStale();
-		return kidKeys(kid);
+		const unknownKid = kid.length && (kid in keysByKid) is null;
+		if (!loaded || tooStale() || unknownKid)
+			refetch();
+		else if (now() - fetchedAt >= cast(long) ttl.total!"seconds")
+			refreshInBackground();
+		if (tooStale())
+		{
+			import vibe.core.log : logWarn;
+
+			logWarn("JWKS from %s has not been refreshed within %s; dropping the cached keys",
+					redactUrl(uri), maxStaleness);
+			keysByKid = null;
+			allKeys = null;
+			loaded = false;
+		}
+		return kidKeys(kid, alg);
 	}
 
-	private string[] kidKeys(string kid) @safe
+	/// Whether a fetch has failed and no keys are held.
+	bool unavailable(out Duration retryAfter) @safe
 	{
+		if (uri.length == 0 || loaded || lastAttemptAt < 0)
+			return false;
+		const wait = minRefetchInterval.total!"seconds" - (now() - lastAttemptAt);
+		retryAfter = (wait > 1 ? wait : 1).seconds;
+		return true;
+	}
+
+	private long now() @safe
+	{
+		return clock !is null ? clock() : currentUnixTime();
+	}
+
+	/// Whether the held keys are older than `maxStaleness`.
+	private bool tooStale() @safe
+	{
+		return loaded && now() - fetchedAt >= cast(long) maxStaleness.total!"seconds";
+	}
+
+	private bool attemptedRecently() @safe
+	{
+		return lastAttemptAt >= 0 && now() - lastAttemptAt < minRefetchInterval.total!"seconds";
+	}
+
+	/// The keys under `kid` (every key when `kid` is absent or unknown) whose
+	/// type `alg` verifies with.
+	private PublicKey[] kidKeys(string kid, string alg) @safe
+	{
+		Key[] pool = allKeys;
 		if (kid.length)
-			if (auto p = kid in pemByKid)
-				return [*p];
-		// Unknown/absent kid: offer all keys.
-		return allPems.dup;
+			if (auto p = kid in keysByKid)
+				pool = *p;
+		const kty = alg == "RS256" ? "RSA" : alg == "ES256" ? "EC" : null;
+		PublicKey[] keys;
+		foreach (k; pool)
+			if (kty.length == 0 || k.kty == kty)
+				keys ~= k.key;
+		return keys;
 	}
 
-	private void refreshIfStale() @safe
+	/// Queue one background `refetch` unless one is already queued or an
+	/// attempt finished within `minRefetchInterval`.
+	private void refreshInBackground() @safe
 	{
-		const now = currentUnixTime();
-		if (loaded && fetchedAt >= 0 && now - fetchedAt < cast(long) ttl.total!"seconds")
+		if (refreshQueued || attemptedRecently())
 			return;
-		const doc = fetchJwks(uri);
-		if (doc.length)
+		refreshQueued = true;
+		void delegate() @safe nothrow refresh = () @safe nothrow{
+			scope (exit)
+				refreshQueued = false;
+			try
+				refetch();
+			catch (Exception e)
+			{
+				import vibe.core.log : logWarn;
+
+				logWarn("JWKS background refresh from %s failed: %s", redactUrl(uri), e.msg);
+			}
+		};
+		if (spawn !is null)
+			spawn(refresh);
+		else
+		{
+			import vibe.core.core : runTask;
+
+			runTask(refresh);
+		}
+	}
+
+	/// Fetch the document unless an attempt finished within
+	/// `minRefetchInterval`. Holding `fetchLock` for the fetch makes concurrent
+	/// callers wait for the one in flight and then find the attempt recent.
+	private void refetch() @safe
+	{
+		fetchLock.lock();
+		scope (exit)
+			fetchLock.unlock();
+		if (attemptedRecently())
+			return;
+		scope (exit)
+			lastAttemptAt = now();
+		const doc = fetcher !is null ? fetcher(uri) : fetchJwks(uri, policy);
+		if (doc.length == 0)
+			return;
+		// An unparseable document is handled like a failed fetch: logged, with
+		// the cached keys kept, rather than failing the request that triggered it.
+		try
 			load(doc);
+		catch (Exception e)
+		{
+			import vibe.core.log : logWarn;
+
+			logWarn("JWKS from %s could not be parsed; keeping the cached keys: %s",
+					redactUrl(uri), e.msg);
+		}
 	}
 
 	/// Populate the cache from a raw JWKS document (also the test seam).
@@ -611,8 +976,8 @@ package final class JwksCache : KeySource
 		// Build new key maps in temporaries so that a parse exception (malformed
 		// JSON or invalid base64url in a JWK field) leaves the existing cache
 		// state untouched rather than clearing it and marking it stale.
-		string[string] newPemByKid;
-		string[] newAllPems;
+		Key[][string] newKeysByKid;
+		Key[] newAllKeys;
 		foreach (jwk; parseJwks(jwksJson))
 		{
 			if (!jwkUsableForSig(jwk))
@@ -620,42 +985,67 @@ package final class JwksCache : KeySource
 			const pem = jwkToPem(jwk);
 			if (pem.length == 0)
 				continue;
-			newAllPems ~= pem;
+			auto parsed = PublicKey.fromPem(pem);
+			if (parsed is null)
+				continue;
+			auto key = Key(jwk.kty, parsed);
+			newAllKeys ~= key;
 			if (jwk.kid.length)
-				newPemByKid[jwk.kid] = pem;
+				newKeysByKid[jwk.kid] ~= key;
+		}
+		// A document with no usable key is treated like a failed fetch: the
+		// previous keys stay and the cache stays stale, so the next fetch is
+		// governed by `minRefetchInterval` rather than the full TTL.
+		if (newAllKeys.length == 0)
+		{
+			import vibe.core.log : logWarn;
+
+			logWarn(
+					"JWKS from %s holds no usable signature-verification key; keeping the cached keys",
+					redactUrl(uri));
+			return;
 		}
 		// Swap atomically into the cache fields only after all parsing succeeds.
-		pemByKid = newPemByKid;
-		allPems = newAllPems;
+		keysByKid = newKeysByKid;
+		allKeys = newAllKeys;
 		loaded = true;
-		fetchedAt = currentUnixTime();
+		fetchedAt = now();
 	}
 }
 
-/// Fetch a JWKS document over HTTP(S). Returns the body, or empty on failure.
-private string fetchJwks(string uri) @trusted
+/// Upper bound on a fetched JWKS document. A larger response is rejected rather
+/// than buffered.
+private enum size_t maxJwksBytes = 256 * 1024;
+
+/// Fetch a JWKS document over HTTP(S) under `policy`. Returns the body, or
+/// empty on failure (logged, since every token then fails verification).
+private string fetchJwks(string uri, SsrfPolicy policy) @safe
 {
+	import vibe.core.log : logWarn;
 	import vibe.http.client : HTTPClientRequest, HTTPClientResponse;
 	import vibe.http.common : HTTPMethod;
 	import vibe.stream.operations : readAllUTF8;
 	import mcp.auth.oauth : secureRequestHTTP;
 
-	// Refuse to fetch a JWKS over an insecure transport (must be https, or http
-	// to a loopback host for dev) or from an internal/link-local address. The
-	// fetch is pinned to a pre-vetted resolved address (DNS-rebinding SSRF
-	// mitigation); secureRequestHTTP throws on an unsafe or unresolvable host.
+	// secureRequestHTTP pins the fetch to a pre-vetted resolved address
+	// (DNS-rebinding SSRF mitigation) and throws on a host `policy` rejects.
 	string body_;
 	try
 	{
-		secureRequestHTTP(uri, (scope HTTPClientRequest req) {
+		secureRequestHTTP(uri, policy, (scope HTTPClientRequest req) {
 			req.method = HTTPMethod.GET;
 		}, (scope HTTPClientResponse res) {
 			if (res.statusCode / 100 == 2)
-				body_ = res.bodyReader.readAllUTF8();
+				body_ = res.bodyReader.readAllUTF8(false, maxJwksBytes);
+			else
+				logWarn("JWKS fetch from %s returned HTTP %d", redactUrl(uri), res.statusCode);
 		});
 	}
-	catch (Exception)
+	catch (Exception e)
+	{
+		logWarn("JWKS fetch from %s failed: %s", redactUrl(uri), e.msg);
 		return null;
+	}
 	return body_;
 }
 
@@ -676,7 +1066,24 @@ package ubyte[] base64UrlDecode(string seg) @safe
 {
 	import std.base64 : Base64URLNoPadding;
 
-	return () @trusted { return Base64URLNoPadding.decode(seg); }();
+	return Base64URLNoPadding.decode(seg);
+}
+
+/// The `iss` claim of a compact JWS, read WITHOUT verifying it; "" when the
+/// token is malformed or names no string issuer. Only for choosing which
+/// verifier to run, never for trusting the claim.
+package string unverifiedIssuer(string token) @safe
+{
+	import std.algorithm : splitter;
+	import std.array : array;
+
+	auto parts = token.splitter('.').array;
+	if (parts.length != 3)
+		return "";
+	auto payload = decodeSegmentJson(parts[1]);
+	if (payload.type != Json.Type.object)
+		return "";
+	return jsonStr(payload, "iss");
 }
 
 private Json decodeSegmentJson(string seg) @safe
@@ -684,8 +1091,8 @@ private Json decodeSegmentJson(string seg) @safe
 	try
 	{
 		auto bytes = base64UrlDecode(seg);
-		auto s = () @trusted { return (cast(char[]) bytes).idup; }();
-		return parseJsonString(s);
+		auto s = (cast(char[]) bytes).idup;
+		return parseUntrustedJson(s);
 	}
 	catch (Exception)
 		return Json.undefined;
@@ -708,21 +1115,10 @@ private string[] jsonStrArray(Json j, string key) @safe
 	if (v.type != Json.Type.array)
 		return null;
 	string[] result;
-	foreach (e; ()@trusted { return v.get!(Json[]); }())
+	foreach (e; v.get!(Json[]))
 		if (e.type == Json.Type.string)
 			result ~= e.get!string;
 	return result;
-}
-
-/// Read an integer claim, returning 0 when absent or not an integer. Callers
-/// that require presence (e.g. `exp`) must check the JSON type separately;
-/// `nbf` is genuinely optional so a 0 result correctly disables the check.
-private long jsonLong(Json j, string key) @safe
-{
-	auto v = j[key];
-	if (v.type == Json.Type.int_)
-		return v.get!long;
-	return 0;
 }
 
 /// Extract the audiences from a claims object: `aud` may be a string or an array
@@ -734,10 +1130,22 @@ package string[] audiences(Json payload) @safe
 	if (a.type == Json.Type.string)
 		result ~= a.get!string;
 	else if (a.type == Json.Type.array)
-		foreach (e; ()@trusted { return a.get!(Json[]); }())
+		foreach (e; a.get!(Json[]))
 			if (e.type == Json.Type.string)
 				result ~= e.get!string;
 	return result;
+}
+
+/// Whether `auds` names `audience`, comparing both in RFC 8707 canonical form
+/// (`canonicalResourceUri`) so a configured resource differing only in host
+/// case, a trailing slash, or an explicit default port still matches.
+package bool includesAudience(const string[] auds, string audience) @safe
+{
+	import std.algorithm : any;
+	import mcp.auth.oauth : canonicalResourceUri;
+
+	const want = canonicalResourceUri(audience);
+	return auds.any!(a => canonicalResourceUri(a) == want);
 }
 
 /// Split a space-delimited scope string into individual scopes, dropping empty
@@ -794,7 +1202,7 @@ string[] tokenScopes(Json payload) @safe
 	if (scp.type == Json.Type.array)
 	{
 		string[] result;
-		foreach (e; ()@trusted { return scp.get!(Json[]); }())
+		foreach (e; scp.get!(Json[]))
 			if (e.type == Json.Type.string)
 				result ~= e.get!string;
 		return result;
@@ -851,9 +1259,14 @@ version (unittest)
 	// A KeySource that returns no JWKS keys (pinned-PEM-only tests).
 	private final class NoKeys : KeySource
 	{
-		string[] keysFor(string kid) @safe
+		PublicKey[] keysFor(string kid, string alg = null) @safe
 		{
 			return null;
+		}
+
+		bool unavailable(out Duration retryAfter) @safe
+		{
+			return false;
 		}
 	}
 }
@@ -877,9 +1290,150 @@ unittest  // a valid RS256 token with good sig/iss/aud/scope is accepted
 	assert(ti.audience.canFind("https://mcp.example.com/mcp"));
 }
 
+unittest  // a config with no issuer rejects every token rather than skipping the iss check
+{
+	JwtVerifierConfig cfg;
+	cfg.allowAnyAudience = true;
+	auto payload = parseJsonString(`{"iss":"https://evil.example","sub":"u","exp":1700003600}`);
+	assert(!validateClaims(cfg, payload, 1_700_001_000).valid);
+	assert(!validateClaims(cfg,
+			parseJsonString(`{"sub":"u","exp":1700003600}`), 1_700_001_000).valid);
+}
+
+unittest  // jwtVerifier refuses a config that pins no issuer
+{
+	import std.exception : assertThrown;
+
+	JwtVerifierConfig cfg;
+	cfg.allowAnyAudience = true;
+	cfg.staticPublicKeysPem = ["unused"];
+	assertThrown(jwtVerifier(cfg));
+}
+
+unittest  // jwtVerifier refuses a config that pins no audience
+{
+	import std.exception : assertThrown;
+
+	JwtVerifierConfig cfg;
+	cfg.issuer = "https://as.example.com";
+	cfg.staticPublicKeysPem = ["unused"];
+	assertThrown(jwtVerifier(cfg));
+	cfg.allowAnyAudience = true;
+	cast(void) jwtVerifier(cfg);
+}
+
+unittest  // a config with no audience rejects every token rather than skipping the aud check
+{
+	JwtVerifierConfig cfg;
+	cfg.issuer = "https://as.example.com";
+	auto payload = parseJsonString(
+			`{"iss":"https://as.example.com","aud":"https://other.example","exp":1700003600}`);
+	assert(!validateClaims(cfg, payload, 1_700_001_000).valid);
+	cfg.allowAnyAudience = true;
+	assert(validateClaims(cfg, payload, 1_700_001_000).valid);
+}
+
+unittest  // jwtVerifier refuses a config with neither a jwksUri nor a pinned key
+{
+	import std.exception : assertThrown;
+
+	JwtVerifierConfig cfg;
+	cfg.allowAnyAudience = true;
+	cfg.issuer = "https://as.example.com";
+	assertThrown(jwtVerifier(cfg));
+}
+
+unittest  // a claim rejection is logged with its reason, never with the token
+{
+	import std.algorithm : any;
+	import vibe.core.log : deregisterLogger, LogLevel, Logger, LogLine, registerLogger;
+
+	static final class DiagLogger : Logger
+	{
+		string[] lines;
+		this() @safe
+		{
+			minLevel = LogLevel.diagnostic;
+		}
+
+		override void log(ref LogLine line) @safe
+		{
+			lines ~= line.text;
+		}
+	}
+
+	auto logger = new DiagLogger;
+	auto shared_ = () @trusted { return cast(shared) logger; }();
+	() @trusted { registerLogger(shared_); }();
+	scope (exit)
+		() @trusted { deregisterLogger(shared_); }();
+
+	JwtVerifierConfig cfg;
+	cfg.allowAnyIssuer = true;
+	cfg.audience = "https://other.example.com";
+	auto cache = new JwksCache("", cfg.jwksCacheTtl);
+	cache.load(`{"keys":[{"kty":"RSA","kid":"rsa-1","n":"` ~ testRsaN ~ `","e":"` ~ testRsaE
+			~ `"}]}`);
+	assert(!verifyToken(cfg, testRs256Jwt, cache, 1_700_001_000).valid);
+
+	auto lines = (cast() logger).lines;
+	assert(lines.any!(l => l.canFind("aud")), "the audience rejection must be logged");
+	assert(!lines.any!(l => l.canFind(testRs256Jwt[0 .. 20])), "the token must never be logged");
+}
+
+unittest  // a `typ` rejection is logged with its reason
+{
+	import std.algorithm : any;
+	import vibe.core.log : deregisterLogger, LogLevel, Logger, LogLine, registerLogger;
+
+	static final class DiagLogger : Logger
+	{
+		string[] lines;
+		this() @safe
+		{
+			minLevel = LogLevel.diagnostic;
+		}
+
+		override void log(ref LogLine line) @safe
+		{
+			lines ~= line.text;
+		}
+	}
+
+	auto logger = new DiagLogger;
+	auto shared_ = () @trusted { return cast(shared) logger; }();
+	() @trusted { registerLogger(shared_); }();
+	scope (exit)
+		() @trusted { deregisterLogger(shared_); }();
+
+	JwtVerifierConfig cfg;
+	cfg.allowAnyAudience = true;
+	cfg.allowAnyIssuer = true;
+	cfg.acceptedTokenTypes = ["at+jwt"];
+	cfg.staticPublicKeysPem = [testEcPubPem];
+	auto tok = makeEs256(`{"sub":"u","exp":1700003600}`);
+	assert(!verifyToken(cfg, tok, new NoKeys, 1_700_001_000).valid);
+
+	auto lines = (cast() logger).lines;
+	assert(lines.any!(l => l.canFind("typ")), "the typ rejection must be logged");
+}
+
+unittest  // allowAnyIssuer explicitly accepts a token from any issuer
+{
+	JwtVerifierConfig cfg;
+	cfg.allowAnyAudience = true;
+	cfg.allowAnyIssuer = true;
+	cfg.staticPublicKeysPem = [testEcPubPem];
+	auto payload = parseJsonString(`{"iss":"https://any.example","sub":"u","exp":1700003600}`);
+	assert(validateClaims(cfg, payload, 1_700_001_000).valid);
+	cast(void) jwtVerifier(cfg);
+}
+
 unittest  // a tampered RS256 signature is rejected
 {
 	JwtVerifierConfig cfg;
+	cfg.allowAnyAudience = true;
+	cfg.allowAnyIssuer = true;
 	auto cache = new JwksCache("", cfg.jwksCacheTtl);
 	cache.load(`{"keys":[{"kty":"RSA","kid":"rsa-1","n":"` ~ testRsaN ~ `","e":"` ~ testRsaE
 			~ `"}]}`);
@@ -893,6 +1447,8 @@ unittest  // a tampered RS256 signature is rejected
 unittest  // an expired token is rejected (beyond clock skew)
 {
 	JwtVerifierConfig cfg;
+	cfg.allowAnyAudience = true;
+	cfg.allowAnyIssuer = true;
 	auto cache = new JwksCache("", cfg.jwksCacheTtl);
 	cache.load(`{"keys":[{"kty":"RSA","kid":"rsa-1","n":"` ~ testRsaN ~ `","e":"` ~ testRsaE
 			~ `"}]}`);
@@ -905,6 +1461,8 @@ unittest  // an expired token is rejected (beyond clock skew)
 unittest  // a token with no exp claim is rejected (cannot be validated as unexpired)
 {
 	JwtVerifierConfig cfg;
+	cfg.allowAnyAudience = true;
+	cfg.allowAnyIssuer = true;
 	// A signature-verified payload with every other claim present but no exp.
 	auto payload = parseJsonString(`{"iss":"https://as.example.com","sub":"ec-user","scope":"mcp:read","iat":1700000000,"nbf":1700000000}`);
 	auto ti = validateClaims(cfg, payload, 1_700_001_000);
@@ -914,6 +1472,8 @@ unittest  // a token with no exp claim is rejected (cannot be validated as unexp
 unittest  // a token with a present integer exp claim validates
 {
 	JwtVerifierConfig cfg;
+	cfg.allowAnyAudience = true;
+	cfg.allowAnyIssuer = true;
 	auto payload = parseJsonString(
 			`{"sub":"ec-user","iat":1700000000,"exp":1700003600,"nbf":1700000000}`);
 	auto ti = validateClaims(cfg, payload, 1_700_001_000);
@@ -924,6 +1484,8 @@ unittest  // a token with a present integer exp claim validates
 unittest  // a non-integer exp claim is rejected (cannot be validated as unexpired)
 {
 	JwtVerifierConfig cfg;
+	cfg.allowAnyAudience = true;
+	cfg.allowAnyIssuer = true;
 	auto payload = parseJsonString(`{"sub":"ec-user","exp":"not-a-number"}`);
 	auto ti = validateClaims(cfg, payload, 1_700_001_000);
 	assert(!ti.valid);
@@ -932,6 +1494,8 @@ unittest  // a non-integer exp claim is rejected (cannot be validated as unexpir
 unittest  // a token is rejected at the exact exp+skew boundary (RFC 7519 4.1.4)
 {
 	JwtVerifierConfig cfg; // default clockSkew is 60s
+	cfg.allowAnyAudience = true;
+	cfg.allowAnyIssuer = true;
 	auto payload = parseJsonString(`{"sub":"ec-user","exp":1700003600,"nbf":1700000000}`);
 	// now == exp + skew: the token is no longer before its expiry, so reject.
 	auto ti = validateClaims(cfg, payload, 1_700_003_660);
@@ -941,6 +1505,8 @@ unittest  // a token is rejected at the exact exp+skew boundary (RFC 7519 4.1.4)
 unittest  // a token one second before the exp+skew boundary is still valid
 {
 	JwtVerifierConfig cfg;
+	cfg.allowAnyAudience = true;
+	cfg.allowAnyIssuer = true;
 	auto payload = parseJsonString(`{"sub":"ec-user","exp":1700003600,"nbf":1700000000}`);
 	auto ti = validateClaims(cfg, payload, 1_700_003_659);
 	assert(ti.valid);
@@ -949,6 +1515,7 @@ unittest  // a token one second before the exp+skew boundary is still valid
 unittest  // the wrong issuer is rejected
 {
 	JwtVerifierConfig cfg;
+	cfg.allowAnyAudience = true;
 	cfg.issuer = "https://evil.example.com";
 	auto cache = new JwksCache("", cfg.jwksCacheTtl);
 	cache.load(`{"keys":[{"kty":"RSA","kid":"rsa-1","n":"` ~ testRsaN ~ `","e":"` ~ testRsaE
@@ -961,6 +1528,7 @@ unittest  // the wrong issuer is rejected
 unittest  // the wrong audience is rejected
 {
 	JwtVerifierConfig cfg;
+	cfg.allowAnyIssuer = true;
 	cfg.audience = "https://other.example.com";
 	auto cache = new JwksCache("", cfg.jwksCacheTtl);
 	cache.load(`{"keys":[{"kty":"RSA","kid":"rsa-1","n":"` ~ testRsaN ~ `","e":"` ~ testRsaE
@@ -970,9 +1538,23 @@ unittest  // the wrong audience is rejected
 	assert(!ti.valid);
 }
 
+unittest  // the audience is compared in canonical form (case of scheme+host, trailing slash, default port)
+{
+	JwtVerifierConfig cfg;
+	cfg.allowAnyIssuer = true;
+	cfg.audience = "HTTPS://MCP.Example.com:443/mcp/";
+	auto payload = parseJsonString(`{"iss":"https://any.example","aud":"https://mcp.example.com/mcp","sub":"u","exp":1700003600}`);
+	assert(validateClaims(cfg, payload, 1_700_001_000).valid);
+
+	cfg.audience = "https://mcp.example.com/MCP";
+	assert(!validateClaims(cfg, payload, 1_700_001_000).valid);
+}
+
 unittest  // a missing required scope is rejected
 {
 	JwtVerifierConfig cfg;
+	cfg.allowAnyAudience = true;
+	cfg.allowAnyIssuer = true;
 	cfg.requiredScopes = ["mcp:admin"];
 	auto cache = new JwksCache("", cfg.jwksCacheTtl);
 	cache.load(`{"keys":[{"kty":"RSA","kid":"rsa-1","n":"` ~ testRsaN ~ `","e":"` ~ testRsaE
@@ -985,6 +1567,8 @@ unittest  // a missing required scope is rejected
 unittest  // a token whose only candidate key is the wrong key is rejected
 {
 	JwtVerifierConfig cfg;
+	cfg.allowAnyAudience = true;
+	cfg.allowAnyIssuer = true;
 	auto cache = new JwksCache("", cfg.jwksCacheTtl);
 	// The JWKS holds a single, unrelated RSA key; the RS256 token was signed by
 	// a different key, so signature verification must fail.
@@ -1013,6 +1597,8 @@ unittest  // ES256: a token verified with a pinned PEM public key is accepted
 unittest  // ES256: verification via an EC JWK (crv/x/y) from a JWKS document
 {
 	JwtVerifierConfig cfg;
+	cfg.allowAnyAudience = true;
+	cfg.allowAnyIssuer = true;
 	auto cache = new JwksCache("", cfg.jwksCacheTtl);
 	cache.load(`{"keys":[{"kty":"EC","kid":"ec-1","crv":"P-256","x":"`
 			~ testEcX ~ `","y":"` ~ testEcY ~ `"}]}`);
@@ -1028,6 +1614,8 @@ unittest  // ES256: verification via an EC JWK (crv/x/y) from a JWKS document
 unittest  // a bad-signature ES256 token (verified against the wrong EC key) fails
 {
 	JwtVerifierConfig cfg;
+	cfg.allowAnyAudience = true;
+	cfg.allowAnyIssuer = true;
 	cfg.staticPublicKeysPem = [testEcPubPem];
 
 	// Sign with the EC key but tamper a payload byte after signing.
@@ -1039,11 +1627,48 @@ unittest  // a bad-signature ES256 token (verified against the wrong EC key) fai
 	assert(!ti.valid);
 }
 
+unittest  // a pinned RSA public key shorter than 2048 bits is not used to verify
+{
+	// A 1024-bit RSA key and an RS256 token it signed correctly.
+	enum weakPem = "-----BEGIN PUBLIC KEY-----\n"
+		~ "MIGfMA0GCSqGSIb3DQEBAQUAA4GNADCBiQKBgQC677t17xuMpPQagrUx7LYzqLJh\n"
+		~ "EM/uXXIIPC5rlQh8rZFHNl1Nozt6XWq3Bvd+Gesl3eZ/PVd0B+IYU/V8+Fex/fst\n"
+		~ "W8pqucd+wGhFUUa7Q24u1momdVAhYOW2M+na8V3TBcr7snfNd+L7L8pkmZiGRos3\n"
+		~ "EKi8uzdJlHOeNGMmmQIDAQAB\n" ~ "-----END PUBLIC KEY-----\n";
+	enum weakToken = "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJ3ZWFrIiwiZXhwIjoxNzAwMDAzNjAwfQ." ~ "Mpded0h9CGy8Ro-2N5OEpJCCMd1E9FLE0XxqEtNXi4D3bxDW1shcbyKNfRNeOMZCOPSdAi3z8etblLoiCDrr3a_" ~ "wfnC_cfHQ9rK2Uq541N77MF1fmvptAdE6VnsRmjh5Kzqu8VaGVP4_q2Gra7OEFciZQ6kXpFMO3w-1_gMMzRs";
+
+	JwtVerifierConfig cfg;
+	cfg.allowAnyAudience = true;
+	cfg.allowAnyIssuer = true;
+	cfg.staticPublicKeysPem = [weakPem];
+	assert(!verifyToken(cfg, weakToken, new NoKeys, 1_700_001_000).valid);
+}
+
+unittest  // a malformed signature segment is invalid without raising (no per-request warning)
+{
+	import std.exception : assertNotThrown;
+	import std.string : lastIndexOf;
+
+	JwtVerifierConfig cfg;
+	cfg.allowAnyAudience = true;
+	cfg.allowAnyIssuer = true;
+	cfg.staticPublicKeysPem = [testEcPubPem];
+	auto jwt = makeEs256(`{"sub":"ec-user","exp":1700003600}`);
+	const dot = jwt.lastIndexOf('.');
+	const garbled = jwt[0 .. dot + 1] ~ "not*base64!";
+
+	TokenInfo ti;
+	assertNotThrown(ti = verifyToken(cfg, garbled, new NoKeys, 1_700_001_000));
+	assert(!ti.valid);
+}
+
 unittest  // an unsupported alg (e.g. none) is rejected outright
 {
 	import mcp.auth.oauth : base64UrlNoPad;
 
 	JwtVerifierConfig cfg;
+	cfg.allowAnyAudience = true;
+	cfg.allowAnyIssuer = true;
 	cfg.staticPublicKeysPem = [testEcPubPem];
 
 	const header = base64UrlNoPad(cast(const(ubyte)[]) `{"alg":"none","typ":"JWT"}`);
@@ -1060,6 +1685,8 @@ unittest  // a token carrying a `crit` header is rejected even with a valid sign
 	import mcp.auth.oauth : base64UrlNoPad;
 
 	JwtVerifierConfig cfg;
+	cfg.allowAnyAudience = true;
+	cfg.allowAnyIssuer = true;
 	cfg.staticPublicKeysPem = [testEcPubPem];
 
 	const header = `{"alg":"ES256","typ":"JWT","crit":["exp"]}`;
@@ -1079,6 +1706,8 @@ unittest  // a token whose `typ` is an OIDC id_token is rejected (RFC 9068 §4.1
 	import mcp.auth.oauth : base64UrlNoPad;
 
 	JwtVerifierConfig cfg;
+	cfg.allowAnyAudience = true;
+	cfg.allowAnyIssuer = true;
 	cfg.staticPublicKeysPem = [testEcPubPem];
 
 	// An ID token signed with the same key as access tokens: every claim check
@@ -1100,6 +1729,8 @@ unittest  // an RFC 9068 `at+jwt` typ is accepted (case-insensitive, RFC 7515 §
 	import mcp.auth.oauth : base64UrlNoPad;
 
 	JwtVerifierConfig cfg;
+	cfg.allowAnyAudience = true;
+	cfg.allowAnyIssuer = true;
 	cfg.staticPublicKeysPem = [testEcPubPem];
 
 	const header = `{"alg":"ES256","typ":"AT+JWT"}`;
@@ -1120,6 +1751,8 @@ unittest  // a token with no `typ` header is rejected by default (RFC 9068 §4.1
 	import mcp.auth.oauth : base64UrlNoPad;
 
 	JwtVerifierConfig cfg;
+	cfg.allowAnyAudience = true;
+	cfg.allowAnyIssuer = true;
 	cfg.staticPublicKeysPem = [testEcPubPem];
 
 	const header = `{"alg":"ES256"}`;
@@ -1139,6 +1772,8 @@ unittest  // emptying acceptedTokenTypes disables the `typ` check (escape hatch 
 	import mcp.auth.oauth : base64UrlNoPad;
 
 	JwtVerifierConfig cfg;
+	cfg.allowAnyAudience = true;
+	cfg.allowAnyIssuer = true;
 	cfg.staticPublicKeysPem = [testEcPubPem];
 	cfg.acceptedTokenTypes = [];
 
@@ -1196,6 +1831,30 @@ unittest  // jwkToPem produces a parseable PEM for an RSA JWK
 	assert(pem.indexOf("BEGIN PUBLIC KEY") >= 0);
 }
 
+unittest  // JwksCache parses each JWK once per load and hands out the parsed key
+{
+	auto cache = new JwksCache("", 300.seconds);
+	cache.load(`{"keys":[{"kty":"RSA","kid":"rsa-1","n":"` ~ testRsaN ~ `","e":"AQAB"},`
+			~ `{"kty":"EC","kid":"ec-9","crv":"P-256","x":"` ~ testEcX ~ `","y":"` ~ testEcY
+			~ `"}]}`);
+	PublicKey[] first = cache.keysFor("rsa-1");
+	assert(first.length == 1);
+	assert(first[0].kty == "RSA");
+	assert(cache.keysFor("rsa-1")[0] is first[0]);
+}
+
+unittest  // a token naming a JWKS kid verifies against that key ahead of pinned keys
+{
+	JwtVerifierConfig cfg;
+	cfg.issuer = "https://as.example.com";
+	cfg.audience = "https://mcp.example.com/mcp";
+	cfg.staticPublicKeysPem = ["not a pem", testEcPubPem];
+	auto cache = new JwksCache("", cfg.jwksCacheTtl);
+	cache.load(`{"keys":[{"kty":"RSA","kid":"rsa-1","n":"` ~ testRsaN ~ `","e":"` ~ testRsaE
+			~ `"}]}`);
+	assert(verifyToken(cfg, testRs256Jwt, cache, 1_700_001_000).valid);
+}
+
 unittest  // JwksCache.keysFor selects by kid, then refreshes from a new document
 {
 	auto cache = new JwksCache("", 300.seconds);
@@ -1209,6 +1868,29 @@ unittest  // JwksCache.keysFor selects by kid, then refreshes from a new documen
 			~ testEcX ~ `","y":"` ~ testEcY ~ `"}]}`);
 	assert(cache.keysFor("rsa-1").length == 1); // falls back to all keys
 	assert(cache.keysFor("ec-9").length == 1);
+}
+
+unittest  // JWKs of different key types sharing a kid are all kept and selected by the token's alg
+{
+	JwtVerifierConfig cfg;
+	cfg.allowAnyAudience = true;
+	cfg.allowAnyIssuer = true;
+	const rsa = `{"kty":"RSA","kid":"rsa-1","n":"` ~ testRsaN ~ `","e":"` ~ testRsaE ~ `"}`;
+	const ec = `{"kty":"EC","kid":"rsa-1","crv":"P-256","x":"` ~ testEcX ~ `","y":"` ~ testEcY
+		~ `"}`;
+	const es256 = makeEs256(`{"exp":1700003600}`, "rsa-1");
+
+	foreach (doc; [
+		`{"keys":[` ~ rsa ~ `,` ~ ec ~ `]}`, `{"keys":[` ~ ec ~ `,` ~ rsa ~ `]}`
+	])
+	{
+		auto cache = new JwksCache("", cfg.jwksCacheTtl);
+		cache.load(doc);
+		assert(cache.keysFor("rsa-1", "RS256").length == 1);
+		assert(cache.keysFor("rsa-1", "ES256").length == 1);
+		assert(verifyToken(cfg, testRs256Jwt, cache, 1_700_001_000).valid);
+		assert(verifyToken(cfg, es256, cache, 1_700_001_000).valid);
+	}
 }
 
 unittest  // a JWK declaring use!="sig" is excluded as a verification candidate (RFC 7517 4.2)
@@ -1238,6 +1920,8 @@ unittest  // a JWK with use=="sig" and key_ops including "verify" is retained
 unittest  // an RS256 token offered only an EC key is rejected (kty<->alg binding)
 {
 	JwtVerifierConfig cfg;
+	cfg.allowAnyAudience = true;
+	cfg.allowAnyIssuer = true;
 	auto cache = new JwksCache("", cfg.jwksCacheTtl);
 	// Only an EC key is available; the token's header alg is RS256, so the
 	// kty<->alg binding rejects it before relying on OpenSSL.
@@ -1250,6 +1934,8 @@ unittest  // an RS256 token offered only an EC key is rejected (kty<->alg bindin
 unittest  // an ES256 token offered only an RSA key is rejected (kty<->alg binding)
 {
 	JwtVerifierConfig cfg;
+	cfg.allowAnyAudience = true;
+	cfg.allowAnyIssuer = true;
 	cfg.staticPublicKeysPem = []; // none pinned
 	auto cache = new JwksCache("", cfg.jwksCacheTtl);
 	cache.load(`{"keys":[{"kty":"RSA","kid":"rsa-1","n":"` ~ testRsaN ~ `","e":"AQAB"}]}`);
@@ -1276,6 +1962,8 @@ unittest  // tokenScopes() reads space-delimited scope and array/string scp
 unittest  // jwtVerifier returns a usable TokenValidator that rejects garbage
 {
 	JwtVerifierConfig cfg;
+	cfg.allowAnyAudience = true;
+	cfg.allowAnyIssuer = true;
 	cfg.staticPublicKeysPem = [testEcPubPem];
 	TokenValidator v = jwtVerifier(cfg);
 	assert(!v("not-a-jwt").valid);
@@ -1291,6 +1979,49 @@ unittest  // JwksCache refuses to fetch from an insecure (plaintext http) JWKS U
 	// fetching signing keys over an insecure transport).
 	auto cache = new JwksCache("http://as.example.com/jwks", 60.seconds);
 	assert(cache.keysFor("any-kid").length == 0);
+}
+
+version (Posix) unittest  // a JWKS on a non-loopback internal address loads only under a policy that permits it
+{
+	import std.conv : to;
+	import vibe.core.core : runTask, runEventLoop, exitEventLoop;
+	import vibe.http.router : URLRouter;
+	import vibe.http.server : HTTPServerResponse, HTTPServerRequest,
+		HTTPServerSettings, listenHTTP;
+
+	const doc = `{"keys":[{"kty":"RSA","kid":"rsa-1","n":"` ~ testRsaN ~ `","e":"`
+		~ testRsaE ~ `"}]}`;
+	string failure;
+	size_t defaultKeys = size_t.max, permittedKeys;
+	runTask(() @safe nothrow{
+		try
+		{
+			auto router = new URLRouter;
+			router.get("/jwks", (HTTPServerRequest req, HTTPServerResponse res) @safe {
+				res.writeBody(doc, "application/json");
+			});
+			auto settings = new HTTPServerSettings;
+			settings.port = 0;
+			settings.bindAddresses = ["0.0.0.0"];
+			auto listener = listenHTTP(settings, router);
+			scope (exit)
+				listener.stopListening();
+			// 0.0.0.0 is an internal, non-loopback address that still reaches
+			// this host's listener on POSIX (Windows refuses to connect to it).
+			const uri = "http://0.0.0.0:" ~ listener.bindAddresses[0].port.to!string ~ "/jwks";
+			defaultKeys = new JwksCache(uri, 300.seconds).keysFor("rsa-1").length;
+			permittedKeys = new JwksCache(uri, 300.seconds, SsrfPolicy.allowUserConfigured).keysFor(
+				"rsa-1").length;
+		}
+		catch (Exception e)
+			failure = e.msg;
+		exitEventLoop();
+	});
+	runEventLoop();
+
+	assert(failure.length == 0, failure);
+	assert(defaultKeys == 0);
+	assert(permittedKeys == 1);
 }
 
 unittest  // JwksCache refuses an internal/link-local JWKS URI (SSRF mitigation)
@@ -1343,7 +2074,7 @@ unittest  // rawEcdsaToDer round-trips via pre-allocated buffer (no OpenSSL allo
 	assert(rawSig.length == 64);
 	// rawEcdsaToDer uses i2d_ECDSA_SIG with a D-GC buffer rather than an
 	// OpenSSL-allocated buffer, so no CRYPTO_free call is needed.
-	auto der = () @trusted { return rawEcdsaToDer(rawSig); }();
+	auto der = rawEcdsaToDer(rawSig);
 	assert(der.length > 0 && der[0] == 0x30);
 }
 
@@ -1397,22 +2128,24 @@ unittest  // fetchJwks discards non-2xx bodies so a 503 does not mark the cache 
 			settings.bindAddresses = ["127.0.0.1"];
 			auto listener = listenHTTP(settings, router);
 			scope (exit)
-				() @trusted { listener.stopListening(); }();
+				listener.stopListening();
 
 			const port = listener.bindAddresses[0].port;
 			const uri = "http://127.0.0.1:" ~ port.to!string ~ "/jwks";
 
 			// First fetch: server returns 503. The cache should NOT be marked fresh.
+			long clock = 1_000;
 			auto cache = new JwksCache(uri, 300.seconds);
+			cache.clock = () @safe => clock;
 			assert(cache.keysFor("rsa-1").length == 0);
 
 			// Switch server to serve a valid JWKS.
 			serveValid = true;
 
-			// Second fetch immediately (well within 300-second TTL). With the bug,
-			// the first 503 body was passed to load(), marking the cache as fresh
-			// with 0 keys, and this call returns 0. With the fix, the 503 did not
-			// mark the cache fresh, so this call re-fetches and returns 1 key.
+			// The next attempt, once the failed fetch's back-off has passed but well
+			// within the 300-second TTL, re-fetches: the 503 body was never loaded,
+			// so the cache was not marked fresh with zero keys.
+			clock += JwksCache.minRefetchInterval.total!"seconds";
 			assert(cache.keysFor("rsa-1").length == 1);
 
 			passed = true;
@@ -1429,18 +2162,56 @@ unittest  // fetchJwks discards non-2xx bodies so a 503 does not mark the cache 
 	assert(passed);
 }
 
-unittest  // ecJwkToPem produces a parseable PEM for P-384 and P-521 EC JWKs (RFC 7518)
+unittest  // fetchJwks refuses a JWKS response larger than maxJwksBytes
 {
-	import std.string : indexOf;
+	import std.array : replicate;
+	import std.conv : to;
+	import vibe.core.core : runTask, runEventLoop, exitEventLoop;
+	import vibe.http.router : URLRouter;
+	import vibe.http.server : HTTPServerResponse, HTTPServerRequest,
+		HTTPServerSettings, listenHTTP;
 
+	// A valid document padded past the cap: it would load one key if read whole.
+	const oversized = `{"keys":[{"kty":"RSA","kid":"rsa-1","n":"` ~ testRsaN
+		~ `","e":"` ~ testRsaE ~ `"}],"pad":"` ~ "x".replicate(maxJwksBytes) ~ `"}`;
+
+	string failure;
+	size_t keys = size_t.max;
+	runTask(() @safe nothrow{
+		try
+		{
+			auto router = new URLRouter;
+			router.get("/jwks", (HTTPServerRequest req, HTTPServerResponse res) @safe {
+				res.writeBody(oversized, "application/json");
+			});
+			auto settings = new HTTPServerSettings;
+			settings.port = 0;
+			settings.bindAddresses = ["127.0.0.1"];
+			auto listener = listenHTTP(settings, router);
+			scope (exit)
+				listener.stopListening();
+			const uri = "http://127.0.0.1:" ~ listener.bindAddresses[0].port.to!string ~ "/jwks";
+			keys = new JwksCache(uri, 300.seconds).keysFor("rsa-1").length;
+		}
+		catch (Exception e)
+			failure = e.msg;
+		exitEventLoop();
+	});
+	runEventLoop();
+
+	assert(failure.length == 0, failure);
+	assert(keys == 0, "an oversized JWKS body must not be loaded");
+}
+
+unittest  // jwkToPem rejects P-384 and P-521 EC JWKs, which no supported alg can verify
+{
 	// P-384 key coordinates (secp384r1, generated with openssl ecparam -name secp384r1)
 	Jwk j384;
 	j384.kty = "EC";
 	j384.crv = "P-384";
 	j384.x = "nAPaQ-Yp5yOfUbCoua-9vveg8CN2xGZcC0pwleiN32_13F8e5ucb4TDIECm7HNHF";
 	j384.y = "50RD8Uk-e11KLEhoe67lPP-XrPZNz_BTJ8Mc4Pw9fzfEp_Bx3kfvopo3CvsqMx9M";
-	auto pem384 = jwkToPem(j384);
-	assert(pem384.indexOf("BEGIN PUBLIC KEY") >= 0, "P-384 JWK must produce a PEM");
+	assert(jwkToPem(j384).length == 0);
 
 	// P-521 key coordinates (secp521r1, generated with openssl ecparam -name secp521r1)
 	Jwk j521;
@@ -1450,8 +2221,299 @@ unittest  // ecJwkToPem produces a parseable PEM for P-384 and P-521 EC JWKs (RF
 		= "AdsIuUmbV1MADf8_U1vxvq7HgqY7rSroFHKSdrgoX20IJxB8WqbDiT5VUe9peyobeRWX5BxmsDvUWBjCGG_0gutA";
 	j521.y
 		= "AegUPdPnBttrFflQ9wJbUurLisEyJu-PZW-PnJomKpiFt9D2o0Ve0uXpqSqLHZTVhWpXu3ddF3Kw9JoO2hsNDE0q";
-	auto pem521 = jwkToPem(j521);
-	assert(pem521.indexOf("BEGIN PUBLIC KEY") >= 0, "P-521 JWK must produce a PEM");
+	assert(jwkToPem(j521).length == 0);
+}
+
+unittest  // jwkUsableForSig rejects a JWK whose declared alg is not supported
+{
+	Jwk j;
+	j.kty = "EC";
+	j.alg = "ES384";
+	assert(!jwkUsableForSig(j));
+}
+
+unittest  // jwkUsableForSig rejects a JWK whose declared alg belongs to another key family
+{
+	Jwk ec;
+	ec.kty = "EC";
+	ec.alg = "RS256";
+	assert(!jwkUsableForSig(ec));
+
+	Jwk rsa;
+	rsa.kty = "RSA";
+	rsa.alg = "RS256";
+	assert(jwkUsableForSig(rsa));
+}
+
+unittest  // verifyJws refuses ES256 with an EC key on a curve other than P-256
+{
+	const p384Pem = "-----BEGIN PUBLIC KEY-----\n"
+		~ "MHYwEAYHKoZIzj0CAQYFK4EEACIDYgAEZAuOASCn4YZGvdnwJ3n0ClX1Nr40mK3R\n"
+		~ "l3CMCJKLvzbEENtB0aX9r4yomSv+138yyeKGkV3HALqfLI4e8OVx0ifDIIepwuiL\n"
+		~ "4kXRpDjft3Urv/CmTZHxxGeBZ3mOQiXk\n" ~ "-----END PUBLIC KEY-----\n";
+	auto sig = new ubyte[64];
+	sig[] = 1;
+	assert(!verifyJws("ES256", cast(const(ubyte)[]) "a.b", sig, p384Pem));
+}
+
+version (unittest)
+{
+	private enum rsaOnlyJwks = `{"keys":[{"kty":"RSA","kid":"rsa-1","n":"`
+		~ testRsaN ~ `","e":"` ~ testRsaE ~ `"}]}`;
+	private enum rotatedJwks = `{"keys":[{"kty":"RSA","kid":"rsa-1","n":"` ~ testRsaN
+		~ `","e":"` ~ testRsaE ~ `"},{"kty":"EC","kid":"ec-new","crv":"P-256","x":"`
+		~ testEcX ~ `","y":"` ~ testEcY ~ `"}]}`;
+
+	/// A JWKS cache over a scripted fetcher and a hand-driven clock.
+	private final class ScriptedJwks
+	{
+		int fetches;
+		long clock = 1_000;
+		string served;
+		JwksCache cache;
+		void delegate() @safe nothrow[] pending;
+
+		this(string served, void delegate() @safe duringFetch = null) @safe
+		{
+			this.served = served;
+			cache = new JwksCache("https://as.example.com/jwks", 300.seconds);
+			cache.fetcher = (string uri) @safe {
+				++fetches;
+				if (duringFetch !is null)
+					duringFetch();
+				return this.served;
+			};
+			cache.clock = () @safe => clock;
+			cache.spawn = (void delegate() @safe nothrow refresh) @safe {
+				pending ~= refresh;
+			};
+		}
+
+		/// Run the background refreshes queued so far.
+		void drain() @safe
+		{
+			auto queued = pending;
+			pending = null;
+			foreach (refresh; queued)
+				refresh();
+		}
+	}
+}
+
+unittest  // JwksCache refetches on an unknown kid so a rotated-in key verifies before the TTL expires
+{
+	auto s = new ScriptedJwks(rsaOnlyJwks);
+	assert(s.cache.keysFor("rsa-1").length == 1);
+	assert(s.fetches == 1);
+
+	// The IdP rotates in a new key; a token naming it arrives well inside the TTL.
+	s.served = rotatedJwks;
+	s.clock += JwksCache.minRefetchInterval.total!"seconds";
+	auto keys = s.cache.keysFor("ec-new");
+	assert(s.fetches == 2);
+	assert(keys.length == 1, "the rotated-in key must be selected by its kid");
+}
+
+unittest  // JwksCache serves stale keys immediately and refreshes them in the background
+{
+	auto s = new ScriptedJwks(rsaOnlyJwks);
+	assert(s.cache.keysFor("rsa-1").length == 1);
+
+	s.served = rotatedJwks;
+	s.clock += 300;
+	foreach (i; 0 .. 3)
+		assert(s.cache.keysFor("rsa-1").length == 1, "stale keys must keep verifying");
+	assert(s.fetches == 1, "a merely stale cache must not block the request on a fetch");
+	assert(s.pending.length == 1, "exactly one background refresh is queued");
+
+	s.drain();
+	assert(s.fetches == 2);
+	assert(s.cache.keysFor("ec-new").length == 1);
+	assert(s.fetches == 2, "the background refresh already loaded the rotated key");
+}
+
+unittest  // JwksCache spaces fetch attempts from when the last one finished, not started
+{
+	ScriptedJwks s;
+	// Each fetch hangs for 15 seconds (an unreachable IdP) and then fails.
+	s = new ScriptedJwks(null, () @safe { s.clock += 15; });
+	assert(s.cache.keysFor("rsa-1").length == 0);
+	assert(s.cache.keysFor("rsa-1").length == 0);
+	assert(s.fetches == 1,
+			"a request arriving right after a slow failed fetch must not stall again");
+}
+
+unittest  // a token is answered as temporarily unavailable, not invalid, while the JWKS cannot be fetched
+{
+	JwtVerifierConfig cfg;
+	cfg.allowAnyAudience = true;
+	cfg.issuer = "https://as.example.com";
+	auto s = new ScriptedJwks(null);
+	auto ti = verifyToken(cfg, testRs256Jwt, s.cache, 1_700_001_000);
+	assert(!ti.valid);
+	assert(ti.unavailable);
+	assert(ti.retryAfter == JwksCache.minRefetchInterval);
+
+	// Once keys load, a token they do not verify is plainly invalid.
+	s.served = `{"keys":[{"kty":"RSA","kid":"rsa-1","n":"` ~ testRsaN2 ~ `","e":"`
+		~ testRsaE ~ `"}]}`;
+	s.clock += JwksCache.minRefetchInterval.total!"seconds";
+	ti = verifyToken(cfg, testRs256Jwt, s.cache, 1_700_001_000);
+	assert(!ti.valid && !ti.unavailable);
+}
+
+unittest  // a pinned-key-only verifier never reports itself unavailable
+{
+	JwtVerifierConfig cfg;
+	cfg.allowAnyAudience = true;
+	cfg.issuer = "https://as.example.com";
+	cfg.staticPublicKeysPem = [testEcPubPem];
+	auto ti = verifyToken(cfg, testRs256Jwt, new NoKeys, 1_700_001_000);
+	assert(!ti.valid && !ti.unavailable);
+}
+
+unittest  // verifyOrInvalid maps TokenVerifierUnavailableException to temporarily unavailable
+{
+	auto ti = verifyOrInvalid(() @safe {
+		throw new TokenVerifierUnavailableException("down", 5.seconds);
+		return TokenInfo.init;
+	});
+	assert(ti.unavailable && ti.retryAfter == 5.seconds);
+}
+
+unittest  // JwksCache rate-limits unknown-kid refetches (junk kids cannot drive outbound fetches)
+{
+	auto s = new ScriptedJwks(rsaOnlyJwks);
+	assert(s.cache.keysFor("rsa-1").length == 1);
+	foreach (i; 0 .. 5)
+		s.cache.keysFor("junk-kid");
+	assert(s.fetches == 1);
+}
+
+unittest  // JwksCache negative-caches a failed fetch instead of refetching on every request
+{
+	auto s = new ScriptedJwks(null);
+	foreach (i; 0 .. 5)
+		assert(s.cache.keysFor("rsa-1").length == 0);
+	assert(s.fetches == 1);
+
+	s.clock += JwksCache.minRefetchInterval.total!"seconds";
+	s.cache.keysFor("rsa-1");
+	assert(s.fetches == 2);
+}
+
+unittest  // a JWKS with no usable keys leaves the cache stale so a kid-less token retries after minRefetchInterval
+{
+	auto s = new ScriptedJwks(`{"keys":[]}`);
+	assert(s.cache.keysFor("").length == 0);
+	assert(s.fetches == 1);
+
+	// The IdP publishes its key shortly after; a kid-less token must not wait out
+	// the full cache TTL to pick it up.
+	s.served = rsaOnlyJwks;
+	s.clock += JwksCache.minRefetchInterval.total!"seconds";
+	assert(s.cache.keysFor("").length == 1);
+	assert(s.fetches == 2);
+}
+
+unittest  // a refetched JWKS with no usable keys keeps the previously cached keys
+{
+	auto s = new ScriptedJwks(rsaOnlyJwks);
+	assert(s.cache.keysFor("rsa-1").length == 1);
+
+	s.served = `{"keys":[{"kty":"RSA","kid":"enc","use":"enc","n":"` ~ testRsaN
+		~ `","e":"` ~ testRsaE ~ `"}]}`;
+	s.clock += 300;
+	s.cache.keysFor("rsa-1");
+	s.drain();
+	assert(s.cache.keysFor("rsa-1").length == 1, "an empty key set must not evict the cached keys");
+	assert(s.fetches == 2);
+}
+
+unittest  // a JWK with undecodable key material is skipped without discarding the rest of the document
+{
+	auto s = new ScriptedJwks(
+			`{"keys":[{"kty":"RSA","kid":"bad","n":"!!not base64!!","e":"AQAB"},`
+			~ `{"kty":"EC","kid":"bad-ec","crv":"P-256","x":"%%%","y":"` ~ testEcY
+			~ `"},` ~ `{"kty":"RSA","kid":"rsa-1","n":"` ~ testRsaN ~ `","e":"` ~ testRsaE ~ `"}]}`);
+	assert(s.cache.keysFor("rsa-1").length == 1);
+}
+
+unittest  // a refetched JWKS that is not valid JSON keeps the cached keys and does not throw
+{
+	auto s = new ScriptedJwks(rsaOnlyJwks);
+	assert(s.cache.keysFor("rsa-1").length == 1);
+
+	s.served = `{not valid json`;
+	s.clock += 300;
+	s.cache.keysFor("rsa-1");
+	s.drain();
+	assert(s.cache.keysFor("rsa-1").length == 1);
+	assert(s.fetches == 2);
+}
+
+unittest  // cached JWKS keys are dropped once refetches have failed for longer than the max staleness
+{
+	auto s = new ScriptedJwks(rsaOnlyJwks);
+	assert(s.cache.keysFor("rsa-1").length == 1);
+
+	// The IdP becomes unreachable: the stale keys keep serving for a while.
+	s.served = null;
+	s.clock += 300;
+	assert(s.cache.keysFor("rsa-1").length == 1);
+	s.drain();
+	assert(s.cache.keysFor("rsa-1").length == 1);
+	assert(s.fetches == 2);
+
+	s.clock += JwksCache.defaultMaxStaleness.total!"seconds";
+	assert(s.cache.keysFor("rsa-1").length == 0);
+
+	// Once the IdP recovers, the next attempt reloads the keys.
+	s.served = rsaOnlyJwks;
+	s.clock += JwksCache.minRefetchInterval.total!"seconds";
+	assert(s.cache.keysFor("rsa-1").length == 1);
+}
+
+unittest  // jwtVerifier refuses a JWKS max staleness shorter than the cache TTL
+{
+	import std.exception : assertThrown;
+
+	JwtVerifierConfig cfg;
+	cfg.allowAnyAudience = true;
+	cfg.issuer = "https://as.example.com";
+	cfg.jwksUri = "https://as.example.com/jwks";
+	cfg.jwksMaxStaleness = cfg.jwksCacheTtl - 1.seconds;
+	assertThrown(jwtVerifier(cfg));
+}
+
+unittest  // JwksCache single-flights concurrent fetches
+{
+	import core.time : msecs;
+	import vibe.core.core : runTask, sleep;
+
+	// The fetch yields to other tasks while in flight.
+	auto s = new ScriptedJwks(rsaOnlyJwks, () @safe { sleep(30.msecs); });
+	auto cache = s.cache;
+
+	size_t a, b;
+	auto ta = runTask(() nothrow{
+		try
+			a = cache.keysFor("rsa-1").length;
+		catch (Exception)
+		{
+		}
+	});
+	auto tb = runTask(() nothrow{
+		try
+			b = cache.keysFor("rsa-1").length;
+		catch (Exception)
+		{
+		}
+	});
+	ta.join();
+	tb.join();
+	assert(s.fetches == 1);
+	assert(a == 1 && b == 1);
 }
 
 unittest  // JwksCache.load() retains previous keys when parsing a malformed JWKS document throws
@@ -1525,15 +2587,87 @@ unittest  // verifyOrInvalid returns the verifier's result when no exception is 
 unittest  // a token whose nbf is in the future is rejected (not-yet-valid)
 {
 	JwtVerifierConfig cfg;
+	cfg.allowAnyAudience = true;
+	cfg.allowAnyIssuer = true;
 	// Valid exp, but nbf is well beyond now + skew: the token is not yet valid.
 	auto payload = parseJsonString(`{"sub":"ec-user","exp":1700100000,"nbf":1700090000}`);
 	auto ti = validateClaims(cfg, payload, 1_700_001_000);
 	assert(!ti.valid);
 }
 
+unittest  // a token carrying OIDC id_token-only claims is rejected even when typ is JWT
+{
+	JwtVerifierConfig cfg;
+	cfg.allowAnyIssuer = true;
+	cfg.audience = "client-123";
+	foreach (claim; [
+		`"nonce":"n-0S6_WzA2Mj"`, `"at_hash":"77QmUPtjPfzWtF2AnpK9RQ"`,
+		`"c_hash":"LDktKdoQak3Pk0cnXxCltA"`
+	])
+	{
+		auto payload = parseJsonString(`{"aud":"client-123","exp":1700100000,` ~ claim ~ `}`);
+		assert(!validateClaims(cfg, payload, 1_700_001_000).valid, claim);
+	}
+	auto plain = parseJsonString(`{"aud":"client-123","exp":1700100000}`);
+	assert(validateClaims(cfg, plain, 1_700_001_000).valid);
+}
+
+unittest  // a non-numeric nbf is rejected rather than skipping the not-before check
+{
+	JwtVerifierConfig cfg;
+	cfg.allowAnyAudience = true;
+	cfg.allowAnyIssuer = true;
+	foreach (nbf; [`"1700090000"`, `true`, `null`, `{}`, `[1700000000]`])
+	{
+		auto payload = parseJsonString(`{"exp":1700100000,"nbf":` ~ nbf ~ `}`);
+		assert(!validateClaims(cfg, payload, 1_700_001_000).valid, nbf);
+	}
+}
+
+unittest  // a fractional nbf is honoured: rejected while in the future, accepted once past
+{
+	JwtVerifierConfig cfg;
+	cfg.allowAnyAudience = true;
+	cfg.allowAnyIssuer = true;
+	auto future = parseJsonString(`{"exp":1700100000,"nbf":1700090000.5}`);
+	assert(!validateClaims(cfg, future, 1_700_001_000).valid);
+	auto past = parseJsonString(`{"exp":1700100000,"nbf":1700000000.5}`);
+	assert(validateClaims(cfg, past, 1_700_001_000).valid);
+}
+
+unittest  // a fractional exp is honoured: accepted while in the future, rejected once past
+{
+	JwtVerifierConfig cfg;
+	cfg.allowAnyAudience = true;
+	cfg.allowAnyIssuer = true;
+	auto live = parseJsonString(`{"sub":"x","exp":1700003600.25}`);
+	assert(validateClaims(cfg, live, 1_700_001_000).valid);
+	auto expired = parseJsonString(`{"sub":"x","exp":1700000000.5}`);
+	assert(!validateClaims(cfg, expired, 1_700_001_000).valid);
+}
+
+unittest  // a non-finite exp or nbf is rejected
+{
+	JwtVerifierConfig cfg;
+	cfg.allowAnyAudience = true;
+	cfg.allowAnyIssuer = true;
+	foreach (bad; [double.infinity, -double.infinity, double.nan])
+	{
+		auto exp = parseJsonString(`{"sub":"x"}`);
+		exp["exp"] = Json(bad);
+		assert(!validateClaims(cfg, exp, 1_700_001_000).valid);
+
+		auto nbf = parseJsonString(`{"sub":"x","exp":1700100000}`);
+		nbf["nbf"] = Json(bad);
+		assert(!validateClaims(cfg, nbf, 1_700_001_000).valid);
+	}
+}
+
 unittest  // verifyToken rejects a well-formed token when no candidate key exists
 {
 	JwtVerifierConfig cfg;
+	cfg.allowAnyAudience = true;
+	cfg.allowAnyIssuer = true;
 	// A structurally valid ES256 token carrying a kid, but the key source offers
 	// nothing and no static PEM is pinned, so there are zero candidate keys.
 	auto token = makeEs256(`{"sub":"x","exp":1700100000}`, "unknown-kid");
@@ -1565,6 +2699,26 @@ unittest  // parseJwks tolerates a non-object root, a non-array keys member, and
 	assert(parseJwks(`{"keys":"not-an-array"}`).length == 0);
 	// Non-object array entries are skipped, leaving no usable keys.
 	assert(parseJwks(`{"keys":[1, "two", null]}`).length == 0);
+}
+
+unittest  // parseJwks rejects a document nested past the depth cap
+{
+	import std.array : replicate;
+	import std.exception : assertThrown;
+	import vibe.data.json : JSONException;
+
+	const deep = "[".replicate(1000) ~ "]".replicate(1000);
+	assertThrown!JSONException(parseJwks(`{"keys":[],"x":` ~ deep ~ `}`));
+}
+
+unittest  // a JWT segment nested past the depth cap decodes as undefined
+{
+	import std.array : replicate;
+	import std.base64 : Base64URLNoPadding;
+
+	const deep = `{"x":` ~ "[".replicate(1000) ~ "]".replicate(1000) ~ `}`;
+	const seg = Base64URLNoPadding.encode(cast(const(ubyte)[]) deep).idup;
+	assert(decodeSegmentJson(seg).type == Json.Type.undefined);
 }
 
 unittest  // jwkToPem returns null for an unsupported key type and for malformed RSA/EC material

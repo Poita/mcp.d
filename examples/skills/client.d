@@ -10,7 +10,7 @@
  * plain Resources reads skill content rides on:
  *
  *   1. server/discover advertises the skills extension under `capabilities`.
- *   2. listSkills() calls skills/list and returns conformant entries
+ *   2. client.skillsList() calls skills/list and returns conformant entries
  *      (verbatim frontmatter, SKILL.md uri, per-file resources manifest with
  *      digest + size), plus the required ttlMs/cacheScope on the result. The
  *      dynamic reports/daily skill carries `resources: "dynamic"` instead.
@@ -18,14 +18,14 @@
  *   4. The @skillDir-sourced team/release-helper skill carries its AUTHORED
  *      frontmatter and a references/CHECKLIST.md file, and its nested
  *      hotfix-helper skill is published as its own flat entry.
- *   5. getSkill() fetches one entry by URI via skills/get, and the fetched
+ *   5. client.skillsGet() fetches one entry by URI via skills/get, and the fetched
  *      content is verified against the entry's digests and frontmatter
  *      (verifySkillMarkdown / verifyResourceDigest).
  *   6. resources/directory/read scope-lists the release-helper tree: files plus
  *      subdirectories (marked inode/directory), descended one level at a time.
  *
- * The example calls the modern-only server/discover, so the client enables the
- * modern protocol (`enableModern`) up front. The skills extension itself
+ * The example calls the modern-only server/discover, so it relies on `connect()`
+ * negotiating the modern protocol up front. The skills extension itself
  * negotiates from 2025-11-25 (the stable spec is written against 2026-07-28,
  * where its results carry ttlMs/cacheScope); the resource reads work on any
  * protocol version.
@@ -35,8 +35,6 @@ module skills_client;
 import std.algorithm : any, canFind, filter, map;
 import std.array : array;
 import std.stdio : writeln;
-
-import vibe.data.json : Json;
 
 import mcp;
 import examples_common : check, checkEq, runClient, connectFromArgs;
@@ -50,7 +48,8 @@ int main(string[] args) @safe
 
 		// server/discover (used below) exists only on the modern protocol, so
 		// negotiate it. The skills extension itself is visible from 2025-11-25.
-		client.enableModern();
+		auto negotiated = client.connect();
+		checkEq(negotiated, ProtocolVersion.v2026_07_28, "connect() should negotiate 2026-07-28");
 
 		// --- 1. server/discover: skills extension must be advertised --------
 		auto disc = client.discover();
@@ -63,15 +62,13 @@ int main(string[] args) @safe
 		check(caps["extensions"][skillsExtensionKey]["directoryRead"].get!bool,
 			"the skills capability should advertise directoryRead");
 
-		auto negotiated = client.connect();
-		checkEq(negotiated, ProtocolVersion.v2026_07_28, "connect() should negotiate 2026-07-28");
-
-		// --- 2. listSkills(): skills/list enumerates every registered skill ---
-		// The raw result carries the CacheableResult fields the stable spec
-		// requires on a 2026-07-28 session; the typed helper drains the pages.
-		auto raw = client.skillsList();
-		check(!raw.cache.isNull, "skills/list on a modern session should carry ttlMs/cacheScope");
-		auto skills = listSkills(client);
+		// --- 2. skills/list enumerates every registered skill ---------------
+		// The result carries the CacheableResult fields the stable spec
+		// requires on a 2026-07-28 session; `entries` types the drained pages.
+		auto listed = client.skillsList();
+		check(!listed.cache.isNull,
+			"skills/list on a modern session should carry ttlMs/cacheScope");
+		auto skills = listed.entries;
 		auto names = skills.map!(s => s.name).array;
 		checkEq(skills.length, 5, "skills/list should carry five entries");
 		check(names.canFind("git-workflow"), "listing should carry git-workflow");
@@ -110,7 +107,7 @@ int main(string[] args) @safe
 
 		// --- 3. a @skill skill: synthesized frontmatter ---------------------
 		auto md = readSkill(client, "git-workflow");
-		check(md.canFind("name: git-workflow"), "SKILL.md frontmatter should carry the name");
+		check(md.canFind(`name: "git-workflow"`), "SKILL.md frontmatter should carry the name");
 		check(md.canFind("description: \"Follow this team's Git"),
 			"SKILL.md frontmatter should carry the description");
 		check(md.canFind("# Git Workflow"), "SKILL.md should carry the instructions body");
@@ -131,10 +128,9 @@ int main(string[] args) @safe
 			"the supporting references/CHECKLIST.md should be readable");
 
 		// --- 5. skills/get + host-side verification --------------------------
-		auto fetchedRaw = client.skillsGet("skill://team/release-helper/SKILL.md");
-		check(!fetchedRaw.cache.isNull,
-			"skills/get on a modern session should carry ttlMs/cacheScope");
-		auto fetched = getSkill(client, "skill://team/release-helper/SKILL.md");
+		auto got = client.skillsGet("skill://team/release-helper/SKILL.md");
+		check(!got.cache.isNull, "skills/get on a modern session should carry ttlMs/cacheScope");
+		auto fetched = got.entry;
 		checkEq(fetched.name, "release-helper", "skills/get should return the entry by uri");
 		auto relMd = readSkillUri(client, fetched.uri);
 		check(verifySkillMarkdown(fetched, relMd) is null,
@@ -144,18 +140,18 @@ int main(string[] args) @safe
 			"CHECKLIST.md should verify against the entry's manifest digest");
 
 		// The nested skill is an ordinary flat entry, retrievable by its own uri.
-		auto hotfix = getSkill(client, "skill://team/release-helper/hotfix-helper/SKILL.md");
+		auto hotfix = client.skillsGet("skill://team/release-helper/hotfix-helper/SKILL.md").entry;
 		checkEq(hotfix.name, "hotfix-helper", "the nested skill answers skills/get");
 		check(hotfix.frontmatter["description"].get!string.canFind("hotfix"),
 			"the nested entry carries its own authored frontmatter");
 
 		// --- 6. resources/directory/read: walk the skill's tree -------------
-		auto root = readDirectory(client, "skill://team/release-helper");
-		check(root.any!(e => e.name == "SKILL.md" && !e.isDirectory),
+		auto root = client.readDirectory("skill://team/release-helper").resources;
+		check(root.any!(e => e.name == "SKILL.md" && e.mimeType.get("") != skillDirectoryMimeType),
 			"directory read should list SKILL.md as a file");
-		check(root.any!(e => e.name == "references" && e.isDirectory),
+		check(root.any!(e => e.name == "references" && e.mimeType.get("") == skillDirectoryMimeType),
 			"directory read should list references/ as a subdirectory");
-		auto refs = readDirectory(client, "skill://team/release-helper/references");
+		auto refs = client.readDirectory("skill://team/release-helper/references").resources;
 		check(refs.any!(e => e.name == "CHECKLIST.md"),
 			"descending into references/ should list CHECKLIST.md");
 

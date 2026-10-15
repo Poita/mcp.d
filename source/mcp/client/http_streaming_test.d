@@ -88,11 +88,11 @@ unittest
 		{
 			auto listener = listenHTTP(settings, router);
 			scope (exit)
-				() @trusted { listener.stopListening(); }();
+				listener.stopListening();
 			const port = listener.bindAddresses[0].port;
 			// Point the client at the LEGACY SSE endpoint. A POST to /sse has no
 			// route (only GET), so the server answers 404 -> the client's modern
-			// POST-and-await raises LegacyFallbackException -> connect() opens the
+			// POST-and-await raises HttpStatusException(404) -> connect() opens the
 			// legacy two-endpoint transport.
 			auto url = "http://127.0.0.1:" ~ port.to!string ~ "/sse";
 
@@ -126,13 +126,14 @@ unittest
 // initialize, the client opens a standalone GET SSE stream; a server-initiated
 // broadcast notification (`notifications/tools/list_changed`) must arrive on that
 // stream and reach the client's inbound `onNotification` handler. This stream is a
-// stable-revision feature gated by `getOpensSseStream` (2025-03-26 / 2025-06-18 /
-// 2025-11-25) and requires a stateful server; 2026-07-28 removed it.
+// stable-revision feature (2025-03-26 / 2025-06-18 / 2025-11-25) and requires a
+// stateful server; 2026-07-28 removed it.
 unittest
 {
-	// `getOpensSseStream` requires a stateful server: a stateless one answers the
-	// standalone GET with 405, so there is no stream to push onto.
+	// A stateless server answers the standalone GET with 405, so there is no
+	// stream to push onto.
 	auto server = McpServer.stateful("server-stream-e2e", "1.0.0");
+	server.enableToolsListChanged();
 
 	auto router = new URLRouter;
 	mountMcp(router, server);
@@ -149,7 +150,7 @@ unittest
 		{
 			auto listener = listenHTTP(settings, router);
 			scope (exit)
-				() @trusted { listener.stopListening(); }();
+				listener.stopListening();
 			const port = listener.bindAddresses[0].port;
 			auto url = "http://127.0.0.1:" ~ port.to!string ~ "/mcp";
 
@@ -221,7 +222,7 @@ unittest
 		{
 			auto listener = listenHTTP(settings, router);
 			scope (exit)
-				() @trusted { listener.stopListening(); }();
+				listener.stopListening();
 			const port = listener.bindAddresses[0].port;
 			auto url = "http://127.0.0.1:" ~ port.to!string ~ "/mcp";
 
@@ -301,7 +302,7 @@ unittest
 		{
 			auto listener = listenHTTP(settings, router);
 			scope (exit)
-				() @trusted { listener.stopListening(); }();
+				listener.stopListening();
 			const port = listener.bindAddresses[0].port;
 			auto url = "http://127.0.0.1:" ~ port.to!string ~ "/mcp";
 
@@ -366,7 +367,7 @@ unittest
 
 	auto router = new URLRouter;
 	router.post("/mcp", (HTTPServerRequest req, HTTPServerResponse res) @safe {
-		const payload = () @trusted { return req.bodyReader.readAllUTF8(); }();
+		const payload = req.bodyReader.readAllUTF8();
 		auto j = parseJsonString(payload);
 		const method = ("method" in j) ? j["method"].get!string : "";
 
@@ -381,15 +382,13 @@ unittest
 		}
 		if (method == "tools/list")
 		{
-			// Open an SSE response, emit a `retry:` delay and an event `id:`, then
-			// close the connection WITHOUT the JSON-RPC response — the trigger for
-			// the client's Last-Event-ID resume.
+			// Open an SSE response, emit a priming event carrying a `retry:` delay
+			// and an event `id:`, then close the connection WITHOUT the JSON-RPC
+			// response — the trigger for the client's Last-Event-ID resume.
 			droppedId = j["id"].get!long;
 			res.contentType = "text/event-stream";
-			() @trusted {
-				res.bodyWriter.write(cast(const(ubyte)[]) "retry: 50\r\nid: evt-1\r\n");
-				res.bodyWriter.flush();
-			}();
+			res.bodyWriter.write(cast(const(ubyte)[]) "retry: 50\r\nid: evt-1\r\n\r\n");
+			res.bodyWriter.flush();
 			return; // handler returns -> stream closes (EOF) with no response
 		}
 		// notifications/initialized and any other oneway: just acknowledge.
@@ -410,10 +409,8 @@ unittest
 		resp["id"] = Json(droppedId);
 		res.contentType = "text/event-stream";
 		const frame = "id: evt-2\r\ndata: " ~ resp.toString() ~ "\r\n\r\n";
-		() @trusted {
-			res.bodyWriter.write(cast(const(ubyte)[]) frame);
-			res.bodyWriter.flush();
-		}();
+		res.bodyWriter.write(cast(const(ubyte)[]) frame);
+		res.bodyWriter.flush();
 	});
 
 	auto settings = new HTTPServerSettings;
@@ -425,7 +422,7 @@ unittest
 		{
 			auto listener = listenHTTP(settings, router);
 			scope (exit)
-				() @trusted { listener.stopListening(); }();
+				listener.stopListening();
 			const port = listener.bindAddresses[0].port;
 			auto url = "http://127.0.0.1:" ~ port.to!string ~ "/mcp";
 
@@ -499,7 +496,7 @@ unittest
 		{
 			auto listener = listenHTTP(settings, router);
 			scope (exit)
-				() @trusted { listener.stopListening(); }();
+				listener.stopListening();
 			const port = listener.bindAddresses[0].port;
 			auto url = "http://127.0.0.1:" ~ port.to!string ~ "/mcp";
 
@@ -542,4 +539,226 @@ unittest
 	assert(peak <= cap,
 			"observed concurrency exceeded the cap: peak=" ~ peak.to!string
 			~ " cap=" ~ cap.to!string);
+}
+
+// A 2025-era server->client request (here `roots/list`) arrives on the response
+// stream of the `tools/call` that triggered it, and the server withholds the call's
+// result until the client answers. The time the client's own handler spends
+// answering must not count against the outer request's `requestTimeout`, and the
+// handler must run to completion rather than being interrupted by an abort.
+unittest
+{
+	import mcp.protocol.types : ListRootsResult, Root;
+
+	auto server = McpServer.stateful("handler-timeout", "1.0.0");
+	Tool tool;
+	tool.name = "roots";
+	tool.description = "Asks the client for its roots";
+	server.registerTool(tool, (Json args, RequestContext ctx) @safe {
+		const n = ctx.listRoots().roots.length;
+		return CallToolResult([Content.makeText(n.to!string)]);
+	});
+
+	auto router = new URLRouter;
+	mountMcp(router, server);
+
+	auto settings = new HTTPServerSettings;
+	settings.port = 0;
+	settings.bindAddresses = ["127.0.0.1"];
+
+	bool handlerFinished;
+	string text;
+	string failure;
+
+	void delegate() @safe nothrow body_ = () @safe nothrow{
+		try
+		{
+			auto listener = listenHTTP(settings, router);
+			scope (exit)
+				listener.stopListening();
+			const port = listener.bindAddresses[0].port;
+			auto url = "http://127.0.0.1:" ~ port.to!string ~ "/mcp";
+
+			ClientSettings s;
+			s.requestTimeout = 300.msecs;
+			auto client = McpClient.http(url, s);
+			scope (exit)
+				closeQuietly(client);
+			client.onListRoots = () @safe {
+				sleep(700.msecs);
+				handlerFinished = true;
+				ListRootsResult r;
+				r.roots = [Root("file:///a")];
+				return r;
+			};
+			client.initialize("2025-11-25");
+			auto res = client.callTool("roots", Json.emptyObject);
+			if (res.content.length)
+				text = res.content[0].text;
+		}
+		catch (Exception e)
+			failure = e.msg;
+		exitEventLoop();
+	};
+
+	runTask(body_);
+	runEventLoop();
+
+	assert(handlerFinished, "the roots handler was interrupted");
+	assert(failure.length == 0, "the call failed while the client handler ran: " ~ failure);
+	assert(text == "1", "unexpected tool result: " ~ text);
+}
+
+// A server->client request that arrives on one call's response stream holds only
+// that call open: while the client's handler answers it, a concurrent call the
+// server never answers still times out on its own `requestTimeout`.
+unittest
+{
+	import mcp.protocol.types : ListRootsResult, Root;
+	import mcp.protocol.errors : RequestTimeoutException;
+	import core.time : Duration;
+
+	auto server = McpServer.stateful("handler-scoped-pause", "1.0.0");
+	Tool rootsTool;
+	rootsTool.name = "roots";
+	rootsTool.description = "Asks the client for its roots";
+	server.registerTool(rootsTool, (Json args, RequestContext ctx) @safe {
+		const n = ctx.listRoots().roots.length;
+		return CallToolResult([Content.makeText(n.to!string)]);
+	});
+	Tool hangTool;
+	hangTool.name = "hang";
+	hangTool.description = "Answers long after the client gives up";
+	server.registerTool(hangTool, (Json args, RequestContext ctx) @safe {
+		sleep(3.seconds);
+		return CallToolResult([Content.makeText("late")]);
+	});
+
+	auto router = new URLRouter;
+	mountMcp(router, server);
+
+	auto settings = new HTTPServerSettings;
+	settings.port = 0;
+	settings.bindAddresses = ["127.0.0.1"];
+
+	enum handlerTime = 1500.msecs;
+	string rootsText;
+	string failure;
+	bool hangTimedOut;
+	Duration hangElapsed;
+
+	void delegate() @safe nothrow body_ = () @safe nothrow{
+		try
+		{
+			auto listener = listenHTTP(settings, router);
+			scope (exit)
+				listener.stopListening();
+			const port = listener.bindAddresses[0].port;
+			auto url = "http://127.0.0.1:" ~ port.to!string ~ "/mcp";
+
+			ClientSettings s;
+			s.requestTimeout = 300.msecs;
+			auto client = McpClient.http(url, s);
+			scope (exit)
+				closeQuietly(client);
+			client.onListRoots = () @safe {
+				sleep(handlerTime);
+				ListRootsResult r;
+				r.roots = [Root("file:///a")];
+				return r;
+			};
+			client.initialize("2025-11-25");
+
+			auto hangCall = runTask(() nothrow{
+				const started = MonoTime.currTime;
+				try
+					client.callTool("hang", Json.emptyObject);
+				catch (RequestTimeoutException)
+					hangTimedOut = true;
+				catch (Exception e)
+					failure = "hang: " ~ e.msg;
+				hangElapsed = MonoTime.currTime - started;
+			});
+			sleep(50.msecs); // the hang call is in flight before the roots request arrives
+			auto res = client.callTool("roots", Json.emptyObject);
+			if (res.content.length)
+				rootsText = res.content[0].text;
+			hangCall.join();
+		}
+		catch (Exception e)
+			failure = e.msg;
+		exitEventLoop();
+	};
+
+	runTask(body_);
+	runEventLoop();
+
+	assert(failure.length == 0, "unexpected failure: " ~ failure);
+	assert(rootsText == "1", "unexpected roots result: " ~ rootsText);
+	assert(hangTimedOut, "the unanswered call did not time out");
+	assert(hangElapsed < handlerTime - 300.msecs,
+			"the unanswered call's deadline was paused by another call's handler: "
+			~ hangElapsed.toString());
+}
+
+// A modern server that does not serve the client's probe version answers
+// `server/discover` with HTTP 400 and an UnsupportedProtocolVersionError whose
+// `data.supported` lists what it does serve; connect() negotiates from that list
+// and runs the initialize handshake for the chosen stable version.
+unittest
+{
+	auto router = new URLRouter;
+	router.post("/mcp", (HTTPServerRequest req, HTTPServerResponse res) @safe {
+		auto msg = parseJsonString(req.bodyReader.readAllUTF8);
+		const method = msg["method"].get!string;
+		if ("id" !in msg)
+		{
+			res.statusCode = 202;
+			res.writeBody("");
+			return;
+		}
+		Json reply = Json.emptyObject;
+		reply["jsonrpc"] = "2.0";
+		reply["id"] = msg["id"];
+		if (method == "server/discover")
+		{
+			reply["error"] = parseJsonString(`{"code":-32022,"message":"Unsupported protocol version","data":{"supported":["2025-11-25"]}}`);
+			res.statusCode = 400;
+		}
+		else if (method == "initialize")
+			reply["result"] = parseJsonString(`{"protocolVersion":"2025-11-25","capabilities":{},"serverInfo":{"name":"fake","version":"1"}}`);
+		else
+			reply["error"] = parseJsonString(`{"code":-32601,"message":"Method not found"}`);
+		res.writeBody(reply.toString, "application/json");
+	});
+
+	auto settings = new HTTPServerSettings;
+	settings.port = 0;
+	settings.bindAddresses = ["127.0.0.1"];
+
+	string failure;
+	ProtocolVersion negotiated;
+
+	void delegate() @safe nothrow body_ = () @safe nothrow{
+		try
+		{
+			auto listener = listenHTTP(settings, router);
+			scope (exit)
+				listener.stopListening();
+			const port = listener.bindAddresses[0].port;
+			auto client = McpClient.http("http://127.0.0.1:" ~ port.to!string ~ "/mcp");
+			scope (exit)
+				closeQuietly(client);
+			negotiated = client.connect();
+		}
+		catch (Exception e)
+			failure = e.msg;
+		exitEventLoop();
+	};
+
+	runTask(body_);
+	runEventLoop();
+
+	assert(failure.length == 0, "connect failed: " ~ failure);
+	assert(negotiated == ProtocolVersion.v2025_11_25);
 }

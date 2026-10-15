@@ -2,7 +2,7 @@ module mcp.api.reflection;
 
 import std.traits;
 import std.typecons : Tuple, Nullable, nullable;
-import std.meta : AliasSeq;
+import std.meta : AliasSeq, staticMap;
 
 import vibe.data.json : Json, serializeToJson, deserializeJson, JsonSerializer;
 import vibe.data.serialization : serializeWithPolicy, deserializeWithPolicy;
@@ -10,63 +10,104 @@ import vibe.data.serialization : serializeWithPolicy, deserializeWithPolicy;
 import mcp.protocol.types;
 import mcp.protocol.capabilities : Icon;
 import mcp.protocol.modern : CacheHint, CacheScope;
-import mcp.server.server : McpServer, ToolResponse;
+import mcp.server.server : McpServer, TaskToolOptions, hasAdjacentUriVariables;
+import mcp.server.responses : ToolResponse, PromptResponse;
 import mcp.server.context;
 import mcp.server.task_context : TaskContext;
 import mcp.server.task_runtime : TaskOptions;
-import mcp.server.event_context : EventContext, EventResult, Event, EventBatch, FetchContext;
+import mcp.server.event_context : EventContext, EventResult, Event, EventBatch,
+	FetchContext, SubContext;
 import mcp.server.events_runtime : EventRegistration, EventCheck;
 import mcp.api.attributes;
-import mcp.api.apps : UiToolMeta, setUiToolMeta;
-import mcp.api.skills : Skill, registerSkill;
+import mcp.api.apps : UiToolMeta, setUiToolMeta, ensureApps;
+import mcp.api.skills : Skill, isValidSkillPath, registerSkill,
+	skillFieldProblem, skillPathRule, unregisterSkill;
+import mcp.api.binding : bindJson, bindString, defaultAs, schemaNode,
+	jsonSchemaOf, SchemaUse, setBound, wireName;
 import mcp.protocol.schema;
+import mcp.protocol.jsonhelpers : isFieldwiseStruct;
 
 @safe:
 
-/// vibe.data serialization policy that maps any `enum` leaf to / from its
-/// member *name* (string), rather than vibe's default numeric base value.
+/// Register every handler-annotated method of `obj` on `server` (`@tool`,
+/// `@taskTool`, `@prompt`, `@resource`, `@resourceTemplate`, `@event`, `@skill`,
+/// and `@skillDir`), deriving JSON schemas and argument marshalling from the
+/// method signatures (FastMCP-style ergonomics). Registering a `@taskTool`,
+/// `@event`, `@skill`, `@skillDir`, or `@ui` tool enables its extension.
 ///
-/// The reflection layer emits enum schemas as `{type:"string", enum:[names…]}`
-/// (see `jsonSchemaOf`), so both directions of marshalling must agree: struct
-/// params/returns and bare-enum values are (de)serialized by-name. The policy
-/// only defines `toRepresentation`/`fromRepresentation` for enums, so vibe's
-/// `isPolicySerializable` is false for every other type and the default
-/// behaviour is preserved (it still recurses into nested struct/array fields,
-/// applying this rule to any enum found at any depth).
-template EnumByNamePolicy(T) if (is(T == enum))
-{
-	import std.conv : to;
-
-	static string toRepresentation(T v) @safe
-	{
-		return v.to!string;
-	}
-
-	static T fromRepresentation(string s) @safe
-	{
-		return s.to!T;
-	}
-}
-
-/// Register every `@tool` / `@prompt` / `@resource` / `@resourceTemplate`
-/// annotated method of `obj` on `server`, deriving JSON schemas and argument
-/// marshalling from the method signatures (FastMCP-style ergonomics).
+/// `obj` is a class instance, an interface, or a pointer to a struct: the
+/// registered handlers call its methods for the server's lifetime, so a struct
+/// passed by value is rejected — they would act on a copy.
+///
+/// An override (or interface implementation) without UDAs of its own takes the
+/// handler UDAs of the declaration it overrides, and calls dispatch virtually to
+/// the override.
+///
+/// Registration is all or nothing: when one handler fails to register (a name
+/// already taken, a missing `@skillDir` directory, ...), the handlers this call
+/// registered before it are removed again and the exception propagates.
+/// Extensions those handlers enabled stay enabled.
 void registerHandlers(T)(McpServer server, T obj) @safe
 {
-	registerAnnotatedMembers!(T, obj)(server);
+	static if (is(T == class) || is(T == interface) || is(T == U*, U))
+		if (obj is null)
+			throw new Exception("registerHandlers needs a " ~ T.stringof
+					~ " instance, not null; its handlers would dereference it on every call");
+	Rollback rollback;
+	scope (failure)
+		rollback.run();
+	static if (is(T == U*, U) && is(U == struct))
+		registerAnnotatedMembers!(U, obj)(server, rollback);
+	else
+	{
+		static assert(is(T == class) || is(T == interface),
+				"registerHandlers needs a class instance or a pointer to a struct, not "
+				~ T.stringof ~ "; a struct passed by value is copied, so its handlers would not "
+				~ "see or update the original (allocate it with new and pass the pointer)");
+		registerAnnotatedMembers!(T, obj)(server, rollback);
+	}
 }
 
-/// Register every `@tool` / `@prompt` / `@resource` / `@resourceTemplate`
-/// annotated **free function** in module `mod` on `server`, mirroring
+/// The handlers one registration call has added so far, each as the action that
+/// removes it again, so a failure part-way through can undo the call.
+private struct Rollback
+{
+	private void delegate() @safe[] undos;
+
+	/// Record `undo` as the removal of a handler just registered.
+	void add(void delegate() @safe undo) @safe
+	{
+		undos ~= undo;
+	}
+
+	/// Remove every recorded handler, newest first. An undo that throws is
+	/// skipped so the rest still run and the original failure propagates.
+	void run() @safe
+	{
+		foreach_reverse (undo; undos)
+		{
+			try
+				undo();
+			catch (Exception)
+			{
+			}
+		}
+		undos = null;
+	}
+}
+
+/// Register every handler-annotated **free function** in module `mod` on
+/// `server` (the same handler UDAs as `registerHandlers`), mirroring
 /// `registerHandlers` but targeting module-scope symbols rather than the
 /// methods of an instance (FastMCP-style module decoration).
 ///
 /// Free functions cannot receive a `RequestContext` via `this`, so a context
 /// must be taken as an explicit parameter (exactly as opt-in methods do).
 /// Non-function members and functions without a recognized UDA are skipped.
+/// Registration is all or nothing, as for `registerHandlers`.
 void registerModule(alias mod)(McpServer server) @safe
 {
-	registerAnnotatedMembers!(mod, mod)(server);
+	registerModules!mod(server);
 }
 
 /// Walk every overload of every member of `root` and dispatch each recognized
@@ -74,44 +115,525 @@ void registerModule(alias mod)(McpServer server) @safe
 /// `parent` is the symbol member calls resolve against — `(T, obj)` for an
 /// instance, `(mod, mod)` for a module's free functions. Members without a
 /// recognized UDA are skipped.
-private void registerAnnotatedMembers(alias root, alias parent)(McpServer server) @safe
+private void registerAnnotatedMembers(alias root, alias parent)(McpServer server,
+		ref Rollback rollback) @safe
 {
 	static foreach (memberName; __traits(allMembers, root))
 	{
-		static if (__traits(compiles, __traits(getOverloads, root, memberName)))
+		static if (__traits(compiles, __traits(getOverloads, root, memberName, true)))
 		{
-			static foreach (overload; __traits(getOverloads, root, memberName))
+			// Templates are included so a templated handler is rejected rather
+			// than silently left unregistered: its parameter types, and so its
+			// schema, are unknown until it is instantiated.
+			static foreach (overload; __traits(getOverloads, root, memberName, true))
 			{
-				static foreach (attr; __traits(getAttributes, overload))
+				// An alias member (`alias g = f;`) reports the overloads of the
+				// symbol it names, which that symbol's own member visit registers.
+				static if (__traits(identifier, overload) != memberName)
 				{
-					static if (is(typeof(attr) == tool))
-						registerToolMethod!(memberName, overload, parent)(server, attr);
-					else static if (is(typeof(attr) == task))
-						registerTaskMethod!(memberName, overload, parent)(server, attr);
-					else static if (is(typeof(attr) == event))
-						registerEventMethod!(memberName, overload, parent)(server, attr);
-					else static if (is(typeof(attr) == prompt))
-						registerPromptMethod!(memberName, overload, parent)(server, attr);
-					else static if (is(typeof(attr) == resource))
-						registerResourceMethod!(memberName, overload, parent)(server, attr);
-					else static if (is(typeof(attr) == resourceTemplate))
-						registerTemplateMethod!(memberName, overload, parent)(server, attr);
-					else static if (is(typeof(attr) == skill))
-						registerSkillMethod!(memberName, overload, parent)(server, attr);
-					else static if (is(typeof(attr) == skillDir))
-						registerSkillDirMethod!(memberName, overload, parent)(server, attr);
 				}
+				else static if (__traits(isTemplate, overload))
+				{
+					static foreach (attr; __traits(getAttributes, overload))
+						static assert(!isHandlerAttribute!attr, "handler '" ~ memberName
+								~ "' is a template; a handler's parameter types must be fixed "
+								~ "to derive its schema, so declare it without template parameters");
+				}
+				else
+					registerOverload!(memberName, AnnotatedDecl!(root,
+							memberName, overload), parent)(server, rollback);
 			}
 		}
 	}
+}
+
+/// The declaration whose UDAs describe `overload`, a member `memberName` of
+/// `root`: `overload` itself when it carries a handler UDA or `root` is not a
+/// class, else the nearest declaration it overrides or implements, in a base
+/// class or an interface, that does. An override does not inherit its base
+/// declaration's UDAs, so the handler's metadata is read from that declaration
+/// while the call still dispatches virtually to the override.
+private template AnnotatedDecl(alias root, string memberName, alias overload)
+{
+	static if (!is(root == class) || hasHandlerUda!overload())
+		alias AnnotatedDecl = overload;
+	else
+	{
+		import std.meta : Filter;
+
+		template declsIn(S)
+		{
+			static if (__traits(hasMember, S, memberName))
+				alias declsIn = AliasSeq!(__traits(getOverloads, S, memberName));
+			else
+				alias declsIn = AliasSeq!();
+		}
+
+		enum isAnnotatedMatch(alias d) = is(Parameters!d == Parameters!overload)
+			&& hasHandlerUda!d();
+		alias matches = Filter!(isAnnotatedMatch, staticMap!(declsIn,
+				BaseClassesTuple!root, InterfacesTuple!root));
+		static if (matches.length)
+			alias AnnotatedDecl = matches[0];
+		else
+			alias AnnotatedDecl = overload;
+	}
+}
+
+/// Validate the handler UDAs on `overload` (member `memberName`) and register
+/// each one on `server`, dispatching calls through `parent`, recording in
+/// `rollback` how to remove each again.
+private void registerOverload(string memberName, alias overload, alias parent)(
+		McpServer server, ref Rollback rollback) @safe
+{
+	static if (hasHandlerUda!overload())
+	{
+		checkHandlerVisibility!(memberName, overload)();
+		checkHandlerSafety!(memberName, overload)();
+		checkMethodFacets!(memberName, overload)();
+		checkUdaPlacement!(memberName, overload)();
+	}
+	else
+	{
+		static foreach (attr; __traits(getAttributes, overload))
+			static assert(!isMethodUda!attr, "@" ~ udaName!attr ~ " on '" ~ memberName
+					~ "' has no effect: the method has no handler UDA (@tool, @taskTool, "
+					~ "@prompt, @resource, @resourceTemplate, @event, @skill, or @skillDir)");
+	}
+	static foreach (attr; __traits(getAttributes, overload))
+	{
+		static if (is(attr))
+		{
+			static assert(!isHandlerUda!attr,
+					"@" ~ attr.stringof ~ " on '" ~ memberName ~ "' is missing its argument list (e.g. "
+					~ handlerUdaExample!attr ~ "); a bare @" ~ attr.stringof
+					~ " attaches the type, not a value, and registers nothing");
+			static assert(!isValueUdaType!attr, "@" ~ attr.stringof ~ " on '"
+					~ memberName ~ "' is missing its argument list; a bare @"
+					~ attr.stringof ~ " attaches the type, not a value, and has no effect");
+		}
+		else static if (is(typeof(attr) == tool))
+		{
+			static assert(isValidToolName(attr.name),
+					"@tool on '" ~ memberName ~ "' has the name '" ~ attr.name ~ "'; "
+					~ toolNameRule);
+			registerToolMethod!(memberName, overload, parent)(server, attr);
+			rollback.add(() @safe { server.removeTool(attr.name); });
+		}
+		else static if (is(typeof(attr) == taskTool))
+		{
+			static assert(isValidToolName(attr.name),
+					"@taskTool on '" ~ memberName ~ "' has the name '"
+					~ attr.name ~ "'; " ~ toolNameRule);
+			registerTaskMethod!(memberName, overload, parent)(server, attr);
+			rollback.add(() @safe { server.removeTool(attr.name); });
+		}
+		else static if (is(typeof(attr) == event))
+		{
+			static assert(attr.name.length, "@event on '" ~ memberName ~ "' has an empty name");
+			registerEventMethod!(memberName, overload, parent)(server, attr);
+			rollback.add(() @safe { server.events.unregister(attr.name); });
+		}
+		else static if (is(typeof(attr) == prompt))
+		{
+			static assert(attr.name.length, "@prompt on '" ~ memberName ~ "' has an empty name");
+			registerPromptMethod!(memberName, overload, parent)(server, attr);
+			rollback.add(() @safe { server.removePrompt(attr.name); });
+		}
+		else static if (is(typeof(attr) == resource))
+		{
+			static assert(attr.uri.length, "@resource on '" ~ memberName ~ "' has an empty uri");
+			static assert(attr.name.length, "@resource on '" ~ memberName ~ "' has an empty name");
+			registerResourceMethod!(memberName, overload, parent)(server, attr);
+			rollback.add(() @safe { server.removeResource(attr.uri); });
+		}
+		else static if (is(typeof(attr) == resourceTemplate))
+		{
+			static assert(attr.uriTemplate.length,
+					"@resourceTemplate on '" ~ memberName ~ "' has an empty uriTemplate");
+			static assert(attr.name.length,
+					"@resourceTemplate on '" ~ memberName ~ "' has an empty name");
+			static assert(!hasAdjacentUriVariables(attr.uriTemplate),
+					"@resourceTemplate on '" ~ memberName
+					~ "' has adjacent variables that can never match: \"" ~ attr.uriTemplate
+					~ "\"; separate them with a literal or an operator such as {?q}");
+			registerTemplateMethod!(memberName, overload, parent, attr)(server);
+			rollback.add(() @safe {
+				server.removeResourceTemplate(attr.uriTemplate);
+			});
+		}
+		else static if (is(typeof(attr) == skill))
+		{
+			static assert(isValidSkillPath(attr.path), "@skill on '" ~ memberName
+					~ "' has the invalid skill path \"" ~ attr.path ~ "\"; " ~ skillPathRule);
+			static assert(skillFieldProblem(attr.description, attr.compatibility) is null,
+					"@skill on '" ~ memberName ~ "': " ~ skillFieldProblem(attr.description,
+						attr.compatibility));
+			registerSkillMethod!(memberName, overload, parent)(server, attr);
+			rollback.add(() @safe { unregisterSkill(server, attr.path); });
+		}
+		else static if (is(typeof(attr) == skillDir))
+		{
+			static assert(attr.path.length == 0 || isValidSkillPath(attr.path),
+					"@skillDir on '" ~ memberName ~ "' has the invalid skill path \""
+					~ attr.path ~ "\"; " ~ skillPathRule);
+			const dirSkillPath = registerSkillDirMethod!(memberName, overload, parent)(server, attr);
+			rollback.add(() @safe { unregisterSkill(server, dirSkillPath); });
+		}
+	}
+}
+
+/// Whether `f` carries a handler UDA value (`@tool(...)`, `@prompt(...)`, ...).
+private bool hasHandlerUda(alias f)()
+{
+	bool found;
+	static foreach (a; __traits(getAttributes, f))
+		static if (!is(a) && isHandlerUda!(typeof(a)))
+			found = true;
+	return found;
+}
+
+/// Reject a handler that is not `public` (or `export`): the registered
+/// callbacks are generated in this module and call it from here, so a private,
+/// package, or protected one would otherwise fail with an access error inside
+/// the SDK rather than at the annotated method.
+private void checkHandlerVisibility(string memberName, alias f)()
+{
+	enum visibility = __traits(getVisibility, f);
+	static assert(visibility == "public" || visibility == "export",
+			"handler '" ~ memberName ~ "' is " ~ visibility
+			~ ", but the SDK calls it from outside its declaring " ~ "scope; make it public");
+}
+
+/// Reject a handler that is not `@safe` (or `@trusted`): the registered
+/// callbacks are `@safe`, so calling it would otherwise fail deep inside a
+/// generated lambda instead of at the annotated method.
+private void checkHandlerSafety(string memberName, alias f)()
+{
+	static assert(isSafe!f, "handler '" ~ memberName ~ "' must be @safe (or @trusted); "
+			~ "annotate it, e.g. `string " ~ memberName ~ "(...) @safe { ... }`");
+}
+
+/// Whether the type `A` is one of the handler UDAs that must be applied with an
+/// argument list; a bare `@tool` attaches the type itself rather than a value.
+private enum isHandlerUda(A) = is(A == tool) || is(A == taskTool)
+	|| is(A == event) || is(A == prompt) || is(A == resource)
+	|| is(A == resourceTemplate) || is(A == skill) || is(A == skillDir);
+
+/// Whether the attribute `a` is a handler UDA, applied (`@tool(...)`) or bare
+/// (`@tool`).
+private template isHandlerAttribute(alias a)
+{
+	static if (is(a))
+		enum isHandlerAttribute = isHandlerUda!a;
+	else
+		enum isHandlerAttribute = isHandlerUda!(typeof(a));
+}
+
+/// An applied form of the handler UDA `A` with placeholder arguments, shown when
+/// `A` is attached bare.
+private template handlerUdaExample(A)
+{
+	static if (is(A == resource))
+		enum handlerUdaExample = `@resource("uri", "name")`;
+	else static if (is(A == resourceTemplate))
+		enum handlerUdaExample = `@resourceTemplate("uriTemplate", "name")`;
+	else static if (is(A == skill))
+		enum handlerUdaExample = `@skill("path", "description")`;
+	else static if (is(A == skillDir))
+		enum handlerUdaExample = `@skillDir("path") or @skillDir()`;
+	else
+		enum handlerUdaExample = "@" ~ A.stringof ~ `("name", "description")`;
 }
 
 /// Convenience variadic form of `registerModule`: register the annotated free
 /// functions of several modules in one call.
 void registerModules(mods...)(McpServer server) @safe
 {
+	Rollback rollback;
+	scope (failure)
+		rollback.run();
 	static foreach (mod; mods)
-		registerModule!mod(server);
+		registerAnnotatedMembers!(mod, mod)(server, rollback);
+}
+
+/// The parameter types of `func` with top-level qualifiers removed, so an `in`,
+/// `const`, or `immutable` parameter's argument can be bound into a mutable slot
+/// before the call.
+private alias BoundParameters(alias func) = staticMap!(Unqual, Parameters!func);
+
+/// Whether a parameter of type `P` is injected by the SDK (a `RequestContext`
+/// or `TaskContext`) rather than bound from a client-supplied argument.
+private enum isInjected(P) = is(P : RequestContext) || is(P == TaskContext);
+
+/// Whether parameter `i` of `func` is a required argument: not `Nullable`, and
+/// with neither a D default value nor a `@schemaDefault`.
+private enum isRequiredParam(alias func, size_t i) = !isInstanceOf!(Nullable,
+			BoundParameters!func[i]) && is(ParameterDefaultValueTuple!func[i] == void)
+	&& !ParamSchemaDefaults!(func, i).length;
+
+/// The UDAs attached to parameter `i` of `func`. The compiler reports the
+/// attributes of a parameter that carries any prefixed by those of `func`
+/// itself, so that prefix is dropped.
+private template ParamAttributes(alias func, size_t i)
+{
+	alias all = AliasSeq!(__traits(getAttributes, Parameters!func[i .. i + 1]));
+	alias own = AliasSeq!(__traits(getAttributes, func));
+	static if (own.length && all.length > own.length
+			&& AliasSeq!(all[0 .. own.length]).stringof == own.stringof)
+		alias ParamAttributes = all[own.length .. $];
+	else
+		alias ParamAttributes = all;
+}
+
+/// The `@schemaDefault` UDAs attached to parameter `i` of `func`.
+private template ParamSchemaDefaults(alias func, size_t i)
+{
+	import jsonschema.attributes : SchemaDefault;
+	import std.meta : Filter;
+
+	enum isDefault(alias a) = !is(a) && isInstanceOf!(SchemaDefault, typeof(a));
+	alias ParamSchemaDefaults = Filter!(isDefault, ParamAttributes!(func, i));
+}
+
+/// Whether `A` is one of the `jsonschema` facet UDA types, which describe a
+/// parameter or struct field.
+private template isSchemaFacet(A)
+{
+	import jsonschema.attributes : Maximum, Minimum, SchemaDefault, fieldDescription,
+		format, maxItems, maxLength, minItems, minLength, pattern, title;
+
+	enum isSchemaFacet = isInstanceOf!(Minimum, A) || isInstanceOf!(Maximum, A)
+		|| isInstanceOf!(SchemaDefault, A) || is(A == fieldDescription)
+		|| is(A == format) || is(A == maxItems) || is(A == maxLength)
+		|| is(A == minItems) || is(A == minLength) || is(A == pattern) || is(A == title);
+}
+
+/// Reject a JSON Schema facet UDA attached to the handler method `f` itself:
+/// facets describe a parameter or struct field, and on a method they would
+/// match nothing.
+private void checkMethodFacets(string memberName, alias f)()
+{
+	static foreach (attr; __traits(getAttributes, f))
+		static if (!is(attr))
+			static assert(!isSchemaFacet!(typeof(attr)),
+					"@" ~ attr.stringof ~ " on '" ~ memberName
+					~ "' is a JSON Schema facet, which applies to a parameter "
+					~ "or struct field, not a method; attach it to the parameter (for a "
+					~ "display title use @tool's title argument or @hintTitle)");
+}
+
+/// Whether the attribute `attr` is a method-level MCP UDA, applied or bare,
+/// which only a handler method reads.
+private template isMethodUda(alias attr)
+{
+	static if (is(attr))
+		enum isMethodUda = isMethodUdaType!attr;
+	else
+		enum isMethodUda = isMethodUdaType!(typeof(attr));
+}
+
+private enum isMethodUdaType(A) = is(A == readOnly) || is(A == destructive)
+	|| is(A == idempotent) || is(A == openWorld) || is(A == strictArgs)
+	|| is(A == hintTitle) || is(A == mcpHeader) || is(A == ui) || is(A == taskTtl)
+	|| is(A == taskPollInterval) || is(A == describeParam) || is(A == audience)
+	|| is(A == priority) || is(A == lastModified) || is(A == cacheable)
+	|| is(A == icon) || is(A == meta) || is(A == eventPollInterval);
+
+/// Whether `A` is a method-level MCP UDA that carries a value, and so must be
+/// applied with an argument list rather than attached bare like a marker.
+private enum isValueUdaType(A) = isMethodUdaType!A && !is(A == readOnly)
+	&& !is(A == destructive) && !is(A == idempotent) && !is(A == openWorld) && !is(A == strictArgs);
+
+/// Whether `f` carries an applied (valued) `U` UDA.
+private bool hasValueUda(alias f, U)()
+{
+	bool found;
+	static foreach (a; __traits(getAttributes, f))
+		static if (!is(a) && is(typeof(a) == U))
+			found = true;
+	return found;
+}
+
+/// The name of the attribute `attr`'s UDA type.
+private template udaName(alias attr)
+{
+	static if (is(attr))
+		enum udaName = attr.stringof;
+	else
+		enum udaName = typeof(attr).stringof;
+}
+
+/// Reject a method-level MCP UDA on `f` that none of its handler kinds reads,
+/// so a misplaced one (`@cacheable` on a `@tool`, `@readOnly` on a `@prompt`)
+/// is an error rather than silently ignored.
+private void checkUdaPlacement(string memberName, alias f)()
+{
+	enum onTool = hasUDA!(f, tool) || hasUDA!(f, taskTool);
+	enum onTask = hasUDA!(f, taskTool);
+	enum onPrompt = hasUDA!(f, prompt);
+	enum onResource = hasUDA!(f, resource) || hasUDA!(f, resourceTemplate);
+	enum onEvent = hasUDA!(f, event);
+
+	static foreach (attr; __traits(getAttributes, f))
+	{
+		static if (__traits(isSame, attr, readOnly) || __traits(isSame, attr,
+				destructive) || __traits(isSame, attr, idempotent) || __traits(isSame,
+				attr, openWorld) || __traits(isSame, attr, strictArgs))
+			static assert(onTool, "@" ~ attr.stringof ~ " on '" ~ memberName
+					~ "' applies only to a @tool or @taskTool method");
+		else static if (!is(attr))
+		{
+			static if (is(typeof(attr) == hintTitle)
+					|| is(typeof(attr) == mcpHeader) || is(typeof(attr) == ui))
+				static assert(onTool, "@" ~ typeof(attr)
+						.stringof ~ " on '" ~ memberName
+						~ "' applies only to a @tool or @taskTool method");
+			else static if (is(typeof(attr) == taskTtl) || is(typeof(attr) == taskPollInterval))
+				static assert(onTask, "@" ~ typeof(attr)
+						.stringof ~ " on '" ~ memberName ~ "' applies only to a @taskTool method");
+			else static if (is(typeof(attr) == describeParam))
+				static assert(onTool || onPrompt, "@describeParam on '" ~ memberName
+						~ "' applies only to a @tool, @taskTool, or @prompt method");
+			else static if (is(typeof(attr) == audience)
+					|| is(typeof(attr) == priority)
+					|| is(typeof(attr) == lastModified) || is(typeof(attr) == cacheable))
+				static assert(onResource, "@" ~ typeof(attr).stringof ~ " on '" ~ memberName
+						~ "' applies only to a @resource or @resourceTemplate method");
+			else static if (is(typeof(attr) == icon) || is(typeof(attr) == meta))
+				static assert(onTool || onPrompt || onResource, "@" ~ typeof(attr)
+						.stringof ~ " on '" ~ memberName
+						~ "' applies only to a @tool, @taskTool, @prompt, @resource, or "
+						~ "@resourceTemplate method");
+			else static if (is(typeof(attr) == eventPollInterval))
+				static assert(onEvent,
+						"@eventPollInterval on '" ~ memberName
+						~ "' applies only to an @event method");
+		}
+	}
+	checkUdaRepeats!(memberName, f)();
+}
+
+/// Whether `A` is a method-level UDA that sets one value, so a second one on the
+/// same method would silently replace the first.
+private enum isSingleValuedUda(A) = is(A == hintTitle) || is(A == ui)
+	|| is(A == taskTtl) || is(A == taskPollInterval)
+	|| is(A == eventPollInterval) || is(A == audience) || is(A == priority)
+	|| is(A == lastModified) || is(A == cacheable) || is(A == meta);
+
+/// Reject a single-valued UDA repeated on `f`, and two `@describeParam`s for the
+/// same parameter, rather than let the last one silently win.
+private void checkUdaRepeats(string memberName, alias f)()
+{
+	alias attrs = AliasSeq!(__traits(getAttributes, f));
+	static foreach (i, a; attrs)
+		static if (!is(a))
+			static foreach (b; attrs[0 .. i])
+				static if (!is(b) && is(typeof(a) == typeof(b)))
+					{
+					static assert(!isSingleValuedUda!(typeof(a)), "@" ~ typeof(a)
+							.stringof ~ " appears more than once on '" ~ memberName ~ "'; keep one");
+					static if (is(typeof(a) == describeParam))
+						static assert(a.parameter != b.parameter, "@describeParam(\"" ~ a.parameter
+								~ "\", ...) appears more than once on '" ~ memberName
+								~ "'; keep one");
+				}
+}
+
+private enum toolNameRule = "a tool name must be 1..128 characters of "
+	~ "A-Z, a-z, 0-9, '_', '-', and '.'";
+
+/// Whether `name` follows the MCP tool-naming guidance (2025-11-25 onward): 1..128
+/// characters, each an ASCII letter, digit, underscore, hyphen, or dot.
+private bool isValidToolName(string name) @safe pure nothrow @nogc
+{
+	import std.ascii : isAlphaNum;
+
+	if (name.length == 0 || name.length > 128)
+		return false;
+	foreach (char c; name)
+		if (!(isAlphaNum(c) || c == '_' || c == '-' || c == '.'))
+			return false;
+	return true;
+}
+
+/// The wire names of `func`'s parameters, in order: each identifier with one
+/// trailing underscore dropped (see `wireName`), the names the input schema,
+/// prompt arguments, and URI template variables use.
+private alias ParamWireNames(alias func) = staticMap!(wireName, ParameterIdentifierTuple!func);
+
+/// Reject a parameter of `func` with no name unless it is an injected context:
+/// every other parameter is an argument whose name is its wire name, and D
+/// gives an unnamed one an internal `__param_N` identifier. Also reject two
+/// arguments sharing a wire name (`limit` and `limit_`).
+private void checkParamNames(alias func)()
+{
+	import std.algorithm.searching : startsWith;
+	import std.conv : to;
+
+	alias ids = ParameterIdentifierTuple!func;
+	alias names = ParamWireNames!func;
+	alias types = BoundParameters!func;
+	enum isArgument(size_t i) = !isInjected!(types[i]);
+	static foreach (i, P; types)
+	{
+		static if (isArgument!i)
+		{
+			static assert(ids[i].length && !ids[i].startsWith("__param_"),
+					"parameter #" ~ (i + 1)
+						.to!string ~ " (" ~ P.stringof ~ ") of '" ~ __traits(identifier,
+							func) ~ "' has no name; name it, since its name is the argument's name");
+			static foreach (j; 0 .. i)
+				static if (isArgument!j)
+					static assert(names[j] != names[i],
+							"parameters '" ~ ids[j] ~ "' and '" ~ ids[i] ~ "' of '" ~ __traits(identifier,
+								func) ~ "' share the argument name '" ~ names[i] ~ "'");
+		}
+	}
+}
+
+/// Reject an argument parameter of `func` whose type cannot be bound from JSON,
+/// or whose `@schemaDefault` value does not convert to its type, with a
+/// diagnostic naming the handler, the parameter, and the offending type rather
+/// than an error from deep inside schema generation or binding.
+private void checkParamTypes(alias func)()
+{
+	import mcp.api.binding : facetMismatch, isDefaultFor, unsupportedTypeReason;
+
+	alias ids = ParameterIdentifierTuple!func;
+	static foreach (i, P; BoundParameters!func)
+	{
+		static if (!isInjected!P)
+		{
+			static assert(unsupportedTypeReason!(P, SchemaUse.input)() is null,
+					"parameter '" ~ ids[i] ~ "' of '" ~ __traits(identifier,
+						func) ~ "' has type " ~ P.stringof ~ ", which cannot be bound from JSON ("
+					~ unsupportedTypeReason!(P, SchemaUse.input)() ~ ")");
+			static assert(facetMismatch!(P, ParamAttributes!(func, i))() is null,
+					"parameter '" ~ ids[i] ~ "' of '" ~ __traits(identifier,
+						func) ~ "' has type " ~ P.stringof ~ ", but " ~ facetMismatch!(P,
+						ParamAttributes!(func, i))());
+			static foreach (d; ParamSchemaDefaults!(func, i))
+				static assert(isDefaultFor!(P, d),
+						"the @schemaDefault value of type " ~ typeof(d.value)
+							.stringof ~ " on parameter '" ~ ids[i] ~ "' of '" ~ __traits(identifier,
+								func) ~ "' does not convert to its type " ~ P.stringof);
+		}
+	}
+}
+
+/// Reject a tool method `func` whose return type cannot be written as
+/// structured JSON, naming the handler and the offending type.
+private void checkToolReturnType(alias func)()
+{
+	import mcp.api.binding : unsupportedTypeReason;
+
+	alias R = ReturnType!func;
+	static if (!isUnstructuredReturn!R)
+		static assert(unsupportedTypeReason!(R, SchemaUse.output)() is null,
+				"tool '" ~ __traits(identifier,
+					func) ~ "' returns " ~ R.stringof ~ ", which cannot be written as JSON ("
+				~ unsupportedTypeReason!(R, SchemaUse.output)() ~ ")");
 }
 
 /// Reject any method-level `@describeParam` or `@mcpHeader` UDA whose
@@ -123,8 +645,8 @@ void registerModules(mods...)(McpServer server) @safe
 /// diagnostic instead.
 private void validateParamUdas(alias func)()
 {
-	alias names = ParameterIdentifierTuple!func;
-	alias types = Parameters!func;
+	alias names = ParamWireNames!func;
+	alias types = BoundParameters!func;
 
 	// Whether `pname` names a parameter of `func` that appears in the input
 	// schema (declared, and not an injected RequestContext / TaskContext).
@@ -132,7 +654,7 @@ private void validateParamUdas(alias func)()
 	{
 		bool found;
 		static foreach (i, P; types)
-			static if (!is(P : RequestContext) && !is(P == TaskContext))
+			static if (!isInjected!P)
 				if (names[i] == pname)
 					found = true;
 		return found;
@@ -149,6 +671,35 @@ private void validateParamUdas(alias func)()
 					~ attr.parameter ~ "\", ...) names no schema parameter of this method "
 					~ "(an injected RequestContext/TaskContext has no schema property).");
 	}
+
+	// Header names compare ASCII case-insensitively on the wire, so two
+	// `@mcpHeader`s differing only in case would claim the same header.
+	alias attrs = AliasSeq!(__traits(getAttributes, func));
+	static foreach (i, a; attrs)
+		static if (is(typeof(a) == mcpHeader))
+			static foreach (b; attrs[0 .. i])
+				static if (is(typeof(b) == mcpHeader))
+					{
+					static assert(a.parameter != b.parameter,
+							"@mcpHeader on '" ~ __traits(identifier,
+								func) ~ "' mirrors parameter '" ~ a.parameter ~ "' twice");
+					static assert(!asciiEqualsIgnoreCase(a.name, b.name),
+							"@mcpHeader on '" ~ __traits(identifier, func) ~ "' uses the header name '"
+							~ a.name ~ "' twice (header names are case-insensitive)");
+				}
+}
+
+/// Whether `a` and `b` are equal ignoring ASCII case.
+private bool asciiEqualsIgnoreCase(string a, string b) @safe pure nothrow @nogc
+{
+	import std.ascii : toLower;
+
+	if (a.length != b.length)
+		return false;
+	foreach (i; 0 .. a.length)
+		if (toLower(a[i]) != toLower(b[i]))
+			return false;
+	return true;
 }
 
 /// Resolve the documentation string for the parameter named `pname` of `func`
@@ -161,6 +712,18 @@ private string describeFor(alias func, string pname)() @safe
 			if (attr.parameter == pname && attr.description.length)
 				desc = attr.description;
 	return desc;
+}
+
+/// The header name a method-level `@mcpHeader` UDA on `func` assigns to the
+/// parameter named `pname`, or `""` when none does.
+private string headerFor(alias func, string pname)() @safe
+{
+	string header;
+	static foreach (attr; __traits(getAttributes, func))
+		static if (is(typeof(attr) == mcpHeader))
+			if (attr.parameter == pname)
+				header = attr.name;
+	return header;
 }
 
 /// Whether `P` is an admissible `@mcpHeader` parameter type: one whose
@@ -185,10 +748,12 @@ private Json parametersSchema(alias func)() @safe
 	import mcp.protocol.mrtr : validateHeaderName;
 	import std.traits : ParameterDefaultValueTuple;
 
+	checkParamNames!func();
+	checkParamTypes!func();
 	validateParamUdas!func();
 
-	alias names = ParameterIdentifierTuple!func;
-	alias types = Parameters!func;
+	alias names = ParamWireNames!func;
+	alias types = BoundParameters!func;
 	// ParameterDefaultValueTuple yields `void` for a parameter with no declared
 	// D-level default and the default value's type otherwise.
 	alias defs = ParameterDefaultValueTuple!func;
@@ -197,30 +762,28 @@ private Json parametersSchema(alias func)() @safe
 	Json required = Json.emptyArray;
 	static foreach (i, P; types)
 	{
-		static if (!is(P : RequestContext) && !is(P == TaskContext) && !is(P == EventContext))
+		static if (!isInjected!P)
 		{
 			{
-				// Generate the parameter's schema and fold in the field-level
-				// facet UDAs (@minimum, @maximum, @title, @format, @minLength,
-				// @maxLength, @pattern, @minItems, @maxItems, @schemaDefault)
-				// attached directly to the parameter. Both the generator and
-				// applyUdaFacets are jsonschema's, operating in its JsonNode IR;
-				// render to vibe Json once the facets are applied, then layer the
-				// MCP-specific extensions (x-mcp-header, description) on below.
+				// Generate the parameter's schema and fold in the facet UDAs
+				// (@minimum, @maximum, @title, @format, @minLength, @maxLength,
+				// @pattern, @minItems, @maxItems, @schemaDefault) attached directly
+				// to the parameter, in the jsonschema JsonNode IR; render to vibe
+				// Json once the facets are applied, then layer the MCP-specific
+				// extensions (x-mcp-header, description) on below.
 				//
-				// nullableOmitsNull: a tool input models an optional parameter as a
-				// bare type absent from `required` (the convention the MCP reference
-				// servers use), not as a union with null. So a `Nullable!T` parameter
-				// emits the bare schema for T rather than anyOf:[T,null]; optionality
-				// is carried by `required` below. (Output and elicitation schemas use
-				// the mcp.protocol.schema adapter, which keeps the honest anyOf:[T,null].)
-				import jsonschema : genParamNode = jsonSchemaOf, applyUdaFacets, GeneratorSettings;
+				// A `Nullable!T` parameter is optional (absent from `required`)
+				// and its schema also admits an explicit `null`, which binds as
+				// unset. An x-mcp-header parameter keeps the bare primitive `type`
+				// the header extension requires.
+				import jsonschema : applyUdaFacets;
 				import jsonschema.vibejson : nodeToVibeJson;
 
-				// (emitSchemaKeyword: false, inlineSubschemas: true, nullableOmitsNull: true)
-				enum GeneratorSettings paramSettings = GeneratorSettings(false, true, true);
-				auto psNode = genParamNode!(P, paramSettings)();
-				applyUdaFacets!(__traits(getAttributes, types[i .. i + 1]))(psNode);
+				static if (isInstanceOf!(Nullable, P) && headerFor!(func, names[i]).length)
+					auto psNode = schemaNode!(TemplateArgsOf!P[0], SchemaUse.input)();
+				else
+					auto psNode = schemaNode!(P, SchemaUse.input)();
+				applyUdaFacets!(ParamAttributes!(func, i))(psNode);
 				Json ps = nodeToVibeJson(psNode);
 				// Modern x-mcp-header: a method-level @mcpHeader(parameter, name)
 				// naming this parameter mirrors it into an `Mcp-Param-<name>`
@@ -233,7 +796,7 @@ private Json parametersSchema(alias func)() @safe
 				// (floating point) is NOT permitted.
 				static foreach (attr; __traits(getAttributes, func))
 					static if (is(typeof(attr) == mcpHeader))
-						if (attr.parameter == names[i])
+						static if (attr.parameter == names[i])
 							{
 							static assert(validateHeaderName(attr.name) is null,
 									"@mcpHeader(\"" ~ attr.parameter ~ "\", \"" ~ attr.name
@@ -249,20 +812,36 @@ private Json parametersSchema(alias func)() @safe
 									.stringof ~ "; x-mcp-header permits only integer/string/boolean (or Nullable thereof)");
 							ps["x-mcp-header"] = attr.name;
 						}
-				// Fold the @describeParam UDA into the property's JSON Schema
-				// `description` (a standard annotation keyword, valid in every
-				// protocol version).
+				// Fold the parameter's @fieldDescription, then the method's
+				// @describeParam for it (which takes precedence), into the
+				// property's JSON Schema `description` (a standard annotation
+				// keyword, valid in every protocol version).
+				static foreach (attr; ParamAttributes!(func, i))
+				{
+					static if (is(typeof(attr) == fieldDescription))
+						ps["description"] = attr.value;
+				}
 				{
 					enum d = describeFor!(func, names[i]);
 					static if (d.length)
 						ps["description"] = d;
 				}
+				// A declared D-level default is advertised as the JSON Schema
+				// `default` unless an explicit @schemaDefault already set one.
+				static if (!is(defs[i] == void))
+					if ("default" !in ps)
+						{
+						auto d = serializeWithPolicy!(JsonSerializer, EnumByNamePolicy)(
+								cast(P) defs[i]);
+						if (d.type != Json.Type.null_ && d.type != Json.Type.undefined)
+							ps["default"] = d;
+					}
 				props[names[i]] = ps;
 			}
-			// A parameter is required only when it is neither Nullable nor carries a
-			// declared D-level default value. ParameterDefaultValueTuple gives
-			// `void` for params without a default.
-			static if (!isInstanceOf!(Nullable, P) && is(defs[i] == void))
+			// A parameter is required only when it is not Nullable and has neither
+			// a declared D-level default value nor a @schemaDefault.
+			// ParameterDefaultValueTuple gives `void` for params without a default.
+			static if (isRequiredParam!(func, i))
 				required ~= Json(names[i]);
 		}
 	}
@@ -271,171 +850,152 @@ private Json parametersSchema(alias func)() @safe
 	s["properties"] = props;
 	if (required.length > 0)
 		s["required"] = required;
+	static if (hasUDA!(func, strictArgs))
+		s["additionalProperties"] = false;
 	return s;
 }
 
-/// Whether argument `name` is meaningfully present in `args`: keyed, and neither
-/// JSON `null` nor `undefined`. The canonical absent/null/undefined predicate
-/// shared by the defaulting and Nullable marshalling paths.
-private bool argPresent(Json args, string name) @safe
+/// Whether argument `name` of a `P` parameter is meaningfully present in
+/// `args`: keyed, not `undefined`, and not JSON `null` unless `P` is `Json`,
+/// which binds `null` verbatim as a value its empty schema admits. The
+/// canonical absent/null/undefined predicate shared by the defaulting and
+/// Nullable marshalling paths.
+private bool argPresent(P)(Json args, string name) @safe
 {
-	return (name in args) !is null && args[name].type != Json.Type.null_
-		&& args[name].type != Json.Type.undefined;
+	if ((name in args) is null || args[name].type == Json.Type.undefined)
+		return false;
+	static if (is(P == Json))
+		return true;
+	else
+		return args[name].type != Json.Type.null_;
+}
+
+/// Whether argument `name` of a `P` parameter is an explicit JSON `null` that
+/// binds as unset: `P` is `Nullable`, so `null` is a value of its own rather
+/// than an omission that takes the parameter's default.
+private bool isExplicitNull(P)(Json args, string name) @safe
+{
+	static if (isInstanceOf!(Nullable, P))
+		return (name in args) !is null && args[name].type == Json.Type.null_;
+	else
+		return false;
 }
 
 /// Convert one JSON argument value into the parameter type `P`, falling back to
-/// the parameter's declared D-level default `def` when the argument is absent.
+/// the parameter's declared D-level default `def` when the argument is absent
+/// (an explicit `null` for a `Nullable` binds as unset).
 /// `def` is the value from `ParameterDefaultValueTuple` for this slot.
-private P marshalArgDefault(P, alias def)(Json args, string name) @safe
+private P marshalArgDefault(P, alias def, bool stringArgs = false)(Json args, string name) @safe
 {
-	static if (is(P : RequestContext))
-	{
-		assert(false, "context parameters are injected, not marshalled");
-	}
-	else
-	{
-		if (!argPresent(args, name))
-			return def;
-		return marshalArg!P(args, name);
-	}
-}
-
-/// Convert one JSON argument value into the parameter type `P`.
-private P marshalArg(P)(Json args, string name) @safe
-{
-	static if (is(P : RequestContext))
-	{
-		assert(false, "context parameters are injected, not marshalled");
-	}
-	else static if (isInstanceOf!(Nullable, P))
-	{
-		alias Inner = TemplateArgsOf!P[0];
-		if (argPresent(args, name))
-			return P(marshalScalar!Inner(args[name]));
+	if (isExplicitNull!P(args, name))
 		return P.init;
-	}
-	else
-	{
-		if (argPresent(args, name))
-			return marshalScalar!P(args[name]);
+	if (!argPresent!P(args, name))
+		return def;
+	return marshalArg!(P, stringArgs)(args, name);
+}
+
+/// Convert one JSON argument value into the parameter type `P`; an absent
+/// argument yields `P.init`. With `stringArgs` (prompt arguments, which the
+/// protocol types as strings) a JSON string is parsed into `P` from its text.
+private P marshalArg(P, bool stringArgs = false)(Json args, string name) @safe
+{
+	if (!argPresent!P(args, name))
 		return P.init;
-	}
-}
-
-/// Convert a captured resource-template URI variable (always a string) into the
-/// declared parameter type `P`. Enums are parsed by member name, other scalars
-/// via `std.conv.to`; conversion failure throws (caller maps it to InvalidParams).
-private P marshalTemplateVar(P)(string raw) @safe
-{
-	import std.conv : to;
-
-	static if (is(P == string))
-		return raw;
-	else static if (is(P == enum) || isIntegral!P || isFloatingPoint!P || is(P == bool))
-		return to!P(raw);
-	else
-	{
-		// Aggregate / Nullable etc.: interpret the captured string as a JSON
-		// document and deserialize through the enum-aware policy.
-		import vibe.data.json : parseJsonString;
-
-		return marshalScalar!P(parseJsonString(raw));
-	}
-}
-
-private P marshalScalar(P)(Json v) @safe
-{
-	// Deserialize through EnumByNamePolicy so any enum — whether `P` itself or
-	// an enum field nested inside a struct/array — is read from its schema-
-	// declared string member name rather than vibe's default integer base
-	// value. Non-enum types are unaffected by the policy.
-	return () @trusted {
-		return deserializeWithPolicy!(JsonSerializer, EnumByNamePolicy, P)(v);
-	}();
+	static if (stringArgs)
+		if (args[name].type == Json.Type.string)
+			return bindString!P(args[name].get!string);
+	return bindJson!P(args[name]);
 }
 
 /// Deserialize a dynamic handler's raw wire `arguments` into a typed value `T`.
 ///
 /// The UDA-driven registration overloads marshal each argument from the method
 /// signature for you, but the dynamic `registerTool`/`registerPrompt`
-/// overloads hand the handler the raw `Json arguments`. This is the inbound
-/// counterpart of the client's `callTool!T`: it deserializes `arguments` through
-/// the same enum-by-name policy the UDA layer uses (so any `enum` leaf is read
-/// from its schema-declared member name, at any nesting depth) and maps a vibe
-/// conversion failure to `invalidParams` (-32602), matching how the reflection
-/// layer reports a malformed argument. A handler can then write
-/// `auto a = argsAs!MyArgs(arguments);` instead of hand-rolling
-/// `arguments["x"].get!int` with manual presence/type checks.
+/// overloads hand the handler the raw `Json arguments`. `argsAs` deserializes
+/// `arguments` by the same binding rules the UDA layer uses (so any `enum` leaf
+/// is read from its schema-declared member name, at any nesting depth) and maps a
+/// conversion failure to a `ToolError`, so a dynamic tool reports a malformed
+/// argument as an `isError` result, exactly as a `@tool` method's does. A
+/// handler can then write `auto a = argsAs!MyArgs(arguments);` instead of
+/// hand-rolling `arguments["x"].get!int` with manual presence/type checks.
+/// Advertise the matching `inputSchema` with `jsonSchemaOf!MyArgs`, which follows
+/// the same field naming and optionality rules.
+///
+/// In a dynamic prompt handler, where a malformed argument is a JSON-RPC
+/// `invalidParams` (-32602) error, catch the `ToolError` and rethrow it as
+/// `invalidParams(e.msg)`.
 T argsAs(T)(Json arguments) @safe
 {
-	import mcp.protocol.errors : McpException, invalidParams;
+	import mcp.protocol.errors : McpException;
+	import mcp.server.responses : ToolError;
 
 	try
-		return marshalScalar!T(arguments);
+		return bindJson!T(arguments);
 	catch (McpException e)
 		throw e;
 	catch (Exception e)
-		throw invalidParams("arguments: " ~ e.msg);
+		throw new ToolError("arguments: " ~ e.msg);
 }
 
 /// The JSON Schema describing a tool's structured output, derived from its
-/// return type — or `Json.undefined` when the tool produces unstructured text
-/// (a `string`) or supplies its own `CallToolResult`. Aggregate (`struct`)
-/// returns map to their object schema directly; scalar/array/enum returns are
-/// wrapped under a `result` property so `structuredContent` is always an object.
+/// return type — or `Json.undefined` when the tool produces unstructured
+/// content (a `string`, `Content`, or `Content[]`) or supplies its own
+/// `CallToolResult`. Fieldwise-serialized
+/// structs map to their object schema directly; every other return (scalars,
+/// arrays, enums, `Nullable`, `Json`, `SumType`, and custom-serialized structs
+/// such as `SysTime`) is wrapped under a `result` property so
+/// `structuredContent` is always an object.
 private Json outputSchemaOf(R)() @safe
 {
-	static if (is(R == CallToolResult) || is(R == ToolResponse) || isSomeString!R || is(R == void))
+	static if (isUnstructuredReturn!R)
 		return Json.undefined;
-	else static if (is(R == struct))
-		return jsonSchemaOf!R;
+	else static if (isFieldwiseStruct!R)
+		return jsonSchemaOf!(R, SchemaUse.output);
 	else
 	{
 		Json s = Json.emptyObject;
 		s["type"] = "object";
 		Json props = Json.emptyObject;
-		props["result"] = jsonSchemaOf!R;
+		props["result"] = jsonSchemaOf!(R, SchemaUse.output);
 		s["properties"] = props;
 		s["required"] = Json([Json("result")]);
 		return s;
 	}
 }
 
+/// Whether a tool returning `R` produces no structured output: it returns
+/// text, `Content`, or nothing, or builds its own result.
+private enum isUnstructuredReturn(R) = is(R == CallToolResult) || is(R == ToolResponse)
+	|| isSomeString!R || is(R == void) || is(R == Content) || is(R == Content[]);
+
 /// Wrap a tool method's return value into a `CallToolResult`. The structured
-/// result mirrors `outputSchemaOf!R`: structs serialize to an object; scalars,
-/// arrays, and enums are wrapped under a `result` key; strings become text
-/// content with no structured output.
+/// result mirrors `outputSchemaOf!R`: fieldwise structs serialize to an object;
+/// every other value is wrapped under a `result` key; strings become text
+/// content and `Content` / `Content[]` become the content itself, with no
+/// structured output.
 private CallToolResult toToolResult(R)(R ret) @safe if (!is(R == void))
 {
 	static if (is(R == CallToolResult))
 		return ret;
-	else static if (isSomeString!R)
+	else static if (is(R == Content) || is(R == Content[]))
 	{
 		CallToolResult r;
-		r.content = [Content.makeText(ret)];
+		static if (is(R == Content))
+			r.content = [ret];
+		else
+			r.content = ret;
+		return r;
+	}
+	else static if (isSomeString!R)
+	{
+		import std.conv : to;
+
+		CallToolResult r;
+		r.content = [Content.makeText(ret.to!string)];
 		return r;
 	}
 	else
-	{
-		CallToolResult r;
-		// Serialize through EnumByNamePolicy so enum leaves (the value itself, or
-		// enums nested in structs/arrays) emit their schema-declared string member
-		// name, matching the tool's outputSchema instead of an integer base value.
-		static if (is(R == struct))
-			auto structured = () @trusted {
-				return serializeWithPolicy!(JsonSerializer, EnumByNamePolicy)(ret);
-			}();
-		else
-		{
-			Json structured = Json.emptyObject;
-			structured["result"] = () @trusted {
-				return serializeWithPolicy!(JsonSerializer, EnumByNamePolicy)(ret);
-			}();
-		}
-		r.structuredContent = structured;
-		r.content = [Content.makeText(structured.toString())];
-		return r;
-	}
+		return CallToolResult.structured(ret);
 }
 
 /// Collect every `@icon` UDA on a method into the descriptor `Icon[]` shape.
@@ -446,6 +1006,10 @@ private Icon[] collectIcons(alias overload)() @safe
 	{
 		static if (is(typeof(a) == icon))
 		{
+			static assert(a.src.length, "@icon on '" ~ __traits(identifier,
+					overload) ~ "' has an empty src");
+			static assert(a.theme.length == 0 || a.theme == "light" || a.theme == "dark",
+					"@icon theme must be \"light\" or \"dark\", got: \"" ~ a.theme ~ "\"");
 			{
 				Icon ic;
 				ic.src = a.src;
@@ -462,7 +1026,8 @@ private Icon[] collectIcons(alias overload)() @safe
 }
 
 /// Collect a `@meta` UDA's object into a descriptor `_meta` Json (undefined when
-/// absent or when the supplied value is not an object).
+/// absent). A `@meta` value that is not a JSON object, or one setting the `ui`
+/// key a `@ui` UDA on the same method writes, is rejected at compile time.
 private Json collectMeta(alias overload)() @safe
 {
 	Json m = Json.undefined;
@@ -470,8 +1035,13 @@ private Json collectMeta(alias overload)() @safe
 	{
 		static if (is(typeof(a) == meta))
 		{
-			if (a.value.type == Json.Type.object)
-				m = a.value;
+			static assert(a.value.type == Json.Type.object, "@meta on '" ~ __traits(identifier,
+					overload) ~ "' must be a JSON object, as `_meta` is");
+			static assert(!hasValueUda!(overload, ui)()
+					|| ("ui" in a.value) is null, "@meta on '" ~ __traits(identifier,
+						overload)
+					~ "' sets the \"ui\" key, which its @ui UDA writes; drop one of them");
+			m = a.value;
 		}
 	}
 	return m;
@@ -498,30 +1068,37 @@ private void applyResourceMetadata(alias overload, D)(ref D descriptor) @safe
 	static foreach (a; __traits(getAttributes, overload))
 	{
 		static if (is(typeof(a) == audience))
+		{
+			static foreach (role; a.roles)
+				static assert(role == "user" || role == "assistant",
+						"@audience role must be \"user\" or \"assistant\", got: \"" ~ role ~ "\"");
 			descriptor.annotations.audience = a.roles;
+		}
 		else static if (is(typeof(a) == priority))
+		{
+			static assert(a.value >= 0.0 && a.value <= 1.0,
+					"@priority value must be in [0.0, 1.0], got " ~ a.value.stringof);
 			descriptor.annotations.priority = a.value;
+		}
 		else static if (is(typeof(a) == lastModified))
 			descriptor.annotations.lastModified = a.value;
 	}
 	applyIconsAndMeta!overload(descriptor);
 }
 
-/// Collect a `@cache` UDA into a `Nullable!CacheHint` for resource/template
+/// Collect a `@cacheable` UDA into a `Nullable!CacheHint` for resource/template
 /// registration; null when absent.
 private Nullable!CacheHint collectCache(alias overload)() @safe
 {
 	Nullable!CacheHint hint;
 	static foreach (a; __traits(getAttributes, overload))
 	{
-		static if (is(typeof(a) == cache))
+		static if (is(typeof(a) == cacheable))
 		{
 			{
-				static assert(a.scope_ == "public" || a.scope_ == "private",
-						"@cache scope_ must be \"public\" or \"private\", got: " ~ a.scope_);
 				CacheHint h;
 				h.ttl = a.ttl;
-				h.cacheScope = (a.scope_ == "private") ? CacheScope.private_ : CacheScope.public_;
+				h.cacheScope = a.scope_;
 				hint = h;
 			}
 		}
@@ -529,8 +1106,74 @@ private Nullable!CacheHint collectCache(alias overload)() @safe
 	return hint;
 }
 
-private void registerToolMethod(string memberName, alias overload, alias parent)(
-		McpServer server, tool attr) @safe
+/// Bind every non-injected parameter of the tool or task method `overload`
+/// from the call's `args` into `argv`, leaving injected context slots untouched.
+/// Returns `null` on success, or an attributed message for a required argument
+/// that is missing or, for a `@strictArgs` method, an argument it does not
+/// declare (both checked even when input-schema validation is disabled), or a
+/// value that cannot be converted; the caller reports it as an `isError` result,
+/// the classification this SDK uses for tool input failures. An `McpException`
+/// raised while binding propagates unchanged.
+private string bindToolArgs(alias overload)(Json args, ref Tuple!(BoundParameters!overload) argv) @safe
+{
+	import mcp.protocol.errors : McpException;
+
+	alias names = ParamWireNames!overload;
+	alias defs = ParameterDefaultValueTuple!overload;
+	static if (hasUDA!(overload, strictArgs))
+	{
+		if (args.type == Json.Type.object)
+			foreach (kv; args.byKeyValue)
+			{
+				bool declared;
+				static foreach (i, P; BoundParameters!overload)
+					static if (!isInjected!P)
+						declared |= kv.key == names[i];
+				if (!declared)
+					return "argument '" ~ kv.key ~ "': unknown argument";
+			}
+	}
+	static foreach (i, P; BoundParameters!overload)
+	{
+		static if (!isInjected!P)
+		{
+			static if (isRequiredParam!(overload, i))
+				if (!argPresent!P(args, names[i]))
+					return "argument '" ~ names[i] ~ "': required argument is missing";
+			try
+			{
+				// An omitted argument takes its advertised default: a @schemaDefault
+				// when present, else the D default.
+				static if (ParamSchemaDefaults!(overload, i).length)
+				{
+					if (argPresent!P(args, names[i]))
+						setBound(argv[i], marshalArg!P(args, names[i]));
+					else if (!isExplicitNull!P(args, names[i]))
+						setBound(argv[i], defaultAs!(P, ParamSchemaDefaults!(overload, i)[0])());
+				}
+				else static if (is(defs[i] == void))
+					setBound(argv[i], marshalArg!P(args, names[i]));
+				else
+					setBound(argv[i], marshalArgDefault!(P, defs[i])(args, names[i]));
+			}
+			catch (McpException e)
+				throw e;
+			catch (Exception e)
+				return "argument '" ~ names[i] ~ "': " ~ e.msg;
+		}
+	}
+	return null;
+}
+
+/// The `Tool` descriptor for the method `overload` annotated with `attr`, its
+/// `@tool` or `@taskTool`: the name, description, and title from `attr`, the
+/// input schema from the parameters, output schema from the return type, the
+/// hint UDAs (`@readOnly` / `@destructive` / `@idempotent` / `@openWorld`) and
+/// `@hintTitle` as annotations, `@icon` / `@meta`, and `@ui` merged into
+/// `_meta.ui`. A hint marker's presence sets its hint to true; absence leaves it
+/// unset (omitted from the wire form).
+private Tool toolDescriptor(alias overload, A)(A attr) @safe
+		if (is(A == tool) || is(A == taskTool))
 {
 	import std.traits : ReturnType;
 
@@ -540,17 +1183,12 @@ private void registerToolMethod(string memberName, alias overload, alias parent)
 		descriptor.description = nullable(attr.description);
 	if (attr.title.length)
 		descriptor.title = nullable(attr.title);
+	checkToolReturnType!overload();
 	descriptor.inputSchema = parametersSchema!overload();
 	auto outSchema = outputSchemaOf!(ReturnType!overload)();
 	if (outSchema.type == Json.Type.object)
 		descriptor.outputSchema = outSchema;
 
-	// Fold every method UDA in a single pass: the marker hint UDAs (@readOnly /
-	// @destructive / @idempotent / @openWorld) and the @hintTitle value UDA into
-	// typed ToolAnnotations. A single loop keeps every UDA handled in one place so
-	// a new UDA cannot land in only one pass. A marker's presence sets the
-	// corresponding hint to true; absence leaves it unset (omitted from the wire
-	// form).
 	ToolAnnotations anns;
 	static foreach (a; __traits(getAttributes, overload))
 	{
@@ -572,72 +1210,53 @@ private void registerToolMethod(string memberName, alias overload, alias parent)
 		descriptor.annotations = anns.toJson();
 
 	applyIconsAndMeta!overload(descriptor);
-
-	// Fold a @ui UDA into the tool's _meta.ui (MCP Apps), merging with any
-	// _meta already set by @meta above.
+	// @ui merges into the _meta that @meta set.
 	static foreach (a; __traits(getAttributes, overload))
 	{
 		static if (is(typeof(a) == ui))
+		{
+			static assert(a.resourceUri.length > 5 && a.resourceUri[0 .. 5] == "ui://",
+					"@ui resourceUri must be a ui:// URI, got: \"" ~ a.resourceUri ~ "\"");
+			static foreach (v; a.visibility)
+				static assert(v == "model" || v == "app",
+						"@ui visibility must be \"model\" or \"app\", got: \"" ~ v ~ "\"");
 			setUiToolMeta(descriptor, UiToolMeta(a.resourceUri, a.visibility));
+		}
+	}
+	return descriptor;
+}
+
+/// Whether `P` is a context only event handlers and hooks receive; any other
+/// handler would otherwise read it as a client-supplied argument.
+private enum isEventHandlerContext(P) = is(P == EventContext)
+	|| is(P == FetchContext) || is(P == SubContext);
+
+private void registerToolMethod(string memberName, alias overload, alias parent)(
+		McpServer server, tool attr) @safe
+{
+	import std.traits : ReturnType;
+
+	static foreach (P; BoundParameters!overload)
+	{
+		static assert(!is(P == TaskContext), "@tool method '" ~ memberName
+				~ "' must not take a TaskContext; declare it with @taskTool to run as a task.");
+		static assert(!isEventHandlerContext!P, "@tool method '" ~ memberName
+				~ "' must not take a " ~ P.stringof ~ "; only event handlers receive one.");
 	}
 
+	auto descriptor = toolDescriptor!overload(attr);
+
 	server.registerTool(descriptor, (Json args, RequestContext ctx) @safe {
-		import mcp.protocol.errors : McpException;
-
-		alias names = ParameterIdentifierTuple!overload;
-		alias defs = ParameterDefaultValueTuple!overload;
-		// A malformed argument that the coarse input-schema check admits (e.g. when
-		// schema validation is disabled, or a conversion the type-check cannot rule
-		// out) must surface as a clean, attributed tool-execution error rather than
-		// a raw std.conv/vibe exception string. This SDK classifies tool input
-		// failures as `isError:true` results (not -32602), so the marshalling
-		// failure is returned as an error CallToolResult, wrapped to the handler's
-		// return type. Protocol errors thrown by the marshaller are re-thrown so an
-		// inner McpException is not swallowed (mirrors the prompt path's pass-through).
-		static CallToolResult marshalError(string argName, string msg) @safe
-		{
-			return CallToolResult.error("argument '" ~ argName ~ "': " ~ msg);
-		}
-
-		Tuple!(Parameters!overload) argv;
-		static foreach (i, P; Parameters!overload)
-		{
+		Tuple!(BoundParameters!overload) argv;
+		static foreach (i, P; BoundParameters!overload)
 			static if (is(P : RequestContext))
 				argv[i] = ctx;
+		if (auto failure = bindToolArgs!overload(args, argv))
+		{
+			static if (is(ReturnType!overload == ToolResponse))
+				return ToolResponse.complete(CallToolResult.error(failure));
 			else
-			{
-				// A required parameter (neither Nullable nor carrying a D-level
-				// default) must be present even when input-schema validation is
-				// disabled; a missing one is a tool input error, not a silently
-				// default-constructed value.
-				static if (is(defs[i] == void) && !isInstanceOf!(Nullable, P))
-				{
-					if (!argPresent(args, names[i]))
-					{
-						static if (is(ReturnType!overload == ToolResponse))
-							return ToolResponse.complete(marshalError(names[i],
-								"required argument is missing"));
-						else
-							return marshalError(names[i], "required argument is missing");
-					}
-				}
-				try
-				{
-					static if (is(defs[i] == void))
-						argv[i] = marshalArg!P(args, names[i]);
-					else
-						argv[i] = marshalArgDefault!(P, defs[i])(args, names[i]);
-				}
-				catch (McpException e)
-					throw e;
-				catch (Exception e)
-				{
-					static if (is(ReturnType!overload == ToolResponse))
-						return ToolResponse.complete(marshalError(names[i], e.msg));
-					else
-						return marshalError(names[i], e.msg);
-				}
-			}
+				return CallToolResult.error(failure);
 		}
 		// An MRTR-capable tool returns a ToolResponse directly, so it may answer
 		// `inputRequired` (stateless elicitation) as well as `complete`; any other
@@ -653,89 +1272,58 @@ private void registerToolMethod(string memberName, alias overload, alias parent)
 		else
 			return toToolResult(__traits(getMember, parent, memberName)(argv.expand));
 	});
+	static if (hasValueUda!(overload, ui)())
+		ensureApps(server);
 }
 
 private void registerTaskMethod(string memberName, alias overload, alias parent)(
-		McpServer server, task attr) @safe
+		McpServer server, taskTool attr) @safe
 {
 	import std.traits : ReturnType;
 
 	// A task executor runs asynchronously, after the originating request has
 	// already returned a task handle — there is no live RequestContext to inject.
 	// Task methods observe progress/cancellation/input through a TaskContext.
-	static foreach (P; Parameters!overload)
-		static assert(!is(P : RequestContext),
-				"@task method '" ~ memberName ~ "' must not take a RequestContext "
-				~ "(the request has already returned); take a TaskContext instead.");
-	static assert(!is(ReturnType!overload == ToolResponse),
-			"@task method '" ~ memberName ~ "' must return a value (or void), not ToolResponse");
-
-	Tool descriptor;
-	descriptor.name = attr.name;
-	if (attr.description.length)
-		descriptor.description = nullable(attr.description);
-	if (attr.title.length)
-		descriptor.title = nullable(attr.title);
-	descriptor.inputSchema = parametersSchema!overload();
-	auto outSchema = outputSchemaOf!(ReturnType!overload)();
-	if (outSchema.type == Json.Type.object)
-		descriptor.outputSchema = outSchema;
-
-	// Behavioral-hint UDAs fold exactly as for @tool.
-	ToolAnnotations anns;
-	static foreach (a; __traits(getAttributes, overload))
+	static foreach (P; BoundParameters!overload)
 	{
-		static if (__traits(isSame, a, readOnly))
-			anns.readOnlyHint = true;
-		else static if (__traits(isSame, a, destructive))
-			anns.destructiveHint = true;
-		else static if (__traits(isSame, a, idempotent))
-			anns.idempotentHint = true;
-		else static if (__traits(isSame, a, openWorld))
-			anns.openWorldHint = true;
-		else static if (is(typeof(a) == hintTitle))
-		{
-			if (a.value.length)
-				anns.title = a.value;
-		}
+		static assert(!is(P : RequestContext),
+				"@taskTool method '" ~ memberName ~ "' must not take a RequestContext "
+				~ "(the request has already returned); take a TaskContext instead.");
+		static assert(!isEventHandlerContext!P, "@taskTool method '" ~ memberName
+				~ "' must not take a " ~ P.stringof ~ "; only event handlers receive one.");
 	}
-	if (!anns.empty)
-		descriptor.annotations = anns.toJson();
-	applyIconsAndMeta!overload(descriptor);
+	static assert(!is(ReturnType!overload == ToolResponse),
+			"@taskTool method '" ~ memberName ~ "' must return a value (or void), not ToolResponse");
+
+	auto descriptor = toolDescriptor!overload(attr);
 
 	// Per-task timing from @taskTtl / @taskPollInterval; an absent UDA inherits the
 	// corresponding server default.
 	import core.time : Duration;
 
-	Nullable!Duration ttl;
-	Nullable!Duration pollInterval;
+	TaskToolOptions opts;
 	static foreach (a; __traits(getAttributes, overload))
 	{
 		static if (is(typeof(a) == taskTtl))
-			ttl = a.value;
+			opts.create.ttl = a.value;
 		else static if (is(typeof(a) == taskPollInterval))
-			pollInterval = a.value;
+			opts.create.pollInterval = a.value;
 	}
 
 	// The executor runs on each dispatch: it reconstitutes the typed arguments
 	// from the task's durable input, injects the TaskContext, invokes the method,
 	// and wraps the return value into a CallToolResult-shaped result JSON. A
-	// marshalling failure or a thrown exception propagates to runTaskExecutor,
-	// which fails the task; a `tc.requireInput(...)` suspends it.
+	// missing or malformed argument completes the task with an `isError` result,
+	// as the same input would for a plain tool call; a thrown exception
+	// propagates to runTaskExecutor, which fails the task; a
+	// `tc.requireInput(...)` suspends it.
 	server.registerTaskTool(descriptor, (TaskContext tc) @safe {
-		alias names = ParameterIdentifierTuple!overload;
-		alias defs = ParameterDefaultValueTuple!overload;
-		Json args = tc.inputJson();
-		Tuple!(Parameters!overload) argv;
-		static foreach (i, P; Parameters!overload)
-		{
+		Tuple!(BoundParameters!overload) argv;
+		static foreach (i, P; BoundParameters!overload)
 			static if (is(P == TaskContext))
 				argv[i] = tc;
-			else static if (is(defs[i] == void))
-				argv[i] = marshalArg!P(args, names[i]);
-			else
-				argv[i] = marshalArgDefault!(P, defs[i])(args, names[i]);
-		}
+		if (auto failure = bindToolArgs!overload(tc.inputJson(), argv))
+			return CallToolResult.error(failure).toJson();
 		static if (is(ReturnType!overload == void))
 		{
 			__traits(getMember, parent, memberName)(argv.expand);
@@ -744,7 +1332,9 @@ private void registerTaskMethod(string memberName, alias overload, alias parent)
 		}
 		else
 			return toToolResult(__traits(getMember, parent, memberName)(argv.expand)).toJson();
-	}, ttl, pollInterval);
+	}, opts);
+	static if (hasValueUda!(overload, ui)())
+		ensureApps(server);
 }
 
 /// Register a typed `@event` pull/fetch type. The method must have the shape
@@ -753,12 +1343,12 @@ private void registerTaskMethod(string memberName, alias overload, alias parent)
 /// handler (backing poll directly, stream/webhook via the runtime's loop) through
 /// `EventsRuntime.define!(A,P).onFetch`. `@eventPollInterval` sets the cadence.
 /// Push-only event types use the builder (`server.events.define!(A,P)(...)` +
-/// `publish`) directly rather than `@event`. Requires `enableEvents()` first.
+/// `publish`) directly rather than `@event`. Enables the Events extension with
+/// default options when it is not yet enabled.
 private void registerEventMethod(string memberName, alias overload, alias parent)(
 		McpServer server, event attr) @safe
 {
 	import std.traits : Parameters, ReturnType;
-	import mcp.protocol.errors : internalError;
 
 	static assert(Parameters!overload.length == 2,
 			"@event method '" ~ memberName ~ "' must take (Args, FetchContext)");
@@ -769,10 +1359,8 @@ private void registerEventMethod(string memberName, alias overload, alias parent
 	{
 		alias A = Parameters!overload[0];
 
-		if (server.events is null)
-			throw internalError("@event requires enableEvents() before registerHandlers");
-
-		auto ev = server.events.define!(A, EP)(attr.name, attr.description, attr.title);
+		auto ev = server.ensureEvents("@event '" ~ attr.name ~ "'").define!(A,
+				EP)(attr.name, attr.description, attr.title);
 		ev.onFetch((A args, scope FetchContext ctx) @safe => __traits(getMember,
 				parent, memberName)(args, ctx));
 		static foreach (a; __traits(getAttributes, overload))
@@ -784,32 +1372,104 @@ private void registerEventMethod(string memberName, alias overload, alias parent
 				~ "' must return EventBatch!P (its payload type P derives the payloadSchema)");
 }
 
-/// Wrap a prompt method's return value into a `GetPromptResult`.
-private GetPromptResult toPromptResult(R)(R ret) @safe
+/// Wrap the value prompt method `memberName` returns into a `PromptResponse`. A
+/// `PromptResponse` passes through, so the method may answer `inputRequired`
+/// (stateless elicitation) as well as complete.
+private PromptResponse toPromptResponse(string memberName, R)(R ret) @safe
 {
-	static if (is(R == GetPromptResult))
+	static if (is(R == PromptResponse))
 		return ret;
+	else static if (is(R == GetPromptResult))
+		return PromptResponse.complete(ret);
 	else static if (is(R == PromptMessage[]))
 	{
 		GetPromptResult r;
 		r.messages = ret;
-		return r;
+		return PromptResponse.complete(r);
 	}
 	else static if (isSomeString!R)
 	{
+		import std.conv : to;
+
 		GetPromptResult r;
-		r.messages = [PromptMessage("user", Content.makeText(ret))];
-		return r;
+		r.messages = [PromptMessage("user", Content.makeText(ret.to!string))];
+		return PromptResponse.complete(r);
 	}
 	else
-		static assert(false,
-				"@prompt method must return GetPromptResult, PromptMessage[], or string");
+		static assert(false, "@prompt method '" ~ memberName ~ "' must return PromptResponse, "
+				~ "GetPromptResult, PromptMessage[], or string, not " ~ R.stringof);
+}
+
+/// Whether an empty string given for a prompt argument of type `P` stands for an
+/// omitted argument: prompt arguments travel as strings, so a client sends `""`
+/// for a field left blank, and that is a value only for a string (or `Json`)
+/// parameter, or a `Nullable` of one.
+private template emptyMeansAbsent(P)
+{
+	static if (isInstanceOf!(Nullable, P))
+		enum emptyMeansAbsent = emptyMeansAbsent!(TemplateArgsOf!P[0]);
+	else
+		enum emptyMeansAbsent = !isSomeString!P && !is(P == Json);
+}
+
+/// The prompt `arguments` of `func` with every empty-string value of a
+/// parameter whose type `emptyMeansAbsent` dropped, so it binds as omitted.
+private Json omitEmptyPromptArgs(alias func)(Json args) @safe
+{
+	if (args.type != Json.Type.object)
+		return args;
+	alias names = ParamWireNames!func;
+	Json kept = Json.emptyObject;
+	foreach (kv; args.byKeyValue)
+	{
+		bool blank;
+		static foreach (i, P; BoundParameters!func)
+			static if (!is(P : RequestContext) && emptyMeansAbsent!P)
+				blank |= kv.key == names[i] && kv.value.type == Json.Type.string
+					&& kv.value.get!string.length == 0;
+		if (!blank)
+			kept[kv.key] = kv.value;
+	}
+	return kept;
+}
+
+/// Whether the facet UDA type `A` takes effect on a prompt argument: a
+/// description, a display title, or a default. A prompt argument has no JSON
+/// Schema, so a validation facet would match nothing.
+private enum isPromptArgFacet(A) = is(A == fieldDescription) || is(A == title)
+	|| isInstanceOf!(SchemaDefault, A);
+
+/// Whether the facet UDA type `A` takes effect on a URI template variable; none
+/// does, since a resource template has no per-variable schema or description.
+private enum isTemplateVarFacet(A) = false;
+
+/// Reject a JSON Schema facet UDA on a parameter of `func`, a handler of the
+/// kind `kind` (e.g. "@prompt"), that `isApplied` says the handler ignores,
+/// rather than let it silently match nothing.
+private void checkParamFacets(alias func, string kind, alias isApplied, string hint)()
+{
+	alias ids = ParameterIdentifierTuple!func;
+	static foreach (i, P; BoundParameters!func)
+		static foreach (attr; ParamAttributes!(func, i))
+			static if (!is(attr) && isSchemaFacet!(typeof(attr)))
+				static assert(isApplied!(typeof(attr)), "@" ~ typeof(attr)
+						.stringof ~ " on parameter '" ~ ids[i] ~ "' of " ~ kind ~ " method '" ~ __traits(
+							identifier, func) ~ "' has no effect: " ~ hint);
 }
 
 private void registerPromptMethod(string memberName, alias overload, alias parent)(
 		McpServer server, prompt attr) @safe
 {
+	static foreach (P; BoundParameters!overload)
+		static assert(!is(P == TaskContext) && !isEventHandlerContext!P,
+				"@prompt method '" ~ memberName ~ "' must not take a " ~ P.stringof
+				~ "; a prompt may take only a RequestContext besides its arguments");
+	checkParamNames!overload();
+	checkParamTypes!overload();
 	validateParamUdas!overload();
+	checkParamFacets!(overload, "@prompt", isPromptArgFacet, "a prompt argument has no "
+			~ "JSON Schema, so only @fieldDescription, @title, and @schemaDefault apply; "
+			~ "validate the value in the handler")();
 
 	Prompt descriptor;
 	descriptor.name = attr.name;
@@ -817,36 +1477,65 @@ private void registerPromptMethod(string memberName, alias overload, alias paren
 		descriptor.title = nullable(attr.title);
 	if (attr.description.length)
 		descriptor.description = nullable(attr.description);
-	alias names = ParameterIdentifierTuple!overload;
+	alias names = ParamWireNames!overload;
 	alias defs = ParameterDefaultValueTuple!overload;
-	static foreach (i, P; Parameters!overload)
+	static foreach (i, P; BoundParameters!overload)
 	{
 		static if (!is(P : RequestContext))
 		{
-			// Populate PromptArgument.description from the @describeParam UDA.
-			enum d = describeFor!(overload, names[i]);
-			// A prompt argument is required only when it is neither Nullable nor
-			// carries a declared D-level default, matching the tool path.
-			descriptor.arguments ~= PromptArgument(names[i], d.length
-					? nullable(d) : Nullable!string.init,
-					!isInstanceOf!(Nullable, P) && is(defs[i] == void));
+			{
+				// A prompt argument is required only when it is neither Nullable nor
+				// carries a declared default (D-level or @schemaDefault), matching
+				// the tool path.
+				PromptArgument arg;
+				arg.name = names[i];
+				arg.required = isRequiredParam!(overload, i);
+				// The parameter's @fieldDescription and @title describe the
+				// argument; the method's @describeParam takes precedence.
+				static foreach (a; ParamAttributes!(overload, i))
+				{
+					static if (is(typeof(a) == fieldDescription))
+						arg.description = a.value;
+					else static if (is(typeof(a) == title))
+						arg.title = a.value;
+				}
+				enum d = describeFor!(overload, names[i]);
+				static if (d.length)
+					arg.description = d;
+				descriptor.arguments ~= arg;
+			}
 		}
 	}
 
 	applyIconsAndMeta!overload(descriptor);
 
-	server.registerPrompt(descriptor, (Json args, RequestContext ctx) @safe {
+	server.registerPrompt(descriptor, (Json rawArgs, RequestContext ctx) @safe {
 		import mcp.protocol.errors : McpException, invalidParams;
-		import mcp.server.server : PromptResponse;
 
-		Tuple!(Parameters!overload) argv;
-		static foreach (i, P; Parameters!overload)
+		Json args = omitEmptyPromptArgs!overload(rawArgs);
+		Tuple!(BoundParameters!overload) argv;
+		static foreach (i, P; BoundParameters!overload)
 		{
 			// A declared RequestContext parameter binds to the real per-request
 			// context so context-dependent features (logging, cancellation,
 			// elicitation) work from prompts, exactly as the tool path does.
 			static if (is(P : RequestContext))
 				argv[i] = ctx;
+			else static if (ParamSchemaDefaults!(overload, i).length)
+			{
+				// An omitted argument takes its advertised @schemaDefault.
+				if (argPresent!P(args, names[i]))
+				{
+					try
+						setBound(argv[i], marshalArg!(P, true)(args, names[i]));
+					catch (McpException e)
+						throw e;
+					catch (Exception e)
+						throw invalidParams("argument '" ~ names[i] ~ "': " ~ e.msg);
+				}
+				else if (!isExplicitNull!P(args, names[i]))
+					setBound(argv[i], defaultAs!(P, ParamSchemaDefaults!(overload, i)[0])());
+			}
 			else static if (is(defs[i] == void))
 			{
 				// A malformed argument (e.g. an out-of-range enum member or a
@@ -855,8 +1544,12 @@ private void registerPromptMethod(string memberName, alias overload, alias paren
 				// the resource-template path. Protocol errors thrown by the
 				// marshaller are passed through unchanged so an inner
 				// invalidParams is not double-wrapped.
+				static if (!isInstanceOf!(Nullable, P))
+					if (!argPresent!P(args, names[i]))
+						throw invalidParams(
+							"Missing required argument '" ~ names[i] ~ "' for prompt: " ~ attr.name);
 				try
-					argv[i] = marshalArg!P(args, names[i]);
+					setBound(argv[i], marshalArg!(P, true)(args, names[i]));
 				catch (McpException e)
 					throw e;
 				catch (Exception e)
@@ -865,31 +1558,42 @@ private void registerPromptMethod(string memberName, alias overload, alias paren
 			else
 			{
 				try
-					argv[i] = marshalArgDefault!(P, defs[i])(args, names[i]);
+					setBound(argv[i], marshalArgDefault!(P, defs[i], true)(args, names[i]));
 				catch (McpException e)
 					throw e;
 				catch (Exception e)
 					throw invalidParams("argument '" ~ names[i] ~ "': " ~ e.msg);
 			}
 		}
-		return PromptResponse.complete(toPromptResult(__traits(getMember,
-			parent, memberName)(argv.expand)));
+		return toPromptResponse!memberName(__traits(getMember, parent, memberName)(argv.expand));
 	});
 }
 
-private ResourceContents toResourceContents(R)(R ret, string uri, string mimeType) @safe
+/// Wrap the value `handler` (e.g. "@resource method 'readme'") returns into a
+/// `ResourceContents`.
+private ResourceContents toResourceContents(string handler, R)(R ret, string uri, string mimeType) @safe
 {
 	static if (is(R == ResourceContents))
 		return ret;
 	else static if (isSomeString!R)
-		return ResourceContents.makeText(uri, mimeType, ret);
+	{
+		import std.conv : to;
+
+		return ResourceContents.makeText(uri, mimeType, ret.to!string);
+	}
 	else
-		static assert(false, "@resource method must return ResourceContents or string");
+		static assert(false, handler ~ " must return ResourceContents or string, not " ~ R.stringof);
 }
 
 private void registerResourceMethod(string memberName, alias overload, alias parent)(
 		McpServer server, resource attr) @safe
 {
+	enum takesContext = Parameters!overload.length == 1
+		&& is(Parameters!overload[0] : RequestContext);
+	static assert(Parameters!overload.length == 0 || takesContext,
+			"@resource method '" ~ memberName ~ "' may take only a RequestContext parameter; "
+			~ "use @resourceTemplate to read values from a URI with variables.");
+
 	Resource descriptor;
 	descriptor.uri = attr.uri;
 	descriptor.name = attr.name;
@@ -902,15 +1606,55 @@ private void registerResourceMethod(string memberName, alias overload, alias par
 
 	applyResourceMetadata!overload(descriptor);
 
-	server.registerResource(descriptor, () @safe {
-		return toResourceContents(__traits(getMember, parent, memberName)(),
+	server.registerResource(descriptor, (RequestContext ctx) @safe {
+		static if (takesContext)
+			auto ret = __traits(getMember, parent, memberName)(ctx);
+		else
+			auto ret = __traits(getMember, parent, memberName)();
+		return toResourceContents!("@resource method '" ~ memberName ~ "'")(ret,
 			attr.uri, attr.mimeType);
 	}, collectCache!overload());
 }
 
-private void registerTemplateMethod(string memberName, alias overload, alias parent)(
-		McpServer server, resourceTemplate attr) @safe
+/// The variable names of an RFC 6570 URI template, in order, with expression
+/// operators (`+#./;?&`) and value modifiers (`*`, `:N`) removed.
+private string[] uriTemplateVars(string tmpl) @safe pure
 {
+	import std.algorithm.iteration : splitter;
+	import std.string : indexOf;
+
+	string[] vars;
+	while (true)
+	{
+		immutable open = tmpl.indexOf('{');
+		if (open < 0)
+			break;
+		immutable close = tmpl[open .. $].indexOf('}');
+		if (close < 0)
+			break;
+		auto expr = tmpl[open + 1 .. open + close];
+		tmpl = tmpl[open + close + 1 .. $];
+		if (expr.length && "+#./;?&".indexOf(expr[0]) >= 0)
+			expr = expr[1 .. $];
+		foreach (spec; expr.splitter(','))
+		{
+			immutable colon = spec.indexOf(':');
+			if (colon >= 0)
+				spec = spec[0 .. colon];
+			if (spec.length && spec[$ - 1] == '*')
+				spec = spec[0 .. $ - 1];
+			if (spec.length)
+				vars ~= spec;
+		}
+	}
+	return vars;
+}
+
+private void registerTemplateMethod(string memberName, alias overload,
+		alias parent, resourceTemplate attr)(McpServer server) @safe
+{
+	import std.algorithm.searching : canFind;
+
 	ResourceTemplate descriptor;
 	descriptor.uriTemplate = attr.uriTemplate;
 	descriptor.name = attr.name;
@@ -921,43 +1665,65 @@ private void registerTemplateMethod(string memberName, alias overload, alias par
 	if (attr.title.length)
 		descriptor.title = nullable(attr.title);
 
+	static foreach (P; BoundParameters!overload)
+		static assert(!is(P == TaskContext) && !isEventHandlerContext!P,
+				"@resourceTemplate method '" ~ memberName ~ "' must not take a " ~ P.stringof
+				~ "; a resource template may take only a RequestContext besides its variables");
+	checkParamNames!overload();
+	checkParamTypes!overload();
+	checkParamFacets!(overload, "@resourceTemplate", isTemplateVarFacet, "a URI template "
+			~ "variable has no schema or description; validate the value in the handler, "
+			~ "and give it a D default value rather than @schemaDefault")();
+	// Every bound parameter must name a template variable; any other name would
+	// silently receive an empty or default value on every read.
+	static foreach (i, P; BoundParameters!overload)
+	{
+		static if (!is(P : RequestContext))
+		{
+			static assert(canFind(uriTemplateVars(attr.uriTemplate), ParamWireNames!overload[i]),
+					"@resourceTemplate method '" ~ memberName ~ "' parameter '"
+					~ ParamWireNames!overload[i]
+					~ "' does not appear in URI template \"" ~ attr.uriTemplate ~ "\"");
+		}
+	}
+
 	applyResourceMetadata!overload(descriptor);
 
 	server.registerResourceTemplate(descriptor, (string uri,
 			string[string] params, RequestContext ctx) @safe {
 		import mcp.protocol.errors : invalidParams;
 
-		alias names = ParameterIdentifierTuple!overload;
-		Tuple!(Parameters!overload) argv;
-		static foreach (i, P; Parameters!overload)
+		alias names = ParamWireNames!overload;
+		alias defs = ParameterDefaultValueTuple!overload;
+		Tuple!(BoundParameters!overload) argv;
+		static foreach (i, P; BoundParameters!overload)
 		{
 			// A declared RequestContext parameter binds to the real per-request
 			// context so context-dependent features work from resource templates,
 			// exactly as the tool path does.
 			static if (is(P : RequestContext))
 				argv[i] = ctx;
-			else static if (is(P == string))
-				argv[i] = (names[i] in params) ? params[names[i]] : "";
 			else
 			{
-				// A captured URI variable is always a string; convert it into the
-				// declared parameter type instead of silently defaulting it to
-				// `P.init`. Surface a conversion failure as InvalidParams
-				// rather than throwing a raw exception.
+				// A captured URI variable is always a string; parse it into the
+				// declared parameter type and surface a conversion failure as
+				// InvalidParams. A variable the URI does not supply binds the
+				// parameter's declared default, or `P.init` when it has none.
 				if (auto pv = names[i] in params)
 				{
 					try
-						argv[i] = marshalTemplateVar!P(*pv);
+						setBound(argv[i], bindString!P(*pv));
 					catch (Exception e)
 						throw invalidParams("resource template parameter '" ~ names[i]
 							~ "' could not be parsed as " ~ P.stringof ~ ": " ~ e.msg);
 				}
-				else
-					argv[i] = P.init;
+				else static if (!is(defs[i] == void))
+					setBound!P(argv[i], defs[i]);
 			}
 		}
 		auto ret = __traits(getMember, parent, memberName)(argv.expand);
-		return toResourceContents(ret, uri, attr.mimeType);
+		return toResourceContents!("@resourceTemplate method '" ~ memberName ~ "'")(ret,
+			uri, attr.mimeType);
 	}, collectCache!overload());
 }
 
@@ -977,11 +1743,14 @@ private void registerSkillMethod(string memberName, alias overload, alias parent
 	Skill sk;
 	sk.path = attr.path;
 	sk.description = attr.description;
+	sk.license = attr.license;
+	sk.compatibility = attr.compatibility;
+	sk.allowedTools = attr.allowedTools;
 	sk.instructions = __traits(getMember, parent, memberName)();
 	registerSkill(server, sk);
 }
 
-private void registerSkillDirMethod(string memberName, alias overload, alias parent)(
+private string registerSkillDirMethod(string memberName, alias overload, alias parent)(
 		McpServer server, skillDir attr) @safe
 {
 	import std.traits : ReturnType;
@@ -998,7 +1767,7 @@ private void registerSkillDirMethod(string memberName, alias overload, alias par
 
 	SkillDirOptions options;
 	options.path = attr.path;
-	registerSkillDir(server, __traits(getMember, parent, memberName)(), options);
+	return registerSkillDir(server, __traits(getMember, parent, memberName)(), options);
 }
 
 version (unittest)
@@ -1115,7 +1884,7 @@ version (unittest)
 	}
 
 	import vibe.data.json : parseJsonString;
-	import mcp.server.server : ToolResponse;
+	import mcp.server.responses : ToolResponse;
 	import mcp.protocol.mrtr : InputRequest;
 
 	// Fixture exercising icons, _meta, annotation title, per-resource cache
@@ -1145,7 +1914,7 @@ version (unittest)
 		@resource("ext://cached", "Cached", "application/json")
 		@icon("https://example.com/res.svg")
 		@meta(parseJsonString(`{"origin":"db"}`))
-		@cache(5.seconds, "private")
+		@cacheable(5.seconds, CacheScope.private_)
 		string cached() @safe
 		{
 			return "{}";
@@ -1208,7 +1977,9 @@ unittest  // @tool reflection: outputSchema is inferred from the return type
 	// Struct return -> the struct's object schema directly.
 	assert(statsSchema["type"].get!string == "object");
 	assert(statsSchema["properties"]["count"]["type"].get!string == "integer");
-	assert(statsSchema["properties"]["total"]["type"].get!string == "number");
+	assert(statsSchema["properties"]["total"]["type"] == Json([
+		Json("number"), Json("null")
+	]));
 
 	// String return -> unstructured text, no outputSchema.
 	assert("outputSchema" !in greetTool);
@@ -1364,7 +2135,7 @@ unittest  // @skill reflection: registerHandlers serves SKILL.md and lists the s
 	const md = contents["text"].get!string;
 	import std.algorithm : canFind;
 
-	assert(md.canFind("name: git-workflow"));
+	assert(md.canFind(`name: "git-workflow"`));
 	assert(md.canFind("# Git Workflow"));
 
 	// The skill is listed by skills/list.
@@ -1407,6 +2178,86 @@ unittest  // @prompt integer arg given a non-numeric string -> InvalidParams (-3
 	assert("error" in resp, "expected an error for a non-numeric integer prompt argument");
 	assert(resp["error"]["code"].get!int == ErrorCode.invalidParams,
 			"non-numeric integer prompt arg must map to -32602, not -32603");
+}
+
+unittest  // @prompt integer arg given its wire-form string is parsed into the D type
+{
+	import mcp.protocol.jsonrpc : Message, makeRequest;
+
+	auto s = new McpServer("t", "1");
+	registerHandlers(s, new DemoApi);
+
+	Json pp = Json.emptyObject;
+	pp["name"] = "repeat";
+	pp["arguments"] = Json(["count": Json("5")]);
+	auto resp = s.handle(Message(makeRequest(Json(3), "prompts/get", pp))).get;
+	assert("error" !in resp, resp.toString);
+	assert(resp["result"]["messages"][0]["content"]["text"].get!string == "count pos");
+}
+
+unittest  // @prompt bool, floating-point, and Nullable args are parsed from their string forms
+{
+	import mcp.protocol.jsonrpc : Message, makeRequest;
+
+	@safe final class TypedPromptApi
+	{
+		@prompt("typed", "Prompt with several typed arguments")
+		string typed(bool loud, double ratio, Nullable!long limit) @safe
+		{
+			import std.conv : to;
+
+			return loud.to!string ~ " " ~ ratio.to!string ~ " " ~ limit.get.to!string;
+		}
+	}
+
+	auto s = new McpServer("t", "1");
+	registerHandlers(s, new TypedPromptApi);
+	Json pp = Json.emptyObject;
+	pp["name"] = "typed";
+	pp["arguments"] = Json([
+		"loud": Json("true"),
+		"ratio": Json("0.5"),
+		"limit": Json("7")
+	]);
+	auto resp = s.handle(Message(makeRequest(Json(3), "prompts/get", pp))).get;
+	assert("error" !in resp, resp.toString);
+	assert(resp["result"]["messages"][0]["content"]["text"].get!string == "true 0.5 7");
+}
+
+unittest  // a @prompt parameter with @schemaDefault is optional and takes that default
+{
+	import jsonschema : schemaDefault;
+	import mcp.protocol.jsonrpc : Message, makeRequest;
+
+	@safe final class DefaultedPromptApi
+	{
+		@prompt("page", "Prompt with a defaulted argument")
+		string page(string topic, @schemaDefault(3) int count)@safe
+		{
+			import std.conv : to;
+
+			return topic ~ " x" ~ count.to!string;
+		}
+	}
+
+	auto s = new McpServer("t", "1");
+	registerHandlers(s, new DefaultedPromptApi);
+	auto list = s.handle(Message(makeRequest(Json(1), "prompts/list", Json.emptyObject))).get;
+	auto args = list["result"]["prompts"][0]["arguments"];
+	foreach (i; 0 .. args.length)
+		if (args[i]["name"].get!string == "count")
+			assert(!("required" in args[i] && args[i]["required"].get!bool));
+
+	Json pp = Json.emptyObject;
+	pp["name"] = "page";
+	pp["arguments"] = Json(["topic": Json("d")]);
+	auto resp = s.handle(Message(makeRequest(Json(2), "prompts/get", pp))).get;
+	assert("error" !in resp, resp.toString);
+	assert(resp["result"]["messages"][0]["content"]["text"].get!string == "d x3");
+
+	pp["arguments"] = Json(["topic": Json("d"), "count": Json("5")]);
+	auto given = s.handle(Message(makeRequest(Json(3), "prompts/get", pp))).get;
+	assert(given["result"]["messages"][0]["content"]["text"].get!string == "d x5");
 }
 
 unittest  // @prompt string arg given JSON null -> clean InvalidParams, not vibe deserialization error
@@ -1702,6 +2553,131 @@ version (unittest) private class CtxHeaderParamApi
 	}
 }
 
+version (unittest)
+{
+	private class BareToolApi
+	{
+		@tool string f() @safe
+		{
+			return "";
+		}
+	}
+
+	private class BarePromptApi
+	{
+		@prompt string f() @safe
+		{
+			return "";
+		}
+	}
+
+	private class BareResourceApi
+	{
+		@resource string f() @safe
+		{
+			return "";
+		}
+	}
+
+	private class EmptyToolNameApi
+	{
+		@tool("", "Nameless")
+		string f() @safe
+		{
+			return "";
+		}
+	}
+
+	private class EmptyPromptNameApi
+	{
+		@prompt("", "Nameless")
+		string f() @safe
+		{
+			return "";
+		}
+	}
+}
+
+version (unittest) private class UnknownTemplateParamApi
+{
+	@resourceTemplate("item://{id}", "Item", "text/plain")
+	string item(string id, string idd) @safe
+	{
+		return id ~ idd;
+	}
+}
+
+version (unittest) private class OperatorTemplateApi
+{
+	@resourceTemplate("doc://{+path}/v{.ext}{/seg*}{?q,limit:3}{&extra}{#frag}",
+			"Doc", "text/plain")
+	string doc(string path, string ext, string seg, string q, int limit,
+			string extra, string frag, RequestContext ctx) @safe
+	{
+		return path;
+	}
+}
+
+unittest  // uriTemplateVars extracts variable names, stripping operators and modifiers
+{
+	static assert(uriTemplateVars("a://{x}/{+y}{?p,q*}{&r:4}") == [
+		"x", "y", "p", "q", "r"
+	]);
+	static assert(uriTemplateVars("plain://no/vars").length == 0);
+}
+
+unittest  // a @resourceTemplate parameter not named in the URI template is rejected at compile time
+{
+	auto s = new McpServer("t", "1");
+	assert(!__traits(compiles, registerHandlers(s, new UnknownTemplateParamApi)));
+}
+
+unittest  // @resourceTemplate parameters may bind any operator-prefixed or modified template variable
+{
+	auto s = new McpServer("t", "1");
+	assert(__traits(compiles, registerHandlers(s, new OperatorTemplateApi)));
+}
+
+unittest  // the bare-UDA diagnostic shows each handler UDA's own argument list
+{
+	static assert(handlerUdaExample!tool == `@tool("name", "description")`);
+	static assert(handlerUdaExample!prompt == `@prompt("name", "description")`);
+	static assert(handlerUdaExample!resource == `@resource("uri", "name")`);
+	static assert(handlerUdaExample!resourceTemplate == `@resourceTemplate("uriTemplate", "name")`);
+	static assert(handlerUdaExample!skill == `@skill("path", "description")`);
+	static assert(handlerUdaExample!skillDir == `@skillDir("path") or @skillDir()`);
+}
+
+unittest  // a bare @tool (without its argument list) is rejected at compile time
+{
+	auto s = new McpServer("t", "1");
+	assert(!__traits(compiles, registerHandlers(s, new BareToolApi)));
+}
+
+unittest  // a bare @prompt (without its argument list) is rejected at compile time
+{
+	auto s = new McpServer("t", "1");
+	assert(!__traits(compiles, registerHandlers(s, new BarePromptApi)));
+}
+
+unittest  // a bare @resource (without its argument list) is rejected at compile time
+{
+	auto s = new McpServer("t", "1");
+	assert(!__traits(compiles, registerHandlers(s, new BareResourceApi)));
+}
+
+unittest  // a @tool with an empty name is rejected at compile time
+{
+	auto s = new McpServer("t", "1");
+	assert(!__traits(compiles, registerHandlers(s, new EmptyToolNameApi)));
+}
+
+unittest  // a @prompt with an empty name is rejected at compile time
+{
+	auto s = new McpServer("t", "1");
+	assert(!__traits(compiles, registerHandlers(s, new EmptyPromptNameApi)));
+}
+
 unittest  // @mcpHeader: a struct-typed parameter is rejected at compile time
 {
 	auto s = new McpServer("t", "1");
@@ -1718,6 +2694,54 @@ unittest  // @mcpHeader: a Nullable-of-primitive parameter is accepted at compil
 {
 	auto s = new McpServer("t", "1");
 	assert(__traits(compiles, registerHandlers(s, new NullableHeaderApi)));
+}
+
+version (unittest) private class HeaderBesideArrayApi
+{
+	@tool("q", "Primitive header beside a non-primitive parameter")
+	@mcpHeader("region", "Region")
+	string q(string region, string[] tags) @safe
+	{
+		return region;
+	}
+}
+
+unittest  // @mcpHeader: a non-primitive sibling of the header parameter is accepted
+{
+	auto s = new McpServer("t", "1");
+	static assert(__traits(compiles, registerHandlers(s, new HeaderBesideArrayApi)));
+}
+
+version (unittest) private class DuplicateHeaderNameApi
+{
+	@tool("q", "Two parameters mirrored into one header")
+	@mcpHeader("region", "Region") @mcpHeader("zone", "region")
+	string q(string region, string zone) @safe
+	{
+		return region ~ zone;
+	}
+}
+
+version (unittest) private class TwoHeadersOneParamApi
+{
+	@tool("q", "One parameter mirrored into two headers")
+	@mcpHeader("region", "Region") @mcpHeader("region", "Zone")
+	string q(string region) @safe
+	{
+		return region;
+	}
+}
+
+unittest  // @mcpHeader: two headers differing only in ASCII case are rejected at compile time
+{
+	auto s = new McpServer("t", "1");
+	static assert(!__traits(compiles, registerHandlers(s, new DuplicateHeaderNameApi)));
+}
+
+unittest  // @mcpHeader: two headers on one parameter are rejected at compile time
+{
+	auto s = new McpServer("t", "1");
+	static assert(!__traits(compiles, registerHandlers(s, new TwoHeadersOneParamApi)));
 }
 
 unittest  // @mcpHeader: naming a non-existent parameter is rejected at compile time
@@ -1832,6 +2856,36 @@ unittest  // @describeParam UDA: prompt argument descriptions appear in prompts/
 		if (prompts[i]["name"].get!string == "intro")
 			intro = prompts[i];
 	assert("description" !in intro["arguments"][0]);
+}
+
+unittest  // @prompt with several non-context parameters registers and dispatches
+{
+	import mcp.protocol.jsonrpc : Message, makeRequest;
+
+	@safe final class TwoArgPromptApi
+	{
+		@prompt("pair", "Prompt taking two arguments")
+		@describeParam("left", "the first word")
+		string pair(string left, string right, RequestContext ctx) @safe
+		{
+			return left ~ "+" ~ right;
+		}
+	}
+
+	auto s = new McpServer("t", "1");
+	registerHandlers(s, new TwoArgPromptApi);
+
+	auto prompts = s.handle(Message(makeRequest(Json(1), "prompts/list",
+			Json.emptyObject))).get["result"]["prompts"];
+	assert(prompts[0]["arguments"].length == 2);
+	assert(prompts[0]["arguments"][0]["description"].get!string == "the first word");
+	assert("description" !in prompts[0]["arguments"][1]);
+
+	Json pp = Json.emptyObject;
+	pp["name"] = "pair";
+	pp["arguments"] = Json(["left": Json("a"), "right": Json("b")]);
+	auto pr = s.handle(Message(makeRequest(Json(2), "prompts/get", pp))).get;
+	assert(pr["result"]["messages"][0]["content"]["text"].get!string == "a+b");
 }
 
 unittest  // ToolAnnotations: typed struct round-trips through JSON
@@ -1981,26 +3035,71 @@ unittest  // argsAs deserializes a typed struct through the enum-by-name policy
 	assert(a.c == Color.green);
 }
 
-unittest  // argsAs maps a conversion failure to invalidParams (-32602)
+unittest  // argsAs maps a conversion failure to a ToolError
 {
-	import mcp.protocol.errors : McpException, ErrorCode;
+	import mcp.server.responses : ToolError;
 
 	struct Args
 	{
 		int n;
 	}
 
-	// `n` is a string, not an int -> vibe conversion fails -> invalidParams.
+	// `n` is a string, not an int -> vibe conversion fails -> ToolError.
 	Json j = Json(["n": Json("not-a-number")]);
 	bool threw;
 	try
 		cast(void) argsAs!Args(j);
-	catch (McpException e)
-	{
+	catch (ToolError e)
 		threw = true;
-		assert(e.code == ErrorCode.invalidParams);
+	assert(threw, "argsAs must surface a conversion failure as a ToolError");
+}
+
+unittest  // a dynamic tool's malformed arguments read via argsAs yield an isError result
+{
+	import std.algorithm.searching : canFind;
+
+	static struct Args
+	{
+		int n;
 	}
-	assert(threw, "argsAs must surface a conversion failure as invalidParams");
+
+	auto s = new McpServer("t", "1");
+	Tool t;
+	t.name = "dyn";
+	t.inputSchema = parseJsonString(`{"type":"object"}`);
+	s.registerTool(t, (Json arguments, RequestContext ctx) @safe {
+		cast(void) argsAs!Args(arguments);
+		return CallToolResult.text("ok");
+	});
+	auto r = callToolArgs(s, "dyn", `{"n":"not-a-number"}`);
+	assert(r["isError"].get!bool, r.toString);
+	assert(r["content"][0]["text"].get!string.canFind("arguments"), r.toString);
+}
+
+version (unittest) private final class PromptResponseApi
+{
+	import mcp.server.responses : PromptResponse;
+
+	@prompt("greet", "Greets")
+	PromptResponse greet(string who) @safe
+	{
+		GetPromptResult r;
+		r.messages = [PromptMessage("user", Content.makeText("hi " ~ who))];
+		return PromptResponse.complete(r);
+	}
+}
+
+unittest  // a @prompt method may return a PromptResponse, which is sent as is
+{
+	import mcp.protocol.jsonrpc : Message, makeRequest;
+
+	auto s = new McpServer("t", "1");
+	registerHandlers(s, new PromptResponseApi);
+	Json pp = Json.emptyObject;
+	pp["name"] = "greet";
+	pp["arguments"] = Json(["who": Json("Ann")]);
+	auto r = s.handle(Message(makeRequest(Json(1), "prompts/get", pp))).get;
+	assert(r["result"]["messages"][0]["content"]["text"].get!string == "hi Ann", r.toString);
 }
 
 unittest  // MRTR UDA tool: returning ToolResponse.complete produces a normal result
@@ -2113,7 +3212,7 @@ version (unittest) private auto modernRead(string uri) @safe
 	return Message(makeRequest(Json(1), "resources/read", params));
 }
 
-unittest  // @cache UDA on a resource: modern resources/read carries CacheableResult fields
+unittest  // @cacheable UDA on a resource: modern resources/read carries CacheableResult fields
 {
 	auto s = new McpServer("t", "1");
 	registerHandlers(s, new ExtApi);
@@ -2123,7 +3222,7 @@ unittest  // @cache UDA on a resource: modern resources/read carries CacheableRe
 	assert(rr["result"]["cacheScope"].get!string == "private");
 }
 
-unittest  // @cache UDA: legacy resources/read has NO cache fields (no wire regression)
+unittest  // @cacheable UDA: legacy resources/read has NO cache fields (no wire regression)
 {
 	import mcp.protocol.jsonrpc : Message, makeRequest;
 
@@ -2135,22 +3234,6 @@ unittest  // @cache UDA: legacy resources/read has NO cache fields (no wire regr
 	auto rr = s.handle(Message(makeRequest(Json(1), "resources/read", rp))).get;
 	assert("ttlMs" !in rr["result"]);
 	assert("cacheScope" !in rr["result"]);
-}
-
-version (unittest) private class InvalidCacheScopeApi
-{
-	@resource("ext://bad", "Bad", "application/json")
-	@cache(5.seconds, "Private")
-	string bad() @safe
-	{
-		return "{}";
-	}
-}
-
-unittest  // @cache: an unrecognised scope_ value is rejected at compile time
-{
-	auto s = new McpServer("t", "1");
-	assert(!__traits(compiles, registerHandlers(s, new InvalidCacheScopeApi)));
 }
 
 version (unittest)
@@ -2345,6 +3428,328 @@ unittest  // omitting a defaulted arg passes the declared default, not P.init
 	assert(r["result"]["structuredContent"]["result"].get!int == 10);
 }
 
+version (unittest)
+{
+	private struct PagedQuery
+	{
+		string q;
+		int limit = 10;
+		Nullable!int offset;
+	}
+
+	private final class PagedApi
+	{
+		@tool("page", "Tool taking a struct with defaulted and Nullable fields")
+		string page(PagedQuery o) @safe
+		{
+			import std.conv : to;
+
+			return o.q ~ ":" ~ o.limit.to!string ~ ":" ~ (o.offset.isNull
+					? "none" : o.offset.get.to!string);
+		}
+	}
+
+	private Json callPage(Json arguments) @safe
+	{
+		import mcp.protocol.jsonrpc : Message, makeRequest;
+
+		auto s = new McpServer("t", "1");
+		s.disableInputSchemaValidation();
+		registerHandlers(s, new PagedApi);
+		Json p = Json.emptyObject;
+		p["name"] = "page";
+		p["arguments"] = arguments;
+		return s.handle(Message(makeRequest(Json(1), "tools/call", p))).get["result"];
+	}
+}
+
+unittest  // struct param fields the schema marks optional bind to their defaults when omitted
+{
+	auto r = callPage(parseJsonString(`{"o":{"q":"x"}}`));
+	assert("isError" !in r, r.toString);
+	assert(r["content"][0]["text"].get!string == "x:10:none");
+}
+
+unittest  // struct param defaulted and Nullable fields bind supplied values
+{
+	auto r = callPage(parseJsonString(`{"o":{"q":"x","limit":3,"offset":4}}`));
+	assert(r["content"][0]["text"].get!string == "x:3:4");
+}
+
+unittest  // struct param missing a required field names the field without serializer internals
+{
+	import std.algorithm : canFind;
+
+	auto r = callPage(parseJsonString(`{"o":{"limit":3}}`));
+	assert(r["isError"].get!bool);
+	const msg = r["content"][0]["text"].get!string;
+	assert(msg.canFind("'q'"), msg);
+	assert(!msg.canFind("Policy"), msg);
+}
+
+version (unittest)
+{
+	import vibe.data.serialization : vibeName = name, vibeOptional = optional;
+
+	private struct Renamed
+	{
+		@vibeName("type") string type_;
+		@vibeOptional int opt;
+		string class_;
+	}
+
+	private final class RenamedApi
+	{
+		@tool("renamed", "Tool whose struct param uses vibe field UDAs")
+		string renamed(Renamed o) @safe
+		{
+			return o.type_ ~ "/" ~ o.class_;
+		}
+
+		@tool("echoRenamed", "Tool returning a struct that uses vibe field UDAs")
+		Renamed echoRenamed() @safe
+		{
+			return Renamed("t", 1, "c");
+		}
+	}
+
+	private Json renamedTool(string toolName) @safe
+	{
+		auto s = new McpServer("t", "1");
+		registerHandlers(s, new RenamedApi);
+		auto tools = s.handle(MakeListMessage()).get["result"]["tools"];
+		foreach (i; 0 .. tools.length)
+			if (tools[i]["name"].get!string == toolName)
+				return tools[i];
+		assert(false, "tool not listed: " ~ toolName);
+	}
+}
+
+unittest  // struct param schema keys fields by their serialized name
+{
+	auto props = renamedTool("renamed")["inputSchema"]["properties"]["o"]["properties"];
+	assert("type" in props && "type_" !in props, props.toString);
+	assert("class" in props && "class_" !in props, props.toString);
+}
+
+unittest  // struct param schema does not require an @optional field
+{
+	auto req = renamedTool("renamed")["inputSchema"]["properties"]["o"]["required"];
+	assert(req == Json([Json("type"), Json("class")]), req.toString);
+}
+
+unittest  // a struct param using vibe field UDAs is callable under input-schema validation
+{
+	import mcp.protocol.jsonrpc : Message, makeRequest;
+
+	auto s = new McpServer("t", "1");
+	registerHandlers(s, new RenamedApi);
+	Json p = Json.emptyObject;
+	p["name"] = "renamed";
+	p["arguments"] = parseJsonString(`{"o":{"type":"x","class":"y"}}`);
+	auto r = s.handle(Message(makeRequest(Json(1), "tools/call", p))).get["result"];
+	assert("isError" !in r, r.toString);
+	assert(r["content"][0]["text"].get!string == "x/y");
+}
+
+unittest  // a struct return using vibe field UDAs passes its own outputSchema validation
+{
+	import mcp.protocol.jsonrpc : Message, makeRequest;
+
+	auto s = new McpServer("t", "1");
+	s.enableOutputSchemaValidation();
+	registerHandlers(s, new RenamedApi);
+	Json p = Json.emptyObject;
+	p["name"] = "echoRenamed";
+	p["arguments"] = Json.emptyObject;
+	auto r = s.handle(Message(makeRequest(Json(1), "tools/call", p))).get;
+	assert("error" !in r, r.toString);
+	assert(r["result"]["structuredContent"]["type"].get!string == "t");
+}
+
+version (unittest)
+{
+	private struct Envelope
+	{
+		string kind;
+		Json body_;
+	}
+
+	private final class JsonParamApi
+	{
+		@tool("raw", "Tool taking an arbitrary JSON parameter")
+		string raw(Json payload) @safe
+		{
+			return payload.toString();
+		}
+
+		@tool("wrap", "Tool taking and returning a struct with a Json field")
+		Envelope wrap(Envelope e) @safe
+		{
+			return e;
+		}
+	}
+}
+
+unittest  // a Json parameter or struct field is described by the empty (any-value) schema
+{
+	auto s = new McpServer("t", "1");
+	registerHandlers(s, new JsonParamApi);
+	auto tools = s.handle(MakeListMessage()).get["result"]["tools"];
+	Json raw, wrap;
+	foreach (i; 0 .. tools.length)
+	{
+		if (tools[i]["name"].get!string == "raw")
+			raw = tools[i];
+		else if (tools[i]["name"].get!string == "wrap")
+			wrap = tools[i];
+	}
+	assert(raw["inputSchema"]["properties"]["payload"] == Json.emptyObject);
+	assert(wrap["inputSchema"]["properties"]["e"]["properties"]["body"] == Json.emptyObject);
+	assert(wrap["outputSchema"]["properties"]["body"] == Json.emptyObject);
+}
+
+unittest  // Json parameters and struct fields bind the argument value verbatim
+{
+	import mcp.protocol.jsonrpc : Message, makeRequest;
+
+	auto s = new McpServer("t", "1");
+	s.enableOutputSchemaValidation();
+	registerHandlers(s, new JsonParamApi);
+
+	Json p = Json.emptyObject;
+	p["name"] = "raw";
+	p["arguments"] = parseJsonString(`{"payload":{"a":[1,2]}}`);
+	auto r = s.handle(Message(makeRequest(Json(1), "tools/call", p))).get["result"];
+	assert(parseJsonString(r["content"][0]["text"].get!string) == parseJsonString(`{"a":[1,2]}`));
+
+	p["name"] = "wrap";
+	p["arguments"] = parseJsonString(`{"e":{"kind":"k","body":[true,null]}}`);
+	auto w = s.handle(Message(makeRequest(Json(2), "tools/call", p))).get;
+	assert("error" !in w, w.toString);
+	assert(w["result"]["structuredContent"]["body"] == parseJsonString(`[true,null]`));
+}
+
+version (unittest)
+{
+	import std.sumtype : SumType;
+
+	private alias IntOrText = SumType!(int, string);
+
+	private struct Tagged
+	{
+		IntOrText value;
+	}
+
+	private final class SumTypeApi
+	{
+		@tool("either", "Tool taking a SumType parameter")
+		string either(IntOrText v) @safe
+		{
+			import std.sumtype : match;
+
+			return v.match!((int n) => "int", (string s) => "string:" ~ s);
+		}
+
+		@tool("tagged", "Tool taking a struct with a SumType field")
+		string tagged(Tagged t) @safe
+		{
+			import std.sumtype : match;
+
+			return t.value.match!((int n) => "int", (string s) => "string:" ~ s);
+		}
+	}
+
+	private string callSumType(string tool, string args) @safe
+	{
+		import mcp.protocol.jsonrpc : Message, makeRequest;
+
+		auto s = new McpServer("t", "1");
+		registerHandlers(s, new SumTypeApi);
+		Json p = Json.emptyObject;
+		p["name"] = tool;
+		p["arguments"] = parseJsonString(args);
+		auto r = s.handle(Message(makeRequest(Json(1), "tools/call", p))).get["result"];
+		assert("isError" !in r, r.toString);
+		return r["content"][0]["text"].get!string;
+	}
+}
+
+unittest  // a SumType parameter is described by anyOf over its members
+{
+	auto s = new McpServer("t", "1");
+	registerHandlers(s, new SumTypeApi);
+	auto tools = s.handle(MakeListMessage()).get["result"]["tools"];
+	auto v = tools[0]["inputSchema"]["properties"]["v"];
+	assert(v["anyOf"].length == 2, v.toString);
+}
+
+unittest  // a SumType parameter binds whichever member the argument matches
+{
+	assert(callSumType("either", `{"v":5}`) == "int");
+	assert(callSumType("either", `{"v":"x"}`) == "string:x");
+}
+
+unittest  // a SumType struct field binds whichever member the value matches
+{
+	assert(callSumType("tagged", `{"t":{"value":7}}`) == "int");
+	assert(callSumType("tagged", `{"t":{"value":"y"}}`) == "string:y");
+}
+
+version (unittest)
+{
+	import std.datetime.date : DateTime, TimeOfDay;
+
+	private struct Slot
+	{
+		TimeOfDay at;
+		DateTime when;
+	}
+
+	private final class ClockApi
+	{
+		@tool("slot", "Tool taking and returning local times")
+		Slot slot(TimeOfDay at, DateTime when) @safe
+		{
+			return Slot(at, when);
+		}
+	}
+}
+
+unittest  // TimeOfDay/DateTime schemas describe the offset-less form they bind, not RFC 3339 formats
+{
+	auto s = new McpServer("t", "1");
+	registerHandlers(s, new ClockApi);
+	auto props = s.handle(MakeListMessage()).get["result"]["tools"][0]["inputSchema"]["properties"];
+	assert("format" !in props["at"] && "pattern" in props["at"], props.toString);
+	assert("format" !in props["when"] && "pattern" in props["when"], props.toString);
+}
+
+unittest  // TimeOfDay/DateTime values round-trip under input and output schema validation
+{
+	import mcp.protocol.jsonrpc : Message, makeRequest;
+
+	auto s = new McpServer("t", "1");
+	s.enableOutputSchemaValidation();
+	registerHandlers(s, new ClockApi);
+	Json p = Json.emptyObject;
+	p["name"] = "slot";
+	p["arguments"] = parseJsonString(`{"at":"10:00:00","when":"2026-09-25T10:00:00"}`);
+	auto r = s.handle(Message(makeRequest(Json(1), "tools/call", p))).get;
+	assert("error" !in r && "isError" !in r["result"], r.toString);
+	assert(r["result"]["structuredContent"]["at"].get!string == "10:00:00");
+
+	p["arguments"] = parseJsonString(`{"at":"10:00","when":"2026-09-25T10:00:00"}`);
+	auto bad = s.handle(Message(makeRequest(Json(2), "tools/call", p))).get;
+	assert(bad["result"]["isError"].get!bool, bad.toString);
+}
+
+unittest  // argsAs honours struct field defaults and Nullable fields
+{
+	auto a = argsAs!PagedQuery(parseJsonString(`{"q":"x"}`));
+	assert(a.q == "x" && a.limit == 10 && a.offset.isNull);
+}
+
 unittest  // a required tool arg missing (schema validation disabled) is an isError, not a default value
 {
 	import mcp.protocol.jsonrpc : Message, makeRequest;
@@ -2381,6 +3786,28 @@ unittest  // resource-template enum param is parsed by member name
 	rp["uri"] = "hue://green";
 	auto rr = s.handle(Message(makeRequest(Json(2), "resources/read", rp))).get;
 	assert(rr["result"]["contents"][0]["text"].get!string == "hue-green");
+}
+
+unittest  // resource-template Nullable!string param receives the plain captured value
+{
+	import mcp.protocol.jsonrpc : Message, makeRequest;
+
+	@safe final class NullableTemplateApi
+	{
+		@resourceTemplate("opt://{x}", "Opt", "text/plain")
+		string opt(Nullable!string x) @safe
+		{
+			return x.isNull ? "null" : "got " ~ x.get;
+		}
+	}
+
+	auto s = new McpServer("t", "1");
+	registerHandlers(s, new NullableTemplateApi);
+	Json rp = Json.emptyObject;
+	rp["uri"] = "opt://hello";
+	auto rr = s.handle(Message(makeRequest(Json(1), "resources/read", rp))).get;
+	assert("error" !in rr, rr.toString);
+	assert(rr["result"]["contents"][0]["text"].get!string == "got hello");
 }
 
 unittest  // resource-template invalid scalar yields an InvalidParams error
@@ -2600,7 +4027,7 @@ version (unittest) private final class FacetParamApi
 	}
 
 	@tool("email", "Send to an email address")
-	string email(@format("email") string address)@safe
+	string email(@schemaFormat("email") string address)@safe
 	{
 		return address;
 	}
@@ -2687,30 +4114,31 @@ unittest  // a parameter facet + a method-level marker on the same tool compiles
 	registerHandlers(s, new OptionalParamApi);
 }
 
-unittest  // a Nullable!T parameter is a bare optional: no anyOf/null, absent from required (#1265)
+unittest  // a Nullable!T parameter is an optional flat type admitting null, absent from required
 {
 	auto schema = optToolSchema();
 	auto order = schema["properties"]["order"];
-	assert(order["type"].get!string == "string");
+	assert(order["type"] == Json([Json("string"), Json("null")]), order.toString);
 	assert("anyOf" !in order);
 	// All parameters are optional, so the schema carries no `required` array.
 	assert("required" !in schema);
 }
 
-unittest  // an optional enum parameter keeps its enum constraint without a null branch (#1266)
+unittest  // an optional enum parameter keeps its enum constraint inline, with null as a member
 {
 	auto schema = optToolSchema();
 	auto unique = schema["properties"]["unique"];
-	assert(unique["type"].get!string == "string");
+	assert(unique["type"] == Json([Json("string"), Json("null")]), unique.toString);
 	assert("anyOf" !in unique);
-	assert(unique["enum"].length == 3);
+	assert(unique["enum"].length == 4);
+	assert(unique["enum"][3].type == Json.Type.null_);
 }
 
-unittest  // @schemaDefault on a Nullable parameter emits `default` (#1264)
+unittest  // @schemaDefault on a Nullable parameter emits `default`
 {
 	auto schema = optToolSchema();
 	auto page = schema["properties"]["page"];
-	assert(page["type"].get!string == "integer");
+	assert(page["type"] == Json([Json("integer"), Json("null")]), page.toString);
 	assert("anyOf" !in page);
 	assert(page["default"].get!long == 1);
 }
@@ -2734,7 +4162,7 @@ version (unittest) private final class TaskUdaApi
 
 	/// A plain async task: returns a typed result the framework wraps. The
 	/// @taskTtl / @taskPollInterval set this task's TTL and poll cadence.
-	@task("async_double", "Double a number asynchronously")
+	@taskTool("async_double", "Double a number asynchronously")
 	@taskTtl(12_345.msecs) @taskPollInterval(250.msecs)
 	@readOnly Doubled asyncDouble(int n, TaskContext tc) @safe
 	{
@@ -2743,7 +4171,7 @@ version (unittest) private final class TaskUdaApi
 	}
 
 	/// A task that elicits mid-execution before finishing (re-entrant model).
-	@task("approve", "Ask for approval, then finish")
+	@taskTool("approve", "Ask for approval, then finish")
 	Approved approve(string topic, TaskContext tc) @safe
 	{
 		if (!tc.hasInput("ok"))
@@ -2759,7 +4187,7 @@ version (unittest) private Json modernMeta() @safe
 	import mcp.protocol.capabilities : tasksExtensionKey;
 	import mcp.protocol.mrtr : MetaKey;
 
-	// A client that declared the Tasks extension: the @task tests exercise the
+	// A client that declared the Tasks extension: the @taskTool tests exercise the
 	// task surface, which the server serves only to such a client.
 	Json ext = Json.emptyObject;
 	ext[tasksExtensionKey] = Json.emptyObject;
@@ -2769,13 +4197,15 @@ version (unittest) private Json modernMeta() @safe
 	return meta;
 }
 
-unittest  // @task UDA: tool is listed with an input schema derived from its params
+unittest  // @taskTool UDA: tool is listed with an input schema derived from its params
 {
 	import mcp.protocol.jsonrpc : Message, makeRequest;
 	import mcp.server.task_context : SyncTaskDispatcher;
 
 	auto s = new McpServer("t", "1");
-	s.enableTasks(null, TaskOptions.init, new SyncTaskDispatcher());
+	TaskOptions taskOpts;
+	taskOpts.dispatcher = new SyncTaskDispatcher();
+	s.enableTasks(taskOpts);
 	registerHandlers(s, new TaskUdaApi);
 
 	auto tools = s.handle(Message(makeRequest(Json(1), "tools/list",
@@ -2791,13 +4221,13 @@ unittest  // @task UDA: tool is listed with an input schema derived from its par
 	assert(dbl["annotations"]["readOnlyHint"].get!bool);
 }
 
-unittest  // @task UDA: tools/call returns a task the executor completes
+unittest  // @taskTool UDA: tools/call returns a task the executor completes
 {
 	import mcp.protocol.jsonrpc : Message, makeRequest;
 	import mcp.server.task_context : SyncTaskDispatcher;
 
 	auto s = new McpServer("t", "1");
-	s.enableTasks(null, TaskOptions.init, new SyncTaskDispatcher());
+	s.enableTasks(TaskOptions(null, new SyncTaskDispatcher()));
 	registerHandlers(s, new TaskUdaApi);
 
 	Json p = Json.emptyObject;
@@ -2819,13 +4249,39 @@ unittest  // @task UDA: tools/call returns a task the executor completes
 	assert(got["result"]["pollIntervalMs"].get!long == 250);
 }
 
-unittest  // @task UDA: a mid-task elicitation suspends and resumes via tasks/update
+unittest  // @taskTool UDA: a missing required argument (schema validation off) completes as an isError result
+{
+	import mcp.protocol.jsonrpc : Message, makeRequest;
+	import mcp.server.task_context : SyncTaskDispatcher;
+	import std.algorithm : canFind;
+
+	auto s = new McpServer("t", "1");
+	s.disableInputSchemaValidation();
+	s.enableTasks(TaskOptions(null, new SyncTaskDispatcher()));
+	registerHandlers(s, new TaskUdaApi);
+
+	Json p = Json.emptyObject;
+	p["name"] = "async_double";
+	p["arguments"] = Json.emptyObject;
+	p["_meta"] = modernMeta();
+	auto call = s.handle(Message(makeRequest(Json(2), "tools/call", p))).get;
+	const id = call["result"]["taskId"].get!string;
+
+	Json gp = Json(["taskId": Json(id)]);
+	gp["_meta"] = modernMeta();
+	auto got = s.handle(Message(makeRequest(Json(3), "tasks/get", gp))).get["result"];
+	assert(got["status"].get!string == "completed", got.toString);
+	assert(got["result"]["isError"].get!bool, got.toString);
+	assert(got["result"]["content"][0]["text"].get!string.canFind("'n'"));
+}
+
+unittest  // @taskTool UDA: a mid-task elicitation suspends and resumes via tasks/update
 {
 	import mcp.protocol.jsonrpc : Message, makeRequest;
 	import mcp.server.task_context : SyncTaskDispatcher;
 
 	auto s = new McpServer("t", "1");
-	s.enableTasks(null, TaskOptions.init, new SyncTaskDispatcher());
+	s.enableTasks(TaskOptions(null, new SyncTaskDispatcher()));
 	registerHandlers(s, new TaskUdaApi);
 
 	Json p = Json.emptyObject;
@@ -2973,4 +4429,2217 @@ unittest  // the typed builder defines a push type whose publish() feeds events/
 	auto n = s.handle(Message(makeRequest(Json(2), "events/poll", next))).get;
 	assert(n["result"]["events"].length == 1);
 	assert(n["result"]["events"][0]["data"]["messageId"].get!string == "m1");
+}
+
+version (unittest) private final class TaskCtxToolApi
+{
+	@tool("t", "A plain tool that wrongly takes a TaskContext")
+	string t(string msg, TaskContext tc) @safe
+	{
+		return msg;
+	}
+}
+
+version (unittest) private final class EventCtxToolApi
+{
+	@tool("t", "A plain tool that wrongly takes an EventContext")
+	string t(string msg, EventContext ec) @safe
+	{
+		return msg;
+	}
+}
+
+version (unittest) private final class EventCtxTaskApi
+{
+	@taskTool("t", "A task that wrongly takes an EventContext")
+	string t(string msg, EventContext ec) @safe
+	{
+		return msg;
+	}
+}
+
+unittest  // a @tool method taking a TaskContext is rejected at compile time
+{
+	auto s = new McpServer("t", "1");
+	static assert(!__traits(compiles, registerHandlers(s, new TaskCtxToolApi)));
+}
+
+unittest  // a @tool method taking an EventContext is rejected at compile time
+{
+	auto s = new McpServer("t", "1");
+	static assert(!__traits(compiles, registerHandlers(s, new EventCtxToolApi)));
+}
+
+unittest  // a @taskTool method taking an EventContext is rejected at compile time
+{
+	auto s = new McpServer("t", "1");
+	static assert(!__traits(compiles, registerHandlers(s, new EventCtxTaskApi)));
+}
+
+version (unittest) private final class EventCtxParamsApi(C)
+{
+	@tool("t", "A plain tool that wrongly takes an event context")
+	string t(string msg, C c) @safe
+	{
+		return msg;
+	}
+}
+
+version (unittest) private final class EventCtxTaskParamsApi(C)
+{
+	@taskTool("t", "A task that wrongly takes an event context")
+	string t(string msg, C c) @safe
+	{
+		return msg;
+	}
+}
+
+version (unittest) private final class EventCtxPromptApi(C)
+{
+	@prompt("p", "A prompt that wrongly takes an event context")
+	string p(string msg, C c) @safe
+	{
+		return msg;
+	}
+}
+
+version (unittest) private final class EventCtxTemplateApi(C)
+{
+	@resourceTemplate("test://{id}", "r")
+	string r(string id, C c) @safe
+	{
+		return id;
+	}
+}
+
+unittest  // a handler taking a FetchContext or SubContext is rejected at compile time
+{
+	auto s = new McpServer("t", "1");
+	static foreach (C; AliasSeq!(FetchContext, SubContext))
+	{
+		static assert(!__traits(compiles, registerHandlers(s, new EventCtxParamsApi!C)));
+		static assert(!__traits(compiles, registerHandlers(s, new EventCtxTaskParamsApi!C)));
+		static assert(!__traits(compiles, registerHandlers(s, new EventCtxPromptApi!C)));
+		static assert(!__traits(compiles, registerHandlers(s, new EventCtxTemplateApi!C)));
+	}
+}
+
+unittest  // a Nullable return is wrapped under `result` in an object output schema
+{
+	auto s = outputSchemaOf!(Nullable!int)();
+	assert(s["type"].get!string == "object", s.toString());
+	assert("result" in s["properties"]);
+
+	auto r = toToolResult(Nullable!int(3));
+	assert(r.structuredContent.type == Json.Type.object);
+	assert(r.structuredContent["result"].get!long == 3);
+}
+
+unittest  // a null Nullable return still yields an object structuredContent
+{
+	auto r = toToolResult(Nullable!int.init);
+	assert(r.structuredContent.type == Json.Type.object);
+	assert(r.structuredContent["result"].type == Json.Type.null_);
+}
+
+unittest  // a SysTime return is wrapped under `result` in an object output schema
+{
+	import std.datetime.systime : SysTime;
+	import std.datetime.timezone : UTC;
+	import std.datetime.date : DateTime;
+
+	auto s = outputSchemaOf!SysTime();
+	assert(s["type"].get!string == "object", s.toString());
+	assert("result" in s["properties"]);
+
+	auto r = toToolResult(SysTime(DateTime(2026, 1, 2, 3, 4, 5), UTC()));
+	assert(r.structuredContent.type == Json.Type.object);
+	assert(r.structuredContent["result"].type == Json.Type.string);
+}
+
+unittest  // a Json return is wrapped under `result` so structuredContent is an object
+{
+	auto r = toToolResult(Json(5));
+	assert(r.structuredContent.type == Json.Type.object);
+	assert(r.structuredContent["result"].get!long == 5);
+	assert("result" in outputSchemaOf!Json()["properties"]);
+}
+
+version (unittest) private final class SystemToolApi
+{
+	@tool("t", "A tool whose method is not @safe")
+	string t(string msg) @system
+	{
+		return msg;
+	}
+}
+
+unittest  // a non-@safe handler method is rejected with a diagnostic naming it
+{
+	static assert(!__traits(compiles, checkHandlerSafety!("t", SystemToolApi.t)()));
+	static assert(__traits(compiles, checkHandlerSafety!("echo", EchoSafeApi.echo)()));
+	auto s = new McpServer("t", "1");
+	static assert(!__traits(compiles, registerHandlers(s, new SystemToolApi)));
+}
+
+version (unittest) private final class EchoSafeApi
+{
+	@tool("echo", "Echo")
+	string echo(string msg) @safe
+	{
+		return msg;
+	}
+}
+
+version (unittest) private final class ContentToolApi
+{
+	@tool("one", "Return a single content block")
+	Content one() @safe
+	{
+		return Content.makeText("hi");
+	}
+
+	@tool("many", "Return several content blocks")
+	Content[] many() @safe
+	{
+		return [Content.makeText("a"), Content.makeText("b")];
+	}
+}
+
+unittest  // a Content return becomes the result's content with no structured output
+{
+	assert(outputSchemaOf!Content().type == Json.Type.undefined);
+	auto r = toToolResult(Content.makeText("hi"));
+	assert(r.content.length == 1);
+	assert(r.structuredContent.type == Json.Type.undefined);
+}
+
+unittest  // a Content[] return becomes the result's content with no structured output
+{
+	assert(outputSchemaOf!(Content[])().type == Json.Type.undefined);
+	auto r = toToolResult([Content.makeText("a"), Content.makeText("b")]);
+	assert(r.content.length == 2);
+	assert(r.structuredContent.type == Json.Type.undefined);
+}
+
+unittest  // @tool methods returning Content and Content[] register
+{
+	auto s = new McpServer("t", "1");
+	registerHandlers(s, new ContentToolApi);
+}
+
+version (unittest) private final class DefaultParamApi
+{
+	enum Order
+	{
+		asc,
+		desc
+	}
+
+	@tool("list", "List with defaults")
+	string list(string q, int page = 1, Order order = Order.desc, @schemaDefault(5) int limit = 7)@safe
+	{
+		return q;
+	}
+}
+
+unittest  // a D default parameter value is emitted as the property's JSON Schema default
+{
+	auto s = parametersSchema!(DefaultParamApi.list)();
+	auto props = s["properties"];
+	assert("default" !in props["q"]);
+	assert(props["page"]["default"].get!long == 1, s.toString());
+	assert(props["order"]["default"].get!string == "desc", s.toString());
+}
+
+unittest  // an explicit @schemaDefault wins over the D default value
+{
+	auto s = parametersSchema!(DefaultParamApi.list)();
+	assert(s["properties"]["limit"]["default"].get!long == 5, s.toString());
+}
+
+version (unittest) private final class NullDefaultParamApi
+{
+	@tool("f", "Nullable parameter with a null default")
+	string f(Nullable!int n = Nullable!int.init) @safe
+	{
+		return "";
+	}
+}
+
+unittest  // a default that serializes to null emits no JSON Schema default
+{
+	auto s = parametersSchema!(NullDefaultParamApi.f)();
+	assert("default" !in s["properties"]["n"], s.toString());
+}
+
+version (unittest) private final class ParamResourceApi
+{
+	@resource("file:///x", "X")
+	string x(string id) @safe
+	{
+		return id;
+	}
+}
+
+unittest  // a @resource method that takes parameters is rejected at compile time
+{
+	auto s = new McpServer("t", "1");
+	static assert(!__traits(compiles, registerHandlers(s, new ParamResourceApi)));
+}
+
+version (unittest) private final class QualifiedParamApi
+{
+	@tool("repeat", "Repeat a string")
+	string repeat(in string s, const int n, immutable bool loud) @safe
+	{
+		import std.array : replicate;
+
+		return loud ? s.replicate(n) ~ "!" : s.replicate(n);
+	}
+
+	@prompt("greet", "Greet someone")
+	string greet(in string name, const int times) @safe
+	{
+		import std.conv : to;
+
+		return name ~ times.to!string;
+	}
+
+	@resourceTemplate("q://{id}", "Q", "text/plain")
+	string q(const int id, const RequestContext ctx) @safe
+	{
+		import std.conv : to;
+
+		return "q-" ~ id.to!string;
+	}
+}
+
+version (unittest) private final class DefaultTemplateParamApi
+{
+	@resourceTemplate("item://{id}{?fmt,n}", "Item", "text/plain")
+	string item(string id, string fmt = "json", int n = 3) @safe
+	{
+		import std.conv : to;
+
+		return id ~ "/" ~ fmt ~ "/" ~ n.to!string;
+	}
+}
+
+unittest  // a @resourceTemplate parameter absent from the URI binds its declared default
+{
+	import mcp.protocol.jsonrpc : Message, makeRequest;
+
+	auto s = new McpServer("t", "1");
+	registerHandlers(s, new DefaultTemplateParamApi);
+
+	Json rp = Json.emptyObject;
+	rp["uri"] = "item://42";
+	auto rr = s.handle(Message(makeRequest(Json(1), "resources/read", rp))).get;
+	assert(rr["result"]["contents"][0]["text"].get!string == "42/json/3", rr.toString);
+
+	rp["uri"] = "item://42?fmt=xml&n=5";
+	rr = s.handle(Message(makeRequest(Json(2), "resources/read", rp))).get;
+	assert(rr["result"]["contents"][0]["text"].get!string == "42/xml/5", rr.toString);
+}
+
+unittest  // handlers with in/const/immutable parameters register and dispatch
+{
+	import mcp.protocol.jsonrpc : Message, makeRequest;
+
+	auto s = new McpServer("t", "1");
+	registerHandlers(s, new QualifiedParamApi);
+
+	Json tp = Json.emptyObject;
+	tp["name"] = "repeat";
+	tp["arguments"] = parseJsonString(`{"s":"ab","n":2,"loud":true}`);
+	auto tr = s.handle(Message(makeRequest(Json(1), "tools/call", tp))).get;
+	assert(tr["result"]["content"][0]["text"].get!string == "abab!", tr.toString);
+
+	Json pp = Json.emptyObject;
+	pp["name"] = "greet";
+	pp["arguments"] = parseJsonString(`{"name":"Sam","times":"3"}`);
+	auto pr = s.handle(Message(makeRequest(Json(2), "prompts/get", pp))).get;
+	assert(pr["result"]["messages"][0]["content"]["text"].get!string == "Sam3", pr.toString);
+
+	Json rp = Json.emptyObject;
+	rp["uri"] = "q://7";
+	auto rr = s.handle(Message(makeRequest(Json(3), "resources/read", rp))).get;
+	assert(rr["result"]["contents"][0]["text"].get!string == "q-7", rr.toString);
+}
+
+version (unittest) private Json callToolArgs(McpServer s, string name, string arguments) @safe
+{
+	import mcp.protocol.jsonrpc : Message, makeRequest;
+
+	Json p = Json.emptyObject;
+	p["name"] = name;
+	p["arguments"] = parseJsonString(arguments);
+	return s.handle(Message(makeRequest(Json(1), "tools/call", p))).get["result"];
+}
+
+version (unittest) private final class NullInputApi
+{
+	static struct Filter
+	{
+		string q;
+		Nullable!int limit;
+	}
+
+	@tool("nul", "Nullable inputs")
+	string nul(Nullable!int limit, Nullable!int[] slots,
+			Nullable!(OptionalParamApi.Unique) unique, Filter filter) @safe
+	{
+		import std.conv : to;
+
+		return (limit.isNull ? "-" : limit.get.to!string) ~ ":" ~ slots.length.to!string ~ ":" ~ (
+				unique.isNull ? "-" : "u") ~ ":" ~ (filter.limit.isNull ? "-" : "l");
+	}
+}
+
+unittest  // explicit null for a Nullable parameter passes input validation and binds as null
+{
+	auto s = new McpServer("t", "1");
+	registerHandlers(s, new NullInputApi);
+	auto r = callToolArgs(s, "nul", `{"limit":null,"slots":[],"filter":{"q":"x"}}`);
+	assert("isError" !in r, r.toString);
+	assert(r["content"][0]["text"].get!string == "-:0:-:-", r.toString);
+}
+
+unittest  // a null element of a Nullable!T[] parameter passes input validation
+{
+	auto s = new McpServer("t", "1");
+	registerHandlers(s, new NullInputApi);
+	auto r = callToolArgs(s, "nul", `{"slots":[1,null],"filter":{"q":"x"}}`);
+	assert("isError" !in r, r.toString);
+	assert(r["content"][0]["text"].get!string == "-:2:-:-", r.toString);
+}
+
+unittest  // explicit null for a Nullable enum parameter passes input validation
+{
+	auto s = new McpServer("t", "1");
+	registerHandlers(s, new NullInputApi);
+	auto r = callToolArgs(s, "nul", `{"unique":null,"slots":[],"filter":{"q":"x"}}`);
+	assert("isError" !in r, r.toString);
+}
+
+unittest  // explicit null for a Nullable struct field passes input validation
+{
+	auto s = new McpServer("t", "1");
+	registerHandlers(s, new NullInputApi);
+	auto r = callToolArgs(s, "nul", `{"slots":[],"filter":{"q":"x","limit":null}}`);
+	assert("isError" !in r, r.toString);
+}
+
+unittest  // a Nullable @mcpHeader parameter keeps the bare primitive type x-mcp-header requires
+{
+	import mcp.protocol.mrtr : paramHeaders;
+
+	auto s = new McpServer("t", "1");
+	registerHandlers(s, new NullableHeaderApi);
+	auto schema = s.handle(MakeListMessage()).get["result"]["tools"][0]["inputSchema"];
+	assert(schema["properties"]["region"]["type"].get!string == "integer", schema.toString);
+	assert(paramHeaders(schema).length == 1);
+}
+
+version (unittest) private final class UnsetFloatApi
+{
+	static struct Reading
+	{
+		string sensor;
+		double value;
+		float[] samples;
+	}
+
+	@tool("read", "Return a reading whose floating-point members are unset")
+	Reading read() @safe
+	{
+		Reading r;
+		r.sensor = "s";
+		r.samples = [float.init];
+		return r;
+	}
+
+	@tool("ratio", "Return an unset double")
+	double ratio() @safe
+	{
+		return double.init;
+	}
+}
+
+unittest  // an unset floating-point result, as sent on the wire, conforms to the tool's outputSchema
+{
+	import mcp.protocol.schema : validateAgainstSchema;
+
+	auto s = new McpServer("t", "1");
+	registerHandlers(s, new UnsetFloatApi);
+	Json[string] schemas;
+	auto tools = s.handle(MakeListMessage()).get["result"]["tools"];
+	foreach (i; 0 .. tools.length)
+		schemas[tools[i]["name"].get!string] = tools[i]["outputSchema"];
+	foreach (name; ["read", "ratio"])
+	{
+		// The wire form: vibe writes a NaN as `null`.
+		auto wire = parseJsonString(callToolArgs(s, name, `{}`).toString);
+		const err = validateAgainstSchema(wire["structuredContent"], schemas[name]);
+		assert(err.length == 0, name ~ ": " ~ err ~ " in " ~ wire.toString);
+	}
+}
+
+unittest  // a floating-point output schema admits the null an unset value serializes as
+{
+	auto s = new McpServer("t", "1");
+	registerHandlers(s, new UnsetFloatApi);
+	auto tools = s.handle(MakeListMessage()).get["result"]["tools"];
+	foreach (i; 0 .. tools.length)
+		if (tools[i]["name"].get!string == "read")
+			assert(tools[i]["outputSchema"]["properties"]["value"]["type"] == Json(
+					[Json("number"), Json("null")]), tools[i].toString);
+}
+
+version (unittest) private final class KeywordParamApi
+{
+	@tool("fetch", "Parameters named after D keywords")
+	@describeParam("version", "the version to fetch")
+	@mcpHeader("version", "Version")
+	string fetch(string version_, string body_) @safe
+	{
+		return version_ ~ "/" ~ body_;
+	}
+
+	@prompt("release", "Prompt with a keyword-named argument")
+	string release(string version_) @safe
+	{
+		return "release " ~ version_;
+	}
+
+	@resourceTemplate("pkg://{version}", "Package")
+	string pkg(string version_) @safe
+	{
+		return "pkg " ~ version_;
+	}
+}
+
+unittest  // a tool parameter's wire name drops one trailing underscore, as a struct field's does
+{
+	auto s = new McpServer("t", "1");
+	registerHandlers(s, new KeywordParamApi);
+	auto schema = s.handle(MakeListMessage()).get["result"]["tools"][0]["inputSchema"];
+	assert("version" in schema["properties"] && "body" in schema["properties"], schema.toString);
+	assert(schema["required"] == Json([Json("version"), Json("body")]), schema.toString);
+	assert(schema["properties"]["version"]["description"].get!string == "the version to fetch");
+	assert(schema["properties"]["version"]["x-mcp-header"].get!string == "Version");
+	auto r = callToolArgs(s, "fetch", `{"version":"1.2","body":"b"}`);
+	assert("isError" !in r, r.toString);
+	assert(r["content"][0]["text"].get!string == "1.2/b", r.toString);
+}
+
+unittest  // a prompt argument's wire name drops one trailing underscore
+{
+	import mcp.protocol.jsonrpc : Message, makeRequest;
+
+	auto s = new McpServer("t", "1");
+	registerHandlers(s, new KeywordParamApi);
+	auto prompts = s.handle(Message(makeRequest(Json(1), "prompts/list",
+			Json.emptyObject))).get["result"]["prompts"];
+	assert(prompts[0]["arguments"][0]["name"].get!string == "version", prompts.toString);
+	Json pp = Json.emptyObject;
+	pp["name"] = "release";
+	pp["arguments"] = parseJsonString(`{"version":"2"}`);
+	auto pr = s.handle(Message(makeRequest(Json(2), "prompts/get", pp))).get;
+	assert(pr["result"]["messages"][0]["content"]["text"].get!string == "release 2", pr.toString);
+}
+
+unittest  // a resource template parameter matches its URI variable without the trailing underscore
+{
+	import mcp.protocol.jsonrpc : Message, makeRequest;
+
+	auto s = new McpServer("t", "1");
+	registerHandlers(s, new KeywordParamApi);
+	Json rp = Json.emptyObject;
+	rp["uri"] = "pkg://3";
+	auto rr = s.handle(Message(makeRequest(Json(1), "resources/read", rp))).get;
+	assert(rr["result"]["contents"][0]["text"].get!string == "pkg 3", rr.toString);
+}
+
+version (unittest) private final class ContextResourceApi
+{
+	@resource("ctx://doc", "Doc")
+	string doc(RequestContext ctx) @safe
+	{
+		return ctx is null ? "no context" : "with context";
+	}
+}
+
+version (unittest) private final class ArgResourceApi
+{
+	@resource("arg://doc", "Doc")
+	string doc(string id) @safe
+	{
+		return id;
+	}
+}
+
+unittest  // a @resource method may take the per-request RequestContext
+{
+	import mcp.protocol.jsonrpc : Message, makeRequest;
+
+	auto s = new McpServer("t", "1");
+	registerHandlers(s, new ContextResourceApi);
+	Json rp = Json.emptyObject;
+	rp["uri"] = "ctx://doc";
+	auto rr = s.handle(Message(makeRequest(Json(1), "resources/read", rp))).get;
+	assert(rr["result"]["contents"][0]["text"].get!string == "with context", rr.toString);
+}
+
+unittest  // a @resource method taking a non-context parameter is rejected at compile time
+{
+	auto s = new McpServer("t", "1");
+	static assert(!__traits(compiles, registerHandlers(s, new ArgResourceApi)));
+}
+
+version (unittest) private final class UnnamedToolParamApi
+{
+	@tool("anon", "A tool with an unnamed parameter")
+	string anon(int) @safe
+	{
+		return "";
+	}
+}
+
+version (unittest) private final class UnnamedPromptParamApi
+{
+	@prompt("anon", "A prompt with an unnamed parameter")
+	string anon(string) @safe
+	{
+		return "";
+	}
+}
+
+version (unittest) private final class UnnamedContextParamApi
+{
+	@tool("ctx", "A tool whose unnamed parameter is the injected context")
+	string ctx(int n, RequestContext) @safe
+	{
+		return "";
+	}
+}
+
+unittest  // a tool with an unnamed schema parameter is rejected at compile time
+{
+	auto s = new McpServer("t", "1");
+	static assert(!__traits(compiles, registerHandlers(s, new UnnamedToolParamApi)));
+}
+
+unittest  // a prompt with an unnamed argument parameter is rejected at compile time
+{
+	auto s = new McpServer("t", "1");
+	static assert(!__traits(compiles, registerHandlers(s, new UnnamedPromptParamApi)));
+}
+
+unittest  // an unnamed injected context parameter needs no name
+{
+	auto s = new McpServer("t", "1");
+	registerHandlers(s, new UnnamedContextParamApi);
+}
+
+version (unittest) private final class StrictArgsApi
+{
+	@tool("strict", "Rejects unknown arguments")
+	@strictArgs string strict(string q, int limit = 1) @safe
+	{
+		return q;
+	}
+
+	@tool("lenient", "Ignores unknown arguments")
+	string lenient(string q) @safe
+	{
+		return q;
+	}
+}
+
+version (unittest) private Json strictToolSchema(string name) @safe
+{
+	auto s = new McpServer("t", "1");
+	registerHandlers(s, new StrictArgsApi);
+	auto tools = s.handle(MakeListMessage()).get["result"]["tools"];
+	foreach (i; 0 .. tools.length)
+		if (tools[i]["name"].get!string == name)
+			return tools[i]["inputSchema"];
+	assert(false, name ~ " not found");
+}
+
+unittest  // a @strictArgs tool's input schema closes its properties
+{
+	auto schema = strictToolSchema("strict");
+	assert(schema["additionalProperties"].type == Json.Type.bool_, schema.toString);
+	assert(!schema["additionalProperties"].get!bool);
+	assert("additionalProperties" !in strictToolSchema("lenient"));
+}
+
+unittest  // a @strictArgs tool rejects an unknown argument
+{
+	auto s = new McpServer("t", "1");
+	registerHandlers(s, new StrictArgsApi);
+	auto r = callToolArgs(s, "strict", `{"q":"x","limt":5}`);
+	assert(r["isError"].get!bool, r.toString);
+}
+
+unittest  // a @strictArgs tool rejects an unknown argument with input validation off
+{
+	import std.algorithm.searching : canFind;
+
+	auto s = new McpServer("t", "1");
+	s.disableInputSchemaValidation();
+	registerHandlers(s, new StrictArgsApi);
+	auto r = callToolArgs(s, "strict", `{"q":"x","limt":5}`);
+	assert(r["isError"].get!bool, r.toString);
+	assert(r["content"][0]["text"].get!string.canFind("'limt'"), r.toString);
+	assert("isError" !in callToolArgs(s, "strict", `{"q":"x","limit":5}`));
+}
+
+unittest  // a tool without @strictArgs ignores an unknown argument
+{
+	auto s = new McpServer("t", "1");
+	registerHandlers(s, new StrictArgsApi);
+	auto r = callToolArgs(s, "lenient", `{"q":"x","extra":true}`);
+	assert("isError" !in r, r.toString);
+}
+
+version (unittest) private struct CounterApi
+{
+	int calls;
+
+	@tool("bump", "Count a call")
+	int bump() @safe
+	{
+		return ++calls;
+	}
+}
+
+unittest  // registerHandlers rejects a struct value, whose handlers would mutate a copy
+{
+	auto s = new McpServer("t", "1");
+	CounterApi api;
+	static assert(!__traits(compiles, registerHandlers(s, api)));
+}
+
+unittest  // registerHandlers with a pointer to a struct dispatches to that struct
+{
+	auto s = new McpServer("t", "1");
+	auto api = new CounterApi;
+	registerHandlers(s, api);
+	callToolArgs(s, "bump", `{}`);
+	callToolArgs(s, "bump", `{}`);
+	assert(api.calls == 2);
+}
+
+version (unittest) private final class SharedWireNameApi
+{
+	@tool("dup", "Two parameters with one wire name")
+	string dup(int limit, int limit_) @safe
+	{
+		return "";
+	}
+}
+
+unittest  // parameters whose names differ only by a trailing underscore are rejected at compile time
+{
+	auto s = new McpServer("t", "1");
+	static assert(!__traits(compiles, registerHandlers(s, new SharedWireNameApi)));
+}
+
+version (unittest) private enum Tone : string
+{
+	soft = "s",
+	loud = "l",
+}
+
+version (unittest) private final class StringEnumApi
+{
+	@tool("speak", "Speak in a tone")
+	string speak(Tone tone, Tone fallback = Tone.soft) @safe
+	{
+		import std.conv : to;
+
+		return tone.to!string ~ "/" ~ fallback.to!string;
+	}
+}
+
+unittest  // a string-based enum parameter is advertised and bound by member name
+{
+	auto s = new McpServer("t", "1");
+	registerHandlers(s, new StringEnumApi);
+	auto tools = s.handle(MakeListMessage()).get["result"]["tools"];
+	auto props = tools[0]["inputSchema"]["properties"];
+	assert(props["tone"]["enum"][1].get!string == "loud", props.toString);
+	assert(props["fallback"]["default"].get!string == "soft", props.toString);
+	auto r = callToolArgs(s, "speak", `{"tone":"loud"}`);
+	assert(r["content"][0]["text"].get!string == "loud/soft", r.toString);
+}
+
+version (unittest) private final class MethodUdaParamApi
+{
+	@tool("f", "f")
+	@hintTitle("Nice") @describeParam("y", "why") @readOnly string f(@minimum(1) int x, int y)@safe
+	{
+		return "";
+	}
+}
+
+unittest  // a parameter's attributes exclude the attributes of its function
+{
+	alias f = MethodUdaParamApi.f;
+	static assert(ParamAttributes!(f, 0).length == 1);
+	static assert(is(typeof(ParamAttributes!(f, 0)[0]) == typeof(minimum(1))));
+	static assert(ParamAttributes!(f, 1).length == 0);
+	auto props = parametersSchema!f()["properties"];
+	assert(props["x"].length == 2 && props["x"]["minimum"].get!long == 1, props.toString);
+}
+
+version (unittest) private final class MethodTitleApi
+{
+	@tool("f", "f") @title("Nice")
+	string f(int x) @safe
+	{
+		return "";
+	}
+}
+
+version (unittest) private final class SchemaDefaultParamApi
+{
+	@tool("sum", "Sum with a schema-defaulted addend")
+	int sum(int n, @schemaDefault(7) int x, @schemaDefault(5) int y = 2)@safe
+	{
+		return n + x + y;
+	}
+}
+
+unittest  // a @schemaDefault parameter is optional in the input schema
+{
+	auto s = parametersSchema!(SchemaDefaultParamApi.sum)();
+	assert(s["required"] == Json([Json("n")]), s.toString);
+	assert(s["properties"]["x"]["default"].get!long == 7, s.toString);
+}
+
+unittest  // an omitted @schemaDefault argument binds to the advertised default
+{
+	auto s = new McpServer("t", "1");
+	registerHandlers(s, new SchemaDefaultParamApi);
+	auto r = callToolArgs(s, "sum", `{"n":1}`);
+	assert(r["structuredContent"]["result"].get!int == 13, r.toString);
+	r = callToolArgs(s, "sum", `{"n":1,"x":0,"y":0}`);
+	assert(r["structuredContent"]["result"].get!int == 1, r.toString);
+}
+
+version (unittest) private final class FieldDescriptionParamApi
+{
+	@tool("find", "Find things")
+	@describeParam("limit", "page size")
+	string find(@fieldDescription("search text") string q, @fieldDescription("ignored") int limit)@safe
+	{
+		return q;
+	}
+}
+
+unittest  // @fieldDescription on a parameter is its description, and @describeParam wins over it
+{
+	auto props = parametersSchema!(FieldDescriptionParamApi.find)()["properties"];
+	assert(props["q"]["description"].get!string == "search text", props.toString);
+	assert(props["limit"]["description"].get!string == "page size", props.toString);
+}
+
+version (unittest) private final class UiTaskApi
+{
+	@taskTool("render_later", "Render a widget as a task")
+	@ui("ui://demo/widget", "model")
+	string renderLater(string spec, TaskContext tc) @safe
+	{
+		return spec;
+	}
+}
+
+unittest  // @ui on a @taskTool attaches _meta.ui to its descriptor
+{
+	import mcp.server.task_context : SyncTaskDispatcher;
+
+	auto s = new McpServer("t", "1");
+	s.enableTasks(TaskOptions(null, new SyncTaskDispatcher()));
+	registerHandlers(s, new UiTaskApi);
+	auto t = s.handle(MakeListMessage()).get["result"]["tools"][0];
+	assert(t["_meta"]["ui"]["resourceUri"].get!string == "ui://demo/widget", t.toString);
+	assert(t["_meta"]["ui"]["visibility"] == Json([Json("model")]), t.toString);
+}
+
+version (unittest) private final class UiBadSchemeApi
+{
+	@tool("f", "f") @ui("https://example.com/widget")
+	string f() @safe
+	{
+		return "";
+	}
+}
+
+version (unittest) private final class UiBadVisibilityApi
+{
+	@tool("f", "f") @ui("ui://demo/widget", "user")
+	string f() @safe
+	{
+		return "";
+	}
+}
+
+unittest  // a @ui resourceUri outside the ui:// scheme is rejected at compile time
+{
+	auto s = new McpServer("t", "1");
+	static assert(!__traits(compiles, registerHandlers(s, new UiBadSchemeApi)));
+}
+
+unittest  // a @ui visibility other than "model" or "app" is rejected at compile time
+{
+	auto s = new McpServer("t", "1");
+	static assert(!__traits(compiles, registerHandlers(s, new UiBadVisibilityApi)));
+}
+
+unittest  // a JSON Schema facet on a handler method is rejected at compile time
+{
+	auto s = new McpServer("t", "1");
+	static assert(!__traits(compiles, registerHandlers(s, new MethodTitleApi)));
+}
+
+version (unittest) private Json callToolResult(McpServer s, string name, Json arguments) @safe
+{
+	import mcp.protocol.jsonrpc : Message, makeRequest;
+
+	Json p = Json.emptyObject;
+	p["name"] = name;
+	p["arguments"] = arguments;
+	return s.handle(Message(makeRequest(Json(1), "tools/call", p))).get["result"];
+}
+
+version (unittest) private struct SumHolder
+{
+	import std.sumtype : SumType;
+
+	string label;
+	SumType!(int, string) value;
+}
+
+version (unittest) private final class SumTypeResultApi
+{
+	import std.sumtype : SumType;
+
+	@tool("pick", "Return a number or a word")
+	SumType!(int, string) pick(bool word) @safe
+	{
+		alias R = SumType!(int, string);
+		return word ? R("seven") : R(7);
+	}
+
+	@tool("tagged", "Return a struct holding a SumType")
+	SumHolder tagged() @safe
+	{
+		return SumHolder("x", typeof(SumHolder.value)("held"));
+	}
+}
+
+unittest  // a SumType tool result serializes as the value it holds
+{
+	auto s = new McpServer("t", "1");
+	registerHandlers(s, new SumTypeResultApi);
+	auto n = callToolResult(s, "pick", Json(["word": Json(false)]));
+	assert(n["structuredContent"]["result"] == Json(7), n.toString);
+	auto w = callToolResult(s, "pick", Json(["word": Json(true)]));
+	assert(w["structuredContent"]["result"] == Json("seven"), w.toString);
+}
+
+unittest  // a SumType field of a struct tool result serializes as the value it holds
+{
+	auto s = new McpServer("t", "1");
+	registerHandlers(s, new SumTypeResultApi);
+	auto r = callToolResult(s, "tagged", Json.emptyObject);
+	assert(r["structuredContent"]["value"] == Json("held"), r.toString);
+	assert(r["structuredContent"]["label"] == Json("x"), r.toString);
+}
+
+version (unittest) private final class RealParamApi
+{
+	@tool("f", "f")
+	string f(real x) @safe
+	{
+		return "";
+	}
+}
+
+version (unittest) private final class TupleReturnApi
+{
+	@tool("f", "f")
+	Tuple!(int, string) f() @safe
+	{
+		return typeof(return)(1, "a");
+	}
+}
+
+version (unittest) private final class ClassParamApi
+{
+	@tool("f", "f")
+	string f(RealParamApi other) @safe
+	{
+		return "";
+	}
+}
+
+version (unittest) private final class MismatchedDefaultApi
+{
+	import jsonschema : schemaDefault;
+
+	@tool("f", "f")
+	string f(@schemaDefault("abc") int x)@safe
+	{
+		return "";
+	}
+}
+
+version (unittest) private final class FractionalIntDefaultApi
+{
+	import jsonschema : schemaDefault;
+
+	@tool("f", "f")
+	string f(@schemaDefault(2.5) int x)@safe
+	{
+		return "";
+	}
+}
+
+unittest  // a real parameter is rejected at compile time
+{
+	auto s = new McpServer("t", "1");
+	static assert(!__traits(compiles, registerHandlers(s, new RealParamApi)));
+}
+
+unittest  // a Tuple return is rejected at compile time
+{
+	auto s = new McpServer("t", "1");
+	static assert(!__traits(compiles, registerHandlers(s, new TupleReturnApi)));
+}
+
+unittest  // a class parameter is rejected at compile time
+{
+	auto s = new McpServer("t", "1");
+	static assert(!__traits(compiles, registerHandlers(s, new ClassParamApi)));
+}
+
+unittest  // a @schemaDefault whose value does not convert to the parameter type is rejected
+{
+	auto s = new McpServer("t", "1");
+	static assert(!__traits(compiles, registerHandlers(s, new MismatchedDefaultApi)));
+	static assert(!__traits(compiles, registerHandlers(s, new FractionalIntDefaultApi)));
+}
+
+version (unittest) private final class OutOfRangeDefaultApi
+{
+	import jsonschema : schemaDefault;
+
+	@tool("f", "f")
+	string f(@schemaDefault(300) ubyte x)@safe
+	{
+		return "";
+	}
+}
+
+version (unittest) private final class NonMemberEnumDefaultApi
+{
+	import jsonschema : schemaDefault;
+
+	enum Mode : string
+	{
+		light = "L",
+		dark = "D",
+	}
+
+	@tool("f", "f")
+	string f(@schemaDefault("dark") Mode x)@safe
+	{
+		return "";
+	}
+}
+
+unittest  // a lossy or non-member @schemaDefault on a parameter is rejected at compile time
+{
+	auto s = new McpServer("t", "1");
+	assert(!__traits(compiles, registerHandlers(s, new OutOfRangeDefaultApi)));
+	assert(!__traits(compiles, registerHandlers(s, new NonMemberEnumDefaultApi)));
+}
+
+version (unittest) private final class SpacedToolNameApi
+{
+	@tool("get weather", "f")
+	string f() @safe
+	{
+		return "";
+	}
+}
+
+version (unittest) private final class LongToolNameApi
+{
+	import std.array : replicate;
+
+	@tool("x".replicate(129), "f")
+	string f() @safe
+	{
+		return "";
+	}
+}
+
+version (unittest) private final class MaxLengthToolNameApi
+{
+	import std.array : replicate;
+
+	@tool("x".replicate(128), "f")
+	string f() @safe
+	{
+		return "";
+	}
+}
+
+version (unittest) private final class SlashedTaskToolNameApi
+{
+	@taskTool("jobs/run", "f")
+	string f() @safe
+	{
+		return "";
+	}
+}
+
+version (unittest) private final class PunctuatedToolNameApi
+{
+	@tool("Admin.get_user-v2", "f")
+	string f() @safe
+	{
+		return "";
+	}
+}
+
+unittest  // a @tool or @taskTool name outside 1..128 of [A-Za-z0-9_.-] is rejected at compile time
+{
+	auto s = new McpServer("t", "1");
+	assert(!__traits(compiles, registerHandlers(s, new SpacedToolNameApi)));
+	assert(!__traits(compiles, registerHandlers(s, new LongToolNameApi)));
+	assert(!__traits(compiles, registerHandlers(s, new SlashedTaskToolNameApi)));
+	registerHandlers(s, new PunctuatedToolNameApi);
+	registerHandlers(s, new MaxLengthToolNameApi);
+}
+
+version (unittest) private final class TaskTtlOnToolApi
+{
+	@tool("f", "f") @taskTtl(1.seconds)
+	string f() @safe
+	{
+		return "";
+	}
+}
+
+version (unittest) private final class CacheableOnToolApi
+{
+	@tool("f", "f") @cacheable(1.seconds)
+	string f() @safe
+	{
+		return "";
+	}
+}
+
+version (unittest) private final class UiOnResourceApi
+{
+	@resource("test://r", "r") @ui("ui://demo/widget")
+	string r() @safe
+	{
+		return "";
+	}
+}
+
+version (unittest) private final class ReadOnlyOnPromptApi
+{
+	@prompt("p", "p") @readOnly string p() @safe
+	{
+		return "";
+	}
+}
+
+version (unittest) private final class StrictArgsOnPromptApi
+{
+	@prompt("p", "p") @strictArgs string p(string topic) @safe
+	{
+		return topic;
+	}
+}
+
+version (unittest) private final class McpHeaderOnPromptApi
+{
+	@prompt("p", "p") @mcpHeader("topic", "Topic")
+	string p(string topic) @safe
+	{
+		return topic;
+	}
+}
+
+version (unittest) private final class DescribeParamOnTemplateApi
+{
+	@resourceTemplate("test://{id}", "t") @describeParam("nope", "missing")
+	string t(string id) @safe
+	{
+		return id;
+	}
+}
+
+version (unittest) private final class MinLengthOnIntApi
+{
+	@tool("f", "f")
+	string f(@minLength(2) int n)@safe
+	{
+		return "";
+	}
+}
+
+version (unittest) private final class MinimumOnStringApi
+{
+	@tool("f", "f")
+	string f(@minimum(2) string s)@safe
+	{
+		return s;
+	}
+}
+
+version (unittest) private struct MinItemsOnScalar
+{
+	@minItems(1) int n;
+}
+
+version (unittest) private final class MinItemsOnFieldApi
+{
+	@tool("f", "f")
+	string f(MinItemsOnScalar arg) @safe
+	{
+		return "";
+	}
+}
+
+version (unittest) private final class TaskContextPromptApi
+{
+	@prompt("p", "p")
+	string p(string topic, TaskContext tc) @safe
+	{
+		return topic;
+	}
+}
+
+version (unittest) private final class EventPollOnToolApi
+{
+	@tool("f", "f") @eventPollInterval(1.seconds)
+	string f() @safe
+	{
+		return "";
+	}
+}
+
+version (unittest) private final class FittingUdasApi
+{
+	@prompt("p", "p") @icon("https://example.com/p.png") @describeParam("topic", "what")
+	string p(@fieldDescription("the topic") string topic)@safe
+	{
+		return topic;
+	}
+
+	@resourceTemplate("test://{id}", "t") @cacheable(1.seconds) @priority(0.5)
+	string t(string id) @safe
+	{
+		return id;
+	}
+}
+
+unittest  // @taskTtl on a plain @tool is rejected at compile time
+{
+	auto s = new McpServer("t", "1");
+	static assert(!__traits(compiles, registerHandlers(s, new TaskTtlOnToolApi)));
+}
+
+version (unittest) private final class MethodUdaWithoutHandlerApi(udas...)
+{
+	@tool("t", "t")
+	string t() @safe
+	{
+		return "";
+	}
+
+	@(udas) string helper() @safe
+	{
+		return "";
+	}
+}
+
+unittest  // a method-level MCP UDA on a method with no handler UDA is rejected at compile time
+{
+	import core.time : seconds;
+
+	auto s = new McpServer("t", "1");
+	static assert(__traits(compiles, registerHandlers(s, new MethodUdaWithoutHandlerApi!())));
+	static assert(!__traits(compiles, registerHandlers(s,
+			new MethodUdaWithoutHandlerApi!readOnly)));
+	static assert(!__traits(compiles, registerHandlers(s,
+			new MethodUdaWithoutHandlerApi!strictArgs)));
+	static assert(!__traits(compiles, registerHandlers(s,
+			new MethodUdaWithoutHandlerApi!(describeParam("x", "y")))));
+	static assert(!__traits(compiles, registerHandlers(s,
+			new MethodUdaWithoutHandlerApi!(cacheable(1.seconds)))));
+	static assert(!__traits(compiles, registerHandlers(s,
+			new MethodUdaWithoutHandlerApi!(hintTitle("h")))));
+	static assert(!__traits(compiles, registerHandlers(s,
+			new MethodUdaWithoutHandlerApi!(priority(0.5)))));
+	static assert(!__traits(compiles, registerHandlers(s,
+			new MethodUdaWithoutHandlerApi!(taskTtl(1.seconds)))));
+}
+
+unittest  // @cacheable on a @tool is rejected at compile time
+{
+	auto s = new McpServer("t", "1");
+	static assert(!__traits(compiles, registerHandlers(s, new CacheableOnToolApi)));
+}
+
+unittest  // @ui on a @resource is rejected at compile time
+{
+	auto s = new McpServer("t", "1");
+	static assert(!__traits(compiles, registerHandlers(s, new UiOnResourceApi)));
+}
+
+unittest  // tool-only UDAs on a @prompt are rejected at compile time
+{
+	auto s = new McpServer("t", "1");
+	static assert(!__traits(compiles, registerHandlers(s, new ReadOnlyOnPromptApi)));
+	static assert(!__traits(compiles, registerHandlers(s, new StrictArgsOnPromptApi)));
+	static assert(!__traits(compiles, registerHandlers(s, new McpHeaderOnPromptApi)));
+}
+
+unittest  // @describeParam on a @resourceTemplate is rejected at compile time
+{
+	auto s = new McpServer("t", "1");
+	static assert(!__traits(compiles, registerHandlers(s, new DescribeParamOnTemplateApi)));
+}
+
+unittest  // a facet that does not fit its parameter or field type is rejected at compile time
+{
+	auto s = new McpServer("t", "1");
+	static assert(!__traits(compiles, registerHandlers(s, new MinLengthOnIntApi)));
+	static assert(!__traits(compiles, registerHandlers(s, new MinimumOnStringApi)));
+	static assert(!__traits(compiles, registerHandlers(s, new MinItemsOnFieldApi)));
+}
+
+unittest  // a TaskContext parameter on a @prompt is rejected at compile time
+{
+	auto s = new McpServer("t", "1");
+	static assert(!__traits(compiles, registerHandlers(s, new TaskContextPromptApi)));
+}
+
+unittest  // @eventPollInterval on a @tool is rejected at compile time
+{
+	auto s = new McpServer("t", "1");
+	static assert(!__traits(compiles, registerHandlers(s, new EventPollOnToolApi)));
+}
+
+version (unittest)
+{
+	private final class ToolWithUdas(udas...)
+	{
+		@tool("t", "t") @(udas) string t(string a) @safe
+		{
+			return a;
+		}
+	}
+
+	private final class TaskWithUdas(udas...)
+	{
+		@taskTool("t", "t") @(udas) string t(string a) @safe
+		{
+			return a;
+		}
+	}
+
+	private final class ResourceWithUdas(udas...)
+	{
+		@resource("test://r", "r") @(udas) string r() @safe
+		{
+			return "";
+		}
+	}
+
+	private final class ResourceUriApi(string uri, string name)
+	{
+		@resource(uri, name) string r() @safe
+		{
+			return "";
+		}
+	}
+
+	private final class TemplateWithUdas(string uriTemplate, udas...)
+	{
+		@resourceTemplate(uriTemplate, "t") @(udas) string t(string a, string b = "") @safe
+		{
+			return a ~ b;
+		}
+	}
+}
+
+unittest  // a value UDA attached bare (without its argument list) is rejected at compile time
+{
+	auto s = new McpServer("t", "1");
+	static assert(!__traits(compiles, registerHandlers(s, new ToolWithUdas!ui)));
+	static assert(!__traits(compiles, registerHandlers(s, new ToolWithUdas!hintTitle)));
+	static assert(!__traits(compiles, registerHandlers(s, new ToolWithUdas!icon)));
+	static assert(!__traits(compiles, registerHandlers(s, new ToolWithUdas!meta)));
+	static assert(!__traits(compiles, registerHandlers(s, new ToolWithUdas!describeParam)));
+	static assert(!__traits(compiles, registerHandlers(s, new ToolWithUdas!mcpHeader)));
+	static assert(!__traits(compiles, registerHandlers(s, new TaskWithUdas!taskTtl)));
+	static assert(!__traits(compiles, registerHandlers(s, new TaskWithUdas!taskPollInterval)));
+	static assert(!__traits(compiles, registerHandlers(s, new ResourceWithUdas!cacheable)));
+	static assert(!__traits(compiles, registerHandlers(s, new ResourceWithUdas!audience)));
+	static assert(!__traits(compiles, registerHandlers(s, new ResourceWithUdas!priority)));
+	static assert(!__traits(compiles, registerHandlers(s, new ResourceWithUdas!lastModified)));
+	static assert(!__traits(compiles, registerHandlers(s, new ToolWithUdas!eventPollInterval)));
+}
+
+unittest  // marker UDAs and applied value UDAs still register beside a handler
+{
+	import core.time : seconds;
+
+	auto s = new McpServer("t", "1");
+	static assert(__traits(compiles, registerHandlers(s, new ToolWithUdas!(readOnly,
+			hintTitle("h"), icon("https://example.com/i.png"), describeParam("a", "d")))));
+	static assert(__traits(compiles, registerHandlers(s, new TaskWithUdas!(taskTtl(1.seconds)))));
+	static assert(__traits(compiles, registerHandlers(s,
+			new ResourceWithUdas!(cacheable(1.seconds), audience("user")))));
+}
+
+unittest  // a handler UDA with an empty required field is rejected at compile time
+{
+	auto s = new McpServer("t", "1");
+	static assert(!__traits(compiles, registerHandlers(s, new ResourceUriApi!("", "r"))));
+	static assert(!__traits(compiles, registerHandlers(s, new ResourceUriApi!("test://r", ""))));
+	static assert(__traits(compiles, registerHandlers(s, new ResourceUriApi!("test://r", "r"))));
+}
+
+unittest  // @audience accepts only the roles "user" and "assistant"
+{
+	auto s = new McpServer("t", "1");
+	static assert(!__traits(compiles, registerHandlers(s,
+			new ResourceWithUdas!(audience("user", "admin")))));
+	static assert(__traits(compiles, registerHandlers(s,
+			new ResourceWithUdas!(audience("user", "assistant")))));
+}
+
+unittest  // @icon needs a src and a theme of "light" or "dark"
+{
+	auto s = new McpServer("t", "1");
+	static assert(!__traits(compiles, registerHandlers(s, new ToolWithUdas!(icon("")))));
+	static assert(!__traits(compiles, registerHandlers(s,
+			new ToolWithUdas!(icon("https://example.com/i.png", "", null, "sepia")))));
+	static assert(__traits(compiles, registerHandlers(s,
+			new ToolWithUdas!(icon("https://example.com/i.png", "", null, "dark")))));
+}
+
+unittest  // a @resourceTemplate with adjacent variables is rejected at compile time
+{
+	auto s = new McpServer("t", "1");
+	static assert(!__traits(compiles, registerHandlers(s, new TemplateWithUdas!("test://{a}{b}"))));
+	static assert(__traits(compiles, registerHandlers(s, new TemplateWithUdas!("test://{a}{?b}"))));
+}
+
+unittest  // a single-valued UDA repeated on one handler is rejected at compile time
+{
+	import core.time : seconds;
+	import vibe.data.json : parseJsonString;
+
+	auto s = new McpServer("t", "1");
+	static assert(!__traits(compiles, registerHandlers(s,
+			new ToolWithUdas!(hintTitle("a"), hintTitle("b")))));
+	static assert(!__traits(compiles, registerHandlers(s,
+			new ToolWithUdas!(meta(parseJsonString(`{"a":1}`)), meta(parseJsonString(`{"b":1}`))))));
+	static assert(!__traits(compiles, registerHandlers(s,
+			new ToolWithUdas!(describeParam("a", "x"), describeParam("a", "y")))));
+	static assert(!__traits(compiles, registerHandlers(s,
+			new ToolWithUdas!(ui("ui://a"), ui("ui://b")))));
+	static assert(!__traits(compiles, registerHandlers(s,
+			new TaskWithUdas!(taskTtl(1.seconds), taskTtl(2.seconds)))));
+	static assert(!__traits(compiles, registerHandlers(s,
+			new TaskWithUdas!(taskPollInterval(1.seconds), taskPollInterval(2.seconds)))));
+	static assert(!__traits(compiles, registerHandlers(s,
+			new ResourceWithUdas!(cacheable(1.seconds), cacheable(2.seconds)))));
+	static assert(!__traits(compiles, registerHandlers(s,
+			new ResourceWithUdas!(priority(0.1), priority(0.2)))));
+	static assert(!__traits(compiles, registerHandlers(s,
+			new ResourceWithUdas!(audience("user"), audience("assistant")))));
+	static assert(!__traits(compiles, registerHandlers(s,
+			new ResourceWithUdas!(lastModified("a"), lastModified("b")))));
+	// @icon repeats by design, one entry per icon.
+	static assert(__traits(compiles, registerHandlers(s,
+			new ToolWithUdas!(icon("https://a/1.png"), icon("https://a/2.png")))));
+}
+
+version (unittest)
+{
+	private struct NullTargetStruct
+	{
+		@tool("t", "t") string t() @safe
+		{
+			return "";
+		}
+	}
+
+	private interface NullTargetIface
+	{
+		@tool("t", "t") string t() @safe;
+	}
+
+	private final class AliasedToolApi
+	{
+		@tool("f", "f") string f() @safe
+		{
+			return "";
+		}
+
+		alias g = f;
+	}
+}
+
+unittest  // an alias of an annotated method does not register the handler twice
+{
+	import mcp.protocol.jsonrpc : Message, makeRequest;
+
+	auto s = new McpServer("t", "1");
+	registerHandlers(s, new AliasedToolApi);
+	auto tools = s.handle(Message(makeRequest(Json(1), "tools/list",
+			Json.emptyObject))).get["result"]["tools"];
+	assert(tools.length == 1);
+}
+
+unittest  // registerHandlers rejects a null object, interface, or struct pointer
+{
+	import std.exception : assertThrown;
+
+	auto s = new McpServer("t", "1");
+	assertThrown!Exception(registerHandlers(s, cast(ToolWithUdas!()) null));
+	assertThrown!Exception(registerHandlers(s, cast(NullTargetIface) null));
+	assertThrown!Exception(registerHandlers(s, cast(NullTargetStruct*) null));
+}
+
+unittest  // UDAs that fit their handler kind and parameter types still register
+{
+	auto s = new McpServer("t", "1");
+	registerHandlers(s, new FittingUdasApi);
+}
+
+version (unittest) private final class TemplatedToolApi
+{
+	@tool("f", "f")
+	string f(T)(T x) @safe
+	{
+		return "";
+	}
+}
+
+version (unittest) private final class TemplatedHelperApi
+{
+	@tool("g", "g")
+	string g(string s) @safe
+	{
+		return helper(s);
+	}
+
+	string helper(T)(T x) @safe
+	{
+		return x;
+	}
+}
+
+unittest  // a templated method carrying a handler UDA is rejected at compile time
+{
+	auto s = new McpServer("t", "1");
+	static assert(!__traits(compiles, registerHandlers(s, new TemplatedToolApi)));
+}
+
+unittest  // a templated method without a handler UDA is skipped
+{
+	auto s = new McpServer("t", "1");
+	registerHandlers(s, new TemplatedHelperApi);
+}
+
+version (unittest) private final class MutableStringApi
+{
+	@tool("chars", "Return a mutable char array")
+	char[] chars() @safe
+	{
+		return "abc".dup;
+	}
+
+	@tool("wide", "Return a wstring")
+	wstring wide() @safe
+	{
+		return "wide"w;
+	}
+
+	@prompt("p", "Return a const char slice")
+	const(char)[] p() @safe
+	{
+		return "prompt text";
+	}
+
+	@resource("test://chars", "chars", "text/plain")
+	char[] r() @safe
+	{
+		return "resource text".dup;
+	}
+}
+
+unittest  // a tool, prompt, or resource returning a non-immutable or wide string serves it as text
+{
+	import mcp.protocol.jsonrpc : Message, makeRequest;
+
+	auto s = new McpServer("t", "1");
+	registerHandlers(s, new MutableStringApi);
+	auto t = callToolResult(s, "chars", Json.emptyObject);
+	assert(t["content"][0]["text"] == Json("abc"), t.toString);
+	auto w = callToolResult(s, "wide", Json.emptyObject);
+	assert(w["content"][0]["text"] == Json("wide"), w.toString);
+
+	Json pp = Json.emptyObject;
+	pp["name"] = "p";
+	auto pr = s.handle(Message(makeRequest(Json(2), "prompts/get", pp))).get["result"];
+	assert(pr["messages"][0]["content"]["text"] == Json("prompt text"), pr.toString);
+
+	Json rp = Json.emptyObject;
+	rp["uri"] = "test://chars";
+	auto rr = s.handle(Message(makeRequest(Json(3), "resources/read", rp))).get["result"];
+	assert(rr["contents"][0]["text"] == Json("resource text"), rr.toString);
+}
+
+/// A `priority` built without its constructor's range check, standing in for
+/// one constructed where that check is compiled out.
+version (unittest) private priority uncheckedPriority(double v) @safe
+{
+	priority p;
+	p.value = v;
+	return p;
+}
+
+version (unittest) private final class OutOfRangePriorityApi
+{
+	@resource("test://p", "p") @uncheckedPriority(5.0)
+	string r() @safe
+	{
+		return "";
+	}
+}
+
+unittest  // an out-of-range @priority is rejected at registration even without contracts
+{
+	auto s = new McpServer("t", "1");
+	static assert(!__traits(compiles, registerHandlers(s, new OutOfRangePriorityApi)));
+}
+
+version (unittest) private final class NullableDefaultApi
+{
+	import jsonschema : schemaDefault;
+
+	@tool("viaUda", "Nullable with a @schemaDefault")
+	string viaUda(@schemaDefault(5) Nullable!int n)@safe
+	{
+		import std.conv : to;
+
+		return n.isNull ? "unset" : n.get.to!string;
+	}
+
+	@tool("viaD", "Nullable with a D default")
+	string viaD(Nullable!int n = 5) @safe
+	{
+		import std.conv : to;
+
+		return n.isNull ? "unset" : n.get.to!string;
+	}
+
+	@prompt("p", "Nullable prompt argument with a @schemaDefault")
+	string p(@schemaDefault("x") Nullable!string topic)@safe
+	{
+		return topic.isNull ? "unset" : topic.get;
+	}
+}
+
+unittest  // an explicit null for a defaulted Nullable parameter binds as unset
+{
+	auto s = new McpServer("t", "1");
+	registerHandlers(s, new NullableDefaultApi);
+	Json nullArg = Json(["n": Json(null)]);
+	assert(callToolResult(s, "viaUda", nullArg)["content"][0]["text"] == Json("unset"));
+	assert(callToolResult(s, "viaD", nullArg)["content"][0]["text"] == Json("unset"));
+	assert(callToolResult(s, "viaUda", Json.emptyObject)["content"][0]["text"] == Json("5"));
+	assert(callToolResult(s, "viaD", Json.emptyObject)["content"][0]["text"] == Json("5"));
+}
+
+unittest  // an explicit null for a defaulted Nullable prompt argument binds as unset
+{
+	import mcp.protocol.jsonrpc : Message, makeRequest;
+
+	auto s = new McpServer("t", "1");
+	registerHandlers(s, new NullableDefaultApi);
+	Json pp = Json.emptyObject;
+	pp["name"] = "p";
+	pp["arguments"] = Json(["topic": Json(null)]);
+	auto r = s.handle(Message(makeRequest(Json(2), "prompts/get", pp))).get["result"];
+	assert(r["messages"][0]["content"]["text"] == Json("unset"), r.toString);
+}
+
+version (unittest) private final class InvalidSkillPathApi
+{
+	@skill("Not A Name", "An invalid skill path")
+	string instructions() @safe
+	{
+		return "# Body\n";
+	}
+}
+
+version (unittest) private final class InvalidSkillDirPathApi
+{
+	@skillDir("office//pdf-forms")
+	string dir() @safe
+	{
+		return "skills/pdf-forms";
+	}
+}
+
+unittest  // an invalid @skill path is rejected at compile time
+{
+	auto s = new McpServer("t", "1");
+	static assert(!__traits(compiles, registerHandlers(s, new InvalidSkillPathApi)));
+}
+
+unittest  // an invalid non-empty @skillDir path is rejected at compile time
+{
+	auto s = new McpServer("t", "1");
+	static assert(!__traits(compiles, registerHandlers(s, new InvalidSkillDirPathApi)));
+}
+
+version (unittest) private class AnnotatedBaseApi
+{
+	@tool("who", "Report which class handles the call")
+	string who() @safe
+	{
+		return "base";
+	}
+}
+
+version (unittest) private class OverridingApi : AnnotatedBaseApi
+{
+	override string who() @safe
+	{
+		return "derived";
+	}
+}
+
+version (unittest) private class FurtherOverridingApi : OverridingApi
+{
+	override string who() @safe
+	{
+		return "further";
+	}
+}
+
+unittest  // an override of an annotated base method registers with the base UDAs and dispatches virtually
+{
+	auto s = new McpServer("t", "1");
+	registerHandlers(s, new OverridingApi);
+	auto r = callToolArgs(s, "who", `{}`);
+	assert(r["content"][0]["text"].get!string == "derived", r.toString);
+}
+
+unittest  // an override two levels below the annotated declaration is still registered
+{
+	auto s = new McpServer("t", "1");
+	registerHandlers(s, new FurtherOverridingApi);
+	auto r = callToolArgs(s, "who", `{}`);
+	assert(r["content"][0]["text"].get!string == "further", r.toString);
+}
+
+version (unittest) private interface AnnotatedInterfaceApi
+{
+	@tool("ping", "Answer a ping")
+	string ping(string from) @safe;
+}
+
+version (unittest) private final class InterfaceImplApi : AnnotatedInterfaceApi
+{
+	string ping(string from) @safe
+	{
+		return "pong " ~ from;
+	}
+}
+
+unittest  // a class implementing an annotated interface method registers that tool
+{
+	auto s = new McpServer("t", "1");
+	registerHandlers(s, new InterfaceImplApi);
+	auto r = callToolArgs(s, "ping", `{"from":"a"}`);
+	assert(r["content"][0]["text"].get!string == "pong a", r.toString);
+}
+
+version (unittest) private final class EmptyPromptArgApi
+{
+	@prompt("page", "Prompt with optional typed arguments")
+	string page(Nullable!int limit, int count = 3, string note = "n") @safe
+	{
+		import std.conv : to;
+
+		return (limit.isNull ? "unset" : limit.get.to!string) ~ " "
+			~ count.to!string ~ " [" ~ note ~ "]";
+	}
+
+	@prompt("need", "Prompt with a required integer argument")
+	string need(int count) @safe
+	{
+		import std.conv : to;
+
+		return count.to!string;
+	}
+}
+
+unittest  // an empty string for an optional non-string prompt argument binds as omitted
+{
+	import mcp.protocol.jsonrpc : Message, makeRequest;
+
+	auto s = new McpServer("t", "1");
+	registerHandlers(s, new EmptyPromptArgApi);
+	Json pp = Json.emptyObject;
+	pp["name"] = "page";
+	pp["arguments"] = Json([
+		"limit": Json(""),
+		"count": Json(""),
+		"note": Json("")
+	]);
+	auto resp = s.handle(Message(makeRequest(Json(1), "prompts/get", pp))).get;
+	assert("error" !in resp, resp.toString);
+	assert(resp["result"]["messages"][0]["content"]["text"].get!string == "unset 3 []",
+			resp.toString);
+}
+
+unittest  // an empty string for a required non-string prompt argument is a missing argument
+{
+	import std.algorithm.searching : canFind;
+	import mcp.protocol.errors : ErrorCode;
+	import mcp.protocol.jsonrpc : Message, makeRequest;
+
+	auto s = new McpServer("t", "1");
+	registerHandlers(s, new EmptyPromptArgApi);
+	Json pp = Json.emptyObject;
+	pp["name"] = "need";
+	pp["arguments"] = Json(["count": Json("")]);
+	auto resp = s.handle(Message(makeRequest(Json(1), "prompts/get", pp))).get;
+	assert("error" in resp, resp.toString);
+	assert(resp["error"]["code"].get!int == ErrorCode.invalidParams);
+	assert(resp["error"]["message"].get!string.canFind("Missing required argument 'count'"),
+			resp.toString);
+}
+
+unittest  // @fieldDescription and @title on a prompt parameter fill its PromptArgument
+{
+	import mcp.protocol.jsonrpc : Message, makeRequest;
+
+	@safe final class DescribedPromptParamApi
+	{
+		@prompt("brief", "A brief")
+		string brief(@fieldDescription("the subject") @title("Subject") string topic)@safe
+		{
+			return topic;
+		}
+	}
+
+	auto s = new McpServer("t", "1");
+	registerHandlers(s, new DescribedPromptParamApi);
+	auto list = s.handle(Message(makeRequest(Json(1), "prompts/list", Json.emptyObject))).get;
+	auto arg = list["result"]["prompts"][0]["arguments"][0];
+	assert(arg["description"].get!string == "the subject", arg.toString);
+	assert(arg["title"].get!string == "Subject", arg.toString);
+}
+
+unittest  // @describeParam takes precedence over a prompt parameter's @fieldDescription
+{
+	import mcp.protocol.jsonrpc : Message, makeRequest;
+
+	@safe final class BothDescribedPromptApi
+	{
+		@prompt("brief", "A brief")
+		@describeParam("topic", "from the method")
+		string brief(@fieldDescription("from the parameter") string topic)@safe
+		{
+			return topic;
+		}
+	}
+
+	auto s = new McpServer("t", "1");
+	registerHandlers(s, new BothDescribedPromptApi);
+	auto list = s.handle(Message(makeRequest(Json(1), "prompts/list", Json.emptyObject))).get;
+	auto arg = list["result"]["prompts"][0]["arguments"][0];
+	assert(arg["description"].get!string == "from the method", arg.toString);
+}
+
+version (unittest) private final class PromptFacetApi
+{
+	@prompt("count", "Count")
+	string count(@minimum(1) int n)@safe
+	{
+		return "";
+	}
+}
+
+version (unittest) private final class TemplateFacetApi
+{
+	@resourceTemplate("t://{id}", "Item")
+	string item(@pattern("^[a-z]+$") string id)@safe
+	{
+		return id;
+	}
+}
+
+version (unittest) private final class TemplateDescriptionApi
+{
+	@resourceTemplate("t://{id}", "Item")
+	string item(@fieldDescription("the id") string id)@safe
+	{
+		return id;
+	}
+}
+
+unittest  // a validation facet on a prompt parameter is rejected at compile time
+{
+	auto s = new McpServer("t", "1");
+	static assert(!__traits(compiles, registerHandlers(s, new PromptFacetApi)));
+}
+
+unittest  // a validation facet on a resource-template parameter is rejected at compile time
+{
+	auto s = new McpServer("t", "1");
+	static assert(!__traits(compiles, registerHandlers(s, new TemplateFacetApi)));
+}
+
+unittest  // @fieldDescription on a resource-template parameter is rejected at compile time
+{
+	auto s = new McpServer("t", "1");
+	static assert(!__traits(compiles, registerHandlers(s, new TemplateDescriptionApi)));
+}
+
+version (unittest) private final class PrivateHandlerApi
+{
+	@tool("hidden", "A private handler")
+	private string hidden() @safe
+	{
+		return "";
+	}
+}
+
+version (unittest) private final class ProtectedHandlerApi
+{
+	@prompt("guarded", "A protected handler")
+	protected string guarded() @safe
+	{
+		return "";
+	}
+}
+
+unittest  // a private handler method is rejected at compile time
+{
+	auto s = new McpServer("t", "1");
+	static assert(!__traits(compiles, registerHandlers(s, new PrivateHandlerApi)));
+}
+
+unittest  // a protected handler method is rejected at compile time
+{
+	auto s = new McpServer("t", "1");
+	static assert(!__traits(compiles, registerHandlers(s, new ProtectedHandlerApi)));
+}
+
+unittest  // registering a @taskTool enables the Tasks extension when it is not yet enabled
+{
+	auto s = new McpServer("t", "1");
+	registerHandlers(s, new TaskUdaApi);
+	assert(s.tasks() !is null);
+}
+
+unittest  // enableTasks with custom options after registering a @taskTool keeps the task tools
+{
+	import mcp.protocol.jsonrpc : Message, makeRequest;
+	import mcp.server.task_context : SyncTaskDispatcher;
+
+	auto s = new McpServer("t", "1");
+	registerHandlers(s, new TaskUdaApi);
+	s.enableTasks(TaskOptions(null, new SyncTaskDispatcher()));
+
+	Json p = Json.emptyObject;
+	p["name"] = "async_double";
+	p["arguments"] = Json(["n": Json(4)]);
+	p["_meta"] = modernMeta();
+	auto call = s.handle(Message(makeRequest(Json(1), "tools/call", p))).get;
+	const id = call["result"]["taskId"].get!string;
+	Json gp = Json(["taskId": Json(id)]);
+	gp["_meta"] = modernMeta();
+	auto got = s.handle(Message(makeRequest(Json(2), "tasks/get", gp))).get["result"];
+	assert(got["status"].get!string == "completed", got.toString);
+	assert(got["result"]["structuredContent"]["value"].get!int == 8);
+}
+
+unittest  // a @taskTool on a stateful server fails naming the tool and the reason
+{
+	import std.algorithm.searching : canFind;
+
+	auto s = McpServer.stateful("t", "1");
+	string msg;
+	try
+		registerHandlers(s, new TaskUdaApi);
+	catch (Exception e)
+		msg = e.msg;
+	assert(msg.canFind("async_double") && msg.canFind("stateful"), msg);
+}
+
+unittest  // registering an @event enables the Events extension when it is not yet enabled
+{
+	auto s = new McpServer("t", "1");
+	registerHandlers(s, new EventUdaApi);
+	assert(s.events() !is null);
+	assert(s.events().has("email.received"));
+}
+
+unittest  // enableEvents after an event type is registered throws rather than dropping it
+{
+	import std.exception : assertThrown;
+
+	auto s = new McpServer("t", "1");
+	registerHandlers(s, new EventUdaApi);
+	assertThrown(s.enableEvents());
+	assert(s.events().has("email.received"));
+}
+
+version (unittest) private final class NullJsonParamApi
+{
+	@tool("kind", "Report the JSON type of a value")
+	string kind(Json value) @safe
+	{
+		return value.type == Json.Type.null_ ? "null" : "other";
+	}
+}
+
+unittest  // a Json parameter binds an explicit null rather than reporting it missing
+{
+	auto s = new McpServer("t", "1");
+	registerHandlers(s, new NullJsonParamApi);
+	auto r = callToolArgs(s, "kind", `{"value":null}`);
+	assert(!("isError" in r && r["isError"].get!bool), r.toString);
+	assert(r["content"][0]["text"].get!string == "null", r.toString);
+}
+
+unittest  // a Json parameter left out is still a missing required argument
+{
+	auto s = new McpServer("t", "1");
+	s.disableInputSchemaValidation();
+	registerHandlers(s, new NullJsonParamApi);
+	auto r = callToolArgs(s, "kind", `{}`);
+	assert(r["isError"].get!bool, r.toString);
+}
+
+version (unittest) private final class NonObjectMetaApi
+{
+	@tool("m", "Tool with a non-object @meta")
+	@meta(parseJsonString(`["not", "an", "object"]`))
+	string m() @safe
+	{
+		return "";
+	}
+}
+
+version (unittest) private final class UiMetaClashApi
+{
+	@tool("m", "Tool whose @meta sets the ui key @ui owns")
+	@meta(parseJsonString(`{"ui":{"resourceUri":"ui://a/b"}}`))
+	@ui("ui://demo/widget")
+	string m() @safe
+	{
+		return "";
+	}
+}
+
+version (unittest) private final class UiMetaMergeApi
+{
+	@tool("m", "Tool combining @meta and @ui")
+	@meta(parseJsonString(`{"category":"art"}`))
+	@ui("ui://demo/widget")
+	string m() @safe
+	{
+		return "";
+	}
+}
+
+unittest  // a @meta whose value is not a JSON object is rejected at compile time
+{
+	auto s = new McpServer("t", "1");
+	static assert(!__traits(compiles, registerHandlers(s, new NonObjectMetaApi)));
+}
+
+unittest  // a @meta setting the "ui" key alongside @ui is rejected at compile time
+{
+	auto s = new McpServer("t", "1");
+	static assert(!__traits(compiles, registerHandlers(s, new UiMetaClashApi)));
+}
+
+unittest  // @meta and @ui merge into one _meta object
+{
+	auto s = new McpServer("t", "1");
+	registerHandlers(s, new UiMetaMergeApi);
+	auto t = s.handle(MakeListMessage()).get["result"]["tools"][0];
+	assert(t["_meta"]["category"].get!string == "art", t.toString);
+	assert(t["_meta"]["ui"]["resourceUri"].get!string == "ui://demo/widget", t.toString);
+}
+
+version (unittest) private final class EmptySkillDescriptionApi
+{
+	@skill("blank", "")
+	string instructions() @safe
+	{
+		return "# Body\n";
+	}
+}
+
+version (unittest) private final class LongSkillDescriptionApi
+{
+	import std.array : replicate;
+
+	@skill("long", "d".replicate(1025))
+	string instructions() @safe
+	{
+		return "# Body\n";
+	}
+}
+
+unittest  // an @skill with an empty description is rejected at compile time
+{
+	auto s = new McpServer("t", "1");
+	static assert(!__traits(compiles, registerHandlers(s, new EmptySkillDescriptionApi)));
+}
+
+unittest  // an @skill description over 1024 characters is rejected at compile time
+{
+	auto s = new McpServer("t", "1");
+	static assert(!__traits(compiles, registerHandlers(s, new LongSkillDescriptionApi)));
+}
+
+unittest  // @skill carries license, compatibility, and allowed-tools into the frontmatter
+{
+	import mcp.protocol.jsonrpc : Message, makeRequest;
+
+	@safe final class LicensedSkillApi
+	{
+		@skill("licensed", "A licensed skill", "MIT", "Needs git", "Bash(git:*)")
+		string instructions() @safe
+		{
+			return "# Body\n";
+		}
+	}
+
+	auto s = new McpServer("t", "1");
+	registerHandlers(s, new LicensedSkillApi);
+	auto fm = s.handle(Message(makeRequest(Json(1), "skills/list",
+			Json.emptyObject))).get["result"]["skills"][0]["frontmatter"];
+	assert(fm["license"].get!string == "MIT", fm.toString);
+	assert(fm["compatibility"].get!string == "Needs git", fm.toString);
+	assert(fm["allowed-tools"].get!string == "Bash(git:*)", fm.toString);
+}
+
+version (unittest) private final class PartlyClashingApi
+{
+	@tool("fresh", "Registered before the clash")
+	string fresh() @safe
+	{
+		return "";
+	}
+
+	@prompt("fresh-prompt", "Registered before the clash")
+	string freshPrompt() @safe
+	{
+		return "";
+	}
+
+	@resource("test://fresh", "Fresh")
+	string freshResource() @safe
+	{
+		return "";
+	}
+
+	@skill("fresh-skill", "Registered before the clash")
+	string freshSkill() @safe
+	{
+		return "# Body\n";
+	}
+
+	@tool("taken", "Collides with a tool already on the server")
+	string taken() @safe
+	{
+		return "";
+	}
+}
+
+unittest  // a registerHandlers that throws part-way leaves none of its handlers registered
+{
+	import std.exception : assertThrown;
+	import mcp.protocol.jsonrpc : Message, makeRequest;
+
+	auto s = new McpServer("t", "1");
+	Tool existing;
+	existing.name = "taken";
+	existing.inputSchema = parseJsonString(`{"type":"object"}`);
+	s.registerTool(existing, (Json args, RequestContext ctx) @safe => CallToolResult.text("old"));
+
+	assertThrown(registerHandlers(s, new PartlyClashingApi));
+
+	auto tools = s.handle(MakeListMessage()).get["result"]["tools"];
+	assert(tools.length == 1 && tools[0]["name"].get!string == "taken", tools.toString);
+	auto prompts = s.handle(Message(makeRequest(Json(1), "prompts/list",
+			Json.emptyObject))).get["result"]["prompts"];
+	assert(prompts.length == 0, prompts.toString);
+	auto resources = s.handle(Message(makeRequest(Json(2), "resources/list",
+			Json.emptyObject))).get["result"]["resources"];
+	assert(resources.length == 0, resources.toString);
+	auto skills = s.handle(Message(makeRequest(Json(3), "skills/list",
+			Json.emptyObject))).get["result"]["skills"];
+	assert(skills.length == 0, skills.toString);
+}
+
+version (unittest) private final class MissingSkillDirApi
+{
+	@tool("before-dir", "Registered before the missing directory")
+	string beforeDir() @safe
+	{
+		return "";
+	}
+
+	@skillDir()
+	string dir() @safe
+	{
+		return "/nonexistent/mcp-d-missing-skill-dir";
+	}
+}
+
+unittest  // a missing @skillDir directory leaves the earlier handlers unregistered
+{
+	import std.exception : assertThrown;
+
+	auto s = new McpServer("t", "1");
+	assertThrown(registerHandlers(s, new MissingSkillDirApi));
+	auto tools = s.handle(MakeListMessage()).get["result"]["tools"];
+	assert(tools.length == 0, tools.toString);
+	// The rolled-back names are free again.
+	Tool t;
+	t.name = "before-dir";
+	t.inputSchema = parseJsonString(`{"type":"object"}`);
+	s.registerTool(t, (Json args, RequestContext ctx) @safe => CallToolResult.text(""));
 }

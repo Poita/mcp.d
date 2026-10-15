@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Build and e2e-run every example under examples/ over EVERY transport it
-# supports. Each example's client is a self-verifying e2e test (it asserts the
+# Build and e2e-run every example under examples/ (or only the examples named
+# as arguments, e.g. `scripts/run-examples.sh tools hello`) over EVERY transport
+# it supports. Run it from the repository root. Each example's client is a self-verifying e2e test (it asserts the
 # server's behaviour and exits non-zero on any mismatch).
 #
 #   - HTTP (every example): start the server with `--http --port <P>` (auth is
@@ -16,6 +17,10 @@ fail=0
 
 # Raise the file-descriptor limit; the D toolchain opens many files at once.
 ulimit -n 65536 2>/dev/null || true
+
+# The PID of the HTTP server currently running, stopped on any exit.
+srvpid=
+trap '[ -n "$srvpid" ] && kill "$srvpid" 2>/dev/null' EXIT
 
 # Per-example HTTP port, kept distinct so the servers never collide.
 port_for() {
@@ -34,12 +39,26 @@ port_for() {
     streaming) echo 9357 ;;
     tasks) echo 8643 ;;
     events) echo 8646 ;;
+    hello) echo 8540 ;;
     tools) echo 8530 ;;
     *) echo 8600 ;;
   esac
 }
 
-for d in examples/*/; do
+if [ "$#" -gt 0 ]; then
+  dirs=()
+  for n in "$@"; do
+    if [ ! -f "examples/${n}/dub.json" ]; then
+      echo "no such example: ${n}" >&2
+      exit 2
+    fi
+    dirs+=("examples/${n}/")
+  done
+else
+  dirs=(examples/*/)
+fi
+
+for d in "${dirs[@]}"; do
   n=$(basename "$d")
   [ -f "${d}dub.json" ] || continue
   # Skip shared library packages (e.g. examples/common) — they are helper
@@ -68,28 +87,39 @@ for d in examples/*/; do
   p=$(port_for "$n")
   url="http://127.0.0.1:${p}/mcp"
   echo "[http] ${n}: server on ${url}"
+  # Run the already-built server binary with `exec` so `$!` is the server's
+  # own PID, which is then the only process stopped afterwards.
   if [ "$n" = "auth" ]; then
-    ( cd "$d" && dub run -c server --quiet -- --port "$p" >"/tmp/ex-${n}-srv.log" 2>&1 ) &
+    ( cd "$d" && exec "./${n}-server" --port "$p" >"/tmp/ex-${n}-srv.log" 2>&1 ) &
     clientflag="--url"
   else
-    ( cd "$d" && dub run -c server --quiet -- --http --port "$p" >"/tmp/ex-${n}-srv.log" 2>&1 ) &
+    ( cd "$d" && exec "./${n}-server" --http --port "$p" >"/tmp/ex-${n}-srv.log" 2>&1 ) &
     clientflag="--http"
   fi
   srvpid=$!
-  # Poll until the server is ready (up to 30 s) instead of sleeping a fixed
-  # amount, which is a CI-flake source on slow or loaded runners.
+  # Poll until the server is listening (up to 30 s) instead of sleeping a
+  # fixed amount, which is a CI-flake source on slow or loaded runners. Any
+  # HTTP status (even 400/401 for the empty probe) means it is up; curl
+  # reports 000 when the connection is refused.
+  up=0
   for i in $(seq 1 30); do
-    if curl -sf -o /dev/null "$url" \
+    code=$(curl -s -o /dev/null -w '%{http_code}' "$url" \
         -H 'Accept: application/json, text/event-stream' \
         -H 'Content-Type: application/json' \
-        -X POST -d '{}'; then break; fi
+        -X POST -d '{}' || true)
+    if [ "$code" != "000" ]; then up=1; break; fi
+    if ! kill -0 "$srvpid" 2>/dev/null; then break; fi
     sleep 1
   done
-  if ! ( cd "$d" && dub run -c client --quiet -- "$clientflag" "$url" ); then
+  if [ "$up" -ne 1 ]; then
+    echo "E2E FAILED (http): ${n} server did not start on ${url}"
+    echo "--- server log ---"; tail -20 "/tmp/ex-${n}-srv.log"; fail=1
+  elif ! ( cd "$d" && dub run -c client --quiet -- "$clientflag" "$url" ); then
     echo "E2E FAILED (http): ${n}"; echo "--- server log ---"; tail -20 "/tmp/ex-${n}-srv.log"; fail=1
   fi
   kill "$srvpid" 2>/dev/null || true
-  pkill -f "${n}-server" 2>/dev/null || true
+  wait "$srvpid" 2>/dev/null || true
+  srvpid=
 
   echo "::endgroup::"
 done

@@ -1,6 +1,8 @@
 module mcp.client.subscription;
 
-import core.atomic : atomicLoad, cas;
+import core.atomic : atomicLoad, atomicStore, cas;
+
+import mcp.protocol.errors : McpException;
 
 /// The set of change-notification types a modern client opts into when opening a
 /// `subscriptions/listen` stream (2026-07-28 basic/utilities/subscriptions). The three
@@ -18,6 +20,9 @@ struct SubscriptionFilter
 	bool resourcesListChanged;
 	/// Resource URIs to receive `notifications/resources/updated` for.
 	string[] resourceSubscriptions;
+	/// Task ids to receive `notifications/tasks` for (Tasks extension, SEP-2663).
+	/// The server accepts this key only when both sides negotiated the extension.
+	string[] taskIds;
 }
 
 /// A handle to an open `subscriptions/listen` stream. The stream runs on a
@@ -25,20 +30,31 @@ struct SubscriptionFilter
 /// `notifications/subscriptions/acknowledged` and every subsequent opted-in
 /// change notification to the client's `onNotification` (and `onProgress`).
 /// Call `cancel()` (alias `close()`) to stop listening; the background task then
-/// closes the connection and terminates.
+/// closes the connection and terminates. When the server ends the stream instead —
+/// closing it, answering the listen request, or failing it with an error — `ended`
+/// turns true and `error` carries the failure, if any.
 final class SubscriptionStream
 {
 	private shared(bool)* cancelled_;
+	// Set by the transport when the server ends the stream. Atomic, like the
+	// cleanup guard, because a cancel() on another thread can race the end.
+	private shared bool finished_;
+	private McpException error_;
 	// Optional transport-supplied action run exactly once on the first cancel().
 	// The stdio transport uses it to emit `notifications/cancelled` referencing
 	// the listen request id (2026-07-28 basic/utilities/subscriptions Cancellation,
 	// stdio); the HTTP transport uses it to force-close the listen stream's socket
 	// so a blocked read unblocks immediately.
 	private void delegate() @safe nothrow onCancel_;
-	// Optional client-supplied cleanup, run once on the first cancel() after the
-	// transport's own teardown. `McpClient.streamEvents` uses it to deregister the
-	// stream's per-subscription event/control handlers when the stream ends.
-	private void delegate() @safe nothrow cleanup_;
+	// Optional client-supplied cleanup, run once when the stream ends: on the
+	// first cancel() (after the transport's own teardown) or when the server ends
+	// it. `McpClient.streamEvents` uses it to deregister the stream's
+	// per-subscription event/control handlers.
+	// Both guarded by `cleanupLock_`, since a cancel() on another thread can
+	// race an addCleanup or the server's end.
+	private void delegate() @safe nothrow[] cleanups_;
+	private bool cleanedUp_;
+	private shared bool cleanupLock_;
 
 	/// Construct a handle wrapping a shared cancellation flag. Created by a
 	/// `ClientTransport` when it opens the listen stream. `onCancel`, when
@@ -62,17 +78,52 @@ final class SubscriptionStream
 		{
 			if (onCancel_ !is null)
 				onCancel_();
-			if (cleanup_ !is null)
-				cleanup_();
+			runCleanup();
 		}
 	}
 
-	/// Attach a cleanup run exactly once on the first `cancel()`/`close()`, after
-	/// the transport's own teardown. Set immediately after the stream is opened
-	/// (before any cancel can race), so a later cancel deregisters client state.
+	private void runCleanup() @safe nothrow
+	{
+		void delegate() @safe nothrow[] due;
+		lockCleanups();
+		const already = cleanedUp_;
+		cleanedUp_ = true;
+		due = cleanups_;
+		cleanups_ = null;
+		unlockCleanups();
+		if (already)
+			return;
+		foreach (cleanup; due)
+			cleanup();
+	}
+
+	/// Add a cleanup run exactly once when the stream ends: on the first
+	/// `cancel()`/`close()` (after the transport's own teardown) or when the server
+	/// ends it. On a stream that has already ended it runs at once, so client
+	/// state is always deregistered.
 	void addCleanup(void delegate() @safe nothrow cleanup) @safe nothrow
 	{
-		cleanup_ = cleanup;
+		lockCleanups();
+		const ended = cleanedUp_;
+		if (!ended)
+			cleanups_ ~= cleanup;
+		unlockCleanups();
+		if (ended)
+			cleanup();
+	}
+
+	// A spin lock: the guarded sections are a few assignments, and the object's
+	// monitor is not usable from nothrow code.
+	private void lockCleanups() @safe nothrow @nogc
+	{
+		while (!cas(&cleanupLock_, false, true))
+		{
+		}
+	}
+
+	private void unlockCleanups() @safe nothrow @nogc
+	{
+		atomicStore(cleanupLock_, false);
 	}
 
 	/// Alias for `cancel()`.
@@ -86,11 +137,127 @@ final class SubscriptionStream
 	{
 		return cancelled_ !is null && atomicLoad(*cancelled_);
 	}
+
+	/// Whether the stream is over: cancelled locally, or ended by the server.
+	bool ended() const @safe nothrow @nogc
+	{
+		return atomicLoad(finished_) || cancelled;
+	}
+
+	/// The error the server ended the stream with (an HTTP or JSON-RPC error
+	/// response to the listen request, or a broken connection); null while the
+	/// stream is open, after a clean end, or after a local cancel.
+	McpException error() @safe nothrow @nogc
+	{
+		return error_;
+	}
+
+	/// Record that the server ended the stream, with `error` when it failed, and
+	/// run the cleanup. Only the first end is kept, and an end after a local
+	/// cancel is ignored.
+	package void finish(McpException error = null) @safe nothrow
+	{
+		if (cancelled || !cas(&finished_, false, true))
+			return;
+		error_ = error;
+		runCleanup();
+	}
+}
+
+unittest  // finish records the server's end and its error once
+{
+	auto s = new SubscriptionStream(new shared bool(false));
+	assert(!s.ended && s.error is null);
+	auto e = new McpException(-32601, "no listen");
+	s.finish(e);
+	assert(s.ended && s.error is e && !s.cancelled);
+	s.finish(null);
+	assert(s.error is e, "only the first end is kept");
+}
+
+unittest  // a cleanup added after the stream ended runs at once
+{
+	auto s = new SubscriptionStream(new shared bool(false));
+	s.finish();
+	bool ran;
+	s.addCleanup(() @safe nothrow{ ran = true; });
+	assert(ran, "a cleanup added to an ended stream must still run");
+}
+
+unittest  // a cleanup added after a local cancel runs at once, exactly once
+{
+	auto s = new SubscriptionStream(new shared bool(false));
+	s.cancel();
+	int runs;
+	s.addCleanup(() @safe nothrow{ runs++; });
+	s.cancel();
+	s.finish();
+	assert(runs == 1);
+}
+
+unittest  // an end reported after a local cancel is ignored
+{
+	auto s = new SubscriptionStream(new shared bool(false));
+	s.cancel();
+	s.finish(new McpException(-32603, "aborted"));
+	assert(s.ended && s.error is null);
+}
+
+/// The rendezvous between a transport's `openListen` and the background task
+/// reading the stream it opened: the task signals once the stream's leading frame
+/// arrives or the stream ends first, and `openListen` waits (bounded) for that.
+/// A heap object so the event outlives an `openListen` that has already returned.
+package final class ListenGate
+{
+	import core.time : Duration;
+	import vibe.core.sync : LocalManualEvent, createManualEvent;
+
+	private LocalManualEvent event_;
+	private int emitCount_;
+	private bool waiting_ = true;
+	private bool established_;
+
+	this() @safe
+	{
+		event_ = createManualEvent();
+		emitCount_ = event_.emitCount;
+	}
+
+	/// Signal the waiter: `frame` is true when the stream's leading frame arrived,
+	/// false when the stream ended before one. Only the first signal counts.
+	void signal(bool frame) @safe nothrow
+	{
+		if (!waiting_)
+			return;
+		waiting_ = false;
+		established_ = frame;
+		try
+			event_.emit();
+		catch (Exception)
+		{
+		}
+	}
+
+	/// Wait up to `timeout` for `signal`, returning whether the leading frame
+	/// arrived. Later signals are ignored.
+	bool wait(Duration timeout) @safe
+	{
+		if (waiting_)
+		{
+			try
+				event_.waitUninterruptible(timeout, emitCount_);
+			catch (Exception)
+			{
+			}
+		}
+		waiting_ = false;
+		return established_;
+	}
 }
 
 unittest  // a SubscriptionStream handle reports and toggles its cancelled state
 {
-	auto cancelled = () @trusted { return new shared bool(false); }();
+	auto cancelled = new shared bool(false);
 	auto s = new SubscriptionStream(cancelled);
 	assert(!s.cancelled);
 	s.cancel();
@@ -108,7 +275,7 @@ unittest  // onCancel fires exactly once even when many threads call cancel() co
 	// Repeat to give the read-then-write race ample opportunity to surface.
 	foreach (iteration; 0 .. 500)
 	{
-		auto cancelled = () @trusted { return new shared bool(false); }();
+		auto cancelled = new shared bool(false);
 		shared int closes = 0;
 		auto s = new SubscriptionStream(cancelled, () @safe nothrow{
 			atomicOp!"+="(closes, 1);
@@ -137,9 +304,46 @@ unittest  // onCancel fires exactly once even when many threads call cancel() co
 	}
 }
 
+unittest  // cleanups run exactly once when cancel() and finish() race across threads
+{
+	import core.thread : Thread;
+	import core.atomic : atomicLoad, atomicStore, atomicOp;
+
+	foreach (iteration; 0 .. 2000)
+	{
+		auto cancelled = new shared bool(false);
+		shared int cleanups = 0;
+		auto s = new SubscriptionStream(cancelled);
+		s.addCleanup(() @safe nothrow{
+			foreach (_; 0 .. 50)
+				atomicOp!"+="(cleanups, 0);
+			atomicOp!"+="(cleanups, 1);
+		});
+		shared bool start = false;
+		auto canceller = new Thread({
+			while (!atomicLoad(start))
+			{
+			}
+			s.cancel();
+		});
+		auto finisher = new Thread({
+			while (!atomicLoad(start))
+			{
+			}
+			s.finish();
+		});
+		canceller.start();
+		finisher.start();
+		atomicStore(start, true);
+		canceller.join();
+		finisher.join();
+		assert(atomicLoad(cleanups) == 1, "cleanups must run exactly once");
+	}
+}
+
 unittest  // a transport onCancel (e.g. HTTP socket close) runs exactly once on first cancel
 {
-	auto cancelled = () @trusted { return new shared bool(false); }();
+	auto cancelled = new shared bool(false);
 	int closes;
 	auto s = new SubscriptionStream(cancelled, () @safe nothrow{ closes++; });
 	assert(closes == 0);

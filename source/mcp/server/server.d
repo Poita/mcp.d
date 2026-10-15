@@ -15,16 +15,17 @@ import mcp.protocol.modern;
 import mcp.protocol.mrtr;
 import mcp.server.context;
 import mcp.server.connection : ConnectionState;
+import mcp.auth.resource_server : TokenInfo;
 import mcp.server.request_state : RequestStateSecurity, RequestStateMode,
 	RequestStateBinding, RequestStateCodec,
 	generateEphemeralKey, verifyIncomingRequestState, secureOutgoingRequestState;
-import mcp.server.task_store : TaskStore, InMemoryTaskStore;
-import mcp.server.task_runtime : TaskRuntime, TaskOptions;
+import mcp.server.task_store : TaskStore, InMemoryTaskStore, TaskRecord;
+import mcp.server.task_runtime : TaskRuntime, TaskOptions, TaskCreateOptions;
 import mcp.server.skill_index : SkillIndex;
 import mcp.protocol.tasks : TaskSupport;
-import mcp.server.task_context : TaskContext, TaskExecutor, TaskDispatcher,
-	InProcessTaskDispatcher, SyncTaskDispatcher, runTaskExecutor;
-import mcp.server.push : PushChannel, ListenFilter;
+import mcp.server.task_context : TaskContext, TaskExecutor, TaskDispatcher, InProcessTaskDispatcher,
+	SyncTaskDispatcher, runTaskExecutor, runTaskExecutorInline, tasksExtensionRequired;
+import mcp.server.push : PushChannel, ListenFilter, listenFilterKey;
 import mcp.server.pagination : pageBounds;
 import mcp.server.transport : ServerCore;
 import mcp.protocol.events;
@@ -32,10 +33,8 @@ import mcp.server.event_store : WebhookSubscriptionStore;
 import mcp.server.events_runtime : EventsRuntime, EventsOptions,
 	EventRegistration, PushHandle, PushStream;
 
-// The handler outcome DTOs live in their own module (part of the api.reflection
-// contract); re-export them so they stay reachable through `mcp.server.server`.
-public import mcp.server.responses : ToolHandler, MrtrToolHandler,
-	InputRequiredPart, ToolResponse, PromptResponse, MrtrPromptHandler;
+import mcp.server.responses : ToolHandler, MrtrToolHandler, ToolResponse, PromptResponse,
+	PromptHandler, MrtrPromptHandler, ResourceReader, TemplateReader, ToolError, PromptError;
 
 // The push-integration unittests below exercise the server seam against the
 // real Streamable HTTP channel; the library build itself has no transport
@@ -70,11 +69,24 @@ struct RegisteredTool
 	Validator outputValidator; /// ditto
 }
 
+/// How `McpServer.registerTaskTool` creates and gates the tasks of one tool.
+struct TaskToolOptions
+{
+	/// Each task's TTL and suggested poll cadence (null inherits the runtime's
+	/// defaults). Each task's owner is the creating request's principal, so
+	/// `create.owner` is ignored.
+	TaskCreateOptions create;
+	/// What a client that did not declare the Tasks extension gets: `optional`
+	/// runs the executor inline and returns its result as a plain tool result,
+	/// `required` rejects the call with -32021.
+	TaskSupport support = TaskSupport.optional;
+}
+
 /// A registered direct resource: descriptor + reader producing its contents.
 struct RegisteredResource
 {
 	Resource descriptor;
-	ResourceContents delegate() @safe reader;
+	ResourceReader reader;
 	/// Per-resource modern `CacheableResult` freshness hint for `resources/read`.
 	Nullable!CacheHint cache;
 	/// Client capabilities this resource's reader requires to run. On 2026-07-28
@@ -84,12 +96,6 @@ struct RegisteredResource
 	/// not cover these. Empty (the default) means no gating.
 	ClientCapabilities requiredClientCapabilities;
 }
-
-/// A resource template reader receiving the concrete URI, the captured `{var}`
-/// parameters, and the per-request `RequestContext` (so a template handler can
-/// log, observe cancellation, or elicit through the real request channel).
-alias TemplateReader = ResourceContents delegate(string uri,
-		string[string] params, RequestContext ctx) @safe;
 
 /// A registered resource template: descriptor + reader receiving the concrete
 /// URI, the captured `{var}` parameters, and the per-request context.
@@ -122,6 +128,18 @@ struct RegisteredPrompt
 	ClientCapabilities requiredClientCapabilities;
 }
 
+/// The error a registration entry point throws on a name/URI collision rather
+/// than silently clobbering the prior entry; `remover` names the method that
+/// unregisters it.
+private Exception alreadyRegistered(string what, string remover) @safe
+{
+	return new Exception(what ~ " is already registered; call " ~ remover ~ " first to replace it");
+}
+
+/// The most `resources/subscribe` URIs one connection may hold, bounding the
+/// per-session state a client can make the server keep.
+private enum maxResourceSubscriptions = 1024;
+
 /// How a server manages per-connection state. The author chooses;
 /// `stateless` is the default. See the README "Statefulness" section for the
 /// full feature-gating matrix.
@@ -137,7 +155,9 @@ enum ServerMode
 	/// Opt-in legacy session management: `initialize` mints an
 	/// `Mcp-Session-Id`, per-session state is isolated, and the full feature set
 	/// (elicitation, GET stream, subscriptions, `logging/setLevel`) is available.
-	/// 2026-07-28 is excluded from negotiation in this mode.
+	/// 2026-07-28 is stateless-only, so this mode does not serve it: a request
+	/// declaring it (including `subscriptions/listen` and `events/stream`) is
+	/// refused with -32022 listing the legacy versions.
 	stateful
 }
 
@@ -146,19 +166,35 @@ enum ServerMode
 /// single bound `activeConnection`. Used by the non-streaming raw batch path
 /// (the 2025-03-26 Streamable HTTP batch back-compat path) where a transport has
 /// already resolved the request's connection state but supplies no server->client
-/// channel. Notifications are dropped and server->client requests are rejected.
+/// channel. Notifications are dropped and server->client requests are rejected;
+/// `clientSupports` still reports what the connection's client declared, so a
+/// refused `elicit`/`sample` names the missing channel rather than a capability.
 private final class ConnectionScopedContext : BaseRequestContext, ConnectionScoped
 {
 	private ConnectionState conn_;
+	private string token_;
+	private TokenInfo auth_;
 
-	this(ConnectionState conn) @safe
+	this(ConnectionState conn, string token, TokenInfo auth) @safe
 	{
 		this.conn_ = conn;
+		this.token_ = token;
+		this.auth_ = auth;
+	}
+
+	override TokenInfo auth() @safe
+	{
+		return auth_;
+	}
+
+	override bool clientSupports(ClientCapability cap) @safe
+	{
+		return conn_.clientCaps.supports(cap);
 	}
 
 	string connectionToken() @safe
 	{
-		return "";
+		return token_;
 	}
 
 	ConnectionState connectionState() @safe
@@ -173,7 +209,7 @@ private final class ConnectionScopedContext : BaseRequestContext, ConnectionScop
 /// parsed messages via `handle` (or raw text via `handleRaw`) and it returns the
 /// response to write back. Transports (stdio, HTTP) are thin drivers over this.
 ///
-/// It satisfies `mcp.server.transport.ServerCore` (aka `ServerTransport`), the
+/// It satisfies `mcp.server.transport.ServerCore`, the
 /// named server-side transport seam symmetric to the client's `ClientTransport`.
 /// A transport can hold its server through that interface and drives it via the
 /// `handle` / `handleRaw` family; `RequestContext` is the outbound companion the
@@ -192,12 +228,23 @@ final class McpServer : ServerCore
 	private RegisteredResource[string] resources;
 	private RegisteredTemplate[] templates;
 	private RegisteredPrompt[string] prompts;
+	// Set once a tool / resource / prompt has been removed, so the capability a
+	// client may already have seen stays advertised (and its methods answer with
+	// an empty list) after the registry empties.
+	private bool toolsDeclared_;
+	private bool resourcesDeclared_;
+	// Monotonic stamp for `resources/subscribe` entries and resource removals:
+	// a session's subscription to a URI is live only while it is newer than that
+	// URI's removal, which drops it from sessions the server cannot enumerate.
+	private ulong subscriptionEpoch_;
+	private ulong[string] resourceRemovedAt_;
+	private bool promptsDeclared_;
 	private CompleteResult delegate(CompleteRequest request) @safe typedCompletionHandler;
 	/// Per-argument completers keyed by "<ref-key>\0<argumentName>", so a consumer
 	/// can register one completer per (reference, argument) instead of hand-routing
 	/// inside a single global delegate. Consulted by `doComplete` when no global
-	/// `typedCompletionHandler` matched.
-	private string[]delegate(string prefix) @safe[string] argumentCompleters;
+	/// `typedCompletionHandler` is set or it returned no values.
+	private CompleteResult delegate(CompleteRequest request) @safe[string] argumentCompleters;
 	private bool loggingEnabled;
 	private bool resourceSubscriptionsEnabled;
 	private bool tasksEnabled_;
@@ -248,6 +295,11 @@ final class McpServer : ServerCore
 	// types/URIs that stream opted into. `ListenFilter.init` (inactive) until a
 	// stdio listen opens, so an unset sink is also a no-op.
 	private ListenFilter stdioListenFilter_;
+	// The stdio transport's raw-JSON-line write sink, installed by `serveStdio` for
+	// the life of the read loop. A 2025-era stdio client has no listen stream: it
+	// receives change notifications on the shared stdout channel once its
+	// stateful `initialize` handshake is processed (see `writeStdioPlain`).
+	private void delegate(string) @safe stdioSink_;
 	private bool toolListChangedEnabled;
 	private bool resourcesListChangedEnabled;
 	private bool promptsListChangedEnabled;
@@ -261,9 +313,9 @@ final class McpServer : ServerCore
 	// it has received `notifications/initialized`. Because this is a SHOULD (and
 	// real clients send `initialized` immediately) the gate is OFF by default to
 	// preserve lenient behaviour; opt in with requireInitialized(). Only a stateful
-	// session has an `initialized` handshake — the stateless path (one shared
-	// fallback state across sequential single-peer clients) is always exempt.
+	// session has an `initialized` handshake — the stateless path is always exempt.
 	private bool requireInitialized_;
+	private bool exposeInternalErrors_;
 	// The opt-in MRTR `requestState` codec installed by `secureRequestState`.
 	// Null (the default) means plaintext passthrough — the wire and behaviour are
 	// exactly as if no codec existed. When set, the dispatch path wraps outgoing
@@ -278,12 +330,12 @@ final class McpServer : ServerCore
 	// application a public surface to react to client notifications. Mirrors
 	// the client's `onNotification` hook. Set via
 	// `setClientNotificationHandler`.
-	private void delegate(string method, Json params) @safe onClientNotification_;
+	private void delegate(string method, Json params, RequestContext ctx) @safe onClientNotification_;
 	// Convenience observer for `notifications/roots/list_changed`: when the
 	// client signals its root list changed, the application can re-call
 	// `ctx.listRoots()` to refresh. Invoked in addition to
 	// `onClientNotification_`. Set via `setRootsListChangedHandler`.
-	private void delegate() @safe onRootsListChanged_;
+	private void delegate(RequestContext ctx) @safe onRootsListChanged_;
 
 	this(string name, string version_, Nullable!string instructions = Nullable!string.init) @safe
 	{
@@ -377,8 +429,23 @@ final class McpServer : ServerCore
 		return mode_;
 	}
 
-	/// The protocol version negotiated with the client (valid after `initialize`).
-	ProtocolVersion negotiatedVersion() const @safe
+	/// The protocol versions this server serves: every supported version on a
+	/// `stateless` server, and only the `initialize`-based (pre-2026-07-28)
+	/// versions on a `stateful` one.
+	const(ProtocolVersion)[] servedVersions() const @safe
+	{
+		import std.algorithm : filter;
+		import std.array : array;
+
+		static immutable ProtocolVersion[] legacy = supportedVersions.filter!(
+				v => !v.isModern).array;
+		return mode_ == ServerMode.stateful ? legacy : supportedVersions;
+	}
+
+	/// The protocol version negotiated on the single bound connection (stdio /
+	/// in-process). Per-request code reads `RequestContext.protocolVersion`, which
+	/// reflects the request's own session or `_meta`.
+	package(mcp) ProtocolVersion negotiatedVersion() const @safe
 	{
 		return activeConnection.negotiated;
 	}
@@ -390,7 +457,7 @@ final class McpServer : ServerCore
 	/// `inputSchema` is built at runtime and therefore have no compile-time D
 	/// type: the handler receives the raw `Json arguments` as they arrived on the
 	/// wire. For a statically-typed tool, prefer the UDA layer
-	/// (`@tool`-annotated methods registered via `registerTools`), which marshals
+	/// (`@tool`-annotated methods registered via `registerHandlers` / `registerModule`), which marshals
 	/// typed parameters for you and dispatches through this same dynamic path.
 	void registerTool(Tool descriptor, ToolHandler handler) @safe
 	{
@@ -402,7 +469,7 @@ final class McpServer : ServerCore
 	/// Compile a registered tool's input/output schema validators once, at
 	/// registration. A schema mcp.d generated is always valid 2020-12; a
 	/// hand-supplied schema that is a malformed object or declares an unsupported
-	/// `$schema` dialect throws here (a `jsonschema.SchemaException`) rather than
+	/// `$schema` dialect throws here (a -32602 `McpException`) rather than
 	/// silently under-validating each `tools/call`.
 	private static RegisteredTool withCompiledValidators(RegisteredTool rt) @safe
 	{
@@ -424,11 +491,13 @@ final class McpServer : ServerCore
 	}
 
 	/// Register a *dynamic* tool whose handler may ask the client for more input
-	/// on a stateless (MRTR) request. The handler branches on `ctx.isStateless`:
-	/// when stateless it reads `ctx.inputResponses` and returns either
-	/// `ToolResponse.complete` or `ToolResponse.inputRequired`; otherwise it may
-	/// call the blocking `ctx.elicit`/`ctx.sample`. A server that wants to serve
-	/// both protocol eras handles both branches here.
+	/// on an MRTR (2026-07-28) request. The handler branches on
+	/// `ctx.usesInputRequired`: when true it reads `ctx.inputResponses` and
+	/// returns either `ToolResponse.complete` or `ToolResponse.inputRequired`.
+	/// When false the request is 2025-era: on a `McpServer.stateful()` server the
+	/// handler may call the blocking `ctx.elicit`/`ctx.sample`, while on a
+	/// `McpServer.stateless()` server (the default) those throw and a 2025-era
+	/// client cannot be asked for input.
 	void registerTool(Tool descriptor, MrtrToolHandler handler) @safe
 	{
 		requireToolNameAvailable(descriptor.name);
@@ -441,8 +510,7 @@ final class McpServer : ServerCore
 	private void requireToolNameAvailable(string name) @safe
 	{
 		if (name in tools)
-			throw new Exception("a tool named '" ~ name
-					~ "' is already registered; call removeTool first to replace it");
+			throw alreadyRegistered("a tool named '" ~ name ~ "'", "removeTool");
 	}
 
 	/// Declare the client capabilities a registered tool's handler requires.
@@ -486,8 +554,8 @@ final class McpServer : ServerCore
 		return true;
 	}
 
-	/// Declare the client capabilities a registered resource (direct or template)
-	/// requires to be read.
+	/// Declare the client capabilities a registered direct resource requires to
+	/// be read (see `setResourceTemplateRequiredClientCapabilities` for templates).
 	///
 	/// On the modern protocol (which carries the caller's `clientCapabilities`
 	/// per-request in `_meta`), a `resources/read` for a URI matching this
@@ -547,6 +615,7 @@ final class McpServer : ServerCore
 		if ((name in tools) is null)
 			return false;
 		tools.remove(name);
+		toolsDeclared_ = true;
 		return true;
 	}
 
@@ -554,12 +623,16 @@ final class McpServer : ServerCore
 	/// if a resource was removed, `false` if no resource with that URI was
 	/// registered. The mirror of `registerResource`; pair with
 	/// `notifyResourcesListChanged` to inform connected clients that the available
-	/// resource set changed.
+	/// resource set changed. Every session's `resources/subscribe` entry for `uri`
+	/// is dropped; a client must subscribe again if the resource returns.
 	bool removeResource(string uri) @safe
 	{
 		if ((uri in resources) is null)
 			return false;
 		resources.remove(uri);
+		resourcesDeclared_ = true;
+		resourceRemovedAt_[uri] = ++subscriptionEpoch_;
+		activeConnection.subscriptions.remove(uri);
 		return true;
 	}
 
@@ -572,6 +645,7 @@ final class McpServer : ServerCore
 		if ((name in prompts) is null)
 			return false;
 		prompts.remove(name);
+		promptsDeclared_ = true;
 		return true;
 	}
 
@@ -630,18 +704,48 @@ final class McpServer : ServerCore
 	/// (other than `ping`) before the client has sent `notifications/initialized`.
 	/// With this enabled, a stateful session that receives e.g. `tools/list` after
 	/// the `initialize` response but before `notifications/initialized` is rejected
-	/// with -32002. `initialize` and `ping` are always allowed; the stateless path
-	/// (which has no per-session `initialized` handshake) is exempt. OFF by default
+	/// with -32600 Invalid Request. `initialize` and `ping` are always allowed. OFF by default
 	/// — the rule is a SHOULD and well-behaved clients send `initialized`
-	/// immediately.
+	/// immediately. Throws on a stateless server, which has no per-session
+	/// `initialized` handshake to gate on.
 	void requireInitialized() @safe
 	{
+		if (mode_ == ServerMode.stateless)
+			throw new Exception("requireInitialized() is not available on a stateless"
+					~ " server: it has no per-session initialized handshake. Construct the"
+					~ " server with McpServer.stateful() instead.");
 		requireInitialized_ = true;
+	}
+
+	/// Send an unexpected (non-`McpException`) handler exception's message to the
+	/// client as the JSON-RPC internal error's `message` (or, for a tool handler,
+	/// as the `isError` result's text). Off by default: such a
+	/// message can carry file paths, SQL or other internals, so the client gets a
+	/// generic "Internal error" and the real message is logged server-side. Useful
+	/// in development.
+	void exposeInternalErrors() @safe
+	{
+		exposeInternalErrors_ = true;
+		if (eventsRuntime_ !is null)
+			eventsRuntime_.exposeInternalErrors = true;
+		if (taskRuntime_ !is null)
+			taskRuntime_.exposeInternalErrors = true;
+	}
+
+	/// The JSON-RPC error a non-`McpException` thrown while serving `method`
+	/// becomes: logged in full, and sent as a generic internal error unless
+	/// `exposeInternalErrors` was called.
+	package(mcp) McpException unexpectedFailure(string method, Exception e) @safe
+	{
+		import vibe.core.log : logError;
+
+		logError("%s: unhandled %s: %s", method, typeid(e).name, e.msg);
+		return internalError(exposeInternalErrors_ ? e.msg : "Internal error");
 	}
 
 	/// Enable the opt-in secure codec for the MRTR (SEP-2322) `requestState`. Once
 	/// enabled, the dispatch path transparently wraps every outgoing
-	/// `requestState` (tool, prompt, and task input-required results) and verifies
+	/// `requestState` (tool and prompt input-required results) and verifies
 	/// every echoed incoming one — handlers keep calling `inputRequired!T` /
 	/// `requestStateAs!T` against plaintext. This delivers the three SEP-2322
 	/// protections at once: integrity (the client cannot tamper with the opaque
@@ -649,8 +753,9 @@ final class McpServer : ServerCore
 	/// the currently authenticated subject, defending against replay/hijack).
 	///
 	/// Verification is fail-closed: a tampered, expired, wrong-subject, or
-	/// otherwise invalid blob is treated as if the client echoed NO state, so the
-	/// handler runs a fresh round and re-prompts (a warning is logged). The
+	/// otherwise invalid blob is treated as if the client echoed NO state and no
+	/// `inputResponses`, so the handler runs a fresh round and re-prompts (a
+	/// warning is logged). The
 	/// request is never errored and no rejection flag is exposed to the handler.
 	///
 	/// Provide a stable secret of at least 32 bytes via `sec.key`. When `sec.key`
@@ -659,10 +764,22 @@ final class McpServer : ServerCore
 	/// any other instance or after a restart (no cross-instance/restart
 	/// continuity). Binding is a no-op on transports without an authenticated
 	/// identity (stdio / in-process, empty subject).
+	///
+	/// Throws when `sec.ttl` is under one second: blobs carry a whole-second
+	/// expiry, so a shorter ttl would expire every state as it is issued. Also
+	/// throws on a `stateful` server: MRTR `requestState` exists only on
+	/// 2026-07-28, which a stateful server never speaks.
 	void secureRequestState(RequestStateSecurity sec) @safe
 	{
+		import core.time : seconds;
 		import vibe.core.log : logWarn;
 
+		if (mode_ == ServerMode.stateful)
+			throw new Exception("secureRequestState() is not available on a stateful server:"
+					~ " MRTR requestState exists only on 2026-07-28, which a stateful server"
+					~ " never speaks. Construct the server with McpServer.stateless() instead.");
+		if (sec.ttl < 1.seconds)
+			throw new Exception("secureRequestState: ttl must be at least one second");
 		if (sec.key.length == 0)
 		{
 			sec.key = generateEphemeralKey();
@@ -671,8 +788,6 @@ final class McpServer : ServerCore
 					~ "verification on other instances or after a restart. Supply a "
 					~ "stable >=32-byte key for multi-instance/persistent deployments.");
 		}
-		else if (sec.key.length < 32)
-			throw new Exception("secureRequestState: key must be at least 32 bytes");
 		requestStateCodec_ = new RequestStateCodec(sec);
 	}
 
@@ -682,7 +797,8 @@ final class McpServer : ServerCore
 	/// the number of listeners reached; `0` when no GET stream is open. Call
 	/// after a runtime `registerTool` / `removeTool`. For the modern protocol,
 	/// the notification is suppressed unless a client opted in via
-	/// `subscriptions/listen` with `toolsListChanged:true`.
+	/// `subscriptions/listen` with `toolsListChanged:true`. Sends nothing
+	/// unless `enableToolsListChanged` advertised the capability.
 	size_t notifyToolsListChanged() @safe
 	{
 		return notifyChange("notifications/tools/list_changed", Json.undefined, "");
@@ -695,7 +811,8 @@ final class McpServer : ServerCore
 	/// stream is open. Call after a runtime `registerResource` /
 	/// `registerResourceTemplate` (or a removal). For the modern protocol, the
 	/// notification is suppressed unless a client opted in via
-	/// `subscriptions/listen` with `resourcesListChanged:true`.
+	/// `subscriptions/listen` with `resourcesListChanged:true`. Sends nothing
+	/// unless `enableResourcesListChanged` advertised the capability.
 	size_t notifyResourcesListChanged() @safe
 	{
 		return notifyChange("notifications/resources/list_changed", Json.undefined, "");
@@ -707,7 +824,8 @@ final class McpServer : ServerCore
 	/// Returns the number of listeners reached; `0` when no GET stream is open.
 	/// Call after a runtime `registerPrompt` (or a removal). For 2026-07-28
 	/// protocol, the notification is suppressed unless a client opted in via
-	/// `subscriptions/listen` with `promptsListChanged:true`.
+	/// `subscriptions/listen` with `promptsListChanged:true`. Sends nothing
+	/// unless `enablePromptsListChanged` advertised the capability.
 	size_t notifyPromptsListChanged() @safe
 	{
 		return notifyChange("notifications/prompts/list_changed", Json.undefined, "");
@@ -724,8 +842,8 @@ final class McpServer : ServerCore
 	/// `resources/list`). It is delivered only when a client is currently
 	/// subscribed to `uri` (via `resources/subscribe`); for an unsubscribed URI
 	/// it is a no-op returning `0`. For the modern protocol the notification is
-	/// additionally suppressed unless a client opted in via `subscriptions/listen`
-	/// with `resourceSubscriptions:true`. Returns the number of GET-stream
+	/// additionally suppressed unless a client listed `uri` in a
+	/// `subscriptions/listen` `resourceSubscriptions`. Returns the number of GET-stream
 	/// listeners reached; `0` when no GET stream is open.
 	size_t notifyResourceUpdated(string uri) @safe
 	{
@@ -736,7 +854,7 @@ final class McpServer : ServerCore
 		// server (where the tool handler that calls this runs against a fresh
 		// per-request state, NOT the listen stream's state nor the stale
 		// `activeConnection`). The 2025-era subscribe-then-deliver-on-GET path runs
-		// through `notifyChange`'s plain-GET fallback (`isSubscribed(uri)`), so
+		// through `notifyChange`'s plain-GET fallback (`plainGetEligibleFor`), so
 		// no caller-`cs` gate is applied here.
 		Json params = Json.emptyObject;
 		params["uri"] = uri;
@@ -748,31 +866,42 @@ final class McpServer : ServerCore
 	/// `RequestContext.elicitUrl`) has finished, so the client can stop waiting on
 	/// it (basic/utilities/elicitation §"Completion Notifications for URL Mode
 	/// Elicitation"). Per spec the notification MUST carry the `elicitationId` that
-	/// correlates it with the original request. It is delivered on the standalone
-	/// GET SSE stream (the unsolicited server->client channel); returns the number
-	/// of listeners reached, or `0` when no GET stream is open (or the server is
-	/// not on a Streamable HTTP transport). Throws `invalidParams` on an empty
-	/// `elicitationId`.
+	/// correlates it with the original request. It is delivered on a standalone GET
+	/// SSE stream of `sessionId` only — the session that received the elicitation,
+	/// i.e. `connectionTokenOf(ctx)` of the request that called `elicitUrl` ("" on
+	/// a server without sessions). Returns the number of streams reached, or `0`
+	/// when that session has no GET stream open (or the server is not on a
+	/// Streamable HTTP transport). Throws an `Exception` on an empty
+	/// `elicitationId`, and on an empty `sessionId` from a stateful server with
+	/// a push channel attached.
 	///
-	/// The modern (modern) protocol removed this notification: a modern client tracks
+	/// The 2026-07-28 protocol removed this notification: a modern client tracks
 	/// URL-mode completion through the MRTR request-state retry, not a server push.
-	/// On a negotiated modern session this is therefore a no-op returning `0`; it
-	/// remains in effect for 2025-11-25 and earlier, where the notification is valid.
-	size_t notifyElicitationComplete(string elicitationId) @safe
+	/// It is therefore never delivered on a modern `subscriptions/listen` stream
+	/// (HTTP or stdio); only 2025-era GET streams receive it.
+	size_t notifyElicitationComplete(string sessionId, string elicitationId) @safe
 	{
-		if (negotiatedVersion().isModern)
-			return 0;
+		enum method = "notifications/elicitation/complete";
 		if (elicitationId.length == 0)
-			throw invalidParams(
-					"notifications/elicitation/complete requires a non-empty elicitationId");
+			throw new Exception(method ~ " requires a non-empty elicitationId");
+		// Every stream of a stateful HTTP server belongs to a session, and an
+		// empty token would let the notification land on an arbitrary one.
+		if (sessionId.length == 0 && mode_ == ServerMode.stateful && pushChannel !is null)
+			throw new Exception(method ~ " on a stateful server requires the sessionId"
+					~ " of the session that received the elicitation");
 		Json params = Json.emptyObject;
 		params["elicitationId"] = elicitationId;
-		return notify("notifications/elicitation/complete", params);
+		// stdio carries one implicit peer whose connection token is "".
+		size_t delivered = sessionId.length == 0 ? writeStdioPlain(method, params, "") : 0;
+		if (pushChannel !is null)
+			delivered += pushChannel.pushToSession(sessionId, method, params);
+		return delivered;
 	}
 
-	/// The capabilities advertised by the connected client (valid after
-	/// `initialize`).
-	ClientCapabilities clientCapabilities() const @safe
+	/// The client capabilities declared on the single bound connection (stdio /
+	/// in-process). Per-request code reads `RequestContext.clientCapabilities`,
+	/// which reflects the request's own session or `_meta`.
+	package(mcp) ClientCapabilities clientCapabilities() const @safe
 	{
 		return activeConnection.clientCaps;
 	}
@@ -790,11 +919,41 @@ final class McpServer : ServerCore
 	/// Register a direct resource with a reader for its contents. An optional
 	/// per-resource modern `CacheableResult` freshness hint is emitted on this
 	/// resource's `resources/read` response (modern protocol only).
+	///
+	/// This is the context-less, single-content form; the other overloads take a
+	/// reader that receives the per-request `RequestContext` and/or returns
+	/// several contents (`ReadResourceResult.contents` is an array).
 	void registerResource(Resource descriptor, ResourceContents delegate() @safe reader,
 			Nullable!CacheHint cache = Nullable!CacheHint.init) @safe
 	{
+		registerResource(descriptor, (RequestContext) => [reader()], cache);
+	}
+
+	/// As above, for a context-less reader returning several contents.
+	void registerResource(Resource descriptor, ResourceContents[]delegate() @safe reader,
+			Nullable!CacheHint cache = Nullable!CacheHint.init) @safe
+	{
+		registerResource(descriptor, (RequestContext) => reader(), cache);
+	}
+
+	/// As above, for a single-content reader receiving the per-request
+	/// `RequestContext`.
+	void registerResource(Resource descriptor,
+			ResourceContents delegate(RequestContext ctx) @safe reader,
+			Nullable!CacheHint cache = Nullable!CacheHint.init) @safe
+	{
+		registerResource(descriptor, (RequestContext ctx) => [reader(ctx)], cache);
+	}
+
+	/// Register a direct resource whose reader receives the per-request
+	/// `RequestContext` and returns every content item. The canonical form the
+	/// other overloads adapt onto.
+	void registerResource(Resource descriptor, ResourceReader reader,
+			Nullable!CacheHint cache = Nullable!CacheHint.init) @safe
+	{
 		if (descriptor.uri in resources)
-			throw new Exception("a resource with uri '" ~ descriptor.uri ~ "' is already registered");
+			throw alreadyRegistered("a resource with uri '" ~ descriptor.uri ~ "'",
+					"removeResource");
 		resources[descriptor.uri] = RegisteredResource(descriptor, reader, cache);
 	}
 
@@ -802,34 +961,71 @@ final class McpServer : ServerCore
 	/// captured `{var}` parameters. An optional per-template modern `CacheableResult`
 	/// freshness hint is emitted on a matching `resources/read` (modern only).
 	///
-	/// This is the context-less form; for a reader that needs the per-request
-	/// `RequestContext` (logging, cancellation, elicitation) use the overload
-	/// taking a `(string, string[string], RequestContext)` reader.
+	/// This is the context-less, single-content form; the other overloads take a
+	/// reader that receives the per-request `RequestContext` (logging,
+	/// cancellation, elicitation) and/or returns several contents.
 	void registerResourceTemplate(ResourceTemplate descriptor, ResourceContents delegate(string uri,
 			string[string] params) @safe reader, Nullable!CacheHint cache = Nullable!CacheHint.init) @safe
 	{
-		// Adapt the context-less reader to the context-aware form, ignoring the
-		// per-request context.
+		registerResourceTemplate(descriptor, (string uri, string[string] params,
+				RequestContext) => [reader(uri, params)], cache);
+	}
+
+	/// As above, for a context-less reader returning several contents.
+	void registerResourceTemplate(ResourceTemplate descriptor, ResourceContents[]delegate(string uri,
+			string[string] params) @safe reader, Nullable!CacheHint cache = Nullable!CacheHint.init) @safe
+	{
 		registerResourceTemplate(descriptor, (string uri, string[string] params,
 				RequestContext) => reader(uri, params), cache);
 	}
 
-	/// Register a resource template whose reader also receives the per-request
-	/// `RequestContext`, so a template handler can log, poll cancellation, or
-	/// elicit through the real request channel. Otherwise identical to the
-	/// context-less overload.
+	/// As above, for a single-content reader receiving the per-request
+	/// `RequestContext`.
+	void registerResourceTemplate(ResourceTemplate descriptor,
+			ResourceContents delegate(string uri, string[string] params,
+				RequestContext ctx) @safe reader,
+			Nullable!CacheHint cache = Nullable!CacheHint.init) @safe
+	{
+		registerResourceTemplate(descriptor, (string uri, string[string] params,
+				RequestContext ctx) => [reader(uri, params, ctx)], cache);
+	}
+
+	/// Register a resource template whose reader receives the per-request
+	/// `RequestContext` and returns every content item. The canonical form the
+	/// other overloads adapt onto.
 	void registerResourceTemplate(ResourceTemplate descriptor,
 			TemplateReader reader, Nullable!CacheHint cache = Nullable!CacheHint.init) @safe
 	{
-		// Two adjacent variables ("{a}{b}") can never be reverse-matched against a
-		// concrete URI (there is no boundary between them), so such a template would
-		// silently never match; reject it at registration rather than shadowing it.
-		import std.string : indexOf;
-
-		if (descriptor.uriTemplate.indexOf("}{") >= 0)
+		// A template with adjacent variables would silently never match; reject
+		// it at registration rather than shadowing it.
+		const tmpl = descriptor.uriTemplate;
+		if (hasAdjacentUriVariables(tmpl))
 			throw new Exception("resource template '" ~ descriptor.name
-					~ "' has adjacent variables that can never match: " ~ descriptor.uriTemplate);
+					~ "' has adjacent variables that can never match: " ~ tmpl);
+		foreach (ref t; templates)
+			if (t.descriptor.uriTemplate == tmpl)
+				throw alreadyRegistered("a resource template '" ~ tmpl ~ "'",
+						"removeResourceTemplate");
 		templates ~= RegisteredTemplate(descriptor, reader, cache);
+	}
+
+	/// Unregister a previously registered resource template by its `uriTemplate`.
+	/// Returns `true` if a template was removed, `false` if none was registered
+	/// under that template. The mirror of `registerResourceTemplate`; pair with
+	/// `notifyResourcesListChanged` to inform connected clients. Existing
+	/// `resources/subscribe` entries for URIs the template matched are kept, since
+	/// such a URI may still be served by another template; unsubscribe them, or
+	/// stop notifying them, as the application requires.
+	bool removeResourceTemplate(string uriTemplate) @safe
+	{
+		import std.algorithm : countUntil, remove;
+
+		const i = templates.countUntil!(t => t.descriptor.uriTemplate == uriTemplate);
+		if (i < 0)
+			return false;
+		templates = templates.remove(i);
+		resourcesDeclared_ = true;
+		return true;
 	}
 
 	/// Register a *dynamic* prompt with the handler that produces its messages.
@@ -841,12 +1037,17 @@ final class McpServer : ServerCore
 	/// marshals typed parameters and dispatches through this same dynamic path.
 	void registerPrompt(Prompt descriptor, GetPromptResult delegate(Json) @safe handler) @safe
 	{
-		// Adapt the simple handler — which always produces a final result — to the
-		// `PromptResponse`-returning form, ignoring the per-request context. Prompts
-		// registered this way never emit an `InputRequiredResult`.
+		registerPrompt(descriptor, (Json args, RequestContext) => handler(args));
+	}
+
+	/// As the context-less overload, but the handler also receives the
+	/// per-request `RequestContext`. It always produces a final result, so a
+	/// prompt registered this way never emits an `InputRequiredResult`.
+	void registerPrompt(Prompt descriptor, PromptHandler handler) @safe
+	{
 		requirePromptNameAvailable(descriptor.name);
 		prompts[descriptor.name] = RegisteredPrompt(descriptor, (Json args,
-				RequestContext ctx) => PromptResponse.complete(handler(args)));
+				RequestContext ctx) => PromptResponse.complete(handler(args, ctx)));
 	}
 
 	/// Throw when a prompt with `name` is already registered, mirroring the tool
@@ -854,7 +1055,7 @@ final class McpServer : ServerCore
 	private void requirePromptNameAvailable(string name) @safe
 	{
 		if (name in prompts)
-			throw new Exception("a prompt named '" ~ name ~ "' is already registered");
+			throw alreadyRegistered("a prompt named '" ~ name ~ "'", "removePrompt");
 	}
 
 	/// Register a *dynamic* prompt whose handler may, on a stateless (MRTR) modern
@@ -888,16 +1089,17 @@ final class McpServer : ServerCore
 	}
 
 	/// Register a completer for a single `(reference, argumentName)` pair, so a
-	/// consumer no longer hand-routes every completable argument inside one global
-	/// `setCompletionRequestHandler` delegate. The delegate receives the partial
-	/// value typed so far and returns the candidate completions; the server wraps
-	/// them in a `CompleteResult` (use `CompleteResult.prefixMatch` for the common
-	/// prefix-matching case). Declaring any completer advertises the `completions`
-	/// capability. `completion/complete` dispatch tries the global handler first
-	/// (when set) and falls back to a matching per-argument completer, then to an
-	/// empty `CompleteResult`.
+	/// consumer need not hand-route every completable argument inside one global
+	/// `setCompletionRequestHandler` delegate. The delegate receives the parsed
+	/// `CompleteRequest` (the partial value in `argumentValue`, previously
+	/// resolved arguments in `context`) and returns the `CompleteResult` (use
+	/// `CompleteResult.prefixMatch` for the common prefix-matching case).
+	/// Declaring any completer advertises the `completions` capability.
+	/// `completion/complete` dispatch tries the global handler first (when set)
+	/// and, when it returns no values, falls back to a matching per-argument
+	/// completer, then to an empty `CompleteResult`.
 	void setArgumentCompleter(CompletionReference reference, string argumentName,
-			string[]delegate(string prefix) @safe completer) @safe
+			CompleteResult delegate(CompleteRequest request) @safe completer) @safe
 	{
 		argumentCompleters[argumentCompleterKey(reference, argumentName)] = completer;
 	}
@@ -921,15 +1123,20 @@ final class McpServer : ServerCore
 	/// the client signals its root list changed (client/roots: "Servers SHOULD
 	/// ... handle root list changes gracefully"). Mirrors the client-side
 	/// `onNotification` observer. Purely an application-facing callback; it does
-	/// not affect the JSON-RPC wire output for any protocol version.
+	/// not affect the JSON-RPC wire output for any protocol version: an exception
+	/// the observer throws is logged and otherwise ignored.
 	///
-	/// The observer itself receives no `RequestContext`: inbound notifications are
-	/// dispatched without one. To issue the `ctx.listRoots()` refresh, capture a
-	/// server->client-capable `RequestContext` from a prior request handler (e.g. a
-	/// `tools/call`) and call it from this observer; on stdio that captured context
-	/// (a `StdioContext` bound to the duplex channel) round-trips the `roots/list`
-	/// request to the client from any task.
-	void setClientNotificationHandler(void delegate(string method, Json params) @safe handler) @safe
+	/// `ctx` is the context the notification arrived on and identifies its
+	/// sender: `connectionTokenOf(ctx)` is the connection / session it came from
+	/// (the `Mcp-Session-Id` on stateful Streamable HTTP, the legacy HTTP+SSE
+	/// session, "" on stdio's single connection) and `ctx.auth()` is the
+	/// request's validated bearer token where the transport enforces auth. On a
+	/// transport with a server->client channel for the notification (stdio,
+	/// legacy HTTP+SSE) a stateful server can call `ctx.listRoots()` on it
+	/// directly; a Streamable HTTP notification POST carries no such channel, so
+	/// refresh through a context captured from a request on the same session.
+	void setClientNotificationHandler(void delegate(string method, Json params,
+			RequestContext ctx) @safe handler) @safe
 	{
 		onClientNotification_ = handler;
 	}
@@ -937,13 +1144,18 @@ final class McpServer : ServerCore
 	/// Convenience observer fired specifically on
 	/// `notifications/roots/list_changed`. Invoked in addition to any handler
 	/// registered via `setClientNotificationHandler`. Set to react to client
-	/// root-list changes without inspecting the method string yourself.
-	void setRootsListChangedHandler(void delegate() @safe handler) @safe
+	/// root-list changes without inspecting the method string yourself. `ctx`
+	/// identifies the client whose roots changed, as for
+	/// `setClientNotificationHandler`.
+	void setRootsListChangedHandler(void delegate(RequestContext ctx) @safe handler) @safe
 	{
 		onRootsListChanged_ = handler;
 	}
 
-	/// Advertise the logging capability and accept `logging/setLevel`.
+	/// Advertise the logging capability so `ctx.log` emits `notifications/message`.
+	/// A stateful server also accepts `logging/setLevel`; a stateless one has no
+	/// session to hold the level and answers it with -32601, logging at the
+	/// default `info` minimum or the modern request's `_meta` log level.
 	void enableLogging() @safe
 	{
 		loggingEnabled = true;
@@ -969,12 +1181,11 @@ final class McpServer : ServerCore
 		resourceSubscriptionsEnabled = true;
 	}
 
-	/// Whether resource subscriptions are effectively active: the author called
-	/// `enableResourceSubscriptions()` AND the server is `stateful`. A `stateless`
-	/// server keeps no per-peer state across HTTP calls, so the `subscribe`
-	/// capability is neither advertised nor honoured even if opted in. Gated on
-	/// the server MODE, not the protocol version, so modern and
-	/// legacy stateless are treated identically.
+	/// Whether 2025-era `resources/subscribe` is effectively active: the author
+	/// called `enableResourceSubscriptions()` AND the server is `stateful`. A
+	/// `stateless` server keeps no per-peer state across HTTP calls, so it never
+	/// serves `resources/subscribe`; on 2026-07-28 it offers resource updates
+	/// through `subscriptions/listen` instead (`listenResourceSubscriptions`).
 	private bool effectiveResourceSubscriptions() const @safe
 	{
 		return resourceSubscriptionsEnabled && mode_ == ServerMode.stateful;
@@ -1002,60 +1213,104 @@ final class McpServer : ServerCore
 
 	/// Enable the SEP-2663 MCP Tasks extension (`io.modelcontextprotocol/tasks`).
 	/// Advertises the extension in `server/discover` capabilities (modern only) and
-	/// routes `tasks/get` / `tasks/update` / `tasks/cancel` against `store`
-	/// (default: in-memory). `opts` tunes the ID generator, default TTL / poll
-	/// interval, and TTL sweep cadence. `dispatcher` decides where a `@task`
-	/// executor runs (default: an in-process fiber; supply a queue-backed
-	/// dispatcher for a durable, multi-node deployment). The runtime emits
-	/// `notifications/tasks` on status changes via the server's notify path.
-	/// Returns the `TaskRuntime` so tools can create and resolve tasks.
-	TaskRuntime enableTasks(TaskStore store = null,
-			TaskOptions opts = TaskOptions.init, TaskDispatcher dispatcher = null) @safe
+	/// routes `tasks/get` / `tasks/update` / `tasks/cancel` against `opts.store`
+	/// (default: in-memory). `opts` also picks the `dispatcher` that decides where
+	/// a `@taskTool` executor runs (default: an in-process fiber; supply a
+	/// queue-backed dispatcher for a durable, multi-node deployment) and tunes the
+	/// ID generator, default TTL / poll interval, and TTL sweep cadence (the
+	/// sweeper runs until `shutdown`). The runtime emits
+	/// `notifications/tasks` on status changes to the task owner's streams (for
+	/// a task created without an authenticated principal, only over stdio; HTTP
+	/// clients poll `tasks/get`). Returns the `TaskRuntime` so tools can create and resolve tasks.
+	/// Throws on a `stateful` server, which never negotiates the modern protocol
+	/// the extension requires, and when the current runtime already holds tasks,
+	/// which replacing it would drop.
+	TaskRuntime enableTasks(TaskOptions opts = TaskOptions.init) @safe
 	{
-		taskRuntime_ = new TaskRuntime((store is null) ? new InMemoryTaskStore() : store, opts);
-		taskDispatcher_ = (dispatcher is null) ? new InProcessTaskDispatcher() : dispatcher;
-		taskRuntime_.onStatusChange((Json detailed) @safe {
-			notify("notifications/tasks", detailed);
+		if (mode_ == ServerMode.stateful)
+			throw new Exception("enableTasks() is not available on a stateful server: the"
+					~ " Tasks extension is modern-only and a stateful server never speaks"
+					~ " 2026-07-28. Construct the server with McpServer.stateless() instead.");
+		if (taskRuntime_ !is null)
+		{
+			bool holdsTasks;
+			taskRuntime_.store.removeIf((const TaskRecord) @safe {
+				holdsTasks = true;
+				return false;
+			});
+			if (holdsTasks)
+				throw new Exception("enableTasks() must come before any task is created:"
+						~ " a new runtime would drop the tasks the current one holds");
+			taskRuntime_.stopSweeper();
+		}
+		taskRuntime_ = new TaskRuntime(opts);
+		taskRuntime_.exposeInternalErrors = exposeInternalErrors_;
+		taskDispatcher_ = (opts.dispatcher is null) ? new InProcessTaskDispatcher()
+			: opts.dispatcher;
+		taskRuntime_.onStatusChange((Json detailed, string owner) @safe {
+			notifyPrincipal(owner, "notifications/tasks", detailed);
 		});
+		// Unit tests drive `sweepExpired` directly.
+		version (unittest)
+		{
+		}
+		else
+		{
+			if (opts.sweepInterval > Duration.zero)
+				taskRuntime_.startSweeper(opts.sweepInterval);
+		}
 		tasksEnabled_ = true;
-		enableExtension(tasksExtensionKey, Json.emptyObject);
+		advertiseExtension(tasksExtensionKey, Json.emptyObject);
 		return taskRuntime_;
 	}
 
-	/// Register a `@task` tool: a tool whose `tools/call` returns a task handle
+	/// Enable the Tasks extension with default options unless it is already
+	/// enabled, for registering `what` (e.g. "task tool 'x'"). Throws, naming
+	/// `what`, on a `stateful` server, which never speaks the modern protocol.
+	private void ensureTasks(string what) @safe
+	{
+		if (taskRuntime_ !is null)
+			return;
+		if (mode_ == ServerMode.stateful)
+			throw new Exception(what ~ " needs the Tasks extension, which is modern-only,"
+					~ " and a stateful server never speaks 2026-07-28. Construct the server"
+					~ " with McpServer.stateless() instead.");
+		enableTasks();
+	}
+
+	/// Register a `@taskTool` tool: a tool whose `tools/call` returns a task handle
 	/// immediately and runs `executor` asynchronously via the dispatcher. The
 	/// executor is stored by `descriptor.name` so the dispatcher can re-invoke it
-	/// on each `tasks/update`. `ttl` / `pollInterval` seed the task's TTL and
-	/// suggested poll cadence (null inherits the runtime's defaults). `support`
-	/// says what a client that did not declare the Tasks extension gets:
-	/// `optional` (the default) runs the executor inline and returns its result as
-	/// a plain tool result, `required` rejects the call with -32021. Requires
-	/// `enableTasks` to have been called first. Used by the UDA reflection layer;
-	/// callable directly for dynamic task tools.
+	/// on each `tasks/update`. `opts` sets each task's TTL / poll cadence and
+	/// what a client without the Tasks extension gets (see `TaskToolOptions`).
+	/// Enables the Tasks extension with default options when it is not yet
+	/// enabled; a later `enableTasks(opts)` replaces those options and keeps the
+	/// registered task tools. Throws on a `stateful` server. Used by the UDA
+	/// reflection layer; callable directly for dynamic task tools.
 	void registerTaskTool(Tool descriptor, TaskExecutor executor,
-			Nullable!Duration ttl = Nullable!Duration.init,
-			Nullable!Duration pollInterval = Nullable!Duration.init,
-			TaskSupport support = TaskSupport.optional) @safe
+			TaskToolOptions opts = TaskToolOptions.init) @safe
 	{
-		registerTaskExecutor(descriptor.name, executor);
+		ensureTasks("task tool '" ~ descriptor.name ~ "'");
 		const toolName = descriptor.name;
-		const ttlDur = ttl;
-		const pollDur = pollInterval;
+		const create = opts.create;
+		// The tool is registered first so a name clash throws before the
+		// executor map changes.
 		registerTool(descriptor, (Json args, RequestContext ctx) @safe {
-			return startTask(toolName, args, ctx, ttlDur, pollDur);
+			return startTask(toolName, args, ctx, create);
 		});
-		setToolTaskSupport(descriptor.name, support == TaskSupport.none
-				? TaskSupport.optional : support);
+		registerTaskExecutor(descriptor.name, executor);
+		setToolTaskSupport(descriptor.name, opts.support == TaskSupport.none
+				? TaskSupport.optional : opts.support);
 	}
 
 	/// Register the executor that drives tasks created under `name`, without
 	/// listing a tool of that name. `startTask(name, …)` then creates and
 	/// dispatches such a task; `registerTaskTool` registers the executor and the
-	/// tool together. Requires `enableTasks` to have been called first.
+	/// tool together. Enables the Tasks extension with default options when it is
+	/// not yet enabled, and throws on a `stateful` server.
 	void registerTaskExecutor(string name, TaskExecutor executor) @safe
 	{
-		if (taskRuntime_ is null)
-			throw internalError("registerTaskExecutor requires enableTasks() first");
+		ensureTasks("task executor '" ~ name ~ "'");
 		taskExecutors_[name] = executor;
 	}
 
@@ -1077,43 +1332,59 @@ final class McpServer : ServerCore
 	/// requesting principal, dispatch it, and return the `CreateTaskResult`
 	/// (`resultType: "task"`) as the tool response. The task is durably stored
 	/// before this returns, so a `tasks/get` for the returned id resolves at
-	/// once. `input` is the executor's durable input (`TaskContext.inputJson`).
-	/// Throws when `enableTasks` was not called or no executor is registered
-	/// under `name`.
+	/// once. `input` is the executor's durable input (`TaskContext.inputJson`);
+	/// `opts` sets its TTL and poll cadence (its owner is always the requesting
+	/// principal).
+	/// A request whose client did not declare the Tasks extension cannot receive
+	/// a task handle, so the executor instead runs to completion on the calling
+	/// fiber and its result is returned as an ordinary tool result. Throws when
+	/// `enableTasks` was not called or no executor is registered under `name`.
 	ToolResponse startTask(string name, Json input, RequestContext ctx,
-			Nullable!Duration ttl = Nullable!Duration.init,
-			Nullable!Duration pollInterval = Nullable!Duration.init) @safe
+			TaskCreateOptions opts = TaskCreateOptions.init) @safe
 	{
 		import mcp.protocol.tasks : makeCreateTaskResult;
 
+		// Both are server-author mistakes, so they throw a plain Exception that
+		// the tools/call path logs and masks rather than sending to the client.
 		if (taskRuntime_ is null)
-			throw internalError("startTask requires enableTasks() first");
+			throw new Exception("startTask requires enableTasks() first");
 		if ((name in taskExecutors_) is null)
-			throw internalError("startTask: no task executor registered under '" ~ name ~ "'");
+			throw new Exception("startTask: no task executor registered under '" ~ name ~ "'");
+		if (!acceptsTasks(ctx.clientCapabilities(), ctx.protocolVersion))
+			return ToolResponse.complete(runTaskToolInline(name, input, ctx));
 		// The task is bound to the creating request's authenticated principal
 		// (if any), so every later tasks/* request must come from the same one.
-		auto seed = taskRuntime_.createFor(name, input, ttl, pollInterval, requestPrincipal(ctx));
+		opts.owner = requestPrincipal(ctx);
+		auto seed = taskRuntime_.createFor(name, input, opts);
 		taskDispatcher_.dispatch(seed.taskId, &runTaskExecutorById);
 		return ToolResponse.task(makeCreateTaskResult(seed));
 	}
 
 	/// Run the executor registered under `name` to completion on the calling
 	/// fiber and return its result as an ordinary tool result: the synchronous
-	/// path a task tool takes for a client that did not declare the Tasks
-	/// extension. The task record is still created, so the executor sees the
-	/// same `TaskContext` as when dispatched. A failed task surfaces as its
-	/// JSON-RPC error; one that needs client input cannot proceed without the
-	/// task surface and is reported as the missing extension.
+	/// path `startTask` takes for a client that did not declare the Tasks
+	/// extension. A task record exists for the duration of the call, so the
+	/// executor sees the same `TaskContext` as when dispatched, except that
+	/// cancelling the request cancels the task and `detach` is refused. A failed
+	/// task surfaces as its JSON-RPC error; one that needs client input cannot
+	/// proceed without the task surface and is reported as the missing extension.
 	private CallToolResult runTaskToolInline(string name, Json args, RequestContext ctx) @safe
 	{
 		import mcp.protocol.tasks : TaskStatus;
 
 		auto exec = name in taskExecutors_;
-		if (exec is null)
-			throw missingRequiredClientCapability(tasksRequiredCapabilities());
-		auto seed = taskRuntime_.createFor(name, args, Nullable!Duration.init,
-				Nullable!Duration.init, requestPrincipal(ctx));
-		runTaskExecutor(taskRuntime_, seed.taskId, *exec);
+		TaskCreateOptions copts;
+		copts.owner = requestPrincipal(ctx);
+		auto seed = taskRuntime_.createFor(name, args, copts);
+		// The client never learns this task's id, so the record dies with the call
+		// and its status changes are not pushed as notifications/tasks.
+		taskRuntime_.setSilent(seed.taskId, true);
+		scope (exit)
+		{
+			taskRuntime_.store.remove(seed.taskId);
+			taskRuntime_.setSilent(seed.taskId, false);
+		}
+		runTaskExecutorInline(taskRuntime_, seed.taskId, *exec, () @safe => ctx.isCancelled());
 		auto detailed = taskRuntime_.getDetailed(seed.taskId);
 		const status = detailed["status"].get!string;
 		switch (status)
@@ -1128,23 +1399,22 @@ final class McpServer : ServerCore
 					("message" in e && e["message"].type == Json.Type.string) ? e["message"]
 						.get!string : "task failed", ("data" in e) ? e["data"] : Json.undefined);
 		case "input_required":
-			throw missingRequiredClientCapability(tasksRequiredCapabilities(),
+			throw tasksExtensionRequired(
 					"The tool needs client input, which requires the Tasks extension");
+		case "cancelled":
+			throw new McpException(ErrorCode.requestCancelled, "Request cancelled");
 		default:
 			throw internalError(
 					"task '" ~ seed.taskId ~ "' did not settle synchronously (" ~ status ~ ")");
 		}
 	}
 
-	/// The `data.requiredCapabilities` of a -32021 for the Tasks extension:
-	/// `{ extensions: { "io.modelcontextprotocol/tasks": {} } }`.
-	private static ClientCapabilities tasksRequiredCapabilities() @safe
+	/// Whether a request on `ver` whose client declared `caps` can receive a task
+	/// handle: the Tasks extension is modern-only, so a 2025-era request never
+	/// can, whatever it declares under `extensions`.
+	private static bool acceptsTasks(const ClientCapabilities caps, ProtocolVersion ver) @safe
 	{
-		ClientCapabilities c;
-		Json ext = Json.emptyObject;
-		ext[tasksExtensionKey] = Json.emptyObject;
-		c.extensions = ext;
-		return c;
+		return ver.isModern && declaresTasksExtension(caps);
 	}
 
 	/// Whether `caps` declares the Tasks extension under `extensions`.
@@ -1173,7 +1443,8 @@ final class McpServer : ServerCore
 	}
 
 	/// The task runtime created by `enableTasks`, or null if tasks are not enabled.
-	/// Tool handlers use it to create (`create`) and resolve (`complete`/`fail`/
+	/// Tool handlers use it to create (`create(ctx)`, which binds the task to the
+	/// request's authenticated principal) and resolve (`complete`/`fail`/
 	/// `requireInput`/`cancel`) tasks.
 	TaskRuntime tasks() @safe
 	{
@@ -1187,13 +1458,30 @@ final class McpServer : ServerCore
 	/// long or no-expiry TTLs); `opts` tunes the emit buffer, TTL negotiation, poll
 	/// lease, and webhook security. Returns the `EventsRuntime` so the author can
 	/// `emit()` events and the reflection layer can register `@event` types.
+	/// Throws on a `stateful` server, which never negotiates the modern protocol
+	/// the extension requires. Registering an event type enables the extension
+	/// with default options, so call this first to choose them: once a type is
+	/// registered it throws rather than replace the runtime holding that type.
+	/// The periodic delivery worker runs until `shutdown`. The extension is
+	/// advertised without `listChanged`, so clients re-call `events/list` rather
+	/// than wait for `notifications/events/list_changed`.
 	EventsRuntime enableEvents(WebhookSubscriptionStore store = null,
 			EventsOptions opts = EventsOptions.init) @safe
 	{
+		if (mode_ == ServerMode.stateful)
+			throw new Exception("enableEvents() is not available on a stateful server: the"
+					~ " Events extension is modern-only and a stateful server never speaks"
+					~ " 2026-07-28. Construct the server with McpServer.stateless() instead.");
+		if (eventsRuntime_ !is null)
+		{
+			if (eventsRuntime_.list().events.length)
+				throw new Exception("enableEvents() must come before any event type is"
+						~ " registered: registering one enables the Events extension with"
+						~ " default options, and a new runtime would drop the registered types");
+			eventsRuntime_.stopDeliveryWorker();
+		}
 		eventsRuntime_ = new EventsRuntime(store, opts);
-		eventsRuntime_.onListChanged(() @safe {
-			notify(eventsListChangedNotification);
-		});
+		eventsRuntime_.exposeInternalErrors = exposeInternalErrors_;
 		// The periodic worker expires poll leases, sweeps lapsed webhook
 		// subscriptions, runs poll-driven webhook delivery, and drains the outbox.
 		// Unit tests drive the runtime's passes directly.
@@ -1206,21 +1494,49 @@ final class McpServer : ServerCore
 				eventsRuntime_.startDeliveryWorker(opts.workerInterval);
 		}
 		eventsEnabled_ = true;
-		Json settings = Json.emptyObject;
-		settings["listChanged"] = true;
-		enableExtension(eventsExtensionKey, settings);
+		// No `listChanged`: a modern client receives list-changed notifications
+		// only through a `subscriptions/listen` filter key, and the extension
+		// defines none for `notifications/events/list_changed`.
+		advertiseExtension(eventsExtensionKey, Json.emptyObject);
 		return eventsRuntime_;
+	}
+
+	/// Stop the server's background timers: the Tasks TTL sweeper
+	/// (`TaskOptions.sweepInterval`) and the Events delivery worker
+	/// (`EventsOptions.workerInterval`). Call it when tearing the server down so
+	/// neither keeps running; transports do not call it. Idempotent, and safe
+	/// when neither extension is enabled.
+	void shutdown() @safe nothrow
+	{
+		if (taskRuntime_ !is null)
+			taskRuntime_.stopSweeper();
+		if (eventsRuntime_ !is null)
+			eventsRuntime_.stopDeliveryWorker();
 	}
 
 	/// Register an event type against the events runtime. `check` is the author's
 	/// "changes since cursor" function (null for an emit-only type whose poll is
-	/// served from the ring buffer). Requires `enableEvents` first. Used by the UDA
-	/// reflection layer; callable directly for dynamic event types.
+	/// served from the ring buffer). Enables the Events extension with default
+	/// options when it is not yet enabled, and throws on a `stateful` server. Used
+	/// by the UDA reflection layer; callable directly for dynamic event types.
 	void registerEventType(EventRegistration reg) @safe
 	{
-		if (eventsRuntime_ is null)
-			throw internalError("registerEventType requires enableEvents() first");
-		eventsRuntime_.register(reg);
+		ensureEvents("event type '" ~ reg.descriptor.name ~ "'").register(reg);
+	}
+
+	/// The events runtime, enabling the Events extension with default options
+	/// unless it is already enabled, for registering `what` (e.g. "event type
+	/// 'x'"). Throws, naming `what`, on a `stateful` server, which never speaks
+	/// the modern protocol.
+	package(mcp) EventsRuntime ensureEvents(string what) @safe
+	{
+		if (eventsRuntime_ !is null)
+			return eventsRuntime_;
+		if (mode_ == ServerMode.stateful)
+			throw new Exception(what ~ " needs the Events extension, which is modern-only,"
+					~ " and a stateful server never speaks 2026-07-28. Construct the server"
+					~ " with McpServer.stateless() instead.");
+		return enableEvents();
 	}
 
 	/// The events runtime created by `enableEvents`, or null if events are not
@@ -1230,25 +1546,59 @@ final class McpServer : ServerCore
 		return eventsRuntime_;
 	}
 
-	/// Advertise a protocol extension (e.g. "io.modelcontextprotocol/tasks") with
-	/// an optional per-extension settings object. The identifier and its settings
-	/// appear in the `extensions` field of the server capabilities sent during
-	/// `initialize` / `server/discover`, per the Extension Negotiation rules, but
-	/// only once the negotiated version meets the extension's `extensionMinVersion`
-	/// floor (Apps/Skills from 2025-11-25, Tasks modern-only). `settings` defaults
-	/// to an empty object.
+	/// Advertise a third-party protocol extension (e.g. "com.example/feature")
+	/// with an optional per-extension settings object; the server only declares
+	/// it, so the application serves its methods. The identifier and its
+	/// settings appear in the `extensions` field of the server capabilities sent
+	/// during `initialize` / `server/discover`, per the Extension Negotiation
+	/// rules, once the negotiated version meets the extension's
+	/// `extensionMinVersion` floor (unknown identifiers are modern-only).
+	/// `settings` defaults to an empty object. Throws for an extension this SDK
+	/// serves itself — Tasks, Events, Apps and Skills — since advertising one
+	/// without its runtime would promise methods nobody answers; use
+	/// `enableTasks`, `enableEvents`, `enableApps` or `enableSkills` instead.
 	void enableExtension(string identifier, Json settings = Json.emptyObject) @safe
+	{
+		if (const remedy = builtInExtensionEnabler(identifier))
+			throw new Exception("enableExtension(\"" ~ identifier ~ "\") would only advertise"
+					~ " an extension this SDK serves; call " ~ remedy ~ " to enable it");
+		advertiseExtension(identifier, settings);
+	}
+
+	/// The call that enables a built-in extension, or null for any other
+	/// identifier. The Apps and Skills identifiers are spelled out because their
+	/// keys live in `mcp.api`, which builds on this module.
+	private static string builtInExtensionEnabler(string identifier) @safe
+	{
+		switch (identifier)
+		{
+		case tasksExtensionKey:
+			return "enableTasks()";
+		case eventsExtensionKey:
+			return "enableEvents()";
+		case "io.modelcontextprotocol/ui":
+			return "enableApps(server) from mcp.api.apps";
+		case "io.modelcontextprotocol/skills":
+			return "enableSkills(server) or registerSkill from mcp.api.skills";
+		default:
+			return null;
+		}
+	}
+
+	/// Record `identifier` and its settings in the advertised `extensions` map.
+	/// The built-in extensions' enable calls go through here.
+	package(mcp) void advertiseExtension(string identifier, Json settings = Json.emptyObject) @safe
 	{
 		if (extensions.type != Json.Type.object)
 			extensions = Json.emptyObject;
 		extensions[identifier] = settings;
 	}
 
-	/// The extension identifiers and settings the connected client advertised
-	/// (valid after `initialize`). `Json.undefined` if the client advertised none.
-	Json clientExtensions() const @safe
+	/// Whether `enableExtension` (or a built-in extension's `enable*` call) has
+	/// advertised the extension `identifier`.
+	bool extensionEnabled(string identifier) const @safe
 	{
-		return activeConnection.clientCaps.extensions;
+		return extensions.type == Json.Type.object && (identifier in extensions) !is null;
 	}
 
 	/// The SEP-2640 skills index, created on first `enableSkills` / `registerSkill`
@@ -1275,65 +1625,152 @@ final class McpServer : ServerCore
 		directoryReadEnabled_ = true;
 	}
 
-	/// Whether a client is currently subscribed to updates for `uri`.
-	bool isSubscribed(string uri) const @safe
-	{
-		return (uri in activeConnection.subscriptions) !is null;
-	}
-
-	/// The most recently set log level (default "info").
-	string currentLogLevel() const @safe
-	{
-		return activeConnection.logLevel;
-	}
-
 	/// Attach the server->client push channel for *unsolicited* traffic — the
 	/// messages a server sends on the standalone SSE stream a client opens with
 	/// an HTTP GET to the MCP endpoint (basic/transports §Listening for Messages
 	/// from the Server), outside any in-flight POST. The Streamable HTTP
 	/// transport creates one channel per mount and attaches it here (via
 	/// `ensurePushChannel`); the `notify*`/`ping*` APIs deliver through it.
-	/// Attaching when a channel is already present is a no-op, so a second mount
-	/// of the same server reuses the first mount's channel.
-	void attachPushChannel(PushChannel channel) @safe
+	/// A server carries one channel: re-attaching the attached channel is a
+	/// no-op, and attaching a different one throws (a second mount reuses the
+	/// first mount's channel through `ensurePushChannel`).
+	package(mcp) void attachPushChannel(PushChannel channel) @safe
 	{
 		if (pushChannel is null)
 			pushChannel = channel;
+		else if (pushChannel !is channel)
+			throw new Exception("a push channel is already attached to this server");
 	}
 
 	/// The attached server->client push channel, or null if none has been
 	/// attached (e.g. the server is not mounted on a Streamable HTTP transport).
-	PushChannel serverPushChannel() @safe
+	/// Internal: its raw delivery skips the `listChanged` and resource
+	/// subscription gates the public `notify*` APIs apply.
+	package(mcp) PushChannel serverPushChannel() @safe
 	{
 		return pushChannel;
 	}
 
 	/// Send an *unsolicited* JSON-RPC notification to every client currently
-	/// listening on the standalone GET SSE stream. This is the public entry point
-	/// for server-initiated traffic outside an in-flight request — e.g. a
-	/// `notifications/resources/updated` for a subscribed resource, or a
-	/// `notifications/tools/list_changed`. Returns the number of listeners the
-	/// notification was delivered to; `0` when no GET stream is open (or the
-	/// server is not on a Streamable HTTP transport). On a stdio server with an
+	/// listening on the standalone GET SSE stream or a `subscriptions/listen`
+	/// stream: once per session (on one of its streams) and once per listen
+	/// stream, skipping listen streams whose filter did not request this type.
+	/// This is the public entry point for server-initiated traffic outside an
+	/// in-flight request. Returns the number of sessions / listen streams reached;
+	/// `0` when none is open (or the server is not on a Streamable HTTP
+	/// transport). On a stdio server with an
 	/// active modern `subscriptions/listen` it is additionally written to stdout
 	/// (stamped with the listen subscriptionId), since that transport shares one
-	/// channel for all server->client traffic.
+	/// channel for all server->client traffic. A list-changed notification whose
+	/// `listChanged` capability the server does not advertise is not sent, and a
+	/// `notifications/resources/updated` reaches a 2025-era stream only when its
+	/// session subscribed to the URI, exactly as `notifyResourceUpdated`.
 	size_t notify(string method, Json params = Json.undefined) @safe
 	{
-		size_t delivered;
-		// Stdio `subscriptions/listen` channel (2026-07-28): the single stdout channel
-		// carries notifications too, stamped with the listen request's id as the
-		// subscriptionId so the client can correlate them (2026-07-28 basic/utilities/
-		// subscriptions). This is in addition to any HTTP push channel below.
-		if (stdioListenSink !is null)
+		return notifyChange(method, params, listenFilterKey(method, params));
+	}
+
+	/// Write `method` to the stdio `subscriptions/listen` stream, if one is open
+	/// and its filter accepts it, stamped with the listen request's id as the
+	/// subscriptionId so the client can correlate it (2026-07-28 basic/utilities/
+	/// subscriptions). Returns the number of streams reached (0 or 1).
+	private size_t writeStdioListen(string method, Json params) @safe
+	{
+		return writeStdioListen(method, params, listenFilterKey(method, params));
+	}
+
+	/// Install the stdio transport's write sink. Called by `serveStdio` before its
+	/// read loop starts.
+	package(mcp) void attachStdioSink(void delegate(string) @safe sink) @safe
+	{
+		stdioSink_ = sink;
+	}
+
+	/// Drop every piece of stdio stream state once `serveStdio` returns: the write
+	/// sink, the `subscriptions/listen` stream, and every open `events/stream`
+	/// (closing each releases its subscription). The client has gone, so no
+	/// closing frames are written.
+	package(mcp) void detachStdio() @safe
+	{
+		stdioSink_ = null;
+		stdioListenSink = null;
+		stdioListenSubscriptionId = Json.init;
+		stdioListenFilter_ = ListenFilter.init;
+		auto streams = stdioEventStreams_;
+		stdioEventStreams_ = null;
+		foreach (handle; streams.byValue)
 		{
-			auto note = withListenSubscriptionId(makeNotification(method,
-					params), stdioListenSubscriptionId);
-			stdioListenSink(note.toString());
-			delivered++;
+			handle.stream.onTerminated = null;
+			try
+				handle.close();
+			catch (Exception)
+			{
+				// Teardown continues for the remaining streams.
+			}
 		}
-		if (pushChannel !is null)
-			delivered += pushChannel.notify(method, params);
+	}
+
+	/// Write `method` unstamped to a 2025-era stdio client: one whose stateful
+	/// `initialize` has been processed on the bound connection (a stateful server
+	/// never speaks 2026-07-28, whose clients use `subscriptions/listen` instead).
+	/// Delivery follows the 2025-era rules: `notifications/resources/updated`
+	/// only for a URI the client subscribed to (callers gate list-changed
+	/// notifications on `listChangedAdvertised`). Returns the number of clients
+	/// reached (0 or 1).
+	private size_t writeStdioPlain(string method, Json params, string uri) @safe
+	{
+		if (stdioSink_ is null || mode_ != ServerMode.stateful)
+			return 0;
+		auto conn = activeConnection;
+		if (!conn.initializeProcessed || conn.negotiated.isModern)
+			return 0;
+		if (!plainGetEligibleFor(conn, method, uri))
+			return 0;
+		stdioSink_(makeNotification(method, params).toString());
+		return 1;
+	}
+
+	/// Whether the server advertises the `listChanged` capability a list-changed
+	/// `method` belongs to; true for any other method.
+	private bool listChangedAdvertised(string method) @safe
+	{
+		switch (method)
+		{
+		case "notifications/tools/list_changed":
+			return toolListChangedEnabled;
+		case "notifications/resources/list_changed":
+			return resourcesListChangedEnabled;
+		case "notifications/prompts/list_changed":
+			return promptsListChangedEnabled;
+		default:
+			return true;
+		}
+	}
+
+	/// As `writeStdioListen(method, params)`, filtering on the given resource `uri`
+	/// ("" for a notification not about one resource).
+	private size_t writeStdioListen(string method, Json params, string uri) @safe
+	{
+		if (stdioListenSink is null)
+			return 0;
+		if (!stdioListenFilter_.accepts(method, uri))
+			return 0;
+		auto note = withListenSubscriptionId(makeNotification(method, params),
+				stdioListenSubscriptionId);
+		stdioListenSink(note.toString());
+		return 1;
+	}
+
+	/// `notify`, restricted to the streams opened by `principal` (the
+	/// authenticated token subject), for notifications whose payload belongs to
+	/// one principal. With no principal only the stdio listen stream is reached:
+	/// anonymous HTTP streams cannot be told apart, and an ownerless task's id is
+	/// the only key to its result, so it must not reach other clients.
+	private size_t notifyPrincipal(string principal, string method, Json params) @safe
+	{
+		size_t delivered = writeStdioListen(method, params);
+		if (pushChannel !is null && principal.length)
+			delivered += pushChannel.notifyPrincipal(principal, method, params);
 		return delivered;
 	}
 
@@ -1352,7 +1789,7 @@ final class McpServer : ServerCore
 	/// stamped acknowledgement as that leading message. Legacy versions never
 	/// defined `subscriptions/listen`, so they take the normal path (returns
 	/// `false`) and the request is answered conventionally.
-	bool tryServeStdioListen(Message msg, void delegate(string) @safe writeLine) @safe
+	package(mcp) bool tryServeStdioListen(Message msg, void delegate(string) @safe writeLine) @safe
 	{
 		if (msg.kind != MessageKind.request || msg.method != "subscriptions/listen")
 			return false;
@@ -1361,16 +1798,34 @@ final class McpServer : ServerCore
 		if (!meta.protocolVersion.length
 				|| !tryParseVersion(meta.protocolVersion, mv) || !mv.isModern)
 			return false;
-
+		if (auto err = modernStreamRequestError(meta))
+		{
+			writeLine(makeErrorResponse(msg.id, err).toString());
+			return true;
+		}
 		// Do NOT overwrite the shared session `clientCaps` here: 2026-07-28
 		// listen request's _meta capabilities are per-request and 2026-07-28
 		// `tools/call` gate already reads them from RequestMeta.fromParams(params);
 		// clobbering the field would wipe the capabilities a prior/concurrent
 		// stateful initialize negotiated. (Delivery on this stream is governed by
 		// the per-stream filter captured below, not a connection-level version.)
-		// Record the opted-in filters; the one-shot {acknowledged:true} result is
-		// discarded (the spec defines no such Result — the ack is a notification).
-		doSubscribeListen(msg.params, cs());
+		// The filter is parsed onto a scratch state first, so an invalid request
+		// is rejected without disturbing the open stream; the one-shot
+		// {acknowledged:true} result is discarded (the spec defines no such
+		// Result — the ack is a notification).
+		auto parsed = new ConnectionState;
+		try
+			doSubscribeListen(msg.params, parsed);
+		catch (McpException e)
+		{
+			writeLine(makeErrorResponse(msg.id, e).toString());
+			return true;
+		}
+
+		// Stdio carries one listen stream: a new listen replaces the open one,
+		// which is answered with its result so the client's request completes.
+		closeStdioListen();
+		cs().listenFilter = parsed.listenFilter;
 
 		// The listen request's id is the stream's subscriptionId; every
 		// notification on this channel (starting with the acknowledgement) is
@@ -1397,6 +1852,38 @@ final class McpServer : ServerCore
 		return true;
 	}
 
+	/// The error a modern stream request (`subscriptions/listen`, `events/stream`)
+	/// on any transport is answered with instead of opening its stream: a stateful
+	/// server never speaks the modern protocol these streams belong to, and a
+	/// stateless one requires the `_meta` client capabilities. Null when the stream
+	/// may open.
+	package(mcp) McpException modernStreamRequestError(RequestMeta meta) @safe
+	{
+		if (mode_ == ServerMode.stateful)
+			return unsupportedVersionError(meta.protocolVersion);
+		if (!meta.hasClientCapabilities)
+			return missingRequiredMeta([cast(string) MetaKey.clientCapabilities]);
+		return null;
+	}
+
+	/// Close the open stdio `subscriptions/listen` stream, if any: drop the sink,
+	/// and the per-stream filter, then answer the listen request with its `SubscriptionsListenResult`. The
+	/// stream is detached before the (possibly yielding) write, so a notify racing
+	/// it can never land after the final response. Returns whether a stream was
+	/// open.
+	private bool closeStdioListen() @safe
+	{
+		auto sink = stdioListenSink;
+		if (sink is null)
+			return false;
+		const id = stdioListenSubscriptionId;
+		stdioListenSink = null;
+		stdioListenSubscriptionId = Json.init;
+		stdioListenFilter_ = ListenFilter.init;
+		sink(subscriptionsListenResult(id).toString());
+		return true;
+	}
+
 	/// Serve a modern `events/stream` (push) request over stdio. Like the listen
 	/// stream it is sink-driven: it opens the subscription, writes the leading
 	/// `notifications/events/active` (and any backlog), and registers the stream so
@@ -1404,10 +1891,9 @@ final class McpServer : ServerCore
 	/// the request id in `_meta` so concurrent streams sharing stdout can be routed.
 	/// Check-function types and heartbeats are advanced by `tickStdioEventStreams`.
 	/// Returns true when the message was an `events/stream` request it handled.
-	bool tryServeStdioEventsStream(Message msg, void delegate(string) @safe writeLine) @safe
+	package(mcp) bool tryServeStdioEventsStream(Message msg, void delegate(string) @safe writeLine) @safe
 	{
-		import mcp.protocol.events : StreamParams, eventsActiveNotification,
-			eventsEventNotification, activeParams, withSubscriptionId, subscriptionIdMetaKey;
+		import mcp.protocol.events : StreamParams;
 
 		if (msg.kind != MessageKind.request || msg.method != "events/stream")
 			return false;
@@ -1416,17 +1902,39 @@ final class McpServer : ServerCore
 		if (!meta.protocolVersion.length
 				|| !tryParseVersion(meta.protocolVersion, mv) || !mv.isModern)
 			return false;
+		if (auto err = modernStreamRequestError(meta))
+		{
+			writeLine(makeErrorResponse(msg.id, err).toString());
+			return true;
+		}
 		if (eventsRuntime_ is null)
 		{
-			writeLine(makeErrorResponse(msg.id, methodNotFound("events")).toString());
+			writeLine(makeErrorResponse(msg.id, methodNotFound("events/stream")).toString());
 			return true;
 		}
 
-		auto p = StreamParams.fromJson(msg.params);
-		if (p.name.length == 0)
+		StreamParams p;
+		try
+		{
+			p = StreamParams.fromJson(msg.params);
+			if (p.name.length == 0)
+				throw invalidParams("events/stream requires a string 'name'");
+		}
+		catch (McpException e)
+		{
+			writeLine(makeErrorResponse(msg.id, e).toString());
+			return true;
+		}
+
+		// Keyed like in-flight requests, so string id "9" and numeric 9 stay distinct.
+		// The id routes cancellation and the closing response, so it must not name
+		// a stream that is still open.
+		const streamKey = cancellationKey(msg.id);
+		if (streamKey in stdioEventStreams_)
 		{
 			writeLine(makeErrorResponse(msg.id,
-					invalidParams("events/stream requires a string 'name'")).toString());
+					invalidRequest("events/stream: request id is already in use by an open stream"))
+					.toString());
 			return true;
 		}
 
@@ -1444,7 +1952,11 @@ final class McpServer : ServerCore
 			writeLine(makeErrorResponse(msg.id, e).toString());
 			return true;
 		}
-		const streamKey = rpcIdString(msg.id);
+		catch (Exception e)
+		{
+			writeLine(makeErrorResponse(msg.id, unexpectedFailure(msg.method, e)).toString());
+			return true;
+		}
 		stdioEventStreams_[streamKey] = handle;
 		// A server-initiated close drops the stream and answers the request with
 		// the StreamEventsResult so the client's pending request completes.
@@ -1455,20 +1967,13 @@ final class McpServer : ServerCore
 			writeLine(makeResponse(msg.id, streamEventsResult()).toString());
 		};
 
-		// Leading active frame + any backlog from an initial poll.
+		// Leading active frame + any backlog, then the live events held since open.
 		try
-		{
-			auto first = eventsRuntime_.poll(p.name, p.arguments, "", p.cursor,
-					p.maxAgeMs, Nullable!long.init);
-			deliver(eventsActiveNotification,
-					withSubscriptionId(activeParams(first.cursor, first.truncated), subId));
-			foreach (ev; first.events)
-				deliver(eventsEventNotification, withSubscriptionId(ev.toJson(), subId));
-			handle.stream.cursor = first.cursor;
-		}
+			eventsRuntime_.startPushStream(handle.stream, p.cursor, p.maxAgeMs);
 		catch (Exception)
-			deliver(eventsActiveNotification,
-					withSubscriptionId(activeParams(p.cursor, false), subId));
+		{
+			// stdout is gone; the transport's shutdown drops the stream.
+		}
 		return true;
 	}
 
@@ -1476,7 +1981,7 @@ final class McpServer : ServerCore
 	/// and send each stream a cursor-carrying `notifications/events/heartbeat` at
 	/// least every 15s. Driven by the stdio transport's background ticker.
 	/// (Emit-only types receive their events live via `emit()`'s sink.)
-	void tickStdioEventStreams(long nowMs) @safe
+	package(mcp) void tickStdioEventStreams(long nowMs) @safe
 	{
 		import mcp.protocol.events : eventsEventNotification,
 			eventsHeartbeatNotification, heartbeatParams, withSubscriptionId;
@@ -1491,9 +1996,20 @@ final class McpServer : ServerCore
 		{
 			auto handle = kv.value;
 			auto s = handle.stream;
-			if (s.terminated)
+			if (s.terminated || !isOpenStdioEventStream(kv.key, handle))
 				continue;
-			eventsRuntime_.advancePushStream(s);
+			// Batches the check reports more of follow straight away, up to a
+			// bound per tick so one busy stream cannot starve the others.
+			foreach (_; 0 .. 16)
+			{
+				if (!eventsRuntime_.advancePushStream(s))
+					break;
+				if (s.terminated || !isOpenStdioEventStream(kv.key, handle))
+					break;
+			}
+			// advancePushStream can yield to a cancel that closes this stream.
+			if (!isOpenStdioEventStream(kv.key, handle))
+				continue;
 			if (nowMs - s.lastHeartbeatMs >= 15_000)
 			{
 				s.lastHeartbeatMs = nowMs;
@@ -1503,11 +2019,18 @@ final class McpServer : ServerCore
 		}
 	}
 
-	/// Whether any stdio push streams are open (the transport's ticker runs only
-	/// while events are enabled).
-	bool hasStdioEventStreams() @safe
+	/// Whether `handle` is still the open stdio push stream registered under
+	/// `key`; false once a `notifications/cancelled` has closed and removed it.
+	private bool isOpenStdioEventStream(string key, PushHandle handle) @safe
 	{
-		return eventsRuntime_ !is null;
+		auto p = key in stdioEventStreams_;
+		return p !is null && *p is handle;
+	}
+
+	/// Whether any stdio `events/stream` push streams are open.
+	package(mcp) bool hasStdioEventStreams() @safe
+	{
+		return stdioEventStreams_.length > 0;
 	}
 
 	/// Deliver a change notification on the standalone GET / `subscriptions/listen`
@@ -1517,26 +2040,18 @@ final class McpServer : ServerCore
 	/// 2026-07-28 basic/utilities/subscriptions "The server MUST NOT send notification
 	/// types the client has not explicitly requested" under Multiple Concurrent
 	/// Subscriptions. On 2025-11-25 / 2025-06-18 / 2025-03-26 (no `subscriptions/
-	/// listen`) it is an ordinary single-stream `notify`. Returns the number of
-	/// streams reached (0 or 1).
+	/// listen`) it reaches every eligible session once. Returns the number of
+	/// sessions / listen streams reached.
 	private size_t notifyChange(string method, Json params, string uri) @safe
 	{
-		size_t delivered;
-		// Stdio `subscriptions/listen` channel (2026-07-28): the single stdout channel
-		// carries change notifications too, stamped with the listen subscriptionId.
-		// Delivery is driven by the stdio listen stream's OWN recorded filter
-		// (`stdioListenFilter_`, the single stdio connection) via `accepts(method, uri)`
-		// — so a stdio listener subscribed to uriA does NOT receive an update for uriB
-		// (per-URI), via the per-stream `ListenFilter`.
-		// Without this branch a stdio listener receives nothing, since there is no
-		// `pushChannel` on the stdio transport.
-		if (stdioListenSink !is null && stdioListenFilter_.accepts(method, uri))
-		{
-			auto note = withListenSubscriptionId(makeNotification(method,
-					params), stdioListenSubscriptionId);
-			stdioListenSink(note.toString());
-			delivered++;
-		}
+		// A list-changed notification is sent only when the server advertises
+		// the matching `listChanged` capability, on every transport.
+		if (!listChangedAdvertised(method))
+			return 0;
+		// The stdio transport has no `pushChannel`; its listen stream filters by
+		// its own per-URI `ListenFilter`.
+		size_t delivered = writeStdioListen(method, params, uri);
+		delivered += writeStdioPlain(method, params, uri);
 		if (pushChannel !is null)
 		{
 			// Listener-driven delivery: every open stream decides for itself.
@@ -1549,42 +2064,16 @@ final class McpServer : ServerCore
 			// 2025-era standalone GET stream, never present in stateless/modern) falls
 			// back to `plainEligible` for legacy delivery:
 			// list-changed broadcasts unconditionally, while `resources/updated` honours
-			// the 2025-era subscribe-then-deliver gate (`isSubscribed(uri)`). On the
+			// the 2025-era subscribe-then-deliver gate (`plainGetEligibleFor`). On the
 			// modern single-connection path the global opt-in still gates that fallback.
 			const plainEligible = plainGetEligible(method, uri);
-			// The three list-changed notifications are genuine broadcasts (MODE 1):
-			// every connected session MUST be told the list changed, not just the first
-			// eligible stream. `broadcast` fans them out once per distinct session
-			// (still one stream per session, honouring Multiple Connections within a
-			// session). `notifications/resources/updated` is a session-scoped push
-			// (MODE 2) — delivered on one stream, per-session gated via
-			// `plainGetEligibleFor` / the stream's own `ListenFilter`. The empty
-			// session token here keeps the unscoped fan-out (a list-changed reaches all
-			// sessions) and the unscoped single-stream filtered delivery for 2026-07-28
-			// self-contained listen path; per-session attribution lives in each
-			// listener's own `ownerToken` and gate.
-			if (isListChangedBroadcast(method))
-				delivered += pushChannel.broadcast(method, params, uri, plainEligible);
-			else
-				delivered += pushChannel.pushToSession("", method, params, uri, plainEligible);
+			// Every change notification fans out once per session and once per
+			// listen stream (one stream per session, honouring Multiple
+			// Connections), each gated by its own filter / per-session subscription
+			// set, so every subscriber of a resource is told it changed.
+			delivered += pushChannel.broadcast(method, params, uri, plainEligible);
 		}
 		return delivered;
-	}
-
-	/// Whether `method` is one of the three list-changed notifications that are
-	/// genuine broadcasts (every connected session must receive them), as opposed to
-	/// the per-session `notifications/resources/updated`.
-	private static bool isListChangedBroadcast(string method) @safe
-	{
-		switch (method)
-		{
-		case "notifications/tools/list_changed":
-		case "notifications/prompts/list_changed":
-		case "notifications/resources/list_changed":
-			return true;
-		default:
-			return false;
-		}
 	}
 
 	/// Eligibility for a plain (2025-era standalone GET) listener whose
@@ -1593,7 +2082,7 @@ final class McpServer : ServerCore
 	/// filter and ignores this). This preserves the legacy delivery semantics: the
 	/// three list-changed notifications broadcast unconditionally, while
 	/// `notifications/resources/updated` is delivered only for a URI the client
-	/// subscribed to via `resources/subscribe` (`isSubscribed`). A plain GET stream
+	/// subscribed to via `resources/subscribe` (`plainGetEligibleFor`). A plain GET stream
 	/// only exists on a legacy connection (the modern answers GET with 405), so
 	/// there is no modern branch here — modern delivery is entirely per-stream-filter
 	/// driven.
@@ -1606,10 +2095,12 @@ final class McpServer : ServerCore
 	/// subscription set, so a standalone GET stream opened for a specific session
 	/// gates `notifications/resources/updated` on that session's own
 	/// `resources/subscribe` set rather than the shared fallback `activeConnection`.
-	private static bool plainGetEligibleFor(ConnectionState conn, string method, string uri) @safe
+	private bool plainGetEligibleFor(ConnectionState conn, string method, string uri) @safe
 	{
 		if (method == "notifications/resources/updated")
-			return conn !is null && (uri in conn.subscriptions) !is null;
+			return conn !is null && hasLiveSubscription(conn, uri);
+		if (method == "notifications/elicitation/complete")
+			return conn is null || !conn.negotiated.isModern;
 		return true;
 	}
 
@@ -1625,34 +2116,19 @@ final class McpServer : ServerCore
 		return (string method, string uri) @safe => plainGetEligibleFor(conn, method, uri);
 	}
 
-	/// Initiate a server->client `ping` on the standalone GET SSE push channel
-	/// and block until a connected client acknowledges with the spec-mandated
-	/// empty result (basic/utilities/ping: "Either the client or server can
-	/// initiate a ping by sending a `ping` request"). This is the server-side
-	/// counterpart to `McpClient.ping()`, exposing the SHOULD-periodic
-	/// connection-health probe the spec describes for either party. The probe
-	/// rides the same push channel `notify` uses, and the client's reply is
-	/// correlated via the shared `StreamCoordinator` when it POSTs the response.
+	/// Initiate a server->client `ping` on the standalone GET SSE stream owned by
+	/// the stateful HTTP session `sessionId` (its `Mcp-Session-Id`) and block until
+	/// the client acknowledges with the spec-mandated empty result
+	/// (basic/utilities/ping: "Either the client or server can initiate a ping by
+	/// sending a `ping` request"). This is the server-side counterpart to
+	/// `McpClient.ping()`. The waiter is scoped to `sessionId`, so only a response
+	/// POSTed under the same session resolves it; `connectedSessions` lists the
+	/// sessions that can be probed.
 	///
 	/// Throws `internalError` when the server is not mounted on a Streamable HTTP
-	/// transport (no push channel) or no client is listening on a GET stream, or
-	/// on a client error / timeout (treat a timeout as a stale connection per the
-	/// spec). The request carries no params, exactly as the spec requires.
-	void pingClient(Duration timeout = 60.seconds) @safe
-	{
-		if (pushChannel is null)
-			throw internalError("No server->client push channel; the server is not mounted on a Streamable HTTP transport");
-		pushChannel.ping(timeout);
-	}
-
-	/// Initiate a server->client `ping` on the GET SSE stream owned by the session
-	/// `sessionId` (its `Mcp-Session-Id`). On a stateful HTTP server every per-session
-	/// GET stream is registered under its session id as the listener's owner token, so
-	/// the probe must be scoped to that token to reach the right stream — an empty
-	/// token (the no-arg `pingClient`) matches no session-scoped listener and would
-	/// always fail. The waiter is likewise scoped to `sessionId`, so only a response
-	/// POSTed under the same session resolves it. Throws as the no-arg form does, plus
-	/// when no GET stream is connected for that session.
+	/// transport (no push channel) or no GET stream is connected for that session,
+	/// or on a client error / timeout (treat a timeout as a stale connection per
+	/// the spec). The request carries no params, exactly as the spec requires.
 	void pingClient(string sessionId, Duration timeout = 60.seconds) @safe
 	{
 		if (pushChannel is null)
@@ -1675,17 +2151,17 @@ final class McpServer : ServerCore
 	ServerCapabilities capabilities() const @safe
 	{
 		ServerCapabilities caps;
-		if (tools.length > 0 || toolListChangedEnabled)
+		if (tools.length > 0 || toolListChangedEnabled || toolsDeclared_)
 			caps.tools = ListChangedCapability(toolListChangedEnabled);
 		// A server declaring the Skills extension serves skill files through
 		// resources/read, so it declares `resources` even before its first skill
 		// (and so its first resource) is registered.
 		const skillsEnabled = skillIndex_ !is null && skillIndex_.enabled;
-		if (resources.length > 0 || templates.length > 0
+		if (resources.length > 0 || templates.length > 0 || resourcesDeclared_
 				|| effectiveResourceSubscriptions() || resourcesListChangedEnabled || skillsEnabled)
 			caps.resources = ResourcesCapability(effectiveResourceSubscriptions(),
 					resourcesListChangedEnabled);
-		if (prompts.length > 0 || promptsListChangedEnabled)
+		if (prompts.length > 0 || promptsListChangedEnabled || promptsDeclared_)
 			caps.prompts = ListChangedCapability(promptsListChangedEnabled);
 		if (typedCompletionHandler !is null || argumentCompleters.length)
 			caps.completions = true;
@@ -1740,45 +2216,17 @@ final class McpServer : ServerCore
 	/// batch version gate and per-message dispatch both consult `conn` instead of
 	/// the single bound `activeConnection`, so a session that negotiated 2025-03-26
 	/// can actually reach the legacy batch path and a modern session is gated on its
-	/// own negotiated version. `null` falls back to the no-arg behaviour.
-	string handleRaw(string text, ConnectionState conn) @safe
+	/// own negotiated version. `connectionToken` identifies the session (its
+	/// `Mcp-Session-Id`) so a `notifications/cancelled` sent on another request of
+	/// the same session matches these requests. `auth` is the request's validated
+	/// bearer token, reported to every message's handler as `ctx.auth()`. A `null`
+	/// `conn` falls back to the no-arg behaviour.
+	string handleRaw(string text, ConnectionState conn, string connectionToken, TokenInfo auth) @safe
 	{
 		if (conn is null)
 			return handleRaw(text);
-
-		ParsedInput input;
-		try
-			input = parseAny(text);
-		catch (McpException e)
-			return makeErrorResponse(Json(null), e).toString();
-		catch (Exception e)
-			return makeErrorResponse(Json(null), parseError(e.msg)).toString();
-
-		auto dispatch = (Message m) @safe {
-			return handle(m, new ConnectionScopedContext(conn));
-		};
-
-		if (!input.isBatch)
-		{
-			auto resp = dispatch(input.messages[0]);
-			return resp.isNull ? "" : resp.get.toString();
-		}
-
-		if (conn.negotiated >= ProtocolVersion.v2025_06_18)
-			return makeErrorResponse(Json(null),
-					invalidRequest("JSON-RPC batching is not supported on this protocol version"))
-				.toString();
-
-		Json responses = Json.emptyArray;
-		foreach (m; input.messages)
-		{
-			auto resp = dispatch(m);
-			if (!resp.isNull)
-				responses ~= resp.get;
-		}
-		foreach (err; input.errors)
-			responses ~= makeErrorResponse(Json(null), err.error);
-		return responses.length == 0 ? "" : responses.toString();
+		return dispatchRaw(text, conn, (Message m) @safe => handle(m,
+				new ConnectionScopedContext(conn, connectionToken, auth)));
 	}
 
 	/// As `handleRaw`, but with a server->client write `sink` for transports (such
@@ -1794,33 +2242,43 @@ final class McpServer : ServerCore
 	}
 
 	/// As `handleRaw(text, sink)`, but with the stdio server->client request
-	/// channel: when a handler calls `ctx.sendRequest` (e.g. via
-	/// `ctx.sample`/`ctx.elicit`) `serverRequest(method, params)` is invoked to
+	/// channel: when a handler calls `ctx.sampleRaw`/`elicitRaw`/`listRootsRaw`
+	/// (e.g. via `ctx.sample`/`ctx.elicit`) `serverRequest(method, params)` is invoked to
 	/// write the request and block the current task for the client's reply (the
 	/// `DuplexChannel` correlates it on its read loop). `null` reproduces the
 	/// no-channel behaviour (server->client requests throw).
 	string handleRaw(string text, scope void delegate(string) @safe sink,
 			scope Json delegate(string, Json) @safe serverRequest) @safe
 	{
-		import vibe.data.json : parseJsonString;
+		return dispatchRaw(text, cs, (Message m) @safe {
+			if (sink is null)
+				return handle(m);
+			StdioContextOptions opts;
+			opts.progressToken = readProgressToken(m.params);
+			opts.negotiated = cs.negotiated;
+			if (serverRequest !is null)
+			{
+				opts.serverRequest = serverRequest;
+				opts.clientCaps = cs.clientCaps;
+				opts.serverStateless = mode_ == ServerMode.stateless;
+			}
+			return handle(m, new StdioContext(sink, opts));
+		});
+	}
 
+	/// Parse a raw wire payload and run each message through `dispatch`, gating a
+	/// batch on `conn`'s negotiated version. Returns the raw response text, or ""
+	/// when there is nothing to send back.
+	private string dispatchRaw(string text, ConnectionState conn,
+			scope Nullable!Json delegate(Message) @safe dispatch) @safe
+	{
 		ParsedInput input;
 		try
 			input = parseAny(text);
 		catch (McpException e)
-			return makeErrorResponse(Json(null), e).toString();
+			return makeErrorResponse(errorReplyId(e), e).toString();
 		catch (Exception e)
 			return makeErrorResponse(Json(null), parseError(e.msg)).toString();
-
-		auto dispatch = (Message m) @safe {
-			if (sink is null)
-				return handle(m);
-			if (serverRequest is null)
-				return handle(m, new StdioContext(sink,
-						readProgressToken(m.params), cs.negotiated));
-			return handle(m, new StdioContext(sink, serverRequest, cs.clientCaps,
-					readProgressToken(m.params), cs.negotiated, mode_ == ServerMode.stateless));
-		};
 
 		if (!input.isBatch)
 		{
@@ -1833,7 +2291,7 @@ final class McpServer : ServerCore
 		// negotiated 2025-06-18 or later, reject a batch with a single
 		// invalidRequest (-32600) error carrying a null id rather than processing
 		// the array.
-		if (cs.negotiated >= ProtocolVersion.v2025_06_18)
+		if (conn.negotiated >= ProtocolVersion.v2025_06_18)
 			return makeErrorResponse(Json(null),
 					invalidRequest("JSON-RPC batching is not supported on this protocol version"))
 				.toString();
@@ -1846,9 +2304,10 @@ final class McpServer : ServerCore
 				responses ~= resp.get;
 		}
 		// A malformed member of an otherwise-recognizable batch yields its own
-		// `id:null` error rather than discarding the valid members alongside it.
+		// error (carrying its id when known) rather than discarding the valid
+		// members alongside it.
 		foreach (err; input.errors)
-			responses ~= makeErrorResponse(Json(null), err.error);
+			responses ~= makeErrorResponse(errorReplyId(err.error), err.error);
 		return responses.length == 0 ? "" : responses.toString();
 	}
 
@@ -1867,6 +2326,11 @@ final class McpServer : ServerCore
 
 	private Nullable!Json handleRequest(Message msg, RequestContext ctx) @safe
 	{
+		// Every MCP request's params is an object. Parsed wire messages are already
+		// validated, but `handle` also accepts a `Message` built in process.
+		if (msg.params.type != Json.Type.object)
+			return nullable(makeErrorResponse(msg.id, invalidParams("params must be an object")));
+
 		// Determine the version in effect for THIS request. Modern+ is stateless:
 		// each request carries its protocol version, client identity, and
 		// capabilities in `params._meta` rather than relying on `initialize`.
@@ -1910,14 +2374,17 @@ final class McpServer : ServerCore
 			{
 				if (mv.isModern)
 				{
+					if (mode_ == ServerMode.stateful)
+						return nullable(makeErrorResponse(msg.id,
+								unsupportedVersionError(meta.protocolVersion)));
 					// Per-request body `_meta.protocolVersion` is the stateless/modern
 					// negotiation channel: only on 2026-07-28 model does it select the
 					// effective version. On a stateful 2025-era session the negotiated
 					// version is fixed at `initialize` and governs every request, so a
 					// per-request body version is ignored for version selection.
 					effective = mv;
-					// Per-request client capabilities (modern, stateless): not stored on the
-					// shared instance. clientCapabilities() reflects the negotiated session.
+					// Per-request client capabilities (modern, stateless) are not stored
+					// on the shared instance; the request scope carries them.
 					if (meta.logLevel.isNull)
 					{
 						// No logLevel field -> the client did not request logging.
@@ -1965,16 +2432,15 @@ final class McpServer : ServerCore
 		}
 
 		// basic/lifecycle: a stateful server SHOULD NOT serve a non-`ping` request
-		// before the client has sent `notifications/initialized`. Enforced only when
+		// before the client has completed `initialize` and then sent
+		// `notifications/initialized`. Enforced only when
 		// opted in via requireInitialized(); the stateless path has no per-session
-		// initialized handshake (one shared fallback state serves sequential
-		// single-peer clients) and is exempt, and `initialize`/`ping` are always
+		// initialized handshake and is exempt, and `initialize`/`ping` are always
 		// allowed (the former establishes the session, the latter is a liveness
 		// probe permitted at any time).
-		if (requireInitialized_ && mode_ == ServerMode.stateful
-				&& !conn.initialized && msg.method != "initialize" && msg.method != "ping")
-			return nullable(makeErrorResponse(msg.id, new McpException(-32002,
-					"Server not initialized")));
+		if (requireInitialized_ && mode_ == ServerMode.stateful && !(conn.initializeProcessed
+				&& conn.initialized) && msg.method != "initialize" && msg.method != "ping")
+			return nullable(makeErrorResponse(msg.id, invalidRequest("Server not initialized")));
 
 		// Register a cancellation token for this request keyed by its id, so an
 		// inbound `notifications/cancelled` can flip it while the handler runs
@@ -1988,38 +2454,51 @@ final class McpServer : ServerCore
 		// in-process) key as the bare id.
 		const idKey = inFlightKey(connectionTokenOf(ctx), msg.id);
 		const trackable = idKey.length && msg.method != "initialize";
+		// A client reusing the id of a request still in flight violates JSON-RPC
+		// and would make a cancellation ambiguous, so the duplicate is refused
+		// and the original keeps its registration.
+		if (trackable && idKey in conn.inFlight)
+			return nullable(makeErrorResponse(msg.id,
+					invalidRequest("Request id is already in flight")));
 		if (trackable)
 			conn.inFlight[idKey] = token;
 		scope (exit)
 			if (trackable)
-			{
-				// Only remove the key when it still maps to THIS request's token. Two
-				// requests that collide on one `idKey` (a client reusing an in-flight id
-				// — itself a JSON-RPC violation) would otherwise have the first
-				// request's teardown delete the second's registration, leaving the live
-				// duplicate uncancelable. Comparing identity keeps one request from
-				// evicting another's token.
-				if (auto t = idKey in conn.inFlight)
-					if (*t is token)
-						conn.inFlight.remove(idKey);
-			}
+				conn.inFlight.remove(idKey);
 
 		// When the secure codec is enabled, verify the echoed (untrusted) MRTR
 		// requestState here, before the handler sees it. The identity it must be
 		// bound to is the request's authenticated subject (empty on stdio /
 		// in-process) and the tool/prompt name. On any verification failure the
-		// handler observes NO requestState (empty) and re-elicits; see
-		// `verifyIncomingRequestState`. When no codec is configured the raw value
-		// passes through unchanged.
-		const incomingState = verifyIncomingRequestState(requestStateCodec_,
-				readRequestState(msg.params), msg.method, msg.params, ctx);
+		// request runs as a fresh round: the handler observes neither the state
+		// nor the input responses answering the rejected round, and re-elicits;
+		// see `verifyIncomingRequestState`. When no codec is configured the raw
+		// value passes through unchanged. A request on a protocol without MRTR
+		// carries no retry state, so whatever the client put in those params is
+		// ignored.
+		const mrtr = effective.usesMRTR;
+		const verifiedState = mrtr ? verifyIncomingRequestState(requestStateCodec_,
+				readRequestState(msg.params), msg.method, msg.params, ctx) : nullable("");
+		const incomingState = verifiedState.isNull ? "" : verifiedState.get;
+		Json[string] inputResponses;
+		if (mrtr && !verifiedState.isNull)
+			inputResponses = readInputResponses(msg.params);
 
 		// Install the per-request scope so handlers see the right statelessness
 		// (MRTR vs blocking), the input responses carried on a retried modern
 		// request, and the cancellation token, regardless of which transport
 		// supplied the base context.
-		auto scoped = new RequestScope(ctx, effective.usesMRTR, readInputResponses(msg.params),
-				requestLogLevel, loggingRequested, token, incomingState, effective);
+		RequestScopeOptions scopeOpts;
+		scopeOpts.inputRequired = mrtr;
+		scopeOpts.inputResponses = inputResponses;
+		scopeOpts.requestState = incomingState;
+		scopeOpts.minLogLevel = requestLogLevel;
+		scopeOpts.loggingRequested = loggingRequested;
+		scopeOpts.cancellation = token;
+		scopeOpts.effectiveVersion = effective;
+		scopeOpts.clientCaps = effective.isModern ? meta.clientCapabilities : conn.clientCaps;
+		scopeOpts.serverStateless = mode_ == ServerMode.stateless;
+		auto scoped = new RequestScope(ctx, scopeOpts);
 
 		try
 		{
@@ -2029,11 +2508,11 @@ final class McpServer : ServerCore
 			if (token.cancelled)
 				return Nullable!Json.init;
 			// When the secure codec is enabled, wrap the outgoing MRTR requestState
-			// (tool/prompt/task input-required results all share the top-level
-			// `requestState` field) before serialisation, so the client only ever
-			// sees an integrity-protected (and optionally encrypted), expiry-stamped,
-			// user-bound blob. A no-op for results that carry no requestState and
-			// when no codec is configured.
+			// (tool and prompt input-required results share the top-level
+			// `requestState` field; task results carry none) before serialisation,
+			// so the client only ever sees an integrity-protected (and optionally
+			// encrypted), expiry-stamped, user-bound blob. A no-op for results that
+			// carry no requestState and when no codec is configured.
 			result = secureOutgoingRequestState(requestStateCodec_, result,
 					msg.method, msg.params, ctx);
 			return nullable(makeResponse(msg.id,
@@ -2049,7 +2528,7 @@ final class McpServer : ServerCore
 		{
 			if (token.cancelled)
 				return Nullable!Json.init;
-			return nullable(makeErrorResponse(msg.id, internalError(e.msg)));
+			return nullable(makeErrorResponse(msg.id, unexpectedFailure(msg.method, e)));
 		}
 	}
 
@@ -2060,12 +2539,12 @@ final class McpServer : ServerCore
 	/// an absent/null id (a notification has none and is never tracked); the empty
 	/// connection token (the default for non-multiplexing transports) yields an
 	/// id-only key, so every request on that transport shares one scope.
-	private static string inFlightKey(string connToken, Json id) @safe
+	package(mcp) static string inFlightKey(string connToken, Json id) @safe
 	{
 		const idKey = cancellationKey(id);
 		if (idKey.length == 0)
 			return "";
-		// `\x1f` (unit separator) cannot appear in the "s:"/"i:" prefixed id key,
+		// `\x1f` (unit separator) cannot appear in the "s:"/"i:"/"f:" prefixed id key,
 		// so the (token, id) pair is unambiguous.
 		return connToken ~ "\x1f" ~ idKey;
 	}
@@ -2087,6 +2566,15 @@ final class McpServer : ServerCore
 				.to!string;
 		case Json.Type.bigInt:
 			return "i:" ~ id.toString();
+		case Json.Type.float_:
+			import std.format : format;
+			import std.math : isFinite;
+
+			// An integral float names the same request as the equal integer.
+			const d = id.get!double;
+			if (d.isFinite && d >= -0x1p63 && d < 0x1p63 && d == cast(double)(cast(long) d))
+				return "i:" ~ (cast(long) d).to!string;
+			return "f:" ~ format("%.17g", d);
 		default:
 			return "";
 		}
@@ -2094,34 +2582,13 @@ final class McpServer : ServerCore
 
 	/// Whether the client's `declared` capabilities can satisfy a single MRTR
 	/// `InputRequest`. The spec forbids emitting an `InputRequest` whose kind
-	/// the client never advertised: elicitation requires the matching elicitation
-	/// submode (url-mode -> `elicitation.url`, form-mode -> `elicitation.form`, the
-	/// latter implied by a bare `elicitation:{}`); sampling requires `sampling`
-	/// (plus `sampling.tools` when the request carries `tools`/`toolChoice`); roots
-	/// requires `roots`. An `InputRequest` of an unrecognised kind is left to the
-	/// caller (kept), since the SDK cannot map it to a capability.
+	/// the client never advertised; `requiredFor` names what each kind needs.
+	/// An `InputRequest` of an unrecognised kind is left to the caller (kept),
+	/// since the SDK cannot map it to a capability.
 	private static bool clientCanSatisfy(ref const InputRequest reqst,
 			ref const ClientCapabilities declared) @safe
 	{
-		const k = reqst.kind;
-		if (k.isNull)
-			return true; // unknown kind: do not second-guess
-		final switch (k.get)
-		{
-		case InputKind.elicitation:
-			const isUrl = reqst.params.type == Json.Type.object
-				&& "mode" in reqst.params && reqst.params["mode"].type == Json.Type.string
-				&& reqst.params["mode"].get!string == "url";
-			return isUrl ? declared.elicitationUrl : declared.elicitationForm;
-		case InputKind.sampling:
-			if (!declared.supports(ClientCapability.sampling))
-				return false;
-			const usesTools = reqst.params.type == Json.Type.object
-				&& ("tools" in reqst.params || "toolChoice" in reqst.params);
-			return usesTools ? declared.samplingTools : true;
-		case InputKind.roots:
-			return declared.roots;
-		}
+		return requiredFor(reqst).missingFrom(declared).isNull;
 	}
 
 	/// Filter an MRTR `inputRequests` list to those the client can satisfy,
@@ -2138,27 +2605,67 @@ final class McpServer : ServerCore
 		return kept;
 	}
 
+	/// The client capabilities an MRTR input request needs, by the same rules
+	/// `ctx.sample` / `ctx.elicit` apply (`samplingRequirements`,
+	/// `elicitationRequirements`); `roots` for a roots request and nothing for
+	/// an unrecognised kind.
+	private static ClientCapabilities requiredFor(ref const InputRequest reqst) @safe
+	{
+		ClientCapabilities need;
+		const k = reqst.kind;
+		if (k.isNull)
+			return need;
+		final switch (k.get)
+		{
+		case InputKind.elicitation:
+			return elicitationRequirements(reqst.params);
+		case InputKind.sampling:
+			return samplingRequirements(reqst.params);
+		case InputKind.roots:
+			need.roots = true;
+			return need;
+		}
+	}
+
 	/// MRTR: never ask the client for an input kind it did not declare. Drop any
-	/// unsupported `inputRequests` against the `declared` capability set; if that
-	/// leaves no requests AND no `requestState`, the result violates the spec
-	/// ("at least one of inputRequests/requestState"), so surface it as an
-	/// internal error rather than emitting an unfulfillable round trip. Shared by
-	/// `doCallTool` (`what` = "tools/call") and `doGetPrompt` ("prompts/get");
-	/// both response types expose `needsInput`/`inputRequests`/`requestState`/
-	/// `withInputRequests`, so the helper is type-safe across them. Callers gate
-	/// on `ver.usesMRTR && response.needsInput` before calling.
+	/// unsupported `inputRequests` against the `declared` capability set. When
+	/// that drops every request, the client can never complete the round trip
+	/// (even with a `requestState`, it would only be asked again for nothing), so
+	/// reject the request with `-32021` naming the capabilities the dropped
+	/// requests need. Shared by `doCallTool` (`what` = "tools/call") and
+	/// `doGetPrompt` ("prompts/get"); both response types expose
+	/// `needsInput`/`inputRequests`/`requestState`/`withInputRequests`. Callers
+	/// gate on `ver.usesMRTR && response.needsInput` before calling.
 	private static T filterInputRequests(T)(T response,
 			ref const ClientCapabilities declared, string what) @safe
 	{
+		import std.algorithm.searching : canFind;
+		import std.array : join;
+
 		auto kept = supportedInputRequests(response.inputRequests, declared);
-		if (kept.length != response.inputRequests.length)
+		if (kept.length == response.inputRequests.length)
+			return response;
+		if (kept.length == 0)
 		{
-			if (kept.length == 0 && response.requestState.length == 0)
-				throw internalError(
-						what ~ " handler returned only input requests the client cannot satisfy");
-			response = response.withInputRequests(kept);
+			ClientCapabilities need;
+			string[] kinds;
+			foreach (ref r; response.inputRequests)
+			{
+				const n = requiredFor(r);
+				need.roots |= n.roots;
+				need.sampling |= n.sampling;
+				need.samplingTools |= n.samplingTools;
+				need.samplingContext |= n.samplingContext;
+				need.elicitationForm |= n.elicitationForm;
+				need.elicitationUrl |= n.elicitationUrl;
+				if (!kinds.canFind(r.type))
+					kinds ~= r.type;
+			}
+			throw missingRequiredClientCapability(need,
+					what ~ " needs input the client did not declare support for: " ~ kinds.join(
+						", "));
 		}
-		return response;
+		return response.withInputRequests(kept);
 	}
 
 	/// Configure the modern `CacheableResult` freshness hint (`ttlMs`/`cacheScope`)
@@ -2181,9 +2688,10 @@ final class McpServer : ServerCore
 		listCacheHints[listMethod] = nullable(hint);
 	}
 
-	/// Set the maximum number of items returned per `*/list` page
+	/// Set the maximum number of items returned per page of a paginated method
 	/// (server/utilities/pagination). When `size > 0`, `tools/list`,
-	/// `resources/list`, `resources/templates/list` and `prompts/list` return at
+	/// `resources/list`, `resources/templates/list`, `prompts/list`,
+	/// `resources/directory/read` and the Skills extension's `skills/list` return at
 	/// most `size` items per response and emit an opaque `nextCursor` whenever
 	/// more results remain; the client passes that cursor back as `params.cursor`
 	/// to fetch the next page (the bundled `McpClient` list helpers follow these
@@ -2219,8 +2727,8 @@ final class McpServer : ServerCore
 	/// ("complete" for a finished response, "input_required" for an
 	/// `InputRequiredResult`). We add the discriminator here, centralized in
 	/// the dispatch path, for any object result that does not already declare
-	/// one — so an `InputRequiredResult` ("input_required") and `DiscoverResult`
-	/// (which set their own) are left untouched.
+	/// one — so a result that sets its own (an `InputRequiredResult`'s
+	/// "input_required", a task handle's "task") is left untouched.
 	///
 	/// An `InputRequiredResult` is shaped `{ inputRequests, requestState }`
 	/// (schema: at least one of `inputRequests`/`requestState` is present, and
@@ -2261,23 +2769,28 @@ final class McpServer : ServerCore
 	}
 
 	/// Shared `*/list` tail for `doListResources`/`doListResourceTemplates`/
-	/// `doListPrompts`/`doListTools`. Runs `pageBounds` over `keys` (already in the
-	/// handler's intended order), projects each item in the page via
+	/// `doListPrompts`/`doListTools`. Runs `pageBounds` over `items` (already
+	/// sorted ascending by `keyOf`, which must be unique per item, so a cursor
+	/// can resume after the last-seen key), projects each item in the page via
 	/// `getDesc(key).forVersion(ver)` onto `ResultT`'s `field`, sets `nextCursor`,
 	/// and returns `maybeCache(result, listHint(listMethod), ver)`. Keeping the
 	/// cursor/cache wiring in one place means a change to pagination or cache
 	/// gating lands on all four lists at once. `ResultT` is one of the four
 	/// structurally-identical list-result structs; `field` is its leading
 	/// collection field ("resources", "resourceTemplates", "prompts", "tools").
-	private Json paginatedList(ResultT, string field, K, Desc)(string listMethod,
-			K[] keys, scope Desc delegate(K) @safe getDesc, Json params, ProtocolVersion ver) @safe
+	private Json paginatedList(ResultT, string field, K, Desc)(string listMethod, K[] items,
+			scope string delegate(K) @safe keyOf,
+			scope Desc delegate(K) @safe getDesc, Json params, ProtocolVersion ver) @safe
 	{
+		import std.algorithm : map;
+		import std.array : array;
+
 		size_t begin, end;
 		Nullable!string next;
-		pageBounds(params, keys.length, pageSize_, begin, end, next);
+		pageBounds(params, items.map!keyOf.array, pageSize_, begin, end, next);
 
 		ResultT result;
-		foreach (key; keys[begin .. end])
+		foreach (key; items[begin .. end])
 			__traits(getMember, result, field) ~= getDesc(key).forVersion(ver);
 		result.nextCursor = next;
 		return maybeCache(result, listHint(listMethod), ver);
@@ -2285,10 +2798,10 @@ final class McpServer : ServerCore
 
 	/// Build the modern `UnsupportedProtocolVersionError` (-32022) listing the
 	/// versions this server supports and the one the client requested.
-	private McpException unsupportedVersionError(string requested) @safe
+	package(mcp) McpException unsupportedVersionError(string requested) @safe
 	{
 		Json supported = Json.emptyArray;
-		foreach (v; supportedVersions)
+		foreach (v; servedVersions)
 			supported ~= Json(v.toWire);
 		Json data = Json.emptyObject;
 		data["supported"] = supported;
@@ -2311,7 +2824,10 @@ final class McpServer : ServerCore
 		switch (msg.method)
 		{
 		case "notifications/initialized":
-			conn.initialized = true;
+			// Only an `initialize` already processed on this connection can be
+			// acknowledged; a stray notification must not open the lifecycle gate.
+			if (conn.initializeProcessed)
+				conn.initialized = true;
 			break;
 		case "notifications/cancelled":
 			// Resolve the cancellation against the connection it arrived on:
@@ -2321,17 +2837,35 @@ final class McpServer : ServerCore
 			break;
 		case "notifications/roots/list_changed":
 			if (onRootsListChanged_ !is null)
-				onRootsListChanged_();
+				runObserver(msg.method, () @safe { onRootsListChanged_(ctx); });
 			if (onClientNotification_ !is null)
-				onClientNotification_(msg.method, msg.params);
+				runObserver(msg.method, () @safe {
+					onClientNotification_(msg.method, msg.params, ctx);
+				});
 			break;
 		default:
 			// Unconsumed client notifications are surfaced to the application
 			// observer (if any) and otherwise ignored, per JSON-RPC.
 			if (onClientNotification_ !is null)
-				onClientNotification_(msg.method, msg.params);
+				runObserver(msg.method, () @safe {
+					onClientNotification_(msg.method, msg.params, ctx);
+				});
 			break;
 		}
+	}
+
+	/// Run an application notification observer, logging rather than
+	/// propagating anything it throws: a notification has no reply to carry an
+	/// error, and an escaping exception would otherwise abort the transport's
+	/// handling of the batch or POST that carried it.
+	private static void runObserver(string method, scope void delegate() @safe observer) @safe
+	{
+		import vibe.core.log : logError;
+
+		try
+			observer();
+		catch (Exception e)
+			logError("%s observer: unhandled %s: %s", method, typeid(e).name, e.msg);
 	}
 
 	/// Honour an inbound `notifications/cancelled` (basic/utilities/cancellation):
@@ -2348,40 +2882,32 @@ final class McpServer : ServerCore
 		// JSON-RPC response (its "result" is the long-lived notification stream), so
 		// it is never registered in `inFlight` and cannot be cancelled via the
 		// token path. Per basic/utilities/cancellation a client cancels the listen
-		// by `notifications/cancelled` referencing the listen request id. Compare
-		// using the same normalization `rpcIdString` produced the stored id with, so
-		// a numeric cancellation requestId matches a numeric (or string) listen id.
-		// On a match, drop the delivery sink and clear the recorded per-stream
+		// by `notifications/cancelled` referencing the listen request id, compared
+		// by `cancellationKey` so a string and a numeric id never match. On a match, drop the delivery sink and clear the recorded per-stream
 		// filter so the listener-driven notify path matches nothing and any
 		// subsequent notify*/notifyResourceUpdated writes nothing.
-		if (stdioListenSink !is null && stdioListenSubscriptionId.type != Json.Type.undefined
-				&& rpcIdString(params["requestId"]) == rpcIdString(stdioListenSubscriptionId))
+		// Both stdio streams belong to the single stdio peer, whose connection
+		// token is empty; a cancel from a connection-scoped (HTTP) peer only ever
+		// names that connection's own in-flight requests.
+		const cancelKey = cancellationKey(params["requestId"]);
+		const fromStdioPeer = connToken.length == 0;
+		if (fromStdioPeer && stdioListenSink !is null && cancelKey.length
+				&& cancelKey == cancellationKey(stdioListenSubscriptionId))
 		{
 			// Graceful teardown: the long-lived listen request returns its single
 			// response now — the `SubscriptionsListenResult` (modern
 			// basic/utilities/subscriptions) — before the stream closes.
-			stdioListenSink(subscriptionsListenResult(stdioListenSubscriptionId).toString());
-			stdioListenSink = null;
-			stdioListenSubscriptionId = Json.init;
-			// Drop every piece of listen state this single stdio stream recorded so
-			// a later notify*/notifyResourceUpdated writes nothing: the per-URI
-			// resource `subscriptions` (keyed by the URIs the per-stream filter
-			// opted into) and the stdio delivery filter `stdioListenFilter_`.
-			// Stdio is single-connection, so the caller is the only listener and
-			// clearing all of it is correct.
-			foreach (u; stdioListenFilter_.resourceUris)
-				conn.subscriptions.remove(u);
-			stdioListenFilter_ = ListenFilter.init;
+			closeStdioListen();
 			return;
 		}
 
 		// Stdio `events/stream` teardown: a push stream returns no JSON-RPC response,
 		// so the client cancels it by `notifications/cancelled` referencing the
 		// stream's request id. Close the handle (fires on_unsubscribe) and drop it.
-		if (auto h = rpcIdString(params["requestId"]) in stdioEventStreams_)
+		if (auto h = fromStdioPeer ? cancelKey in stdioEventStreams_ : null)
 		{
 			h.close();
-			stdioEventStreams_.remove(rpcIdString(params["requestId"]));
+			stdioEventStreams_.remove(cancelKey);
 			return;
 		}
 
@@ -2479,7 +3005,7 @@ final class McpServer : ServerCore
 			// the RPC.
 			if (ver.isModern)
 				throw methodNotFound(method);
-			return doSubscribe(params, conn);
+			return doSubscribe(params, conn, ver);
 		case "resources/unsubscribe":
 			if (ver.isModern)
 				throw methodNotFound(method);
@@ -2520,10 +3046,10 @@ final class McpServer : ServerCore
 	// a server that never enabled tasks does not expose these methods and MUST
 	// answer -32601 (method not found). SEP-2663 defines exactly tasks/get,
 	// tasks/update, and tasks/cancel — there is no tasks/list or tasks/result.
-	private void requireTasks(ProtocolVersion ver) @safe
+	private void requireTasks(ProtocolVersion ver, string method) @safe
 	{
 		if (!ver.isModern || !tasksEnabled_)
-			throw methodNotFound("tasks");
+			throw methodNotFound(method);
 	}
 
 	private string requireTaskId(Json params) @safe
@@ -2540,13 +3066,13 @@ final class McpServer : ServerCore
 	private void requireTasksDeclared(Json params) @safe
 	{
 		if (!declaresTasksExtension(RequestMeta.fromParams(params).clientCapabilities))
-			throw missingRequiredClientCapability(tasksRequiredCapabilities(),
+			throw tasksExtensionRequired(
 					"The tasks methods require the " ~ tasksExtensionKey ~ " extension");
 	}
 
 	private Json doTasksGet(Json params, RequestContext ctx, ProtocolVersion ver) @safe
 	{
-		requireTasks(ver);
+		requireTasks(ver, "tasks/get");
 		requireTasksDeclared(params);
 		const id = requireTaskId(params);
 		taskRuntime_.requireAccess(id, requestPrincipal(ctx));
@@ -2555,30 +3081,22 @@ final class McpServer : ServerCore
 
 	private Json doTasksUpdate(Json params, RequestContext ctx, ProtocolVersion ver) @safe
 	{
-		import mcp.protocol.tasks : TaskStatus;
-
-		requireTasks(ver);
+		requireTasks(ver, "tasks/update");
 		requireTasksDeclared(params);
 		const id = requireTaskId(params);
 		taskRuntime_.requireAccess(id, requestPrincipal(ctx));
-		Json responses = ("inputResponses" in params) ? params["inputResponses"] : Json.emptyObject;
-		taskRuntime_.deliverInput(id, responses); // throws -32602 for an unknown task
-		// Resume an executor-backed task that was waiting on this input: move it
-		// back to `working` and re-dispatch so the executor re-runs and consumes
-		// the delivered answers. Manual (executor-less) tasks are left as-is.
-		auto st = taskRuntime_.statusOf(id);
-		if (!st.isNull && st.get == TaskStatus.inputRequired
-				&& taskRuntime_.toolName(id).length > 0 && taskDispatcher_ !is null)
-		{
-			taskRuntime_.resumeWorking(id);
+		Json responses = ("inputResponses" in params) ? params["inputResponses"] : Json.undefined;
+		// An executor-backed task whose outstanding input is now fully answered
+		// is moved back to `working` by `deliverInput`; re-dispatch it so the
+		// executor re-runs and consumes the answers.
+		if (taskRuntime_.deliverInput(id, responses))
 			taskDispatcher_.dispatch(id, &runTaskExecutorById);
-		}
 		return Json.emptyObject; // empty acknowledgement
 	}
 
 	private Json doTasksCancel(Json params, RequestContext ctx, ProtocolVersion ver) @safe
 	{
-		requireTasks(ver);
+		requireTasks(ver, "tasks/cancel");
 		requireTasksDeclared(params);
 		const id = requireTaskId(params);
 		taskRuntime_.requireAccess(id, requestPrincipal(ctx));
@@ -2590,10 +3108,10 @@ final class McpServer : ServerCore
 	// extension is modern-only and opt-in via `enableEvents()`; a legacy session
 	// or a server that never enabled events answers -32601. `events/stream` (push)
 	// is long-lived and handled by the transports, not routed here.
-	private void requireEvents(ProtocolVersion ver) @safe
+	private void requireEvents(ProtocolVersion ver, string method) @safe
 	{
 		if (!ver.isModern || !eventsEnabled_)
-			throw methodNotFound("events");
+			throw methodNotFound(method);
 	}
 
 	// The authenticated principal behind a request (the validated token's
@@ -2610,13 +3128,13 @@ final class McpServer : ServerCore
 
 	private Json doEventsList(Json params, ProtocolVersion ver) @safe
 	{
-		requireEvents(ver);
+		requireEvents(ver, "events/list");
 		return eventsRuntime_.list().toJson();
 	}
 
 	private Json doEventsPoll(Json params, RequestContext ctx, ProtocolVersion ver) @safe
 	{
-		requireEvents(ver);
+		requireEvents(ver, "events/poll");
 		auto p = PollParams.fromJson(params);
 		if (p.name.length == 0)
 			throw invalidParams("events/poll requires a string 'name'");
@@ -2626,7 +3144,7 @@ final class McpServer : ServerCore
 
 	private Json doEventsSubscribe(Json params, RequestContext ctx, ProtocolVersion ver) @safe
 	{
-		requireEvents(ver);
+		requireEvents(ver, "events/subscribe");
 		auto p = SubscribeParams.fromJson(params);
 		if (p.name.length == 0)
 			throw invalidParams("events/subscribe requires a string 'name'");
@@ -2635,7 +3153,7 @@ final class McpServer : ServerCore
 
 	private Json doEventsUnsubscribe(Json params, RequestContext ctx, ProtocolVersion ver) @safe
 	{
-		requireEvents(ver);
+		requireEvents(ver, "events/unsubscribe");
 		auto p = UnsubscribeParams.fromJson(params);
 		if (p.name.length == 0)
 			throw invalidParams("events/unsubscribe requires a string 'name'");
@@ -2648,9 +3166,12 @@ final class McpServer : ServerCore
 	private Json doDiscover() @safe
 	{
 		DiscoverResult d;
-		foreach (v; supportedVersions)
-			d.protocolVersions ~= v.toWire;
-		d.capabilities = capabilities().forVersion(ProtocolVersion.v2026_07_28);
+		foreach (v; servedVersions)
+			d.supportedVersions ~= v.toWire;
+		auto caps = capabilities();
+		if (!caps.resources.isNull && listenResourceSubscriptions())
+			caps.resources.get.subscribe = true;
+		d.capabilities = caps.forVersion(ProtocolVersion.v2026_07_28);
 		// Identity is stamped into `_meta` by the dispatch path, along with every
 		// other modern result.
 		d.instructions = instructions;
@@ -2667,15 +3188,15 @@ final class McpServer : ServerCore
 	/// `params.notifications` (a `ListenFilter`): the `toolsListChanged`,
 	/// `promptsListChanged` and `resourcesListChanged` flags are booleans, while
 	/// `resourceSubscriptions` is a `string[]` of resource URIs the client wants
-	/// `notifications/resources/updated` for. Those URIs are recorded as per-URI
-	/// subscriptions (so `isSubscribed`/`notifyResourceUpdated` honour them) and
-	/// the `resourceSubscriptions` opt-in is flagged when the array is non-empty.
-	/// A flat top-level filter is also accepted when no `notifications` object is
-	/// present.
+	/// `notifications/resources/updated` for. Those URIs are kept on the stream's
+	/// filter (so `notifyResourceUpdated` honours them) and the
+	/// `resourceSubscriptions` opt-in is flagged when the array is non-empty.
+	/// With the Tasks extension enabled, `taskIds` (SEP-2663) opts the stream into
+	/// `notifications/tasks` for those task ids; it requires the client to declare
+	/// the extension. A flat top-level filter is also accepted when no
+	/// `notifications` object is present.
 	private Json doSubscribeListen(Json params, ConnectionState conn) @safe
 	{
-		import std.algorithm : canFind;
-
 		Json filter = Json.undefined;
 		if (params.type == Json.Type.object && "notifications" in params
 				&& params["notifications"].type == Json.Type.object)
@@ -2709,29 +3230,44 @@ final class McpServer : ServerCore
 				auto rs = filter["resourceSubscriptions"];
 				if (rs.type == Json.Type.array)
 				{
-					bool any;
+					// Preserve the agreed URI list so the acknowledgement can
+					// echo `resourceSubscriptions` as the spec's string[]
+					// (deduplicated, request order kept).
+					bool[string] seen;
 					foreach (i; 0 .. rs.length)
 						if (rs[i].type == Json.Type.string)
 						{
 							const u = rs[i].get!string;
-							conn.subscriptions[u] = true;
-							// Preserve the agreed URI list so the acknowledgement
-							// can echo `resourceSubscriptions` as the spec's
-							// string[] (deduplicated, request order kept).
-							if (!perStream.resourceUris.canFind(u))
-								perStream.resourceUris ~= u;
-							any = true;
+							if (u in seen)
+								continue;
+							if (seen.length >= maxResourceSubscriptions)
+								throw invalidParams(
+										"Too many resourceSubscriptions URIs in one listen request");
+							seen[u] = true;
+							perStream.resourceUris ~= u;
 						}
-					if (any)
+					if (perStream.resourceUris.length)
 						perStream.resourceSubscriptions = true;
 				}
-				else if (rs.type == Json.Type.bool_ && rs.get!bool)
-				{
-					// A boolean opt-in: blanket interest in resource-update
-					// notifications without per-URI URIs.
-					perStream.resourceSubscriptions = true;
-				}
 			}
+
+			if (auto ids = "taskIds" in filter)
+				if (tasksEnabled_ && ids.type == Json.Type.array && ids.length)
+				{
+					requireTasksDeclared(params);
+					bool[string] seen;
+					foreach (i; 0 .. ids.length)
+						if ((*ids)[i].type == Json.Type.string)
+						{
+							const id = (*ids)[i].get!string;
+							if (id in seen)
+								continue;
+							if (seen.length >= maxResourceSubscriptions)
+								throw invalidParams("Too many taskIds in one listen request");
+							seen[id] = true;
+							perStream.taskIds ~= id;
+						}
+				}
 		}
 		// Record the filter on THIS request's connection state (a fresh
 		// per-request state on the HTTP listen route, the single bound state on
@@ -2763,23 +3299,20 @@ final class McpServer : ServerCore
 		case "resourcesListChanged":
 			return resourcesListChangedEnabled;
 		case "resourceSubscriptions":
-			// The modern `subscriptions/listen` stream is a self-contained channel
-			// whose per-stream filter IS the client's resource-update opt-in, so on a
-			// modern (2026-07-28) server the listen filter alone drives delivery — the
-			// stateful-only `enableResourceSubscriptions()` (which throws on a
-			// stateless server) is neither required nor callable there. The stateless
-			// HTTP transport refuses subscriptions/listen BEFORE it reaches the server
-			// core (handlePost -> -32601), so this is only consulted on the stdio
-			// listen path (a single implicit connection where resource-update push is
-			// allowed in any mode — the requirement's stdio carve-out). On a stateful
-			// server the 2025-era `resources/subscribe` opt-in
-			// (`resourceSubscriptionsEnabled`) gates it, and the `subscribe`
-			// CAPABILITY advertisement is mode-gated in `capabilities()` /
-			// `effectiveResourceSubscriptions`.
-			return resourceSubscriptionsEnabled || mode_ == ServerMode.stateless;
+			return listenResourceSubscriptions();
 		default:
 			return false;
 		}
+	}
+
+	/// Whether `subscriptions/listen` accepts `resourceSubscriptions`, which is
+	/// also what `server/discover` advertises as `resources.subscribe`. The
+	/// listen stream's per-stream filter is the client's resource-update opt-in,
+	/// so any stateless server (the only mode serving 2026-07-28) that advertises
+	/// the resources capability supports it.
+	private bool listenResourceSubscriptions() const @safe
+	{
+		return mode_ == ServerMode.stateless && !capabilities().resources.isNull;
 	}
 
 	/// The acknowledged subset for a single `subscriptions/listen` request's filter,
@@ -2791,7 +3324,7 @@ final class McpServer : ServerCore
 	/// The three list-changed types appear as booleans (`{ "<type>": true }`) and
 	/// `resourceSubscriptions` as the agreed `string[]` of URIs; an empty object when
 	/// the filter opted into nothing.
-	Json acknowledgedSubsetFor(ListenFilter f) const @safe
+	package(mcp) Json acknowledgedSubsetFor(ListenFilter f) const @safe
 	{
 		Json subset = Json.emptyObject;
 		if (f.toolsListChanged)
@@ -2807,6 +3340,13 @@ final class McpServer : ServerCore
 				uris ~= Json(u);
 			subset["resourceSubscriptions"] = uris;
 		}
+		if (f.taskIds.length)
+		{
+			Json ids = Json.emptyArray;
+			foreach (id; f.taskIds)
+				ids ~= Json(id);
+			subset["taskIds"] = ids;
+		}
 		return subset;
 	}
 
@@ -2816,15 +3356,20 @@ final class McpServer : ServerCore
 
 		auto uris = resources.keys;
 		sort(uris);
-		return paginatedList!(ListResourcesResult, "resources")("resources/list",
-				uris, (string uri) => resources[uri].descriptor, params, ver);
+		return paginatedList!(ListResourcesResult, "resources")("resources/list", uris,
+				(string uri) => uri, (string uri) => resources[uri].descriptor, params, ver);
 	}
 
 	private Json doListResourceTemplates(Json params, ProtocolVersion ver) @safe
 	{
+		import std.algorithm : sort;
+
+		auto sorted = templates.dup;
+		sort!((a, b) => a.descriptor.uriTemplate < b.descriptor.uriTemplate)(sorted);
 		return paginatedList!(ListResourceTemplatesResult, "resourceTemplates")(
-				"resources/templates/list",
-				templates, (RegisteredTemplate t) => t.descriptor, params, ver);
+				"resources/templates/list", sorted,
+				(RegisteredTemplate t) => t.descriptor.uriTemplate,
+				(RegisteredTemplate t) => t.descriptor, params, ver);
 	}
 
 	private Json doReadResource(Json params, RequestContext ctx,
@@ -2839,12 +3384,11 @@ final class McpServer : ServerCore
 			// Capability gating: mirrors doCallTool — uses per-request
 			// _meta.clientCapabilities on the modern protocol, or the session caps
 			// negotiated at initialize on stateful 2025-era protocols.
-			const ClientCapabilities declared = ver.isModern
-				? RequestMeta.fromParams(params).clientCapabilities : conn.clientCaps;
+			const ClientCapabilities declared = ctx.clientCapabilities();
 			if (auto missing = direct.requiredClientCapabilities.missingFrom(declared))
 				throw missingRequiredClientCapability(missing.get);
 			ReadResourceResult result;
-			result.contents = [direct.reader().forVersion(ver)];
+			result.contents = projectContents(direct.reader(ctx), ver);
 			return maybeCache(result, direct.cache, ver);
 		}
 
@@ -2854,12 +3398,11 @@ final class McpServer : ServerCore
 			if (matchUriTemplate(t.descriptor.uriTemplate, uri, captured))
 			{
 				// Capability gating: same logic as for direct resources.
-				const ClientCapabilities declared = ver.isModern
-					? RequestMeta.fromParams(params).clientCapabilities : conn.clientCaps;
+				const ClientCapabilities declared = ctx.clientCapabilities();
 				if (auto missing = t.requiredClientCapabilities.missingFrom(declared))
 					throw missingRequiredClientCapability(missing.get);
 				ReadResourceResult result;
-				result.contents = [t.reader(uri, captured, ctx).forVersion(ver)];
+				result.contents = projectContents(t.reader(uri, captured, ctx), ver);
 				return maybeCache(result, t.cache, ver);
 			}
 		}
@@ -2868,7 +3411,17 @@ final class McpServer : ServerCore
 		// clients can read the offending URI without parsing the message string.
 		Json data = Json.emptyObject;
 		data["uri"] = uri;
-		throw new McpException(ver.resourceNotFoundCode, "Resource not found: " ~ uri, data);
+		throw resourceNotFound(uri, ver, data);
+	}
+
+	/// Project each content item a reader returned to the negotiated version.
+	private static ResourceContents[] projectContents(ResourceContents[] contents,
+			ProtocolVersion ver) @safe
+	{
+		import std.algorithm : map;
+		import std.array : array;
+
+		return contents.map!(c => c.forVersion(ver)).array;
 	}
 
 	// The MIME type SEP-2640 assigns to a directory resource. A directory is
@@ -2888,9 +3441,11 @@ final class McpServer : ServerCore
 
 		// A directory's direct children: registered resources whose URI sits one
 		// path segment below `prefix` are files; a deeper resource contributes its
-		// first segment as a synthesized subdirectory (reported once).
+		// first segment as a synthesized subdirectory. Each URI is reported once,
+		// as the registered file when one also has resources beneath it.
 		Resource[] children;
-		bool[string] seenDirs;
+		Resource[string] dirs;
+		bool[string] fileUris;
 		foreach (uri; resources.keys)
 		{
 			if (uri.length <= prefix.length || uri[0 .. prefix.length] != prefix)
@@ -2910,6 +3465,7 @@ final class McpServer : ServerCore
 				Resource child = resources[uri].descriptor;
 				child.name = rest;
 				children ~= child;
+				fileUris[uri] = true;
 			}
 			else
 			{
@@ -2918,16 +3474,18 @@ final class McpServer : ServerCore
 				if (slash == 0)
 					continue;
 				const childUri = prefix ~ rest[0 .. slash];
-				if (childUri in seenDirs)
+				if (childUri in dirs)
 					continue;
-				seenDirs[childUri] = true;
 				Resource d;
 				d.uri = childUri;
 				d.name = rest[0 .. slash];
 				d.mimeType = directoryMimeType;
-				children ~= d;
+				dirs[childUri] = d;
 			}
 		}
+		foreach (uri, d; dirs)
+			if (uri !in fileUris)
+				children ~= d;
 
 		// The method applies only to directory resources: a URI that names no
 		// subtree (a file, or an unknown URI) is reported as -32602, the same code
@@ -2943,11 +3501,11 @@ final class McpServer : ServerCore
 
 		sort!((a, b) => a.uri < b.uri)(children);
 		return paginatedList!(ListResourcesResult, "resources")("resources/directory/read",
-				children, (Resource r) => r, params, ver);
+				children, (Resource r) => r.uri, (Resource r) => r, params, ver);
 	}
 
 	/// Serve `skills/list` (Skills extension): the registered skill entries in
-	/// registration order, paginated like the base `*/list` methods. Entries are
+	/// `SKILL.md` URI order, paginated like the base `*/list` methods. Entries are
 	/// atomic — a skill's `resources` manifest is never split across pages. Not
 	/// routed through `paginatedList` because entries are raw extension-defined
 	/// Json with no `forVersion` projection, but it shares `maybeCache`: the
@@ -2955,12 +3513,16 @@ final class McpServer : ServerCore
 	/// `ttlMs`/`cacheScope` (configured via `setListCacheHint("skills/list")`).
 	private Json doListSkills(Json params, ProtocolVersion ver) @safe
 	{
+		import std.algorithm : sort;
+
+		auto uris = skillIndex_.byUri.keys;
+		sort(uris);
 		size_t begin, end;
 		Nullable!string next;
-		pageBounds(params, skillIndex_.order.length, pageSize_, begin, end, next);
+		pageBounds(params, uris, pageSize_, begin, end, next);
 
 		ListSkillsResult result;
-		foreach (uri; skillIndex_.order[begin .. end])
+		foreach (uri; uris[begin .. end])
 			result.skills ~= skillIndex_.byUri[uri];
 		result.nextCursor = next;
 		return maybeCache(result, listHint("skills/list"), ver);
@@ -2992,7 +3554,7 @@ final class McpServer : ServerCore
 		return maybeCache(result, listHint("skills/get"), ver);
 	}
 
-	private Json doSubscribe(Json params, ConnectionState conn) @safe
+	private Json doSubscribe(Json params, ConnectionState conn, ProtocolVersion ver) @safe
 	{
 		// `subscribe` is an optional resources capability (server/resources:
 		// "whether the client can subscribe to be notified of changes to individual
@@ -3006,8 +3568,55 @@ final class McpServer : ServerCore
 			throw methodNotFound("resources/subscribe", subscriptionRejectionHint());
 		if ("uri" !in params || params["uri"].type != Json.Type.string)
 			throw invalidParams("resources/subscribe requires a string 'uri'");
-		conn.subscriptions[params["uri"].get!string] = true;
+		const uri = params["uri"].get!string;
+		if (!resourceExists(uri))
+		{
+			Json data = Json.emptyObject;
+			data["uri"] = uri;
+			throw resourceNotFound(uri, ver, data);
+		}
+		pruneStaleSubscriptions(conn);
+		if ((uri in conn.subscriptions) is null
+				&& conn.subscriptions.length >= maxResourceSubscriptions)
+			throw invalidParams("Too many resource subscriptions on this connection");
+		conn.subscriptions[uri] = ++subscriptionEpoch_;
 		return Json.emptyObject;
+	}
+
+	/// Whether `conn` holds a `resources/subscribe` entry for `uri` made after
+	/// the resource was last removed.
+	private bool hasLiveSubscription(ConnectionState conn, string uri) const @safe
+	{
+		auto at = uri in conn.subscriptions;
+		if (at is null)
+			return false;
+		auto removed = uri in resourceRemovedAt_;
+		return removed is null || *at > *removed;
+	}
+
+	/// Drop `conn`'s subscriptions to resources removed since they were made.
+	private void pruneStaleSubscriptions(ConnectionState conn) @safe
+	{
+		string[] stale;
+		foreach (uri, at; conn.subscriptions)
+			if (!hasLiveSubscription(conn, uri))
+				stale ~= uri;
+		foreach (uri; stale)
+			conn.subscriptions.remove(uri);
+	}
+
+	/// Whether `uri` names a registered resource or matches a resource template.
+	private bool resourceExists(string uri) @safe
+	{
+		if (uri in resources)
+			return true;
+		foreach (t; templates)
+		{
+			string[string] captured;
+			if (matchUriTemplate(t.descriptor.uriTemplate, uri, captured))
+				return true;
+		}
+		return false;
 	}
 
 	/// The `data` payload accompanying a -32601 for resources/subscribe or
@@ -3046,8 +3655,8 @@ final class McpServer : ServerCore
 		// to peers that don't understand them. `BaseMetadata.title` was introduced
 		// by 2025-06-18 and `Prompt.icons` by 2025-11-25; forVersion strips each on
 		// older versions.
-		return paginatedList!(ListPromptsResult, "prompts")("prompts/list",
-				names, (string name) => prompts[name].descriptor, params, ver);
+		return paginatedList!(ListPromptsResult, "prompts")("prompts/list", names,
+				(string name) => name, (string name) => prompts[name].descriptor, params, ver);
 	}
 
 	/// The per-list modern cache hint configured for `listMethod`, or null if none.
@@ -3071,12 +3680,11 @@ final class McpServer : ServerCore
 		// Capability gating: mirrors doCallTool — uses per-request
 		// _meta.clientCapabilities on the modern protocol, or the session caps
 		// negotiated at initialize on stateful 2025-era protocols.
-		const ClientCapabilities declared = ver.isModern
-			? RequestMeta.fromParams(params).clientCapabilities : conn.clientCaps;
+		const ClientCapabilities declared = ctx.clientCapabilities();
 		if (auto missing = entry.requiredClientCapabilities.missingFrom(declared))
 			throw missingRequiredClientCapability(missing.get);
 
-		Json args = ("arguments" in params) ? params["arguments"] : Json.emptyObject;
+		Json args = requestArguments(params, "prompts/get");
 		// Validate declared required arguments before invoking the handler so a
 		// missing required argument yields -32602 instead of a default-valued
 		// prompt (spec: server/prompts § Error Handling / Implementation
@@ -3098,7 +3706,11 @@ final class McpServer : ServerCore
 		// client attached to this (retried) request. The `resultType`
 		// discriminator (and statelessness) is modern-gated by the dispatch path,
 		// so the 2025-era protocols never see it.
-		auto response = entry.handler(args, ctx);
+		PromptResponse response;
+		try
+			response = entry.handler(args, ctx);
+		catch (PromptError e)
+			throw internalError(e.msg);
 		// MRTR: mirror doCallTool — never ask the client for an input kind
 		// it did not declare. MRTR is modern-only (`usesMRTR`); reuse the
 		// `declared` set already resolved above for capability gating.
@@ -3114,30 +3726,83 @@ final class McpServer : ServerCore
 
 	private Json doComplete(Json params) @safe
 	{
-		auto request = CompleteRequest.fromJson(params);
-		// The global handler takes precedence (advanced/dynamic routing), then a
-		// per-argument completer registered via `setArgumentCompleter`.
-		if (typedCompletionHandler !is null)
-			return typedCompletionHandler(request).toJson();
-		if (argumentCompleters.length)
-		{
-			const key = argumentCompleterKey(request.reference, request.argumentName);
-			if (auto completer = key in argumentCompleters)
-			{
-				CompleteResult result;
-				auto values = (*completer)(request.argumentValue);
-				result.values = values;
-				result.total = values.length;
-				return result.toJson();
-			}
-			// A registered (reference, argument) surface exists but this request
-			// matched none of them: an empty completion is the spec-compliant answer.
-			return CompleteResult.init.toJson();
-		}
 		// No handler registered => the `completions` capability is not advertised.
 		// The spec directs servers to answer with -32601 (Capability not
 		// supported) rather than a success result in this case.
-		throw methodNotFound("completion/complete");
+		if (typedCompletionHandler is null && argumentCompleters.length == 0)
+			throw methodNotFound("completion/complete");
+		validateCompleteParams(params);
+		auto request = CompleteRequest.fromJson(params);
+		requireCompletionTarget(request.reference);
+		// The global handler takes precedence (advanced/dynamic routing); an empty
+		// result from it falls back to a per-argument completer registered via
+		// `setArgumentCompleter`.
+		if (typedCompletionHandler !is null)
+		{
+			auto global = typedCompletionHandler(request);
+			if (global.values.length || argumentCompleters.length == 0)
+				return global.toJson();
+		}
+		const key = argumentCompleterKey(request.reference, request.argumentName);
+		if (auto completer = key in argumentCompleters)
+			return (*completer)(request).toJson();
+		// A registered (reference, argument) surface exists but this request
+		// matched none of them: an empty completion is the spec-compliant answer.
+		return CompleteResult.init.toJson();
+	}
+
+	/// Reject a `completion/complete` whose `ref` names no registered prompt,
+	/// resource, or resource template (server/utilities/completion: invalid
+	/// prompt name -> -32602).
+	private void requireCompletionTarget(CompletionReference reference) @safe
+	{
+		if (reference.type == "ref/prompt")
+		{
+			if (reference.name !in prompts)
+				throw invalidParams("Unknown prompt: " ~ reference.name);
+			return;
+		}
+		if (reference.uri in resources)
+			return;
+		foreach (ref t; templates)
+			if (t.descriptor.uriTemplate == reference.uri)
+				return;
+		throw invalidParams("Unknown resource or resource template: " ~ reference.uri);
+	}
+
+	/// Reject a `completion/complete` whose params do not match
+	/// `CompleteRequestParams`: a `ref` that is a `ref/prompt` with a string
+	/// `name` or a `ref/resource` with a string `uri`, and an `argument` with
+	/// string `name` and `value`.
+	private static void validateCompleteParams(Json params) @safe
+	{
+		bool isString(Json obj, string key) @safe
+		{
+			return obj.type == Json.Type.object && key in obj && obj[key].type == Json.Type.string;
+		}
+
+		if (params.type != Json.Type.object)
+			throw invalidParams("completion/complete requires params");
+		auto reference = ("ref" in params) ? params["ref"] : Json.undefined;
+		if (!isString(reference, "type"))
+			throw invalidParams("completion/complete requires a 'ref' with a string 'type'");
+		const refType = reference["type"].get!string;
+		if (refType == "ref/prompt")
+		{
+			if (!isString(reference, "name"))
+				throw invalidParams("a ref/prompt reference requires a string 'name'");
+		}
+		else if (refType == "ref/resource")
+		{
+			if (!isString(reference, "uri"))
+				throw invalidParams("a ref/resource reference requires a string 'uri'");
+		}
+		else
+			throw invalidParams("Unknown completion reference type: " ~ refType);
+		auto argument = ("argument" in params) ? params["argument"] : Json.undefined;
+		if (!isString(argument, "name") || !isString(argument, "value"))
+			throw invalidParams(
+					"completion/complete requires an 'argument' with string 'name' and 'value'");
 	}
 
 	private Json doSetLevel(Json params, ProtocolVersion ver, ConnectionState conn) @safe
@@ -3195,9 +3860,8 @@ final class McpServer : ServerCore
 		// and replace the client capabilities mid-session, desyncing version-gated
 		// projection and the `tools/call` capability gate. Reject it with -32600,
 		// leaving the established `negotiated`/`clientCaps` untouched. A stateless
-		// server shares one fallback `ConnectionState` across its sequential
-		// single-peer clients, each of which legitimately performs its own
-		// `initialize` handshake, so the guard applies only to stateful sessions.
+		// server has no session, and each of its clients legitimately performs its
+		// own `initialize` handshake, so the guard applies only to stateful sessions.
 		if (mode_ == ServerMode.stateful && conn.initializeProcessed)
 			throw invalidRequest("Session already initialized");
 
@@ -3211,18 +3875,9 @@ final class McpServer : ServerCore
 			throw invalidParams("initialize requires a non-empty string 'protocolVersion'");
 
 		auto p = InitializeParams.fromJson(params);
+		// `negotiate` answers a modern request with the latest legacy version:
+		// 2026-07-28 defines no `initialize`, so the handshake cannot claim it.
 		conn.negotiated = negotiate(p.protocolVersion);
-		// The 2026-07-28 revision defines NO `initialize`/`InitializeResult`: modern
-		// peers establish the session via `server/discover` plus per-request
-		// `_meta`, never the stateful `initialize` handshake. So the `initialize`
-		// channel does not actually "support" modern. Per the Version Negotiation
-		// rule ("if the server supports the requested version it MUST respond with
-		// the same version, otherwise it MUST respond with another version it
-		// supports — SHOULD be the latest"), clamp a modern negotiation down to the
-		// latest stable rather than emitting an InitializeResult that claims a
-		// version with no initialize semantics.
-		if (conn.negotiated.isModern)
-			conn.negotiated = latestLegacy;
 		conn.clientCaps = p.capabilities;
 		// Record that this stateful session has processed its `initialize`, so the
 		// re-init guard above rejects a second one even if it arrives before the
@@ -3233,6 +3888,19 @@ final class McpServer : ServerCore
 		InitializeResult result;
 		result.protocolVersion = conn.negotiated.toWire;
 		result.capabilities = capabilities().forVersion(conn.negotiated);
+		// A stateless server has no channel to push a 2025-era list_changed
+		// notification on (no stdio session, no HTTP GET stream), so it does not
+		// promise one. Its modern clients learn of list changes through
+		// `subscriptions/listen` instead, advertised via `server/discover`.
+		if (mode_ == ServerMode.stateless)
+		{
+			if (!result.capabilities.tools.isNull)
+				result.capabilities.tools.get.listChanged = false;
+			if (!result.capabilities.resources.isNull)
+				result.capabilities.resources.get.listChanged = false;
+			if (!result.capabilities.prompts.isNull)
+				result.capabilities.prompts.get.listChanged = false;
+		}
 		result.serverInfo = serverInfo_.forVersion(conn.negotiated);
 		result.instructions = instructions;
 		return result.toJson();
@@ -3243,8 +3911,21 @@ final class McpServer : ServerCore
 		// Each tool is projected to the negotiated protocol version (via
 		// `paginatedList` -> `forVersion`) so version-gated fields are not emitted
 		// to peers that don't understand them.
-		return paginatedList!(ListToolsResult, "tools")("tools/list",
-				sortedToolNames(), (string name) => tools[name].descriptor, params, ver);
+		return paginatedList!(ListToolsResult, "tools")("tools/list", sortedToolNames(),
+				(string name) => name, (string name) => tools[name].descriptor, params, ver);
+	}
+
+	/// The `arguments` object of a `tools/call` / `prompts/get` request: an empty
+	/// object when absent. Any other non-object value makes the request
+	/// malformed (-32602).
+	private static Json requestArguments(Json params, string method) @safe
+	{
+		auto a = "arguments" in params;
+		if (a is null)
+			return Json.emptyObject;
+		if (a.type != Json.Type.object)
+			throw invalidParams(method ~ " 'arguments' must be an object");
+		return *a;
 	}
 
 	private Json doCallTool(Json params, RequestContext ctx,
@@ -3265,24 +3946,19 @@ final class McpServer : ServerCore
 		// taken from this request's `_meta.clientCapabilities` on the stateless
 		// modern protocol, or from the session capabilities negotiated at
 		// `initialize` on the stateful 2025-era protocols.
-		const ClientCapabilities declared = ver.isModern
-			? RequestMeta.fromParams(params).clientCapabilities : conn.clientCaps;
+		const ClientCapabilities declared = ctx.clientCapabilities();
 		if (auto missing = entry.requiredClientCapabilities.missingFrom(declared))
 			throw missingRequiredClientCapability(missing.get);
 
-		Json args = ("arguments" in params) ? params["arguments"] : Json.emptyObject;
+		Json args = requestArguments(params, "tools/call");
 
 		// Tasks extension (SEP-2663): the server decides whether a call creates a
 		// task, but only for a client that declared the extension. Without it a
-		// task-supporting tool falls through to a synchronous run, and a tool that
-		// requires the extension is rejected with -32021 naming it.
-		if (entry.taskSupport != TaskSupport.none && !declaresTasksExtension(declared))
-		{
-			if (entry.taskSupport == TaskSupport.required)
-				throw missingRequiredClientCapability(tasksRequiredCapabilities(),
-						"This tool requires the " ~ tasksExtensionKey ~ " extension");
-			return runTaskToolInline(name, args, ctx).forVersion(ver).toJson();
-		}
+		// tool that requires the extension is rejected with -32021 naming it; any
+		// other tool's handler runs, and `startTask` runs its executor inline.
+		if (entry.taskSupport == TaskSupport.required && !acceptsTasks(declared, ver))
+			throw tasksExtensionRequired("This tool requires the " ~ tasksExtensionKey
+					~ " extension");
 		// Validate the supplied arguments against the tool's declared inputSchema
 		// before dispatch (spec: server/tools § Security Considerations,
 		// "Servers MUST: Validate all tool inputs"). Per § Error Handling, an
@@ -3309,12 +3985,16 @@ final class McpServer : ServerCore
 		{
 			// CallToolResult or InputRequiredResult.
 			auto response = entry.handler(args, ctx);
+			// A task handle is only meaningful to a client that declared the
+			// Tasks extension, whichever way the handler built it.
+			if (response.isTask && !acceptsTasks(declared, ver))
+				throw tasksExtensionRequired(
+						"This tool requires the " ~ tasksExtensionKey ~ " extension");
 			// MRTR: an InputRequiredResult MUST NOT ask the client for an
 			// input kind it never declared. Drop any unsupported inputRequests
 			// against the same `declared` set used for capability gating above. If
-			// that leaves no requests AND no requestState, the result violates the
-			// spec ("at least one of inputRequests/requestState"), so surface it as
-			// an internal error rather than emitting an unfulfillable round trip.
+			// that drops every request, the round trip can never complete, so the
+			// call fails with -32021 naming the missing capabilities.
 			// MRTR exists only on the modern (stateless) protocol — `usesMRTR` —
 			// where `declared` is the request's own _meta.clientCapabilities; a
 			// legacy InputRequiredResult is left untouched.
@@ -3323,7 +4003,7 @@ final class McpServer : ServerCore
 			// Validate the handler's (un-projected) output against the tool's
 			// declared outputSchema before version-shaping, so validation always
 			// sees the full structuredContent regardless of the negotiated version.
-			if (validateOutputSchema_ && !response.isTask)
+			if (validateOutputSchema_ && !response.isTask && !response.needsInput)
 				checkOutputSchema(entry.outputValidator, entry.descriptor.name, response.toJson());
 			// Project the result to the negotiated protocol version so version-
 			// gated fields are not emitted to peers that don't understand them.
@@ -3333,14 +4013,18 @@ final class McpServer : ServerCore
 		}
 		catch (McpException e)
 			throw e; // protocol-level errors propagate as JSON-RPC errors
+		catch (ToolError e)
+			return CallToolResult.error(e.msg).toJson();
 		catch (Exception e)
 		{
 			// Tool *execution* failures are reported as isError content, not
-			// protocol errors (per the MCP spec).
-			CallToolResult err;
-			err.content = [Content.makeText(e.msg)];
-			err.isError = true;
-			return err.toJson();
+			// protocol errors (per the MCP spec). An unexpected exception's
+			// message can carry internals, so it is logged and masked unless
+			// `exposeInternalErrors` was called.
+			import vibe.core.log : logError;
+
+			logError("tools/call %s: unhandled %s: %s", name, typeid(e).name, e.msg);
+			return CallToolResult.error(exposeInternalErrors_ ? e.msg : "Internal error").toJson();
 		}
 	}
 
@@ -3370,9 +4054,9 @@ final class McpServer : ServerCore
 	///   2. Conformance — that `structuredContent` MUST validate against the
 	///      tool's `outputSchema`.
 	/// No-op when the tool declares no output schema. A tool *execution* error
-	/// (`isError:true`) and an `InputRequiredResult` (MRTR — `inputRequests`
-	/// only, no `content`) are exempt: the MUST governs successful structured
-	/// results, not error reports or input-gathering round trips. Throws an
+	/// (`isError:true`) is exempt, and the caller skips task handles and
+	/// `InputRequiredResult`s: the MUST governs successful structured results,
+	/// not error reports, task handles, or input-gathering round trips. Throws an
 	/// internal `McpException` on a violation.
 	private static void checkOutputSchema(Validator validator, string toolName, Json result) @safe
 	{
@@ -3387,10 +4071,6 @@ final class McpServer : ServerCore
 		// content (no structuredContent); the MUST does not apply to it.
 		if ("isError" in result && result["isError"].type == Json.Type.bool_
 				&& result["isError"].get!bool)
-			return;
-		// An InputRequiredResult is a distinct result shape (only `inputRequests`,
-		// no `content`); it is not a structured tool output.
-		if ("inputRequests" in result && "content" !in result)
 			return;
 		// Presence half of the MUST: a successful result with a declared
 		// outputSchema must provide structuredContent.
@@ -3416,78 +4096,303 @@ final class McpServer : ServerCore
 	}
 }
 
-/// Match a concrete `uri` against an RFC 6570-style template containing
-/// `{var}` placeholders (each capturing a non-empty run up to the next literal).
-/// On success, fills `params` with the captured values and returns true.
+/// Match a concrete `uri` against an RFC 6570 URI template. On success, fills
+/// `params` with the captured variable values and returns true.
 ///
-/// Captured values are percent-decoded per RFC 3986 (RFC 6570 expansion
-/// percent-encodes reserved characters during URI construction, so the reverse
-/// is required to recover the original variable value); a URI carrying a
-/// malformed percent escape does not match. A single leading RFC 6570 operator
-/// (`+`, `#`, `.`, `/`, `;`, `?`, `&`) on a placeholder is recognised and
-/// stripped, so `{+path}` binds the variable `path`.
+/// Each expression is bound according to its operator:
+///   - `{var}` (simple): a non-empty value that contains no `/`, `\`, `?` or
+///     `#`, neither raw nor percent-encoded (simple expansion encodes them, so a
+///     value carrying one could only be a path-traversal attempt).
+///   - `{+var}` (reserved): a non-empty value that may contain `/`.
+///   - `{#var}`: an optional `#`-prefixed fragment, which may contain `/`.
+///   - `{/var}` / `{.var}`: optional `/`- or `.`-prefixed segments, one per
+///     variable, none containing `/`.
+///   - `{;var}` / `{?var}` / `{&var}`: optional `name=value` pairs, only for the
+///     variables the expression names, in any order.
+/// Outside a fragment, a value with a `.` or `..` path segment (raw or
+/// percent-encoded, delimited by `/` or `\`) does not match, so a captured
+/// value never walks out of the path the template names.
+/// Values are percent-decoded per RFC 3986; a malformed escape does not match.
+/// Comma-separated variable lists are supported. A prefix modifier (`:n`) caps
+/// its variable's decoded value at `n` code points. An explode modifier (`*`) on
+/// the last variable of a `/` or `.` expression takes the remaining segments.
 bool matchUriTemplate(string tmpl, string uri, out string[string] params) @safe
 {
+	auto m = UriTemplateMatcher(tmpl, uri);
+	return m.match(0, 0, params);
+}
+
+/// Backtracking matcher behind `matchUriTemplate`. An expression's extent is
+/// ambiguous when its trailing literal (or the next expression's operator
+/// prefix) recurs in the URI, so each candidate end is tried shortest first,
+/// backtracking when the rest of the template fails. Binding never reads the
+/// values bound so far, so a failed (template, URI) position pair fails for
+/// every path that reaches it and is memoised; the bind attempts are also
+/// capped so a hostile URI cannot make matching expensive.
+private struct UriTemplateMatcher
+{
+	/// The most expression bindings one match may attempt.
+	enum maxAttempts = 1024;
+
+	string tmpl;
+	string uri;
+	bool[ulong] failed;
+	size_t attempts;
+
+	this(string tmpl, string uri) @safe
+	{
+		this.tmpl = tmpl;
+		this.uri = uri;
+	}
+
+	/// Match `tmpl[ti .. $]` against `uri[ui .. $]`, updating `params` only on
+	/// success.
+	bool match(size_t ti, size_t ui, ref string[string] params) @safe
+	{
+		import std.string : indexOf;
+
+		if (ti == tmpl.length)
+			return ui == uri.length;
+		const key = (cast(ulong) ti << 32) | ui;
+		if (key in failed)
+			return false;
+		if (tmpl[ti] != '{')
+		{
+			const brace = tmpl[ti .. $].indexOf('{');
+			const lit = tmpl[ti .. brace < 0 ? $ : ti + brace];
+			if (uri.length - ui >= lit.length && uri[ui .. ui + lit.length] == lit
+					&& match(ti + lit.length, ui + lit.length, params))
+				return true;
+			failed[key] = true;
+			return false;
+		}
+		const close = tmpl[ti .. $].indexOf('}');
+		if (close < 0)
+			return false;
+		const expr = tmpl[ti + 1 .. ti + close];
+		const next = ti + close + 1;
+		foreach (end; candidateEnds(next, ui))
+		{
+			if (++attempts > maxAttempts)
+				return false;
+			auto attempt = params.dup;
+			if (bindUriExpression(expr, uri[ui .. end], attempt) && match(next, end, attempt))
+			{
+				params = attempt;
+				return true;
+			}
+		}
+		failed[key] = true;
+		return false;
+	}
+
+	/// The URI offsets at which the expression starting at `ui` may end: each
+	/// occurrence of the literal at `tmpl[next .. $]`, or - when another
+	/// expression follows directly - each occurrence of its operator prefix and
+	/// the end of the URI; with nothing after it, the end of the URI.
+	private size_t[] candidateEnds(size_t next, size_t ui) @safe
+	{
+		import std.string : indexOf;
+
+		size_t[] ends;
+		const brace = tmpl[next .. $].indexOf('{');
+		const lit = tmpl[next .. brace < 0 ? $ : next + brace];
+		if (lit.length)
+		{
+			size_t from = ui;
+			for (ptrdiff_t pos; (pos = uri[from .. $].indexOf(lit)) >= 0; from += pos + 1)
+				ends ~= from + pos;
+		}
+		else if (next + 1 < tmpl.length && uriTemplatePrefixOps.indexOf(tmpl[next + 1]) >= 0)
+		{
+			foreach (i; ui .. uri.length)
+				if (uri[i] == tmpl[next + 1])
+					ends ~= i;
+			ends ~= uri.length;
+		}
+		else
+			ends ~= uri.length;
+		return ends;
+	}
+}
+
+/// RFC 6570 operators whose expansion begins with the operator character itself.
+private enum uriTemplatePrefixOps = "#./;?&";
+
+/// Whether the URI template `tmpl` has two adjacent expressions ("{a}{b}") that
+/// can never be reverse-matched against a concrete URI, as there is no boundary
+/// between them. An expression whose operator emits its own prefix ("{id}{?q}")
+/// is bounded.
+bool hasAdjacentUriVariables(string tmpl) @safe pure nothrow @nogc
+{
+	foreach (i; 2 .. tmpl.length)
+	{
+		if (tmpl[i - 2 .. i] != "}{")
+			continue;
+		bool prefixed;
+		foreach (op; uriTemplatePrefixOps)
+			prefixed |= tmpl[i] == op;
+		if (!prefixed)
+			return true;
+	}
+	return false;
+}
+
+/// Bind one template expression (`expr`, the text between the braces) against
+/// the URI substring `s` it spans; see `matchUriTemplate` for the rules.
+private bool bindUriExpression(string expr, string s, ref string[string] params) @safe
+{
+	import std.algorithm : countUntil;
+	import std.array : join, split;
+	import std.string : indexOf;
+
+	char op = 0;
+	if (expr.length && "+#./;?&".indexOf(expr[0]) >= 0)
+	{
+		op = expr[0];
+		expr = expr[1 .. $];
+	}
+	string[] names;
+	// Each variable's RFC 6570 prefix length (`{var:n}`), or 0 for none.
+	size_t[] maxLengths;
+	bool explodeLast;
+	foreach (spec; expr.split(','))
+	{
+		size_t maxLength;
+		const colon = spec.indexOf(':');
+		if (colon >= 0)
+		{
+			import std.conv : ConvException, to;
+
+			try
+				maxLength = spec[colon + 1 .. $].to!size_t;
+			catch (ConvException)
+				return false;
+			if (maxLength == 0)
+				return false;
+			spec = spec[0 .. colon];
+		}
+		maxLengths ~= maxLength;
+		explodeLast = spec.length && spec[$ - 1] == '*';
+		if (explodeLast)
+			spec = spec[0 .. $ - 1];
+		if (spec.length == 0)
+			return false;
+		names ~= spec;
+	}
+	if (names.length == 0)
+		return false;
+
+	// A prefix expansion emits at most `n` code points of the value, so a longer
+	// captured value cannot have come from this template.
+	bool withinPrefix(size_t i, string v) @safe
+	{
+		import std.range : walkLength;
+
+		return maxLengths[i] == 0 || v.walkLength <= maxLengths[i];
+	}
+
+	bool bindList(string[] parts, bool allowSlash) @safe
+	{
+		bool mergedPath;
+		if (parts.length > names.length)
+		{
+			if (!explodeLast)
+				return false;
+			const sep = op == '.' ? "." : op == '/' ? "/" : ",";
+			auto merged = parts[0 .. names.length].dup;
+			merged[$ - 1] ~= sep ~ parts[names.length .. $].join(sep);
+			parts = merged;
+			// An exploded `{/var*}` deliberately spans several path segments.
+			mergedPath = op == '/';
+		}
+		foreach (i, raw; parts)
+		{
+			string v;
+			if (!decodeUriValue(raw, allowSlash || (mergedPath && i + 1 == parts.length), v))
+				return false;
+			// A fragment is never resolved as a path, so only it may carry dot segments.
+			if (op != '#' && hasDotSegment(v))
+				return false;
+			if (!withinPrefix(i, v))
+				return false;
+			params[names[i]] = v;
+		}
+		return true;
+	}
+
+	switch (op)
+	{
+	case 0:
+	case '+':
+		if (s.length == 0)
+			return false;
+		return bindList(names.length > 1 ? s.split(',') : [s], op == '+');
+	case '#':
+		if (s.length == 0)
+			return true;
+		if (s[0] != '#' || s.length == 1)
+			return false;
+		return bindList(names.length > 1 ? s[1 .. $].split(',') : [s[1 .. $]], true);
+	case '/':
+	case '.':
+		if (s.length == 0)
+			return true;
+		if (s[0] != op)
+			return false;
+		return bindList(s[1 .. $].split(op), false);
+	default: // ';', '?', '&'
+		if (s.length == 0)
+			return true;
+		if (s[0] != op)
+			return false;
+		foreach (pair; s[1 .. $].split(op == ';' ? ';' : '&'))
+		{
+			const eq = pair.indexOf('=');
+			const name = eq < 0 ? pair : pair[0 .. eq];
+			const idx = names.countUntil(name);
+			if (idx < 0)
+				return false;
+			string v;
+			if (!decodeUriValue(eq < 0 ? "" : pair[eq + 1 .. $], true, v))
+				return false;
+			if (hasDotSegment(v))
+				return false;
+			if (!withinPrefix(idx, v))
+				return false;
+			params[name] = v;
+		}
+		return true;
+	}
+}
+
+/// Whether any segment of the decoded value `v`, split on `/` or `\`, is `.` or
+/// `..`, so a reader that joins the value onto a path (including a Windows path,
+/// where `\` also separates) cannot be walked out of it.
+private bool hasDotSegment(string v) @safe
+{
+	import std.algorithm : any, splitter;
+
+	return v.splitter!(c => c == '/' || c == '\\')
+		.any!(seg => seg == "." || seg == "..");
+}
+
+/// Percent-decode a captured template value. Unless `allowSlash`, a value whose
+/// raw or decoded form contains a path separator (`/` or `\`) — or whose raw
+/// form contains `?` or `#` — is rejected. Returns false on a malformed escape.
+private bool decodeUriValue(string raw, bool allowSlash, out string value) @safe
+{
+	import std.algorithm : canFind;
 	import std.string : indexOf;
 	import std.uri : decodeComponent, URIException;
 
-	size_t ti = 0, ui = 0;
-	while (ti < tmpl.length)
-	{
-		if (tmpl[ti] == '{')
-		{
-			const close = tmpl[ti .. $].indexOf('}');
-			if (close < 0)
-				return false;
-			auto varName = tmpl[ti + 1 .. ti + close];
-			// RFC 6570 operator prefix (e.g. {+path}, {#frag}, {?query}); the
-			// operator only affects expansion semantics, not the variable name.
-			if (varName.length && indexOf("+#./;?&", varName[0]) >= 0)
-				varName = varName[1 .. $];
-			ti += close + 1;
-
-			const litStart = ti;
-			while (ti < tmpl.length && tmpl[ti] != '{')
-				ti++;
-			const lit = tmpl[litStart .. ti];
-
-			string captured;
-			if (lit.length == 0)
-			{
-				captured = uri[ui .. $];
-				ui = uri.length;
-			}
-			else
-			{
-				const pos = uri[ui .. $].indexOf(lit);
-				if (pos < 0)
-					return false;
-				captured = uri[ui .. ui + pos];
-				ui += pos + lit.length;
-			}
-			if (captured.length == 0)
-				return false;
-			// Reverse RFC 6570/3986 percent-encoding to recover the original
-			// variable value; a malformed escape means the URI does not match.
-			string decoded;
-			try
-				decoded = decodeComponent(captured);
-			catch (URIException)
-				return false;
-			params[varName] = decoded;
-		}
-		else
-		{
-			const litStart = ti;
-			while (ti < tmpl.length && tmpl[ti] != '{')
-				ti++;
-			const lit = tmpl[litStart .. ti];
-			if (ui + lit.length > uri.length || uri[ui .. ui + lit.length] != lit)
-				return false;
-			ui += lit.length;
-		}
-	}
-	return ui == uri.length;
+	if (!allowSlash && (raw.canFind('/', '\\') || raw.indexOf('?') >= 0 || raw.indexOf('#') >= 0))
+		return false;
+	try
+		value = decodeComponent(raw);
+	catch (URIException)
+		return false;
+	return allowSlash || !value.canFind('/', '\\');
 }
 
 unittest  // template matching captures a single parameter
@@ -3507,8 +4412,141 @@ unittest  // template matching rejects non-matching URIs
 unittest  // template matching captures a trailing parameter
 {
 	string[string] params;
-	assert(matchUriTemplate("file:///{path}", "file:///a/b/c", params));
-	assert(params["path"] == "a/b/c");
+	assert(matchUriTemplate("file:///{name}", "file:///notes.txt", params));
+	assert(params["name"] == "notes.txt");
+}
+
+unittest  // a simple {var} never captures a '/' (no path traversal)
+{
+	string[string] params;
+	assert(!matchUriTemplate("file:///{path}", "file:///a/b/c", params));
+	assert(!matchUriTemplate("file:///docs/{name}", "file:///docs/../../etc/passwd", params));
+}
+
+unittest  // a simple {var} rejects a '.' or '..' value, raw or percent-encoded
+{
+	string[string] params;
+	assert(!matchUriTemplate("file:///{dir}/{file}", "file:///../passwd", params));
+	assert(!matchUriTemplate("file:///{dir}/{file}", "file:///%2e%2e/passwd", params));
+	assert(!matchUriTemplate("file:///{dir}/{file}", "file:///%2E./passwd", params));
+	assert(!matchUriTemplate("file:///docs/{name}", "file:///docs/.", params));
+	assert(matchUriTemplate("file:///docs/{name}", "file:///docs/..hidden", params));
+	assert(params["name"] == "..hidden");
+}
+
+unittest  // segment and reserved expressions reject a '.' or '..' path segment
+{
+	string[string] params;
+	assert(!matchUriTemplate("res://x{/seg}", "res://x/..", params));
+	assert(!matchUriTemplate("res://x{/path*}", "res://x/a/../b", params));
+	assert(!matchUriTemplate("res://x/{+path}", "res://x/a/../../etc", params));
+	assert(!matchUriTemplate("res://x/{+path}", "res://x/a/%2e%2e/etc", params));
+	assert(!matchUriTemplate("res://x/{+path}", "res://x/a%2F..%2Fetc", params));
+	assert(matchUriTemplate("res://x/{+path}", "res://x/a/b.c/d", params));
+	assert(params["path"] == "a/b.c/d");
+}
+
+unittest  // a prefix modifier {var:n} rejects a value longer than n characters
+{
+	string[string] params;
+	assert(!matchUriTemplate("res://{id:3}", "res://abcdef", params));
+	assert(matchUriTemplate("res://{id:3}", "res://abc", params));
+	assert(params["id"] == "abc");
+}
+
+unittest  // a prefix modifier counts decoded code points, not encoded bytes
+{
+	string[string] params;
+	assert(matchUriTemplate("res://{id:2}", "res://%C3%A9%C3%A9", params));
+	assert(params["id"] == "\u00e9\u00e9");
+	assert(!matchUriTemplate("res://{id:2}", "res://%C3%A9%C3%A9%C3%A9", params));
+}
+
+unittest  // a prefix modifier applies to its own variable in a list and in a query
+{
+	string[string] params;
+	assert(!matchUriTemplate("res://{a:1,b}", "res://xy,z", params));
+	assert(matchUriTemplate("res://{a,b:1}", "res://xy,z", params));
+	assert(!matchUriTemplate("res://x{?q:2}", "res://x?q=abc", params));
+	assert(matchUriTemplate("res://x{?q:2}", "res://x?q=ab", params));
+}
+
+unittest  // a simple {var} rejects a backslash separator, raw or percent-encoded
+{
+	string[string] params;
+	assert(!matchUriTemplate("res://x/{id}", "res://x/..%5C..%5Csecret", params));
+	assert(!matchUriTemplate("res://x/{id}", "res://x/a%5Cb", params));
+	assert(!matchUriTemplate("res://x/{id}", "res://x/a\\b", params));
+}
+
+unittest  // a reserved expression rejects a dot segment delimited by a backslash
+{
+	string[string] params;
+	assert(!matchUriTemplate("res://x/{+path}", "res://x/a/..\\..\\etc", params));
+	assert(!matchUriTemplate("res://x/{+path}", "res://x/a/..%5C..%5Cetc", params));
+	assert(!matchUriTemplate("res://x{/seg}", "res://x/..%5Cetc", params));
+}
+
+unittest  // a query expression rejects a dot-segment value, raw or percent-encoded
+{
+	string[string] params;
+	assert(!matchUriTemplate("file:///docs{?path}", "file:///docs?path=../../etc/passwd", params));
+	assert(!matchUriTemplate("file:///docs{?path}",
+			"file:///docs?path=%2e%2e%2f%2e%2e%2fetc", params));
+	assert(matchUriTemplate("file:///docs{?path}", "file:///docs?path=a/b.c", params));
+	assert(params["path"] == "a/b.c");
+}
+
+unittest  // a query-continuation expression rejects a dot-segment value
+{
+	string[string] params;
+	assert(!matchUriTemplate("res://x?a=1{&path}", "res://x?a=1&path=a/../../etc", params));
+	assert(!matchUriTemplate("res://x?a=1{&path}", "res://x?a=1&path=..%5Cetc", params));
+}
+
+unittest  // a path-parameter expression rejects a dot-segment value
+{
+	string[string] params;
+	assert(!matchUriTemplate("res://x{;path}", "res://x;path=..", params));
+	assert(!matchUriTemplate("res://x{;path}", "res://x;path=%2E%2E/etc", params));
+}
+
+unittest  // a reserved expression spans a later occurrence of its trailing literal
+{
+	string[string] params;
+	assert(matchUriTemplate("res://{+path}/meta", "res://a/meta/b/meta", params));
+	assert(params["path"] == "a/meta/b");
+}
+
+unittest  // matching backtracks over an earlier expression's literal choice
+{
+	string[string] params;
+	assert(matchUriTemplate("res://{+a}-{b}.txt", "res://x-y/z-w.txt", params));
+	assert(params["a"] == "x-y/z");
+	assert(params["b"] == "w");
+	string[string] none;
+	assert(!matchUriTemplate("res://{+a}-{b}.txt", "res://x-y/z-w.md", none));
+	assert(none.length == 0);
+}
+
+unittest  // backtracking over a URI full of ambiguous literals stays bounded
+{
+	import std.array : replicate;
+	import std.datetime.stopwatch : StopWatch, AutoStart;
+	import core.time : seconds;
+
+	string[string] params;
+	auto sw = StopWatch(AutoStart.yes);
+	assert(!matchUriTemplate("res://{+a}-{+b}-{+c}-{+d}.txt",
+			"res://" ~ "-".replicate(20_000), params));
+	assert(sw.peek < 2.seconds);
+}
+
+unittest  // a simple {var} rejects a percent-encoded '/' (no encoded traversal)
+{
+	string[string] params;
+	assert(!matchUriTemplate("file:///docs/{name}", "file:///docs/%2e%2e%2fetc%2fpasswd", params));
+	assert(!matchUriTemplate("file:///{path}", "file:///a%20b%2Fc", params));
 }
 
 unittest  // captured variables are RFC 6570/3986 percent-decoded
@@ -3517,8 +4555,104 @@ unittest  // captured variables are RFC 6570/3986 percent-decoded
 	// during URI construction; the matcher must reverse that so the reader
 	// delegate receives the original value, not the still-encoded form.
 	string[string] params;
-	assert(matchUriTemplate("file:///{path}", "file:///a%20b%2Fc", params));
-	assert(params["path"] == "a b/c");
+	assert(matchUriTemplate("file:///{name}", "file:///a%20b%3Fc", params));
+	assert(params["name"] == "a b?c");
+}
+
+unittest  // {?q} binds the value from the query form, not the raw "?q=" text
+{
+	string[string] params;
+	assert(matchUriTemplate("res://x{?q}", "res://x?q=1", params));
+	assert(params["q"] == "1");
+}
+
+unittest  // {?a,b} binds several query variables and tolerates absent ones
+{
+	string[string] params;
+	assert(matchUriTemplate("res://x{?a,b}", "res://x?b=2&a=hello%20world", params));
+	assert(params["a"] == "hello world");
+	assert(params["b"] == "2");
+	string[string] none;
+	assert(matchUriTemplate("res://x{?a,b}", "res://x", none));
+	assert(none.length == 0);
+}
+
+unittest  // a query expression may directly follow a path variable
+{
+	string[string] params;
+	assert(matchUriTemplate("res://items/{id}{?fields}", "res://items/7?fields=name", params));
+	assert(params["id"] == "7");
+	assert(params["fields"] == "name");
+}
+
+unittest  // {&q} continues an existing query
+{
+	string[string] params;
+	assert(matchUriTemplate("res://x?fixed=1{&q}", "res://x?fixed=1&q=z", params));
+	assert(params["q"] == "z");
+}
+
+unittest  // a query variable not named by the template does not match
+{
+	string[string] params;
+	assert(!matchUriTemplate("res://x{?q}", "res://x?other=1", params));
+}
+
+unittest  // {/var} and {#var} require their prefix character
+{
+	string[string] params;
+	assert(matchUriTemplate("res://x{/seg}", "res://x/abc", params));
+	assert(params["seg"] == "abc");
+	assert(!matchUriTemplate("res://x{/seg}", "res://x/a/b", params));
+	string[string] frag;
+	assert(matchUriTemplate("res://x{#frag}", "res://x#part/1", frag));
+	assert(frag["frag"] == "part/1");
+}
+
+unittest  // an exploded {/var*} takes the remaining path segments
+{
+	string[string] params;
+	assert(matchUriTemplate("res://x{/path*}", "res://x/a/b/c", params));
+	assert(params["path"] == "a/b/c");
+}
+
+unittest  // registerResourceTemplate rejects a duplicate uriTemplate
+{
+	import std.exception : assertThrown;
+
+	auto s = new McpServer("t", "1");
+	ResourceTemplate t = {uriTemplate: "res://items/{id}", name: "items"};
+	auto reader = delegate(string uri, string[string] params) @safe => ResourceContents.makeText(
+			uri, "text/plain", "x");
+	s.registerResourceTemplate(t, reader);
+	assertThrown!Exception(s.registerResourceTemplate(t, reader));
+}
+
+unittest  // removeResourceTemplate unregisters a template by its uriTemplate
+{
+	auto s = new McpServer("t", "1");
+	ResourceTemplate t = {uriTemplate: "res://items/{id}", name: "items"};
+	auto reader = delegate(string uri, string[string] params) @safe => ResourceContents.makeText(
+			uri, "text/plain", "x");
+	s.registerResourceTemplate(t, reader);
+	assert(s.removeResourceTemplate("res://items/{id}"));
+	assert(!s.removeResourceTemplate("res://items/{id}"));
+	Json p = Json.emptyObject;
+	p["uri"] = "res://items/7";
+	auto resp = s.handle(req(1, "resources/read", p)).get;
+	assert("error" in resp, "a removed template must no longer serve reads");
+	s.registerResourceTemplate(t, reader);
+}
+
+unittest  // registerResourceTemplate accepts a path variable followed by a query expression
+{
+	auto s = new McpServer("t", "1");
+	ResourceTemplate t = {
+		uriTemplate: "res://items/{id}{?fields}", name: "items"
+	};
+	s.registerResourceTemplate(t, (string uri, string[string] params) @safe {
+		return ResourceContents.makeText(uri, "text/plain", "x");
+	});
 }
 
 unittest  // a delimited captured variable is percent-decoded
@@ -3553,7 +4687,7 @@ version (unittest)
 	}
 
 	// A stateful variant for tests that exercise correlation
-	// features (resources/subscribe, subscriptions/listen resourceSubscriptions,
+	// features (resources/subscribe,
 	// notifyResourceUpdated) — these are only available on a stateful server.
 	private McpServer makeStatefulTestServer() @safe
 	{
@@ -3621,6 +4755,22 @@ unittest  // a stateful session ignores a body _meta.protocolVersion naming an e
 	assert(s.negotiatedVersion == ProtocolVersion.v2025_11_25);
 }
 
+unittest  // a request whose params is an array is rejected with invalidParams
+{
+	auto s = McpServer.stateful("t", "1");
+	Tool t = {name: "noop"};
+	s.registerTool(t, (Json) @safe => CallToolResult());
+	auto resp = s.handle(req(1, "tools/call", Json.emptyArray)).get;
+	assert(resp["error"]["code"].get!int == ErrorCode.invalidParams);
+}
+
+unittest  // a request whose params is a scalar is rejected with invalidParams
+{
+	auto s = McpServer.stateful("t", "1");
+	auto resp = s.handle(req(1, "resources/read", Json("file:///x"))).get;
+	assert(resp["error"]["code"].get!int == ErrorCode.invalidParams);
+}
+
 unittest  // initialize negotiates the requested version and reports server info
 {
 	auto s = makeTestServer();
@@ -3633,6 +4783,51 @@ unittest  // initialize negotiates the requested version and reports server info
 	assert(resp["result"]["protocolVersion"].get!string == "2025-06-18");
 	assert(resp["result"]["serverInfo"]["name"].get!string == "test-srv");
 	assert(resp["result"]["capabilities"]["tools"].type == Json.Type.object);
+}
+
+version (unittest) private Json legacyInitParams() @safe
+{
+	Json params = Json.emptyObject;
+	params["protocolVersion"] = "2025-11-25";
+	params["capabilities"] = Json.emptyObject;
+	params["clientInfo"] = Json(["name": Json("c"), "version": Json("1")]);
+	return params;
+}
+
+version (unittest) private McpServer withListChanged(McpServer s) @safe
+{
+	s.registerTool(Tool("noop"), (Json) @safe => CallToolResult());
+	s.registerResource(Resource("res://x", "x"), () @safe => ResourceContents.init);
+	s.registerPrompt(Prompt("p"), (Json, RequestContext) @safe => GetPromptResult.init);
+	s.enableToolsListChanged();
+	s.enableResourcesListChanged();
+	s.enablePromptsListChanged();
+	return s;
+}
+
+unittest  // a stateless server does not advertise listChanged to a 2025-era client it cannot notify
+{
+	auto s = withListChanged(McpServer.stateless("t", "1"));
+	auto caps = s.handle(req(1, "initialize", legacyInitParams())).get["result"]["capabilities"];
+	assert("listChanged" !in caps["tools"]);
+	assert("listChanged" !in caps["resources"]);
+	assert("listChanged" !in caps["prompts"]);
+}
+
+unittest  // a stateful server advertises listChanged to a 2025-era client
+{
+	auto s = withListChanged(McpServer.stateful("t", "1"));
+	auto caps = s.handle(req(1, "initialize", legacyInitParams())).get["result"]["capabilities"];
+	assert(caps["tools"]["listChanged"].get!bool);
+	assert(caps["resources"]["listChanged"].get!bool);
+	assert(caps["prompts"]["listChanged"].get!bool);
+}
+
+unittest  // a stateless server keeps listChanged in its modern server/discover capabilities
+{
+	auto s = withListChanged(McpServer.stateless("t", "1"));
+	auto caps = s.handle(modernReq(1, "server/discover")).get["result"]["capabilities"];
+	assert(caps["tools"]["listChanged"].get!bool);
 }
 
 unittest  // a second initialize on an already-initialized stateful session is rejected
@@ -3676,6 +4871,13 @@ unittest  // a stateless server still serves a second initialize from a fresh si
 	assert("error" !in second, "a stateless server must not reject a fresh client's initialize");
 }
 
+unittest  // requireInitialized throws on a stateless server, which has no initialized handshake
+{
+	import std.exception : assertThrown;
+
+	assertThrown(McpServer.stateless("t", "1").requireInitialized());
+}
+
 unittest  // requireInitialized: a stateful request before notifications/initialized is rejected
 {
 	auto s = McpServer.stateful("init-gate-srv", "0.1.0");
@@ -3688,9 +4890,10 @@ unittest  // requireInitialized: a stateful request before notifications/initial
 	init["clientInfo"] = Json(["name": Json("c"), "version": Json("1")]);
 	s.handle(req(1, "initialize", init));
 
-	// tools/list before notifications/initialized -> -32002 Server not initialized.
+	// tools/list before notifications/initialized -> -32600 Server not initialized
+	// (-32002 is resource-not-found on the 2025-era protocols).
 	auto early = s.handle(req(2, "tools/list")).get;
-	assert(early["error"]["code"].get!int == -32002);
+	assert(early["error"]["code"].get!int == ErrorCode.invalidRequest);
 
 	// ping is always allowed, even before initialized.
 	auto pong = s.handle(req(3, "ping")).get;
@@ -3717,6 +4920,20 @@ unittest  // requireInitialized: after notifications/initialized requests are se
 	assert(resp["result"]["tools"].type == Json.Type.array);
 }
 
+unittest  // requireInitialized: notifications/initialized without initialize does not open the gate
+{
+	import mcp.protocol.jsonrpc : makeNotification;
+
+	auto s = McpServer.stateful("init-gate-srv", "0.1.0");
+	registerAddTool(s);
+	s.requireInitialized();
+
+	s.handle(Message(makeNotification("notifications/initialized", Json.emptyObject)));
+
+	auto resp = s.handle(req(1, "tools/list")).get;
+	assert(resp["error"]["code"].get!int == ErrorCode.invalidRequest);
+}
+
 unittest  // requireInitialized is OFF by default: a pre-initialized request is still served
 {
 	auto s = makeTestServer();
@@ -3733,27 +4950,50 @@ unittest  // legacy subscriptions/listen on the normal route path is method-not-
 	assert(resp["error"]["code"].get!int == ErrorCode.methodNotFound);
 }
 
-unittest  // duplicate in-flight id: the first request's teardown does not evict the second's token
+unittest  // a connection-scoped batch context reports the connection's declared client capabilities
+{
+	auto conn = new ConnectionState;
+	conn.clientCaps = ClientCapabilities.fromJson(Json([
+		"elicitation": Json.emptyObject
+	]));
+	auto ctx = new ConnectionScopedContext(conn, "sess", TokenInfo.invalid());
+	assert(ctx.clientSupports(ClientCapability.elicitationForm));
+	assert(!ctx.clientSupports(ClientCapability.sampling));
+}
+
+unittest  // a request reusing an in-flight id is rejected and leaves the first registration intact
 {
 	import mcp.server.context : CancellationToken;
 
-	auto conn = new ConnectionState;
-	auto tokA = new CancellationToken;
-	auto tokB = new CancellationToken;
+	auto s = makeTestServer();
+	auto first = new CancellationToken;
+	const key = McpServer.inFlightKey("", Json(1));
+	s.activeConnection.inFlight[key] = first;
 
-	// Both colliding requests share the bare id key (empty connection token).
-	conn.inFlight["i:1"] = tokA;
-	conn.inFlight["i:1"] = tokB; // B overwrites A's registration.
+	auto resp = s.handle(req(1, "tools/list")).get;
+	assert(resp["error"]["code"].get!int == ErrorCode.invalidRequest);
+	assert((key in s.activeConnection.inFlight) !is null);
+	assert(s.activeConnection.inFlight[key] is first);
+}
 
-	// A's teardown must only remove the key when it still maps to A's token; since
-	// B now owns it, the key (and B's token) must survive so a later cancellation
-	// can still reach B.
-	if (auto t = "i:1" in conn.inFlight)
-		if (*t is tokA)
-			conn.inFlight.remove("i:1");
+unittest  // a request with a fractional id is tracked in flight and cancellable
+{
+	import vibe.data.json : parseJsonString;
 
-	assert(("i:1" in conn.inFlight) !is null, "B's live token must not be evicted by A's teardown");
-	assert(conn.inFlight["i:1"] is tokB);
+	auto s = new McpServer("t", "1");
+	string[] keys;
+	Tool t = {name: "probe"};
+	s.registerTool(t, (Json args, RequestContext ctx) @safe {
+		keys = s.activeConnection.inFlight.keys;
+		CallToolResult r;
+		r.content = [Content.makeText("ok")];
+		return r;
+	});
+	s.handle(Message(parseJsonString(
+			`{"jsonrpc":"2.0","id":1.5,"method":"tools/call","params":{"name":"probe"}}`)));
+	assert(keys.length == 1);
+	assert(keys[0] == McpServer.inFlightKey("", Json(1.5)));
+	assert(McpServer.inFlightKey("", Json(1.5)) != McpServer.inFlightKey("", Json(2.5)));
 }
 
 unittest  // Implementation constructor advertises full serverInfo on 2025-11-25
@@ -3942,7 +5182,7 @@ unittest  // pingClient throws when there is no server->client push channel
 	auto s = makeTestServer();
 	bool threw;
 	try
-		s.pingClient();
+		s.pingClient("sess-A");
 	catch (McpException e)
 	{
 		threw = true;
@@ -3951,43 +5191,17 @@ unittest  // pingClient throws when there is no server->client push channel
 	assert(threw);
 }
 
-unittest  // pingClient drives a ping on the push channel and awaits the empty reply
+unittest  // attachPushChannel refuses a second, different channel
 {
-	import std.algorithm : canFind;
-	import vibe.core.core : runTask, exitEventLoop, runEventLoop;
+	import std.exception : assertThrown, assertNotThrown;
+	import mcp.transport.sse_context : ServerPushChannel;
 
 	auto srv = makeTestServer();
-	auto coord = new StreamCoordinator;
-	auto ch = ensurePushChannel(srv, coord); // create + attach the GET push channel
-	string frame;
-	ch.addListener((string f) @safe { frame = f; });
-
-	bool pinged;
-	void delegate() @safe nothrow initiator = () @safe nothrow{
-		try
-			srv.pingClient(); // blocks until the simulated client resolves the request
-		catch (Exception)
-			assert(false, "pingClient threw");
-		pinged = true;
-		exitEventLoop();
-	};
-	void delegate() @safe nothrow responder = () @safe nothrow{
-		// The server emitted a JSON-RPC `ping` request on the GET stream.
-		assert(frame.canFind("\"method\":\"ping\""));
-		assert(frame.canFind("\"id\":1"));
-		// Client answers id 1 with the empty result object, via the coordinator.
-		bool matched;
-		try
-			matched = coord.resolve(Json(1), Json.emptyObject, Json.undefined);
-		catch (Exception)
-			assert(false, "resolve threw");
-		assert(matched);
-	};
-	runTask(initiator);
-	runTask(responder);
-	runEventLoop();
-
-	assert(pinged);
+	auto first = new ServerPushChannel(new StreamCoordinator);
+	srv.attachPushChannel(first);
+	assertNotThrown(srv.attachPushChannel(first));
+	assertThrown(srv.attachPushChannel(new ServerPushChannel(new StreamCoordinator)));
+	assert(srv.serverPushChannel() is first);
 }
 
 unittest  // pingClient(sessionId) reaches a session-scoped GET listener (non-empty owner token)
@@ -4038,10 +5252,10 @@ unittest  // pingClient with an empty/mismatched token cannot reach a session-sc
 	auto ch = ensurePushChannel(srv, coord);
 	ch.addListener((string) @safe {}, Json(""), ListenFilter.init, "", null, "sess-A");
 
-	// The empty-token no-arg form matches no session-scoped listener.
+	// The empty token matches no session-scoped listener.
 	bool threwEmpty;
 	try
-		srv.pingClient();
+		srv.pingClient("");
 	catch (McpException)
 		threwEmpty = true;
 	assert(threwEmpty, "empty owner token must not reach a session-scoped GET listener");
@@ -4236,7 +5450,7 @@ unittest  // tools/call with unknown tool is an invalid-params protocol error
 
 unittest  // output-schema validation: conforming structuredContent passes
 {
-	import mcp.protocol.schema : jsonSchemaOf;
+	import mcp.api.binding : jsonSchemaOf, SchemaUse;
 
 	auto s = new McpServer("vsrv", "0.1.0");
 	struct AddResult
@@ -4245,7 +5459,8 @@ unittest  // output-schema validation: conforming structuredContent passes
 	}
 
 	Tool add = {
-		name: "add", description: nullable("Add"), outputSchema: jsonSchemaOf!AddResult
+		name: "add", description: nullable("Add"), outputSchema: jsonSchemaOf!(AddResult,
+				SchemaUse.output)
 	};
 	s.registerTool(add, (Json args) @safe {
 		CallToolResult r;
@@ -4264,7 +5479,7 @@ unittest  // output-schema validation: conforming structuredContent passes
 
 unittest  // output-schema validation: non-conforming structuredContent errors
 {
-	import mcp.protocol.schema : jsonSchemaOf;
+	import mcp.api.binding : jsonSchemaOf, SchemaUse;
 
 	auto s = new McpServer("vsrv", "0.1.0");
 	struct AddResult
@@ -4273,7 +5488,8 @@ unittest  // output-schema validation: non-conforming structuredContent errors
 	}
 
 	Tool add = {
-		name: "add", description: nullable("Add"), outputSchema: jsonSchemaOf!AddResult
+		name: "add", description: nullable("Add"), outputSchema: jsonSchemaOf!(AddResult,
+				SchemaUse.output)
 	};
 	s.registerTool(add, (Json args) @safe {
 		CallToolResult r;
@@ -4292,7 +5508,7 @@ unittest  // output-schema validation: non-conforming structuredContent errors
 
 unittest  // output-schema validation is off by default: bad output still ships
 {
-	import mcp.protocol.schema : jsonSchemaOf;
+	import mcp.api.binding : jsonSchemaOf, SchemaUse;
 
 	auto s = new McpServer("vsrv", "0.1.0");
 	struct AddResult
@@ -4301,7 +5517,8 @@ unittest  // output-schema validation is off by default: bad output still ships
 	}
 
 	Tool add = {
-		name: "add", description: nullable("Add"), outputSchema: jsonSchemaOf!AddResult
+		name: "add", description: nullable("Add"), outputSchema: jsonSchemaOf!(AddResult,
+				SchemaUse.output)
 	};
 	s.registerTool(add, (Json args) @safe {
 		CallToolResult r;
@@ -4319,7 +5536,7 @@ unittest  // output-schema validation is off by default: bad output still ships
 
 unittest  // output-schema validation: missing structuredContent is a violation
 {
-	import mcp.protocol.schema : jsonSchemaOf;
+	import mcp.api.binding : jsonSchemaOf, SchemaUse;
 
 	auto s = new McpServer("vsrv", "0.1.0");
 	struct AddResult
@@ -4328,7 +5545,8 @@ unittest  // output-schema validation: missing structuredContent is a violation
 	}
 
 	Tool add = {
-		name: "add", description: nullable("Add"), outputSchema: jsonSchemaOf!AddResult
+		name: "add", description: nullable("Add"), outputSchema: jsonSchemaOf!(AddResult,
+				SchemaUse.output)
 	};
 	// Tool declares an outputSchema but returns only bare text, no structuredContent.
 	// Spec (2025-06-18 server/tools, Output Schema): "If an output schema is
@@ -4349,7 +5567,7 @@ unittest  // output-schema validation: missing structuredContent is a violation
 
 unittest  // output-schema validation: an isError result is exempt from the structuredContent MUST
 {
-	import mcp.protocol.schema : jsonSchemaOf;
+	import mcp.api.binding : jsonSchemaOf, SchemaUse;
 
 	auto s = new McpServer("vsrv", "0.1.0");
 	struct AddResult
@@ -4358,7 +5576,8 @@ unittest  // output-schema validation: an isError result is exempt from the stru
 	}
 
 	Tool add = {
-		name: "add", description: nullable("Add"), outputSchema: jsonSchemaOf!AddResult
+		name: "add", description: nullable("Add"), outputSchema: jsonSchemaOf!(AddResult,
+				SchemaUse.output)
 	};
 	// A tool *execution* error reports failure via isError:true with text
 	// content and no structuredContent. The "MUST provide structured results"
@@ -4381,7 +5600,7 @@ unittest  // output-schema validation: an isError result is exempt from the stru
 
 unittest  // output-schema validation off: missing structuredContent still ships
 {
-	import mcp.protocol.schema : jsonSchemaOf;
+	import mcp.api.binding : jsonSchemaOf, SchemaUse;
 
 	auto s = new McpServer("vsrv", "0.1.0");
 	struct AddResult
@@ -4390,7 +5609,8 @@ unittest  // output-schema validation off: missing structuredContent still ships
 	}
 
 	Tool add = {
-		name: "add", description: nullable("Add"), outputSchema: jsonSchemaOf!AddResult
+		name: "add", description: nullable("Add"), outputSchema: jsonSchemaOf!(AddResult,
+				SchemaUse.output)
 	};
 	s.registerTool(add, (Json args) @safe {
 		CallToolResult r;
@@ -4407,7 +5627,7 @@ unittest  // output-schema validation off: missing structuredContent still ships
 
 unittest  // input-schema validation: a missing required argument yields an isError result
 {
-	import mcp.protocol.schema : jsonSchemaOf;
+	import mcp.api.binding : jsonSchemaOf;
 
 	auto s = new McpServer("vsrv", "0.1.0");
 	struct AddArgs
@@ -4440,7 +5660,7 @@ unittest  // input-schema validation: a missing required argument yields an isEr
 
 unittest  // input-schema validation: a wrong-typed argument yields an isError result
 {
-	import mcp.protocol.schema : jsonSchemaOf;
+	import mcp.api.binding : jsonSchemaOf;
 
 	auto s = new McpServer("vsrv", "0.1.0");
 	struct AddArgs
@@ -4471,7 +5691,7 @@ unittest  // input-schema validation: a wrong-typed argument yields an isError r
 
 unittest  // input-schema validation: conforming arguments dispatch normally
 {
-	import mcp.protocol.schema : jsonSchemaOf;
+	import mcp.api.binding : jsonSchemaOf;
 
 	auto s = new McpServer("vsrv", "0.1.0");
 	struct AddArgs
@@ -4500,7 +5720,7 @@ unittest  // input-schema validation: conforming arguments dispatch normally
 
 unittest  // input-schema validation is ON by default: a missing required argument is rejected
 {
-	import mcp.protocol.schema : jsonSchemaOf;
+	import mcp.api.binding : jsonSchemaOf;
 
 	// Spec: server/tools § Security Considerations — "Servers MUST: Validate all
 	// tool inputs". The SDK validates tool arguments against the declared
@@ -4532,7 +5752,7 @@ unittest  // input-schema validation is ON by default: a missing required argume
 
 unittest  // input-schema validation default can be turned off via disableInputSchemaValidation
 {
-	import mcp.protocol.schema : jsonSchemaOf;
+	import mcp.api.binding : jsonSchemaOf;
 
 	auto s = new McpServer("vsrv", "0.1.0");
 	struct AddArgs
@@ -4561,7 +5781,7 @@ unittest  // input-schema validation default can be turned off via disableInputS
 
 unittest  // a genuinely malformed CallToolRequest (non-string name) is still -32602
 {
-	import mcp.protocol.schema : jsonSchemaOf;
+	import mcp.api.binding : jsonSchemaOf;
 
 	// The spec reserves protocol errors for requests that fail the
 	// CallToolRequest schema itself (name/arguments), so a non-string `name`
@@ -4601,7 +5821,75 @@ unittest  // a tool handler that throws becomes an isError result, not a protoco
 	auto resp = s.handle(req(6, "tools/call", params)).get;
 	assert("error" !in resp);
 	assert(resp["result"]["isError"].get!bool);
+	assert(resp["result"]["content"][0]["text"].get!string == "Internal error");
+}
+
+unittest  // a throwing tool handler's message stays server-side by default
+{
+	import std.algorithm.searching : canFind;
+
+	auto s = new McpServer("t", "1");
+	Tool boom = {name: "boom"};
+	CallToolResult delegate(Json) @safe handler = (Json) {
+		throw new Exception("open /srv/secret.db failed");
+	};
+	s.registerTool(boom, handler);
+	auto resp = s.handle(req(6, "tools/call", Json(["name": Json("boom")]))).get;
+	assert(resp["result"]["isError"].get!bool);
+	assert(!resp.toString().canFind("secret"));
+}
+
+unittest  // exposeInternalErrors sends a throwing tool handler's message as isError content
+{
+	auto s = new McpServer("t", "1");
+	s.exposeInternalErrors();
+	Tool boom = {name: "boom"};
+	CallToolResult delegate(Json) @safe handler = (Json) {
+		throw new Exception("kaboom");
+	};
+	s.registerTool(boom, handler);
+	auto resp = s.handle(req(6, "tools/call", Json(["name": Json("boom")]))).get;
+	assert(resp["result"]["isError"].get!bool);
 	assert(resp["result"]["content"][0]["text"].get!string == "kaboom");
+}
+
+unittest  // a ToolError's message always reaches the client as isError content
+{
+	auto s = new McpServer("t", "1");
+	Tool boom = {name: "boom"};
+	CallToolResult delegate(Json) @safe handler = (Json) {
+		throw new ToolError("no such city");
+	};
+	s.registerTool(boom, handler);
+	auto resp = s.handle(req(6, "tools/call", Json(["name": Json("boom")]))).get;
+	assert("error" !in resp);
+	assert(resp["result"]["isError"].get!bool);
+	assert(resp["result"]["content"][0]["text"].get!string == "no such city");
+}
+
+unittest  // a PromptError's message always reaches the client as a JSON-RPC error
+{
+	import mcp.server.responses : PromptError;
+
+	auto s = new McpServer("t", "1");
+	GetPromptResult delegate(Json) @safe handler = (Json) {
+		throw new PromptError("no such template");
+	};
+	s.registerPrompt(Prompt("p"), handler);
+	auto resp = s.handle(req(6, "prompts/get", Json(["name": Json("p")]))).get;
+	assert(resp["error"]["code"].get!int == ErrorCode.internalError);
+	assert(resp["error"]["message"].get!string == "no such template");
+}
+
+unittest  // any other prompt handler exception is masked as Internal error
+{
+	auto s = new McpServer("t", "1");
+	GetPromptResult delegate(Json) @safe handler = (Json) {
+		throw new Exception("open /srv/prompts.db failed");
+	};
+	s.registerPrompt(Prompt("p"), handler);
+	auto resp = s.handle(req(6, "prompts/get", Json(["name": Json("p")]))).get;
+	assert(resp["error"]["message"].get!string == "Internal error");
 }
 
 unittest  // an unknown method yields method-not-found
@@ -4745,6 +6033,62 @@ unittest  // a cancellation on connection B must not suppress connection A's sam
 	assert(resp.get["result"]["content"][0]["text"].get!string == "done");
 }
 
+unittest  // a handler reads its own session's version and capabilities from ctx
+{
+	auto s = McpServer.stateful("t", "1");
+	auto stateA = new ConnectionState;
+	auto stateB = new ConnectionState;
+
+	ProtocolVersion seenVersion;
+	bool seenSampling;
+	Tool probe = {name: "probe"};
+	s.registerTool(probe, (Json args, RequestContext ctx) @safe {
+		seenVersion = ctx.protocolVersion;
+		seenSampling = ctx.clientCapabilities.sampling;
+		return CallToolResult.init;
+	});
+
+	Json initA = Json.emptyObject;
+	initA["protocolVersion"] = "2025-03-26";
+	initA["capabilities"] = Json(["sampling": Json.emptyObject]);
+	s.handle(req(1, "initialize", initA), new ConnCtx("A", stateA));
+	Json initB = Json.emptyObject;
+	initB["protocolVersion"] = "2025-11-25";
+	initB["capabilities"] = Json.emptyObject;
+	s.handle(req(1, "initialize", initB), new ConnCtx("B", stateB));
+
+	Json call = Json.emptyObject;
+	call["name"] = "probe";
+	s.handle(req(2, "tools/call", call), new ConnCtx("A", stateA));
+	assert(seenVersion == ProtocolVersion.v2025_03_26);
+	assert(seenSampling);
+	s.handle(req(2, "tools/call", call), new ConnCtx("B", stateB));
+	assert(seenVersion == ProtocolVersion.v2025_11_25);
+	assert(!seenSampling);
+}
+
+unittest  // a modern handler reads the request's own _meta capabilities from ctx
+{
+	auto s = new McpServer("t", "1");
+	bool seenSampling;
+	ProtocolVersion seenVersion;
+	Tool probe = {name: "probe"};
+	s.registerTool(probe, (Json args, RequestContext ctx) @safe {
+		seenVersion = ctx.protocolVersion;
+		seenSampling = ctx.clientCapabilities.sampling;
+		return CallToolResult.init;
+	});
+	Json call = Json.emptyObject;
+	call["name"] = "probe";
+	Json meta = Json.emptyObject;
+	meta[MetaKey.protocolVersion] = "2026-07-28";
+	meta[MetaKey.clientCapabilities] = Json(["sampling": Json.emptyObject]);
+	call["_meta"] = meta;
+	s.handle(req(1, "tools/call", call));
+	assert(seenVersion == ProtocolVersion.v2026_07_28);
+	assert(seenSampling);
+}
+
 unittest  // a cancellation on the SAME connection still cancels
 {
 	auto s = new McpServer("t", "1");
@@ -4774,7 +6118,9 @@ unittest  // notifications/roots/list_changed fires the dedicated server hook
 {
 	auto s = new McpServer("t", "1");
 	bool sawRootsChanged;
-	s.setRootsListChangedHandler(() @safe { sawRootsChanged = true; });
+	s.setRootsListChangedHandler((RequestContext ctx) @safe {
+		sawRootsChanged = true;
+	});
 
 	auto out_ = s.handle(Message(makeNotification("notifications/roots/list_changed")));
 	assert(out_.isNull, "a notification produces no response");
@@ -4785,7 +6131,7 @@ unittest  // notifications/roots/list_changed also reaches the generic client-no
 {
 	auto s = new McpServer("t", "1");
 	string seenMethod;
-	s.setClientNotificationHandler((string method, Json params) @safe {
+	s.setClientNotificationHandler((string method, Json params, RequestContext ctx) @safe {
 		seenMethod = method;
 	});
 
@@ -4797,7 +6143,7 @@ unittest  // unrecognised client notifications are surfaced to the generic obser
 {
 	auto s = new McpServer("t", "1");
 	string seenMethod;
-	s.setClientNotificationHandler((string method, Json params) @safe {
+	s.setClientNotificationHandler((string method, Json params, RequestContext ctx) @safe {
 		seenMethod = method;
 	});
 
@@ -4806,13 +6152,68 @@ unittest  // unrecognised client notifications are surfaced to the generic obser
 	assert(seenMethod == "notifications/something/unknown");
 }
 
+unittest  // client-notification observers see which connection a notification came from
+{
+	auto s = new McpServer("t", "1");
+	string[] rootsFrom, notesFrom;
+	s.setRootsListChangedHandler((RequestContext ctx) @safe {
+		rootsFrom ~= connectionTokenOf(ctx);
+	});
+	s.setClientNotificationHandler((string method, Json params, RequestContext ctx) @safe {
+		notesFrom ~= connectionTokenOf(ctx);
+	});
+
+	s.handle(Message(makeNotification("notifications/roots/list_changed")), new ConnCtx("conn-A"));
+	s.handle(Message(makeNotification("notifications/roots/list_changed")), new ConnCtx("conn-B"));
+	assert(rootsFrom == ["conn-A", "conn-B"]);
+	assert(notesFrom == ["conn-A", "conn-B"]);
+}
+
+unittest  // a throwing client-notification observer does not escape handle()
+{
+	auto s = new McpServer("t", "1");
+	s.setRootsListChangedHandler((RequestContext ctx) @safe {
+		throw new Exception("roots boom");
+	});
+	s.setClientNotificationHandler((string method, Json params, RequestContext ctx) @safe {
+		throw new Exception("observer boom");
+	});
+
+	auto out_ = s.handle(Message(makeNotification("notifications/roots/list_changed")));
+	assert(out_.isNull);
+	out_ = s.handle(Message(makeNotification("notifications/something/unknown")));
+	assert(out_.isNull);
+}
+
+unittest  // a throwing client-notification observer does not drop a batch's replies
+{
+	import vibe.data.json : parseJsonString;
+
+	auto s = makeTestServer();
+	Json params = Json.emptyObject;
+	params["protocolVersion"] = "2025-03-26";
+	params["capabilities"] = Json.emptyObject;
+	params["clientInfo"] = Json(["name": Json("c"), "version": Json("1")]);
+	s.handle(req(1, "initialize", params));
+	s.setRootsListChangedHandler((RequestContext ctx) @safe {
+		throw new Exception("roots boom");
+	});
+
+	auto outText = s.handleRaw(`[{"jsonrpc":"2.0","id":1,"method":"ping"},
+		{"jsonrpc":"2.0","method":"notifications/roots/list_changed"}]`);
+	auto arr = parseJsonString(outText);
+	assert(arr.type == Json.Type.array);
+	assert(arr.length == 1);
+	assert(arr[0]["id"].get!int == 1);
+}
+
 unittest  // server-consumed notifications do NOT reach the generic client observer
 {
 	// notifications/initialized and notifications/cancelled are handled by the
 	// server itself and must not be forwarded to the application observer.
 	auto s = new McpServer("t", "1");
 	bool observed;
-	s.setClientNotificationHandler((string method, Json params) @safe {
+	s.setClientNotificationHandler((string method, Json params, RequestContext ctx) @safe {
 		observed = true;
 	});
 
@@ -4859,6 +6260,44 @@ unittest  // handleRaw rejects a non-string method as -32600 instead of crashing
 	assert(j["error"]["code"].get!int == ErrorCode.invalidRequest);
 }
 
+unittest  // handleRaw answers by-position params with -32602 carrying the request id
+{
+	import vibe.data.json : parseJsonString;
+
+	auto s = makeTestServer();
+	auto j = parseJsonString(s.handleRaw(`{"jsonrpc":"2.0","id":7,"method":"ping","params":[]}`));
+	assert(j["error"]["code"].get!int == ErrorCode.invalidParams);
+	assert(j["id"] == Json(7));
+	auto k = parseJsonString(
+			s.handleRaw(`{"jsonrpc":"2.0","id":"r1","method":"ping","params":["x"]}`));
+	assert(k["id"] == Json("r1"));
+}
+
+unittest  // a batch member with by-position params is answered with its own id
+{
+	import vibe.data.json : parseJsonString;
+
+	auto s = makeTestServer();
+	auto conn = new ConnectionState;
+	conn.negotiated = ProtocolVersion.v2025_03_26;
+	auto resp = parseJsonString(
+			s.handleRaw(`[{"jsonrpc":"2.0","id":4,"method":"ping","params":[]},`
+			~ `{"jsonrpc":"2.0","id":5,"method":"ping"}]`, conn, "", TokenInfo.invalid()));
+	assert(resp.type == Json.Type.array && resp.length == 2);
+	bool sawError;
+	foreach (i; 0 .. resp.length)
+	{
+		auto r = resp[i];
+		if ("error" in r)
+		{
+			sawError = true;
+			assert(r["id"] == Json(4));
+			assert(r["error"]["code"].get!int == ErrorCode.invalidParams);
+		}
+	}
+	assert(sawError);
+}
+
 unittest  // handleRaw(text, conn) gates a batch on the supplied state's version
 {
 	import vibe.data.json : parseJsonString;
@@ -4869,11 +6308,31 @@ unittest  // handleRaw(text, conn) gates a batch on the supplied state's version
 	auto conn = new ConnectionState;
 	conn.negotiated = ProtocolVersion.v2025_06_18;
 	auto outText = s.handleRaw(`[{"jsonrpc":"2.0","id":1,"method":"ping"},
-		{"jsonrpc":"2.0","id":2,"method":"ping"}]`, conn);
+		{"jsonrpc":"2.0","id":2,"method":"ping"}]`, conn, "", TokenInfo.invalid());
 	auto resp = parseJsonString(outText);
 	assert(resp.type == Json.Type.object);
 	assert(resp["id"].type == Json.Type.null_);
 	assert(resp["error"]["code"].get!int == ErrorCode.invalidRequest);
+}
+
+unittest  // handleRaw(text, conn, token, auth) registers in-flight requests under the connection token
+{
+	// A notifications/cancelled arriving on another POST of the same session is
+	// matched by (token, id), so the batch path must register under that token.
+	auto s = new McpServer("t", "1");
+	auto conn = new ConnectionState;
+	conn.negotiated = ProtocolVersion.v2025_03_26;
+	string[] keys;
+	Tool t = {name: "probe"};
+	s.registerTool(t, (Json args, RequestContext ctx) @safe {
+		keys = conn.inFlight.keys;
+		CallToolResult r;
+		r.content = [Content.makeText("ok")];
+		return r;
+	});
+	s.handleRaw(`[{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"probe"}}]`,
+			conn, "sess-1", TokenInfo.invalid());
+	assert(keys == [McpServer.inFlightKey("sess-1", Json(7))]);
 }
 
 unittest  // handleRaw(text, conn) processes a batch on a 2025-03-26 state
@@ -4887,7 +6346,7 @@ unittest  // handleRaw(text, conn) processes a batch on a 2025-03-26 state
 	auto conn = new ConnectionState;
 	conn.negotiated = ProtocolVersion.v2025_03_26;
 	auto outText = s.handleRaw(`[{"jsonrpc":"2.0","id":1,"method":"ping"},
-		{"jsonrpc":"2.0","id":2,"method":"ping"}]`, conn);
+		{"jsonrpc":"2.0","id":2,"method":"ping"}]`, conn, "", TokenInfo.invalid());
 	auto arr = parseJsonString(outText);
 	assert(arr.type == Json.Type.array);
 	assert(arr.length == 2);
@@ -4899,7 +6358,7 @@ unittest  // handleRaw(null) falls back to the no-arg activeConnection behaviour
 
 	auto s = makeTestServer();
 	auto j = parseJsonString(s.handleRaw(`{"jsonrpc":"2.0","id":1,"method":"ping"}`,
-			cast(ConnectionState) null));
+			cast(ConnectionState) null, "", TokenInfo.invalid()));
 	assert(j["id"].get!int == 1);
 	assert("result" in j);
 }
@@ -4976,7 +6435,8 @@ unittest  // handleRaw answers valid members of a mixed batch and errors malform
 	s.handle(req(1, "initialize", params));
 
 	// The middle member has a wrong jsonrpc version: it must not discard the two
-	// valid requests. Expect three responses — two results plus one null-id error.
+	// valid requests. Expect three responses — two results plus an error that
+	// carries the bad member's id.
 	auto outText = s.handleRaw(`[{"jsonrpc":"2.0","id":1,"method":"ping"},
 		{"jsonrpc":"1.0","id":99,"method":"ping"},
 		{"jsonrpc":"2.0","id":2,"method":"ping"}]`);
@@ -4984,18 +6444,18 @@ unittest  // handleRaw answers valid members of a mixed batch and errors malform
 	assert(arr.type == Json.Type.array);
 	assert(arr.length == 3);
 
-	bool sawId1, sawId2, sawNullError;
+	bool sawId1, sawId2, sawError99;
 	foreach (i; 0 .. arr.length)
 	{
 		auto r = arr[i];
-		if (r["id"].type == Json.Type.null_ && "error" in r)
-			sawNullError = r["error"]["code"].get!int == ErrorCode.invalidRequest;
-		else if (r["id"].type == Json.Type.int_ && r["id"].get!int == 1)
+		if (r["id"] == Json(99) && "error" in r)
+			sawError99 = r["error"]["code"].get!int == ErrorCode.invalidRequest;
+		else if (r["id"] == Json(1))
 			sawId1 = true;
-		else if (r["id"].type == Json.Type.int_ && r["id"].get!int == 2)
+		else if (r["id"] == Json(2))
 			sawId2 = true;
 	}
-	assert(sawId1 && sawId2 && sawNullError);
+	assert(sawId1 && sawId2 && sawError99);
 }
 
 unittest  // registering a tool whose name already exists throws
@@ -5089,6 +6549,47 @@ unittest  // resources/list and resources/read for a direct resource
 	p["uri"] = "test://x";
 	auto read = s.handle(req(2, "resources/read", p)).get;
 	assert(read["result"]["contents"][0]["text"].get!string == "hi");
+}
+
+unittest  // a direct resource reader may return several contents
+{
+	auto s = new McpServer("t", "1");
+	s.registerResource(Resource("test://x", "x"), () @safe => [
+		ResourceContents.makeText("test://x", "text/plain", "one"),
+		ResourceContents.makeText("test://x#2", "text/plain", "two")
+	]);
+	s.registerResource(Resource("test://y", "y"),
+			(RequestContext ctx) @safe => [
+				ResourceContents.makeText("test://y", "text/plain", "y")
+	]);
+
+	Json p = Json.emptyObject;
+	p["uri"] = "test://x";
+	auto read = s.handle(req(1, "resources/read", p)).get["result"]["contents"];
+	assert(read.length == 2);
+	assert(read[0]["text"].get!string == "one");
+	assert(read[1]["text"].get!string == "two");
+	p["uri"] = "test://y";
+	assert(s.handle(req(2, "resources/read", p))
+			.get["result"]["contents"][0]["text"].get!string == "y");
+}
+
+unittest  // a resource template reader may return several contents
+{
+	auto s = new McpServer("t", "1");
+	ResourceTemplate t = {uriTemplate: "test://dir/{name}", name: "dir"};
+	s.registerResourceTemplate(t, (string uri,
+			string[string] params) @safe => [
+		ResourceContents.makeText(uri ~ "/a", "text/plain", params["name"] ~ "-a"),
+		ResourceContents.makeText(uri ~ "/b", "text/plain", params["name"] ~ "-b")
+	]);
+
+	Json p = Json.emptyObject;
+	p["uri"] = "test://dir/n";
+	auto read = s.handle(req(1, "resources/read", p)).get["result"]["contents"];
+	assert(read.length == 2);
+	assert(read[0]["text"].get!string == "n-a");
+	assert(read[1]["uri"].get!string == "test://dir/n/b");
 }
 
 unittest  // resources/read strips per-content _meta for a 2024-11-05 client
@@ -5245,6 +6746,12 @@ unittest  // prompts/get allows a missing optional argument
 	assert(resp["result"]["messages"][0]["content"]["text"].get!string == "Hi world");
 }
 
+version (unittest) private void registerCompletablePrompt(McpServer s, string name) @safe
+{
+	Prompt p = {name: name};
+	s.registerPrompt(p, (Json args) @safe => GetPromptResult.init);
+}
+
 unittest  // completion/complete returns -32601 when no completions capability is declared
 {
 	auto s = new McpServer("t", "1");
@@ -5258,18 +6765,54 @@ unittest  // completion/complete returns -32601 when no completions capability i
 unittest  // completion/complete uses the registered typed handler
 {
 	auto s = new McpServer("t", "1");
+	registerCompletablePrompt(s, "greet");
 	s.setCompletionRequestHandler((CompleteRequest) @safe {
 		CompleteResult r;
 		r.values = ["paris", "park"];
 		return r;
 	});
-	auto resp = s.handle(req(1, "completion/complete", Json.emptyObject)).get;
+	Json p = Json.emptyObject;
+	p["ref"] = CompletionReference.forPrompt("greet").toJson();
+	p["argument"] = Json(["name": Json("city"), "value": Json("pa")]);
+	auto resp = s.handle(req(1, "completion/complete", p)).get;
 	assert(resp["result"]["completion"]["values"].length == 2);
+}
+
+unittest  // completion/complete rejects params missing a valid ref or argument with -32602
+{
+	auto s = new McpServer("t", "1");
+	bool called;
+	s.setCompletionRequestHandler((CompleteRequest) @safe {
+		called = true;
+		return CompleteResult.init;
+	});
+	Json goodRef = CompletionReference.forPrompt("greet").toJson();
+	Json goodArg = Json(["name": Json("city"), "value": Json("pa")]);
+	Json[] bad = [
+		Json.emptyObject, Json(["argument": goodArg]), Json(["ref": goodRef]),
+		Json([
+			"ref": Json(["type": Json("ref/other"), "name": Json("x")]),
+			"argument": goodArg
+		]), Json([
+			"ref": Json(["type": Json("ref/prompt")]),
+			"argument": goodArg
+		]),
+		Json(["ref": Json(["type": Json("ref/resource")]),
+			"argument": goodArg]),
+		Json(["ref": goodRef, "argument": Json(["name": Json("city")])]),
+	];
+	foreach (i, p; bad)
+	{
+		auto resp = s.handle(req(i, "completion/complete", p)).get;
+		assert(resp["error"]["code"].get!int == ErrorCode.invalidParams);
+	}
+	assert(!called);
 }
 
 unittest  // typed completion handler receives a parsed CompleteRequest
 {
 	auto s = new McpServer("t", "1");
+	registerCompletablePrompt(s, "greet");
 	string seenName;
 	string seenArg;
 	bool wasPrompt;
@@ -5297,6 +6840,7 @@ unittest  // typed completion handler receives a parsed CompleteRequest
 unittest  // typed completion handler receives the resolved context.arguments
 {
 	auto s = new McpServer("t", "1");
+	registerCompletablePrompt(s, "greet");
 	string[string] seenContext;
 	s.setCompletionRequestHandler((CompleteRequest r) @safe {
 		seenContext = r.context;
@@ -5325,9 +6869,10 @@ unittest  // typed completion handler receives the resolved context.arguments
 unittest  // a per-argument completer is dispatched on its (reference, argument) pair
 {
 	auto s = new McpServer("t", "1");
+	registerCompletablePrompt(s, "code_review");
 	immutable langs = ["c", "cpp", "d", "go", "java", "javascript"];
 	s.setArgumentCompleter(CompletionReference.forPrompt("code_review"), "language",
-			(string prefix) @safe => CompleteResult.prefixMatch(langs, prefix).values);
+			(CompleteRequest r) @safe => CompleteResult.prefixMatch(langs, r.argumentValue));
 
 	Json p = Json.emptyObject;
 	p["ref"] = CompletionReference.forPrompt("code_review").toJson();
@@ -5342,11 +6887,42 @@ unittest  // a per-argument completer is dispatched on its (reference, argument)
 	assert(values[1].get!string == "javascript");
 }
 
+unittest  // an empty global completion result falls back to a per-argument completer
+{
+	auto s = new McpServer("t", "1");
+	registerCompletablePrompt(s, "code_review");
+	s.setCompletionRequestHandler((CompleteRequest r) @safe {
+		CompleteResult result;
+		if (r.argumentName == "owner")
+			result.values = ["poita"];
+		return result;
+	});
+	s.setArgumentCompleter(CompletionReference.forPrompt("code_review"),
+			"language", (CompleteRequest r) @safe => CompleteResult(["d"]));
+
+	Json p = Json.emptyObject;
+	p["ref"] = CompletionReference.forPrompt("code_review").toJson();
+	Json arg = Json.emptyObject;
+	arg["name"] = "language";
+	arg["value"] = "";
+	p["argument"] = arg;
+	auto resp = s.handle(req(1, "completion/complete", p)).get;
+	assert(resp["result"]["completion"]["values"].length == 1);
+	assert(resp["result"]["completion"]["values"][0].get!string == "d");
+
+	arg["name"] = "owner";
+	p["argument"] = arg;
+	resp = s.handle(req(2, "completion/complete", p)).get;
+	assert(resp["result"]["completion"]["values"][0].get!string == "poita",
+			"a non-empty global result takes precedence");
+}
+
 unittest  // a per-argument completer surface answers a non-matching request with empty
 {
 	auto s = new McpServer("t", "1");
+	registerCompletablePrompt(s, "code_review");
 	s.setArgumentCompleter(CompletionReference.forPrompt("code_review"),
-			"language", (string prefix) @safe => ["d"]);
+			"language", (CompleteRequest r) @safe => CompleteResult(["d"]));
 
 	// Different argument name on the same prompt: no completer, empty result (not -32601).
 	Json p = Json.emptyObject;
@@ -5364,7 +6940,7 @@ unittest  // registering a per-argument completer advertises the completions cap
 {
 	auto s = new McpServer("t", "1");
 	s.setArgumentCompleter(CompletionReference.forPrompt("p"), "a",
-			(string prefix) @safe => cast(string[]) null);
+			(CompleteRequest r) @safe => CompleteResult.init);
 	auto caps = s.capabilities();
 	assert(caps.completions);
 }
@@ -5427,7 +7003,7 @@ unittest  // logging/setLevel is refused on a stateless server (no session-scope
 	auto resp = s.handle(req(1, "logging/setLevel", p)).get;
 	assert(resp["error"]["code"].get!int == ErrorCode.methodNotFound);
 	// The default level is untouched by the rejected request.
-	assert(s.currentLogLevel == "info");
+	assert(s.activeConnection.logLevel == "info");
 }
 
 unittest  // logging/setLevel stores the level and returns an empty object
@@ -5438,7 +7014,7 @@ unittest  // logging/setLevel stores the level and returns an empty object
 	p["level"] = "debug";
 	auto resp = s.handle(req(1, "logging/setLevel", p)).get;
 	assert(resp["result"].type == Json.Type.object && resp["result"].length == 0);
-	assert(s.currentLogLevel == "debug");
+	assert(s.activeConnection.logLevel == "debug");
 }
 
 unittest  // logging/setLevel rejects an unrecognised level with -32602
@@ -5450,7 +7026,7 @@ unittest  // logging/setLevel rejects an unrecognised level with -32602
 	auto resp = s.handle(req(1, "logging/setLevel", p)).get;
 	assert(resp["error"]["code"].get!int == ErrorCode.invalidParams);
 	// The invalid level must not have been stored.
-	assert(s.currentLogLevel == "info");
+	assert(s.activeConnection.logLevel == "info");
 }
 
 unittest  // logging/setLevel requires a string 'level' param
@@ -5474,7 +7050,7 @@ unittest  // logging/setLevel is rejected when the logging capability was never 
 	auto resp = s.handle(req(1, "logging/setLevel", p)).get;
 	assert(resp["error"]["code"].get!int == ErrorCode.methodNotFound);
 	// The level must not have been mutated by the rejected request.
-	assert(s.currentLogLevel == "info");
+	assert(s.activeConnection.logLevel == "info");
 }
 
 unittest  // modern: logging/setLevel is method-not-found (removed in 2026-07-28)
@@ -5489,7 +7065,7 @@ unittest  // modern: logging/setLevel is method-not-found (removed in 2026-07-28
 	p["level"] = "debug";
 	auto resp = s.handle(modernReq(1, "logging/setLevel", p)).get;
 	assert(resp["error"]["code"].get!int == ErrorCode.methodNotFound);
-	assert(s.currentLogLevel == "info");
+	assert(s.activeConnection.logLevel == "info");
 }
 
 unittest  // after setLevel(error), a handler's sub-error logs are dropped
@@ -5685,7 +7261,7 @@ unittest  // advertised extensions appear in server/discover capabilities under 
 	auto s = new McpServer("t", "1");
 	Json settings = Json.emptyObject;
 	settings["maxConcurrent"] = 4;
-	s.enableExtension("io.modelcontextprotocol/tasks", settings);
+	s.advertiseExtension("io.modelcontextprotocol/tasks", settings);
 
 	// The Tasks extension is modern-only; a modern client discovers it via
 	// `server/discover`, not the `initialize` handshake.
@@ -5698,7 +7274,7 @@ unittest  // advertised extensions appear in server/discover capabilities under 
 unittest  // the Tasks extension is NOT advertised for legacy negotiated versions
 {
 	auto s = new McpServer("t", "1");
-	s.enableExtension("io.modelcontextprotocol/tasks", Json.emptyObject);
+	s.advertiseExtension("io.modelcontextprotocol/tasks", Json.emptyObject);
 
 	foreach (ver; ["2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25"])
 	{
@@ -5713,8 +7289,8 @@ unittest  // the Tasks extension is NOT advertised for legacy negotiated version
 unittest  // Apps/Skills extensions are advertised when negotiating 2025-11-25
 {
 	auto s = new McpServer("t", "1");
-	s.enableExtension("io.modelcontextprotocol/ui", Json.emptyObject);
-	s.enableExtension("io.modelcontextprotocol/skills", Json.emptyObject);
+	s.advertiseExtension("io.modelcontextprotocol/ui", Json.emptyObject);
+	s.advertiseExtension("io.modelcontextprotocol/skills", Json.emptyObject);
 
 	Json params = Json.emptyObject;
 	params["protocolVersion"] = "2025-11-25";
@@ -5728,8 +7304,8 @@ unittest  // Apps/Skills extensions are advertised when negotiating 2025-11-25
 unittest  // a mixed extension set negotiated at 2025-11-25 advertises Apps/Skills but not Tasks
 {
 	auto s = new McpServer("t", "1");
-	s.enableExtension("io.modelcontextprotocol/tasks", Json.emptyObject);
-	s.enableExtension("io.modelcontextprotocol/skills", Json.emptyObject);
+	s.advertiseExtension("io.modelcontextprotocol/tasks", Json.emptyObject);
+	s.advertiseExtension("io.modelcontextprotocol/skills", Json.emptyObject);
 
 	Json params = Json.emptyObject;
 	params["protocolVersion"] = "2025-11-25";
@@ -5850,9 +7426,16 @@ unittest  // server reads the extensions a client advertises at initialize
 	params["capabilities"] = caps;
 	s.handle(req(1, "initialize", params));
 
-	assert(s.clientExtensions.type == Json.Type.object);
-	assert("io.modelcontextprotocol/ui" in s.clientExtensions);
+	assert(s.activeConnection.clientCaps.extensions.type == Json.Type.object);
+	assert("io.modelcontextprotocol/ui" in s.activeConnection.clientCaps.extensions);
 	assert("io.modelcontextprotocol/ui" in s.clientCapabilities.extensions);
+}
+
+/// Register an empty resource at each of `uris`, so tests can subscribe to them.
+version (unittest) private void registerStubResources(McpServer s, string[] uris...) @safe
+{
+	foreach (uri; uris)
+		s.registerResource(Resource(uri, uri), () @safe => ResourceContents.init);
 }
 
 unittest  // resources/subscribe and unsubscribe track URIs and return {}
@@ -5861,15 +7444,112 @@ unittest  // resources/subscribe and unsubscribe track URIs and return {}
 	// only available on a STATEFUL server (a stateless server answers -32601).
 	auto s = McpServer.stateful("t", "1");
 	s.enableResourceSubscriptions();
+	registerStubResources(s, "test://w");
 	Json p = Json.emptyObject;
 	p["uri"] = "test://w";
 	auto sub = s.handle(req(1, "resources/subscribe", p)).get;
 	assert(sub["result"].type == Json.Type.object && sub["result"].length == 0);
-	assert(s.isSubscribed("test://w"));
+	assert(("test://w" in s.activeConnection.subscriptions));
 
 	auto unsub = s.handle(req(2, "resources/unsubscribe", p)).get;
 	assert(unsub["result"].length == 0);
-	assert(!s.isSubscribed("test://w"));
+	assert(("test://w" !in s.activeConnection.subscriptions));
+}
+
+unittest  // resources/subscribe to an unknown uri is rejected with resource-not-found
+{
+	auto s = McpServer.stateful("t", "1");
+	s.enableResourceSubscriptions();
+	Json p = Json.emptyObject;
+	p["uri"] = "test://nowhere";
+	auto resp = s.handle(req(1, "resources/subscribe", p)).get;
+	assert(resp["error"]["code"].get!int == -32002);
+	assert(resp["error"]["data"]["uri"].get!string == "test://nowhere");
+	assert(("test://nowhere" !in s.activeConnection.subscriptions));
+}
+
+unittest  // resources/subscribe accepts a uri matching a resource template
+{
+	auto s = McpServer.stateful("t", "1");
+	s.enableResourceSubscriptions();
+	s.registerResourceTemplate(ResourceTemplate("file:///{name}", "f"),
+			(string uri, string[string] vars) @safe => ResourceContents.init);
+	Json p = Json.emptyObject;
+	p["uri"] = "file:///a";
+	auto resp = s.handle(req(1, "resources/subscribe", p)).get;
+	assert("error" !in resp);
+	assert(("file:///a" in s.activeConnection.subscriptions));
+}
+
+unittest  // removeResource drops resources/subscribe entries for that URI on every session
+{
+	import mcp.server.connection : ConnectionState;
+
+	auto s = McpServer.stateful("t", "1");
+	s.enableResourceSubscriptions();
+	registerStubResources(s, "res://gone");
+	auto a = new ConnectionState;
+	auto b = new ConnectionState;
+	Json p = Json.emptyObject;
+	p["uri"] = "res://gone";
+	assert("error" !in s.handle(req(1, "resources/subscribe", p)).get);
+	assert("error" !in s.handle(req(1, "resources/subscribe", p), new ConnCtx("A", a)).get);
+	assert("error" !in s.handle(req(1, "resources/subscribe", p), new ConnCtx("B", b)).get);
+
+	assert(s.removeResource("res://gone"));
+	assert("res://gone" !in s.activeConnection.subscriptions);
+	enum m = "notifications/resources/updated";
+	assert(!s.plainGetEligibleFor(a, m, "res://gone"));
+	assert(!s.plainGetEligibleFor(b, m, "res://gone"));
+
+	// A fresh subscription after re-registration is honoured again.
+	registerStubResources(s, "res://gone");
+	assert("error" !in s.handle(req(2, "resources/subscribe", p), new ConnCtx("A", a)).get);
+	assert(s.plainGetEligibleFor(a, m, "res://gone"));
+	assert(!s.plainGetEligibleFor(b, m, "res://gone"));
+}
+
+unittest  // a subscription to a removed resource does not count toward the per-connection cap
+{
+	import std.conv : to;
+
+	auto s = McpServer.stateful("t", "1");
+	s.enableResourceSubscriptions();
+	foreach (i; 0 .. maxResourceSubscriptions)
+		registerStubResources(s, "res://" ~ i.to!string);
+	registerStubResources(s, "res://extra");
+	Json p = Json.emptyObject;
+	foreach (i; 0 .. maxResourceSubscriptions)
+	{
+		p["uri"] = "res://" ~ i.to!string;
+		assert("error" !in s.handle(req(i, "resources/subscribe", p)).get);
+	}
+	assert(s.removeResource("res://0"));
+	p["uri"] = "res://extra";
+	assert("error" !in s.handle(req(-1, "resources/subscribe", p)).get);
+}
+
+unittest  // resources/subscribe caps the number of subscriptions per connection
+{
+	import std.conv : to;
+
+	auto s = McpServer.stateful("t", "1");
+	s.enableResourceSubscriptions();
+	s.registerResourceTemplate(ResourceTemplate("file:///{name}", "f"),
+			(string uri, string[string] vars) @safe => ResourceContents.init);
+	Json p = Json.emptyObject;
+	foreach (i; 0 .. maxResourceSubscriptions)
+	{
+		p["uri"] = "file:///" ~ i.to!string;
+		assert("error" !in s.handle(req(i, "resources/subscribe", p)).get);
+	}
+	p["uri"] = "file:///0";
+	assert("error" !in s.handle(req(-1, "resources/subscribe", p)).get,
+			"re-subscribing an existing uri at the cap succeeds");
+	p["uri"] = "file:///over";
+	auto resp = s.handle(req(-2, "resources/subscribe", p)).get;
+	assert(resp["error"]["code"].get!int == ErrorCode.invalidParams);
+	assert(s.activeConnection.subscriptions.length == maxResourceSubscriptions);
 }
 
 unittest  // resources/subscribe is rejected with -32601 when capability not advertised
@@ -5883,7 +7563,7 @@ unittest  // resources/subscribe is rejected with -32601 when capability not adv
 	auto resp = s.handle(req(1, "resources/subscribe", p)).get;
 	assert("error" in resp);
 	assert(resp["error"]["code"].get!int == ErrorCode.methodNotFound);
-	assert(!s.isSubscribed("test://w"));
+	assert(("test://w" !in s.activeConnection.subscriptions));
 }
 
 unittest  // modern: resources/subscribe is method-not-found (subscriptions/listen takes its place)
@@ -5899,7 +7579,7 @@ unittest  // modern: resources/subscribe is method-not-found (subscriptions/list
 	p["uri"] = "test://w";
 	auto resp = s.handle(modernReq(1, "resources/subscribe", p)).get;
 	assert(resp["error"]["code"].get!int == ErrorCode.methodNotFound);
-	assert(!s.isSubscribed("test://w"));
+	assert(("test://w" !in s.activeConnection.subscriptions));
 }
 
 unittest  // resources/unsubscribe is rejected with -32601 when capability not advertised
@@ -5940,6 +7620,239 @@ unittest  // server/discover under the modern protocol still serves the discover
 	assert(resp["result"]["_meta"][MetaKey.serverInfo]["name"].get!string == "disc-srv");
 }
 
+// Task options whose executors run synchronously on the dispatching call.
+version (unittest) private TaskOptions syncTasks() @safe
+{
+	TaskOptions o;
+	o.dispatcher = new SyncTaskDispatcher();
+	return o;
+}
+
+version (unittest) private Message stdioListenReq(long id, Json meta = Json.undefined) @safe
+{
+	if (meta.type == Json.Type.undefined)
+	{
+		meta = Json.emptyObject;
+		meta[MetaKey.protocolVersion] = "2026-07-28";
+		meta[MetaKey.clientCapabilities] = Json.emptyObject;
+	}
+	Json params = Json.emptyObject;
+	params["notifications"] = Json(["toolsListChanged": Json(true)]);
+	params["_meta"] = meta;
+	return Message(makeRequest(Json(id), "subscriptions/listen", params));
+}
+
+unittest  // enableTasks throws on a stateful server (Tasks is modern-only)
+{
+	import std.exception : assertThrown;
+
+	auto s = McpServer.stateful("t", "1");
+	assertThrown(s.enableTasks());
+	assert(s.tasks() is null);
+}
+
+unittest  // enableTasks throws rather than replace a runtime that holds tasks
+{
+	import std.exception : assertThrown;
+
+	auto s = new McpServer("t", "1");
+	auto rt = s.enableTasks();
+	const id = rt.create().taskId;
+	assertThrown(s.enableTasks());
+	assert(s.tasks() is rt);
+	assert(!rt.statusOf(id).isNull);
+}
+
+unittest  // enableTasks may replace a runtime that holds no tasks
+{
+	auto s = new McpServer("t", "1");
+	auto first = s.enableTasks();
+	auto second = s.enableTasks();
+	assert(second !is first);
+	assert(s.tasks() is second);
+}
+
+unittest  // enableEvents throws on a stateful server (Events is modern-only)
+{
+	import std.exception : assertThrown;
+
+	auto s = McpServer.stateful("t", "1");
+	assertThrown(s.enableEvents());
+	assert("extensions" !in s.capabilities().toJson());
+}
+
+unittest  // removing the last tool, resource or prompt keeps its capability and list method
+{
+	auto s = makeTestServer();
+	Resource r = {uri: "u", name: "u"};
+	s.registerResource(r, () @safe => ResourceContents.makeText("u", "text/plain", "x"));
+	Prompt pr = {name: "p"};
+	s.registerPrompt(pr, (Json) @safe => GetPromptResult.init);
+	assert(s.removeTool("add"));
+	assert(s.removeResource("u"));
+	assert(s.removePrompt("p"));
+	auto caps = s.capabilities();
+	assert(!caps.tools.isNull && !caps.resources.isNull && !caps.prompts.isNull);
+	foreach (i, m; ["tools/list", "resources/list", "prompts/list"])
+	{
+		auto resp = s.handle(req(i, m)).get;
+		assert("error" !in resp, m);
+	}
+}
+
+unittest  // notify() on stdio honours the listen stream's filter
+{
+	auto s = new McpServer("t", "1");
+	s.enableToolsListChanged();
+	string[] sink;
+	assert(s.tryServeStdioListen(stdioListenReq(1), (string line) @safe {
+			sink ~= line;
+		}));
+	assert(sink.length == 1); // the acknowledgement
+	assert(s.notify("notifications/prompts/list_changed") == 0);
+	assert(s.notify("notifications/resources/updated", Json([
+		"uri": Json("note:///x")
+	])) == 0);
+	assert(sink.length == 1);
+	assert(s.notify("notifications/tools/list_changed") == 1);
+	assert(sink.length == 2);
+}
+
+unittest  // a second stdio subscriptions/listen closes the first with its result
+{
+	import vibe.data.json : parseJsonString;
+
+	import std.algorithm : canFind;
+
+	auto s = new McpServer("t", "1");
+	s.enableToolsListChanged();
+	string[] frames;
+	void sink(string line) @safe
+	{
+		frames ~= line;
+	}
+
+	assert(s.tryServeStdioListen(stdioListenReq(1), &sink));
+	assert(s.tryServeStdioListen(stdioListenReq(2), &sink));
+	// The first stream gets its SubscriptionsListenResult response (id 1).
+	bool firstClosed;
+	foreach (f; frames)
+	{
+		auto j = parseJsonString(f);
+		if ("id" in j && j["id"].get!long == 1 && "result" in j)
+			firstClosed = true;
+	}
+	assert(firstClosed, "the replaced listen must be answered with its result");
+
+	const before = frames.length;
+	assert(s.notifyToolsListChanged() == 1);
+	assert(frames[before].canFind(`subscriptionId":2`),
+			"notifications flow to the newest listen stream");
+}
+
+unittest  // no stdio listen notification follows the stream's closing result
+{
+	import vibe.data.json : parseJsonString;
+
+	auto s = new McpServer("t", "1");
+	s.enableToolsListChanged();
+	string[] frames;
+	void sink(string line) @safe
+	{
+		frames ~= line;
+		// A notify that runs while the closing result is being written (the
+		// write yields on a real transport) must not reach the closed stream.
+		if (("result" in parseJsonString(line)) !is null)
+			s.notifyToolsListChanged();
+	}
+
+	assert(s.tryServeStdioListen(stdioListenReq(1), &sink));
+	s.handle(Message(makeNotification("notifications/cancelled", Json([
+		"requestId": Json(1)
+	]))));
+	assert(frames.length == 2, "ack then the closing result, nothing after it");
+	assert("result" in parseJsonString(frames[$ - 1]));
+}
+
+unittest  // an invalid replacement stdio listen leaves the open stream untouched
+{
+	import std.conv : to;
+	import vibe.data.json : parseJsonString;
+
+	auto s = new McpServer("t", "1");
+	registerStubResources(s, "test://stub");
+	s.enableToolsListChanged();
+	string[] frames;
+	void sink(string line) @safe
+	{
+		frames ~= line;
+	}
+
+	assert(s.tryServeStdioListen(stdioListenReq(1), &sink));
+	auto bad = stdioListenReq(2);
+	Json uris = Json.emptyArray;
+	foreach (i; 0 .. maxResourceSubscriptions + 1)
+		uris ~= Json("test://r" ~ i.to!string);
+	bad.params["notifications"]["resourceSubscriptions"] = uris;
+	assert(s.tryServeStdioListen(bad, &sink));
+	assert(frames.length == 2);
+	auto err = parseJsonString(frames[1]);
+	assert(err["id"].get!long == 2 && "error" in err);
+
+	// Stream 1 is still open and still receives its notifications.
+	assert(s.notifyToolsListChanged() == 1);
+	assert(parseJsonString(frames[2])["params"]["_meta"][MetaKey.subscriptionId].get!long == 1);
+}
+
+unittest  // a stdio subscriptions/listen missing _meta clientCapabilities is -32602
+{
+	import vibe.data.json : parseJsonString;
+
+	auto s = new McpServer("t", "1");
+	s.enableToolsListChanged();
+	string[] frames;
+	Json meta = Json.emptyObject;
+	meta[MetaKey.protocolVersion] = "2026-07-28";
+	assert(s.tryServeStdioListen(stdioListenReq(1, meta), (string l) @safe {
+			frames ~= l;
+		}));
+	assert(frames.length == 1);
+	auto j = parseJsonString(frames[0]);
+	assert(j["error"]["code"].get!int == ErrorCode.invalidParams);
+	assert(s.notifyToolsListChanged() == 0, "a rejected listen must not open a stream");
+}
+
+unittest  // a stdio events/stream missing _meta clientCapabilities is -32602
+{
+	import vibe.data.json : parseJsonString;
+
+	auto s = new McpServer("t", "1");
+	string[] frames;
+	Json meta = Json.emptyObject;
+	meta[MetaKey.protocolVersion] = "2026-07-28";
+	Json params = Json.emptyObject;
+	params["name"] = "x";
+	params["_meta"] = meta;
+	assert(s.tryServeStdioEventsStream(Message(makeRequest(Json(1),
+			"events/stream", params)), (string l) @safe { frames ~= l; }));
+	assert(frames.length == 1);
+	assert(parseJsonString(frames[0])["error"]["code"].get!int == ErrorCode.invalidParams);
+}
+
+unittest  // a stdio events/stream on a server without events is -32601 naming events/stream
+{
+	import vibe.data.json : parseJsonString;
+
+	auto s = new McpServer("t", "1");
+	string[] frames;
+	assert(s.tryServeStdioEventsStream(modernReq(1, "events/stream",
+			Json(["name": Json("x")])), (string l) @safe { frames ~= l; }));
+	assert(frames.length == 1);
+	auto err = parseJsonString(frames[0])["error"];
+	assert(err["code"].get!int == ErrorCode.methodNotFound);
+	assert(err["message"].get!string == "Method not found: events/stream", err.toString());
+}
+
 unittest  // stdio subscriptions/listen is cancellable via notifications/cancelled
 {
 	import std.algorithm : canFind;
@@ -5955,6 +7868,7 @@ unittest  // stdio subscriptions/listen is cancellable via notifications/cancell
 
 	Json meta = Json.emptyObject;
 	meta[MetaKey.protocolVersion] = "2026-07-28";
+	meta[MetaKey.clientCapabilities] = Json.emptyObject;
 	Json filter = Json.emptyObject;
 	filter["toolsListChanged"] = true;
 	Json params = Json.emptyObject;
@@ -5982,10 +7896,10 @@ unittest  // stdio subscriptions/listen is cancellable via notifications/cancell
 	assert(frames.length == before, "notify wrote to a cancelled stdio listen stream");
 }
 
-unittest  // stdio subscriptions/listen cancellation matches a string requestId too
+unittest  // stdio subscriptions/listen cancellation does not match a string requestId to a numeric id
 {
-	// rpcIdString normalizes numeric and string ids identically, so a cancellation
-	// carrying a string "42" tears down a listen whose id was the number 42.
+	// JSON-RPC ids are typed: the string "42" names a different request than the
+	// number 42, so it leaves the listen stream open.
 	auto s = new McpServer("t", "1");
 	s.enableToolsListChanged();
 	string[] frames;
@@ -5996,6 +7910,7 @@ unittest  // stdio subscriptions/listen cancellation matches a string requestId 
 
 	Json meta = Json.emptyObject;
 	meta[MetaKey.protocolVersion] = "2026-07-28";
+	meta[MetaKey.clientCapabilities] = Json.emptyObject;
 	Json filter = Json.emptyObject;
 	filter["toolsListChanged"] = true;
 	Json params = Json.emptyObject;
@@ -6007,9 +7922,32 @@ unittest  // stdio subscriptions/listen cancellation matches a string requestId 
 	Json cp = Json.emptyObject;
 	cp["requestId"] = "42";
 	s.handle(Message(makeNotification("notifications/cancelled", cp)));
-	const before = frames.length;
-	assert(s.notifyToolsListChanged() == 0);
-	assert(frames.length == before);
+	assert(s.notifyToolsListChanged() == 1);
+}
+
+unittest  // stdio subscriptions/listen cancellation ignores a fractional requestId
+{
+	import std.exception : assertNotThrown;
+
+	auto s = new McpServer("t", "1");
+	s.enableToolsListChanged();
+	void sink(string line) @safe
+	{
+	}
+
+	Json meta = Json.emptyObject;
+	meta[MetaKey.protocolVersion] = "2026-07-28";
+	meta[MetaKey.clientCapabilities] = Json.emptyObject;
+	Json params = Json.emptyObject;
+	params["notifications"] = Json(["toolsListChanged": Json(true)]);
+	params["_meta"] = meta;
+	assert(s.tryServeStdioListen(Message(makeRequest(Json(42),
+			"subscriptions/listen", params)), &sink));
+
+	Json cp = Json.emptyObject;
+	cp["requestId"] = 1.5;
+	assertNotThrown(s.handle(Message(makeNotification("notifications/cancelled", cp))));
+	assert(s.notifyToolsListChanged() == 1);
 }
 
 unittest  // stdio subscriptions/listen does not wipe negotiated session clientCaps
@@ -6088,13 +8026,35 @@ version (unittest)
 		return Message(makeRequest(Json(id), method, params));
 	}
 
+	// A modern request (as `modernReq`) whose client also declares elicitation,
+	// so MRTR elicitation input requests reach it.
+	private Message modernReqElicit(long id, string method, Json params = Json.emptyObject) @safe
+	{
+		Json meta = Json.emptyObject;
+		meta[MetaKey.protocolVersion] = "2026-07-28";
+		meta[MetaKey.clientInfo] = Json([
+			"name": Json("c"),
+			"version": Json("1")
+		]);
+		Json ext = Json.emptyObject;
+		ext[tasksExtensionKey] = Json.emptyObject;
+		meta[MetaKey.clientCapabilities] = Json([
+			"extensions": ext,
+			"elicitation": Json.emptyObject
+		]);
+		params["_meta"] = meta;
+		return Message(makeRequest(Json(id), method, params));
+	}
+
 	/// A modern request whose client capabilities do NOT declare the Tasks
-	/// extension (an ordinary client).
+	/// extension (an ordinary client that supports form elicitation).
 	private Message modernReqNoTasks(long id, string method, Json params = Json.emptyObject) @safe
 	{
 		Json meta = Json.emptyObject;
 		meta[MetaKey.protocolVersion] = "2026-07-28";
-		meta[MetaKey.clientCapabilities] = Json.emptyObject;
+		meta[MetaKey.clientCapabilities] = Json([
+			"elicitation": Json.emptyObject
+		]);
 		params["_meta"] = meta;
 		return Message(makeRequest(Json(id), method, params));
 	}
@@ -6118,6 +8078,8 @@ unittest  // tasks/* are -32601 when the server never enabled tasks
 		Json p = Json(["taskId": Json("x")]);
 		auto resp = s.handle(modernReq(1, m, p)).get;
 		assert(resp["error"]["code"].get!int == ErrorCode.methodNotFound, m);
+		assert(resp["error"]["message"].get!string == "Method not found: " ~ m,
+				resp["error"]["message"].get!string);
 	}
 }
 
@@ -6130,6 +8092,8 @@ unittest  // tasks/* are -32601 on a legacy session even when enabled (extension
 		Json p = Json(["taskId": Json("x")]);
 		auto resp = s.handle(req(1, m, p)).get;
 		assert(resp["error"]["code"].get!int == ErrorCode.methodNotFound, m);
+		assert(resp["error"]["message"].get!string == "Method not found: " ~ m,
+				resp["error"]["message"].get!string);
 	}
 }
 
@@ -6169,14 +8133,22 @@ version (unittest)
 	}
 }
 
-unittest  // enableEvents advertises the events extension (with listChanged) under the modern protocol discover
+unittest  // enableEvents advertises the events extension under the modern protocol discover
 {
 	auto s = new McpServer("t", "1");
 	s.enableEvents();
 	auto resp = s.handle(modernReq(1, "server/discover")).get;
 	auto caps = resp["result"]["capabilities"];
 	assert("io.modelcontextprotocol/events" in caps["extensions"]);
-	assert(caps["extensions"]["io.modelcontextprotocol/events"]["listChanged"].get!bool);
+}
+
+unittest  // the events extension does not advertise listChanged, which no listen filter can carry
+{
+	auto s = new McpServer("t", "1");
+	s.enableEvents();
+	auto resp = s.handle(modernReq(1, "server/discover")).get;
+	auto settings = resp["result"]["capabilities"]["extensions"]["io.modelcontextprotocol/events"];
+	assert("listChanged" !in settings);
 }
 
 unittest  // events/* are -32601 when the server never enabled events
@@ -6188,6 +8160,8 @@ unittest  // events/* are -32601 when the server never enabled events
 	{
 		auto resp = s.handle(modernReq(1, m, Json(["name": Json("x")]))).get;
 		assert(resp["error"]["code"].get!int == ErrorCode.methodNotFound, m);
+		assert(resp["error"]["message"].get!string == "Method not found: " ~ m,
+				resp["error"]["message"].get!string);
 	}
 }
 
@@ -6201,6 +8175,8 @@ unittest  // events/* are -32601 on a legacy session even when enabled (modern-o
 	{
 		auto resp = s.handle(req(1, m, Json(["name": Json("x")]))).get;
 		assert(resp["error"]["code"].get!int == ErrorCode.methodNotFound, m);
+		assert(resp["error"]["message"].get!string == "Method not found: " ~ m,
+				resp["error"]["message"].get!string);
 	}
 }
 
@@ -6266,7 +8242,7 @@ unittest  // events/subscribe without an authenticated principal is -32012 Forbi
 
 unittest  // stdio events/stream opens with an active frame, then delivers emitted events
 {
-	import mcp.protocol.events : subscriptionIdMetaKey, EventOccurrence;
+	import mcp.protocol.events : EventOccurrence;
 	import vibe.data.json : parseJsonString;
 
 	auto s = new McpServer("t", "1");
@@ -6285,7 +8261,7 @@ unittest  // stdio events/stream opens with an active frame, then delivers emitt
 	// first frame is notifications/events/active stamped with the request id
 	auto active = parseJsonString(lines[0]);
 	assert(active["method"].get!string == "notifications/events/active");
-	assert(active["params"]["_meta"][subscriptionIdMetaKey].get!long == 9);
+	assert(active["params"]["_meta"][MetaKey.subscriptionId].get!long == 9);
 
 	// an emitted event is delivered live on the same channel
 	rt.emit(EventOccurrence("evt_1", "incident.created", "", Json([
@@ -6294,7 +8270,90 @@ unittest  // stdio events/stream opens with an active frame, then delivers emitt
 	auto ev = parseJsonString(lines[$ - 1]);
 	assert(ev["method"].get!string == "notifications/events/event");
 	assert(ev["params"]["eventId"].get!string == "evt_1");
-	assert(ev["params"]["_meta"][subscriptionIdMetaKey].get!long == 9);
+	assert(ev["params"]["_meta"][MetaKey.subscriptionId].get!long == 9);
+}
+
+unittest  // stdio events/stream rejects a request id that already names an open stream
+{
+	import std.algorithm : count, canFind;
+	import mcp.protocol.events : EventOccurrence;
+	import vibe.data.json : parseJsonString;
+
+	auto s = new McpServer("t", "1");
+	auto rt = s.enableEvents();
+	registerDemoEvent(s);
+	string[] lines;
+	void sink(string line) @safe
+	{
+		lines ~= line;
+	}
+
+	Json params = Json.emptyObject;
+	params["name"] = "incident.created";
+	assert(s.tryServeStdioEventsStream(modernReq(9, "events/stream", params), &sink));
+	const opened = lines.length;
+	assert(s.tryServeStdioEventsStream(modernReq(9, "events/stream", params), &sink));
+	assert(lines.length == opened + 1);
+	auto resp = parseJsonString(lines[$ - 1]);
+	assert(resp["id"].get!long == 9);
+	assert(resp["error"]["code"].get!int == ErrorCode.invalidRequest);
+
+	rt.emit(EventOccurrence("evt_1", "incident.created", "", Json([
+		"sev": Json("P1")
+	])));
+	assert(lines.count!(l => l.canFind("evt_1")) == 1);
+}
+
+unittest  // stdio events/stream answers a negative maxAgeMs with InvalidParams
+{
+	import vibe.data.json : parseJsonString;
+
+	auto s = new McpServer("t", "1");
+	s.enableEvents();
+	registerDemoEvent(s);
+	string[] lines;
+	void sink(string line) @safe
+	{
+		lines ~= line;
+	}
+
+	Json params = Json.emptyObject;
+	params["name"] = "incident.created";
+	params["maxAgeMs"] = -1;
+	assert(s.tryServeStdioEventsStream(modernReq(9, "events/stream", params), &sink));
+	assert(lines.length == 1);
+	auto resp = parseJsonString(lines[0]);
+	assert(resp["error"]["code"].get!int == ErrorCode.invalidParams);
+}
+
+unittest  // stdio events/stream answers InternalError when on_subscribe throws a plain Exception
+{
+	import vibe.data.json : parseJsonString;
+	import mcp.server.event_context : EventContext;
+	import mcp.server.events_runtime : EventRegistration;
+
+	auto s = new McpServer("t", "1");
+	s.enableEvents();
+	EventRegistration reg;
+	reg.descriptor.name = "n";
+	reg.emitOnly = true;
+	reg.onSubscribe = (EventContext ctx, string id) @safe {
+		throw new Exception("upstream unavailable");
+	};
+	s.registerEventType(reg);
+	string[] lines;
+	void sink(string line) @safe
+	{
+		lines ~= line;
+	}
+
+	Json params = Json.emptyObject;
+	params["name"] = "n";
+	assert(s.tryServeStdioEventsStream(modernReq(9, "events/stream", params), &sink));
+	assert(lines.length == 1);
+	auto resp = parseJsonString(lines[0]);
+	assert(resp["id"].get!long == 9);
+	assert(resp["error"]["code"].get!int == ErrorCode.internalError);
 }
 
 unittest  // a cancelled stdio events/stream stops receiving events
@@ -6320,6 +8379,80 @@ unittest  // a cancelled stdio events/stream stops receiving events
 	]))));
 	rt.emit(EventOccurrence("evt_2", "incident.created", "t"));
 	assert(lines.length == before); // no further delivery after cancellation
+}
+
+unittest  // cancelling string request id "9" leaves the stdio events/stream with numeric id 9 open
+{
+	import mcp.protocol.events : EventOccurrence;
+
+	auto s = new McpServer("t", "1");
+	auto rt = s.enableEvents();
+	registerDemoEvent(s);
+	string[] lines;
+	void sink(string line) @safe
+	{
+		lines ~= line;
+	}
+
+	Json params = Json.emptyObject;
+	params["name"] = "incident.created";
+	s.tryServeStdioEventsStream(modernReq(9, "events/stream", params), &sink);
+	const before = lines.length;
+	s.handle(Message(makeNotification("notifications/cancelled", Json([
+		"requestId": Json("9")
+	]))));
+	rt.emit(EventOccurrence("evt_3", "incident.created", "t"));
+	assert(lines.length > before, "a different request id must not tear the stream down");
+}
+
+unittest  // an HTTP connection's cancel leaves the stdio events/stream with the same id open
+{
+	import mcp.protocol.events : EventOccurrence;
+	import mcp.server.connection : ConnectionState;
+
+	auto s = new McpServer("t", "1");
+	auto rt = s.enableEvents();
+	registerDemoEvent(s);
+	string[] lines;
+	void sink(string line) @safe
+	{
+		lines ~= line;
+	}
+
+	Json params = Json.emptyObject;
+	params["name"] = "incident.created";
+	s.tryServeStdioEventsStream(modernReq(9, "events/stream", params), &sink);
+	const before = lines.length;
+	s.handle(Message(makeNotification("notifications/cancelled",
+			Json(["requestId": Json(9)]))), new ConnCtx("http-session", new ConnectionState));
+	rt.emit(EventOccurrence("evt_4", "incident.created", "t"));
+	assert(lines.length > before, "an HTTP cancel must not tear down a stdio stream");
+}
+
+unittest  // an HTTP connection's cancel leaves the stdio subscriptions/listen with the same id open
+{
+	import mcp.server.connection : ConnectionState;
+
+	auto s = new McpServer("t", "1");
+	s.enableToolsListChanged();
+	string[] frames;
+	void sink(string line) @safe
+	{
+		frames ~= line;
+	}
+
+	Json meta = Json.emptyObject;
+	meta[MetaKey.protocolVersion] = "2026-07-28";
+	meta[MetaKey.clientCapabilities] = Json.emptyObject;
+	Json params = Json.emptyObject;
+	params["notifications"] = Json(["toolsListChanged": Json(true)]);
+	params["_meta"] = meta;
+	assert(s.tryServeStdioListen(Message(makeRequest(Json(1),
+			"subscriptions/listen", params)), &sink));
+
+	s.handle(Message(makeNotification("notifications/cancelled",
+			Json(["requestId": Json(1)]))), new ConnCtx("http-session", new ConnectionState));
+	assert(s.notifyToolsListChanged() == 1, "an HTTP cancel must not tear down a stdio listen");
 }
 
 unittest  // events/poll answers -32602 InvalidParams on the wire when arguments violate inputSchema
@@ -6374,6 +8507,26 @@ unittest  // a server-terminated stdio stream gets the terminated frame, then th
 	assert(lines.length == opened + 2);
 }
 
+unittest  // hasStdioEventStreams reports open stdio push streams, not merely enabled events
+{
+	import mcp.server.event_context : EventContext, EventResult;
+	import mcp.server.events_runtime : EventRegistration;
+
+	auto s = new McpServer("t", "1");
+	s.enableEvents();
+	assert(!s.hasStdioEventStreams());
+
+	EventRegistration reg;
+	reg.descriptor.name = "email.received";
+	reg.check = (EventContext ctx) @safe => EventResult.empty("c0");
+	s.registerEventType(reg);
+	Json params = Json.emptyObject;
+	params["name"] = "email.received";
+	assert(s.tryServeStdioEventsStream(modernReq(1, "events/stream", params), (string) @safe {
+		}));
+	assert(s.hasStdioEventStreams());
+}
+
 unittest  // tickStdioEventStreams iterates a snapshot, so a mid-tick cancel can't corrupt it
 {
 	import mcp.protocol.events : EventOccurrence;
@@ -6413,6 +8566,49 @@ unittest  // tickStdioEventStreams iterates a snapshot, so a mid-tick cancel can
 	// ticks. No throw / corruption is the assertion.
 	s.tickStdioEventStreams(0);
 	assert(s.hasStdioEventStreams());
+}
+
+unittest  // a stdio events/stream cancelled mid-tick gets no heartbeat from that tick
+{
+	import mcp.server.event_context : EventContext, EventResult;
+	import mcp.server.events_runtime : EventRegistration;
+
+	auto s = new McpServer("t", "1");
+	s.enableEvents();
+
+	// A check-backed type whose check() cancels both streams during the tick, so
+	// each is cancelled after the tick snapshotted it but before its heartbeat.
+	bool cancelDuringTick;
+	EventRegistration reg;
+	reg.descriptor.name = "email.received";
+	reg.check = (EventContext ctx) @safe {
+		if (cancelDuringTick)
+		{
+			cancelDuringTick = false;
+			foreach (id; [1, 2])
+				s.handle(Message(makeNotification("notifications/cancelled",
+						Json(["requestId": Json(id)]))));
+		}
+		return EventResult.empty("c0");
+	};
+	s.registerEventType(reg);
+
+	string[] lines;
+	void sink(string line) @safe
+	{
+		lines ~= line;
+	}
+
+	Json params = Json.emptyObject;
+	params["name"] = "email.received";
+	s.tryServeStdioEventsStream(modernReq(1, "events/stream", params), &sink);
+	s.tryServeStdioEventsStream(modernReq(2, "events/stream", params), &sink);
+	const before = lines.length;
+	cancelDuringTick = true;
+
+	s.tickStdioEventStreams(100_000);
+	assert(!s.hasStdioEventStreams());
+	assert(lines.length == before, lines.length > before ? lines[before] : "");
 }
 
 unittest  // tickStdioEventStreams polls a check-backed stream and heartbeats only every 15s
@@ -6531,6 +8727,81 @@ unittest  // input_required surfaces inputRequests and tasks/update is acknowled
 	assert(rt.takenInput(t.taskId)["k1"]["answer"].get!string == "yes");
 }
 
+version (unittest) private McpServer twoQuestionTaskServer(out int* runs) @safe
+{
+	import mcp.protocol.mrtr : InputRequest;
+
+	auto s = new McpServer("t", "1");
+	s.enableTasks(syncTasks());
+	Tool desc;
+	desc.name = "ask2";
+	desc.inputSchema = Json(["type": Json("object")]);
+	int* counter = new int;
+	runs = counter;
+	s.registerTaskTool(desc, (TaskContext tc) @safe {
+		(*counter)++;
+		if (!tc.hasInput("a") || !tc.hasInput("b"))
+			return tc.requireInput([
+			InputRequest.elicitation("a", "A?"),
+			InputRequest.elicitation("b", "B?")
+		]);
+		return Json(["content": Json.emptyArray]);
+	});
+	return s;
+}
+
+version (unittest) private Json taskUpdate(string id, Json responses) @safe
+{
+	Json up = Json(["taskId": Json(id)]);
+	if (responses.type != Json.Type.undefined)
+		up["inputResponses"] = responses;
+	return up;
+}
+
+unittest  // tasks/update resumes the executor only once every requested key is answered
+{
+	import mcp.protocol.tasks : TaskStatus;
+
+	int* runs;
+	auto s = twoQuestionTaskServer(runs);
+	auto created = s.handle(modernReq(1, "tools/call",
+			Json(["name": Json("ask2"), "arguments": Json.emptyObject]))).get;
+	const id = created["result"]["taskId"].get!string;
+	assert(*runs == 1);
+
+	auto partial = s.handle(modernReq(2, "tasks/update", taskUpdate(id,
+			Json(["a": Json(["action": Json("accept")])])))).get;
+	assert("error" !in partial);
+	assert(*runs == 1, "a partial answer must not re-run the executor");
+	assert(s.tasks.statusOf(id).get == TaskStatus.inputRequired);
+
+	auto rest = s.handle(modernReq(3, "tasks/update", taskUpdate(id,
+			Json(["b": Json(["action": Json("accept")])])))).get;
+	assert("error" !in rest);
+	assert(*runs == 2);
+	assert(s.tasks.statusOf(id).get == TaskStatus.completed);
+}
+
+unittest  // tasks/update with no or empty inputResponses is -32602 and re-runs nothing
+{
+	import mcp.protocol.tasks : TaskStatus;
+
+	int* runs;
+	auto s = twoQuestionTaskServer(runs);
+	auto created = s.handle(modernReq(1, "tools/call",
+			Json(["name": Json("ask2"), "arguments": Json.emptyObject]))).get;
+	const id = created["result"]["taskId"].get!string;
+	foreach (i, body_; [
+		taskUpdate(id, Json.undefined), taskUpdate(id, Json.emptyObject)
+	])
+	{
+		auto resp = s.handle(modernReq(2 + cast(long) i, "tasks/update", body_)).get;
+		assert(resp["error"]["code"].get!int == ErrorCode.invalidParams);
+	}
+	assert(*runs == 1);
+	assert(s.tasks.statusOf(id).get == TaskStatus.inputRequired);
+}
+
 unittest  // tasks/cancel acknowledges and cancels a task
 {
 	auto s = new McpServer("t", "1");
@@ -6559,7 +8830,7 @@ unittest  // tasks/update for an unknown taskId is -32602
 unittest  // registerTaskTool: tools/call returns a task handle the executor completes
 {
 	auto s = new McpServer("t", "1");
-	s.enableTasks(null, TaskOptions.init, new SyncTaskDispatcher());
+	s.enableTasks(syncTasks());
 	Tool desc;
 	desc.name = "dbl";
 	desc.inputSchema = Json(["type": Json("object")]);
@@ -6613,7 +8884,7 @@ version (unittest)
 		import mcp.protocol.mrtr : InputRequest;
 
 		auto s = new McpServer("t", "1");
-		s.enableTasks(null, TaskOptions.init, new SyncTaskDispatcher());
+		s.enableTasks(syncTasks());
 		Tool desc;
 		desc.name = "gate";
 		desc.inputSchema = Json(["type": Json("object")]);
@@ -6640,6 +8911,29 @@ version (unittest)
 		])), ctx).get;
 		return call["result"]["taskId"].get!string;
 	}
+}
+
+unittest  // a manual task a handler creates from its request is bound to that request's principal
+{
+	import mcp.protocol.tasks : makeCreateTaskResult;
+
+	auto s = new McpServer("t", "1");
+	auto rt = s.enableTasks();
+	Tool desc = {name: "manual"};
+	s.registerTool(desc, (Json args,
+			RequestContext ctx) @safe => ToolResponse.task(makeCreateTaskResult(rt.create(ctx))));
+	auto call = s.handle(modernReq(1, "tools/call", Json([
+		"name": Json("manual"),
+		"arguments": Json.emptyObject
+	])), new OwnerCtx("alice")).get;
+	const id = call["result"]["taskId"].get!string;
+
+	auto foreign = s.handle(modernReq(2, "tasks/get",
+			Json(["taskId": Json(id)])), new OwnerCtx("bob")).get;
+	assert(foreign["error"]["code"].get!int == ErrorCode.invalidParams);
+	auto own = s.handle(modernReq(3, "tasks/get", Json(["taskId": Json(id)])),
+			new OwnerCtx("alice")).get;
+	assert(own["result"]["status"].get!string == "working");
 }
 
 unittest  // a task is bound to the principal that created it: another principal cannot read it
@@ -6722,7 +9016,7 @@ unittest  // tasks/get, tasks/update, tasks/cancel are -32021 for a client witho
 unittest  // a task tool called without the extension runs synchronously and returns a plain result
 {
 	auto s = new McpServer("t", "1");
-	s.enableTasks(null, TaskOptions.init, new SyncTaskDispatcher());
+	s.enableTasks(syncTasks());
 	Tool desc;
 	desc.name = "dbl";
 	desc.inputSchema = Json(["type": Json("object")]);
@@ -6745,16 +9039,125 @@ unittest  // a task tool called without the extension runs synchronously and ret
 	assert(resp["result"]["content"][0]["text"].get!string == "doubled");
 }
 
-unittest  // a task tool that requires the extension rejects a client without it with -32021
+unittest  // a task tool run inline for a client without the extension emits no notifications/tasks
+{
+	import std.algorithm : canFind;
+
+	auto s = new McpServer("t", "1");
+	s.enableTasks(syncTasks());
+	Tool desc;
+	desc.name = "slow";
+	desc.inputSchema = Json(["type": Json("object")]);
+	s.registerTaskTool(desc, (TaskContext tc) @safe {
+		tc.progress("halfway");
+		return Json(["content": Json.emptyArray]);
+	});
+	string[] frames;
+	void sink(string f) @safe
+	{
+		frames ~= f;
+	}
+
+	Json meta = Json.emptyObject;
+	meta[MetaKey.protocolVersion] = "2026-07-28";
+	meta[MetaKey.clientCapabilities] = Json.emptyObject;
+	Json params = Json.emptyObject;
+	params["notifications"] = Json(["toolsListChanged": Json(true)]);
+	params["_meta"] = meta;
+	assert(s.tryServeStdioListen(Message(makeRequest(Json(1),
+			"subscriptions/listen", params)), &sink));
+
+	auto resp = s.handle(modernReqNoTasks(2, "tools/call",
+			Json(["name": Json("slow"), "arguments": Json.emptyObject]))).get;
+	assert("error" !in resp);
+	assert(!frames.canFind!(fr => fr.canFind("notifications/tasks")));
+}
+
+unittest  // a synchronous task-tool call validates arguments before running the executor
 {
 	auto s = new McpServer("t", "1");
-	s.enableTasks(null, TaskOptions.init, new SyncTaskDispatcher());
+	s.enableTasks(syncTasks());
 	Tool desc;
-	desc.name = "must-task";
+	desc.name = "dbl";
+	desc.inputSchema = Json([
+		"type": Json("object"),
+		"properties": Json(["n": Json(["type": Json("integer")])]),
+		"required": Json([Json("n")])
+	]);
+	bool ran;
+	s.registerTaskTool(desc, (TaskContext tc) @safe {
+		ran = true;
+		return Json(["content": Json.emptyArray]);
+	});
+	auto resp = s.handle(modernReqNoTasks(1, "tools/call",
+			Json(["name": Json("dbl"), "arguments": Json(["n": Json("x")])]))).get;
+	assert(!ran, "the executor must not see arguments that violate inputSchema");
+	assert(resp["result"]["isError"].get!bool);
+}
+
+unittest  // a synchronous task-tool result is checked against the outputSchema
+{
+	auto s = new McpServer("t", "1");
+	s.enableOutputSchemaValidation();
+	s.enableTasks(syncTasks());
+	Tool desc;
+	desc.name = "typed";
+	desc.inputSchema = Json(["type": Json("object")]);
+	desc.outputSchema = Json([
+		"type": Json("object"),
+		"properties": Json(["v": Json(["type": Json("integer")])]),
+		"required": Json([Json("v")])
+	]);
+	s.registerTaskTool(desc, (TaskContext tc) @safe => Json([
+		"content": Json.emptyArray,
+		"structuredContent": Json(["v": Json("not an integer")])
+	]));
+	auto resp = s.handle(modernReqNoTasks(1, "tools/call",
+			Json(["name": Json("typed"), "arguments": Json.emptyObject]))).get;
+	assert("error" in resp);
+}
+
+unittest  // a synchronous task-tool call leaves no task record behind
+{
+	TaskOptions o;
+	o.idGenerator = () @safe => "inline-1";
+	auto s = new McpServer("t", "1");
+	o.dispatcher = new SyncTaskDispatcher();
+	s.enableTasks(o);
+	Tool desc;
+	desc.name = "noop";
 	desc.inputSchema = Json(["type": Json("object")]);
 	s.registerTaskTool(desc, (TaskContext tc) @safe => Json([
 		"content": Json.emptyArray
-	]), Nullable!Duration.init, Nullable!Duration.init, TaskSupport.required);
+	]));
+	auto ok = s.handle(modernReqNoTasks(1, "tools/call",
+			Json(["name": Json("noop"), "arguments": Json.emptyObject]))).get;
+	assert("result" in ok);
+	assert(s.tasks.store.get("inline-1").isNull);
+
+	desc.name = "boom";
+	s.registerTaskTool(desc, (TaskContext tc) @safe {
+		throw new McpException(ErrorCode.internalError, "boom");
+		return Json.emptyObject;
+	});
+	auto failed = s.handle(modernReqNoTasks(2, "tools/call",
+			Json(["name": Json("boom"), "arguments": Json.emptyObject]))).get;
+	assert("error" in failed);
+	assert(s.tasks.store.get("inline-1").isNull);
+}
+
+unittest  // a task tool that requires the extension rejects a client without it with -32021
+{
+	auto s = new McpServer("t", "1");
+	s.enableTasks(syncTasks());
+	Tool desc;
+	desc.name = "must-task";
+	desc.inputSchema = Json(["type": Json("object")]);
+	TaskToolOptions required;
+	required.support = TaskSupport.required;
+	s.registerTaskTool(desc, (TaskContext tc) @safe => Json([
+		"content": Json.emptyArray
+	]), required);
 
 	auto resp = s.handle(modernReqNoTasks(1, "tools/call",
 			Json(["name": Json("must-task"), "arguments": Json.emptyObject]))).get;
@@ -6767,10 +9170,91 @@ unittest  // a task tool that requires the extension rejects a client without it
 	assert(ok["result"]["resultType"].get!string == "task");
 }
 
+unittest  // an inline task tool observes its request's cancellation through tc.cancelRequested
+{
+	auto s = new McpServer("t", "1");
+	s.enableTasks(syncTasks());
+	Tool desc;
+	desc.name = "slow";
+	desc.inputSchema = Json(["type": Json("object")]);
+	bool saw;
+	s.registerTaskTool(desc, (TaskContext tc) @safe {
+		assert(!tc.cancelRequested());
+		Json p = Json.emptyObject;
+		p["requestId"] = 42;
+		s.handle(Message(makeNotification("notifications/cancelled", p)));
+		saw = tc.cancelRequested();
+		return Json(["content": Json.emptyArray]);
+	});
+	auto resp = s.handle(req(42, "tools/call", Json([
+		"name": Json("slow"),
+		"arguments": Json.emptyObject
+	])));
+	assert(saw, "the executor must see the request's cancellation");
+	assert(resp.isNull, "no response is sent for a cancelled request");
+}
+
+unittest  // an inline task tool that ends cancelled answers with requestCancelled, not an internal error
+{
+	import std.algorithm : canFind;
+
+	auto s = new McpServer("t", "1");
+	auto rt = s.enableTasks(syncTasks());
+	Tool desc;
+	desc.name = "abort";
+	desc.inputSchema = Json(["type": Json("object")]);
+	string taskId;
+	s.registerTaskTool(desc, (TaskContext tc) @safe {
+		taskId = tc.taskId;
+		rt.cancel(tc.taskId);
+		return Json(["content": Json.emptyArray]);
+	});
+	auto resp = s.handle(modernReqNoTasks(1, "tools/call",
+			Json(["name": Json("abort"), "arguments": Json.emptyObject]))).get;
+	assert(resp["error"]["code"].get!int == cast(int) ErrorCode.requestCancelled);
+	assert(!resp["error"]["message"].get!string.canFind(taskId));
+}
+
+unittest  // an inline task tool cannot detach: the client gets -32021 naming the extension
+{
+	auto s = new McpServer("t", "1");
+	s.enableTasks(syncTasks());
+	Tool desc;
+	desc.name = "handoff";
+	desc.inputSchema = Json(["type": Json("object")]);
+	s.registerTaskTool(desc, (TaskContext tc) @safe => tc.detach());
+	auto resp = s.handle(modernReqNoTasks(1, "tools/call",
+			Json(["name": Json("handoff"), "arguments": Json.emptyObject]))).get;
+	assert(resp["error"]["code"].get!int == cast(int) ErrorCode.missingRequiredClientCapability);
+	assert(tasksExtensionKey in resp["error"]["data"]["requiredCapabilities"]["extensions"]);
+}
+
+unittest  // a handler-built task result is rejected with -32021 for a client without the extension
+{
+	auto s = new McpServer("t", "1");
+	Tool desc;
+	desc.name = "handmade-task";
+	desc.inputSchema = Json(["type": Json("object")]);
+	s.registerTool(desc, (Json args, RequestContext ctx) @safe => ToolResponse.task(
+			Json([
+			"resultType": Json("task"),
+			"task": Json(["taskId": Json("t1"), "status": Json("working")])
+	])));
+
+	auto resp = s.handle(modernReqNoTasks(1, "tools/call",
+			Json(["name": Json("handmade-task"), "arguments": Json.emptyObject]))).get;
+	assert(resp["error"]["code"].get!int == cast(int) ErrorCode.missingRequiredClientCapability);
+	assert(tasksExtensionKey in resp["error"]["data"]["requiredCapabilities"]["extensions"]);
+
+	auto ok = s.handle(modernReq(2, "tools/call",
+			Json(["name": Json("handmade-task"), "arguments": Json.emptyObject]))).get;
+	assert(ok["result"]["resultType"].get!string == "task");
+}
+
 unittest  // a synchronous fall-through surfaces a failed task as its JSON-RPC error
 {
 	auto s = new McpServer("t", "1");
-	s.enableTasks(null, TaskOptions.init, new SyncTaskDispatcher());
+	s.enableTasks(syncTasks());
 	Tool desc;
 	desc.name = "boom";
 	desc.inputSchema = Json(["type": Json("object")]);
@@ -6789,7 +9273,7 @@ unittest  // startTask lets an MRTR tool gather input and then escalate to a tas
 	import mcp.protocol.mrtr : InputRequest;
 
 	auto s = new McpServer("t", "1");
-	s.enableTasks(null, TaskOptions.init, new SyncTaskDispatcher());
+	s.enableTasks(syncTasks());
 	s.registerTaskExecutor("escalate", (TaskContext tc) @safe {
 		const name = tc.inputJson()["user_name"].get!string;
 		return Json([
@@ -6814,10 +9298,8 @@ unittest  // startTask lets an MRTR tool gather input and then escalate to a tas
 	s.setToolTaskSupport("escalate", TaskSupport.required);
 
 	// Round 1: an InputRequiredResult, no taskId.
-	auto r1 = s.handle(modernReq(1, "tools/call", Json([
-		"name": Json("escalate"),
-		"arguments": Json.emptyObject
-	]))).get["result"];
+	auto r1 = s.handle(modernReqElicit(1, "tools/call",
+			Json(["name": Json("escalate"), "arguments": Json.emptyObject]))).get["result"];
 	assert(r1["resultType"].get!string == "input_required");
 	assert("taskId" !in r1);
 	// Round 2: the answer echoed back escalates to a task carrying no requestState.
@@ -6832,7 +9314,7 @@ unittest  // startTask lets an MRTR tool gather input and then escalate to a tas
 			])
 		])
 	]);
-	auto r2 = s.handle(modernReq(2, "tools/call", p2)).get["result"];
+	auto r2 = s.handle(modernReqElicit(2, "tools/call", p2)).get["result"];
 	assert(r2["resultType"].get!string == "task");
 	assert("requestState" !in r2);
 	const id = r2["taskId"].get!string;
@@ -6841,12 +9323,201 @@ unittest  // startTask lets an MRTR tool gather input and then escalate to a tas
 	assert(got["result"]["content"][0]["text"].get!string == "Hello, Alice");
 }
 
+unittest  // startTask with an unregistered executor fails as a masked tool error, not a protocol error
+{
+	import std.algorithm.searching : canFind;
+
+	auto s = new McpServer("t", "1");
+	s.enableTasks(syncTasks());
+	Tool desc = {name: "go"};
+	s.registerTool(desc, (Json args, RequestContext ctx) @safe {
+		return s.startTask("missing_executor", Json.emptyObject, ctx);
+	});
+	auto resp = s.handle(modernReq(1, "tools/call", Json(["name": Json("go")]))).get;
+	assert("error" !in resp, "a server-author mistake must not surface as a JSON-RPC error");
+	assert(resp["result"]["isError"].get!bool);
+	assert(!resp.toString().canFind("missing_executor"));
+}
+
+unittest  // startTask before enableTasks fails as a masked tool error, not a protocol error
+{
+	auto s = new McpServer("t", "1");
+	Tool desc = {name: "go"};
+	s.registerTool(desc, (Json args, RequestContext ctx) @safe {
+		return s.startTask("x", Json.emptyObject, ctx);
+	});
+	auto resp = s.handle(modernReq(1, "tools/call", Json(["name": Json("go")]))).get;
+	assert("error" !in resp);
+	assert(resp["result"]["content"][0]["text"].get!string == "Internal error");
+}
+
+version (unittest) private McpServer makeEscalatingServer(TaskSupport support) @safe
+{
+	import mcp.protocol.mrtr : InputRequest;
+
+	auto s = new McpServer("t", "1");
+	s.enableTasks(syncTasks());
+	s.registerTaskExecutor("greet", (TaskContext tc) @safe {
+		const name = tc.inputJson()["user_name"].get!string;
+		return Json([
+			"content": Json([
+				Json(["type": Json("text"), "text": Json("Hello, " ~ name)])
+			])
+		]);
+	});
+	Tool desc;
+	desc.name = "escalate";
+	desc.inputSchema = Json(["type": Json("object")]);
+	s.registerTool(desc, (Json args, RequestContext ctx) @safe {
+		auto answers = ctx.inputResponses();
+		if (ctx.usesInputRequired && "user_name" !in answers)
+			return ToolResponse.inputRequired([
+			InputRequest.elicitation("user_name", "What is your name?")
+		], "round-1");
+		Json input = Json.emptyObject;
+		input["user_name"] = ctx.usesInputRequired
+			? answers["user_name"]["content"]["name"] : Json("Bob");
+		return s.startTask("greet", input, ctx);
+	});
+	if (support != TaskSupport.none)
+		s.setToolTaskSupport("escalate", support);
+	return s;
+}
+
+version (unittest) private size_t storedTaskCount(McpServer s) @safe
+{
+	size_t n;
+	s.taskRuntime_.store.removeIf((const TaskRecord) @safe { n++; return false; });
+	return n;
+}
+
+unittest  // an optional task tool with its own handler keeps its MRTR rounds for a client without the extension
+{
+	auto s = makeEscalatingServer(TaskSupport.optional);
+	auto r1 = s.handle(modernReqNoTasks(1, "tools/call",
+			Json(["name": Json("escalate"), "arguments": Json.emptyObject]))).get;
+	assert(r1["result"]["resultType"].get!string == "input_required");
+	Json p2 = Json([
+		"name": Json("escalate"),
+		"arguments": Json.emptyObject,
+		"requestState": Json("round-1"),
+		"inputResponses": Json([
+			"user_name": Json([
+				"action": Json("accept"),
+				"content": Json(["name": Json("Alice")])
+			])
+		])
+	]);
+	auto r2 = s.handle(modernReqNoTasks(2, "tools/call", p2)).get;
+	assert("error" !in r2);
+	assert("taskId" !in r2["result"]);
+	assert(r2["result"]["content"][0]["text"].get!string == "Hello, Alice");
+	assert(storedTaskCount(s) == 0);
+}
+
+unittest  // startTask for a 2025-era client runs inline and leaves no orphaned task
+{
+	auto s = makeEscalatingServer(TaskSupport.none);
+	auto r = s.handle(req(1, "tools/call", Json([
+		"name": Json("escalate"),
+		"arguments": Json.emptyObject
+	]))).get;
+	assert("error" !in r);
+	assert(r["result"]["content"][0]["text"].get!string == "Hello, Bob");
+	assert(storedTaskCount(s) == 0);
+}
+
+version (unittest) private Message legacyInitDeclaringTasks() @safe
+{
+	return req(0, "initialize", Json([
+		"protocolVersion": Json("2025-11-25"),
+		"capabilities": Json([
+			"extensions": Json([tasksExtensionKey: Json.emptyObject])
+		]),
+		"clientInfo": Json(["name": Json("c"), "version": Json("1")])
+	]));
+}
+
+unittest  // a 2025-era request never exposes MRTR inputResponses or requestState
+{
+	auto s = new McpServer("t", "1");
+	size_t seenResponses = size_t.max;
+	string seenState = "unset";
+	Tool desc;
+	desc.name = "peek";
+	s.registerTool(desc, (Json args, RequestContext ctx) @safe {
+		seenResponses = ctx.inputResponses().length;
+		seenState = ctx.requestState();
+		return ToolResponse.complete(CallToolResult.init);
+	});
+	auto r = s.handle(req(1, "tools/call", Json([
+		"name": Json("peek"),
+		"arguments": Json.emptyObject,
+		"requestState": Json("forged"),
+		"inputResponses": Json(["q": Json(["action": Json("accept")])])
+	]))).get;
+	assert("error" !in r);
+	assert(seenResponses == 0);
+	assert(seenState == "");
+}
+
+unittest  // startTask runs inline for a 2025-era client even when it declares the tasks extension
+{
+	auto s = makeEscalatingServer(TaskSupport.optional);
+	assert("error" !in s.handle(legacyInitDeclaringTasks()).get);
+	auto r = s.handle(req(1, "tools/call", Json([
+		"name": Json("escalate"),
+		"arguments": Json.emptyObject
+	]))).get;
+	assert("error" !in r);
+	assert("taskId" !in r["result"]);
+	assert(r["result"]["content"][0]["text"].get!string == "Hello, Bob");
+	assert(storedTaskCount(s) == 0);
+}
+
+unittest  // a task-required tool rejects a 2025-era client even when it declares the tasks extension
+{
+	auto s = makeEscalatingServer(TaskSupport.required);
+	assert("error" !in s.handle(legacyInitDeclaringTasks()).get);
+	auto r = s.handle(req(1, "tools/call", Json([
+		"name": Json("escalate"),
+		"arguments": Json.emptyObject
+	]))).get;
+	assert(r["error"]["code"].get!int == cast(int) ErrorCode.missingRequiredClientCapability);
+	assert(storedTaskCount(s) == 0);
+}
+
+unittest  // registerTaskTool with a clashing name leaves the existing executor in place
+{
+	import std.exception : assertThrown;
+
+	auto s = new McpServer("t", "1");
+	s.enableTasks(syncTasks());
+	Tool desc;
+	desc.name = "dup";
+	s.registerTaskTool(desc,
+			(TaskContext tc) @safe => Json([
+				"content": Json([
+					Json(["type": Json("text"), "text": Json("first")])
+				])
+	]));
+	assertThrown(s.registerTaskTool(desc,
+			(TaskContext tc) @safe => Json([
+				"content": Json([
+					Json(["type": Json("text"), "text": Json("second")])
+				])
+	])));
+	auto r = s.handle(modernReqNoTasks(1, "tools/call",
+			Json(["name": Json("dup"), "arguments": Json.emptyObject]))).get;
+	assert(r["result"]["content"][0]["text"].get!string == "first");
+}
+
 unittest  // registerTaskTool: a mid-task input_required resumes on tasks/update
 {
 	import mcp.protocol.mrtr : InputRequest;
 
 	auto s = new McpServer("t", "1");
-	s.enableTasks(null, TaskOptions.init, new SyncTaskDispatcher());
+	s.enableTasks(syncTasks());
 	Tool desc;
 	desc.name = "gate";
 	desc.inputSchema = Json(["type": Json("object")]);
@@ -7014,6 +9685,104 @@ unittest  // stateful (2025-era) prompts/get gates on negotiated session capabil
 	Json p = Json(["name": Json("greet")]);
 	auto resp = s.handle(req(2, "prompts/get", p)).get;
 	assert(resp["error"]["code"].get!long == -32021);
+}
+
+unittest  // duplicate resource, template and prompt registrations name their remover
+{
+	import std.algorithm : canFind;
+
+	auto s = new McpServer("t", "1");
+	registerStubResources(s, "test://r");
+	ResourceTemplate t = {uriTemplate: "test://{x}", name: "t"};
+	s.registerResourceTemplate(t, (string uri, string[string] p) @safe => ResourceContents.init);
+	Prompt pr = {name: "p"};
+	s.registerPrompt(pr, (Json) @safe => GetPromptResult());
+
+	string msgOf(void delegate() @safe dg) @safe
+	{
+		try
+			dg();
+		catch (Exception e)
+			return e.msg;
+		return "";
+	}
+
+	assert(msgOf(() => registerStubResources(s, "test://r")).canFind("call removeResource first"));
+	assert(msgOf(() => s.registerResourceTemplate(t, (string uri,
+			string[string] p) @safe => ResourceContents.init)).canFind(
+			"call removeResourceTemplate first"));
+	assert(msgOf(() => s.registerPrompt(pr, (Json) @safe => GetPromptResult()))
+			.canFind("call removePrompt first"));
+}
+
+unittest  // tools/call rejects non-object arguments with -32602 before the handler runs
+{
+	auto s = makeTestServer();
+	bool ran;
+	Tool t = {name: "probe"};
+	s.registerTool(t, (Json args) @safe { ran = true; return CallToolResult.init; });
+	foreach (bad; [Json(null), Json("x"), Json([Json(1)])])
+	{
+		auto resp = s.handle(req(1, "tools/call", Json([
+			"name": Json("probe"),
+			"arguments": bad
+		]))).get;
+		assert(resp["error"]["code"].get!int == cast(int) ErrorCode.invalidParams);
+	}
+	assert(!ran);
+}
+
+unittest  // prompts/get rejects non-object arguments with -32602 before the handler runs
+{
+	import std.algorithm : canFind;
+
+	auto s = new McpServer("t", "1");
+	bool ran;
+	Prompt pr = {name: "greet"};
+	s.registerPrompt(pr, (Json) @safe { ran = true; return GetPromptResult(); });
+	foreach (bad; [Json(null), Json("x"), Json([Json(1)])])
+	{
+		auto resp = s.handle(req(1, "prompts/get", Json([
+			"name": Json("greet"),
+			"arguments": bad
+		]))).get;
+		assert(resp["error"]["code"].get!int == cast(int) ErrorCode.invalidParams);
+		assert(!resp["error"]["message"].get!string.canFind("Missing required argument"));
+	}
+	assert(!ran);
+}
+
+unittest  // an unexpected handler exception reaches the client as a generic internal error
+{
+	import std.algorithm : canFind;
+
+	auto s = new McpServer("t", "1");
+	Resource r = {uri: "test://boom", name: "boom"};
+	s.registerResource(r, () @safe {
+		throw new Exception("open /srv/secret.db failed");
+		return ResourceContents.init;
+	});
+	auto resp = s.handle(req(1, "resources/read", Json([
+		"uri": Json("test://boom")
+	]))).get;
+	assert(resp["error"]["code"].get!int == cast(int) ErrorCode.internalError);
+	assert(resp["error"]["message"].get!string == "Internal error");
+	assert(!resp.toString().canFind("secret"));
+}
+
+unittest  // exposeInternalErrors sends an unexpected exception's message to the client
+{
+	auto s = new McpServer("t", "1");
+	s.exposeInternalErrors();
+	Resource r = {uri: "test://boom", name: "boom"};
+	s.registerResource(r, () @safe {
+		throw new Exception("disk full");
+		return ResourceContents.init;
+	});
+	auto resp = s.handle(req(1, "resources/read", Json([
+		"uri": Json("test://boom")
+	]))).get;
+	assert(resp["error"]["message"].get!string == "disk full");
 }
 
 unittest  // modern resources/read rejects with -32021 when a required client cap is undeclared
@@ -7325,7 +10094,8 @@ unittest  // a modern request with no _meta at all names both required keys
 	auto conn = new ConnectionState;
 	conn.negotiated = ProtocolVersion.v2026_07_28;
 	auto resp = parseJsonString(s.handleRaw(
-			`{"jsonrpc":"2.0","id":1,"method":"server/discover","params":{}}`, conn));
+			`{"jsonrpc":"2.0","id":1,"method":"server/discover","params":{}}`,
+			conn, "", TokenInfo.invalid()));
 	assert(resp["error"]["code"].get!int == cast(int) ErrorCode.invalidParams);
 	auto missing = resp["error"]["data"]["missingMeta"];
 	assert(missing.length == 2);
@@ -7342,7 +10112,8 @@ unittest  // a modern request whose _meta lacks only protocolVersion is -32602, 
 	auto conn = new ConnectionState;
 	conn.negotiated = ProtocolVersion.v2026_07_28;
 	auto resp = parseJsonString(s.handleRaw(`{"jsonrpc":"2.0","id":1,"method":"server/discover",`
-			~ `"params":{"_meta":{"io.modelcontextprotocol/clientCapabilities":{}}}}`, conn));
+			~ `"params":{"_meta":{"io.modelcontextprotocol/clientCapabilities":{}}}}`,
+			conn, "", TokenInfo.invalid()));
 	assert(resp["error"]["code"].get!int == cast(int) ErrorCode.invalidParams);
 	assert(resp["error"]["data"]["missingMeta"].length == 1);
 	assert(resp["error"]["data"]["missingMeta"][0].get!string == MetaKey.protocolVersion);
@@ -7356,9 +10127,8 @@ unittest  // a modern notification is exempt from the required-_meta check
 	auto conn = new ConnectionState;
 	conn.negotiated = ProtocolVersion.v2026_07_28;
 	// Notifications get no reply at all; the check must not turn one into an error.
-	const outText = s.handleRaw(
-			`{"jsonrpc":"2.0","method":"notifications/cancelled",` ~ `"params":{"requestId":7}}`,
-			conn);
+	const outText = s.handleRaw(`{"jsonrpc":"2.0","method":"notifications/cancelled",`
+			~ `"params":{"requestId":7}}`, conn, "", TokenInfo.invalid());
 	assert(outText.length == 0);
 }
 
@@ -7493,14 +10263,177 @@ unittest  // modern: a raw CallToolResult carrying inputRequests is stamped "inp
 		];
 		return r;
 	});
-	Json p = Json(["name": Json("raw"), "arguments": Json.emptyObject]);
-	auto resp = s.handle(modernReq(1, "tools/call", p)).get;
+	auto resp = s.handle(modernCall(1, "raw", [])).get;
 	assert("error" !in resp);
 	// The modern base Result discriminator MUST be "input_required" for an
 	// InputRequiredResult-shaped body, not the default "complete".
 	assert(resp["result"]["resultType"].get!string == "input_required");
 	assert("inputRequests" in resp["result"]);
 	assert("content" !in resp["result"]);
+}
+
+unittest  // modern: a raw CallToolResult's inputRequests are filtered against the client's capabilities
+{
+	import mcp.protocol.mrtr : InputRequest;
+
+	auto s = new McpServer("t", "1");
+	Tool t = {name: "raw"};
+	s.registerTool(t, (Json args) @safe {
+		CallToolResult r;
+		r.inputRequests = [
+			InputRequest("date", "elicitation", Json(["message": Json("When?")]))
+		];
+		return r;
+	});
+	// modernReq declares no elicitation capability, so the only request is
+	// unfulfillable and the call fails naming the missing capability.
+	Json p = Json(["name": Json("raw"), "arguments": Json.emptyObject]);
+	auto resp = s.handle(modernReq(1, "tools/call", p)).get;
+	assert("error" in resp);
+	assert(resp["error"]["code"].get!int == ErrorCode.missingRequiredClientCapability);
+}
+
+version (unittest) private Message modernReqWithCaps(long id, string method, Json params, Json caps) @safe
+{
+	Json meta = Json.emptyObject;
+	meta[MetaKey.protocolVersion] = "2026-07-28";
+	meta[MetaKey.clientCapabilities] = caps;
+	params["_meta"] = meta;
+	return Message(makeRequest(Json(id), method, params));
+}
+
+unittest  // modern: an MRTR sampling request with includeContext needs sampling.context
+{
+	import mcp.protocol.mrtr : InputRequest;
+
+	auto s = new McpServer("t", "1");
+	Tool t = {name: "raw"};
+	s.registerTool(t, (Json args) @safe {
+		CallToolResult r;
+		r.inputRequests = [
+			InputRequest("ask", "sampling", Json([
+				"messages": Json.emptyArray,
+				"maxTokens": Json(10),
+				"includeContext": Json("thisServer")
+			]))
+		];
+		return r;
+	});
+	Json p = Json(["name": Json("raw"), "arguments": Json.emptyObject]);
+	auto resp = s.handle(modernReqWithCaps(1, "tools/call", p,
+			Json(["sampling": Json.emptyObject]))).get;
+	assert(resp["error"]["code"].get!int == ErrorCode.missingRequiredClientCapability);
+	auto need = resp["error"]["data"]["requiredCapabilities"];
+	assert("context" in need["sampling"]);
+
+	auto ok = s.handle(modernReqWithCaps(2, "tools/call", p,
+			Json(["sampling": Json(["context": Json.emptyObject])]))).get;
+	assert("error" !in ok);
+}
+
+unittest  // modern: a dropped form elicitation reports form elicitation as required
+{
+	import mcp.protocol.mrtr : InputRequest;
+
+	auto s = new McpServer("t", "1");
+	Tool t = {name: "raw"};
+	s.registerTool(t, (Json args) @safe {
+		CallToolResult r;
+		r.inputRequests = [
+			InputRequest("date", "elicitation", Json(["message": Json("When?")]))
+		];
+		return r;
+	});
+	Json p = Json(["name": Json("raw"), "arguments": Json.emptyObject]);
+	auto resp = s.handle(modernReqWithCaps(1, "tools/call", p,
+			Json(["elicitation": Json(["url": Json.emptyObject])]))).get;
+	assert(resp["error"]["code"].get!int == ErrorCode.missingRequiredClientCapability);
+	// Form-only elicitation serializes as the bare `elicitation: {}` form.
+	auto elicit = resp["error"]["data"]["requiredCapabilities"]["elicitation"];
+	assert(elicit.type == Json.Type.object && "url" !in elicit);
+}
+
+unittest  // modern: a raw CallToolResult carrying a task handle bypasses output-schema validation
+{
+	import mcp.protocol.tasks : Task;
+
+	auto s = new McpServer("t", "1");
+	s.enableOutputSchemaValidation();
+	Tool t = {name: "raw"};
+	t.outputSchema = Json(["type": Json("object")]);
+	s.registerTool(t, (Json args) @safe {
+		CallToolResult r;
+		r.task = Task("task-1");
+		r.task.createdAt = "2026-01-01T00:00:00Z";
+		r.task.lastUpdatedAt = "2026-01-01T00:00:00Z";
+		return r;
+	});
+	Json p = Json(["name": Json("raw"), "arguments": Json.emptyObject]);
+	auto resp = s.handle(modernReq(1, "tools/call", p)).get;
+	assert("error" !in resp);
+	assert(resp["result"]["resultType"].get!string == "task");
+	assert(resp["result"]["taskId"].get!string == "task-1");
+}
+
+unittest  // modern: a requestState-only input-required result bypasses output-schema validation
+{
+	auto s = new McpServer("t", "1");
+	s.enableOutputSchemaValidation();
+	Tool t = {name: "raw"};
+	t.outputSchema = Json(["type": Json("object")]);
+	s.registerTool(t, (Json args) @safe {
+		CallToolResult r;
+		r.requestState = "resume-here";
+		return r;
+	});
+	Json p = Json(["name": Json("raw"), "arguments": Json.emptyObject]);
+	auto resp = s.handle(modernReq(1, "tools/call", p)).get;
+	assert("error" !in resp);
+	assert(resp["result"]["resultType"].get!string == "input_required");
+	assert(resp["result"]["requestState"].get!string == "resume-here");
+}
+
+unittest  // a direct resource reader can receive the per-request RequestContext
+{
+	auto s = new McpServer("t", "1");
+	Resource r = {uri: "s://ctx", name: "ctx"};
+	s.registerResource(r, (RequestContext ctx) @safe => ResourceContents.makeText("s://ctx",
+			"text/plain", ctx.usesInputRequired ? "stateless" : "session"));
+	auto res = s.handle(modernReq(1, "resources/read", Json([
+		"uri": Json("s://ctx")
+	]))).get;
+	assert(res["result"]["contents"][0]["text"].get!string == "stateless");
+}
+
+unittest  // a prompt handler returning a final result can receive the per-request RequestContext
+{
+	auto s = new McpServer("t", "1");
+	Prompt p = {name: "greet"};
+	s.registerPrompt(p, (Json args, RequestContext ctx) @safe {
+		GetPromptResult g;
+		g.messages = [
+			PromptMessage("user", Content.makeText(ctx.usesInputRequired ? "stateless" : "session"))
+		];
+		return g;
+	});
+	auto res = s.handle(modernReq(1, "prompts/get", Json(["name": Json("greet")]))).get;
+	assert(res["result"]["messages"][0]["content"]["text"].get!string == "stateless");
+}
+
+unittest  // resources/directory/read reports a URI that is both a file and a subdirectory once
+{
+	auto s = new McpServer("t", "1");
+	s.enableDirectoryRead();
+	foreach (u; ["s://d/a", "s://d/a/b", "s://d/c"])
+	{
+		Resource r = {uri: u, name: u};
+		s.registerResource(r, () @safe => ResourceContents.makeText(u, "text/plain", "x"));
+	}
+	auto res = s.handle(modernReq(1, "resources/directory/read",
+			Json(["uri": Json("s://d")]))).get["result"]["resources"];
+	assert(res.length == 2);
+	assert(res[0]["uri"].get!string == "s://d/a");
+	assert(res[1]["uri"].get!string == "s://d/c");
 }
 
 unittest  // modern resources/read unknown uri uses invalidParams (-32602)
@@ -7516,12 +10449,11 @@ unittest  // modern resources/read unknown uri uses invalidParams (-32602)
 
 unittest  // subscriptions/listen reads the spec-shaped filter nested under params.notifications
 {
-	// resourceSubscriptions opt-in requires a stateful server.
-	auto s = makeStatefulTestServer();
+	auto s = makeTestServer();
+	registerStubResources(s, "test://stub");
 	// The server must support the requested notification types for them to be
 	// recorded/acknowledged (2026-07-28 basic/utilities/subscriptions Acknowledgment).
 	s.enableToolsListChanged();
-	s.enableResourceSubscriptions();
 	Json filter = Json.emptyObject;
 	filter["toolsListChanged"] = true;
 	filter["resourceSubscriptions"] = Json([Json("file:///project/config.json")]);
@@ -7532,19 +10464,63 @@ unittest  // subscriptions/listen reads the spec-shaped filter nested under para
 	assert(f.toolsListChanged);
 	assert(f.resourceSubscriptions);
 	assert(!f.promptsListChanged);
-	// resourceSubscriptions URIs are tracked as per-URI subscriptions.
-	assert(s.isSubscribed("file:///project/config.json"));
+	// The stream's own filter carries the URIs; the connection's
+	// resources/subscribe set is left alone.
+	assert(f.resourceUris == ["file:///project/config.json"]);
+	assert(s.activeConnection.subscriptions.length == 0);
+}
+
+unittest  // a stdio subscriptions/listen leaves the connection's resources/subscribe set alone
+{
+	auto s = makeTestServer();
+	registerStubResources(s, "test://stub");
+	void sink(string line) @safe
+	{
+	}
+
+	Json meta = Json.emptyObject;
+	meta[MetaKey.protocolVersion] = "2026-07-28";
+	meta[MetaKey.clientCapabilities] = Json.emptyObject;
+	Json params = Json.emptyObject;
+	params["notifications"] = Json([
+		"resourceSubscriptions": Json([Json("test://stub")])
+	]);
+	params["_meta"] = meta;
+	assert(s.tryServeStdioListen(Message(makeRequest(Json(3),
+			"subscriptions/listen", params)), &sink));
+	assert(s.activeConnection.subscriptions.length == 0);
+	assert(s.notifyResourceUpdated("test://stub") == 1);
+}
+
+unittest  // a modern stateless server with resources advertises resources.subscribe on discover
+{
+	auto s = makeTestServer();
+	registerStubResources(s, "test://w");
+	auto resp = s.handle(modernReq(1, "server/discover")).get;
+	assert(resp["result"]["capabilities"]["resources"]["subscribe"].get!bool);
+}
+
+unittest  // a server without resources neither advertises subscribe nor acks resourceSubscriptions
+{
+	auto s = makeTestServer();
+	auto resp = s.handle(modernReq(1, "server/discover")).get;
+	assert("resources" !in resp["result"]["capabilities"]);
+	Json p = Json.emptyObject;
+	p["notifications"] = Json([
+		"resourceSubscriptions": Json([Json("file:///a")])
+	]);
+	s.handle(modernReq(2, "subscriptions/listen", p));
+	assert(!s.cs().listenFilter.resourceSubscriptions);
 }
 
 unittest  // subscriptions/listen accepts the flat (top-level) filter shape
 {
-	// resourceSubscriptions opt-in requires a stateful server.
-	auto s = makeStatefulTestServer();
+	auto s = makeTestServer();
+	registerStubResources(s, "test://stub");
 	s.enableToolsListChanged();
-	s.enableResourceSubscriptions();
 	Json p = Json.emptyObject;
 	p["toolsListChanged"] = true;
-	p["resourceSubscriptions"] = true;
+	p["resourceSubscriptions"] = Json([Json("file:///a")]);
 	s.handle(modernReq(4, "subscriptions/listen", p)).get;
 	auto f = s.cs().listenFilter;
 	assert(f.toolsListChanged);
@@ -7552,9 +10528,26 @@ unittest  // subscriptions/listen accepts the flat (top-level) filter shape
 	assert(!f.promptsListChanged);
 }
 
+unittest  // subscriptions/listen ignores a non-array resourceSubscriptions
+{
+	auto s = makeTestServer();
+	registerStubResources(s, "test://stub");
+	s.enableToolsListChanged();
+	Json p = Json.emptyObject;
+	p["toolsListChanged"] = true;
+	p["resourceSubscriptions"] = true;
+	s.handle(modernReq(4, "subscriptions/listen", p)).get;
+	auto f = s.cs().listenFilter;
+	assert(f.toolsListChanged);
+	assert(!f.resourceSubscriptions);
+	assert(f.accepts("notifications/resources/updated", "file:///a") == false);
+	assert("resourceSubscriptions" !in s.acknowledgedSubsetFor(f));
+}
+
 unittest  // subscriptions/listen with an empty resourceSubscriptions array does not opt in
 {
 	auto s = makeTestServer();
+	registerStubResources(s, "test://stub");
 	Json filter = Json.emptyObject;
 	filter["resourceSubscriptions"] = Json.emptyArray;
 	Json p = Json.emptyObject;
@@ -7565,10 +10558,9 @@ unittest  // subscriptions/listen with an empty resourceSubscriptions array does
 
 unittest  // the per-stream ack reflects exactly the opted-in change types
 {
-	// resourceSubscriptions opt-in requires a stateful server.
-	auto s = makeStatefulTestServer();
+	auto s = makeTestServer();
+	registerStubResources(s, "test://stub");
 	s.enableToolsListChanged();
-	s.enableResourceSubscriptions();
 	// Nothing opted in yet -> empty object.
 	assert(s.acknowledgedSubsetFor(s.cs().listenFilter).type == Json.Type.object);
 	assert(s.acknowledgedSubsetFor(s.cs().listenFilter).length == 0);
@@ -7591,11 +10583,67 @@ unittest  // the per-stream ack reflects exactly the opted-in change types
 	assert("promptsListChanged" !in subset);
 }
 
+unittest  // subscriptions/listen rejects more resourceSubscriptions URIs than the per-connection cap
+{
+	import std.conv : to;
+
+	auto s = makeTestServer();
+	registerStubResources(s, "test://stub");
+	Json uris = Json.emptyArray;
+	foreach (i; 0 .. maxResourceSubscriptions + 1)
+		uris ~= Json("file:///" ~ i.to!string);
+	Json filter = Json.emptyObject;
+	filter["resourceSubscriptions"] = uris;
+	Json p = Json.emptyObject;
+	p["notifications"] = filter;
+	auto resp = s.handle(modernReq(1, "subscriptions/listen", p)).get;
+	assert(resp["error"]["code"].get!int == ErrorCode.invalidParams);
+	assert(s.activeConnection.subscriptions.length == 0);
+}
+
+unittest  // subscriptions/listen deduplicates repeated URIs
+{
+	auto s = makeTestServer();
+	registerStubResources(s, "test://stub");
+	Json uris = Json.emptyArray;
+	foreach (i; 0 .. maxResourceSubscriptions * 4)
+		uris ~= Json(i % 2 ? "file:///a" : "file:///b");
+	Json filter = Json.emptyObject;
+	filter["resourceSubscriptions"] = uris;
+	Json p = Json.emptyObject;
+	p["notifications"] = filter;
+	s.handle(modernReq(1, "subscriptions/listen", p)).get;
+	assert(s.cs().listenFilter.resourceUris == ["file:///b", "file:///a"]);
+}
+
+unittest  // stdio subscriptions/listen over the URI cap answers an error instead of opening
+{
+	import std.algorithm : canFind;
+	import std.conv : to;
+
+	auto s = new McpServer("t", "1");
+	registerStubResources(s, "test://stub");
+	Json uris = Json.emptyArray;
+	foreach (i; 0 .. maxResourceSubscriptions + 1)
+		uris ~= Json("note:///" ~ i.to!string);
+	Json na = Json.emptyObject;
+	na["resourceSubscriptions"] = uris;
+	Json p = Json.emptyObject;
+	p["notifications"] = na;
+	string[] sink;
+	assert(s.tryServeStdioListen(modernReq(1, "subscriptions/listen", p), (string line) @safe {
+			sink ~= line;
+		}));
+	assert(sink.length == 1);
+	assert(sink[0].canFind("-32602"));
+	assert(s.notifyResourceUpdated("note:///0") == 0);
+	assert(s.activeConnection.subscriptions.length == 0);
+}
+
 unittest  // ack echoes every opted-in resourceSubscriptions URI in request order
 {
-	// resourceSubscriptions opt-in requires a stateful server.
-	auto s = makeStatefulTestServer();
-	s.enableResourceSubscriptions();
+	auto s = makeTestServer();
+	registerStubResources(s, "test://stub");
 	Json filter = Json.emptyObject;
 	filter["resourceSubscriptions"] = Json([
 		Json("file:///a.txt"), Json("file:///b.txt")
@@ -7654,17 +10702,15 @@ unittest  // acknowledgedSubsetFor of an empty filter is an empty object
 
 unittest  // per-stream ack does not leak a concurrent stream's opt-in
 {
-	// Regression for the cross-subscription leak: one shared McpServer handles two
-	// concurrent subscriptions/listen requests. Stream A opts into toolsListChanged
+	// One shared McpServer handles two concurrent subscriptions/listen requests. Stream A opts into toolsListChanged
 	// only; stream B opts into resourceSubscriptions only. Per modern §Multiple
 	// Concurrent Subscriptions each subscription is independent, so B's ack must NOT
-	// report toolsListChanged (and A's must NOT report resourceSubscriptions). The
-	// fix builds each ack from the per-stream filter the transport captured right
-	// after routing that listen request — never the server-wide accumulator.
-	// resourceSubscriptions opt-in requires a stateful server.
-	auto s = makeStatefulTestServer();
+	// report toolsListChanged (and A's must NOT report resourceSubscriptions): each
+	// ack is built from the per-stream filter the transport captured right after
+	// routing that listen request, never a server-wide accumulator.
+	auto s = makeTestServer();
+	registerStubResources(s, "test://stub");
 	s.enableToolsListChanged();
-	s.enableResourceSubscriptions();
 
 	Json fa = Json.emptyObject;
 	fa["toolsListChanged"] = true;
@@ -7754,29 +10800,13 @@ unittest  // subscriptions/listen ack omits resourcesListChanged when unsupporte
 	assert("resourcesListChanged" !in s.acknowledgedSubsetFor(s.cs().listenFilter));
 }
 
-unittest  // subscriptions/listen ack omits resourceSubscriptions when subscriptions disabled
-{
-	// On a stateful server that never opted into resource subscriptions, the listen
-	// gate (resourceSubscriptionsEnabled) is closed, so the agreed subset omits the
-	// URIs. (On a stateless/modern server the listen filter itself is the opt-in, so
-	// that case is covered separately.)
-	auto s = McpServer.stateful("t", "1");
-	Json filter = Json.emptyObject;
-	filter["resourceSubscriptions"] = Json([Json("file:///x")]);
-	Json p = Json.emptyObject;
-	p["notifications"] = filter;
-	s.handle(modernReq(4, "subscriptions/listen", p));
-	assert(!s.cs().listenFilter.resourceSubscriptions);
-	assert("resourceSubscriptions" !in s.acknowledgedSubsetFor(s.cs().listenFilter));
-	assert(!s.isSubscribed("file:///x"));
-}
-
 unittest  // a stateless/modern server honours a subscriptions/listen resourceSubscriptions filter
 {
 	// The modern `subscriptions/listen` filter is the client's own resource-update
 	// opt-in; a modern (2026-07-28) server honours it without (and cannot use)
 	// `enableResourceSubscriptions()`.
 	auto s = McpServer.stateless("t", "1");
+	registerStubResources(s, "test://stub");
 	Json filter = Json.emptyObject;
 	filter["resourceSubscriptions"] = Json([Json("file:///x")]);
 	Json p = Json.emptyObject;
@@ -7786,19 +10816,54 @@ unittest  // a stateless/modern server honours a subscriptions/listen resourceSu
 	assert(s.acknowledgedSubsetFor(s.cs().listenFilter)["resourceSubscriptions"].length == 1);
 }
 
-unittest  // subscriptions/listen ack keeps resourceSubscriptions once enabled
+unittest  // a stateful server refuses a 2026-07-28 request with -32022 listing only legacy versions
 {
-	// resourceSubscriptions opt-in requires a stateful server.
+	auto s = McpServer.stateful("t", "1");
+	auto resp = s.handle(modernReq(1, "tools/list")).get;
+	assert(resp["error"]["code"].get!int == ErrorCode.unsupportedProtocolVersion);
+	foreach (v; resp["error"]["data"]["supported"].get!(Json[]))
+		assert(v.get!string != "2026-07-28", "a stateful server must not offer 2026-07-28");
+}
+
+unittest  // a stateful server refuses subscriptions/listen
+{
 	auto s = McpServer.stateful("t", "1");
 	s.enableResourceSubscriptions();
 	Json filter = Json.emptyObject;
 	filter["resourceSubscriptions"] = Json([Json("file:///x")]);
 	Json p = Json.emptyObject;
 	p["notifications"] = filter;
-	s.handle(modernReq(4, "subscriptions/listen", p));
-	assert(s.cs().listenFilter.resourceSubscriptions);
-	assert(s.acknowledgedSubsetFor(s.cs().listenFilter)["resourceSubscriptions"].length == 1);
-	assert(s.isSubscribed("file:///x"));
+	auto resp = s.handle(modernReq(4, "subscriptions/listen", p)).get;
+	assert(resp["error"]["code"].get!int == ErrorCode.unsupportedProtocolVersion);
+	assert(!s.cs().listenFilter.active);
+	assert("file:///x" !in s.activeConnection.subscriptions);
+}
+
+unittest  // a stateful stdio server refuses subscriptions/listen
+{
+	import vibe.data.json : parseJsonString;
+
+	auto s = McpServer.stateful("t", "1");
+	s.enableToolsListChanged();
+	string[] frames;
+	void sink(string line) @safe
+	{
+		frames ~= line;
+	}
+
+	Json meta = Json.emptyObject;
+	meta[MetaKey.protocolVersion] = "2026-07-28";
+	meta[MetaKey.clientCapabilities] = Json.emptyObject;
+	Json params = Json.emptyObject;
+	params["notifications"] = Json(["toolsListChanged": Json(true)]);
+	params["_meta"] = meta;
+	assert(s.tryServeStdioListen(Message(makeRequest(Json(1),
+			"subscriptions/listen", params)), &sink));
+	assert(frames.length == 1);
+	auto resp = parseJsonString(frames[0]);
+	assert(resp["error"]["code"].get!int == ErrorCode.unsupportedProtocolVersion);
+	assert(s.notifyToolsListChanged() == 0 && frames.length == 1,
+			"a refused listen must not receive notifications");
 }
 
 version (unittest)
@@ -7845,9 +10910,9 @@ unittest  // requests without a per-request version use the negotiated session v
 }
 
 // ---------------------------------------------------------------------------
-// MRTR (2026-07-28) tool handling: the handler branches on ctx.isStateless and either
-// returns ToolResponse.inputRequired(...) (stateless) or calls ctx.elicit()
-// (2025-era). No framework version-dispatch and no replay.
+// MRTR (2026-07-28) tool handling: the handler branches on ctx.usesInputRequired and either
+// returns ToolResponse.inputRequired(...) (MRTR) or calls ctx.elicit()
+// (2025-era, stateful server). No framework version-dispatch and no replay.
 // ---------------------------------------------------------------------------
 
 unittest  // ToolResponse.complete serializes to the tool result
@@ -7897,7 +10962,7 @@ version (unittest)
 	{
 		Tool book = {name: "book"};
 		s.registerTool(book, (Json args, RequestContext ctx) @safe {
-			if (ctx.isStateless)
+			if (ctx.usesInputRequired)
 			{
 				auto answers = ctx.inputResponses();
 				if ("date" !in answers)
@@ -8026,6 +11091,40 @@ unittest  // SEP-2322: a stateless server emits requestState and reads it back o
 	assert(retry["result"]["content"][0]["text"].get!string == "resumed:awaiting-date day:friday");
 }
 
+unittest  // secureRequestState rejects a ttl under one second
+{
+	import std.exception : assertThrown, assertNotThrown;
+	import core.time : msecs, seconds;
+
+	RequestStateSecurity sec;
+	sec.key = new ubyte[32];
+	sec.ttl = Duration.zero;
+	assertThrown(new McpServer("t", "1").secureRequestState(sec));
+	sec.ttl = -(1.seconds);
+	assertThrown(new McpServer("t", "1").secureRequestState(sec));
+	sec.ttl = 500.msecs;
+	assertThrown(new McpServer("t", "1").secureRequestState(sec));
+	sec.ttl = 1.seconds;
+	assertNotThrown(new McpServer("t", "1").secureRequestState(sec));
+}
+
+unittest  // secureRequestState throws on a stateful server, which never issues MRTR requestState
+{
+	import std.algorithm.searching : canFind;
+
+	RequestStateSecurity sec;
+	sec.key = new ubyte[32];
+	bool threw;
+	try
+		McpServer.stateful("t", "1").secureRequestState(sec);
+	catch (Exception e)
+	{
+		threw = true;
+		assert(e.msg.canFind("McpServer.stateless()"), e.msg);
+	}
+	assert(threw, "secureRequestState must throw on a stateful server");
+}
+
 version (unittest) private McpServer secureStatebookServer() @safe
 {
 	// A tool that round-trips its progress entirely through the opaque
@@ -8132,6 +11231,38 @@ unittest  // secureRequestState: a tampered echoed blob re-elicits instead of re
 	assert("date" in retry["result"]["inputRequests"]);
 }
 
+unittest  // secureRequestState: a rejected echoed blob also drops the round's inputResponses
+{
+	auto s = new McpServer("t", "1");
+	RequestStateSecurity sec;
+	sec.key = new ubyte[32];
+	sec.bindTo = RequestStateBinding.none;
+	s.secureRequestState(sec);
+	size_t seenResponses = size_t.max;
+	Tool probe = {name: "probe"};
+	s.registerTool(probe, (Json args, RequestContext ctx) @safe {
+		seenResponses = ctx.inputResponses().length;
+		CallToolResult r;
+		return ToolResponse.complete(r);
+	});
+
+	auto answer = InputResponse("date", Json([
+			"content": Json(["day": Json("friday")])
+	]));
+	Json meta = Json.emptyObject;
+	meta[MetaKey.protocolVersion] = "2026-07-28";
+	meta[MetaKey.clientInfo] = Json(["name": Json("c"), "version": Json("1")]);
+	meta[MetaKey.clientCapabilities] = Json.emptyObject;
+	Json params = Json.emptyObject;
+	params["name"] = "probe";
+	params["arguments"] = Json.emptyObject;
+	params["requestState"] = "v1.forged.blob";
+	params["inputResponses"] = inputResponsesToJson([answer]);
+	params["_meta"] = meta;
+	s.handle(Message(makeRequest(Json(25), "tools/call", params)));
+	assert(seenResponses == 0, "a fresh round must not see the rejected round's answers");
+}
+
 unittest  // no codec configured: outgoing requestState stays plaintext (wire unchanged)
 {
 	auto s = new McpServer("t", "1");
@@ -8152,8 +11283,8 @@ unittest  // a modern InputRequiredResult drops an elicitation request the clien
 	// The handler asks for elicitation, but this modern request's
 	// _meta.clientCapabilities omits elicitation. The server MUST NOT
 	// emit an inputRequest whose kind the client never declared. With no other
-	// request and no requestState, the result is a server-side error rather than
-	// an InputRequiredResult that the client could never fulfil.
+	// request left, the result is a -32021 error rather than an
+	// InputRequiredResult that the client could never fulfil.
 	auto s = new McpServer("t", "1");
 	Tool ask = {name: "ask"};
 	s.registerTool(ask, (Json args, RequestContext ctx) @safe {
@@ -8225,6 +11356,50 @@ unittest  // a mixed InputRequiredResult drops only the unsupported kinds
 			"the unsupported roots request must be dropped");
 }
 
+unittest  // dropping every inputRequest with requestState set yields -32021, not an empty round trip
+{
+	auto s = new McpServer("t", "1");
+	Tool ask = {name: "ask"};
+	s.registerTool(ask, (Json args, RequestContext ctx) @safe {
+		return ToolResponse.inputRequired([InputRequest.roots("r1")], "state-1");
+	});
+	Json p = Json(["name": Json("ask")]);
+	auto resp = s.handle(modernReq(73, "tools/call", p)).get;
+	assert("error" in resp, "an all-dropped InputRequiredResult must not reach the client");
+	assert(resp["error"]["code"].get!int == cast(int) ErrorCode.missingRequiredClientCapability);
+	assert("roots" in resp["error"]["data"]["requiredCapabilities"]);
+}
+
+unittest  // dropping every inputRequest without requestState yields -32021 naming the kinds
+{
+	auto s = new McpServer("t", "1");
+	Tool ask = {name: "ask"};
+	s.registerTool(ask, (Json args, RequestContext ctx) @safe {
+		return ToolResponse.inputRequired([
+			InputRequest.elicitation("q1", "Your name?")
+		]);
+	});
+	Json p = Json(["name": Json("ask")]);
+	auto resp = s.handle(modernReq(74, "tools/call", p)).get;
+	assert(resp["error"]["code"].get!int == cast(int) ErrorCode.missingRequiredClientCapability);
+	assert("elicitation" in resp["error"]["data"]["requiredCapabilities"]);
+	import std.algorithm.searching : canFind;
+
+	assert(resp["error"]["message"].get!string.canFind("elicitation"));
+}
+
+unittest  // prompts/get: dropping every inputRequest with requestState set yields -32021
+{
+	auto s = new McpServer("t", "1");
+	Prompt descriptor = {name: "p"};
+	s.registerPrompt(descriptor, (Json args, RequestContext ctx) @safe {
+		return PromptResponse.inputRequired([InputRequest.roots("r1")], "state-1");
+	});
+	Json p = Json(["name": Json("p")]);
+	auto resp = s.handle(modernReq(75, "prompts/get", p)).get;
+	assert(resp["error"]["code"].get!int == cast(int) ErrorCode.missingRequiredClientCapability);
+}
+
 unittest  // elicit() is rejected on a modern (2026-07-28) request
 {
 	auto s = new McpServer("t", "1");
@@ -8245,7 +11420,7 @@ unittest  // elicit() is rejected on a modern (2026-07-28) request
 
 unittest  // 2025-era request: ctx.elicit() blocks and the handler completes
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateful("t", "1");
 	registerBookTool(s);
 	Json p = Json.emptyObject;
 	auto resp = s.handle(req(4, "tools/call", buildName(p, "book")), new FakeCtx).get;
@@ -8418,14 +11593,12 @@ unittest  // notify delivers unsolicited notifications to GET-stream listeners
 
 	string[] received;
 	ch.addListener((string f) @safe { received ~= f; });
-	const n = s.notify("notifications/resources/updated", Json([
-		"uri": Json("test://x")
-	]));
+	const n = s.notify("notifications/example/changed", Json(["id": Json("x")]));
 	assert(n == 1);
 	assert(received.length == 1);
 	import std.algorithm : canFind;
 
-	assert(received[0].canFind("notifications/resources/updated"));
+	assert(received[0].canFind("notifications/example/changed"));
 }
 
 unittest  // notifyResourceUpdated emits resources/updated for a subscribed uri
@@ -8433,6 +11606,7 @@ unittest  // notifyResourceUpdated emits resources/updated for a subscribed uri
 	// resources/subscribe + notifyResourceUpdated require a stateful server.
 	auto s = McpServer.stateful("t", "1");
 	s.enableResourceSubscriptions();
+	registerStubResources(s, "test://w");
 	auto coord = new StreamCoordinator;
 	auto ch = ensurePushChannel(s, coord);
 	string[] received;
@@ -8467,6 +11641,21 @@ unittest  // notifyResourceUpdated is a no-op for a uri nobody subscribed to
 	assert(received.length == 0);
 }
 
+unittest  // notify(resources/updated) honours the subscription gate like notifyResourceUpdated
+{
+	auto s = McpServer.stateful("t", "1");
+	s.enableResourceSubscriptions();
+	auto coord = new StreamCoordinator;
+	auto ch = ensurePushChannel(s, coord);
+	string[] received;
+	ch.addListener((string f) @safe { received ~= f; });
+
+	Json p = Json.emptyObject;
+	p["uri"] = "test://never";
+	assert(s.notify("notifications/resources/updated", p) == 0);
+	assert(received.length == 0);
+}
+
 unittest  // notifyResourceUpdated emits params that are exactly { uri } (no non-spec title)
 {
 	import std.algorithm : canFind;
@@ -8474,6 +11663,7 @@ unittest  // notifyResourceUpdated emits params that are exactly { uri } (no non
 	// resources/subscribe + notifyResourceUpdated require a stateful server.
 	auto s = McpServer.stateful("t", "1");
 	s.enableResourceSubscriptions();
+	registerStubResources(s, "test://w");
 	auto coord = new StreamCoordinator;
 	auto ch = ensurePushChannel(s, coord);
 	string[] received;
@@ -8502,11 +11692,61 @@ unittest  // notifyResourceUpdated has no title overload (title is not a spec pa
 	static assert(!__traits(compiles, s.notifyResourceUpdated("test://w", nullable("X"))));
 }
 
+unittest  // notifyResourceUpdated reaches every listen stream subscribed to the uri
+{
+	import std.algorithm : canFind;
+
+	auto s = new McpServer("t", "1");
+	registerStubResources(s, "test://stub");
+	auto ch = ensurePushChannel(s, new StreamCoordinator);
+	string a, b, other;
+	ListenFilter f;
+	f.active = true;
+	f.resourceSubscriptions = true;
+	f.resourceUris = ["file:///x"];
+	ListenFilter g = f;
+	g.resourceUris = ["file:///y"];
+	ch.addListener((string fr) @safe { a = fr; }, Json("l-a"), f);
+	ch.addListener((string fr) @safe { b = fr; }, Json("l-b"), f);
+	ch.addListener((string fr) @safe { other = fr; }, Json("l-o"), g);
+
+	assert(s.notifyResourceUpdated("file:///x") == 2);
+	assert(a.canFind("file:///x"));
+	assert(b.canFind("file:///x"));
+	assert(other.length == 0);
+}
+
+unittest  // notifyResourceUpdated reaches every session subscribed to the uri
+{
+	import std.algorithm : canFind;
+
+	auto s = McpServer.stateful("t", "1");
+	auto ch = ensurePushChannel(s, new StreamCoordinator);
+	auto connA = new ConnectionState;
+	auto connB = new ConnectionState;
+	auto connC = new ConnectionState;
+	connA.subscriptions["file:///x"] = true;
+	connB.subscriptions["file:///x"] = true;
+	string a, b, c;
+	ch.addListener((string fr) @safe { a = fr; }, Json.init, ListenFilter.init,
+			"", s.sessionPushEligibility(connA), "sess-A");
+	ch.addListener((string fr) @safe { b = fr; }, Json.init, ListenFilter.init,
+			"", s.sessionPushEligibility(connB), "sess-B");
+	ch.addListener((string fr) @safe { c = fr; }, Json.init, ListenFilter.init,
+			"", s.sessionPushEligibility(connC), "sess-C");
+
+	assert(s.notifyResourceUpdated("file:///x") == 2);
+	assert(a.canFind("file:///x"));
+	assert(b.canFind("file:///x"));
+	assert(c.length == 0, "an unsubscribed session must not be notified");
+}
+
 unittest  // notifyResourceUpdated is a no-op before a push channel exists
 {
 	// resources/subscribe requires a stateful server.
 	auto s = McpServer.stateful("t", "1");
 	s.enableResourceSubscriptions();
+	registerStubResources(s, "test://w");
 	Json p = Json.emptyObject;
 	p["uri"] = "test://w";
 	s.handle(req(1, "resources/subscribe", p));
@@ -8521,7 +11761,7 @@ unittest  // notifyElicitationComplete emits notifications/elicitation/complete 
 	string[] received;
 	ch.addListener((string f) @safe { received ~= f; });
 
-	const n = s.notifyElicitationComplete("elic-123");
+	const n = s.notifyElicitationComplete("", "elic-123");
 	assert(n == 1);
 	import std.algorithm : canFind;
 
@@ -8534,30 +11774,195 @@ unittest  // notifyElicitationComplete emits notifications/elicitation/complete 
 unittest  // notifyElicitationComplete is a no-op before a push channel exists
 {
 	auto s = new McpServer("t", "1");
-	assert(s.notifyElicitationComplete("elic-1") == 0);
+	assert(s.notifyElicitationComplete("", "elic-1") == 0);
 }
 
-unittest  // notifyElicitationComplete is a no-op on a modern (modern) session
+unittest  // notifyElicitationComplete never reaches a modern subscriptions/listen stream
 {
-	// The modern removed `notifications/elicitation/complete`; even with an open
-	// push channel a modern session must emit nothing.
+	// 2026-07-28 removed `notifications/elicitation/complete`; a modern listen
+	// stream (an active filter) must not receive it.
 	auto s = new McpServer("t", "1");
-	s.activeConnection.negotiated = ProtocolVersion.v2026_07_28;
 	auto coord = new StreamCoordinator;
 	auto ch = ensurePushChannel(s, coord);
 	string[] received;
-	ch.addListener((string f) @safe { received ~= f; });
+	ListenFilter modern;
+	modern.active = true;
+	modern.toolsListChanged = true;
+	ch.addListener((string f) @safe { received ~= f; }, Json(1), modern);
 
-	assert(s.notifyElicitationComplete("elic-123") == 0);
+	assert(s.notifyElicitationComplete("", "elic-123") == 0);
 	assert(received.length == 0);
 }
 
-unittest  // notifyElicitationComplete rejects an empty elicitationId
+unittest  // notifyElicitationComplete never reaches a stdio subscriptions/listen stream
 {
-	import std.exception : assertThrown;
+	auto s = new McpServer("t", "1");
+	s.enableToolsListChanged();
+	string[] frames;
+	void sink(string line) @safe
+	{
+		frames ~= line;
+	}
+
+	Json meta = Json.emptyObject;
+	meta[MetaKey.protocolVersion] = "2026-07-28";
+	meta[MetaKey.clientCapabilities] = Json.emptyObject;
+	Json params = Json.emptyObject;
+	params["notifications"] = Json(["toolsListChanged": Json(true)]);
+	params["_meta"] = meta;
+	assert(s.tryServeStdioListen(Message(makeRequest(Json(1),
+			"subscriptions/listen", params)), &sink));
+	const before = frames.length;
+
+	assert(s.notifyElicitationComplete("", "elic-123") == 0);
+	assert(frames.length == before);
+}
+
+unittest  // notifyElicitationComplete rejects an empty elicitationId as API misuse, not a protocol error
+{
+	import std.exception : collectException;
 
 	auto s = new McpServer("t", "1");
-	assertThrown!McpException(s.notifyElicitationComplete(""));
+	auto e = collectException(s.notifyElicitationComplete("", ""));
+	assert(e !is null);
+	assert(cast(McpException) e is null);
+}
+
+unittest  // a stateful HTTP server rejects notifyElicitationComplete without a session id
+{
+	import std.exception : collectException;
+
+	auto s = McpServer.stateful("t", "1");
+	auto ch = ensurePushChannel(s, new StreamCoordinator);
+	string a;
+	ch.addListener((string f) @safe { a = f; }, Json(""), ListenFilter.init, "", null, "sess-A");
+	auto e = collectException(s.notifyElicitationComplete("", "elic-1"));
+	assert(e !is null && cast(McpException) e is null);
+	assert(a.length == 0, "an unnamed session must not reach some other session's stream");
+}
+
+unittest  // notifyElicitationComplete reaches only the session that received the elicitation
+{
+	import std.algorithm : canFind;
+
+	auto s = new McpServer("t", "1");
+	auto ch = ensurePushChannel(s, new StreamCoordinator);
+	string a, b;
+	ch.addListener((string f) @safe { a = f; }, Json(""), ListenFilter.init, "", null, "sess-A");
+	ch.addListener((string f) @safe { b = f; }, Json(""), ListenFilter.init, "", null, "sess-B");
+
+	assert(s.notifyElicitationComplete("sess-B", "elic-9") == 1);
+	assert(b.canFind("elic-9"));
+	assert(a.length == 0, "another session must not learn of the elicitation");
+}
+
+unittest  // notifications/tasks reaches only the task owner's streams
+{
+	import std.algorithm : canFind;
+
+	auto s = new McpServer("t", "1");
+	auto rt = s.enableTasks();
+	auto ch = ensurePushChannel(s, new StreamCoordinator);
+	string alice, bob;
+	TaskCreateOptions copts;
+	copts.owner = "alice";
+	auto t = rt.createFor("", Json.undefined, copts);
+	ListenFilter f;
+	f.active = true;
+	f.taskIds = [t.taskId];
+	ch.addListener((string fr) @safe { alice = fr; }, Json("l-a"), f, "", null, "", "alice");
+	ch.addListener((string fr) @safe { bob = fr; }, Json("l-b"), f, "", null, "", "bob");
+
+	rt.complete(t.taskId, Json(["secret": Json("s3cr3t")]));
+	assert(alice.canFind("notifications/tasks"));
+	assert(alice.canFind("s3cr3t"));
+	assert(bob.length == 0, "a task's result must not reach another principal's stream");
+}
+
+unittest  // notifications/tasks for an ownerless task reaches no anonymous HTTP stream
+{
+	auto s = new McpServer("t", "1");
+	auto rt = s.enableTasks();
+	auto ch = ensurePushChannel(s, new StreamCoordinator);
+	string anon;
+	auto t = rt.createFor("", Json.undefined);
+	ListenFilter f;
+	f.active = true;
+	f.taskIds = [t.taskId];
+	ch.addListener((string fr) @safe { anon = fr; }, Json("l-x"), f, "", null, "", "");
+
+	rt.complete(t.taskId, Json(["secret": Json("s3cr3t")]));
+	assert(anon.length == 0, "an ownerless task's id must not reach other anonymous clients");
+}
+
+unittest  // notifications/tasks for an ownerless task reaches the stdio listen stream
+{
+	import std.algorithm : canFind;
+
+	auto s = new McpServer("t", "1");
+	auto rt = s.enableTasks();
+	string[] frames;
+	void sink(string f) @safe
+	{
+		frames ~= f;
+	}
+
+	auto t = rt.createFor("", Json.undefined);
+	auto other = rt.createFor("", Json.undefined);
+	Json meta = Json.emptyObject;
+	meta[MetaKey.protocolVersion] = "2026-07-28";
+	meta[MetaKey.clientCapabilities] = Json([
+		"extensions": Json([tasksExtensionKey: Json.emptyObject])
+	]);
+	Json params = Json.emptyObject;
+	params["notifications"] = Json(["taskIds": Json([Json(t.taskId)])]);
+	params["_meta"] = meta;
+	assert(s.tryServeStdioListen(Message(makeRequest(Json(1),
+			"subscriptions/listen", params)), &sink));
+	assert(frames.canFind!(fr => fr.canFind("acknowledged") && fr.canFind(t.taskId)));
+
+	rt.complete(other.taskId, Json(["v": Json("unrequested")]));
+	rt.complete(t.taskId, Json(["v": Json("done")]));
+	assert(frames.canFind!(fr => fr.canFind("notifications/tasks") && fr.canFind("done")));
+	assert(!frames.canFind!(fr => fr.canFind("unrequested")),
+			"a task the listen stream did not name must not reach it");
+}
+
+unittest  // a listen stream receives only the notification types its filter requested
+{
+	import std.algorithm : canFind;
+
+	auto s = new McpServer("t", "1");
+	s.enableToolsListChanged();
+	string[] frames;
+	void sink(string f) @safe
+	{
+		frames ~= f;
+	}
+
+	Json meta = Json.emptyObject;
+	meta[MetaKey.protocolVersion] = "2026-07-28";
+	meta[MetaKey.clientCapabilities] = Json.emptyObject;
+	Json params = Json.emptyObject;
+	params["notifications"] = Json(["toolsListChanged": Json(true)]);
+	params["_meta"] = meta;
+	assert(s.tryServeStdioListen(Message(makeRequest(Json(1),
+			"subscriptions/listen", params)), &sink));
+
+	s.notify("notifications/message", Json([
+		"level": Json("info"),
+		"data": Json("x")
+	]));
+	s.notify("notifications/progress", Json([
+		"progressToken": Json(1),
+		"progress": Json(1)
+	]));
+	s.notify("notifications/events/list_changed");
+	assert(!frames.canFind!(fr => fr.canFind("notifications/message")));
+	assert(!frames.canFind!(fr => fr.canFind("notifications/progress")));
+	assert(!frames.canFind!(fr => fr.canFind("notifications/events/list_changed")));
+	s.notify("notifications/tools/list_changed");
+	assert(frames.canFind!(fr => fr.canFind("notifications/tools/list_changed")));
 }
 
 unittest  // tools listChanged is not advertised by default
@@ -8611,6 +12016,7 @@ unittest  // removeTool unregisters a previously registered tool
 unittest  // notifyToolsListChanged broadcasts notifications/tools/list_changed
 {
 	auto s = new McpServer("t", "1");
+	s.enableToolsListChanged();
 	auto coord = new StreamCoordinator;
 	auto ch = ensurePushChannel(s, coord);
 	string[] received;
@@ -8621,6 +12027,18 @@ unittest  // notifyToolsListChanged broadcasts notifications/tools/list_changed
 
 	assert(received.length == 1);
 	assert(received[0].canFind("notifications/tools/list_changed"));
+}
+
+unittest  // a plain GET stream gets no list_changed whose listChanged capability is unadvertised
+{
+	auto s = McpServer.stateful("t", "1");
+	auto ch = ensurePushChannel(s, new StreamCoordinator);
+	string[] received;
+	ch.addListener((string f) @safe { received ~= f; });
+	assert(s.notifyToolsListChanged() == 0);
+	assert(s.notifyResourcesListChanged() == 0);
+	assert(s.notifyPromptsListChanged() == 0);
+	assert(received.length == 0);
 }
 
 unittest  // notifyToolsListChanged is a no-op before a push channel exists
@@ -8638,6 +12056,7 @@ unittest  // notifyToolsListChanged fans out to EVERY connected session, not jus
 	import std.algorithm : canFind;
 
 	auto s = new McpServer("t", "1");
+	s.enableToolsListChanged();
 	auto coord = new StreamCoordinator;
 	auto ch = ensurePushChannel(s, coord);
 	string aFrame, bFrame;
@@ -8657,6 +12076,7 @@ unittest  // a list_changed broadcast still delivers only ONE stream within a si
 	// Multiple Connections rule: within ONE session two open GET streams must not
 	// both receive the same broadcast — only one of the session's streams does.
 	auto s = new McpServer("t", "1");
+	s.enableToolsListChanged();
 	auto coord = new StreamCoordinator;
 	auto ch = ensurePushChannel(s, coord);
 	int aCount, bCount;
@@ -8721,6 +12141,7 @@ unittest  // enableResourceSubscriptions advertises resources capability with ze
 unittest  // notifyResourcesListChanged broadcasts notifications/resources/list_changed
 {
 	auto s = new McpServer("t", "1");
+	s.enableResourcesListChanged();
 	auto coord = new StreamCoordinator;
 	auto ch = ensurePushChannel(s, coord);
 	string[] received;
@@ -8778,6 +12199,7 @@ unittest  // enablePromptsListChanged advertises listChanged:true for prompts
 unittest  // notifyPromptsListChanged broadcasts notifications/prompts/list_changed
 {
 	auto s = new McpServer("t", "1");
+	s.enablePromptsListChanged();
 	auto coord = new StreamCoordinator;
 	auto ch = ensurePushChannel(s, coord);
 	string[] received;
@@ -8821,17 +12243,15 @@ unittest  // enableToolsListChanged is the consistent name and advertises listCh
 
 unittest  // modern: concurrent listen streams only receive the type each opted into
 {
-	// Regression for per-stream notification filtering (2026-07-28 basic/utilities/
-	// subscriptions): "The server MUST NOT send notification types the client has not
+	// Per-stream notification filtering (2026-07-28 basic/utilities/subscriptions): "The server MUST NOT send notification types the client has not
 	// explicitly requested." Two concurrent subscriptions/listen streams: A opted into
 	// toolsListChanged only, B into resourceSubscriptions only. notifyToolsListChanged
 	// MUST reach A and never B, even though B registered first.
 	import std.algorithm : canFind;
 
-	// resourceSubscriptions opt-in requires a stateful server.
-	auto s = makeStatefulTestServer();
+	auto s = makeTestServer();
+	registerStubResources(s, "test://stub");
 	s.enableToolsListChanged();
-	s.enableResourceSubscriptions();
 	auto coord = new StreamCoordinator;
 	auto push = ensurePushChannel(s, coord);
 
@@ -8885,6 +12305,7 @@ unittest  // STATELESS HTTP subscriptions/listen delivers resources/updated per-
 	// Delivery is driven by the open listener's own ListenFilter, not by
 	// enableResourceSubscriptions() (which a stateless server cannot call).
 	auto s = McpServer.stateless("t", "1");
+	registerStubResources(s, "test://stub");
 	auto coord = new StreamCoordinator;
 	auto push = ensurePushChannel(s, coord);
 
@@ -8952,6 +12373,7 @@ unittest  // stdio listen sink is per-URI filtered (subscribed delivered, other 
 	// Delivery is driven by the stdio listen stream's own recorded filter, not by
 	// enableResourceSubscriptions() (which a stateless server cannot call).
 	auto s = new McpServer("t", "1");
+	registerStubResources(s, "test://stub");
 
 	string[] sink;
 	// Open a modern stdio listen subscribed to note:///a only.
@@ -9059,6 +12481,47 @@ unittest  // setPageSize paginates tools/list across cursor-following pages
 	auto page3 = s.handle(req(3, "tools/list", p3)).get;
 	assert(page3["result"]["tools"].length == 1);
 	assert("nextCursor" !in page3["result"]);
+}
+
+unittest  // a tools/list cursor resumes after the last-seen tool when earlier tools are removed
+{
+	auto s = new McpServer("t", "1");
+	foreach (name; ["a", "b", "c", "d", "e"])
+	{
+		Tool tool = {name: name};
+		s.registerTool(tool, (Json) @safe => CallToolResult.init);
+	}
+	s.setPageSize(2);
+	auto page1 = s.handle(req(1, "tools/list")).get["result"];
+	assert(page1["tools"][1]["name"].get!string == "b");
+	s.removeTool("a");
+	Tool late = {name: "bb"};
+	s.registerTool(late, (Json) @safe => CallToolResult.init);
+	auto page2 = s.handle(req(2, "tools/list",
+			Json(["cursor": page1["nextCursor"]]))).get["result"];
+	assert(page2["tools"][0]["name"].get!string == "bb");
+	assert(page2["tools"][1]["name"].get!string == "c");
+}
+
+unittest  // a resources/templates/list cursor survives removal of an earlier template
+{
+	auto s = new McpServer("t", "1");
+	foreach (name; ["test://c/{id}", "test://a/{id}", "test://b/{id}"])
+	{
+		ResourceTemplate t = {uriTemplate: name, name: "t"};
+		s.registerResourceTemplate(t, (string uri, string[string] params) @safe {
+			return ResourceContents.makeText(uri, "text/plain", "x");
+		});
+	}
+	s.setPageSize(1);
+	auto page1 = s.handle(req(1, "resources/templates/list")).get["result"];
+	const first = page1["resourceTemplates"][0]["uriTemplate"].get!string;
+	assert(s.removeResourceTemplate(first));
+	auto page2 = s.handle(req(2, "resources/templates/list",
+			Json(["cursor": page1["nextCursor"]]))).get["result"];
+	assert(page2["resourceTemplates"].length == 1);
+	assert(page2["resourceTemplates"][0]["uriTemplate"].get!string > first);
+	assert("nextCursor" in page2);
 }
 
 unittest  // without setPageSize, tools/list returns everything in one page (no cursor)
@@ -9169,7 +12632,7 @@ unittest  // an invalid pagination cursor yields invalidParams (-32602)
 	assert(resp["error"]["code"].get!int == ErrorCode.invalidParams);
 }
 
-unittest  // a stale cursor pointing past the end of the list yields invalidParams (-32602)
+unittest  // a well-formed cursor the server never issued yields invalidParams (-32602)
 {
 	import std.string : representation;
 	import mcp.auth.oauth : base64UrlNoPad;
@@ -9182,10 +12645,8 @@ unittest  // a stale cursor pointing past the end of the list yields invalidPara
 		return r;
 	});
 	s.setPageSize(1);
-	// A well-formed cursor encoding an offset far beyond the single registered
-	// tool: the client may be replaying a stale cursor from a longer, earlier
-	// result set. This MUST be rejected with -32602 rather than silently
-	// returning an empty final page.
+	// Valid base64 that does not decode to a server-issued cursor is rejected
+	// rather than read as a position in the list.
 	Json p = Json.emptyObject;
 	p["cursor"] = base64UrlNoPad("999".representation);
 	auto resp = s.handle(req(1, "tools/list", p)).get;
@@ -9342,9 +12803,7 @@ unittest  // inputRequired(reqs, T) stores requestState as the JSON of the struc
 	auto resp = ToolResponse.inputRequired(cast(InputRequest[]) null, ResumeState("verify", 2));
 	assert(resp.needsInput);
 	auto j = resp.toJson();
-	auto back = () @trusted {
-		return deserializeJson!ResumeState(parseJsonString(j["requestState"].get!string));
-	}();
+	auto back = deserializeJson!ResumeState(parseJsonString(j["requestState"].get!string));
 	assert(back.step == "verify");
 	assert(back.attempt == 2);
 }
@@ -9445,6 +12904,7 @@ unittest  // cross-talk: two contexts on ONE server keep independent state
 	auto s = McpServer.stateful("t", "1");
 	s.enableLogging();
 	s.enableResourceSubscriptions();
+	registerStubResources(s, "res://a");
 	auto stateA = new ConnectionState;
 	auto stateB = new ConnectionState;
 
@@ -9469,6 +12929,8 @@ unittest  // notifications/initialized flips only the carried state
 
 	auto s = new McpServer("t", "1");
 	auto state = new ConnectionState;
+	state.initializeProcessed = true;
+	s.activeConnection.initializeProcessed = true;
 	auto note = parseJsonString(`{"jsonrpc":"2.0","method":"notifications/initialized"}`);
 	s.handle(Message(note), new ConnCtx("sess", state));
 	assert(state.initialized, "initialized must be recorded on the carried state");
@@ -9549,11 +13011,13 @@ unittest  // a STATEFUL server advertises + honours subscribe
 	sub["uri"] = "res://x";
 	auto resp = s.handle(req(1, "resources/subscribe", sub)).get;
 	assert("error" !in resp, "stateful resources/subscribe must succeed");
-	assert(s.isSubscribed("res://x"), "stateful subscribe must record the subscription");
+	assert(("res://x" in s.activeConnection.subscriptions),
+			"stateful subscribe must record the subscription");
 
 	auto resp2 = s.handle(req(2, "resources/unsubscribe", sub)).get;
 	assert("error" !in resp2, "stateful resources/unsubscribe must succeed");
-	assert(!s.isSubscribed("res://x"), "stateful unsubscribe must drop the subscription");
+	assert(("res://x" !in s.activeConnection.subscriptions),
+			"stateful unsubscribe must drop the subscription");
 }
 
 unittest  // stateless requests get INDEPENDENT ConnectionState; the server keeps no reference
@@ -9600,6 +13064,7 @@ unittest  // two stateful sessions on ONE server cannot observe each other's sta
 	auto s = McpServer.stateful("t", "1");
 	s.enableLogging();
 	s.enableResourceSubscriptions();
+	registerStubResources(s, "res://a", "res://b");
 
 	auto mgr = new SessionManager;
 	const idA = mgr.create();
@@ -9725,4 +13190,131 @@ unittest  // clientCanSatisfy: samplingContext alone implies sampling capability
 	InputRequest r = InputRequest("s1", "sampling", Json.emptyObject);
 	auto kept = McpServer.supportedInputRequests([r], declared);
 	assert(kept.length == 1, "samplingContext must imply sampling for clientCanSatisfy");
+}
+
+unittest  // McpServer.exposeInternalErrors reaches the events runtime in either call order
+{
+	auto before = McpServer.stateless("t", "1");
+	before.exposeInternalErrors();
+	assert(before.enableEvents().exposeInternalErrors);
+	auto after = McpServer.stateless("t", "1");
+	auto rt = after.enableEvents();
+	assert(!rt.exposeInternalErrors);
+	after.exposeInternalErrors();
+	assert(rt.exposeInternalErrors);
+}
+
+unittest  // McpServer.exposeInternalErrors reaches the task runtime in either call order
+{
+	auto before = McpServer.stateless("t", "1");
+	before.exposeInternalErrors();
+	assert(before.enableTasks().exposeInternalErrors);
+	auto after = McpServer.stateless("t", "1");
+	auto rt = after.enableTasks();
+	assert(!rt.exposeInternalErrors);
+	after.exposeInternalErrors();
+	assert(rt.exposeInternalErrors);
+}
+
+unittest  // completion/complete for an unregistered prompt is -32602
+{
+	auto s = new McpServer("t", "1");
+	s.setCompletionRequestHandler((CompleteRequest r) @safe => CompleteResult.init);
+	Json p = Json.emptyObject;
+	p["ref"] = Json(["type": Json("ref/prompt"), "name": Json("nope")]);
+	p["argument"] = Json(["name": Json("a"), "value": Json("")]);
+	auto resp = s.handle(req(1, "completion/complete", p)).get;
+	assert(resp["error"]["code"].get!int == ErrorCode.invalidParams);
+}
+
+unittest  // completion/complete for an unregistered resource or template is -32602
+{
+	auto s = new McpServer("t", "1");
+	s.setCompletionRequestHandler((CompleteRequest r) @safe => CompleteResult.init);
+	ResourceTemplate t = {uriTemplate: "file:///{path}", name: "files"};
+	s.registerResourceTemplate(t, (string uri, string[string] vars, RequestContext ctx) @safe {
+		return cast(ResourceContents[])[];
+	});
+	Json p = Json.emptyObject;
+	p["argument"] = Json(["name": Json("path"), "value": Json("")]);
+	p["ref"] = Json(["type": Json("ref/resource"), "uri": Json("db:///{table}")]);
+	auto resp = s.handle(req(1, "completion/complete", p)).get;
+	assert(resp["error"]["code"].get!int == ErrorCode.invalidParams);
+
+	p["ref"] = Json([
+		"type": Json("ref/resource"),
+		"uri": Json("file:///{path}")
+	]);
+	resp = s.handle(req(2, "completion/complete", p)).get;
+	assert("result" in resp);
+}
+
+unittest  // the attached push channel is internal: its raw delivery bypasses the server's gates
+{
+	static assert(__traits(getVisibility, McpServer.serverPushChannel) == "package");
+}
+
+unittest  // a per-argument completer sees context.arguments and returns its own CompleteResult
+{
+	auto s = new McpServer("t", "1");
+	registerCompletablePrompt(s, "deploy");
+	string seenEnv;
+	s.setArgumentCompleter(CompletionReference.forPrompt("deploy"), "service",
+			(CompleteRequest r) @safe {
+		seenEnv = r.context.get("env", "");
+		auto res = CompleteResult.prefixMatch(["api", "auth"], r.argumentValue);
+		res.hasMore = true;
+		res.total = 40;
+		return res;
+	});
+	Json p = Json.emptyObject;
+	p["ref"] = CompletionReference.forPrompt("deploy").toJson();
+	p["argument"] = Json(["name": Json("service"), "value": Json("a")]);
+	p["context"] = Json(["arguments": Json(["env": Json("prod")])]);
+	auto resp = s.handle(req(1, "completion/complete", p)).get;
+	assert(seenEnv == "prod");
+	assert(resp["result"]["completion"]["values"].length == 2);
+	assert(resp["result"]["completion"]["total"].get!long == 40);
+	assert(resp["result"]["completion"]["hasMore"].get!bool);
+}
+
+unittest  // shutdown stops the background timers and is idempotent
+{
+	import core.time : msecs;
+
+	auto s = new McpServer("t", "1");
+	s.shutdown();
+	auto tasks = s.enableTasks();
+	auto events = s.enableEvents();
+	tasks.startSweeper(10.msecs);
+	events.startDeliveryWorker(10.msecs);
+	s.shutdown();
+	s.shutdown();
+}
+
+unittest  // enableExtension rejects the extensions the SDK serves itself, naming their enable call
+{
+	import std.algorithm.searching : canFind;
+
+	auto s = new McpServer("t", "1");
+	foreach (key, remedy; [
+		"io.modelcontextprotocol/tasks": "enableTasks",
+		"io.modelcontextprotocol/events": "enableEvents",
+		"io.modelcontextprotocol/ui": "enableApps",
+		"io.modelcontextprotocol/skills": "enableSkills"
+	])
+	{
+		bool threw;
+		try
+			s.enableExtension(key);
+		catch (Exception e)
+		{
+			threw = true;
+			assert(e.msg.canFind(remedy), e.msg);
+		}
+		assert(threw, key);
+		assert(!s.extensionEnabled(key), key);
+	}
+	s.enableExtension("com.example/custom");
+	assert(s.extensionEnabled("com.example/custom"));
 }

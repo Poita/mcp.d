@@ -26,7 +26,7 @@
  *   2. The advertised Protected Resource Metadata document (RFC 9728):
  *      `resource`, `authorization_servers`, `scopes_supported`.
  *   3. Happy path: a token obtained via the SDK OAuth client-credentials
- *      acquisition surface -> initialize succeeds, tools/list contains
+ *      acquisition surface -> connect() succeeds, tools/list contains
  *      `whoami` + `secret_note`, `whoami` returns the token's subject + scopes
  *      in its TYPED structuredContent (inferred from the server's WhoamiResult
  *      struct), `secret_note` returns the privileged payload.
@@ -61,7 +61,6 @@ import std.datetime.systime : Clock;
 import std.getopt : getopt;
 import std.string : indexOf;
 
-import vibe.data.json : Json, parseJsonString;
 import vibe.http.client : requestHTTP, HTTPClientRequest, HTTPClientResponse;
 import vibe.http.common : HTTPMethod;
 import vibe.http.server : HTTPServerSettings, HTTPServerRequest, HTTPServerResponse, listenHTTP;
@@ -143,7 +142,7 @@ string mintToken(string subject, string scope_, string audience) @safe
 /// response JSON. This stands in for the real AS so the happy path can drive the
 /// SDK's `OAuthClient.clientCredentials` acquisition surface end to end while
 /// staying offline.
-string startTokenEndpoint(string audience) @trusted
+string startTokenEndpoint(string audience) @safe
 {
 	auto router = new URLRouter;
 	router.post("/token", (scope HTTPServerRequest req, scope HTTPServerResponse res) {
@@ -187,17 +186,15 @@ int run() @safe
 	{
 		int status;
 		string wwwAuth;
-		() @trusted {
-			requestHTTP(serverUrl, (scope HTTPClientRequest req) {
-				req.method = HTTPMethod.POST;
-				req.headers["Content-Type"] = "application/json";
-				req.writeBody(cast(const(ubyte)[]) `{"jsonrpc":"2.0","id":1,"method":"ping"}`);
-			}, (scope HTTPClientResponse res) {
-				status = res.statusCode;
-				wwwAuth = res.headers.get("WWW-Authenticate", "");
-				res.bodyReader.readAllUTF8();
-			});
-		}();
+		requestHTTP(serverUrl, (scope HTTPClientRequest req) {
+			req.method = HTTPMethod.POST;
+			req.headers["Content-Type"] = "application/json";
+			req.writeBody(cast(const(ubyte)[]) `{"jsonrpc":"2.0","id":1,"method":"ping"}`);
+		}, (scope HTTPClientResponse res) {
+			status = res.statusCode;
+			wwwAuth = res.headers.get("WWW-Authenticate", "");
+			res.bodyReader.readAllUTF8();
+		});
 		checkEq(status, 401, "no-token POST status");
 		check(wwwAuth.indexOf("Bearer") >= 0, "challenge should be a Bearer scheme: " ~ wwwAuth);
 		check(wwwAuth.indexOf("resource_metadata=") >= 0,
@@ -228,27 +225,23 @@ int run() @safe
 	{
 		int status;
 		string body_;
-		() @trusted {
-			requestHTTP(baseOrigin ~ "/.well-known/oauth-protected-resource",
-					(scope HTTPClientRequest req) { req.method = HTTPMethod.GET; },
-					(scope HTTPClientResponse res) {
-				status = res.statusCode;
-				body_ = res.bodyReader.readAllUTF8();
-			});
-		}();
+		requestHTTP(baseOrigin ~ "/.well-known/oauth-protected-resource/mcp",
+				(scope HTTPClientRequest req) { req.method = HTTPMethod.GET; },
+				(scope HTTPClientResponse res) {
+			status = res.statusCode;
+			body_ = res.bodyReader.readAllUTF8();
+		});
 		checkEq(status, 200, "PRM document status");
-		auto prm = () @trusted { return parseJsonString(body_); }();
-		checkEq(() @trusted { return prm["resource"].get!string; }(),
-				serverUrl, "PRM resource (raw)");
-		checkEq(() @trusted { return prm["authorization_servers"][0].get!string; }(),
-				Issuer, "PRM authorization_servers (raw)");
-		auto scopes = () @trusted { return prm["scopes_supported"]; }();
-		check(() @trusted {
-			return scopes[0].get!string == "mcp:read" && scopes[1].get!string == "mcp:write";
-		}(), "PRM scopes_supported mismatch (raw)");
+		auto prm = parseJsonString(body_);
+		checkEq(prm["resource"].get!string, serverUrl, "PRM resource (raw)");
+		checkEq(prm["authorization_servers"][0].get!string, Issuer,
+				"PRM authorization_servers (raw)");
+		auto scopes = prm["scopes_supported"];
+		check(scopes[0].get!string == "mcp:read"
+				&& scopes[1].get!string == "mcp:write", "PRM scopes_supported mismatch (raw)");
 	}
 
-	// ---- 3. Happy path: full-scope token, initialize + tools ----
+	// ---- 3. Happy path: full-scope token, connect + tools ----
 	//
 	// ACQUISITION: obtain the bearer token through the SDK's OAuth client
 	// surface rather than hand-minting it inline. A tiny in-process token endpoint
@@ -256,7 +249,7 @@ int run() @safe
 	// the cleanest automated grant, so we POST to it and feed the returned
 	// `TokenSet.accessToken` to `setBearerToken`.
 	{
-		const tokenUrl = () @trusted { return startTokenEndpoint(serverUrl); }();
+		const tokenUrl = startTokenEndpoint(serverUrl);
 		auto oauth = new OAuthClient;
 		oauth.resource = serverUrl;
 		AuthorizationServerMetadata as_;
@@ -270,7 +263,7 @@ int run() @safe
 		scope (exit)
 			client.close();
 		client.setBearerToken(ts.accessToken);
-		client.initialize();
+		client.connect();
 
 		auto tools = client.listTools().tools;
 		bool haveWhoami, haveSecret;
@@ -310,7 +303,7 @@ int run() @safe
 		scope (exit)
 			client.close();
 		client.setBearerToken(mintToken("reader", "mcp:read", serverUrl));
-		client.initialize();
+		client.connect();
 
 		auto who = client.callTool("whoami", Json.emptyObject);
 		check(!who.isError, "whoami should still work for a read-only token");
@@ -333,7 +326,7 @@ int run() @safe
 				"https://other.example.com/mcp"));
 		bool rejected = false;
 		try
-			client.initialize();
+			client.connect();
 		catch (Exception)
 			rejected = true;
 		check(rejected, "a token for the wrong audience must be rejected (RFC 8707)");
@@ -344,18 +337,16 @@ int run() @safe
 		const tok = mintToken("user-42", "some:other", serverUrl);
 		int status;
 		string wwwAuth;
-		() @trusted {
-			requestHTTP(serverUrl, (scope HTTPClientRequest req) {
-				req.method = HTTPMethod.POST;
-				req.headers["Content-Type"] = "application/json";
-				req.headers["Authorization"] = "Bearer " ~ tok;
-				req.writeBody(cast(const(ubyte)[]) `{"jsonrpc":"2.0","id":1,"method":"ping"}`);
-			}, (scope HTTPClientResponse res) {
-				status = res.statusCode;
-				wwwAuth = res.headers.get("WWW-Authenticate", "");
-				res.bodyReader.readAllUTF8();
-			});
-		}();
+		requestHTTP(serverUrl, (scope HTTPClientRequest req) {
+			req.method = HTTPMethod.POST;
+			req.headers["Content-Type"] = "application/json";
+			req.headers["Authorization"] = "Bearer " ~ tok;
+			req.writeBody(cast(const(ubyte)[]) `{"jsonrpc":"2.0","id":1,"method":"ping"}`);
+		}, (scope HTTPClientResponse res) {
+			status = res.statusCode;
+			wwwAuth = res.headers.get("WWW-Authenticate", "");
+			res.bodyReader.readAllUTF8();
+		});
 		checkEq(status, 403, "missing-scope token status");
 		check(wwwAuth.indexOf(`error="insufficient_scope"`) >= 0,
 				"403 challenge should carry insufficient_scope: " ~ wwwAuth);

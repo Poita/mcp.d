@@ -140,6 +140,9 @@ version (linux)
 	// differs by architecture.
 	private extern (C) long syscall(long number, ...) @system nothrow @nogc;
 
+	/// getrandom(2), or -1 with `errno` set to ENOSYS on an architecture whose
+	/// syscall number is not known here, so the caller falls back to
+	/// /dev/urandom rather than misreading a stale `errno`.
 	private long sysGetrandom(scope void* buf, size_t buflen, uint flags) @trusted nothrow @nogc
 	{
 		version (X86_64)
@@ -155,9 +158,14 @@ version (linux)
 		else version (RISCV64)
 			enum sysno = 278;
 		else
-			enum sysno = -1; // unknown: force /dev/urandom fallback
+			enum sysno = -1;
 		static if (sysno < 0)
+		{
+			import core.stdc.errno : errno, ENOSYS;
+
+			errno = ENOSYS;
 			return -1;
+		}
 		else
 			return syscall(sysno, buf, buflen, flags);
 	}
@@ -256,6 +264,16 @@ unittest  // the source is the OS CSPRNG, not the default-seeded std.random rndG
 
 	auto secure = cryptoRandomBytes(32);
 	assert(secure[] != predictable[]);
+}
+
+version (linux) unittest  // a failed getrandom(2) never leaves a stale EINTR that would retry forever
+{
+	import core.stdc.errno : errno, EINTR;
+
+	errno = EINTR;
+	ubyte[1] b;
+	if (sysGetrandom(&b[0], b.length, 0) < 0)
+		assert(errno != EINTR);
 }
 
 version (Windows) unittest  // BCryptGenRandom fills the entire buffer across chunk boundaries

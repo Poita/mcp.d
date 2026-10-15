@@ -1,6 +1,6 @@
 /// The execution context handed to an event type's check function and lifecycle
 /// hooks, plus the `EventResult` such a check returns. Mirrors the role
-/// `TaskContext` plays for `@task`: the SDK injects it as a trailing parameter
+/// `TaskContext` plays for `@taskTool`: the SDK injects it as a trailing parameter
 /// (omitted from the input schema), carrying the incoming cursor, the raw
 /// subscription arguments, the authenticated principal, and the replay floor.
 module mcp.server.event_context;
@@ -61,7 +61,8 @@ struct EventResult
 
 /// One typed event in a fetch batch: the strongly-typed `payload`, plus an
 /// optional `cursor` (this event's position — falls back to the batch cursor),
-/// `eventId` (for dedup; auto-generated when empty), and `timestamp` (ISO-8601;
+/// `eventId` (for dedup; when empty, derived from the event's position and payload,
+/// so a re-fetch of the same batch yields the same id), and `timestamp` (ISO-8601;
 /// stamped to now when empty).
 struct Event(P)
 {
@@ -86,12 +87,13 @@ struct EventBatch(P)
 {
 	Event!P[] events;
 	Nullable!string cursor;
-	bool hasMore;
 	bool truncated;
+	bool hasMore;
 
-	/// A batch with a fresh cursor (the common replayable case).
-	static EventBatch of(Event!P[] events, string cursor, bool hasMore = false,
-			bool truncated = false) @safe
+	/// A batch with a fresh cursor (the common replayable case). The flags
+	/// follow the same order as `EventResult.of`.
+	static EventBatch of(Event!P[] events, string cursor, bool truncated = false,
+			bool hasMore = false) @safe
 	{
 		EventBatch b;
 		b.events = events;
@@ -125,7 +127,7 @@ struct FetchContext
 {
 	Nullable!string cursor; /// resume position; null = from now
 	Nullable!long maxAgeMs; /// replay floor; null = unbounded
-	Nullable!long maxEvents; /// batch cap; null = server default
+	Nullable!long maxEvents; /// batch cap (see `EventContext.maxEvents`); null = uncapped
 	string principal; /// authenticated subject ("" if unauthenticated)
 
 	/// True when the client passed `cursor: null` (start from now).
@@ -144,14 +146,19 @@ struct FetchContext
 /// stop it in `onUnsubscribe`.
 ///
 /// NODE-LOCAL: "once per distinct key" holds within a single `EventsRuntime`
-/// instance — the lifecycle refcount is node-local. Webhook subscriptions are
-/// shared across a cluster via the subscription store, so on a multi-node
-/// deployment these hooks fire once per node, not once cluster-wide; write them to
-/// be idempotent across nodes. A cluster-coherent shared-store refcount is future
-/// work.
+/// instance — the lifecycle refcount is node-local. A webhook subscription fires
+/// `onSubscribe` on the node that creates it, and on every node that registers the
+/// type's `onSubscribe` while the subscription is in the shared or durable store
+/// (so a restarted node provisions its upstream sources again); it does not fire on
+/// a node for a webhook subscription another node creates later. `onUnsubscribe`
+/// fires on each node holding the key once the subscription is gone. Write the
+/// hooks to be idempotent across nodes.
 struct SubContext
 {
 	string principal;
+	/// Derived by the server from the subscription that first acquired the key,
+	/// never chosen by the client: `poll_…` and `push_…` hash the `(principal,
+	/// name, arguments)` key, `sub_…` (webhook) also the callback URL.
 	string subscriptionId;
 }
 
@@ -165,14 +172,19 @@ final class EventContext
 	private Json arguments_;
 	private string principal_;
 	private Nullable!long maxAgeMs_;
+	private Nullable!long maxEvents_;
 
 	this(Nullable!string cursor, Json arguments, string principal,
-			Nullable!long maxAgeMs = Nullable!long.init) @safe
+			Nullable!long maxAgeMs = Nullable!long.init,
+			Nullable!long maxEvents = Nullable!long.init) @safe
 	{
 		cursor_ = cursor;
-		arguments_ = (arguments.type == Json.Type.object) ? arguments : Json.emptyObject;
+		// A private copy, so a hook that mutates its arguments cannot reach the
+		// stored subscription they came from.
+		arguments_ = (arguments.type == Json.Type.object) ? arguments.clone() : Json.emptyObject;
 		principal_ = principal;
 		maxAgeMs_ = maxAgeMs;
+		maxEvents_ = maxEvents;
 	}
 
 	/// The cursor the client supplied — the position to resume from. Null means
@@ -207,6 +219,28 @@ final class EventContext
 	{
 		return maxAgeMs_;
 	}
+
+	/// The cap on events to return in one batch. For `events/poll` it is the
+	/// client's `maxEvents`, or `EventsOptions.pollDefaultMaxEvents` when it set
+	/// none, clamped to `EventsOptions.pollMaxEvents`; push streams and webhook
+	/// fetches use that default, and a webhook fetch is lowered further to the
+	/// subscription's free pending-delivery slots. Null only when those options
+	/// leave the batch uncapped. A check returning more is cut at the last kept
+	/// event that carries its own cursor; report `hasMore` to be called again.
+	Nullable!long maxEvents() const @safe nothrow
+	{
+		return maxEvents_;
+	}
+}
+
+unittest  // an EventContext keeps its own copy of the subscription arguments
+{
+	auto args = Json(["channel": Json("general")]);
+	auto ctx = new EventContext(Nullable!string.init, args, "u");
+	args["channel"] = "mutated";
+	assert(ctx.arguments["channel"].get!string == "general");
+	ctx.arguments["channel"] = "changed by a hook";
+	assert(args["channel"].get!string == "mutated");
 }
 
 unittest  // EventResult.of carries events + cursor and clears flags by default
@@ -214,6 +248,22 @@ unittest  // EventResult.of carries events + cursor and clears flags by default
 	auto r = EventResult.of([EventOccurrence("e1", "n", "t")], "c1");
 	assert(r.events.length == 1 && r.cursor.get == "c1");
 	assert(!r.truncated && !r.hasMore);
+}
+
+unittest  // EventBatch.of takes truncated before hasMore, the same order as EventResult.of
+{
+	auto b = EventBatch!int.of([], "c1", true, false);
+	assert(b.truncated && !b.hasMore);
+	auto r = EventResult.of([], "c1", true, false);
+	assert(r.truncated == b.truncated && r.hasMore == b.hasMore);
+}
+
+unittest  // EventBatch and EventResult declare their flags in the same order
+{
+	auto b = EventBatch!int(null, nullable("c1"), true, false);
+	auto r = EventResult(null, nullable("c1"), true, false);
+	assert(b.truncated && !b.hasMore);
+	assert(r.truncated == b.truncated && r.hasMore == b.hasMore);
 }
 
 unittest  // EventResult.empty advances the cursor with no events
@@ -248,6 +298,13 @@ unittest  // EventContext normalizes non-object arguments to an empty object
 {
 	auto ctx = new EventContext(Nullable!string.init, Json("not-an-object"), "p");
 	assert(ctx.arguments.type == Json.Type.object && ctx.arguments.length == 0);
+}
+
+unittest  // EventContext carries the maxEvents cap when supplied
+{
+	auto ctx = new EventContext(nullable("c"), Json.emptyObject, "p",
+			Nullable!long.init, nullable(25L));
+	assert(ctx.maxEvents.get == 25);
 }
 
 unittest  // EventContext carries the maxAgeMs replay floor when supplied

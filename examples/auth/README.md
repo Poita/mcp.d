@@ -4,7 +4,7 @@ A self-contained example of an **MCP server protected as an OAuth 2.1 Resource
 Server** over Streamable HTTP, plus a client that authenticates with a bearer
 token and **doubles as an end-to-end regression test**.
 
-It is its own dub package with a path dependency on the root `mcp` SDK; it does
+It is its own dub package with a path dependency on the root `mcp-d` SDK; it does
 not modify the root `dub.json`.
 
 ## Transport: HTTP only (and why)
@@ -27,8 +27,8 @@ everything else automatically:
 - **401 + `WWW-Authenticate`** when no/invalid token is presented — the
   challenge carries `resource_metadata="…"` and a `scope="mcp:read"` hint
   (RFC 6750 §3, RFC 9728 §5.1).
-- **Protected Resource Metadata** served at
-  `/.well-known/oauth-protected-resource` (RFC 9728) advertising `resource`,
+- **Protected Resource Metadata** served at the path-inserted
+  `/.well-known/oauth-protected-resource/mcp` (RFC 9728 §3.1) advertising `resource`,
   `authorization_servers`, and `scopes_supported`.
 - **RFC 8707 audience binding** — a token whose `aud` does not name this server
   is rejected (`401 invalid_token`).
@@ -49,7 +49,7 @@ SDK's typed APIs rather than hand-built `Json`:
   derives the tool's output schema (via `jsonSchemaOf`) and fills in the
   `structuredContent` of the result automatically — the handler never touches
   `Json`. On the client side the result is decoded straight back into a typed
-  struct with **`CallToolResult.structuredContentAs!WhoamiResult`** (SDK #464),
+  struct with **`CallToolResult.structuredContentAs!WhoamiResult`**,
   so the assertions read real `.subject` / `.scopes` fields instead of poking at
   raw `structuredContent["..."]` Json.
 - **`secret_note` returns a `CallToolResult`** because it must set `isError` on
@@ -58,7 +58,7 @@ SDK's typed APIs rather than hand-built `Json`:
 
 ### High-level OAuth client surface
 
-The client also demonstrates the SDK's real OAuth consumer API (SDK #471)
+The client also demonstrates the SDK's real OAuth consumer API
 alongside the low-level wire checks:
 
 - **`OAuthClient.probeUnauthorized(endpoint)`** POSTs an unauthenticated
@@ -82,18 +82,18 @@ server **pins the AS public key** (`staticPublicKeysPem`) and the client stands
 in for the authorization server with the matching private key.
 
 For the happy path the client drives the SDK's real **token-acquisition
-surface** (#504): it stands up a tiny in-process AS **token endpoint** that
+surface**: it stands up a tiny in-process AS **token endpoint** that
 mints the ES256 JWT, then calls **`OAuthClient.clientCredentials`** against it —
 the cleanest automated grant — and feeds the returned `TokenSet.accessToken` to
-`setBearerToken`, instead of ONLY hand-minting the JWT inline. The discovery and
-wire-shape assertions are kept. The negative-path tokens (read-only,
+`setBearerToken`. The discovery and wire-shape assertions check the raw
+protocol alongside it. The negative-path tokens (read-only,
 wrong-audience, missing-scope) are still hand-minted directly, since each needs
 a bespoke claim set. The keypair here is a throwaway used only for this demo;
 never ship a private key in a real client.
 
 ## Scaffold (examples/common)
 
-The client uses the shared **`examples_common`** scaffold (#505): `runClient`
+The client uses the shared **`examples_common`** scaffold: `runClient`
 drives the vibe event loop and maps a thrown assertion to a non-zero exit,
 `check` / `checkEq` are the assertion primitives, and `connectFromArgs` selects
 the HTTP transport from `--url`. On the server side the scaffold's HTTP-only
@@ -101,7 +101,7 @@ the HTTP transport from `--url`. On the server side the scaffold's HTTP-only
 `StreamableHttpOptions.bindAddresses`) and hands back the resolved host/port so
 `main` can derive the RFC 8707 resource audience from the actual socket; `main`
 then sets `StreamableHttpOptions.auth` and calls `runStreamableHttp(server,
-port, opts)` directly. There is deliberately no stdio fallback: an OAuth
+opts)` directly. There is deliberately no stdio fallback: an OAuth
 resource server must never silently degrade to an unauthenticated transport.
 
 ## Run it (two terminals / CI two-step)
@@ -136,7 +136,7 @@ code.
    `OAuthClient.discoverProtectedResource` API and against the raw well-known
    JSON.
 3. **Full-scope token** (`mcp:read mcp:write`), **acquired via the SDK OAuth
-   client-credentials surface** (`OAuthClient.clientCredentials`, #504) →
+   client-credentials surface** (`OAuthClient.clientCredentials`) →
    `initialize` succeeds, `tools/list` contains `whoami` + `secret_note`,
    `whoami` reports the token subject (`user-42`) and granted scopes, decoded
    with `structuredContentAs!WhoamiResult`, and `secret_note` returns the

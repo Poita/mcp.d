@@ -2,6 +2,7 @@ module mcp.api.attributes;
 
 import vibe.data.json : Json;
 import core.time : Duration;
+import mcp.protocol.modern : CacheScope;
 
 @safe:
 
@@ -14,15 +15,17 @@ import core.time : Duration;
 /// class Calc
 /// {
 ///     @tool("add", "Add two integers")
-///     int add(int a, int b) { return a + b; }
+///     int add(int a, int b) @safe { return a + b; }
 /// }
 /// ---
 ///
-/// An optional human-readable `title` may be supplied for display purposes; it
-/// is independent of the programmatic `name`. To declare behavioral hints
-/// (readOnlyHint, destructiveHint, ...), attach the marker UDAs `@readOnly`,
-/// `@destructive`, `@idempotent`, `@openWorld` (and `@hintTitle(...)` for the
-/// annotation-level title) to the same method.
+/// The `name` must be 1..128 characters of ASCII letters, digits, `_`, `-`, and
+/// `.` (the MCP tool-naming guidance), or registration is a compile error; this
+/// applies to `@taskTool` too. An optional human-readable `title` may be
+/// supplied for display purposes; it is independent of the programmatic `name`.
+/// To declare behavioral hints (readOnlyHint, destructiveHint, ...), attach the
+/// marker UDAs `@readOnly`, `@destructive`, `@idempotent`, `@openWorld` (and
+/// `@hintTitle(...)` for the annotation-level title) to the same method.
 struct tool
 {
 	string name;
@@ -36,33 +39,36 @@ struct tool
 /// the server's task dispatcher, its return value becoming the task's final
 /// result. The method may take an injected `TaskContext` parameter (omitted from
 /// the input schema) to report progress, observe cancellation, or suspend for
-/// mid-execution input via `requireInput`. Requires `enableTasks()` on the server.
+/// mid-execution input via `requireInput`. Registering one enables the Tasks
+/// extension with default options (a later `enableTasks(opts)` replaces them and
+/// keeps the task tools); it throws on a `stateful` server, since the extension is
+/// modern-only.
 ///
 /// Behavioral-hint marker UDAs (`@readOnly`, `@destructive`, ...) and
 /// `@hintTitle` apply exactly as for `@tool`.
 ///
 /// Example:
 /// ---
-/// @task("word_count", "Count words asynchronously")
+/// @taskTool("word_count", "Count words asynchronously")
 /// @readOnly
 /// WordCount count(string text, TaskContext tc) @safe { ... }
 /// ---
-struct task
+struct taskTool
 {
 	string name;
 	string description;
 	string title; /// optional human-readable display name (empty = unset)
 }
 
-/// Per-task time-to-live UDA, attached alongside `@task`: how long the task lives
-/// from creation. Intrinsic to the work the task does (a long-running job vs a
+/// Per-task time-to-live UDA, attached alongside `@taskTool`: how long the task's
+/// record is kept after it settles (a task still working never expires). Intrinsic to the work the task does (a long-running job vs a
 /// quick computation), so it belongs on the task, not the server. Omit it to
 /// inherit `TaskOptions.defaultTtl`.
 ///
 /// Example:
 /// ---
 /// import core.time : hours;
-/// @task("build", "Run the build")
+/// @taskTool("build", "Run the build")
 /// @taskTtl(1.hours)
 /// BuildResult build(string target, TaskContext tc) @safe { ... }
 /// ---
@@ -73,14 +79,14 @@ struct taskTtl
 	Duration value; /// task TTL (serialized to integer ms on the wire)
 }
 
-/// Per-task poll-cadence UDA, attached alongside `@task`: the interval the client
+/// Per-task poll-cadence UDA, attached alongside `@taskTool`: the interval the client
 /// SHOULD wait between `tasks/get` polls. Like `@taskTtl`, it is intrinsic to the
 /// task. Omit it to inherit `TaskOptions.defaultPollInterval`.
 ///
 /// Example:
 /// ---
 /// import core.time : seconds;
-/// @task("build", "Run the build")
+/// @taskTool("build", "Run the build")
 /// @taskTtl(1.hours) @taskPollInterval(5.seconds)
 /// BuildResult build(string target, TaskContext tc) @safe { ... }
 /// ---
@@ -96,7 +102,10 @@ struct taskPollInterval
 /// shape `EventBatch!P fetch(A args, FetchContext ctx)`: `A` (the subscription
 /// arguments) derives the `inputSchema`, `P` (the payload) derives the
 /// `payloadSchema`, and the method becomes the type's fetch handler, backing poll
-/// directly and stream/webhook via the runtime's loop. Requires `enableEvents()`.
+/// directly and stream/webhook via the runtime's loop. Registering one enables the
+/// Events extension with default options, so to choose them call `enableEvents`
+/// first: it throws once an event type is registered. Registration throws on a
+/// `stateful` server, since the extension is modern-only.
 ///
 /// Push-only event types (no cursor-addressable upstream) use the builder instead
 /// — `auto ev = server.events.define!(A, P)("name"); ev.publish(payload);` — so the
@@ -134,7 +143,7 @@ struct eventPollInterval
 /// ---
 /// @tool("search", "Search records")
 /// @readOnly
-/// string[] search(string q) { ... }
+/// string[] search(string q) @safe { ... }
 /// ---
 enum readOnly;
 
@@ -150,6 +159,35 @@ enum idempotent;
 /// (`ToolAnnotations.openWorldHint`). Presence = `true`; absence = unset.
 enum openWorld;
 
+/// Marker UDA on a `@tool` or `@taskTool` method rejecting arguments it does not
+/// declare. Its input schema carries `"additionalProperties": false`, and a
+/// call naming an unknown argument fails as an input error even with input
+/// schema validation disabled. Without it an unknown argument is ignored.
+///
+/// Example:
+/// ---
+/// @tool("search", "Search records")
+/// @strictArgs
+/// string[] search(string q, int limit = 10) @safe { ... }
+/// ---
+enum strictArgs;
+
+/// Marker UDA on a struct bound from tool arguments making every field
+/// optional: an omitted field keeps the struct's own default. Without it a
+/// field is required unless it is `Nullable`, vibe-`@optional`, or has an
+/// initializer differing from its type's `.init` — so `bool verbose = false;`
+/// is required, as D cannot tell that initializer from none.
+///
+/// Example:
+/// ---
+/// @allOptional struct ListOptions
+/// {
+///     bool verbose = false;
+///     int depth;
+/// }
+/// ---
+enum allOptional;
+
 /// Positional value UDA setting the annotation-level display title
 /// (`ToolAnnotations.title`), distinct from `@tool`'s 3rd argument
 /// (`Tool.title`). Attach alongside `@tool`.
@@ -158,7 +196,7 @@ enum openWorld;
 /// ---
 /// @tool("erase", "Erase a record")
 /// @destructive @idempotent @hintTitle("Erase Record")
-/// void erase(string id) { ... }
+/// void erase(string id) @safe { ... }
 /// ---
 struct hintTitle
 {
@@ -166,7 +204,9 @@ struct hintTitle
 }
 
 /// UDA marking a method as an MCP prompt. The method returns the prompt's
-/// messages (a `PromptMessage[]`, a `GetPromptResult`, or a `string`).
+/// messages (a `PromptMessage[]`, a `GetPromptResult`, or a `string`), or a
+/// `PromptResponse`, which may instead ask the client for input
+/// (`PromptResponse.inputRequired`).
 ///
 /// An optional human-readable `title` may be supplied for display purposes; it
 /// is independent of the programmatic `name`.
@@ -177,8 +217,9 @@ struct prompt
 	string title; /// optional human-readable display name (empty = unset)
 }
 
-/// UDA marking a method as a static MCP resource. The method takes no arguments
-/// and returns the resource contents (`string`, or a `ResourceContents`).
+/// UDA marking a method as a static MCP resource. The method takes no arguments,
+/// or only the per-request `RequestContext`, and returns the resource contents
+/// (`string`, or a `ResourceContents`).
 ///
 /// An optional human-readable `title` may be supplied for display purposes; it
 /// is independent of the programmatic `name`.
@@ -201,22 +242,28 @@ struct resource
 /// `skills/get` methods. `path` is a `/`-separated locator whose final segment is the skill
 /// name; that segment must be lowercase alphanumeric with single hyphens
 /// (1..64 chars), per the Agent Skills spec. Preceding segments are an optional
-/// organizational prefix (e.g. `acme/billing/refunds`).
+/// organizational prefix (e.g. `acme/billing/refunds`). `description` must be
+/// 1..1024 characters and `compatibility` at most 500, or registration is a
+/// compile error; `license`, `compatibility`, and `allowedTools` (the
+/// `allowed-tools` field) are optional frontmatter, in that order.
 ///
-/// The directory is read eagerly at `registerHandlers` time (a skill is a static
-/// value — its frontmatter and content digest must be stable), so a missing
-/// directory, absent `SKILL.md`, symlink, or oversized tree throws from
-/// registration rather than per request.
+/// The method is called once, by `registerHandlers`, and its result is served
+/// for the server's lifetime: a skill is a static value whose content digest
+/// must stay stable. For a body generated on each read, use
+/// `registerDynamicSkill`.
 ///
 /// Example:
 /// ---
-/// @skill("git-workflow", "Follow this team's Git conventions")
+/// @skill("git-workflow", "Follow this team's Git conventions", "MIT")
 /// string gitWorkflow() @safe { return "# Git Workflow\n\n1. Branch from main.\n"; }
 /// ---
 struct skill
 {
 	string path;
 	string description;
+	string license; /// optional `license` frontmatter
+	string compatibility; /// optional `compatibility` frontmatter (at most 500 characters)
+	string allowedTools; /// optional `allowed-tools` frontmatter (space-delimited)
 }
 
 /// UDA marking a method as an MCP skill served from a local directory (SEP-2640).
@@ -224,11 +271,17 @@ struct skill
 /// (one containing a `SKILL.md`); the reflection layer reads `SKILL.md` verbatim,
 /// parses its authored frontmatter for the skill entry, and exposes every file in
 /// the directory tree as a `skill://<path>/<file>` resource (so subdirectories
-/// are walkable via `resources/directory/read`). `path` is the skill path (its
-/// final segment must equal the directory's `SKILL.md` frontmatter `name`);
+/// are walkable via `resources/directory/read`). The directory's name must equal
+/// its `SKILL.md` frontmatter `name`. `path` is the skill path (its final
+/// segment must equal that `name` too);
 /// leave it empty to derive the path from that name. For finer control (read
 /// filters, size caps) use the imperative `registerSkillDir` with
 /// `SkillDirOptions`.
+///
+/// The directory is read eagerly at `registerHandlers` time (a skill is a static
+/// value — its frontmatter and content digest must be stable), so a missing
+/// directory, absent `SKILL.md`, symlink, or oversized tree throws from
+/// registration rather than per request.
 ///
 /// Example:
 /// ---
@@ -263,7 +316,7 @@ struct resourceTemplate
 /// ---
 /// @resource("file:///readme", "Readme", "text/markdown")
 /// @priority(0.9) @audience("user")
-/// string readme() { return "..."; }
+/// string readme() @safe { return "..."; }
 /// ---
 struct audience
 {
@@ -277,14 +330,17 @@ struct audience
 
 /// Positional value UDA declaring the importance `priority` (0.0..1.0) for a
 /// `@resource`- or `@resourceTemplate`-annotated method (the MCP
-/// `Annotations.priority` field). Absence leaves the priority unset.
+/// `Annotations.priority` field). Absence leaves the priority unset. A value
+/// outside that range is a compile-time error: the check runs whether or not
+/// contracts are compiled in.
 struct priority
 {
 	double value; /// importance 0.0 (least) .. 1.0 (most)
 
 	this(double value) @safe pure nothrow
-	in (value >= 0.0 && value <= 1.0, "@priority value must be in [0.0, 1.0]")
 	{
+		if (!(value >= 0.0 && value <= 1.0))
+			assert(0, "@priority value must be in [0.0, 1.0]");
 		this.value = value;
 	}
 }
@@ -297,11 +353,14 @@ struct lastModified
 	string value; /// ISO 8601 last-modified timestamp
 }
 
-/// Method-level UDA documenting a named parameter of a `@tool`, `@task`, or
+/// Method-level UDA documenting a named parameter of a `@tool`, `@taskTool`, or
 /// `@prompt` method. Attach it to the method declaration (never inline to a
 /// parameter); `parameter` names the argument it documents and `description`
 /// is the human-readable text folded into that property's JSON Schema
 /// `description` (or, for prompts, into `PromptArgument.description`).
+///
+/// A parameter is named by its wire name, the identifier with one trailing
+/// underscore dropped (`version` for `string version_`), as for `@mcpHeader`.
 ///
 /// Repeatable: attach one `@describeParam` per documented parameter. Naming a
 /// parameter that the method does not declare — or an injected context
@@ -313,7 +372,7 @@ struct lastModified
 /// @tool("annotate", "Annotate a document")
 /// @describeParam("id", "the document id")
 /// @describeParam("count", "how many copies")
-/// string annotate(string id, int count) { ... }
+/// string annotate(string id, int count) @safe { ... }
 /// ---
 struct describeParam
 {
@@ -341,7 +400,7 @@ struct describeParam
 /// ---
 /// @tool("query", "Query a region")
 /// @mcpHeader("region", "Region")
-/// string query(string region) { ... }
+/// string query(string region) @safe { ... }
 /// ---
 struct mcpHeader
 {
@@ -349,9 +408,9 @@ struct mcpHeader
 	string name; /// the header suffix, e.g. "Region" -> `Mcp-Param-Region`
 }
 
-/// UDA declaring a display icon for a `@tool`, `@resource`, or
-/// `@resourceTemplate`-annotated method (the MCP `Icons` mixin: `Tool.icons`,
-/// `Resource.icons`). Attach one or more `@icon` UDAs to the same method; each
+/// UDA declaring a display icon for a `@tool`, `@taskTool`, `@prompt`,
+/// `@resource`, or `@resourceTemplate`-annotated method (the MCP `Icons` mixin:
+/// `Tool.icons`, `Prompt.icons`, `Resource.icons`). Attach one or more `@icon` UDAs to the same method; each
 /// becomes an entry in the descriptor's `icons` array. `src` is required;
 /// `mimeType`, `sizes`, and `theme` are optional.
 ///
@@ -359,7 +418,7 @@ struct mcpHeader
 /// ---
 /// @tool("draw", "Draw something")
 /// @icon("https://example.com/draw.png", "image/png", ["48x48"], "dark")
-/// string draw(string spec) { ... }
+/// string draw(string spec) @safe { ... }
 /// ---
 struct icon
 {
@@ -373,13 +432,15 @@ struct icon
 /// Apps `_meta.ui` field on `Tool`). `resourceUri` points at the `ui://`
 /// resource a host renders for this tool; the optional trailing `visibility`
 /// roles name who may invoke the tool ("model" and/or "app"). The reflection
-/// layer folds this into the tool's `_meta.ui`, merging with any `@meta` object.
+/// layer folds this into the tool's `_meta.ui`, merging with any `@meta` object,
+/// and rejects at compile time a `resourceUri` outside the `ui://` scheme or a
+/// role other than "model" / "app".
 ///
 /// Example:
 /// ---
 /// @tool("get_weather", "Show the weather dashboard")
 /// @ui("ui://weather/dashboard", "model", "app")
-/// WeatherData getWeather(string city) { ... }
+/// WeatherData getWeather(string city) @safe { ... }
 /// ---
 struct ui
 {
@@ -393,31 +454,39 @@ struct ui
 	}
 }
 
-/// UDA attaching a descriptor-level `_meta` object to a `@tool`, `@resource`,
-/// or `@resourceTemplate`-annotated method (the MCP `_meta` field on `Tool`,
-/// `Resource`, `ResourceTemplate`). The supplied JSON must be an object; it is
-/// emitted verbatim as the descriptor's `_meta`.
+/// UDA attaching a descriptor-level `_meta` object to a `@tool`, `@taskTool`,
+/// `@prompt`, `@resource`, or `@resourceTemplate`-annotated method (the MCP
+/// `_meta` field on `Tool`, `Prompt`, `Resource`, `ResourceTemplate`). The supplied JSON must be an object, or
+/// registration is a compile error; it is emitted verbatim as the descriptor's
+/// `_meta`. On a tool that also carries `@ui`, it must not set the `ui` key,
+/// which `@ui` writes.
 ///
 /// Example:
 /// ---
 /// import vibe.data.json : parseJsonString;
 /// @tool("x", "X")
 /// @meta(parseJsonString(`{"category":"math"}`))
-/// int x() { ... }
+/// int x() @safe { ... }
 /// ---
 struct meta
 {
-	Json value; /// the `_meta` object (must be a JSON object to be emitted)
+	Json value; /// the `_meta` object
 }
 
 /// The JSON Schema constraint UDAs (`@fieldDescription`, `@minimum`, `@maximum`,
-/// `@title`, `@format`, `@minLength`, `@maxLength`, `@pattern`, `@minItems`,
+/// `@title`, `@schemaFormat`, `@minLength`, `@maxLength`, `@pattern`, `@minItems`,
 /// `@maxItems`, `@schemaDefault`/`SchemaDefault`) are owned by the `jsonschema`
-/// package, which also owns the schema generation (`jsonSchemaOf`) and facet
-/// application (`applyUdaFacets`) that consume them. They are re-exported here so
-/// MCP users get them from `mcp.api.attributes` alongside the MCP-specific UDAs,
-/// and so the type identity matches what `jsonschema` matches against.
-public import jsonschema : fieldDescription, minimum, maximum, title, format,
+/// package, which also owns the facet application (`applyUdaFacets`) that
+/// `jsonSchemaOf` uses. They are re-exported here so MCP users get them from
+/// `mcp.api.attributes` alongside the MCP-specific UDAs, and so the type identity matches what `jsonschema` matches against. The
+/// `format` facet is re-exported as `schemaFormat` so `import mcp;` does not
+/// collide with `std.format.format`. They attach to a handler parameter or a
+/// struct field; one attached to a handler method is a compile error (a tool's
+/// display title is `@tool`'s `title` argument, or `@hintTitle` for its
+/// annotations). A `@prompt` parameter takes only `@fieldDescription`, `@title`,
+/// and `@schemaDefault`, and a `@resourceTemplate` parameter none, since neither
+/// has a JSON Schema for the others to constrain.
+public import jsonschema : fieldDescription, minimum, maximum, title, schemaFormat = format,
 	minLength, maxLength, pattern, minItems, maxItems, SchemaDefault, schemaDefault;
 
 /// UDA declaring a per-resource / per-template modern `CacheableResult` freshness
@@ -426,18 +495,18 @@ public import jsonschema : fieldDescription, minimum, maximum, title, format,
 /// `resources/read` carries `ttlMs` / `cacheScope`. Has no effect on legacy
 /// protocol versions (the server only emits cache fields when negotiated to the modern protocol).
 ///
-/// `scope_` is `"public"` (the default) or `"private"`.
+/// `scope_` is `CacheScope.public_` (the default) or `CacheScope.private_`.
 ///
 /// Example:
 /// ---
 /// @resource("file:///data", "Data", "application/json")
-/// @cache(5.seconds, "private")
-/// string data() { ... }
+/// @cacheable(5.seconds, CacheScope.private_)
+/// string data() @safe { ... }
 /// ---
-struct cache
+struct cacheable
 {
 	Duration ttl; /// how long the result may be cached
-	string scope_ = "public"; /// "public" (default) | "private"
+	CacheScope scope_ = CacheScope.public_; /// who may cache the result
 }
 
 unittest  // @priority accepts in-range values
@@ -452,7 +521,7 @@ unittest  // @priority accepts the boundary values 0.0 and 1.0
 	assert(priority(1.0).value == 1.0);
 }
 
-unittest  // @priority rejects out-of-range values via its contract
+unittest  // @priority rejects out-of-range values
 {
 	import core.exception : AssertError;
 
@@ -467,4 +536,15 @@ unittest  // @priority rejects out-of-range values via its contract
 
 	assert(rejects(5.0));
 	assert(rejects(-1.0));
+}
+
+unittest  // @cacheable takes its scope as a CacheScope, defaulting to public
+{
+	import core.time : seconds;
+	import mcp.protocol.modern : CacheScope;
+
+	static assert(is(typeof(cacheable.init.scope_) == CacheScope));
+	static assert(cacheable.init.scope_ == CacheScope.public_);
+	static assert(!__traits(compiles, cacheable(1.seconds, "private")));
+	static assert(cacheable(1.seconds, CacheScope.private_).scope_ == CacheScope.private_);
 }

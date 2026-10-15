@@ -44,7 +44,7 @@ private ubyte[] base64UrlDecode(string seg) @safe
 {
 	import std.base64 : Base64URLNoPadding;
 
-	return () @trusted { return Base64URLNoPadding.decode(seg); }();
+	return Base64URLNoPadding.decode(seg);
 }
 
 /// Current wall-clock time in unix seconds.
@@ -74,8 +74,9 @@ enum RequestStateBinding
 	none,
 	/// Bind to the authenticated subject (`ctx.auth().subject`).
 	authSubject,
-	/// Bind to the authenticated subject AND the tool/prompt name, so a blob
-	/// issued by one tool cannot be replayed into another.
+	/// Bind to the authenticated subject AND the request method plus tool/prompt
+	/// name, so a blob issued by one tool cannot be replayed into another tool,
+	/// nor into a prompt that shares its name.
 	authSubjectAndTool,
 }
 
@@ -107,21 +108,28 @@ struct RequestStateSecurity
 /// wire; `decode` verifies an echoed blob and returns the inner state, or null
 /// when verification fails (the caller then treats it as no state and
 /// re-elicits). All crypto is fail-closed.
-final class RequestStateCodec
+package(mcp) final class RequestStateCodec
 {
 	private const ubyte[32] cipherKey;
-	private const ubyte[32] macSubkey;
+	private const ubyte[32] bindSubkey;
+	private const ubyte[32] payloadMacSubkey;
 	private const RequestStateMode mode;
 	private const Duration ttl;
 	private const RequestStateBinding bindTo;
 
+	/// Throws when `sec.key` is shorter than 32 bytes.
 	this(RequestStateSecurity sec) @safe
 	{
-		// Split the operator secret into two independent sub-keys via HKDF-SHA256
-		// (RFC 5869) with distinct info labels, so the AES key and the HMAC key
-		// share no bytes even when the secret is exactly 32 bytes long.
+		if (sec.key.length < 32)
+			throw new Exception("secureRequestState: key must be at least 32 bytes");
+		// Split the operator secret into independent sub-keys via HKDF-SHA256
+		// (RFC 5869) with distinct info labels, one per use, so the AES key, the
+		// bind-tag key and the payload-MAC key share no bytes even when the
+		// secret is exactly 32 bytes long, and a bind tag can never double as a
+		// payload MAC.
 		this.cipherKey = hkdfSha256Subkey(sec.key, "mcp.requestState aes-256-gcm key");
-		this.macSubkey = hkdfSha256Subkey(sec.key, "mcp.requestState bind-hmac key");
+		this.bindSubkey = hkdfSha256Subkey(sec.key, "mcp.requestState bind-hmac key");
+		this.payloadMacSubkey = hkdfSha256Subkey(sec.key, "mcp.requestState payload-hmac key");
 		this.mode = sec.mode;
 		this.ttl = sec.ttl;
 		this.bindTo = sec.bindTo;
@@ -146,7 +154,7 @@ final class RequestStateCodec
 		final switch (mode)
 		{
 		case RequestStateMode.signed:
-			const mac = hmacSha256(macKey(), payloadBytes);
+			const mac = hmacSha256(payloadMacKey(), payloadBytes);
 			return "v1." ~ base64UrlNoPad(payloadBytes) ~ "." ~ base64UrlNoPad(mac);
 		case RequestStateMode.encrypted:
 			ubyte[12] nonce;
@@ -189,7 +197,7 @@ final class RequestStateCodec
 		// Reject an absent or wrong-length MAC outright; a valid MAC is 32 bytes.
 		if (presentedMac.length != 32)
 			return Nullable!string.init;
-		const expectedMac = hmacSha256(macKey(), payloadBytes);
+		const expectedMac = hmacSha256(payloadMacKey(), payloadBytes);
 		if (!constantTimeEquals(presentedMac, expectedMac))
 			return Nullable!string.init;
 		return openEnvelope(payloadBytes, subject, toolName);
@@ -245,7 +253,7 @@ final class RequestStateCodec
 		string material = subject;
 		if (bindTo == RequestStateBinding.authSubjectAndTool)
 			material = subject ~ "\0" ~ toolName;
-		const mac = hmacSha256(macKey(), cast(const(ubyte)[]) material.representation);
+		const mac = hmacSha256(bindKey(), cast(const(ubyte)[]) material.representation);
 		return toHex(mac);
 	}
 
@@ -255,10 +263,16 @@ final class RequestStateCodec
 		return cipherKey[];
 	}
 
-	/// The HMAC sub-key for bind tags and signed-mode payload MACs.
-	private const(ubyte)[] macKey() @safe
+	/// The HMAC sub-key for bind tags.
+	private const(ubyte)[] bindKey() @safe
 	{
-		return macSubkey[];
+		return bindSubkey[];
+	}
+
+	/// The HMAC sub-key for signed-mode payload MACs.
+	private const(ubyte)[] payloadMacKey() @safe
+	{
+		return payloadMacSubkey[];
 	}
 }
 
@@ -267,22 +281,25 @@ final class RequestStateCodec
 // ===========================================================================
 
 /// The identity an MRTR `requestState` blob is bound to: the request's
-/// authenticated subject (empty on stdio / in-process, where binding is a
-/// no-op). Shared by the incoming/outgoing seams so both sides bind to the same
+/// authenticated subject (empty without a valid token, e.g. on stdio /
+/// in-process, where binding is a no-op). Shared by the incoming/outgoing seams so both sides bind to the same
 /// identity.
 package string requestStateSubject(RequestContext ctx) @safe
 {
-	return ctx.auth().subject;
+	const token = ctx.auth();
+	return token.valid ? token.subject : "";
 }
 
-/// The tool/prompt name (the top-level `params.name`) an MRTR `requestState`
-/// blob binds to under the `authSubjectAndTool` binding.
-package string requestStateToolName(Json params) @safe
+/// The target an MRTR `requestState` blob binds to under the
+/// `authSubjectAndTool` binding: the request method and the tool/prompt name (the
+/// top-level `params.name`), NUL-separated so neither part can absorb the other.
+package string requestStateTarget(string method, Json params) @safe
 {
+	string name;
 	if (params.type == Json.Type.object && "name" in params
 			&& params["name"].type == Json.Type.string)
-		return params["name"].get!string;
-	return "";
+		name = params["name"].get!string;
+	return method ~ "\0" ~ name;
 }
 
 /// Verify an incoming (echoed) MRTR `requestState`. With no codec configured
@@ -290,24 +307,21 @@ package string requestStateToolName(Json params) @safe
 /// the codec enabled, a non-empty blob is decoded and verified against the
 /// request's authenticated subject and tool name; on success the inner state
 /// is returned, and on ANY failure (tamper / GCM auth fail / expiry /
-/// wrong-subject / unparseable) it fails closed to an empty string so the
-/// handler re-elicits, with a warning logged. The transparent re-elicit means
-/// no rejection is surfaced to the handler.
-package string verifyIncomingRequestState(RequestStateCodec codec, string raw,
-		string method, Json params, RequestContext ctx) @safe
+/// wrong-subject / unparseable) it fails closed to null, with a warning
+/// logged. The caller then runs the request as a fresh round, so no rejection
+/// is surfaced to the handler.
+package Nullable!string verifyIncomingRequestState(RequestStateCodec codec,
+		string raw, string method, Json params, RequestContext ctx) @safe
 {
 	import vibe.core.log : logWarn;
 
 	if (codec is null || raw.length == 0)
-		return raw;
-	auto decoded = codec.decode(raw, requestStateSubject(ctx), requestStateToolName(params));
+		return nullable(raw);
+	auto decoded = codec.decode(raw, requestStateSubject(ctx), requestStateTarget(method, params));
 	if (decoded.isNull)
-	{
 		logWarn("secureRequestState: rejected an echoed requestState on %s "
 				~ "(tamper, expiry, wrong-subject, or malformed); re-eliciting.", method);
-		return "";
-	}
-	return decoded.get;
+	return decoded;
 }
 
 /// Wrap an outgoing MRTR `requestState` on an input-required result. With no
@@ -315,8 +329,8 @@ package string verifyIncomingRequestState(RequestStateCodec codec, string raw,
 /// (plaintext, no wire change). With the codec enabled, a non-empty top-level
 /// `requestState` string is replaced by an integrity-protected (and optionally
 /// encrypted), expiry-stamped, user-bound blob bound to the same subject/tool
-/// the incoming seam will verify against. Tool, prompt, and task input-required
-/// results all share this single top-level field, so one seam covers all three.
+/// the incoming seam will verify against. Tool and prompt input-required results
+/// share this single top-level field, so one seam covers both.
 package Json secureOutgoingRequestState(RequestStateCodec codec, Json result,
 		string method, Json params, RequestContext ctx) @safe
 {
@@ -328,7 +342,7 @@ package Json secureOutgoingRequestState(RequestStateCodec codec, Json result,
 	if (plain.length == 0)
 		return result;
 	result["requestState"] = codec.encode(plain, requestStateSubject(ctx),
-			requestStateToolName(params));
+			requestStateTarget(method, params));
 	return result;
 }
 
@@ -524,6 +538,18 @@ version (unittest)
 	}
 }
 
+unittest  // the codec refuses a key shorter than 32 bytes
+{
+	import std.exception : assertThrown;
+
+	RequestStateSecurity sec;
+	assertThrown(new RequestStateCodec(sec));
+	sec.key = new ubyte[31];
+	assertThrown(new RequestStateCodec(sec));
+	sec.key = new ubyte[32];
+	new RequestStateCodec(sec);
+}
+
 unittest  // signed mode round-trips the inner state for the same subject
 {
 	auto codec = signedCodec();
@@ -660,5 +686,56 @@ unittest  // encrypted: AES and bind-HMAC keys are independent (no key reuse)
 	// key length. The AES sub-key and the bind-HMAC sub-key MUST NOT share bytes,
 	// otherwise recovering one key compromises the other.
 	auto codec = encryptedCodec();
-	assert(codec.aesKey() != codec.macKey());
+	assert(codec.aesKey() != codec.bindKey());
+	assert(codec.aesKey() != codec.payloadMacKey());
+}
+
+unittest  // signed: bind tags and payload MACs are keyed independently
+{
+	auto codec = encryptedCodec();
+	assert(codec.bindKey() != codec.payloadMacKey());
+}
+
+unittest  // authSubjectAndTool rejects a requestState minted for another method with the same name
+{
+	import mcp.auth.resource_server : TokenInfo;
+	import mcp.server.context : BaseRequestContext;
+
+	static final class AliceCtx : BaseRequestContext
+	{
+		override TokenInfo auth() @safe
+		{
+			TokenInfo t;
+			t.valid = true;
+			t.subject = "alice";
+			return t;
+		}
+	}
+
+	auto codec = signedCodec(RequestStateBinding.authSubjectAndTool);
+	auto ctx = new AliceCtx();
+	Json params = Json(["name": Json("x")]);
+	Json result = Json(["requestState": Json(`{"step":1}`)]);
+	const wire = secureOutgoingRequestState(codec, result, "prompts/get", params, ctx)["requestState"]
+		.get!string;
+	assert(verifyIncomingRequestState(codec, wire, "tools/call", params, ctx).isNull);
+	assert(verifyIncomingRequestState(codec, wire, "prompts/get", params, ctx).get == `{"step":1}`);
+}
+
+unittest  // requestStateSubject ignores the subject of a token that is not valid
+{
+	import mcp.auth.resource_server : TokenInfo;
+	import mcp.server.context : BaseRequestContext;
+
+	static final class InvalidAliceCtx : BaseRequestContext
+	{
+		override TokenInfo auth() @safe
+		{
+			TokenInfo t;
+			t.subject = "alice";
+			return t;
+		}
+	}
+
+	assert(requestStateSubject(new InvalidAliceCtx) == "");
 }

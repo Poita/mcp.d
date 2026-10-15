@@ -3,7 +3,7 @@
 A focused, runnable demonstration of **MCP Resources** from both sides, over
 **BOTH transports** — stdio and Streamable HTTP — from a single server binary
 and a single self-verifying client. It is its own dub package with a path
-dependency on the root `mcp` SDK (it does not modify the root `dub.json`).
+dependency on the root `mcp-d` SDK (it does not modify the root `dub.json`).
 
 ## What it teaches
 
@@ -11,7 +11,7 @@ Server side (`server.d`), written in the ergonomic **UDA style**
 (`@resource` / `@resourceTemplate` / `@tool` + `registerHandlers`):
 
 - **Direct resource** — a static `@resource` `config://app`, carrying a modern
-  `CacheableResult` freshness hint declared with `@cache(ttl, scope)` (a
+  `CacheableResult` freshness hint declared with `@cacheable(ttl, scope)` (a
   `core.time.Duration`) that rides on `resources/read` (serialized on the wire as
   `ttlMs` milliseconds).
 - **Resource template** — `@resourceTemplate("note:///{id}")`; the reader

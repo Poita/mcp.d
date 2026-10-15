@@ -20,8 +20,8 @@
  *      (The server uses a fixed "fake auth" principal so webhook subscribe is
  *      permitted; the spec forbids webhook on unauthenticated servers.)
  *
- * Events is modern-only, so the client switches to the modern protocol
- * (`enableModern`) before negotiation.
+ * Events is modern-only; `connect()` negotiates 2026-07-28 with this stateless
+ * server.
  */
 module events_client;
 
@@ -30,7 +30,6 @@ import std.stdio : writeln;
 import core.time : msecs;
 import std.conv : to;
 import vibe.core.core : sleep;
-import vibe.data.json : Json, parseJsonString;
 import vibe.http.server : listenHTTP, HTTPListener, HTTPServerSettings,
 	HTTPServerRequest, HTTPServerResponse;
 import vibe.stream.operations : readAllUTF8;
@@ -48,8 +47,8 @@ int main(string[] args) @safe
 		scope (exit)
 			client.close();
 
-		// Events is modern-only: switch to the modern protocol before negotiation.
-		client.enableModern();
+		// Events is modern-only; connect() negotiates 2026-07-28.
+		client.connect();
 
 		// --- 1. server/discover advertises the events extension --------------
 		auto disc = client.discover();
@@ -58,7 +57,6 @@ int main(string[] args) @safe
 		check("extensions" in caps && (eventsExtensionKey in caps["extensions"]) !is null,
 			"discover capabilities.extensions should contain the events extension key");
 
-		client.connect();
 		check(client.eventsSupported(), "client.eventsSupported() should be true");
 
 		// --- 2. events/list declares incident.created -----------------------
@@ -75,13 +73,16 @@ int main(string[] args) @safe
 
 		// --- 3. POLL: bootstrap, raise, then drain the occurrence ------------
 		{
-			auto boot = client.pollEvents("incident.created");
+			auto boot = client.pollEvents(PollParams("incident.created"));
 			check(boot.events.length == 0, "bootstrap poll returns no events");
 			auto cursor = boot.cursor;
 
 			client.callTool("raise_incident", Json(["severity": Json("P1")]));
 
-			auto polled = client.pollEvents("incident.created", Json.emptyObject, cursor);
+			PollParams next;
+			next.name = "incident.created";
+			next.cursor = cursor;
+			auto polled = client.pollEvents(next);
 			check(polled.events.length >= 1, "poll after raise should drain the incident");
 			checkEq(polled.events[0].data["severity"].get!string, "P1",
 				"polled incident severity");
@@ -94,7 +95,8 @@ int main(string[] args) @safe
 			// Occurrences and control frames arrive on this stream's own handlers,
 			// already typed — no global onNotification, no manual subscriptionId
 			// routing.
-			auto stream = client.streamEvents("incident.created", (EventOccurrence occ) @safe {
+			auto stream = client.streamEvents(StreamParams("incident.created"),
+				(EventOccurrence occ) @safe {
 				eventCount++;
 				if ("severity" in occ.data)
 					lastEventSeverity = occ.data["severity"].get!string;
@@ -129,7 +131,7 @@ int main(string[] args) @safe
 
 			// Run the receiver as a loopback HTTP listener the server can POST to.
 			HTTPListener listener;
-			() @trusted {
+			{
 				auto settings = new HTTPServerSettings;
 				settings.port = receiverPort;
 				settings.bindAddresses = ["127.0.0.1"];
@@ -150,9 +152,9 @@ int main(string[] args) @safe
 					res.statusCode = resp.status;
 					res.writeBody(resp.body, "application/json");
 				});
-			}();
+			}
 			scope (exit)
-				() @trusted { listener.stopListening(); }();
+				listener.stopListening();
 
 			// One managed call: subscribe, register the receiver under the
 			// server-derived id, and (when the grant expires) keep it refreshed.

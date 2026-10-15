@@ -13,21 +13,27 @@ module mcp.auth.login;
  * `TokenStore` (default: file-backed), and transparently refreshes the access
  * token on expiry before each request.
  *
- * Loopback redirect URIs (`http://localhost:<port>/callback`) are explicitly
+ * Loopback redirect URIs (`http://127.0.0.1:<port>/callback`) are explicitly
  * permitted by the MCP authorization spec: "All redirect URIs MUST be either
- * `localhost` or use HTTPS." PKCE S256 is enforced by the underlying
+ * `localhost` or use HTTPS." The `127.0.0.1` literal is used rather than
+ * `localhost` because that is the address the listener binds (RFC 8252 §8.3).
+ * PKCE S256 is enforced by the underlying
  * `OAuthClient`, and the RFC 8707 `resource` parameter is sent on both the
  * authorization and token requests.
  */
 
 import core.time : Duration, minutes;
 
+import vibe.core.sync : TaskMutex;
 import vibe.data.json : Json, parseJsonString;
 
 import mcp.protocol.errors;
+import mcp.protocol.ssrf : SsrfPolicy;
+import std.typecons : Nullable;
 import mcp.auth.oauth;
 import mcp.auth.client;
 import mcp.client.client : McpClient;
+import mcp.client.transport : BearerProvider;
 
 @safe:
 
@@ -50,11 +56,54 @@ struct StoredToken
 	/// DCR-issued). Persisted so a later refresh can authenticate at the token
 	/// endpoint even when no `client_id` was statically configured.
 	string clientId;
+	/// The client secret issued alongside a dynamically registered `clientId`,
+	/// persisted so a later refresh can authenticate as that client.
+	string clientSecret;
+	/// RFC 7591 `client_secret_expires_at` for `clientSecret` (absolute unix
+	/// seconds); 0 means it does not expire.
+	long clientSecretExpiresAt;
+	/// The `token_endpoint_auth_method` the authorization server assigned the
+	/// dynamically registered `clientId` (RFC 7591 §3.2.1), persisted so a later
+	/// refresh authenticates the way that registration requires. Empty when the
+	/// configured `OAuthLogin.authMethod` applies.
+	string tokenEndpointAuthMethod;
+	/// The issuer of the authorization server that issued this token. `useOAuth`
+	/// reuses or refreshes the token only with that same server, so a record
+	/// with a different or empty issuer is treated as absent.
+	string issuer;
+
+	/// Record the client registration this token was obtained under.
+	void setClient(RegisteredClient rc) @safe pure nothrow @nogc
+	{
+		clientId = rc.clientId;
+		clientSecret = rc.clientSecret;
+		clientSecretExpiresAt = rc.clientSecretExpiresAt;
+	}
+
+	/// Whether the recorded client secret has expired at `now`, leaving the
+	/// registration unusable for authenticating a refresh.
+	bool clientSecretExpired(long now) const @safe pure nothrow @nogc
+	{
+		return clientSecretExpiresAt != 0 && now >= clientSecretExpiresAt;
+	}
 
 	/// Whether this record holds a usable access token.
 	bool hasToken() const @safe pure nothrow @nogc
 	{
 		return accessToken.length > 0;
+	}
+
+	/// Whether the token's granted `scope_` includes every scope in `requested`.
+	/// A step-up request for a scope the token lacks needs a new authorization:
+	/// neither reusing nor refreshing the token can widen it.
+	bool grantsScopes(const string[] requested) const @safe pure
+	{
+		import std.algorithm : canFind, splitter;
+
+		foreach (sc; requested)
+			if (!scope_.splitter(' ').canFind(sc))
+				return false;
+		return true;
 	}
 
 	/// Build a `StoredToken` from a freshly issued `TokenSet`, computing the
@@ -83,6 +132,11 @@ struct StoredToken
 		j["scope"] = scope_;
 		j["resource"] = resource;
 		j["client_id"] = clientId;
+		j["client_secret"] = clientSecret;
+		j["client_secret_expires_at"] = Json(clientSecretExpiresAt);
+		if (tokenEndpointAuthMethod.length)
+			j["token_endpoint_auth_method"] = tokenEndpointAuthMethod;
+		j["issuer"] = issuer;
 		return j;
 	}
 
@@ -105,6 +159,14 @@ struct StoredToken
 			s.resource = p.type == Json.Type.string ? p.get!string : "";
 		if (auto p = "client_id" in j)
 			s.clientId = p.type == Json.Type.string ? p.get!string : "";
+		if (auto p = "client_secret" in j)
+			s.clientSecret = p.type == Json.Type.string ? p.get!string : "";
+		if (auto p = "client_secret_expires_at" in j)
+			s.clientSecretExpiresAt = p.type == Json.Type.int_ ? p.get!long : 0;
+		if (auto p = "token_endpoint_auth_method" in j)
+			s.tokenEndpointAuthMethod = p.type == Json.Type.string ? p.get!string : "";
+		if (auto p = "issuer" in j)
+			s.issuer = p.type == Json.Type.string ? p.get!string : "";
 		return s;
 	}
 }
@@ -120,13 +182,39 @@ interface TokenStore
 
 	/// Persist `token` for `resource`, replacing any previous value.
 	void save(string resource, StoredToken token) @safe;
+
+	/// Run `dg` holding the store's exclusive lock for `resource`, which other
+	/// sessions sharing the store (other processes, for a file-backed store)
+	/// also take. `OAuthSession` and `useOAuth` hold it from loading a token
+	/// through refreshing and saving it, so two sessions never present the same
+	/// rotating refresh token (which an authorization server may answer by
+	/// revoking the whole token family). `load` and `save` may be called
+	/// inside `dg`, and the lock is reentrant. It may cover more than
+	/// `resource`.
+	void withLock(string resource, scope void delegate() @safe dg) @safe;
 }
 
 /// An in-memory `TokenStore` (no persistence across processes). Useful for
 /// tests and ephemeral sessions.
 final class MemoryTokenStore : TokenStore
 {
+	import vibe.core.sync : RecursiveTaskMutex;
+
 	private StoredToken[string] tokens_;
+	private RecursiveTaskMutex lock_;
+
+	this() @safe
+	{
+		lock_ = new RecursiveTaskMutex;
+	}
+
+	override void withLock(string resource, scope void delegate() @safe dg) @safe
+	{
+		lock_.lock();
+		scope (exit)
+			lock_.unlock();
+		dg();
+	}
 
 	override StoredToken load(string resource) @safe
 	{
@@ -141,6 +229,62 @@ final class MemoryTokenStore : TokenStore
 	}
 }
 
+version (Posix)
+{
+	// BSD `flock(2)`, available on Linux, macOS and the BSDs. Unlike `fcntl`
+	// record locks it belongs to the open file description, so closing an
+	// unrelated descriptor for the same file does not release it.
+	private extern (C) int flock(int fd, int operation) nothrow @nogc @system;
+	private enum int LOCK_EX = 2;
+	private enum int LOCK_UN = 8;
+}
+
+/// The in-process side of one token lock file, shared by every `FileTokenStore`
+/// on that path: a reentrant task mutex serializes the process's tasks and
+/// threads, and the outermost holder keeps the OS file lock that excludes other
+/// processes.
+private final class TokenFileLock
+{
+	import vibe.core.sync : RecursiveTaskMutex;
+
+	RecursiveTaskMutex mutex;
+	size_t depth; /// nesting of the holder's lock calls; touched only by the holder
+	version (Posix)
+		int fd = -1;
+	else version (Windows)
+	{
+		import core.sys.windows.windows : HANDLE;
+
+		HANDLE handle;
+	}
+
+	this() @safe
+	{
+		mutex = new RecursiveTaskMutex;
+	}
+}
+
+private __gshared TokenFileLock[string] tokenFileLocks;
+private __gshared Object tokenFileLocksGuard;
+
+shared static this() @trusted
+{
+	tokenFileLocksGuard = new Object;
+}
+
+/// The process-wide lock state for the lock file at `lockPath`.
+private TokenFileLock tokenFileLockFor(string lockPath) @trusted
+{
+	synchronized (tokenFileLocksGuard)
+	{
+		if (auto p = lockPath in tokenFileLocks)
+			return *p;
+		auto l = new TokenFileLock;
+		tokenFileLocks[lockPath] = l;
+		return l;
+	}
+}
+
 /// A file-backed `TokenStore`. Tokens for all resources are stored as a single
 /// JSON object (`{ "<resource>": { ... } }`) at `path`.
 ///
@@ -148,6 +292,11 @@ final class MemoryTokenStore : TokenStore
 /// the JSON blob at rest (e.g. with a key from the OS keychain). The plaintext
 /// implementation writes the file with owner-only (`0600`) permissions on
 /// POSIX.
+///
+/// `save` and `withLock` hold an exclusive advisory lock on the sidecar file
+/// `path ~ ".lock"`, so several processes sharing one token file (for example
+/// two MCP clients refreshing at once) never drop each other's tokens or
+/// present the same refresh token.
 class FileTokenStore : TokenStore
 {
 	/// The on-disk path of the token file.
@@ -187,7 +336,7 @@ class FileTokenStore : TokenStore
 			return Json.emptyObject;
 		try
 		{
-			auto data = () @trusted { return cast(const(ubyte)[]) read(path); }();
+			auto data = cast(const(ubyte)[]) read(path);
 			auto j = deserialize(data);
 			return j.type == Json.Type.object ? j : Json.emptyObject;
 		}
@@ -217,36 +366,145 @@ class FileTokenStore : TokenStore
 
 	override void save(string resource, StoredToken token) @safe
 	{
-		import std.file : mkdirRecurse, rename;
+		import std.file : exists, isDir, mkdirRecurse, rename;
 		import std.path : dirName;
 
 		auto dir = dirName(path);
-		if (dir.length && dir != ".")
+		// Only a directory the store creates is made owner-only; an existing one
+		// (e.g. the user's home directory) is the user's to manage.
+		if (dir.length && dir != "." && !(dir.exists && dir.isDir))
 		{
 			try
-				() @trusted { mkdirRecurse(dir); }();
+				mkdirRecurse(dir);
 			catch (Exception e)
 				throw internalError(
 						"FileTokenStore: could not create token directory " ~ dir ~ ": " ~ e.msg);
 			restrictDirPermissions(dir);
 		}
 
-		bool corrupt;
-		auto all = tryReadMap(corrupt);
-		// Do not silently overwrite an unparseable token file: preserve its bytes
-		// alongside (path~) so any recoverable tokens for other resources are not
-		// destroyed by this save.
-		if (corrupt)
-			() @trusted {
-			try
-				rename(path, path ~ "~");
-			catch (Exception)
+		withFileLock(() @safe {
+			bool corrupt;
+			auto all = tryReadMap(corrupt);
+			// Do not silently overwrite an unparseable token file: preserve its bytes
+			// alongside (path~) so any recoverable tokens for other resources are not
+			// destroyed by this save.
+			if (corrupt)
 			{
+				try
+					rename(path, path ~ "~");
+				catch (Exception)
+				{
+				}
 			}
-		}();
-		all[resource] = token.toJson();
-		auto bytes = serialize(all);
-		writeSecretFile(bytes);
+			all[resource] = token.toJson();
+			auto bytes = serialize(all);
+			writeSecretFile(bytes);
+		});
+	}
+
+	override void withLock(string resource, scope void delegate() @safe dg) @safe
+	{
+		withFileLock(dg);
+	}
+
+	/// Run `fn` holding an exclusive lock on the sidecar file `path ~ ".lock"`,
+	/// so processes, threads and tasks sharing the token file serialize their
+	/// read-modify-write and none loses another's update. The lock is reentrant
+	/// within a task. The token file itself is replaced by rename, so it cannot
+	/// carry the lock.
+	private void withFileLock(scope void delegate() @safe fn) @safe
+	{
+		if (!path.length)
+			return fn();
+		const lockPath = path ~ ".lock";
+		auto l = tokenFileLockFor(lockPath);
+		l.mutex.lock();
+		scope (exit)
+			l.mutex.unlock();
+		if (l.depth == 0)
+			acquireOsLock(l, lockPath);
+		++l.depth;
+		scope (exit)
+			if (--l.depth == 0)
+				releaseOsLock(l);
+		fn();
+	}
+
+	// Take the OS lock other processes contend on, keeping its handle in `l`.
+	private static void acquireOsLock(TokenFileLock l, string lockPath) @safe
+	{
+		version (Posix)
+		{
+			import core.stdc.errno : EINTR, errno;
+			import core.sys.posix.fcntl : open, O_CREAT, O_RDWR;
+			import core.sys.posix.unistd : close;
+			import std.string : toStringz;
+
+			const fd = () @trusted {
+				return open(lockPath.toStringz, O_CREAT | O_RDWR, 384); // 0600
+			}();
+			if (fd < 0)
+				throw internalError("FileTokenStore: could not open lock file " ~ lockPath);
+			int rc;
+			do
+				rc = () @trusted { return flock(fd, LOCK_EX); }();
+			while (rc != 0 && (()@trusted => errno)() == EINTR);
+			if (rc != 0)
+			{
+				close(fd);
+				throw internalError("FileTokenStore: could not lock " ~ lockPath);
+			}
+			l.fd = fd;
+		}
+		else version (Windows)
+		{
+			import core.sys.windows.windows : CloseHandle, CreateFileW,
+				FILE_ATTRIBUTE_NORMAL, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+				GENERIC_READ, GENERIC_WRITE, INVALID_HANDLE_VALUE,
+				LOCKFILE_EXCLUSIVE_LOCK, LockFileEx, OPEN_ALWAYS, OVERLAPPED;
+			import std.utf : toUTF16z;
+
+			auto h = () @trusted {
+				return CreateFileW(lockPath.toUTF16z, GENERIC_READ | GENERIC_WRITE,
+						FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+						null, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, null);
+			}();
+			if (h == INVALID_HANDLE_VALUE)
+				throw internalError("FileTokenStore: could not open lock file " ~ lockPath);
+			OVERLAPPED ov;
+			if (!()@trusted {
+					return LockFileEx(h, LOCKFILE_EXCLUSIVE_LOCK, 0, 1, 0, &ov);
+				}())
+			{
+				() @trusted { CloseHandle(h); }();
+				throw internalError("FileTokenStore: could not lock " ~ lockPath);
+			}
+			l.handle = h;
+		}
+	}
+
+	// Release the OS lock `acquireOsLock` took.
+	private static void releaseOsLock(TokenFileLock l) @safe nothrow
+	{
+		version (Posix)
+		{
+			import core.sys.posix.unistd : close;
+
+			// Closing the descriptor releases the lock.
+			() { close(l.fd); }();
+			l.fd = -1;
+		}
+		else version (Windows)
+		{
+			import core.sys.windows.windows : CloseHandle, OVERLAPPED, UnlockFileEx;
+
+			OVERLAPPED ov;
+			() @trusted {
+				UnlockFileEx(l.handle, 0, 1, 0, &ov);
+				CloseHandle(l.handle);
+			}();
+			l.handle = null;
+		}
 	}
 
 	/// Persist `bytes` to `path` such that the plaintext secrets they contain are
@@ -307,13 +565,11 @@ class FileTokenStore : TokenStore
 
 			void discardTmp() @safe nothrow
 			{
-				() @trusted {
-					try
-						remove(tmp);
-					catch (Exception)
-					{
-					}
-				}();
+				try
+					remove(tmp);
+				catch (Exception)
+				{
+				}
 			}
 
 			if (wrote && ()@trusted {
@@ -328,7 +584,7 @@ class FileTokenStore : TokenStore
 			// afterwards in case the file had to be created by `write`.
 			discardTmp();
 			restrictPermissions();
-			() @trusted { write(path, bytes); }();
+			write(path, bytes);
 			restrictPermissions();
 			return;
 		}
@@ -368,14 +624,14 @@ class FileTokenStore : TokenStore
 			if (!path.exists)
 				return;
 			try
-				() @trusted { setAttributes(path, S_IRUSR | S_IWUSR); }();
+				setAttributes(path, S_IRUSR | S_IWUSR);
 			catch (Exception e)
 			{
 				logWarn("FileTokenStore: could not restrict token file %s to owner-only (0600); "
 						~ "OAuth tokens may be readable by other local users: %s", path, e.msg);
 				return;
 			}
-			const mode = () @trusted { return getAttributes(path); }();
+			const mode = getAttributes(path);
 			if (stillGroupOrOtherAccessible(mode))
 				logWarn("FileTokenStore: token file %s remains group/other-accessible after "
 						~ "chmod; OAuth tokens may be exposed to other local users", path);
@@ -402,7 +658,7 @@ class FileTokenStore : TokenStore
 			if (dir.length && dir.exists)
 			{
 				try
-					() @trusted { setAttributes(dir, S_IRWXU); }();
+					setAttributes(dir, S_IRWXU);
 				catch (Exception)
 				{
 				}
@@ -492,12 +748,6 @@ struct LoopbackCapture
 	}
 }
 
-/// Parse the path+query of an inbound loopback HTTP request (e.g.
-/// `/callback?code=abc&state=xyz`) and extract the OAuth authorization response
-/// parameters. When `expectedState` is non-empty, a missing or mismatched
-/// `state` clears the captured `code` and records an error (MCP "Open
-/// Redirection": clients SHOULD verify the state parameter and discard
-/// mismatched results).
 /// Extract just the path component of an inbound HTTP request target, dropping
 /// any `?query` and `#fragment`. An empty target yields an empty path.
 string requestTargetPath(string requestTarget) @safe pure nothrow
@@ -512,6 +762,12 @@ string requestTargetPath(string requestTarget) @safe pure nothrow
 	return path;
 }
 
+/// Parse the path+query of an inbound loopback HTTP request (e.g.
+/// `/callback?code=abc&state=xyz`) and extract the OAuth authorization response
+/// parameters. When `expectedState` is non-empty, a missing or mismatched
+/// `state` clears the captured `code` and records an error (MCP "Open
+/// Redirection": clients SHOULD verify the state parameter and discard
+/// mismatched results).
 LoopbackCapture parseLoopbackCallback(string requestTarget, string expectedState = "") @safe
 {
 	LoopbackCapture c;
@@ -556,8 +812,14 @@ string loopbackResponseHtml(bool success) @safe pure nothrow
 /// client-registration inputs.
 struct OAuthLogin
 {
-	/// OAuth scopes to request (space-joined into the `scope` parameter).
+	/// OAuth scopes to request (space-joined into the `scope` parameter). When
+	/// empty, `useOAuth` requests the scopes named by `wwwAuthenticate`'s
+	/// challenge, else the protected-resource metadata's `scopes_supported`.
 	string[] scopes;
+	/// The `WWW-Authenticate` header of the 401 that prompted the login, if any.
+	/// Its `resource_metadata` URL is tried first for discovery and its `scope`
+	/// selects the scopes to request when `scopes` is empty.
+	string wwwAuthenticate;
 	/// Loopback listener port for the redirect. 0 selects an ephemeral port.
 	ushort callbackPort = 0;
 	/// The loopback path the authorization server redirects to.
@@ -573,8 +835,12 @@ struct OAuthLogin
 	/// SEP-991 OAuth Client ID Metadata Document URL (used as `client_id`
 	/// when the AS advertises `client_id_metadata_document_supported`).
 	string clientIdMetadataUrl;
-	/// How to authenticate at the token endpoint.
+	/// How to authenticate at the token endpoint. Under `none`, a supplied
+	/// `clientSecret` is sent with `client_secret_basic`.
 	TokenEndpointAuthMethod authMethod = TokenEndpointAuthMethod.none;
+	/// The SSRF policy for discovery, registration and token requests (see
+	/// `OAuthClient.ssrfPolicy`). Null anchors it at the MCP endpoint.
+	Nullable!SsrfPolicy ssrfPolicy;
 	/// Maximum time to wait for the authorization-server redirect to arrive on
 	/// the loopback listener before aborting the interactive flow. Bounds the
 	/// wait so an abandoned browser or an absent redirect cannot block the
@@ -594,41 +860,101 @@ struct OAuthLogin
 	}
 }
 
-/// The default loopback redirect URI for a given port and path.
+/// The scopes a login requests: `opts.scopes` when set, otherwise those chosen
+/// by `selectScope` from the `opts.wwwAuthenticate` challenge and the
+/// protected-resource metadata `prm`.
+package string[] loginScopes(const OAuthLogin opts, const ProtectedResourceMetadata prm) @safe
+{
+	import std.array : split;
+
+	if (opts.scopes.length)
+		return opts.scopes.dup;
+	const challengeScope = opts.wwwAuthenticate.length
+		? parseWwwAuthenticate(opts.wwwAuthenticate).scope_ : null;
+	return selectScope(challengeScope, prm.scopesSupported).split();
+}
+
+/// The scopes a cached token must have been granted to be reused: those named
+/// explicitly by `opts.scopes` or by the step-up challenge in
+/// `opts.wwwAuthenticate`. The `scopes_supported` fallback of `loginScopes` is
+/// not required, since an AS may grant a subset of what it advertises.
+package string[] requiredScopes(const OAuthLogin opts) @safe
+{
+	import std.array : split;
+
+	if (opts.scopes.length)
+		return opts.scopes.dup;
+	if (opts.wwwAuthenticate.length)
+		return parseWwwAuthenticate(opts.wwwAuthenticate).scope_.split();
+	return null;
+}
+
+/// The default loopback redirect URI for a given port and path. It names the
+/// `127.0.0.1` literal the callback listener binds (RFC 8252 §8.3): `localhost`
+/// may resolve to `::1` first, where nothing is listening.
 string loopbackRedirectUri(ushort port, string path = "/callback") @safe pure
 {
 	import std.conv : to;
 
-	auto p = path.length ? path : "/callback";
-	if (p[0] != '/')
-		p = "/" ~ p;
-	return "http://localhost:" ~ port.to!string ~ p;
+	return "http://127.0.0.1:" ~ port.to!string ~ normalizeCallbackPath(path);
 }
 
-/// The default token-store path under the user's config directory:
-/// `$XDG_CONFIG_HOME/dlang-mcp/tokens.json` (or `~/.config/...`), falling back
-/// to `./.dlang-mcp-tokens.json` when no home directory is known.
+/// The loopback callback path as it appears in the redirect URI: `/callback`
+/// when empty, and always with a leading slash.
+package string normalizeCallbackPath(string path) @safe pure nothrow
+{
+	if (path.length == 0)
+		return "/callback";
+	return path[0] == '/' ? path : "/" ~ path;
+}
+
+/// The default token-store path under the current user's config directory (see
+/// `tokenStorePathFor`). Throws `McpException` when the environment names no
+/// per-user directory.
 string defaultTokenStorePath() @safe
 {
 	import std.process : environment;
+
+	version (Windows)
+		enum windows = true;
+	else
+		enum windows = false;
+	return tokenStorePathFor((string name) @safe {
+		try
+			return environment.get(name, "");
+		catch (Exception)
+			return "";
+	}, windows);
+}
+
+/// The token-store path for an environment read through `getEnv`:
+/// `%APPDATA%\dlang-mcp\tokens.json` (else `%LOCALAPPDATA%`) on Windows, and
+/// `$XDG_CONFIG_HOME/dlang-mcp/tokens.json` (else `~/.config/...`) elsewhere.
+/// Tokens are secrets, so when no per-user directory is known this throws
+/// `McpException` rather than writing them into the working directory.
+string tokenStorePathFor(scope string delegate(string name) @safe getEnv, bool windows) @safe
+{
 	import std.path : buildPath;
 
 	string base;
-	try
+	if (windows)
 	{
-		base = environment.get("XDG_CONFIG_HOME", "");
+		base = getEnv("APPDATA");
+		if (base.length == 0)
+			base = getEnv("LOCALAPPDATA");
+	}
+	else
+	{
+		base = getEnv("XDG_CONFIG_HOME");
 		if (base.length == 0)
 		{
-			auto home = environment.get("HOME", "");
+			const home = getEnv("HOME");
 			if (home.length)
 				base = buildPath(home, ".config");
 		}
 	}
-	catch (Exception)
-	{
-	}
 	if (base.length == 0)
-		return ".dlang-mcp-tokens.json";
+		throw internalError(windows ? "no per-user directory for the OAuth token store: neither APPDATA nor LOCALAPPDATA is set; supply OAuthLogin.store" : "no per-user directory for the OAuth token store: neither XDG_CONFIG_HOME nor HOME is set; supply OAuthLogin.store");
 	return buildPath(base, "dlang-mcp", "tokens.json");
 }
 
@@ -666,6 +992,11 @@ final class OAuthSession
 	// overridable (see the secondary constructor) so the refresh-on-expiry path
 	// is unit-testable without network access.
 	private TokenSet delegate(string refreshToken) @safe refreshFn_;
+	private TaskMutex refreshLock_;
+	// `invalidate` discarded a rejected token, so the next refresh replaces it.
+	private bool rejectionPending_;
+	// The current token came from a refresh that replaced a rejected one.
+	private bool refreshedOnRejection_;
 
 	/// `oauth` must already carry the canonical `resource`. `token` is the
 	/// initial (possibly empty) stored token for `resource`.
@@ -679,6 +1010,7 @@ final class OAuthSession
 		this.resource_ = resource;
 		this.token_ = token;
 		this.refreshFn_ = (string rt) @safe => oauth.refresh(as_, client, rt);
+		this.refreshLock_ = new TaskMutex;
 	}
 
 	/// Test/advanced constructor: inject a refresh function (the
@@ -690,6 +1022,7 @@ final class OAuthSession
 		this.token_ = token;
 		this.store_ = store;
 		this.refreshFn_ = refreshFn;
+		this.refreshLock_ = new TaskMutex;
 	}
 
 	/// The current stored token (for inspection / persistence).
@@ -698,35 +1031,177 @@ final class OAuthSession
 		return token_;
 	}
 
+	/// Record that the resource server rejected `rejectedAccessToken` (an HTTP
+	/// 401 whose `WWW-Authenticate` challenge carries `error="invalid_token"`).
+	/// When it is still the current access token, it is discarded here and in
+	/// the token store, so the next `bearerForRequest` refreshes via the
+	/// refresh-token grant, or throws demanding re-authentication when no
+	/// refresh token is held, and a later `useOAuth` does not reuse it. This is
+	/// the only way a token without a known expiry is ever replaced.
+	///
+	/// Returns whether a replacement token can be obtained: false when no
+	/// refresh token is held, or when the rejected token is itself the
+	/// replacement for a rejected one (the server would reject any refresh the
+	/// same way, until the token is replaced on expiry), so the rejection (and its `WWW-Authenticate`
+	/// challenge, which a re-authenticating `useOAuth` needs) reaches the caller.
+	///
+	/// Naming the rejected token keeps concurrent rejections idempotent: a
+	/// request that failed with a token another request has already replaced
+	/// does not discard the replacement.
+	///
+	/// `useOAuth` installs this as the client's `BearerProvider.onRejected`, so
+	/// the HTTP transport calls it with the bearer a rejected request carried and
+	/// retries that request once when it returns true.
+	bool invalidate(string rejectedAccessToken) @safe
+	{
+		import mcp.auth.oauth : constantTimeEquals;
+
+		refreshLock_.lock();
+		scope (exit)
+			refreshLock_.unlock();
+		const replaceable = token_.refreshToken.length > 0;
+		if (!token_.hasToken || !constantTimeEquals(token_.accessToken, rejectedAccessToken))
+			return token_.hasToken || replaceable;
+		if (refreshedOnRejection_)
+		{
+			// The token a rejection-driven refresh produced is rejected too
+			// (e.g. an audience mismatch), so another refresh would only be
+			// rejected again. Keep sending it, surfacing each 401, and drop it
+			// from the store so a later `useOAuth` does not reuse it.
+			if (store_ !is null)
+			{
+				auto discarded = token_;
+				discarded.accessToken = "";
+				discarded.expiresAt = 0;
+				store_.save(resource_, discarded);
+			}
+			return false;
+		}
+		token_.accessToken = "";
+		token_.expiresAt = 0;
+		rejectionPending_ = replaceable;
+		if (store_ !is null)
+			store_.save(resource_, token_);
+		return replaceable;
+	}
+
+	/// `bearerForRequest` at the current wall-clock time. `useOAuth` installs this
+	/// as the client's bearer provider, so every request carries a fresh token.
+	string bearer() @safe
+	{
+		import std.datetime.systime : Clock;
+
+		return bearerForRequest(Clock.currTime().toUnixTime());
+	}
+
 	/// Return a valid bearer access token for use at `now` (Unix seconds),
 	/// refreshing via the refresh-token grant first when the current token has
 	/// expired (or is within the skew window). The refreshed token is persisted
 	/// through the `TokenStore`. Throws when no valid token can be produced
 	/// (e.g. expired with no refresh token).
+	///
+	/// Refreshes are single-flighted: concurrent callers (fibers or threads) wait
+	/// for one in-flight refresh and share its result, so a rotating refresh token
+	/// is never presented twice (which an AS answers with `invalid_grant` and may
+	/// treat as token theft, revoking the whole token family). The refresh runs
+	/// holding the `TokenStore`'s lock (`TokenStore.withLock`), and before
+	/// refreshing the session re-reads the store, so a token another session or
+	/// process sharing the store has already refreshed (and the refresh token it
+	/// rotated to) is adopted rather than refreshed again with a stale refresh
+	/// token.
+	///
+	/// A refresh the AS answers with `invalid_grant` drops the refresh token here
+	/// and in the store, so later calls throw demanding re-authentication instead
+	/// of presenting the dead refresh token again.
 	string bearerForRequest(long now) @safe
 	{
-		if (needsRefresh(token_, now, skew_))
+		refreshLock_.lock();
+		scope (exit)
+			refreshLock_.unlock();
+		if (!needsRefresh(token_, now, skew_))
+			return token_.accessToken;
+		if (store_ is null)
+			return refreshHoldingLocks(now);
+		string bearer;
+		store_.withLock(resource_, () @safe { bearer = refreshHoldingLocks(now); });
+		return bearer;
+	}
+
+	/// The body of `bearerForRequest` once the token needs refreshing, run
+	/// holding `refreshLock_` and the token store's lock.
+	private string refreshHoldingLocks(long now) @safe
+	{
+		if (adoptStoredToken() && !needsRefresh(token_, now, skew_))
+			return token_.accessToken;
+		if (token_.refreshToken.length == 0)
 		{
-			if (token_.refreshToken.length == 0)
-			{
-				if (token_.hasToken && token_.expiresAt == 0)
-					return token_.accessToken; // no expiry known, no refresh possible
-				throw internalError(
-						"OAuth access token expired and no refresh token is available; "
-						~ "re-authentication required");
-			}
-			auto ts = refreshFn_(token_.refreshToken);
-			if (ts.accessToken.length == 0)
-				throw internalError("OAuth token refresh returned no access token");
-			// Carry the registered client_id forward so the persisted record can
-			// authenticate a later refresh (the refresh response omits it).
-			auto clientId = token_.clientId.length ? token_.clientId : client_.clientId;
-			token_ = StoredToken.fromTokenSet(ts, resource_, now, token_.refreshToken);
-			token_.clientId = clientId;
-			if (store_ !is null)
-				store_.save(resource_, token_);
+			if (token_.hasToken && token_.expiresAt == 0)
+				return token_.accessToken; // no expiry known, no refresh possible
+			throw internalError(
+					"OAuth access token has expired or was rejected and no refresh token "
+					~ "is available; call useOAuth again to re-authenticate");
 		}
+		TokenSet ts;
+		try
+			ts = refreshFn_(token_.refreshToken);
+		catch (Exception e)
+		{
+			// Another process may have rotated the refresh token in the meantime;
+			// only a refresh token still current in the store is known dead.
+			if (oauthErrorCode(e) == "invalid_grant" && !adoptStoredToken())
+			{
+				token_.refreshToken = "";
+				if (store_ !is null)
+					store_.save(resource_, token_);
+			}
+			throw e;
+		}
+		if (ts.accessToken.length == 0)
+			throw internalError("OAuth token refresh returned no access token");
+		// Carry the registered client and the issuer forward so the persisted
+		// record can authenticate a later refresh at the same AS (the refresh
+		// response carries neither).
+		auto prev = token_;
+		auto issuer = prev.issuer.length ? prev.issuer : as_.issuer;
+		token_ = StoredToken.fromTokenSet(ts, resource_, now, prev.refreshToken);
+		refreshedOnRejection_ = rejectionPending_;
+		rejectionPending_ = false;
+		if (token_.scope_.length == 0)
+			token_.scope_ = prev.scope_;
+		if (prev.clientId.length)
+		{
+			token_.clientId = prev.clientId;
+			token_.clientSecret = prev.clientSecret;
+			token_.clientSecretExpiresAt = prev.clientSecretExpiresAt;
+			token_.tokenEndpointAuthMethod = prev.tokenEndpointAuthMethod;
+		}
+		else
+			token_.clientId = client_.clientId;
+		token_.issuer = issuer;
+		if (store_ !is null)
+			store_.save(resource_, token_);
 		return token_.accessToken;
+	}
+
+	/// Replace the current token with the store's record for this resource when
+	/// that record differs and is bound to the same issuer and client (so its
+	/// refresh token is one this session's client may present). Returns whether a
+	/// record was adopted. The caller holds `refreshLock_`.
+	private bool adoptStoredToken() @safe
+	{
+		if (store_ is null)
+			return false;
+		auto stored = store_.load(resource_);
+		if (!stored.hasToken && stored.refreshToken.length == 0)
+			return false;
+		if (stored.issuer != token_.issuer || stored.clientId != token_.clientId)
+			return false;
+		if (stored.accessToken == token_.accessToken && stored.refreshToken == token_.refreshToken)
+			return false;
+		token_ = stored;
+		rejectionPending_ = false;
+		refreshedOnRejection_ = false;
+		return true;
 	}
 }
 
@@ -738,8 +1213,43 @@ final class OAuthSession
 /// inject a stub to exercise the success and failure branches deterministically.
 alias BrowserSpawn = void delegate(string[] cmd) @safe;
 
+/// The platform families `browserLaunchCommand` knows how to target.
+enum LauncherPlatform
+{
+	macOS,
+	windows,
+	other, /// Linux/BSD and anything else with `xdg-open`
+}
+
+/// The platform this build targets.
+enum LauncherPlatform hostLauncherPlatform = () {
+	version (OSX)
+		return LauncherPlatform.macOS;
+	else version (Windows)
+		return LauncherPlatform.windows;
+	else
+		return LauncherPlatform.other;
+}();
+
+/// The argv that opens `url` in the default browser on `platform`. The URL is
+/// always a single argument and never passes through a shell: on Windows it
+/// goes to `rundll32 url.dll,FileProtocolHandler`, because `cmd /c start` would
+/// treat the `&` separating query parameters as a command separator.
+string[] browserLaunchCommand(string url, LauncherPlatform platform) @safe pure nothrow
+{
+	final switch (platform)
+	{
+	case LauncherPlatform.macOS:
+		return ["open", url];
+	case LauncherPlatform.windows:
+		return ["rundll32", "url.dll,FileProtocolHandler", url];
+	case LauncherPlatform.other:
+		return ["xdg-open", url];
+	}
+}
+
 /// Open `url` in the user's default browser using the platform launcher
-/// (`open` on macOS, `xdg-open` on Linux/BSD, `cmd /c start` on Windows).
+/// (see `browserLaunchCommand`).
 /// Returns true if the launcher started. On failure (no launcher on a headless
 /// host, spawn error) it does not throw — the loopback flow can still complete
 /// if the user opens the URL manually — but it logs the URL so the user is not
@@ -749,20 +1259,14 @@ bool openSystemBrowser(string url, scope BrowserSpawn spawn = null) @safe
 {
 	import std.process : spawnProcess, Config;
 
-	string[] cmd;
-	version (OSX)
-		cmd = ["open", url];
-	else version (Windows)
-		cmd = ["cmd", "/c", "start", "", url];
-	else
-		cmd = ["xdg-open", url];
+	auto cmd = browserLaunchCommand(url, hostLauncherPlatform);
 
 	try
 	{
 		if (spawn !is null)
 			spawn(cmd);
 		else
-			() @trusted { spawnProcess(cmd, null, Config.detached); }();
+			spawnProcess(cmd, null, Config.detached);
 		return true;
 	}
 	catch (Exception e)
@@ -779,15 +1283,36 @@ bool openSystemBrowser(string url, scope BrowserSpawn spawn = null) @safe
 // The one-call flow
 // ===========================================================================
 
-/// The `RegisteredClient` to use on the cache fast-path. The `client_id` is
-/// read from the persisted token (so DCR/CIMD users, who have no statically
-/// configured `client_id`, still carry the AS-issued one needed to refresh),
-/// falling back to the configured `opts.clientId` for records that predate
-/// persisting it. The secret comes from `opts` (it is not persisted).
+/// The `RegisteredClient` to use on the cache fast-path. The `client_id` and
+/// secret are read from the persisted token (so DCR/CIMD users, who have no
+/// statically configured credentials, still carry the AS-issued ones needed to
+/// refresh), falling back to the configured `opts.clientId`/`opts.clientSecret`
+/// for the pre-registered client or a record without a client.
 RegisteredClient cacheHitClient(StoredToken cached, OAuthLogin opts) @safe pure nothrow
 {
-	const id = cached.clientId.length ? cached.clientId : opts.clientId;
-	return RegisteredClient(id, opts.clientSecret);
+	if (cached.clientId.length == 0 || cached.clientId == opts.clientId)
+		return RegisteredClient(opts.clientId, opts.clientSecret);
+	return RegisteredClient(cached.clientId, cached.clientSecret, cached.clientSecretExpiresAt);
+}
+
+/// Set `oauth.authMethod` to the persisted `method` when it names a known
+/// token-endpoint auth method; leave it unchanged otherwise.
+private void restoreAssignedAuthMethod(OAuthClient oauth, string method) @safe
+{
+	import std.traits : EnumMembers;
+
+	static foreach (m; EnumMembers!TokenEndpointAuthMethod)
+		if (method == m)
+			oauth.authMethod = m;
+}
+
+/// The client registration to persist with a token: the configured
+/// pre-registered secret stays in `opts` and is not written to the store.
+RegisteredClient persistedClient(RegisteredClient rc, OAuthLogin opts) @safe pure nothrow
+{
+	if (rc.clientId.length && rc.clientId == opts.clientId)
+		return RegisteredClient(rc.clientId);
+	return rc;
 }
 
 /// Perform the full interactive OAuth login for `client` and attach the
@@ -801,14 +1326,16 @@ RegisteredClient cacheHitClient(StoredToken cached, OAuthLogin opts) @safe pure 
 /// 4. Run the authorization-code + PKCE flow: open the browser at the
 ///    authorization URL and capture the redirect `code` on a localhost loopback
 ///    listener; verify `state`.
-/// 5. Exchange the code for tokens, persist them, and set the bearer on the
-///    client.
+/// 5. Exchange the code for tokens, persist them, and install the session as
+///    the client's bearer provider.
 ///
-/// Returns the live `OAuthSession` so callers can refresh on later requests via
-/// `session.bearerForRequest(now)`.
+/// The client then asks the session for its bearer on every request
+/// (`OAuthSession.bearer`), which refreshes the access token when it nears
+/// expiry, so refresh is transparent. Returns the live `OAuthSession`.
 OAuthSession useOAuth(McpClient client, string mcpEndpoint, OAuthLogin opts) @safe
 {
 	import std.datetime.systime : Clock;
+	import vibe.core.log : logWarn;
 
 	auto store = opts.store !is null ? opts.store : new FileTokenStore(defaultTokenStorePath());
 
@@ -816,50 +1343,89 @@ OAuthSession useOAuth(McpClient client, string mcpEndpoint, OAuthLogin opts) @sa
 	oauth.resource = canonicalResourceUri(mcpEndpoint);
 	oauth.authMethod = opts.authMethod;
 	oauth.clientIdMetadataUrl = opts.clientIdMetadataUrl;
+	oauth.ssrfPolicy = opts.ssrfPolicy;
 
-	const long now = () @trusted { return Clock.currTime().toUnixTime(); }();
+	const long now = Clock.currTime().toUnixTime();
 
 	// Discover the issuer and AS metadata. Enforce the discovered AS document's
 	// issuer only on the modern RFC 9728 path (issuer named by a
 	// protected-resource-metadata document); stay lenient on the 2025-03-26
 	// origin fallback.
-	bool issuerFromPrm;
-	const issuer = oauth.resolveIssuer(mcpEndpoint, issuerFromPrm);
-	auto as_ = oauth.discoverAuthServer(issuer, issuerFromPrm);
+	const located = oauth.discoverIssuer(mcpEndpoint, opts.wwwAuthenticate);
+	// RFC 9728: the protected-resource metadata names the resource the server
+	// protects, which may be a parent of the endpoint (`prmResourceMatches`); that
+	// is the audience the server checks, so it is the resource indicator to send.
+	if (located.fromProtectedResourceMetadata && located.metadata.resource.length)
+		oauth.resource = canonicalResourceUri(located.metadata.resource);
+	auto as_ = oauth.discoverAuthServer(located.issuer, located.fromProtectedResourceMetadata);
+	const required = requiredScopes(opts);
+	opts.scopes = loginScopes(opts, located.metadata);
 
-	// Reuse a cached, still-valid token when present.
-	auto cached = store.load(oauth.resource);
-	if (cached.hasToken && !needsRefresh(cached, now))
+	// Reuse a cached, still-valid token when present. A record from another
+	// authorization server (or one that never recorded its issuer) is ignored:
+	// its access token is not meant for this AS, and its refresh token and
+	// client credentials must never be sent to a server that did not issue them.
+	//
+	// The store lock is held from the load through any refresh and save, so a
+	// session or process sharing the store never presents the same rotating
+	// refresh token at the same time.
+	OAuthSession fromCache() @safe
 	{
-		client.setBearerToken(cached.accessToken);
-		return new OAuthSession(oauth, as_, cacheHitClient(cached, opts),
-				store, oauth.resource, cached);
-	}
-
-	// A refresh token is bound to the client that obtained it (RFC 6749 §6), so
-	// try it under that client id — persisted from the first login, or the
-	// pre-registered one — before registering anything new.
-	auto prior = cacheHitClient(cached, opts);
-	if (cached.refreshToken.length && prior.clientId.length)
-	{
-		try
+		auto cached = store.load(oauth.resource);
+		if (cached.issuer.length == 0 || cached.issuer != as_.issuer)
+			cached = StoredToken.init;
+		// An expired client secret can no longer authenticate a refresh, so the
+		// registration (and the tokens bound to it) must be replaced.
+		if (cached.clientSecretExpired(now))
+			cached = StoredToken.init;
+		// A token lacking an explicitly required scope (a step-up after
+		// `insufficient_scope`) cannot be reused or refreshed into one that has it.
+		const scopesGranted = cached.grantsScopes(required);
+		// A dynamically registered client authenticates the way the authorization
+		// server assigned at registration, not the configured method.
+		if (cached.clientId.length && cached.clientId != opts.clientId)
+			restoreAssignedAuthMethod(oauth, cached.tokenEndpointAuthMethod);
+		if (scopesGranted && cached.hasToken && !needsRefresh(cached, now))
 		{
-			auto ts = oauth.refresh(as_, prior, cached.refreshToken);
-			if (ts.accessToken.length)
+			return new OAuthSession(oauth, as_, cacheHitClient(cached, opts),
+					store, oauth.resource, cached);
+		}
+
+		// A refresh token is bound to the client that obtained it (RFC 6749 §6), so
+		// try it under that client id — persisted from the first login, or the
+		// pre-registered one — before registering anything new.
+		auto prior = cacheHitClient(cached, opts);
+		if (scopesGranted && cached.refreshToken.length && prior.clientId.length)
+		{
+			try
 			{
-				auto refreshed = StoredToken.fromTokenSet(ts, oauth.resource,
-						now, cached.refreshToken);
-				refreshed.clientId = prior.clientId;
-				store.save(oauth.resource, refreshed);
-				client.setBearerToken(refreshed.accessToken);
-				return new OAuthSession(oauth, as_, prior, store, oauth.resource, refreshed);
+				auto ts = oauth.refresh(as_, prior, cached.refreshToken);
+				if (ts.accessToken.length)
+				{
+					auto refreshed = StoredToken.fromTokenSet(ts,
+							oauth.resource, now, cached.refreshToken);
+					if (refreshed.scope_.length == 0)
+						refreshed.scope_ = cached.scope_;
+					refreshed.setClient(persistedClient(prior, opts));
+					refreshed.tokenEndpointAuthMethod = cached.tokenEndpointAuthMethod;
+					refreshed.issuer = as_.issuer;
+					store.save(oauth.resource, refreshed);
+					return new OAuthSession(oauth, as_, prior, store, oauth.resource, refreshed);
+				}
+				logWarn("OAuth refresh for %s returned no access token; "
+						~ "starting an interactive login", oauth.resource);
 			}
+			catch (Exception e)
+				logWarn("OAuth refresh for %s failed (%s); starting an interactive login",
+						oauth.resource, e.msg);
 		}
-		catch (Exception)
-		{
-			// Fall through to the interactive flow.
-		}
+		return null;
 	}
+
+	OAuthSession cachedSession;
+	store.withLock(oauth.resource, () @safe { cachedSession = fromCache(); });
+	if (cachedSession !is null)
+		return attachSession(client, cachedSession);
 
 	// Select / obtain a client registration. Runs once the loopback listener
 	// is bound, so a dynamic registration names the real redirect URI.
@@ -895,12 +1461,26 @@ OAuthSession useOAuth(McpClient client, string mcpEndpoint, OAuthLogin opts) @sa
 	// expiresAt = issuedAt + expiresIn reflects the actual token-issuance
 	// wall time, not the time useOAuth was entered (which predates the
 	// interactive browser wait by however long the user took to authenticate).
-	const long issuedAt = () @trusted { return Clock.currTime().toUnixTime(); }();
+	const long issuedAt = Clock.currTime().toUnixTime();
 	auto stored = StoredToken.fromTokenSet(ts, oauth.resource, issuedAt);
-	stored.clientId = rc.clientId;
+	// An omitted `scope` means the requested scope was granted (RFC 6749 §5.1).
+	if (stored.scope_.length == 0)
+		stored.scope_ = opts.scopeString();
+	stored.setClient(persistedClient(rc, opts));
+	if (rc.clientId != opts.clientId)
+		stored.tokenEndpointAuthMethod = cast(string) oauth.authMethod;
+	stored.issuer = as_.issuer;
 	store.save(oauth.resource, stored);
-	client.setBearerToken(stored.accessToken);
-	return new OAuthSession(oauth, as_, rc, store, oauth.resource, stored);
+	return attachSession(client, new OAuthSession(oauth, as_, rc, store, oauth.resource, stored));
+}
+
+/// Install `session` as `client`'s bearer provider, so each request carries a
+/// token refreshed on demand and a token the server rejects is discarded, and
+/// return it.
+private OAuthSession attachSession(McpClient client, OAuthSession session) @safe
+{
+	client.setBearerProvider(BearerProvider(&session.bearer, &session.invalidate));
+	return session;
 }
 
 /// Apply the RFC 9207 `iss` authorization-response validation to a captured
@@ -922,13 +1502,14 @@ LoopbackCapture enforceIssOnCapture(LoopbackCapture cap, AuthorizationServerMeta
 	return cap;
 }
 
-/// Returns true when `reqPath` matches `callbackPath` exactly, meaning the
-/// request should be processed as an OAuth callback. Requests on any other path
-/// are always rejected with 404, regardless of query parameters — a request
-/// carrying `code=` or `error=` on the wrong path must not abort the flow.
-private bool isLoopbackCallbackPath(string reqPath, string callbackPath) @safe pure nothrow @nogc
+/// Returns true when `reqPath` matches the normalized `callbackPath` (the path
+/// the redirect URI names) exactly, meaning the request should be processed as
+/// an OAuth callback. Requests on any other path are always rejected with 404,
+/// regardless of query parameters — a request carrying `code=` or `error=` on
+/// the wrong path must not abort the flow.
+private bool isLoopbackCallbackPath(string reqPath, string callbackPath) @safe pure nothrow
 {
-	return reqPath == callbackPath;
+	return reqPath == normalizeCallbackPath(callbackPath);
 }
 
 /// Open the browser at the authorization URL and run a localhost loopback HTTP
@@ -993,6 +1574,16 @@ private LoopbackCapture runBrowserLoopbackFlow(OAuthClient oauth,
 		}
 
 		auto cap = parseLoopbackCallback(req.requestURI, state);
+		// A response without this flow's state did not come from the authorization
+		// request this flow made (any web page can make the browser hit the
+		// loopback port), so it neither completes nor aborts the login.
+		if (!validateAuthorizationResponseState(cap.state, state))
+		{
+			res.statusCode = 400;
+			res.contentType = "text/plain; charset=utf-8";
+			res.writeBody("Unknown authorization state");
+			return;
+		}
 		// RFC 9207 mix-up protection: validate the `iss` authorization-response
 		// parameter against the selected AS's recorded issuer BEFORE the token
 		// exchange (the spec requires this regardless of whether an error param
@@ -1002,22 +1593,20 @@ private LoopbackCapture runBrowserLoopbackFlow(OAuthClient oauth,
 		{
 			result = cap;
 			done = true;
-			() @trusted { timeoutTimer.stop(); }();
+			timeoutTimer.stop();
 		}
 		res.contentType = "text/html; charset=utf-8";
 		res.writeBody(loopbackResponseHtml(cap.ok));
 		if (!inTask)
-			() @trusted { exitEventLoop(); }();
+			exitEventLoop();
 	}
 
 	HTTPListener listener;
 	ushort boundPort;
-	() @trusted {
-		listener = listenHTTP(settings, &handle);
-		boundPort = listener.bindAddresses[0].port;
-	}();
+	listener = listenHTTP(settings, &handle);
+	boundPort = listener.bindAddresses[0].port;
 	scope (exit)
-		() @trusted { listener.stopListening(); }();
+		listener.stopListening();
 
 	oauth.redirectUri = loopbackRedirectUri(boundPort, opts.callbackPath);
 	rc = resolveClient(oauth.redirectUri);
@@ -1039,19 +1628,17 @@ private LoopbackCapture runBrowserLoopbackFlow(OAuthClient oauth,
 			done = true;
 		}
 		if (!inTask)
-			() @trusted { exitEventLoop(); }();
+			exitEventLoop();
 	}
 
-	timeoutTimer = () @trusted {
-		return setTimer(opts.callbackTimeout, &onTimeout);
-	}();
+	timeoutTimer = setTimer(opts.callbackTimeout, &onTimeout);
 	scope (exit)
-		() @trusted { timeoutTimer.stop(); }();
+		timeoutTimer.stop();
 	if (inTask)
 		while (!done)
 			sleep(10.msecs);
 	else
-		() @trusted { runEventLoop(); }();
+		runEventLoop();
 	return result;
 }
 
@@ -1205,11 +1792,11 @@ unittest  // MemoryTokenStore persists and loads per resource
 	assert(!store.load("https://b").hasToken);
 }
 
-unittest  // loopbackRedirectUri formats a localhost URI for the bound port
+unittest  // loopbackRedirectUri names the 127.0.0.1 literal the listener binds (RFC 8252 §8.3)
 {
-	assert(loopbackRedirectUri(8765) == "http://localhost:8765/callback");
-	assert(loopbackRedirectUri(1234, "/cb") == "http://localhost:1234/cb");
-	assert(loopbackRedirectUri(1234, "cb") == "http://localhost:1234/cb");
+	assert(loopbackRedirectUri(8765) == "http://127.0.0.1:8765/callback");
+	assert(loopbackRedirectUri(1234, "/cb") == "http://127.0.0.1:1234/cb");
+	assert(loopbackRedirectUri(1234, "cb") == "http://127.0.0.1:1234/cb");
 }
 
 unittest  // scopeString space-joins the requested scopes
@@ -1257,6 +1844,156 @@ unittest  // OAuthSession returns an unknown-expiry token even with no refresh t
 	t.expiresAt = 0;
 	auto sess = new OAuthSession(new OAuthClient(), as_, rc, store, "https://mcp.example.com", t);
 	assert(sess.bearerForRequest(long.max - 100) == "no-expiry-token");
+}
+
+unittest  // a token the server rejected is refreshed on the next request even with no known expiry
+{
+	auto store = new MemoryTokenStore();
+	StoredToken t;
+	t.accessToken = "rejected-access";
+	t.refreshToken = "the-refresh";
+	t.expiresAt = 0;
+
+	string seenRefresh;
+	TokenSet delegate(string) @safe refreshFn = (string rt) @safe {
+		seenRefresh = rt;
+		TokenSet ts;
+		ts.accessToken = "new-access";
+		return ts;
+	};
+
+	auto sess = new OAuthSession("https://mcp.example.com", t, store, refreshFn);
+	sess.invalidate("rejected-access");
+	assert(sess.bearerForRequest(5000) == "new-access");
+	assert(seenRefresh == "the-refresh");
+	assert(store.load("https://mcp.example.com").accessToken == "new-access");
+}
+
+unittest  // a rejected token with no refresh token demands re-authentication and leaves the store
+{
+	import std.exception : assertThrown;
+
+	auto store = new MemoryTokenStore();
+	StoredToken t;
+	t.accessToken = "rejected-access";
+	store.save("https://mcp.example.com", t);
+
+	int refreshes;
+	auto sess = new OAuthSession("https://mcp.example.com", t, store, (string rt) @safe {
+		++refreshes;
+		return TokenSet.init;
+	});
+	sess.invalidate("rejected-access");
+	assertThrown(sess.bearerForRequest(5000));
+	assert(refreshes == 0);
+	// A later useOAuth must not reuse the rejected token from the store.
+	assert(!store.load("https://mcp.example.com").hasToken);
+}
+
+unittest  // invalidating a token that has already been replaced keeps the current one
+{
+	auto store = new MemoryTokenStore();
+	StoredToken t;
+	t.accessToken = "current-access";
+
+	int refreshes;
+	auto sess = new OAuthSession("https://mcp.example.com", t, store, (string rt) @safe {
+		++refreshes;
+		return TokenSet.init;
+	});
+	sess.invalidate("stale-access");
+	assert(sess.bearerForRequest(5000) == "current-access");
+	assert(refreshes == 0);
+}
+
+version (unittest) private string delegate(string) @safe fakeEnv(string[string] vars) @safe
+{
+	return (string name) @safe => vars.get(name, "");
+}
+
+unittest  // the Windows token store lives under %APPDATA%
+{
+	import std.path : buildPath;
+
+	assert(tokenStorePathFor(fakeEnv(["APPDATA": `C:\Users\u\AppData\Roaming`]),
+			true) == buildPath(`C:\Users\u\AppData\Roaming`, "dlang-mcp", "tokens.json"));
+}
+
+unittest  // the Windows token store falls back to %LOCALAPPDATA%
+{
+	import std.path : buildPath;
+
+	assert(tokenStorePathFor(fakeEnv([
+		"LOCALAPPDATA": `C:\Users\u\AppData\Local`
+	]), true) == buildPath(`C:\Users\u\AppData\Local`, "dlang-mcp", "tokens.json"));
+}
+
+unittest  // the Windows token store ignores HOME-style variables and never uses the working directory
+{
+	import std.exception : assertThrown;
+
+	assertThrown!McpException(tokenStorePathFor(fakeEnv(["HOME": "/home/u"]), true));
+}
+
+unittest  // the POSIX token store lives under XDG_CONFIG_HOME, else ~/.config
+{
+	import std.path : buildPath;
+
+	assert(tokenStorePathFor(fakeEnv([
+		"XDG_CONFIG_HOME": "/xdg",
+		"HOME": "/home/u"
+	]), false) == buildPath("/xdg", "dlang-mcp", "tokens.json"));
+	assert(tokenStorePathFor(fakeEnv(["HOME": "/home/u"]),
+			false) == buildPath("/home/u", ".config", "dlang-mcp", "tokens.json"));
+}
+
+unittest  // with no per-user directory the token store path is refused, not put in the working directory
+{
+	import std.exception : assertThrown;
+
+	assertThrown!McpException(tokenStorePathFor(fakeEnv(null), false));
+}
+
+unittest  // login scopes default to the WWW-Authenticate challenge's scope
+{
+	OAuthLogin opts;
+	opts.wwwAuthenticate = `Bearer resource_metadata="https://mcp.example.com/.well-known/oauth-protected-resource", scope="files:read files:write"`;
+	ProtectedResourceMetadata prm;
+	prm.scopesSupported = ["other"];
+	assert(loginScopes(opts, prm) == ["files:read", "files:write"]);
+}
+
+unittest  // login scopes fall back to the resource metadata's scopes_supported
+{
+	OAuthLogin opts;
+	ProtectedResourceMetadata prm;
+	prm.scopesSupported = ["mcp:read", "mcp:write"];
+	assert(loginScopes(opts, prm) == ["mcp:read", "mcp:write"]);
+}
+
+unittest  // explicitly configured login scopes win over discovered ones
+{
+	OAuthLogin opts;
+	opts.scopes = ["mine"];
+	opts.wwwAuthenticate = `Bearer scope="theirs"`;
+	ProtectedResourceMetadata prm;
+	prm.scopesSupported = ["supported"];
+	assert(loginScopes(opts, prm) == ["mine"]);
+}
+
+unittest  // the scopes a cached token must cover exclude the scopes_supported fallback
+{
+	OAuthLogin opts;
+	assert(requiredScopes(opts).length == 0);
+	opts.wwwAuthenticate = `Bearer error="insufficient_scope", scope="files:write"`;
+	assert(requiredScopes(opts) == ["files:write"]);
+	opts.scopes = ["mine"];
+	assert(requiredScopes(opts) == ["mine"]);
+}
+
+unittest  // with nothing configured or discovered no scope is requested
+{
+	assert(loginScopes(OAuthLogin.init, ProtectedResourceMetadata.init).length == 0);
 }
 
 unittest  // loopbackResponseHtml differs for success and failure
@@ -1325,6 +2062,238 @@ unittest  // OAuthSession refreshes an expired token via the injected refresh fn
 	assert(saved.accessToken == "new-access");
 	assert(saved.refreshToken == "rotated-refresh");
 	assert(saved.expiresAt == 5000 + 3600);
+}
+
+unittest  // a session adopts a still-valid token another process saved to the shared store
+{
+	auto store = new MemoryTokenStore();
+	StoredToken mine;
+	mine.accessToken = "old-access";
+	mine.refreshToken = "stale-refresh";
+	mine.expiresAt = 1000;
+	StoredToken theirs;
+	theirs.accessToken = "their-access";
+	theirs.refreshToken = "rotated-refresh";
+	theirs.expiresAt = 10_000;
+	store.save("https://mcp.example.com", theirs);
+
+	int calls;
+	TokenSet delegate(string) @safe refreshFn = (string rt) @safe {
+		++calls;
+		return TokenSet.init;
+	};
+	auto sess = new OAuthSession("https://mcp.example.com", mine, store, refreshFn);
+	assert(sess.bearerForRequest(5000) == "their-access");
+	assert(calls == 0);
+	assert(sess.token.refreshToken == "rotated-refresh");
+}
+
+unittest  // a session refreshes with the rotated refresh token another process saved
+{
+	auto store = new MemoryTokenStore();
+	StoredToken mine;
+	mine.accessToken = "old-access";
+	mine.refreshToken = "stale-refresh";
+	mine.expiresAt = 1000;
+	StoredToken theirs;
+	theirs.accessToken = "their-access";
+	theirs.refreshToken = "rotated-refresh";
+	theirs.expiresAt = 4000;
+	store.save("https://mcp.example.com", theirs);
+
+	string seenRefresh;
+	TokenSet delegate(string) @safe refreshFn = (string rt) @safe {
+		seenRefresh = rt;
+		TokenSet ts;
+		ts.accessToken = "new-access";
+		ts.expiresIn = 3600;
+		return ts;
+	};
+	auto sess = new OAuthSession("https://mcp.example.com", mine, store, refreshFn);
+	assert(sess.bearerForRequest(5000) == "new-access");
+	assert(seenRefresh == "rotated-refresh");
+}
+
+unittest  // a session ignores a stored token bound to another client
+{
+	auto store = new MemoryTokenStore();
+	StoredToken mine;
+	mine.accessToken = "old-access";
+	mine.refreshToken = "my-refresh";
+	mine.expiresAt = 1000;
+	mine.clientId = "client-a";
+	StoredToken theirs = mine;
+	theirs.accessToken = "their-access";
+	theirs.refreshToken = "their-refresh";
+	theirs.expiresAt = 10_000;
+	theirs.clientId = "client-b";
+	store.save("https://mcp.example.com", theirs);
+
+	string seenRefresh;
+	TokenSet delegate(string) @safe refreshFn = (string rt) @safe {
+		seenRefresh = rt;
+		TokenSet ts;
+		ts.accessToken = "new-access";
+		ts.expiresIn = 3600;
+		return ts;
+	};
+	auto sess = new OAuthSession("https://mcp.example.com", mine, store, refreshFn);
+	assert(sess.bearerForRequest(5000) == "new-access");
+	assert(seenRefresh == "my-refresh");
+}
+
+unittest  // an invalid_grant refresh drops the dead refresh token so later requests fail fast
+{
+	import std.exception : assertThrown;
+
+	auto store = new MemoryTokenStore();
+	StoredToken t;
+	t.accessToken = "old-access";
+	t.refreshToken = "dead-refresh";
+	t.expiresAt = 1000;
+	store.save("https://mcp.example.com", t);
+
+	int calls;
+	TokenSet delegate(string) @safe refreshFn = (string rt) @safe {
+		++calls;
+		auto data = Json.emptyObject;
+		data["error"] = "invalid_grant";
+		throw invalidRequest("token endpoint returned HTTP 400", data);
+	};
+	auto sess = new OAuthSession("https://mcp.example.com", t, store, refreshFn);
+	assertThrown(sess.bearerForRequest(5000));
+	assertThrown(sess.bearerForRequest(5001));
+	assert(calls == 1, "a refresh token the AS rejected is never presented again");
+	assert(store.load("https://mcp.example.com").refreshToken.length == 0);
+}
+
+unittest  // a transient refresh failure keeps the refresh token for a retry
+{
+	import std.exception : assertThrown;
+
+	auto store = new MemoryTokenStore();
+	StoredToken t;
+	t.accessToken = "old-access";
+	t.refreshToken = "good-refresh";
+	t.expiresAt = 1000;
+
+	int calls;
+	TokenSet delegate(string) @safe refreshFn = (string rt) @safe {
+		if (++calls == 1)
+			throw new Exception("network down");
+		TokenSet ts;
+		ts.accessToken = "new-access";
+		ts.expiresIn = 3600;
+		return ts;
+	};
+	auto sess = new OAuthSession("https://mcp.example.com", t, store, refreshFn);
+	assertThrown(sess.bearerForRequest(5000));
+	assert(sess.bearerForRequest(5001) == "new-access");
+}
+
+unittest  // concurrent bearerForRequest calls share a single refresh (rotating refresh tokens)
+{
+	import core.time : msecs;
+	import vibe.core.core : runTask, sleep;
+
+	auto store = new MemoryTokenStore();
+	StoredToken t;
+	t.accessToken = "old-access";
+	t.refreshToken = "single-use-refresh";
+	t.expiresAt = 1000;
+
+	int calls;
+	TokenSet delegate(string) @safe refreshFn = (string rt) @safe {
+		++calls;
+		// A rotating AS rejects a second use of the same refresh token.
+		assert(rt == "single-use-refresh", "refresh token replayed");
+		sleep(30.msecs); // the token request yields to other tasks
+		TokenSet ts;
+		ts.accessToken = "new-access";
+		ts.expiresIn = 3600;
+		ts.refreshToken = "rotated-refresh";
+		return ts;
+	};
+	auto sess = new OAuthSession("https://mcp.example.com", t, store, refreshFn);
+
+	string a, b;
+	auto ta = runTask(() nothrow{
+		try
+			a = sess.bearerForRequest(5000);
+		catch (Exception)
+		{
+		}
+	});
+	auto tb = runTask(() nothrow{
+		try
+			b = sess.bearerForRequest(5000);
+		catch (Exception)
+		{
+		}
+	});
+	ta.join();
+	tb.join();
+
+	assert(calls == 1);
+	assert(a == "new-access" && b == "new-access");
+}
+
+unittest  // sessions sharing a FileTokenStore refresh a rotating refresh token once between them
+{
+	import core.time : msecs;
+	import std.conv : to;
+	import std.file : exists, remove, tempDir;
+	import std.path : buildPath;
+	import std.process : thisProcessID;
+	import vibe.core.core : runTask, sleep;
+
+	const path = buildPath(tempDir, "mcp-d-lock-test-" ~ thisProcessID.to!string ~ ".json");
+	scope (exit)
+		foreach (p; [path, path ~ ".lock"])
+			if (p.exists)
+				remove(p);
+	StoredToken t;
+	t.accessToken = "old-access";
+	t.refreshToken = "single-use-refresh";
+	t.expiresAt = 1000;
+	new FileTokenStore(path).save("https://mcp.example.com", t);
+
+	int calls;
+	string[] presented;
+	TokenSet delegate(string) @safe refreshFn = (string rt) @safe {
+		++calls;
+		presented ~= rt;
+		sleep(30.msecs); // the token request yields to other tasks
+		TokenSet ts;
+		ts.accessToken = "new-access";
+		ts.expiresIn = 3600;
+		ts.refreshToken = "rotated-refresh";
+		return ts;
+	};
+	// Each session has its own store object, as two processes would.
+	auto a = new OAuthSession("https://mcp.example.com", t, new FileTokenStore(path), refreshFn);
+	auto b = new OAuthSession("https://mcp.example.com", t, new FileTokenStore(path), refreshFn);
+
+	string ra, rb;
+	auto ta = runTask(() nothrow{
+		try
+			ra = a.bearerForRequest(5000);
+		catch (Exception)
+		{
+		}
+	});
+	auto tb = runTask(() nothrow{
+		try
+			rb = b.bearerForRequest(5000);
+		catch (Exception)
+		{
+		}
+	});
+	ta.join();
+	tb.join();
+
+	assert(calls == 1, "refresh token presented " ~ presented.to!string);
+	assert(ra == "new-access" && rb == "new-access");
 }
 
 unittest  // OAuthSession does not refresh when the cached token is still valid
@@ -1462,6 +2431,16 @@ unittest  // isLoopbackCallbackPath rejects a different path even with an error=
 	assert(!isLoopbackCallbackPath("/favicon.ico", "/callback"));
 }
 
+unittest  // isLoopbackCallbackPath matches a callback path configured without a leading slash
+{
+	assert(isLoopbackCallbackPath("/callback", "callback"));
+}
+
+unittest  // isLoopbackCallbackPath matches the default path when the configured path is empty
+{
+	assert(isLoopbackCallbackPath("/callback", ""));
+}
+
 version (Posix) unittest  // FileTokenStore.writeSecretFile does not draw from the Mersenne Twister (std.random)
 {
 	// writeSecretFile MUST obtain its temp-file suffix from the OS CSPRNG
@@ -1478,7 +2457,7 @@ version (Posix) unittest  // FileTokenStore.writeSecretFile does not draw from t
 	auto root = buildPath(tempDir, "mcp-login-mt-" ~ Clock.currTime().toUnixTime().to!string);
 	mkdirRecurse(root);
 	scope (exit)
-		() @trusted { rmdirRecurse(root); }();
+		rmdirRecurse(root);
 
 	auto before = rndGen; // snapshot the MT state before the save
 
@@ -1506,7 +2485,7 @@ version (Posix) unittest  // FileTokenStore creates the token file 0600 (never a
 	auto root = buildPath(tempDir, "mcp-login-perm-" ~ Clock.currTime().toUnixTime().to!string);
 	mkdirRecurse(root);
 	scope (exit)
-		() @trusted { rmdirRecurse(root); }();
+		rmdirRecurse(root);
 
 	auto file = buildPath(root, "sub", "tokens.json");
 	auto store = new FileTokenStore(file);
@@ -1520,6 +2499,52 @@ version (Posix) unittest  // FileTokenStore creates the token file 0600 (never a
 	// The file must end up owner-only (0600): no group/other bits set.
 	const fileMode = getAttributes(file) & (S_IRWXU | S_IRWXG | S_IRWXO);
 	assert((fileMode & (S_IRWXG | S_IRWXO)) == 0, "token file is group/other accessible");
+}
+
+version (Posix) unittest  // FileTokenStore leaves the permissions of an existing directory it did not create alone
+{
+	import std.file : tempDir, mkdirRecurse, rmdirRecurse, getAttributes, setAttributes;
+	import std.path : buildPath;
+	import std.conv : octal, to;
+	import core.sys.posix.sys.stat : S_IRWXU, S_IRWXG, S_IRWXO;
+	import std.datetime.systime : Clock;
+
+	// e.g. a token file placed directly in the user's home directory.
+	auto root = buildPath(tempDir, "mcp-login-owndir-" ~ Clock.currTime().toUnixTime().to!string);
+	mkdirRecurse(root);
+	scope (exit)
+		rmdirRecurse(root);
+	setAttributes(root, octal!755);
+
+	auto store = new FileTokenStore(buildPath(root, "tokens.json"));
+	StoredToken t;
+	t.accessToken = "secret-access";
+	store.save("https://mcp.example.com", t);
+
+	assert((getAttributes(root) & (S_IRWXU | S_IRWXG | S_IRWXO)) == octal!755,
+			"an existing directory must not be chmod-ed by the token store");
+}
+
+version (Posix) unittest  // FileTokenStore makes a directory it creates owner-only
+{
+	import std.file : tempDir, mkdirRecurse, rmdirRecurse, getAttributes;
+	import std.path : buildPath;
+	import std.conv : to;
+	import core.sys.posix.sys.stat : S_IRWXU, S_IRWXG, S_IRWXO;
+	import std.datetime.systime : Clock;
+
+	auto root = buildPath(tempDir, "mcp-login-newdir-" ~ Clock.currTime().toUnixTime().to!string);
+	mkdirRecurse(root);
+	scope (exit)
+		rmdirRecurse(root);
+
+	auto dir = buildPath(root, "dlang-mcp");
+	auto store = new FileTokenStore(buildPath(dir, "tokens.json"));
+	StoredToken t;
+	t.accessToken = "secret-access";
+	store.save("https://mcp.example.com", t);
+
+	assert((getAttributes(dir) & (S_IRWXU | S_IRWXG | S_IRWXO)) == S_IRWXU);
 }
 
 version (Windows) unittest  // FileTokenStore restricts the token file to the current user (no inherited broad ACEs)
@@ -1569,12 +2594,12 @@ version (Posix) unittest  // FileTokenStore never writes secrets through a pre-e
 	auto root = buildPath(tempDir, "mcp-login-pre-" ~ Clock.currTime().toUnixTime().to!string);
 	mkdirRecurse(root);
 	scope (exit)
-		() @trusted { rmdirRecurse(root); }();
+		rmdirRecurse(root);
 
 	auto file = buildPath(root, "tokens.json");
 	// Pre-create the target as a world/group-readable (0644) file, as an earlier
 	// SDK version, an interrupted run, or an unusual umask might leave it.
-	() @trusted {
+	() {
 		write(file, "{}");
 		setAttributes(file, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
 	}();
@@ -1605,7 +2630,7 @@ version (Posix) unittest  // FileTokenStore never writes secrets through a pre-e
 	assert((() @trusted => readText(file))().indexOf("secret-refresh") >= 0);
 
 	// The loose-perm alias to the old inode must NOT have received the secrets.
-	auto aliasContents = () @trusted { return readText(alias_); }();
+	auto aliasContents = readText(alias_);
 	assert(aliasContents.indexOf("secret-refresh") < 0,
 			"secrets were written through a pre-existing group/world-readable inode");
 }
@@ -1622,7 +2647,7 @@ version (Posix) unittest  // FileTokenStore restricts the parent dir to 0700
 			.toUnixTime().to!string ~ "-d");
 	mkdirRecurse(root);
 	scope (exit)
-		() @trusted { rmdirRecurse(root); }();
+		rmdirRecurse(root);
 
 	auto file = buildPath(root, "sub", "tokens.json");
 	auto store = new FileTokenStore(file);
@@ -1650,8 +2675,9 @@ version (Posix) unittest  // FileTokenStore.save does not chmod CWD when path ha
 	auto bare = "mcp-bare-token-" ~ Clock.currTime().toUnixTime().to!string ~ ".json";
 	scope (exit)
 	{
-		if (bare.exists)
-			remove(bare);
+		foreach (f; [bare, bare ~ ".lock"])
+			if (f.exists)
+				remove(f);
 	}
 
 	auto store = new FileTokenStore(bare);
@@ -1697,37 +2723,62 @@ unittest  // requestTargetPath strips the query and fragment from a request targ
 	assert(requestTargetPath("") == "");
 }
 
-version (Posix) unittest  // openSystemBrowser does not leave a zombie process after the launcher exits
+version (Posix) unittest  // openSystemBrowser leaves no direct child process behind
 {
-	// openSystemBrowser must spawn the launcher with Config.detached so the OS
-	// never keeps a zombie entry after the process exits.  Without Config.detached,
-	// discarding the Pid without calling wait() causes the exited child to remain
-	// in the process table as a zombie until the parent process exits.
+	// openSystemBrowser must spawn the launcher with Config.detached: the
+	// launcher then runs as a grandchild and spawnProcess reaps the intermediate
+	// fork itself, so the call leaves this process no new direct child. Without
+	// it the discarded launcher stays a direct child, running or as a zombie.
 	//
-	// Call openSystemBrowser with a URL scheme that the platform launcher cannot
-	// handle, causing it to exit within milliseconds with an error — fast enough
-	// to reliably produce a zombie before the assertion if Config.detached is absent.
-	// With Config.detached the launcher runs as a grandchild (double-fork), so this
-	// process has no direct child to reap and waitpid returns ECHILD.
-	import core.stdc.errno : errno, ECHILD;
-	import core.sys.posix.sys.types : pid_t;
-	import core.sys.posix.sys.wait : waitpid, WNOHANG;
-	import core.thread : Thread;
-	import core.time : msecs;
+	// The check compares this process's direct children before and after the
+	// call, so children other tests leave behind (running, or exited and
+	// unreaped) neither fail it nor get reaped by it, and it does not depend on
+	// how quickly the launcher exits.
+	import std.algorithm : canFind, filter;
+	import std.array : array;
+	import std.process : spawnProcess, wait;
 
+	// An unrelated child that has exited but is not yet reaped, as another test
+	// can leave behind.
+	auto unrelated = spawnProcess(["true"]);
+	scope (exit)
+		wait(unrelated);
+
+	const before = directChildPids();
 	cast(void) openSystemBrowser("mcp-sdk-test-zombie://localhost/verify-detach");
+	const added = directChildPids().filter!(p => !before.canFind(p)).array;
 
-	Thread.sleep(300.msecs); // allow the launcher to exit and become a zombie if not detached
+	assert(added.length == 0,
+			"openSystemBrowser left a direct child process; it must spawn with Config.detached");
+}
 
-	// Reap any zombie direct children.  With Config.detached, the grandchild is
-	// not a direct child of this process, so waitpid returns -1/ECHILD.
-	// Without Config.detached the exited launcher is a zombie child and waitpid
-	// returns its PID, causing the assertion to fail.
-	int status;
-	pid_t reaped = () @trusted { return waitpid(-1, &status, WNOHANG); }();
+/// The PIDs of this process's direct children, zombies included (`pgrep -P`
+/// omits zombies on macOS, so `ps` is used), excluding the `ps` run itself.
+version (Posix) version (unittest) private int[] directChildPids() @trusted
+{
+	import core.sys.posix.unistd : getpid;
+	import std.algorithm : filter, splitter;
+	import std.array : array;
+	import std.conv : to;
+	import std.process : pipeProcess, Redirect, wait;
+	import std.string : strip;
 
-	assert(reaped == -1 && errno == ECHILD,
-			"openSystemBrowser left a zombie child process; it must spawn with Config.detached");
+	auto ps = pipeProcess(["ps", "-A", "-o", "pid=,ppid="], Redirect.stdout);
+	const psPid = ps.pid.processID;
+	const output = ps.stdout.byLineCopy.array;
+	wait(ps.pid);
+
+	const self = getpid();
+	int[] pids;
+	foreach (line; output)
+	{
+		auto cols = line.strip.splitter(' ').filter!(c => c.length);
+		const pid = cols.front.to!int;
+		cols.popFront();
+		if (cols.front.to!int == self && pid != psPid)
+			pids ~= pid;
+	}
+	return pids;
 }
 
 unittest  // the cache fast-path carries the registered client_id (DCR/CIMD have no static client_id)
@@ -1750,6 +2801,76 @@ unittest  // the cache fast-path falls back to the pre-registered client_id when
 	assert(rc.clientId == "pre-reg");
 }
 
+unittest  // the cache fast-path carries the persisted DCR client_secret
+{
+	OAuthLogin opts; // DCR: no static client credentials
+	StoredToken cached;
+	cached.accessToken = "valid";
+	cached.clientId = "abc123";
+	cached.clientSecret = "dcr-secret";
+	auto rc = cacheHitClient(cached, opts);
+	assert(rc.clientId == "abc123");
+	assert(rc.clientSecret == "dcr-secret");
+}
+
+unittest  // the cache fast-path uses the configured secret for the pre-registered client
+{
+	OAuthLogin opts;
+	opts.clientId = "pre-reg";
+	opts.clientSecret = "configured";
+	StoredToken cached;
+	cached.accessToken = "valid";
+	cached.clientId = "pre-reg";
+	auto rc = cacheHitClient(cached, opts);
+	assert(rc.clientSecret == "configured");
+}
+
+unittest  // the configured pre-registered secret is not persisted with the token
+{
+	OAuthLogin opts;
+	opts.clientId = "pre-reg";
+	opts.clientSecret = "configured";
+	assert(persistedClient(RegisteredClient("pre-reg", "configured"), opts).clientSecret.length == 0);
+	assert(persistedClient(RegisteredClient("dcr-id", "dcr-secret"), opts)
+			.clientSecret == "dcr-secret");
+}
+
+unittest  // StoredToken persists the DCR client_secret and its expiry across JSON round-trips
+{
+	StoredToken t;
+	t.accessToken = "tok";
+	t.setClient(RegisteredClient("abc123", "dcr-secret", 1_900_000_000));
+	auto back = StoredToken.fromJson(t.toJson());
+	assert(back.clientId == "abc123");
+	assert(back.clientSecret == "dcr-secret");
+	assert(back.clientSecretExpiresAt == 1_900_000_000);
+}
+
+unittest  // StoredToken persists the assigned token_endpoint_auth_method across JSON round-trips
+{
+	StoredToken t;
+	t.accessToken = "tok";
+	t.tokenEndpointAuthMethod = "client_secret_post";
+	assert(StoredToken.fromJson(t.toJson()).tokenEndpointAuthMethod == "client_secret_post");
+}
+
+unittest  // a stored token without token_endpoint_auth_method loads with none recorded
+{
+	auto back = StoredToken.fromJson(parseJsonString(`{"access_token":"tok","client_id":"abc"}`));
+	assert(back.accessToken == "tok");
+	assert(back.tokenEndpointAuthMethod.length == 0);
+}
+
+unittest  // a stored client secret past its client_secret_expires_at is reported expired
+{
+	StoredToken t;
+	t.setClient(RegisteredClient("abc123", "dcr-secret", 100));
+	assert(t.clientSecretExpired(100));
+	assert(!t.clientSecretExpired(99));
+	t.clientSecretExpiresAt = 0; // RFC 7591: 0 means the secret never expires
+	assert(!t.clientSecretExpired(long.max));
+}
+
 unittest  // StoredToken persists the registered client_id across JSON round-trips
 {
 	StoredToken t;
@@ -1757,6 +2878,562 @@ unittest  // StoredToken persists the registered client_id across JSON round-tri
 	t.clientId = "abc123";
 	auto back = StoredToken.fromJson(t.toJson());
 	assert(back.clientId == "abc123");
+}
+
+unittest  // StoredToken persists the issuing authorization server across JSON round-trips
+{
+	StoredToken t;
+	t.accessToken = "tok";
+	t.issuer = "https://as.example.com";
+	assert(StoredToken.fromJson(t.toJson()).issuer == "https://as.example.com");
+}
+
+version (unittest)
+{
+	import vibe.http.server : HTTPListener;
+
+	/// A loopback MCP authorization setup for `useOAuth`: PRM naming the
+	/// loopback AS, AS metadata (issuer = `base`), DCR, and a token endpoint
+	/// that counts every refresh-token grant it receives.
+	private final class IssuerTestAuthServer
+	{
+		HTTPListener listener;
+		string base;
+		int refreshCalls;
+		bool failRefresh;
+		/// The `client_secret` form field of the last refresh-token grant.
+		string lastRefreshFormSecret;
+		/// The PRM `resource`; empty selects `base ~ "/mcp"`.
+		string prmResource;
+		/// The PRM `scopes_supported`; empty omits it.
+		string[] prmScopes;
+
+		void stop() @safe
+		{
+			listener.stopListening();
+		}
+	}
+
+	/// ditto
+	private IssuerTestAuthServer startIssuerTestAuthServer() @safe
+	{
+		import std.algorithm : canFind;
+		import std.conv : to;
+		import vibe.http.server : HTTPServerRequest, HTTPServerResponse,
+			HTTPServerSettings, listenHTTP;
+
+		auto srv = new IssuerTestAuthServer;
+		auto settings = new HTTPServerSettings;
+		settings.bindAddresses = ["127.0.0.1"];
+		settings.port = 0;
+		srv.listener = listenHTTP(settings, (scope HTTPServerRequest req,
+				scope HTTPServerResponse res) @safe {
+			const b = srv.base;
+			if (req.path.canFind("oauth-protected-resource"))
+			{
+				auto prm = Json.emptyObject;
+				prm["resource"] = srv.prmResource.length ? srv.prmResource : b ~ "/mcp";
+				prm["authorization_servers"] = Json([Json(b)]);
+				if (srv.prmScopes.length)
+				{
+					Json[] scopes;
+					foreach (sc; srv.prmScopes)
+						scopes ~= Json(sc);
+					prm["scopes_supported"] = Json(scopes);
+				}
+				res.writeBody(prm.toString(), "application/json");
+			}
+			else if (req.path.canFind("authorization-server"))
+				res.writeBody(`{"issuer":"` ~ b ~ `","authorization_endpoint":"` ~ b
+					~ `/authorize","token_endpoint":"` ~ b ~ `/token","registration_endpoint":"`
+					~ b ~ `/register","code_challenge_methods_supported":["S256"]}`,
+					"application/json");
+			else if (req.path == "/register")
+				res.writeBody(
+					`{"client_id":"fresh-id","redirect_uris":["http://localhost:8765/callback"]}`,
+					"application/json");
+			else if (req.path == "/token")
+			{
+				if (req.form.get("grant_type", "") == "refresh_token")
+				{
+					srv.refreshCalls++;
+					srv.lastRefreshFormSecret = req.form.get("client_secret", "");
+					if (srv.failRefresh)
+					{
+						res.statusCode = 400;
+						res.writeBody(`{"error":"invalid_grant"}`, "application/json");
+						return;
+					}
+				}
+				res.writeBody(
+					`{"access_token":"new-access","token_type":"Bearer","expires_in":3600}`,
+					"application/json");
+			}
+			else
+			{
+				res.statusCode = 404;
+				res.writeBody("", "text/plain");
+			}
+		});
+		srv.base = "http://127.0.0.1:" ~ srv.listener.bindAddresses[0].port.to!string;
+		return srv;
+	}
+}
+
+unittest  // useOAuth requests the resource the protected-resource metadata names
+{
+	import core.time : msecs;
+	import std.algorithm : canFind;
+	import std.exception : assertThrown;
+	import std.uri : encodeComponent;
+
+	auto srv = startIssuerTestAuthServer();
+	scope (exit)
+		srv.stop();
+	// The server protects its whole origin; the MCP endpoint is a path beneath it.
+	srv.prmResource = srv.base;
+	const endpoint = srv.base ~ "/mcp";
+
+	string authUrl;
+	OAuthLogin opts;
+	opts.store = new MemoryTokenStore();
+	opts.callbackTimeout = 50.msecs;
+	opts.openBrowser = (string url) @safe { authUrl = url; };
+
+	assertThrown(useOAuth(McpClient.http(endpoint), endpoint, opts));
+	assert((authUrl ~ "&").canFind("resource=" ~ encodeComponent(srv.base) ~ "&"), authUrl);
+}
+
+unittest  // useOAuth never sends a refresh token to an authorization server other than its issuer
+{
+	import core.time : msecs;
+	import std.exception : assertThrown;
+	import mcp.auth.oauth : canonicalResourceUri;
+
+	auto srv = startIssuerTestAuthServer();
+	scope (exit)
+		srv.stop();
+	const endpoint = srv.base ~ "/mcp";
+	const resource = canonicalResourceUri(endpoint);
+
+	auto store = new MemoryTokenStore();
+	StoredToken t;
+	t.accessToken = "old";
+	t.refreshToken = "rt-from-old-as";
+	t.clientId = "abc123";
+	t.expiresAt = 1; // expired, so a refresh would be attempted
+	t.resource = resource;
+	t.issuer = "https://old-as.example.com";
+	store.save(resource, t);
+
+	OAuthLogin opts;
+	opts.store = store;
+	opts.callbackTimeout = 50.msecs;
+	opts.openBrowser = (string url) @safe {};
+
+	// The interactive flow runs (and times out) instead of the refresh.
+	assertThrown(useOAuth(McpClient.http(endpoint), endpoint, opts));
+	assert(srv.refreshCalls == 0, "a refresh token must only ever go to the AS that issued it");
+}
+
+unittest  // useOAuth does not reuse a cached access token issued by another authorization server
+{
+	import core.time : msecs;
+	import std.exception : assertThrown;
+	import mcp.auth.oauth : canonicalResourceUri;
+
+	auto srv = startIssuerTestAuthServer();
+	scope (exit)
+		srv.stop();
+	const endpoint = srv.base ~ "/mcp";
+	const resource = canonicalResourceUri(endpoint);
+
+	auto store = new MemoryTokenStore();
+	StoredToken t;
+	t.accessToken = "token-for-old-as";
+	t.resource = resource;
+	t.issuer = "https://old-as.example.com";
+	store.save(resource, t);
+
+	OAuthLogin opts;
+	opts.store = store;
+	opts.callbackTimeout = 50.msecs;
+	opts.openBrowser = (string url) @safe {};
+
+	assertThrown(useOAuth(McpClient.http(endpoint), endpoint, opts));
+}
+
+unittest  // useOAuth treats a stored token that records no issuer as absent
+{
+	import core.time : msecs;
+	import std.exception : assertThrown;
+	import mcp.auth.oauth : canonicalResourceUri;
+
+	auto srv = startIssuerTestAuthServer();
+	scope (exit)
+		srv.stop();
+	const endpoint = srv.base ~ "/mcp";
+	const resource = canonicalResourceUri(endpoint);
+
+	auto store = new MemoryTokenStore();
+	StoredToken t;
+	t.accessToken = "unbound";
+	t.refreshToken = "rt-unbound";
+	t.clientId = "abc123";
+	t.expiresAt = 1;
+	t.resource = resource;
+	store.save(resource, t);
+
+	OAuthLogin opts;
+	opts.store = store;
+	opts.callbackTimeout = 50.msecs;
+	opts.openBrowser = (string url) @safe {};
+
+	assertThrown(useOAuth(McpClient.http(endpoint), endpoint, opts));
+	assert(srv.refreshCalls == 0);
+}
+
+unittest  // useOAuth reuses a cached token whose issuer matches the discovered authorization server
+{
+	import mcp.auth.oauth : canonicalResourceUri;
+
+	auto srv = startIssuerTestAuthServer();
+	scope (exit)
+		srv.stop();
+	const endpoint = srv.base ~ "/mcp";
+	const resource = canonicalResourceUri(endpoint);
+
+	auto store = new MemoryTokenStore();
+	StoredToken t;
+	t.accessToken = "still-valid";
+	t.resource = resource;
+	t.issuer = srv.base;
+	store.save(resource, t);
+
+	OAuthLogin opts;
+	opts.store = store;
+	opts.openBrowser = (string url) @safe {
+		assert(0, "no interactive login expected");
+	};
+
+	assert(useOAuth(McpClient.http(endpoint), endpoint, opts).token.accessToken == "still-valid");
+}
+
+unittest  // useOAuth re-authorizes instead of reusing a valid cached token that lacks a requested scope
+{
+	import core.time : msecs;
+	import std.exception : assertThrown;
+	import mcp.auth.oauth : canonicalResourceUri;
+
+	auto srv = startIssuerTestAuthServer();
+	scope (exit)
+		srv.stop();
+	const endpoint = srv.base ~ "/mcp";
+	const resource = canonicalResourceUri(endpoint);
+
+	auto store = new MemoryTokenStore();
+	StoredToken t;
+	t.accessToken = "narrow";
+	t.scope_ = "files:read";
+	t.resource = resource;
+	t.issuer = srv.base;
+	store.save(resource, t);
+
+	OAuthLogin opts;
+	opts.store = store;
+	opts.wwwAuthenticate = `Bearer error="insufficient_scope", scope="files:read files:write"`;
+	opts.callbackTimeout = 50.msecs;
+	bool browserOpened;
+	opts.openBrowser = (string url) @safe { browserOpened = true; };
+
+	assertThrown(useOAuth(McpClient.http(endpoint), endpoint, opts));
+	assert(browserOpened, "a step-up must run a new authorization");
+}
+
+unittest  // useOAuth refreshes a cached DCR token with the auth method the AS assigned
+{
+	import mcp.auth.oauth : canonicalResourceUri;
+
+	auto srv = startIssuerTestAuthServer();
+	scope (exit)
+		srv.stop();
+	const endpoint = srv.base ~ "/mcp";
+	const resource = canonicalResourceUri(endpoint);
+
+	auto store = new MemoryTokenStore();
+	StoredToken t;
+	t.accessToken = "old";
+	t.refreshToken = "rt";
+	t.setClient(RegisteredClient("abc123", "dcr-secret"));
+	t.tokenEndpointAuthMethod = "client_secret_post";
+	t.expiresAt = 1;
+	t.resource = resource;
+	t.issuer = srv.base;
+	store.save(resource, t);
+
+	OAuthLogin opts;
+	opts.store = store;
+	opts.openBrowser = (string url) @safe {};
+
+	auto sess = useOAuth(McpClient.http(endpoint), endpoint, opts);
+	assert(sess.token.accessToken == "new-access");
+	assert(srv.lastRefreshFormSecret == "dcr-secret");
+	assert(store.load(resource).tokenEndpointAuthMethod == "client_secret_post");
+}
+
+unittest  // a failed cached refresh is logged before useOAuth falls back to the browser
+{
+	import core.time : msecs;
+	import std.algorithm : any, canFind;
+	import std.exception : assertThrown;
+	import vibe.core.log : deregisterLogger, LogLevel, Logger, LogLine, registerLogger;
+	import mcp.auth.oauth : canonicalResourceUri;
+
+	static final class CaptureLogger : Logger
+	{
+		string[] lines;
+		this() @safe
+		{
+			minLevel = LogLevel.warn;
+		}
+
+		override void log(ref LogLine line) @safe
+		{
+			lines ~= line.text;
+		}
+	}
+
+	auto logger = new CaptureLogger;
+	auto shared_ = () @trusted { return cast(shared) logger; }();
+	() @trusted { registerLogger(shared_); }();
+	scope (exit)
+		() @trusted { deregisterLogger(shared_); }();
+
+	auto srv = startIssuerTestAuthServer();
+	scope (exit)
+		srv.stop();
+	srv.failRefresh = true;
+	const endpoint = srv.base ~ "/mcp";
+	const resource = canonicalResourceUri(endpoint);
+
+	auto store = new MemoryTokenStore();
+	StoredToken t;
+	t.accessToken = "old";
+	t.refreshToken = "rt";
+	t.clientId = "abc123";
+	t.expiresAt = 1;
+	t.resource = resource;
+	t.issuer = srv.base;
+	store.save(resource, t);
+
+	OAuthLogin opts;
+	opts.store = store;
+	opts.callbackTimeout = 50.msecs;
+	opts.openBrowser = (string url) @safe {};
+
+	assertThrown(useOAuth(McpClient.http(endpoint), endpoint, opts));
+	assert(srv.refreshCalls == 1);
+	auto lines = (cast() logger).lines;
+	assert(lines.any!(l => l.canFind("refresh")), "a failed refresh must not be silent");
+}
+
+unittest  // useOAuth holds the token store lock from loading a cached token through its refresh and save
+{
+	import std.conv : to;
+	import mcp.auth.oauth : canonicalResourceUri;
+
+	// Records whether each load and save ran under the store lock.
+	static final class LockRecordingStore : TokenStore
+	{
+		MemoryTokenStore inner;
+		int depth;
+		string[] events;
+
+		this() @safe
+		{
+			inner = new MemoryTokenStore();
+		}
+
+		override StoredToken load(string resource) @safe
+		{
+			events ~= depth ? "load-locked" : "load";
+			return inner.load(resource);
+		}
+
+		override void save(string resource, StoredToken token) @safe
+		{
+			events ~= depth ? "save-locked" : "save";
+			inner.save(resource, token);
+		}
+
+		override void withLock(string resource, scope void delegate() @safe dg) @safe
+		{
+			++depth;
+			scope (exit)
+				--depth;
+			dg();
+		}
+	}
+
+	auto srv = startIssuerTestAuthServer();
+	scope (exit)
+		srv.stop();
+	const endpoint = srv.base ~ "/mcp";
+	const resource = canonicalResourceUri(endpoint);
+
+	auto store = new LockRecordingStore();
+	StoredToken t;
+	t.accessToken = "old";
+	t.refreshToken = "rt";
+	t.clientId = "abc123";
+	t.expiresAt = 1;
+	t.resource = resource;
+	t.issuer = srv.base;
+	store.inner.save(resource, t);
+
+	OAuthLogin opts;
+	opts.store = store;
+	opts.openBrowser = (string url) @safe {};
+	cast(void) useOAuth(McpClient.http(endpoint), endpoint, opts);
+	assert(srv.refreshCalls == 1);
+	assert(store.events == ["load-locked", "save-locked"], store.events.to!string);
+}
+
+unittest  // useOAuth does not refresh a cached token that lacks a requested scope
+{
+	import core.time : msecs;
+	import std.exception : assertThrown;
+	import mcp.auth.oauth : canonicalResourceUri;
+
+	auto srv = startIssuerTestAuthServer();
+	scope (exit)
+		srv.stop();
+	const endpoint = srv.base ~ "/mcp";
+	const resource = canonicalResourceUri(endpoint);
+
+	auto store = new MemoryTokenStore();
+	StoredToken t;
+	t.accessToken = "narrow";
+	t.refreshToken = "rt";
+	t.clientId = "abc123";
+	t.expiresAt = 1;
+	t.scope_ = "files:read";
+	t.resource = resource;
+	t.issuer = srv.base;
+	store.save(resource, t);
+
+	OAuthLogin opts;
+	opts.store = store;
+	opts.scopes = ["files:read", "files:write"];
+	opts.callbackTimeout = 50.msecs;
+	opts.openBrowser = (string url) @safe {};
+
+	assertThrown(useOAuth(McpClient.http(endpoint), endpoint, opts));
+	assert(srv.refreshCalls == 0, "a refresh cannot widen the granted scope");
+}
+
+unittest  // useOAuth reuses a cached token whose scope covers the requested scopes
+{
+	import mcp.auth.oauth : canonicalResourceUri;
+
+	auto srv = startIssuerTestAuthServer();
+	scope (exit)
+		srv.stop();
+	const endpoint = srv.base ~ "/mcp";
+	const resource = canonicalResourceUri(endpoint);
+
+	auto store = new MemoryTokenStore();
+	StoredToken t;
+	t.accessToken = "wide";
+	t.scope_ = "files:write files:read";
+	t.resource = resource;
+	t.issuer = srv.base;
+	store.save(resource, t);
+
+	OAuthLogin opts;
+	opts.store = store;
+	opts.scopes = ["files:read"];
+	opts.openBrowser = (string url) @safe {
+		assert(0, "no interactive login expected");
+	};
+
+	assert(useOAuth(McpClient.http(endpoint), endpoint, opts).token.accessToken == "wide");
+}
+
+unittest  // useOAuth reuses a cached token granted a subset of the discovered scopes_supported
+{
+	import mcp.auth.oauth : canonicalResourceUri;
+
+	auto srv = startIssuerTestAuthServer();
+	scope (exit)
+		srv.stop();
+	srv.prmScopes = ["files:read", "files:write"];
+	const endpoint = srv.base ~ "/mcp";
+	const resource = canonicalResourceUri(endpoint);
+
+	auto store = new MemoryTokenStore();
+	StoredToken t;
+	t.accessToken = "subset";
+	t.scope_ = "files:read";
+	t.resource = resource;
+	t.issuer = srv.base;
+	store.save(resource, t);
+
+	OAuthLogin opts;
+	opts.store = store;
+	opts.openBrowser = (string url) @safe {
+		assert(0, "no interactive login expected");
+	};
+
+	assert(useOAuth(McpClient.http(endpoint), endpoint, opts).token.accessToken == "subset");
+}
+
+unittest  // useOAuth does not reuse a cached token lacking a step-up challenge's scope
+{
+	import core.time : msecs;
+	import std.exception : assertThrown;
+	import mcp.auth.oauth : canonicalResourceUri;
+
+	auto srv = startIssuerTestAuthServer();
+	scope (exit)
+		srv.stop();
+	const endpoint = srv.base ~ "/mcp";
+	const resource = canonicalResourceUri(endpoint);
+
+	auto store = new MemoryTokenStore();
+	StoredToken t;
+	t.accessToken = "narrow";
+	t.scope_ = "files:read";
+	t.resource = resource;
+	t.issuer = srv.base;
+	store.save(resource, t);
+
+	bool browserOpened;
+	OAuthLogin opts;
+	opts.store = store;
+	opts.wwwAuthenticate = `Bearer error="insufficient_scope", scope="files:write"`;
+	opts.callbackTimeout = 50.msecs;
+	opts.openBrowser = (string url) @safe { browserOpened = true; };
+
+	assertThrown(useOAuth(McpClient.http(endpoint), endpoint, opts));
+	assert(browserOpened);
+}
+
+unittest  // a refresh response that omits scope keeps the previously granted scope
+{
+	StoredToken t;
+	t.accessToken = "old";
+	t.refreshToken = "rt";
+	t.expiresAt = 1000;
+	t.scope_ = "files:read";
+	auto sess = new OAuthSession("https://mcp.example.com", t,
+			new MemoryTokenStore(), (string rt) @safe {
+		TokenSet ts;
+		ts.accessToken = "new";
+		return ts;
+	});
+	sess.bearerForRequest(5000);
+	assert(sess.token.scope_ == "files:read");
 }
 
 unittest  // refreshing an expired token preserves the registered client_id for later refreshes
@@ -1780,6 +3457,27 @@ unittest  // refreshing an expired token preserves the registered client_id for 
 	// The persisted token still carries the registered client_id so a subsequent
 	// refresh (e.g. after a process restart) can authenticate at the AS.
 	assert(store.load("https://mcp.example.com").clientId == "abc123");
+}
+
+unittest  // refreshing an expired token keeps the issuer it is bound to
+{
+	auto store = new MemoryTokenStore();
+	StoredToken t;
+	t.accessToken = "old";
+	t.refreshToken = "rt";
+	t.expiresAt = 1000;
+	t.issuer = "https://as.example.com";
+
+	TokenSet delegate(string) @safe refreshFn = (string rt) @safe {
+		TokenSet ts;
+		ts.accessToken = "new";
+		ts.expiresIn = 3600;
+		return ts;
+	};
+	auto sess = new OAuthSession("https://mcp.example.com", t, store, refreshFn);
+	sess.bearerForRequest(5000);
+
+	assert(store.load("https://mcp.example.com").issuer == "https://as.example.com");
 }
 
 unittest  // a stray non-callback request does not abort the loopback flow
@@ -1806,36 +3504,81 @@ unittest  // a stray non-callback request does not abort the loopback flow
 		auto redirectUri = extractQueryParam(url, "redirect_uri");
 		import std.string : indexOf;
 
-		// redirect_uri looks like http://localhost:<port>/callback
-		auto hostStart = redirectUri.indexOf("localhost:");
+		// redirect_uri looks like http://127.0.0.1:<port>/callback
+		auto hostStart = redirectUri.indexOf("127.0.0.1:");
 		assert(hostStart >= 0);
-		auto rest = redirectUri[hostStart + "localhost:".length .. $];
+		auto rest = redirectUri[hostStart + "127.0.0.1:".length .. $];
 		auto slash = rest.indexOf('/');
 		auto portStr = slash >= 0 ? rest[0 .. slash] : rest;
 		auto baseUrl = "http://127.0.0.1:" ~ portStr;
 
-		() @trusted {
-			runTask(() nothrow{
-				try
-				{
-					sleep(50.msecs);
-					requestHTTP(baseUrl ~ "/favicon.ico", (scope req) {}, (scope res) {
-						res.dropBody();
-					});
-					sleep(50.msecs);
-					requestHTTP(baseUrl ~ "/callback?code=real-code&state=state-xyz", (scope req) {
-					}, (scope res) { res.dropBody(); });
-				}
-				catch (Exception)
-				{
-				}
-			});
-		}();
+		runTask(() nothrow{
+			try
+			{
+				sleep(50.msecs);
+				requestHTTP(baseUrl ~ "/favicon.ico", (scope req) {}, (scope res) {
+					res.dropBody();
+				});
+				sleep(50.msecs);
+				requestHTTP(baseUrl ~ "/callback?code=real-code&state=state-xyz", (scope req) {
+				}, (scope res) { res.dropBody(); });
+			}
+			catch (Exception)
+			{
+			}
+		});
 	};
 
 	auto captured = runBrowserLoopbackFlow(oauth, as_, rc, pkce, opts, "state-xyz");
 
 	assert(captured.ok, "genuine callback should be captured despite the stray request");
+	assert(captured.code == "real-code");
+}
+
+unittest  // a callback with the wrong state is refused (400) and the flow keeps waiting for the real one
+{
+	import core.time : msecs, seconds;
+	import std.string : indexOf;
+	import vibe.core.core : runTask, sleep;
+	import vibe.http.client : requestHTTP;
+
+	auto oauth = new OAuthClient();
+	oauth.resource = "https://mcp.example.com/mcp";
+	AuthorizationServerMetadata as_;
+	as_.authorizationEndpoint = "https://as.example.com/authorize";
+	as_.codeChallengeMethodsSupported = ["S256"];
+	auto rc = RegisteredClient("cid", "");
+	auto pkce = generatePkce();
+
+	OAuthLogin opts;
+	opts.callbackTimeout = 5.seconds;
+	int forgedStatus;
+	opts.openBrowser = (string url) @safe {
+		auto redirectUri = extractQueryParam(url, "redirect_uri");
+		auto rest = redirectUri[redirectUri.indexOf("127.0.0.1:") + "127.0.0.1:".length .. $];
+		auto baseUrl = "http://127.0.0.1:" ~ rest[0 .. rest.indexOf('/')];
+		runTask(() nothrow{
+			try
+			{
+				// Any web page can make the browser hit the loopback callback; one
+				// without the flow's state must not end the login.
+				sleep(50.msecs);
+				requestHTTP(baseUrl ~ "/callback?error=access_denied&state=forged", (scope req) {
+				}, (scope res) { forgedStatus = res.statusCode; res.dropBody(); });
+				sleep(50.msecs);
+				requestHTTP(baseUrl ~ "/callback?code=real-code&state=state-xyz", (scope req) {
+				}, (scope res) { res.dropBody(); });
+			}
+			catch (Exception)
+			{
+			}
+		});
+	};
+
+	auto captured = runBrowserLoopbackFlow(oauth, as_, rc, pkce, opts, "state-xyz");
+
+	assert(forgedStatus == 400);
+	assert(captured.ok, "the genuine callback must still be captured");
 	assert(captured.code == "real-code");
 }
 
@@ -1849,12 +3592,12 @@ version (Posix) unittest  // save() throws a typed error when the token director
 	auto root = buildPath(tempDir, "mcp-login-mkdir-" ~ Clock.currTime().toUnixTime().to!string);
 	mkdirRecurse(root);
 	scope (exit)
-		() @trusted { rmdirRecurse(root); }();
+		rmdirRecurse(root);
 
 	// A regular file standing where the token file's parent directory must be, so
 	// mkdirRecurse cannot create the directory.
 	auto blocker = buildPath(root, "blocker");
-	() @trusted { write(blocker, "x"); }();
+	write(blocker, "x");
 	auto store = new FileTokenStore(buildPath(blocker, "tokens.json"));
 	StoredToken t;
 	t.accessToken = "secret";
@@ -1868,6 +3611,51 @@ version (Posix) unittest  // save() throws a typed error when the token director
 			"save must surface a directory-creation failure rather than silently dropping the token");
 }
 
+version (Posix) @system unittest  // save() waits for the token file's lock, so concurrent writers never lose updates
+{
+	import core.atomic : atomicLoad, atomicStore;
+	import core.sys.posix.fcntl : open, O_CREAT, O_RDWR;
+	import core.sys.posix.unistd : close;
+	import core.thread : Thread;
+	import core.time : msecs;
+	import std.conv : to;
+	import std.datetime.systime : Clock;
+	import std.file : tempDir, mkdirRecurse, rmdirRecurse;
+	import std.path : buildPath;
+	import std.string : toStringz;
+
+	auto root = buildPath(tempDir, "mcp-login-lock-" ~ Clock.currTime().stdTime.to!string);
+	mkdirRecurse(root);
+	scope (exit)
+		rmdirRecurse(root);
+	auto file = buildPath(root, "tokens.json");
+
+	// Another process holds the lock mid read-modify-write.
+	const fd = () @trusted {
+		return open((file ~ ".lock").toStringz, O_CREAT | O_RDWR, 384);
+	}();
+	assert(fd >= 0);
+	assert(() @trusted { return flock(fd, LOCK_EX); }() == 0);
+
+	shared bool saved;
+	auto writer = new Thread(() {
+		auto store = new FileTokenStore(file);
+		StoredToken t;
+		t.accessToken = "from-writer";
+		store.save("https://b.example.com", t);
+		atomicStore(saved, true);
+	});
+	writer.start();
+	Thread.sleep(300.msecs);
+	assert(!atomicLoad(saved), "save must wait for the lock");
+
+	assert(() @trusted { return flock(fd, LOCK_UN); }() == 0);
+	assert(close(fd) == 0);
+	writer.join();
+	assert(atomicLoad(saved));
+	assert(new FileTokenStore(file).load("https://b.example.com").accessToken == "from-writer");
+}
+
 version (Posix) unittest  // save() backs up an unparseable token file instead of silently destroying it
 {
 	import std.file : tempDir, mkdirRecurse, rmdirRecurse, write, readText, exists;
@@ -1878,10 +3666,10 @@ version (Posix) unittest  // save() backs up an unparseable token file instead o
 	auto root = buildPath(tempDir, "mcp-login-corrupt-" ~ Clock.currTime().toUnixTime().to!string);
 	mkdirRecurse(root);
 	scope (exit)
-		() @trusted { rmdirRecurse(root); }();
+		rmdirRecurse(root);
 
 	auto file = buildPath(root, "tokens.json");
-	() @trusted { write(file, "{ this is not valid json"); }();
+	write(file, "{ this is not valid json");
 
 	auto store = new FileTokenStore(file);
 	StoredToken t;
@@ -1902,6 +3690,22 @@ version (Posix) unittest  // stillGroupOrOtherAccessible flags any lingering gro
 	assert(!FileTokenStore.stillGroupOrOtherAccessible(S_IRUSR | S_IWUSR));
 	assert(FileTokenStore.stillGroupOrOtherAccessible(S_IRUSR | S_IWUSR | S_IRGRP));
 	assert(FileTokenStore.stillGroupOrOtherAccessible(S_IRUSR | S_IWUSR | S_IROTH));
+}
+
+unittest  // browserLaunchCommand on Windows hands the URL to rundll32, never to a cmd shell
+{
+	const url = "https://idp.example/authorize?client_id=c&state=s&code_challenge=x";
+	const cmd = browserLaunchCommand(url, LauncherPlatform.windows);
+	assert(cmd == ["rundll32", "url.dll,FileProtocolHandler", url]);
+}
+
+unittest  // browserLaunchCommand uses open on macOS and xdg-open elsewhere, URL as one argument
+{
+	const url = "https://idp.example/authorize?a=1&b=2";
+	assert(browserLaunchCommand(url, LauncherPlatform.macOS) == ["open", url]);
+	assert(browserLaunchCommand(url, LauncherPlatform.other) == [
+		"xdg-open", url
+	]);
 }
 
 unittest  // openSystemBrowser reports a launcher failure instead of swallowing it into a hang
@@ -1942,46 +3746,43 @@ unittest  // useOAuth refreshes under the stored client_id before registering an
 	auto settings = new HTTPServerSettings;
 	settings.bindAddresses = ["127.0.0.1"];
 	settings.port = 0;
-	listener = () @trusted {
-		return listenHTTP(settings, (scope HTTPServerRequest req, scope HTTPServerResponse res) @safe {
-			if (req.path.canFind("oauth-protected-resource"))
-				res.writeBody(
-					`{"resource":"` ~ base ~ `/mcp","authorization_servers":["` ~ base ~ `"]}`,
+	listener = listenHTTP(settings, (scope HTTPServerRequest req, scope HTTPServerResponse res) @safe {
+		if (req.path.canFind("oauth-protected-resource"))
+			res.writeBody(`{"resource":"` ~ base ~ `/mcp","authorization_servers":["` ~ base ~ `"]}`,
+				"application/json");
+		else if (req.path.canFind("authorization-server"))
+			res.writeBody(`{"issuer":"http://` ~ req.host ~ `","authorization_endpoint":"` ~ base
+				~ `/authorize","token_endpoint":"` ~ base ~ `/token","registration_endpoint":"`
+				~ base ~ `/register","code_challenge_methods_supported":["S256"]}`,
+				"application/json");
+		else if (req.path == "/register")
+		{
+			registerCalls++;
+			res.writeBody(
+				`{"client_id":"fresh-id","redirect_uris":["http://localhost:8765/callback"]}`,
+				"application/json");
+		}
+		else if (req.path == "/token")
+		{
+			if (req.form.get("grant_type", "") == "refresh_token"
+				&& req.form.get("refresh_token", "") == "rt"
+				&& req.form.get("client_id", "") == "abc123")
+				res.writeBody(`{"access_token":"new-access","token_type":"Bearer","expires_in":3600,"refresh_token":"rt2"}`,
 					"application/json");
-			else if (req.path.canFind("authorization-server"))
-				res.writeBody(`{"issuer":"http://` ~ req.host ~ `","authorization_endpoint":"` ~ base
-					~ `/authorize","token_endpoint":"` ~ base ~ `/token","registration_endpoint":"`
-					~ base ~ `/register","code_challenge_methods_supported":["S256"]}`,
-					"application/json");
-			else if (req.path == "/register")
-			{
-				registerCalls++;
-				res.writeBody(
-					`{"client_id":"fresh-id","redirect_uris":["http://localhost:8765/callback"]}`,
-					"application/json");
-			}
-			else if (req.path == "/token")
-			{
-				if (req.form.get("grant_type", "") == "refresh_token"
-					&& req.form.get("refresh_token", "") == "rt"
-					&& req.form.get("client_id", "") == "abc123")
-					res.writeBody(`{"access_token":"new-access","token_type":"Bearer","expires_in":3600,"refresh_token":"rt2"}`,
-						"application/json");
-				else
-				{
-					res.statusCode = 400;
-					res.writeBody(`{"error":"invalid_grant"}`, "application/json");
-				}
-			}
 			else
 			{
-				res.statusCode = 404;
-				res.writeBody("", "text/plain");
+				res.statusCode = 400;
+				res.writeBody(`{"error":"invalid_grant"}`, "application/json");
 			}
-		});
-	}();
+		}
+		else
+		{
+			res.statusCode = 404;
+			res.writeBody("", "text/plain");
+		}
+	});
 	scope (exit)
-		() @trusted { listener.stopListening(); }();
+		listener.stopListening();
 	import std.conv : to;
 
 	base = "http://127.0.0.1:" ~ listener.bindAddresses[0].port.to!string;
@@ -1995,6 +3796,7 @@ unittest  // useOAuth refreshes under the stored client_id before registering an
 	t.clientId = "abc123"; // registered on the first run and persisted
 	t.expiresAt = 1; // long expired
 	t.resource = resource;
+	t.issuer = base; // issued by this AS
 	store.save(resource, t);
 
 	OAuthLogin opts;
@@ -2033,40 +3835,36 @@ unittest  // the loopback flow completes when invoked from inside a vibe task
 		auto redirectUri = extractQueryParam(url, "redirect_uri");
 		import std.string : indexOf;
 
-		auto hostStart = redirectUri.indexOf("localhost:");
+		auto hostStart = redirectUri.indexOf("127.0.0.1:");
 		assert(hostStart >= 0);
-		auto rest = redirectUri[hostStart + "localhost:".length .. $];
+		auto rest = redirectUri[hostStart + "127.0.0.1:".length .. $];
 		auto slash = rest.indexOf('/');
 		auto baseUrl = "http://127.0.0.1:" ~ (slash >= 0 ? rest[0 .. slash] : rest);
-		() @trusted {
-			runTask(() nothrow{
-				try
-				{
-					sleep(50.msecs);
-					requestHTTP(baseUrl ~ "/callback?code=in-task-code&state=state-xyz", (scope req) {
-					}, (scope res) { res.dropBody(); });
-				}
-				catch (Exception)
-				{
-				}
-			});
-		}();
+		runTask(() nothrow{
+			try
+			{
+				sleep(50.msecs);
+				requestHTTP(baseUrl ~ "/callback?code=in-task-code&state=state-xyz", (scope req) {
+				}, (scope res) { res.dropBody(); });
+			}
+			catch (Exception)
+			{
+			}
+		});
 	};
 
 	// Hosts such as a worker loop call the login from a task; the wait must
 	// yield to that loop rather than nest an event loop (which asserts).
 	bool finished;
 	LoopbackCapture captured;
-	() @trusted {
-		runTask(() nothrow{
-			try
-				captured = runBrowserLoopbackFlow(oauth, as_, rc, pkce, opts, "state-xyz");
-			catch (Exception)
-			{
-			}
-			finished = true;
-		});
-	}();
+	runTask(() nothrow{
+		try
+			captured = runBrowserLoopbackFlow(oauth, as_, rc, pkce, opts, "state-xyz");
+		catch (Exception)
+		{
+		}
+		finished = true;
+	});
 	auto sw = StopWatch(AutoStart.yes);
 	while (!finished && sw.peek < 8.seconds)
 		sleep(10.msecs);
@@ -2098,24 +3896,22 @@ unittest  // the client is registered with the redirect URI the listener actuall
 		registeredBeforeOpen = registeredWith.length > 0;
 		import std.string : indexOf;
 
-		auto hostStart = openedWith.indexOf("localhost:");
+		auto hostStart = openedWith.indexOf("127.0.0.1:");
 		assert(hostStart >= 0);
-		auto rest = openedWith[hostStart + "localhost:".length .. $];
+		auto rest = openedWith[hostStart + "127.0.0.1:".length .. $];
 		auto slash = rest.indexOf('/');
 		auto baseUrl = "http://127.0.0.1:" ~ (slash >= 0 ? rest[0 .. slash] : rest);
-		() @trusted {
-			runTask(() nothrow{
-				try
-				{
-					sleep(50.msecs);
-					requestHTTP(baseUrl ~ "/callback?code=c&state=state-xyz", (scope req) {
-					}, (scope res) { res.dropBody(); });
-				}
-				catch (Exception)
-				{
-				}
-			});
-		}();
+		runTask(() nothrow{
+			try
+			{
+				sleep(50.msecs);
+				requestHTTP(baseUrl ~ "/callback?code=c&state=state-xyz", (scope req) {
+				}, (scope res) { res.dropBody(); });
+			}
+			catch (Exception)
+			{
+			}
+		});
 	};
 
 	RegisteredClient rc;
@@ -2130,4 +3926,169 @@ unittest  // the client is registered with the redirect URI the listener actuall
 	assert(registeredWith == openedWith,
 			"registered redirect_uri must match the authorization request");
 	assert(registeredWith == oauth.redirectUri);
+}
+
+version (unittest)
+{
+	/// A loopback MCP server that answers `initialize` and accepts `tools/list`
+	/// only with the bearer `accepted`, answering any other with a 401
+	/// `invalid_token` challenge. Records the `Authorization` header of every
+	/// `tools/list`.
+	private final class RejectingMcpServer
+	{
+		import vibe.http.server : HTTPListener;
+
+		HTTPListener listener;
+		string endpoint;
+		string accepted;
+		string[] toolsAuth;
+
+		void stop() @safe
+		{
+			listener.stopListening();
+		}
+	}
+
+	/// ditto
+	private RejectingMcpServer startRejectingMcpServer(string accepted) @safe
+	{
+		import std.conv : to;
+		import vibe.http.server : HTTPServerRequest, HTTPServerResponse,
+			HTTPServerSettings, listenHTTP;
+		import vibe.stream.operations : readAllUTF8;
+
+		auto srv = new RejectingMcpServer;
+		srv.accepted = accepted;
+		auto settings = new HTTPServerSettings;
+		settings.bindAddresses = ["127.0.0.1"];
+		settings.port = 0;
+		srv.listener = listenHTTP(settings, (scope HTTPServerRequest req,
+				scope HTTPServerResponse res) @safe {
+			auto j = parseJsonString(req.bodyReader.readAllUTF8());
+			if ("id" !in j)
+			{
+				res.statusCode = 202;
+				res.writeBody("", "text/plain");
+				return;
+			}
+			auto reply = Json.emptyObject;
+			reply["jsonrpc"] = "2.0";
+			reply["id"] = j["id"];
+			if (j["method"].get!string == "initialize")
+				reply["result"] = parseJsonString(`{"protocolVersion":"2025-11-25",`
+					~ `"capabilities":{"tools":{}},"serverInfo":{"name":"fake","version":"1"}}`);
+			else
+			{
+				const auth = req.headers.get("Authorization", "");
+				srv.toolsAuth ~= auth;
+				if (auth != "Bearer " ~ srv.accepted)
+				{
+					res.statusCode = 401;
+					res.headers["WWW-Authenticate"] = `Bearer error="invalid_token"`;
+					res.writeBody("", "text/plain");
+					return;
+				}
+				reply["result"] = parseJsonString(`{"tools":[]}`);
+			}
+			res.writeBody(reply.toString(), "application/json");
+		});
+		srv.endpoint = "http://127.0.0.1:" ~ srv.listener.bindAddresses[0].port.to!string ~ "/mcp";
+		return srv;
+	}
+}
+
+unittest  // a 401 invalid_token replaces a token with no known expiry and retries the request once
+{
+	auto srv = startRejectingMcpServer("new-access");
+	scope (exit)
+		srv.stop();
+
+	auto store = new MemoryTokenStore();
+	StoredToken t;
+	t.accessToken = "old-access";
+	t.refreshToken = "the-refresh";
+	auto sess = new OAuthSession(srv.endpoint, t, store, (string rt) @safe {
+		TokenSet ts;
+		ts.accessToken = "new-access";
+		return ts;
+	});
+	auto client = McpClient.http(srv.endpoint);
+	scope (exit)
+		client.close();
+	cast(void) attachSession(client, sess);
+	client.initialize("2025-11-25");
+	client.listTools();
+	assert(srv.toolsAuth == ["Bearer old-access", "Bearer new-access"]);
+	assert(store.load(srv.endpoint).accessToken == "new-access");
+}
+
+unittest  // a rejected token with no refresh token surfaces the server's 401 challenge
+{
+	import mcp.client.http_transport : HttpStatusException;
+
+	auto srv = startRejectingMcpServer("never-sent");
+	scope (exit)
+		srv.stop();
+
+	StoredToken t;
+	t.accessToken = "old-access";
+	auto sess = new OAuthSession(srv.endpoint, t, new MemoryTokenStore(), (string rt) @safe {
+		assert(0, "no refresh token to present");
+		return TokenSet.init;
+	});
+	auto client = McpClient.http(srv.endpoint);
+	scope (exit)
+		client.close();
+	cast(void) attachSession(client, sess);
+	client.initialize("2025-11-25");
+	HttpStatusException failure;
+	try
+		client.listTools();
+	catch (HttpStatusException e)
+		failure = e;
+	assert(failure !is null, "the caller needs the 401 and its challenge to re-authenticate");
+	assert(failure.status == 401);
+	assert(failure.wwwAuthenticate == `Bearer error="invalid_token"`);
+	assert(srv.toolsAuth == ["Bearer old-access"], "nothing new to retry with");
+}
+
+unittest  // a refreshed token the server also rejects is not refreshed again on every request
+{
+	import mcp.client.http_transport : HttpStatusException;
+
+	auto srv = startRejectingMcpServer("never-issued");
+	scope (exit)
+		srv.stop();
+
+	auto store = new MemoryTokenStore();
+	StoredToken t;
+	t.accessToken = "old-access";
+	t.refreshToken = "the-refresh";
+	int refreshes;
+	auto sess = new OAuthSession(srv.endpoint, t, store, (string rt) @safe {
+		++refreshes;
+		TokenSet ts;
+		ts.accessToken = "new-access";
+		return ts;
+	});
+	auto client = McpClient.http(srv.endpoint);
+	scope (exit)
+		client.close();
+	cast(void) attachSession(client, sess);
+	client.initialize("2025-11-25");
+	foreach (_; 0 .. 3)
+	{
+		bool rejected;
+		try
+			client.listTools();
+		catch (HttpStatusException e)
+			rejected = e.status == 401;
+		assert(rejected);
+	}
+	assert(refreshes == 1, "the authorization server must not be hit on every request");
+	assert(srv.toolsAuth == [
+		"Bearer old-access", "Bearer new-access", "Bearer new-access",
+		"Bearer new-access"
+	]);
+	assert(!store.load(srv.endpoint).hasToken, "a later useOAuth must not reuse the token");
 }

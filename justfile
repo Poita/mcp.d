@@ -26,13 +26,27 @@ build:
 test:
     ulimit -n 65536 && dub test
 
-# Format the source in place (source/ + conformance/, matching CI).
+# Format every D source tree in place (matching CI's format check).
 fmt:
-    ulimit -n 65536 && dub run dfmt -- --inplace source/ conformance/
+    ulimit -n 65536 && dub run dfmt -- --inplace source/ conformance/ examples/ bench/ deploy/ci-smoke/
 
-# Run the exact D-Scanner lint gate CI runs (with documented filters).
+# Run CI's lint gates: D-Scanner (with documented filters) + README toolchain check.
 lint:
     ./scripts/dscanner-lint.sh
+    ./scripts/check-readme-versions.sh
+
+# Every example compiles its own server and client, so a full run takes ~15 min.
+# Build every example and run its self-verifying client over stdio and HTTP (~15 min).
+examples:
+    ./scripts/run-examples.sh
+
+# Build and run one example over stdio and HTTP, e.g. `just example tools`.
+example name:
+    ./scripts/run-examples.sh {{name}}
+
+# Generate the API documentation into docs/ (adrdox if installed, else ddox).
+docs:
+    ulimit -n 65536 && ./scripts/gen-docs.sh
 
 # Build the two conformance harness targets.
 conformance-build:
@@ -50,11 +64,15 @@ conformance-server-lane revision: conformance-build
     ./conformance-server --port "$PORT" $MODE &
     SERVER_PID=$!
     trap 'kill "$SERVER_PID" 2>/dev/null || true' EXIT
+    # Any HTTP status means the server is listening; curl reports 000 when
+    # the connection is refused.
     for i in $(seq 1 30); do
-      if curl -sf -o /dev/null "http://127.0.0.1:$PORT/mcp" \
+      CODE=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$PORT/mcp" \
         -H 'Accept: application/json, text/event-stream' \
         -H 'Content-Type: application/json' \
-        -X POST -d '{}'; then break; fi
+        -X POST -d '{}' || true)
+      if [ "$CODE" != "000" ]; then break; fi
+      if [ "$i" -eq 30 ]; then echo "conformance-server did not start on port $PORT" >&2; exit 1; fi
       sleep 1
     done
     npx --yes "@modelcontextprotocol/conformance@{{conformance_version}}" \

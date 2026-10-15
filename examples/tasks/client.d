@@ -6,7 +6,7 @@
  *   - STDIO (default): spawns the sibling `tasks-server` binary.
  *   - HTTP (`--http <url>`): connects to a running server via Streamable HTTP.
  *
- * Exercises the SEP-2663 task flow against the server's three `@task` tools:
+ * Exercises the SEP-2663 task flow against the server's three `@taskTool` tools:
  *
  *   1. word_count — `callToolAwait` calls the tool, detects the CreateTaskResult,
  *      polls `tasks/get` to completion, and returns the final CallToolResult.
@@ -19,8 +19,8 @@
  *      `onInputRequired` callback; the client answers via `respondTaskInput`
  *      (`tasks/update`) and keeps polling until the resumed task completes.
  *
- * The tasks extension is modern-only, so the client enables the modern protocol
- * (`enableModern`) and declares the extension (`enableTasks`) before negotiation.
+ * The tasks extension is modern-only, so the client declares the extension
+ * (`enableTasks`) and then `connect()`s, which negotiates 2026-07-28.
  *
  * Assertions verified:
  *   - `server/discover` advertises the tasks extension under `capabilities`.
@@ -35,8 +35,6 @@
 module tasks_client;
 
 import std.stdio : writeln;
-
-import vibe.data.json : Json;
 
 import mcp;
 import examples_common : check, checkEq, runClient, connectFromArgs;
@@ -77,13 +75,12 @@ int main(string[] args) @safe
 		scope (exit)
 			client.close();
 
-		// The tasks extension is modern-only: switch to the modern protocol and
-		// declare the extension (plus elicitation, which labeled_count needs to
-		// answer its mid-task input request) before version negotiation.
-		client.enableModern();
+		// Declare the tasks extension (plus elicitation, which labeled_count
+		// needs to answer its mid-task input request) before version negotiation.
 		client.enableTasks();
-		client.capabilities.elicitation = true;
 		client.capabilities.elicitationForm = true;
+		auto negotiated = client.connect();
+		checkEq(negotiated, ProtocolVersion.v2026_07_28, "connect() should negotiate 2026-07-28");
 
 		// --- 1. server/discover: tasks extension must be advertised ---------
 		auto disc = client.discover();
@@ -96,9 +93,6 @@ int main(string[] args) @safe
 			"discover should include extensions in capabilities");
 		check((tasksExtensionKey in caps["extensions"]) !is null,
 			"discover capabilities.extensions should contain the tasks extension key");
-
-		auto negotiated = client.connect();
-		checkEq(negotiated, ProtocolVersion.v2026_07_28, "connect() should negotiate 2026-07-28");
 
 		// --- 2. word_count (plain async task) -------------------------------
 		{
@@ -152,8 +146,8 @@ int main(string[] args) @safe
 			Json a = Json.emptyObject;
 			a["text"] = "hello world";
 			bool answered;
-			auto r = client.callToolAwait("labeled_count", a, (string taskId,
-				Json inputRequests) @safe {
+			auto r = client.callToolAwait("labeled_count", a,
+				RequestOptions.init, (string taskId, Json inputRequests) @safe {
 				check((("label" in inputRequests) !is null),
 				"labeled_count should surface a 'label' input request");
 				check(inputRequests["label"]["method"].get!string == "elicitation/create",

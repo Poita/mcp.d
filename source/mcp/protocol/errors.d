@@ -3,6 +3,7 @@ module mcp.protocol.errors;
 import vibe.data.json : Json;
 import mcp.protocol.capabilities : ClientCapabilities;
 import mcp.protocol.versions : ProtocolVersion, resourceNotFoundCode;
+import mcp.protocol.jsonhelpers : asciiEqualsIgnoreCase;
 
 @safe:
 
@@ -17,8 +18,10 @@ enum ErrorCode : int
 	// MCP-specific
 	resourceNotFound = -32002,
 	requestCancelled = -32800,
-	// MCP-allocated codes live in -32020..-32099 (sequential from -32020). The
-	// values below are emitted only to modern peers.
+	// MCP-allocated codes sit in JSON-RPC's implementation-defined server range
+	// [-32000,-32099]. Core modern-protocol codes are allocated sequentially from
+	// -32020 and are emitted only to modern peers; the Events extension's
+	// general-purpose codes below use -32011..-32015.
 	// Streamable HTTP: header/body validation failure.
 	headerMismatch = -32020,
 	// basic/lifecycle (MissingRequiredClientCapabilityError): processing a request
@@ -36,11 +39,10 @@ enum ErrorCode : int
 	// server's `sampling/createMessage` request. Not a JSON-RPC reserved code;
 	// the spec assigns this conventional value.
 	userRejected = -1,
-	// General-purpose codes introduced by the MCP Events extension, carried in
-	// the JSON-RPC implementation-defined server range [-32000,-32099] alongside
-	// -32001/-32003/-32004. Each spans a family of conditions, conveying the
-	// specifics through a typed `data` payload (the -32004 pattern). Named for
-	// reuse across MCP rather than scoped to events.
+	// General-purpose codes introduced by the MCP Events extension. Each spans a
+	// family of conditions, conveying the specifics through a typed `data`
+	// payload (the -32004 pattern). Named for reuse across MCP rather than scoped
+	// to events.
 	notFound = -32011, /// referenced entity does not exist (data.kind disambiguates)
 	forbidden = -32012, /// principal not permitted, or access revoked
 	resourceExhausted = -32013, /// a server-imposed limit/quota was reached
@@ -60,6 +62,23 @@ class McpException : Exception
 		super(message, file, line);
 		this.code = code;
 		this.data = data;
+	}
+}
+
+/// Thrown when a peer does not reply to a request within its timeout: a client
+/// request past `ClientSettings.requestTimeout` (restarted by progress when
+/// `resetTimeoutOnProgress` is set) or `ClientSettings.maxTotalTimeout`, which
+/// the client has already cancelled on the server, or a server->client request
+/// (elicitation, sampling, roots) the client left unanswered.
+///
+/// JSON-RPC has no timeout code, so `code` is `ErrorCode.internalError`, the same
+/// code a peer reports for its own internal errors. Tell a local timeout apart
+/// by catching this type rather than by inspecting `code`.
+class RequestTimeoutException : McpException
+{
+	this(string message, string file = __FILE__, size_t line = __LINE__) @safe
+	{
+		super(ErrorCode.internalError, message, Json.undefined, file, line);
 	}
 }
 
@@ -164,16 +183,6 @@ McpException callbackEndpointError(string message, string reason) @safe
 	return new McpException(ErrorCode.callbackEndpointError, message, data);
 }
 
-/// Build a "resource not found" error using the legacy MCP-specific code
-/// (-32002). Kept for backwards compatibility; this form always emits -32002.
-/// Modern connections should instead use the version-aware overload below, which
-/// selects the version-appropriate code (modern aligns it to invalidParams /
-/// -32602).
-McpException resourceNotFound(string uri, Json data = Json.undefined) @safe pure nothrow
-{
-	return new McpException(ErrorCode.resourceNotFound, "Resource not found: " ~ uri, data);
-}
-
 /// Build a "resource not found" error whose code is selected for the negotiated
 /// protocol version: modern aligns it to invalidParams (-32602), while earlier
 /// versions use the MCP-specific -32002 (see `versions.resourceNotFoundCode`).
@@ -193,7 +202,8 @@ McpException resourceNotFound(string uri, ProtocolVersion v, Json data = Json.un
 /// accepted rather than rejected here.) Beyond the scheme this requires an
 /// absolute URI: the scheme is followed by `:` and a hierarchical `//authority`
 /// with a non-empty host. Relative references, bare strings such as
-/// `"not a url"`, and `scheme:`-only values are rejected. Validation is
+/// `"not a url"`, `scheme:`-only values, whitespace, control characters, a
+/// backslash and an unbalanced IPv6 bracket are rejected. Validation is
 /// permissive about the path/query/fragment so any real `https://…` consent or
 /// OAuth URL passes.
 bool isValidElicitationUrl(string url) @safe pure nothrow @nogc
@@ -203,6 +213,13 @@ bool isValidElicitationUrl(string url) @safe pure nothrow @nogc
 
 	if (url.length == 0)
 		return false;
+
+	// A URI never contains whitespace or control characters, and browsers read
+	// a backslash as '/', so `https://evil.com\@good.com` would navigate to a
+	// different host than the one parsed here.
+	foreach (c; url)
+		if (c <= ' ' || c == 0x7F || c == '\\')
+			return false;
 
 	// Scheme: ALPHA *( ALPHA / DIGIT / "+" / "-" / "." ) ":" (RFC 3986 §3.1)
 	if (!isAlpha(url[0]))
@@ -224,7 +241,7 @@ bool isValidElicitationUrl(string url) @safe pure nothrow @nogc
 	// Restrict to web schemes (case-insensitive). URL-mode elicitation drives
 	// browser navigation, so non-web schemes such as `file`, `ftp` or `ws` are
 	// rejected even though they carry a `//authority`. Only `http`/`https` pass.
-	if (!schemeEquals(scheme, "http") && !schemeEquals(scheme, "https"))
+	if (!asciiEqualsIgnoreCase(scheme, "http") && !asciiEqualsIgnoreCase(scheme, "https"))
 		return false;
 
 	// Require a hierarchical authority ("//host…"). URL-mode elicitation always
@@ -251,27 +268,24 @@ bool isValidElicitationUrl(string url) @safe pure nothrow @nogc
 			break;
 		}
 	}
+	// A bracketed IPv6 literal must close its bracket and be followed only by
+	// an optional port; brackets are not allowed anywhere else in the host.
+	if (authority.length && authority[0] == '[')
+	{
+		const close = indexOf(authority, ']');
+		if (close < 2 || indexOf(authority[close + 1 .. $], ']') >= 0)
+			return false;
+		const rest = authority[close + 1 .. $];
+		return rest.length == 0 || rest[0] == ':';
+	}
+	if (indexOf(authority, '[') >= 0 || indexOf(authority, ']') >= 0)
+		return false;
 	// Strip the port suffix before checking that the host is non-empty.
 	// A URL such as "https://:8080/" has authority ":8080" with an empty host.
 	const colon = indexOf(authority, ':');
 	if (colon >= 0)
 		authority = authority[0 .. colon];
 	return authority.length > 0;
-}
-
-/// ASCII case-insensitive equality for an elicitation URL scheme. Avoids the
-/// allocation/`@nogc` cost of `std.uni.toLower` so `isValidElicitationUrl` can
-/// stay `pure nothrow @nogc`.
-private bool schemeEquals(scope const(char)[] scheme, scope string lower) @safe pure nothrow @nogc
-{
-	import std.ascii : toLower;
-
-	if (scheme.length != lower.length)
-		return false;
-	foreach (i, c; scheme)
-		if (toLower(c) != lower[i])
-			return false;
-	return true;
 }
 
 /// A single URL-mode elicitation entry carried by a `-32042`
@@ -361,15 +375,11 @@ unittest  // convenience constructors set the right code
 {
 	assert(methodNotFound("nope").code == ErrorCode.methodNotFound);
 	assert(invalidParams("x").code == ErrorCode.invalidParams);
-	assert(resourceNotFound("file:///x").code == ErrorCode.resourceNotFound);
 }
 
-unittest  // resourceNotFound (no-version) keeps the legacy -32002 code
+unittest  // resourceNotFound requires the negotiated version to pick its code
 {
-	auto e = resourceNotFound("file:///x");
-	assert(e.code == -32002);
-	assert(e.code == ErrorCode.resourceNotFound);
-	assert(e.msg == "Resource not found: file:///x");
+	static assert(!__traits(compiles, resourceNotFound("file:///x")));
 }
 
 unittest  // resourceNotFound(version) selects -32602 for modern, -32002 otherwise
@@ -514,7 +524,7 @@ unittest  // missingRequiredClientCapability carries data.requiredCapabilities
 unittest  // missingRequiredClientCapability requiredCapabilities matches ClientCapabilities.toJson
 {
 	ClientCapabilities req;
-	req.elicitation = true;
+	req.elicitationForm = true;
 	req.elicitationUrl = true;
 	auto e = missingRequiredClientCapability(req);
 	auto j = e.toErrorJson();
@@ -592,6 +602,42 @@ unittest  // isValidElicitationUrl still accepts http/https (case-insensitive sc
 	assert(isValidElicitationUrl("https://example.com/consent"));
 	assert(isValidElicitationUrl("HTTPS://example.com/consent"));
 	assert(isValidElicitationUrl("HtTp://example.com"));
+}
+
+unittest  // isValidElicitationUrl rejects whitespace anywhere in the URL
+{
+	assert(!isValidElicitationUrl("https://exa mple.com/"));
+	assert(!isValidElicitationUrl("https://example.com/a b"));
+	assert(!isValidElicitationUrl(" https://example.com/"));
+	assert(!isValidElicitationUrl("https://example.com/\t"));
+}
+
+unittest  // isValidElicitationUrl rejects control characters
+{
+	assert(!isValidElicitationUrl("https://example.com/\n"));
+	assert(!isValidElicitationUrl("https://exa\x00mple.com/"));
+	assert(!isValidElicitationUrl("https://example.com/\x7f"));
+}
+
+unittest  // isValidElicitationUrl rejects a backslash, which browsers read as a path separator
+{
+	assert(!isValidElicitationUrl(`https://evil.com\@good.com`));
+	assert(!isValidElicitationUrl(`https://good.com/a\b`));
+}
+
+unittest  // isValidElicitationUrl rejects an unbalanced IPv6 bracket in the authority
+{
+	assert(!isValidElicitationUrl("https://["));
+	assert(!isValidElicitationUrl("https://[::1/"));
+	assert(!isValidElicitationUrl("https://::1]/"));
+	assert(!isValidElicitationUrl("https://[]/"));
+	assert(!isValidElicitationUrl("https://[::1]x/"));
+}
+
+unittest  // isValidElicitationUrl accepts a bracketed IPv6 host with or without a port
+{
+	assert(isValidElicitationUrl("https://[::1]/consent"));
+	assert(isValidElicitationUrl("https://[2001:db8::1]:8443/"));
 }
 
 unittest  // urlElicitationRequired throws on a malformed url

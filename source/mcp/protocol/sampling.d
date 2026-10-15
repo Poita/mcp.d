@@ -16,7 +16,7 @@ import std.typecons : Nullable, nullable;
 import vibe.data.json : Json;
 import mcp.protocol.types : Content, ContentKind, Tool;
 import mcp.protocol.errors : McpException, invalidParams;
-import mcp.protocol.jsonhelpers : getOr, tryGet;
+import mcp.protocol.jsonhelpers : getOr, tryGet, numberOrThrow, stringOrThrow, requireObject;
 
 @safe:
 
@@ -67,8 +67,11 @@ struct SamplingMessage
 
 	Json toJson() const @safe
 	{
-		if (contentBlocks.length == 0)
-			throw invalidParams("SamplingMessage requires at least one content block");
+		import std.exception : enforce;
+
+		// An empty message is a local builder mistake, so it is a plain Exception
+		// rather than a -32602 that would blame the peer.
+		enforce(contentBlocks.length > 0, "SamplingMessage requires at least one content block");
 		Json j = Json.emptyObject;
 		j["role"] = role;
 		// Preserve the single-object wire shape for the common one-block message
@@ -90,24 +93,34 @@ struct SamplingMessage
 
 	static SamplingMessage fromJson(Json j) @safe
 	{
+		requireObject(j, "SamplingMessage");
 		SamplingMessage m;
 		m.role = j.getOr("role", "");
-		// `content` may be a single block (object) or an array of blocks; accept
-		// both so a tool-loop follow-up (array of tool_use/tool_result blocks)
-		// round-trips without dropping any block.
-		if ("content" in j)
-		{
-			auto c = j["content"];
-			if (c.type == Json.Type.array)
-				foreach (i; 0 .. c.length)
-					m.contentBlocks ~= Content.fromJson(c[i]);
-			else
-				m.contentBlocks ~= Content.fromJson(c);
-		}
+		m.contentBlocks = requiredContentBlocks(j, "SamplingMessage");
 		if ("_meta" in j && j["_meta"].type == Json.Type.object)
 			m.meta = j["_meta"];
 		return m;
 	}
+}
+
+/// Parse the required `content` of a sampling message or result: a single block
+/// (object) or an array of blocks, so a tool-loop message carrying several
+/// tool_use/tool_result blocks round-trips. Throws -32602 when `content` is
+/// absent or an empty array.
+private Content[] requiredContentBlocks(Json j, string owner) @safe
+{
+	if ("content" !in j)
+		throw invalidParams(owner ~ " requires 'content'");
+	auto c = j["content"];
+	Content[] blocks;
+	if (c.type == Json.Type.array)
+		foreach (i; 0 .. c.length)
+			blocks ~= Content.fromJson(c[i]);
+	else
+		blocks ~= Content.fromJson(c);
+	if (blocks.length == 0)
+		throw invalidParams(owner ~ " requires at least one content block");
+	return blocks;
 }
 
 /// A hint for which model the client should select. `name` is a substring the
@@ -126,6 +139,7 @@ struct ModelHint
 
 	static ModelHint fromJson(Json j) @safe
 	{
+		requireObject(j, "ModelHint");
 		ModelHint h;
 		h.name = j.getOr("name", "");
 		return h;
@@ -163,19 +177,21 @@ struct ModelPreferences
 
 	static ModelPreferences fromJson(Json j) @safe
 	{
+		requireObject(j, "ModelPreferences");
 		ModelPreferences p;
 		if ("hints" in j && j["hints"].type == Json.Type.array)
 			foreach (i; 0 .. j["hints"].length)
 				p.hints ~= ModelHint.fromJson(j["hints"][i]);
 		if ("costPriority" in j && j["costPriority"].type != Json.Type.undefined
 				&& j["costPriority"].type != Json.Type.null_)
-			p.costPriority = j["costPriority"].to!double;
+			p.costPriority = numberOrThrow(j["costPriority"], "costPriority");
 		if ("speedPriority" in j && j["speedPriority"].type != Json.Type.undefined
 				&& j["speedPriority"].type != Json.Type.null_)
-			p.speedPriority = j["speedPriority"].to!double;
+			p.speedPriority = numberOrThrow(j["speedPriority"], "speedPriority");
 		if ("intelligencePriority" in j && j["intelligencePriority"].type != Json.Type.undefined
 				&& j["intelligencePriority"].type != Json.Type.null_)
-			p.intelligencePriority = j["intelligencePriority"].to!double;
+			p.intelligencePriority = numberOrThrow(j["intelligencePriority"],
+					"intelligencePriority");
 		return p;
 	}
 
@@ -207,6 +223,7 @@ struct ToolChoice
 
 	static ToolChoice fromJson(Json j) @safe
 	{
+		requireObject(j, "ToolChoice");
 		ToolChoice c;
 		if (j.type == Json.Type.object && "mode" in j && j["mode"].type == Json.Type.string)
 			c.mode = j["mode"].get!string;
@@ -246,8 +263,12 @@ struct CreateMessageRequest
 		// `maxTokens` is REQUIRED by CreateMessageRequestParams in every spec
 		// version (schema.ts: `maxTokens: number;`, no `?`). Refuse to serialize a
 		// request that would omit it rather than silently emit spec-invalid params.
-		if (maxTokens.isNull)
-			throw invalidParams("CreateMessageRequest.maxTokens is required and must be set");
+		// This is a local builder mistake, so it is a plain Exception rather than
+		// a -32602 that would blame the peer.
+		import std.exception : enforce;
+
+		enforce(!maxTokens.isNull, "CreateMessageRequest.maxTokens is required and must be set");
+		enforce(maxTokens.get >= 0, "CreateMessageRequest.maxTokens must not be negative");
 		if (!modelPreferences.empty)
 			j["modelPreferences"] = modelPreferences.toJson();
 		if (!systemPrompt.isNull)
@@ -256,8 +277,7 @@ struct CreateMessageRequest
 			j["includeContext"] = includeContext.get;
 		if (!temperature.isNull)
 			j["temperature"] = temperature.get;
-		if (!maxTokens.isNull)
-			j["maxTokens"] = maxTokens.get;
+		j["maxTokens"] = maxTokens.get;
 		if (stopSequences.length)
 		{
 			Json s = Json.emptyArray;
@@ -281,6 +301,7 @@ struct CreateMessageRequest
 
 	static CreateMessageRequest fromJson(Json j) @safe
 	{
+		requireObject(j, "CreateMessageRequest");
 		CreateMessageRequest r;
 		if ("messages" in j && j["messages"].type == Json.Type.array)
 			foreach (i; 0 .. j["messages"].length)
@@ -291,16 +312,21 @@ struct CreateMessageRequest
 		tryGet(j, "includeContext", r.includeContext);
 		if ("temperature" in j && j["temperature"].type != Json.Type.undefined
 				&& j["temperature"].type != Json.Type.null_)
-			r.temperature = j["temperature"].to!double;
-		// `maxTokens` is a spec `number` (schema.ts: `maxTokens: number;`), so accept
-		// any non-null numeric representation (int, bigInt, or float) and not just an
-		// integer literal: a conformant sender may emit e.g. 100.0 (Json.Type.float_).
-		if ("maxTokens" in j && j["maxTokens"].type != Json.Type.undefined
-				&& j["maxTokens"].type != Json.Type.null_)
-			r.maxTokens = j["maxTokens"].to!long;
+			r.temperature = numberOrThrow(j["temperature"], "temperature");
+		// `maxTokens` is a required spec `number` (schema.ts: `maxTokens: number;`),
+		// so accept any numeric representation (int, bigInt, or float) and not just
+		// an integer literal: a conformant sender may emit e.g. 100.0.
+		if ("maxTokens" !in j || j["maxTokens"].type == Json.Type.null_)
+			throw invalidParams("'maxTokens' is required");
+		const v = numberOrThrow(j["maxTokens"], "maxTokens");
+		// `!(v >= 0)` also rejects NaN; the upper bound keeps the cast defined.
+		if (!(v >= 0) || v >= 0x1p63)
+			throw invalidParams(
+					"'maxTokens' must be a non-negative number within the integer range");
+		r.maxTokens = cast(long) v;
 		if ("stopSequences" in j && j["stopSequences"].type == Json.Type.array)
 			foreach (i; 0 .. j["stopSequences"].length)
-				r.stopSequences ~= j["stopSequences"][i].get!string;
+				r.stopSequences ~= stringOrThrow(j["stopSequences"][i], "stopSequences");
 		if ("tools" in j && j["tools"].type == Json.Type.array)
 			foreach (i; 0 .. j["tools"].length)
 				r.tools ~= Tool.fromJson(j["tools"][i]);
@@ -322,10 +348,13 @@ struct CreateMessageRequest
 ///   immediately followed by a `user` message that consists entirely of
 ///   `tool_result` blocks, with each `tool_use` `id` matched by a
 ///   `tool_result` `toolUseId`, before any other message.
+/// - Every `tool_result` `toolUseId` MUST match a `tool_use` `id` of the
+///   immediately preceding `assistant` message.
 ///
 /// On violation throws an `McpException` with the spec's `-32602` (Invalid
-/// params) code; the message distinguishes "Tool result missing in request"
-/// from "Tool results mixed with other content". A well-formed (or
+/// params) code; the message distinguishes "Tool result missing in request",
+/// "Tool result has no matching tool_use" and "Tool results mixed with other
+/// content". A well-formed (or
 /// tool-free) request returns normally.
 ///
 /// `params` is the raw `sampling/createMessage` params JSON — the same value
@@ -361,15 +390,21 @@ void validateSamplingMessages(Json params) @safe
 			.get!string : "";
 	}
 
+	// The tool_use ids of the previous message, which are the only ids a
+	// tool_result in the current message may answer.
+	bool[string] priorToolUseIds;
 	foreach (mi; 0 .. msgs.length)
 	{
 		auto msg = msgs[mi];
 		const role = (msg.type == Json.Type.object && "role" in msg
 				&& msg["role"].type == Json.Type.string) ? msg["role"].get!string : "";
 		auto blocks = blocksOf(msg);
+		auto answerable = priorToolUseIds;
+		priorToolUseIds = null;
 
 		// §Tool Result Messages: a user message containing any tool_result
-		// block must contain ONLY tool_result blocks.
+		// block must contain ONLY tool_result blocks, each answering a
+		// tool_use of the immediately preceding assistant message.
 		if (role == "user")
 		{
 			bool hasToolResult, hasOther;
@@ -382,6 +417,16 @@ void validateSamplingMessages(Json params) @safe
 			}
 			if (hasToolResult && hasOther)
 				throw invalidParams("Tool results mixed with other content");
+			foreach (b; blocks)
+			{
+				if (blockType(b) != "tool_result")
+					continue;
+				if (b.type != Json.Type.object || "toolUseId" !in b
+						|| b["toolUseId"].type != Json.Type.string)
+					throw invalidParams("Tool result block missing required string toolUseId");
+				if (b["toolUseId"].get!string !in answerable)
+					throw invalidParams("Tool result has no matching tool_use");
+			}
 		}
 
 		// §Tool Use and Result Balance: every assistant message with tool_use
@@ -406,6 +451,7 @@ void validateSamplingMessages(Json params) @safe
 			}
 			if (toolUseIds.length == 0)
 				continue;
+			priorToolUseIds = toolUseIds;
 
 			if (mi + 1 >= msgs.length)
 				throw invalidParams("Tool result missing in request");
@@ -532,8 +578,11 @@ struct CreateMessageResult
 
 	Json toJson() const @safe
 	{
-		if (contentBlocks.length == 0)
-			throw invalidParams("CreateMessageResult requires at least one content block");
+		import std.exception : enforce;
+
+		// An empty result is a local builder mistake, so it is a plain Exception
+		// rather than a -32602 that would blame the peer.
+		enforce(contentBlocks.length > 0, "CreateMessageResult requires at least one content block");
 		Json j = Json.emptyObject;
 		j["role"] = role;
 		// Preserve the single-object wire shape for the common one-block reply
@@ -558,20 +607,11 @@ struct CreateMessageResult
 
 	static CreateMessageResult fromJson(Json j) @safe
 	{
+		requireObject(j, "CreateMessageResult");
 		CreateMessageResult r;
-		r.role = j.getOr("role", "");
-		// `content` may be a single block (object) or an array of blocks; accept
-		// both so a tool-use reply (array of tool_use blocks) round-trips.
-		if ("content" in j)
-		{
-			auto c = j["content"];
-			if (c.type == Json.Type.array)
-				foreach (i; 0 .. c.length)
-					r.contentBlocks ~= Content.fromJson(c[i]);
-			else
-				r.contentBlocks ~= Content.fromJson(c);
-		}
-		r.model = j.getOr("model", "");
+		r.role = stringOrThrow("role" in j ? j["role"] : Json.undefined, "role");
+		r.contentBlocks = requiredContentBlocks(j, "CreateMessageResult");
+		r.model = stringOrThrow("model" in j ? j["model"] : Json.undefined, "model");
 		tryGet(j, "stopReason", r.stopReason);
 		if ("_meta" in j && j["_meta"].type == Json.Type.object)
 			r.meta = j["_meta"];
@@ -723,6 +763,15 @@ unittest  // ModelPreferences round-trips through fromJson
 	assert(back.costPriority.isNull);
 }
 
+unittest  // ModelHint.fromJson rejects a non-object value with -32602
+{
+	import mcp.protocol.errors : ErrorCode;
+	import std.exception : collectException;
+
+	auto ex = cast(McpException) collectException(ModelHint.fromJson(Json("claude")));
+	assert(ex !is null && ex.code == ErrorCode.invalidParams);
+}
+
 unittest  // CreateMessageRequest serializes all set params and omits unset
 {
 	CreateMessageRequest req;
@@ -754,15 +803,13 @@ unittest  // CreateMessageRequest.toJson throws when the REQUIRED maxTokens is u
 	req.messages = [SamplingMessage("user", Content.makeText("hi"))];
 	assert(req.maxTokens.isNull);
 
-	bool threw;
-	try
-		cast(void) req.toJson();
-	catch (McpException e)
-	{
-		threw = true;
-		assert(e.code == ErrorCode.invalidParams);
-	}
-	assert(threw, "toJson must throw invalidParams when maxTokens is unset");
+	// A missing maxTokens is a local builder mistake, not bad peer params, so
+	// it surfaces as a plain Exception rather than a -32602 McpException.
+	import std.exception : collectException;
+
+	auto e = collectException(req.toJson());
+	assert(e !is null, "toJson must throw when maxTokens is unset");
+	assert(cast(McpException) e is null);
 }
 
 unittest  // CreateMessageRequest.toJson emits maxTokens once it is set
@@ -835,6 +882,32 @@ unittest  // CreateMessageRequest.fromJson still accepts an integer-valued maxTo
 	auto r = CreateMessageRequest.fromJson(j);
 	assert(!r.maxTokens.isNull);
 	assert(r.maxTokens.get == 256);
+}
+
+unittest  // CreateMessageRequest.fromJson rejects a negative or out-of-range maxTokens with -32602
+{
+	import std.exception : collectException;
+
+	foreach (bad; [Json(-1L), Json(-0.5), Json(1e300)])
+	{
+		Json j = Json.emptyObject;
+		j["messages"] = Json.emptyArray;
+		j["maxTokens"] = bad;
+		auto ex = cast(McpException) collectException(CreateMessageRequest.fromJson(j));
+		assert(ex !is null && ex.code == ErrorCode.invalidParams, bad.toString);
+	}
+}
+
+unittest  // CreateMessageRequest.toJson rejects a negative maxTokens as a local error
+{
+	import std.exception : collectException;
+
+	CreateMessageRequest req;
+	req.messages = [SamplingMessage("user", Content.makeText("hi"))];
+	req.maxTokens = -5;
+	auto e = collectException(req.toJson());
+	assert(e !is null);
+	assert(cast(McpException) e is null);
 }
 
 unittest  // CreateMessageRequest emits tools and toolChoice; omits when unset
@@ -1015,41 +1088,29 @@ unittest  // CreateMessageResult.text honours custom stopReason and role
 	assert(u.role == "user");
 }
 
-unittest  // SamplingMessage.toJson throws invalidParams when contentBlocks is empty
+unittest  // SamplingMessage.toJson throws a local error when contentBlocks is empty
 {
-	import mcp.protocol.errors : ErrorCode;
+	import std.exception : collectException;
 
 	SamplingMessage m;
 	m.role = "user";
 	// contentBlocks is empty — toJson must reject this rather than emit `"content": []`
-	bool threw;
-	try
-		cast(void) m.toJson();
-	catch (McpException e)
-	{
-		threw = true;
-		assert(e.code == ErrorCode.invalidParams);
-	}
-	assert(threw, "SamplingMessage.toJson must throw invalidParams when contentBlocks is empty");
+	auto e = collectException(m.toJson());
+	assert(e !is null, "SamplingMessage.toJson must throw when contentBlocks is empty");
+	assert(cast(McpException) e is null);
 }
 
-unittest  // CreateMessageResult.toJson throws invalidParams when contentBlocks is empty
+unittest  // CreateMessageResult.toJson throws a local error when contentBlocks is empty
 {
-	import mcp.protocol.errors : ErrorCode;
+	import std.exception : collectException;
 
 	CreateMessageResult r;
 	r.role = "assistant";
 	r.model = "m";
 	// contentBlocks is empty — toJson must reject this rather than emit `"content": []`
-	bool threw;
-	try
-		cast(void) r.toJson();
-	catch (McpException e)
-	{
-		threw = true;
-		assert(e.code == ErrorCode.invalidParams);
-	}
-	assert(threw, "CreateMessageResult.toJson must throw invalidParams when contentBlocks is empty");
+	auto e = collectException(r.toJson());
+	assert(e !is null, "CreateMessageResult.toJson must throw when contentBlocks is empty");
+	assert(cast(McpException) e is null);
 }
 
 unittest  // StopReason wire mapping is exact and reversible
@@ -1212,10 +1273,28 @@ unittest  // a tool_use followed by an assistant message (not user) is rejected
 	assert(threw);
 }
 
-unittest  // a lone user tool_result message (no other content) is allowed
+unittest  // a tool_result with no preceding assistant tool_use is rejected
 {
-	auto p = samplingParams(msg("user", toolResult("call_1")));
-	validateSamplingMessages(p); // single-block tool_result-only user msg is fine
+	import std.exception : collectException;
+
+	auto e = collectException!McpException(
+			validateSamplingMessages(samplingParams(msg("user", toolResult("call_1")))));
+	assert(e !is null && e.code == ErrorCode.invalidParams);
+	assert(e.msg == "Tool result has no matching tool_use");
+	e = collectException!McpException(validateSamplingMessages(samplingParams(textMsg("assistant",
+			"hi"), msg("user", toolResult("call_1")))));
+	assert(e !is null && e.msg == "Tool result has no matching tool_use");
+}
+
+unittest  // a tool_result whose toolUseId matches no tool_use of the prior message is rejected
+{
+	import std.exception : collectException;
+
+	auto p = samplingParams(msg("assistant", toolUse("call_1", "get_weather")),
+			msg("user", toolResult("call_1"), toolResult("call_9")));
+	auto e = collectException!McpException(validateSamplingMessages(p));
+	assert(e !is null && e.code == ErrorCode.invalidParams);
+	assert(e.msg == "Tool result has no matching tool_use");
 }
 
 unittest  // missing/empty messages is a no-op (nothing to validate)
@@ -1296,4 +1375,107 @@ unittest  // duplicate tool_use ids with one matching tool_result are rejected
 		assert(e.code == ErrorCode.invalidParams);
 	}
 	assert(threw, "duplicate tool_use ids must be rejected");
+}
+
+unittest  // CreateMessageRequest.fromJson rejects non-numeric temperature and maxTokens with -32602
+{
+	import std.exception : collectException;
+	import mcp.protocol.errors : ErrorCode;
+
+	foreach (bad; [
+			Json(["maxTokens": Json(10), "temperature": Json("hot")]),
+			Json(["maxTokens": Json(10), "temperature": Json("0.5")]),
+			Json(["maxTokens": Json("100")]),
+			Json(["maxTokens": Json(10), "stopSequences": Json([Json(1)])])
+		])
+	{
+		auto ex = cast(McpException) collectException(CreateMessageRequest.fromJson(bad));
+		assert(ex !is null && ex.code == ErrorCode.invalidParams, bad.toString());
+	}
+	auto ok = CreateMessageRequest.fromJson(Json([
+		"maxTokens": Json(100.0),
+		"temperature": Json(1)
+	]));
+	assert(ok.maxTokens.get == 100 && ok.temperature.get == 1.0);
+}
+
+unittest  // ModelPreferences.fromJson rejects a non-numeric priority with -32602
+{
+	import std.exception : collectException;
+	import mcp.protocol.errors : ErrorCode;
+
+	auto ex = cast(McpException) collectException(
+			ModelPreferences.fromJson(Json(["costPriority": Json("high")])));
+	assert(ex !is null && ex.code == ErrorCode.invalidParams);
+	assert(ModelPreferences.fromJson(Json(["speedPriority": Json(1)])).speedPriority.get == 1.0);
+}
+
+unittest  // SamplingMessage and CreateMessageResult fromJson reject absent or empty content with -32602
+{
+	import mcp.protocol.errors : ErrorCode;
+	import std.exception : collectException;
+	import vibe.data.json : parseJsonString;
+
+	static immutable string[] bodies = [
+		`{"role":"assistant","model":"m"}`,
+		`{"role":"assistant","model":"m","content":[]}`,
+	];
+	foreach (b; bodies)
+	{
+		auto e1 = cast(McpException) collectException(SamplingMessage.fromJson(parseJsonString(b)));
+		assert(e1 !is null && e1.code == ErrorCode.invalidParams, b);
+		auto e2 = cast(McpException) collectException(
+				CreateMessageResult.fromJson(parseJsonString(b)));
+		assert(e2 !is null && e2.code == ErrorCode.invalidParams, b);
+	}
+}
+
+unittest  // every sampling fromJson rejects a non-object value with -32602
+{
+	import mcp.protocol.errors : ErrorCode;
+	import std.exception : collectException;
+	import std.meta : AliasSeq;
+
+	static foreach (T; AliasSeq!(SamplingMessage, ModelPreferences, ToolChoice,
+			CreateMessageRequest, CreateMessageResult))
+	{
+		{
+			auto ex = cast(McpException) collectException(T.fromJson(Json(5)));
+			assert(ex !is null && ex.code == ErrorCode.invalidParams, T.stringof);
+		}
+	}
+}
+
+unittest  // CreateMessageRequest.fromJson rejects a missing or null maxTokens with -32602
+{
+	import mcp.protocol.errors : ErrorCode;
+	import std.exception : collectException;
+	import vibe.data.json : parseJsonString;
+
+	foreach (b; [`{"messages":[]}`, `{"messages":[],"maxTokens":null}`])
+	{
+		auto ex = cast(McpException) collectException(
+				CreateMessageRequest.fromJson(parseJsonString(b)));
+		assert(ex !is null && ex.code == ErrorCode.invalidParams, b);
+	}
+}
+
+unittest  // CreateMessageResult.fromJson rejects a missing or non-string model or role with -32602
+{
+	import mcp.protocol.errors : ErrorCode;
+	import std.exception : collectException;
+	import vibe.data.json : parseJsonString;
+
+	static immutable string[] bodies = [
+		`{"role":"assistant","content":{"type":"text","text":"x"}}`,
+		`{"role":"assistant","model":5,"content":{"type":"text","text":"x"}}`,
+		`{"model":"m","content":{"type":"text","text":"x"}}`,
+		`{"role":true,"model":"m","content":{"type":"text","text":"x"}}`,
+	];
+	foreach (b; bodies)
+	{
+		auto ex = cast(McpException) collectException(
+				CreateMessageResult.fromJson(parseJsonString(b)));
+		assert(ex !is null && ex.code == ErrorCode.invalidParams, b);
+	}
 }

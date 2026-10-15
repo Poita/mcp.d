@@ -1,15 +1,16 @@
 module mcp.server.context;
 
 import std.typecons : Nullable;
-import vibe.data.json : Json, deserializeJson, parseJsonString;
+import vibe.data.json : Json, deserializeJson;
 
 import mcp.protocol.errors;
 import mcp.protocol.sampling : CreateMessageRequest, CreateMessageResult;
-import mcp.protocol.types : ListRootsResult, ElicitResult, ElicitAction, LogLevel, shouldLog;
+import mcp.protocol.types : ListRootsResult, ElicitResult, ElicitAction,
+	LogLevel, logLevelRank, shouldLog;
 import mcp.protocol.capabilities : ClientCapabilities, ClientCapability;
-import mcp.protocol.schema : jsonSchemaOf, isFlatElicitationStruct;
+import mcp.api.binding : elicitationSchemaOf, isFlatElicitationStruct;
 import mcp.auth.resource_server : TokenInfo;
-import mcp.protocol.jsonrpc : makeNotification;
+import mcp.protocol.jsonrpc : makeNotification, parseUntrustedJson;
 import mcp.protocol.versions : ProtocolVersion, latestLegacy, supportsProgressMessage;
 import mcp.server.connection : ConnectionState;
 
@@ -26,6 +27,7 @@ import mcp.server.connection : ConnectionState;
 final class CancellationToken
 {
 	private bool cancelled_;
+	private void delegate() @safe nothrow[] onCancel_;
 
 	/// Whether a cancellation has been requested for this token's request.
 	bool cancelled() const @safe nothrow @nogc
@@ -33,10 +35,28 @@ final class CancellationToken
 		return cancelled_;
 	}
 
-	/// Mark the request cancelled. Idempotent.
-	void cancel() @safe nothrow @nogc
+	/// Mark the request cancelled and run the callbacks given to `onCancel`.
+	/// Idempotent.
+	void cancel() @safe nothrow
 	{
+		if (cancelled_)
+			return;
 		cancelled_ = true;
+		auto callbacks = onCancel_;
+		onCancel_ = null;
+		foreach (dg; callbacks)
+			dg();
+	}
+
+	/// Run `dg` when the request is cancelled, or now if it already is, so work
+	/// parked on the request's behalf (a server->client request awaiting the
+	/// client's reply) is released at once.
+	void onCancel(void delegate() @safe nothrow dg) @safe nothrow
+	{
+		if (cancelled_)
+			dg();
+		else
+			onCancel_ ~= dg;
 	}
 }
 
@@ -53,11 +73,11 @@ final class CancellationToken
 /// token), the behaviour for stdio, in-process, and any transport that does not
 /// distinguish connections.
 ///
-/// The McpServer's other per-client state — the negotiated protocol version, the
-/// client capabilities, the logging level, and resource subscriptions — lives in
-/// shared instance fields, so the supported deployment for stateful HTTP is one
-/// McpServer per connection. This `ConnectionScoped` hook isolates the
-/// cancellation registry.
+/// The rest of the per-client state — the negotiated protocol version, the client
+/// capabilities, the logging level, and resource subscriptions — lives in the
+/// `ConnectionState` returned by `connectionState`, so one McpServer serves many
+/// isolated sessions (stateful HTTP: one state per `Mcp-Session-Id`; stateless
+/// HTTP: a fresh state per request).
 interface ConnectionScoped
 {
 	/// A stable, non-empty identifier for this request's connection / session.
@@ -98,20 +118,97 @@ ConnectionState connectionStateOf(RequestContext ctx) @safe
 	return null;
 }
 
+/// The message every server->client request (elicitation / sampling / roots)
+/// fails with on a stateless server, which keeps no per-peer channel to carry it.
+enum string statelessServerRequestError = "server-initiated requests"
+	~ " (elicitation/sampling/roots) require a stateful server; construct with McpServer.stateful()";
+
+/// Refuse `what` (`sample`, `elicit`, ...) when this request has no
+/// server->client channel: on a stateless (MRTR) request, or on a legacy request
+/// dispatched by a stateless server. Checked before the client's capabilities so
+/// the error names the server-side remedy rather than a client shortcoming.
+private void requireServerChannel(RequestContext ctx, string what) @safe
+{
+	if (ctx.usesInputRequired)
+		throw internalError(what ~ "() is unavailable on a stateless (MRTR) request;"
+				~ " return ToolResponse.inputRequired instead, or construct the server with"
+				~ " McpServer.stateful() for a blocking server->client round-trip");
+	if (auto s = cast(RequestScope) ctx)
+		if (s.serverStateless)
+			throw internalError(statelessServerRequestError);
+}
+
+/// The client capabilities a `sampling/createMessage` request with `params`
+/// needs: `sampling`, plus `sampling.tools` when it carries `tools` or
+/// `toolChoice` (even `{mode:"none"}` exercises the tool-use surface), plus
+/// the soft-deprecated `sampling.context` when `includeContext` is
+/// `thisServer` or `allServers`. Shared by `RequestContext.sample` and the
+/// MRTR input-request filter so both apply the same rules.
+package(mcp) ClientCapabilities samplingRequirements(Json params) @safe
+{
+	ClientCapabilities need;
+	need.sampling = true;
+	if (params.type != Json.Type.object)
+		return need;
+	need.samplingTools = "tools" in params || "toolChoice" in params;
+	if (auto inc = "includeContext" in params)
+		if (inc.type == Json.Type.string)
+			need.samplingContext = inc.get!string == "thisServer" || inc.get!string == "allServers";
+	return need;
+}
+
+/// The client capabilities an `elicitation/create` request with `params` needs:
+/// `elicitation.url` for `mode: "url"`, otherwise `elicitation.form` (form is
+/// the default mode). Shared by the `RequestContext` elicitation calls and the
+/// MRTR input-request filter.
+package(mcp) ClientCapabilities elicitationRequirements(Json params) @safe
+{
+	ClientCapabilities need;
+	const isUrl = params.type == Json.Type.object && "mode" in params
+		&& params["mode"].type == Json.Type.string && params["mode"].get!string == "url";
+	if (isUrl)
+		need.elicitationUrl = true;
+	else
+		need.elicitationForm = true;
+	return need;
+}
+
+/// Throw the `missingClientCapability` error for the first capability in
+/// `need` that `ctx` does not support, in the order a request would hit them.
+private void requireClientCapabilities(RequestContext ctx, const ClientCapabilities need) @safe
+{
+	if (need.sampling && !ctx.clientSupports(ClientCapability.sampling))
+		throw missingClientCapability(ClientCapability.sampling, "Client does not support sampling");
+	if (need.samplingTools && !ctx.clientSupports(ClientCapability.samplingTools))
+		throw missingClientCapability(ClientCapability.samplingTools,
+				"Client does not support tool use in sampling (sampling.tools)");
+	if (need.samplingContext && !ctx.clientSupports(ClientCapability.samplingContext))
+		throw missingClientCapability(ClientCapability.samplingContext,
+				"Client does not support context-enabled sampling (sampling.context)");
+	if (need.elicitationForm && !ctx.clientSupports(ClientCapability.elicitationForm))
+		throw missingClientCapability(ClientCapability.elicitationForm,
+				"Client does not support form-mode elicitation");
+	if (need.elicitationUrl && !ctx.clientSupports(ClientCapability.elicitationUrl))
+		throw missingClientCapability(ClientCapability.elicitationUrl,
+				"Client does not support url-mode elicitation");
+}
+
 /// Per-request context handed to tool handlers. It is the channel through which
 /// a handler emits server->client traffic while a request is in flight:
 /// progress + logging notifications, and (blocking) sampling / elicitation
-/// requests. Transports supply a concrete implementation; the in-process and
-/// stdio paths use `NullContext` (notifications are dropped, server->client
+/// requests. Transports supply a concrete implementation: stdio uses
+/// `StdioContext`, Streamable HTTP its SSE contexts, and the bare in-process
+/// `handle(msg)` uses `NullContext` (notifications are dropped, server->client
 /// requests are unsupported).
 interface RequestContext
 {
 	/// Whether the client has sent a `notifications/cancelled` for this request
 	/// (basic/utilities/cancellation). A long-running handler SHOULD poll this
 	/// and, when true, stop work and free resources promptly; the server
-	/// suppresses the late response for a cancelled request regardless. Always
-	/// false on transports that cannot deliver an out-of-band cancellation while
-	/// a request is in flight (e.g. the in-process / stdio `NullContext`).
+	/// suppresses the late response for a cancelled request regardless. For a
+	/// request the server core dispatches, this reflects the in-flight token an
+	/// inbound `notifications/cancelled` flips, on stdio as on HTTP. Always false
+	/// on a context that has no way to receive one (e.g. a bare `NullContext`).
 	bool isCancelled() @safe;
 
 	/// Emit a `notifications/progress`. No-op if the originating request carried
@@ -119,7 +216,9 @@ interface RequestContext
 	void reportProgress(double progress,
 			Nullable!double total = Nullable!double.init, string message = null) @safe;
 
-	/// Emit a `notifications/message` (logging) at the given level. `data` may be
+	/// Emit a `notifications/message` (logging) at the given level. `level` must
+	/// be one of the RFC 5424 names the spec defines (`debug` ... `emergency`);
+	/// prefer the `LogLevel` overloads, which cannot misspell it. `data` may be
 	/// any JSON value (commonly a string or object); `logger` is optional.
 	void log(string level, Json data, string logger = null) @safe;
 
@@ -139,12 +238,38 @@ interface RequestContext
 	/// Whether the connected client advertised `cap`.
 	bool clientSupports(ClientCapability cap) @safe;
 
-	/// True when this request is on a stateless (MRTR) protocol — 2026-07-28
-	/// revision, where there is no server->client channel. On such requests a
-	/// tool handler must NOT call `elicit`/`sample` (they throw); instead it
-	/// returns `ToolResponse.inputRequired(...)` and reads the client's answers
-	/// from `inputResponses` on the retried request. False on 2025-era requests.
-	bool isStateless() @safe;
+	/// The protocol version in effect for this request: the version the
+	/// request's session negotiated at `initialize` on the 2025-era protocols, or
+	/// the request's own `_meta.protocolVersion` on 2026-07-28. `latestLegacy` for
+	/// a context the server core did not dispatch.
+	final ProtocolVersion protocolVersion() @safe
+	{
+		if (auto s = cast(RequestScope) this)
+			return s.effectiveVersion;
+		return latestLegacy;
+	}
+
+	/// The capabilities this request's client declared: at `initialize` for its
+	/// session on the 2025-era protocols, or in the request's own `_meta` on
+	/// 2026-07-28. Empty for a context the server core did not dispatch.
+	final ClientCapabilities clientCapabilities() @safe
+	{
+		if (auto s = cast(RequestScope) this)
+			return s.requestClientCaps;
+		return ClientCapabilities.init;
+	}
+
+	/// True when this request gathers client input through MRTR (the 2026-07-28
+	/// protocol): the handler returns `ToolResponse.inputRequired(...)` and reads
+	/// the client's answers from `inputResponses` on the retried request, and
+	/// `elicit`/`sample`/`listRoots` throw.
+	///
+	/// False on 2025-era requests, but false does not mean those blocking calls
+	/// are available: they need a server constructed with `McpServer.stateful()`
+	/// on a transport with a server->client channel. On a `McpServer.stateless()`
+	/// server (the default) a 2025-era request has no way to ask the client for
+	/// input, and `elicit`/`sample` throw there too.
+	bool usesInputRequired() @safe;
 
 	/// The input responses the client attached when resubmitting an MRTR
 	/// request, keyed by the `InputRequest.id` the server issued on the prior
@@ -170,31 +295,8 @@ interface RequestContext
 	/// instead — or if the client does not support sampling.
 	final Json sample(Json params) @safe
 	{
-		if (isStateless)
-			throw internalError("sample() is unavailable on a stateless (MRTR) request;"
-					~ " return ToolResponse.inputRequired instead, or construct the server with"
-					~ " McpServer.stateful() for a blocking server->client round-trip");
-		if (!clientSupports(ClientCapability.sampling))
-			throw invalidRequest("Client does not support sampling");
-		// Per spec, servers MUST NOT send tool-enabled sampling requests to
-		// clients that have not declared the `sampling.tools` sub-capability.
-		// This covers both the `tools` list and a `toolChoice` directive, since
-		// a request that sets `toolChoice` (even `{mode:"none"}`) without any
-		// `tools` still exercises the tool-use sampling surface.
-		if (params.type == Json.Type.object && ("tools" in params
-				|| "toolChoice" in params) && !clientSupports(ClientCapability.samplingTools))
-			throw invalidRequest("Client does not support tool use in sampling (sampling.tools)");
-		// The soft-deprecated `sampling.context` sub-capability gates the
-		// `includeContext` values `thisServer`/`allServers`.
-		if (params.type == Json.Type.object && "includeContext" in params
-				&& params["includeContext"].type == Json.Type.string)
-		{
-			const inc = params["includeContext"].get!string;
-			if ((inc == "thisServer" || inc == "allServers")
-					&& !clientSupports(ClientCapability.samplingContext))
-				throw invalidRequest(
-						"Client does not support context-enabled sampling (sampling.context)");
-		}
+		requireServerChannel(this, "sample");
+		requireClientCapabilities(this, samplingRequirements(params));
 		return sampleRaw(params);
 	}
 
@@ -219,23 +321,18 @@ interface RequestContext
 	/// `.action`; read collected values via `.content` or `.contentAs!T`).
 	final ElicitResult elicit(string message, Json requestedSchema) @safe
 	{
-		if (isStateless)
-			throw internalError("elicit() is unavailable on a stateless (MRTR) request;"
-					~ " return ToolResponse.inputRequired instead, or construct the server with"
-					~ " McpServer.stateful() for a blocking server->client round-trip");
-		// Per client/elicitation: servers MUST NOT send elicitation requests
-		// with modes the client does not support. A bare `elicitation:{}` is
-		// form-only, so a generic declaration already sets the form submode.
-		if (!clientSupports(ClientCapability.elicitationForm))
-			throw invalidRequest("Client does not support form-mode elicitation");
+		requireServerChannel(this, "elicit");
 		Json params = Json.emptyObject;
 		params["message"] = message;
 		params["requestedSchema"] = requestedSchema;
+		// Per client/elicitation: servers MUST NOT send elicitation requests
+		// with modes the client does not support.
+		requireClientCapabilities(this, elicitationRequirements(params));
 		return ElicitResult.fromJson(elicitRaw(params));
 	}
 
 	/// Typed convenience over `elicit(string, Json)`: derive the form
-	/// `requestedSchema` from the flat struct `T` via `jsonSchemaOf!T`, send the
+	/// `requestedSchema` from the flat struct `T` via `elicitationSchemaOf!T`, send the
 	/// elicitation, and return the typed `ElicitResult`. On an `accept`, decode
 	/// the collected values with `result.contentAs!T`. `T` must be a flat struct
 	/// of scalar fields (string / number / integer / boolean / enum, optionally
@@ -245,7 +342,7 @@ interface RequestContext
 	{
 		static assert(isFlatElicitationStruct!T, "elicit!T requires a flat struct of scalar fields (string/number/integer/boolean/enum); " ~ T
 				.stringof ~ " has a nested or non-scalar field");
-		return elicit(message, jsonSchemaOf!T);
+		return elicit(message, elicitationSchemaOf!T);
 	}
 
 	/// Request URL-mode elicitation from the client (`elicitation/create` with
@@ -264,20 +361,18 @@ interface RequestContext
 	/// contain a valid URL).
 	final ElicitResult elicitUrl(string message, string url, string elicitationId) @safe
 	{
-		if (isStateless)
-			throw internalError("elicitUrl() is unavailable on a stateless (MRTR) request;"
-					~ " return ToolResponse.inputRequired instead, or construct the server with"
-					~ " McpServer.stateful() for a blocking server->client round-trip");
+		requireServerChannel(this, "elicitUrl");
 		// Per client/elicitation: servers MUST NOT send a url-mode request to a
 		// client that only declared form mode (e.g. a bare `elicitation:{}`).
-		if (!clientSupports(ClientCapability.elicitationUrl))
-			throw invalidRequest("Client does not support url-mode elicitation");
+		requireClientCapabilities(this, elicitationRequirements(Json([
+			"mode": Json("url")
+		])));
 		if (url.length == 0)
-			throw invalidParams("URL-mode elicitation requires a non-empty url");
+			throw internalError("URL-mode elicitation requires a non-empty url");
 		if (!isValidElicitationUrl(url))
-			throw invalidParams("URL-mode elicitation requires a valid url (absolute URI): " ~ url);
+			throw internalError("URL-mode elicitation requires a valid url (absolute URI): " ~ url);
 		if (elicitationId.length == 0)
-			throw invalidParams("URL-mode elicitation requires a non-empty elicitationId");
+			throw internalError("URL-mode elicitation requires a non-empty elicitationId");
 		Json params = Json.emptyObject;
 		params["mode"] = "url";
 		params["message"] = message;
@@ -294,26 +389,24 @@ interface RequestContext
 	/// channel on the stateless protocol; use `ToolResponse.inputRequired` instead.
 	final ListRootsResult listRoots() @safe
 	{
-		if (isStateless)
-			throw internalError("listRoots() is unavailable on a stateless (MRTR) request;"
-					~ " return ToolResponse.inputRequired instead, or construct the server with"
-					~ " McpServer.stateful() for a blocking server->client round-trip");
+		requireServerChannel(this, "listRoots");
 		if (!clientSupports(ClientCapability.roots))
-			throw invalidRequest("Client does not support roots");
+			throw missingClientCapability(ClientCapability.roots, "Client does not support roots");
 		return ListRootsResult.fromJson(listRootsRaw());
 	}
 
 	/// Typed convenience over `inputResponses`: decode the MRTR answer the client
 	/// attached for `id` into `T` via `T.fromJson` (e.g. `ElicitResult`,
 	/// `CreateMessageResult`, `ListRootsResult` — matching the `InputRequest`
-	/// kind the server issued). Returns `T.fromJson(Json.emptyObject)` when no
-	/// answer is present for `id`.
+	/// kind the server issued). Throws `invalidParams` (-32602) when the client
+	/// sent no answer for `id`; check `hasInputResponse(id)` first where an answer
+	/// is optional.
 	T inputResponseAs(T)(string id) @safe
 	{
 		auto m = inputResponses();
 		if (auto p = id in m)
 			return T.fromJson(*p);
-		return T.fromJson(Json.emptyObject);
+		throw invalidParams("no input response for '" ~ id ~ "'");
 	}
 
 	/// Decode the opaque MRTR `requestState` as JSON into `T`. The server owns the
@@ -322,13 +415,17 @@ interface RequestContext
 	/// `serializeToJson(state).toString()`), so this is the typed inverse: parse
 	/// the echoed string and deserialise it into `T`. Returns `T.init` when the
 	/// client echoed no state (`requestState` empty). The value is untrusted input
-	/// the client round-tripped, so a malformed payload throws.
+	/// the client round-tripped, so a payload that does not parse, nests too
+	/// deeply, or does not fit `T` throws an invalid-params (-32602) error.
 	T requestStateAs(T)() @safe
 	{
 		const raw = requestState();
 		if (raw.length == 0)
 			return T.init;
-		return deserializeJson!T(parseJsonString(raw));
+		try
+			return deserializeJson!T(parseUntrustedJson(raw));
+		catch (Exception e)
+			throw invalidParams("malformed requestState");
 	}
 
 	/// Typed convenience over `log(string, Json, string)`: emit a
@@ -363,12 +460,13 @@ interface RequestContext
 		return (id in inputResponses()) !is null;
 	}
 
-	/// Whether this is an MRTR resubmission carrying client answers
-	/// (`inputResponses` non-empty). False on the first round and on non-stateless
-	/// requests.
+	/// Whether this is an MRTR resubmission: it carries client answers
+	/// (`inputResponses` non-empty) or echoes a `requestState` (a handler may ask
+	/// for no input and only round-trip its state). False on the first round and
+	/// on non-stateless requests.
 	final bool isResubmit() @safe
 	{
-		return inputResponses().length > 0;
+		return inputResponses().length > 0 || requestState().length > 0;
 	}
 }
 
@@ -377,8 +475,9 @@ interface RequestContext
 /// capabilities, not stateless, no input responses / request state, no auth). A
 /// focused context — most of them test fakes — subclasses this and overrides only
 /// the one or two members it exercises, instead of re-stubbing the whole 12-method
-/// surface. Channel-less production contexts (`NullContext`,
-/// `HttpNotifyContext`) override only the server->client reject message.
+/// surface. `NullContext` overrides nothing; the Streamable HTTP transport's
+/// `HttpScopedContext` adds its connection scope and overrides only `noChannel`,
+/// the server->client reject message.
 abstract class BaseRequestContext : RequestContext
 {
 	bool isCancelled() @safe
@@ -414,7 +513,7 @@ abstract class BaseRequestContext : RequestContext
 	/// message while inheriting the three throwing primitives.
 	protected Json noChannel() @safe
 	{
-		throw invalidRequest("This transport has no server-to-client channel");
+		throw internalError("This transport has no server-to-client channel");
 	}
 
 	bool clientSupports(ClientCapability) @safe
@@ -422,7 +521,7 @@ abstract class BaseRequestContext : RequestContext
 		return false;
 	}
 
-	bool isStateless() @safe
+	bool usesInputRequired() @safe
 	{
 		return false;
 	}
@@ -463,6 +562,31 @@ final class NullContext : BaseRequestContext
 /// out-of-band `notifications/cancelled` is dispatched (flipping the matching
 /// in-flight `CancellationToken`) *concurrently* with a running handler — the
 /// handler's `ctx.isCancelled()` simply observes the flipped token.
+/// The per-request settings of a `StdioContext`.
+struct StdioContextOptions
+{
+	/// Writes a server->client request and blocks the current task until the
+	/// client's reply (the `DuplexChannel` correlates it on its read loop),
+	/// returning the `result` or throwing on error. Null wires no channel:
+	/// `sampleRaw`/`elicitRaw`/`listRootsRaw` throw and `clientSupports` is false.
+	Json delegate(string, Json) @safe serverRequest;
+	/// The capabilities the client declared at `initialize`, so `clientSupports`
+	/// can gate `sample`/`elicit`.
+	ClientCapabilities clientCaps;
+	/// The originating request's `_meta.progressToken`; undefined when it
+	/// carried none.
+	Json progressToken;
+	/// The protocol version agreed for this connection; it gates
+	/// version-specific wire fields on the notifications this context emits
+	/// (e.g. the `message` field on `notifications/progress`, which only exists
+	/// from 2025-03-26 onward).
+	ProtocolVersion negotiated = latestLegacy;
+	/// Mirrors `server.mode == ServerMode.stateless`: when true, server-initiated
+	/// requests are refused (a stateless server has no per-peer connection to
+	/// carry the round-trip), exactly as on the HTTP transport.
+	bool serverStateless;
+}
+
 final class StdioContext : RequestContext
 {
 	private void delegate(string) @safe sink;
@@ -473,39 +597,16 @@ final class StdioContext : RequestContext
 	private bool serverStateless_;
 
 	/// `sink` receives one serialised JSON-RPC frame per call (the transport
-	/// adds the newline terminator). `progressToken` is the originating request's
-	/// `_meta.progressToken`, or `Json.undefined` when it carried none.
-	/// `negotiated` is the protocol version agreed for this connection; it gates
-	/// version-specific wire fields on the notifications this context emits (e.g.
-	/// the `message` field on `notifications/progress`, which only exists from
-	/// 2025-03-26 onward). This overload wires no server->client request channel
-	/// (`sendRequest` throws, `clientSupports` is false).
-	this(void delegate(string) @safe sink, Json progressToken = Json.undefined,
-			ProtocolVersion negotiated = latestLegacy) @safe
+	/// adds the newline terminator); `opts` carries the request's progress
+	/// token, protocol version, and optional server->client request channel.
+	this(void delegate(string) @safe sink, StdioContextOptions opts = StdioContextOptions.init) @safe
 	{
 		this.sink = sink;
-		this.progressTok = progressToken;
-		this.version_ = negotiated;
-	}
-
-	/// As above, plus a server->client request channel: `serverRequest(method,
-	/// params)` writes the request and blocks the current task until the client's
-	/// reply (the `DuplexChannel` correlates it on its read loop), returning the
-	/// `result` or throwing on error. `clientCaps` are the capabilities the client
-	/// declared at `initialize`, so `clientSupports` can gate `sample`/`elicit`.
-	/// `serverStateless` mirrors `server.mode == ServerMode.stateless`: when true,
-	/// server-initiated requests are refused (a stateless server has no per-peer
-	/// connection to carry the round-trip), exactly as on the HTTP transport.
-	this(void delegate(string) @safe sink, Json delegate(string, Json) @safe serverRequest,
-			ClientCapabilities clientCaps, Json progressToken = Json.undefined,
-			ProtocolVersion negotiated = latestLegacy, bool serverStateless = false) @safe
-	{
-		this.sink = sink;
-		this.serverRequestFn = serverRequest;
-		this.clientCaps = clientCaps;
-		this.progressTok = progressToken;
-		this.version_ = negotiated;
-		this.serverStateless_ = serverStateless;
+		this.serverRequestFn = opts.serverRequest;
+		this.clientCaps = opts.clientCaps;
+		this.progressTok = opts.progressToken;
+		this.version_ = opts.negotiated;
+		this.serverStateless_ = opts.serverStateless;
 	}
 
 	bool isCancelled() @safe
@@ -571,9 +672,9 @@ final class StdioContext : RequestContext
 		// `McpServer.stateful()`; on the modern stateless protocol, return
 		// `ToolResponse.inputRequired` (MRTR) instead.
 		if (serverStateless_)
-			throw invalidRequest("server-initiated requests (elicitation/sampling/roots) require a stateful server; construct with McpServer.stateful()");
+			throw internalError(statelessServerRequestError);
 		if (serverRequestFn is null)
-			throw invalidRequest("The stdio transport has no server-to-client request channel");
+			throw internalError("The stdio transport has no server-to-client request channel");
 		return serverRequestFn(method, params);
 	}
 
@@ -586,7 +687,7 @@ final class StdioContext : RequestContext
 		return clientCaps.supports(cap);
 	}
 
-	bool isStateless() @safe
+	bool usesInputRequired() @safe
 	{
 		return false;
 	}
@@ -608,36 +709,96 @@ final class StdioContext : RequestContext
 	}
 }
 
+/// The -32021 `MissingRequiredClientCapabilityError` a server->client request
+/// is refused with when the client did not declare `cap`, naming it in
+/// `data.requiredCapabilities` like the server's other capability gates.
+private McpException missingClientCapability(ClientCapability cap, string message) @safe
+{
+	ClientCapabilities c;
+	final switch (cap)
+	{
+	case ClientCapability.sampling:
+		c.sampling = true;
+		break;
+	case ClientCapability.samplingTools:
+		c.samplingTools = true;
+		break;
+	case ClientCapability.samplingContext:
+		c.samplingContext = true;
+		break;
+	case ClientCapability.elicitation:
+	case ClientCapability.elicitationForm:
+		// Any-mode elicitation is named as a bare `elicitation: {}`, i.e. form.
+		c.elicitationForm = true;
+		break;
+	case ClientCapability.elicitationUrl:
+		c.elicitationUrl = true;
+		break;
+	case ClientCapability.roots:
+		c.roots = true;
+		break;
+	}
+	return missingRequiredClientCapability(c, message);
+}
+
 /// Wraps a transport-supplied `RequestContext` with the per-request protocol
 /// state the server determines only after parsing the message: whether the
-/// request is stateless (MRTR), and the input responses the client attached.
-/// The server installs this around the transport context before dispatching, so
-/// handlers observe correct `isStateless`/`inputResponses` and `elicit`/`sample`
-/// fail fast on stateless requests. Notifications and server->client requests
+/// request gathers input through MRTR, and the input responses the client
+/// attached. The server installs this around the transport context before
+/// dispatching, so handlers observe correct `usesInputRequired`/`inputResponses`
+/// and `elicit`/`sample` fail fast on MRTR requests. Notifications and server->client requests
 /// delegate to the wrapped context unchanged.
+/// The per-request state the server installs on a `RequestScope`.
+package(mcp) struct RequestScopeOptions
+{
+	/// Whether the request gathers input through MRTR (`usesInputRequired`).
+	bool inputRequired;
+	/// The MRTR input responses the client attached.
+	Json[string] inputResponses;
+	/// The (verified) MRTR `requestState` the client echoed.
+	string requestState;
+	/// The minimum log level; lower-severity logs are dropped.
+	string minLogLevel = "info";
+	/// False when the request did not ask for logging, dropping every log.
+	bool loggingRequested = true;
+	/// The shared token `notifications/cancelled` flips; null delegates
+	/// `isCancelled` to the wrapped context.
+	CancellationToken cancellation;
+	/// The protocol version in effect for this request.
+	ProtocolVersion effectiveVersion = latestLegacy;
+	/// The client capabilities in effect for this request.
+	ClientCapabilities clientCaps;
+	/// Mirrors `server.mode == ServerMode.stateless`: such a server has no
+	/// per-peer channel, so `sample`/`elicit`/`listRoots` refuse before
+	/// consulting the client's capabilities.
+	bool serverStateless;
+}
+
 final class RequestScope : RequestContext, ConnectionScoped
 {
 	private RequestContext inner;
-	private bool stateless;
+	private bool inputRequired;
 	private Json[string] responses;
 	private string requestState_;
 	private string minLevel;
 	private bool loggingRequested;
 	private CancellationToken cancellation;
 	private ProtocolVersion effectiveVersion_;
+	private ClientCapabilities clientCaps_;
+	private bool serverStateless_;
 
-	this(RequestContext inner, bool stateless, Json[string] responses, string minLevel = "info",
-			bool loggingRequested = true, CancellationToken cancellation = null,
-			string requestState = "", ProtocolVersion effectiveVersion = latestLegacy) @safe
+	package(mcp) this(RequestContext inner, RequestScopeOptions opts) @safe
 	{
 		this.inner = inner;
-		this.stateless = stateless;
-		this.responses = responses;
-		this.requestState_ = requestState;
-		this.minLevel = minLevel;
-		this.loggingRequested = loggingRequested;
-		this.cancellation = cancellation;
-		this.effectiveVersion_ = effectiveVersion;
+		this.inputRequired = opts.inputRequired;
+		this.responses = opts.inputResponses;
+		this.requestState_ = opts.requestState;
+		this.minLevel = opts.minLogLevel;
+		this.loggingRequested = opts.loggingRequested;
+		this.cancellation = opts.cancellation;
+		this.effectiveVersion_ = opts.effectiveVersion;
+		this.clientCaps_ = opts.clientCaps;
+		this.serverStateless_ = opts.serverStateless;
 	}
 
 	/// The protocol version in effect for THIS request (negotiated version on the
@@ -649,6 +810,19 @@ final class RequestScope : RequestContext, ConnectionScoped
 	ProtocolVersion effectiveVersion() @safe
 	{
 		return effectiveVersion_;
+	}
+
+	/// Whether the dispatching server is stateless (has no server->client channel).
+	bool serverStateless() const @safe
+	{
+		return serverStateless_;
+	}
+
+	/// The client capabilities in effect for THIS request (the session's
+	/// `initialize` capabilities, or the modern request's `_meta` capabilities).
+	ClientCapabilities requestClientCaps() @safe
+	{
+		return clientCaps_;
 	}
 
 	/// Delegate the connection token to the wrapped transport context: the
@@ -700,8 +874,16 @@ final class RequestScope : RequestContext, ConnectionScoped
 	/// `_meta["io.modelcontextprotocol/logLevel"]`; the server signals that by
 	/// constructing this scope with `loggingRequested = false`, in which case
 	/// every log is dropped regardless of severity.
+	///
+	/// Throws an `internalError` for a `level` outside the RFC 5424 set (e.g.
+	/// `"warn"` or `"Info"`): it cannot be ordered against the client's minimum
+	/// and is not a valid wire level.
 	void log(string level, Json data, string logger = null) @safe
 	{
+		if (logLevelRank(level) < 0)
+			throw internalError("log(): unknown level \"" ~ level ~ "\"; use one of debug,"
+					~ " info, notice, warning, error, critical, alert, emergency, or the"
+					~ " LogLevel overload");
 		if (!loggingRequested)
 			return;
 		if (!shouldLog(level, minLevel))
@@ -724,14 +906,19 @@ final class RequestScope : RequestContext, ConnectionScoped
 		return inner.listRootsRaw();
 	}
 
+	/// A stateless (MRTR) request declares its capabilities in its own `_meta`,
+	/// so those are authoritative; a session request delegates to the transport
+	/// context, which also knows whether a server->client channel exists.
 	bool clientSupports(ClientCapability cap) @safe
 	{
+		if (inputRequired)
+			return clientCaps_.supports(cap);
 		return inner.clientSupports(cap);
 	}
 
-	bool isStateless() @safe
+	bool usesInputRequired() @safe
 	{
-		return stateless;
+		return inputRequired;
 	}
 
 	Json[string] inputResponses() @safe
@@ -811,7 +998,7 @@ version (unittest) private final class ElicitProbe : BaseRequestContext
 	/// them individually to model form-only / url-only clients.
 	bool supportsForm = true;
 	bool supportsUrl = true;
-	bool stateless = false;
+	bool inputRequired = false;
 	/// MRTR round-2 answers a test can populate to exercise `inputResponseAs!T`.
 	Json[string] responses;
 
@@ -839,9 +1026,9 @@ version (unittest) private final class ElicitProbe : BaseRequestContext
 		}
 	}
 
-	override bool isStateless() @safe
+	override bool usesInputRequired() @safe
 	{
-		return stateless;
+		return inputRequired;
 	}
 
 	override Json[string] inputResponses() @safe
@@ -872,40 +1059,28 @@ unittest  // form-mode elicit() does not set a mode field
 	assert(probe.lastParams["message"].get!string == "Pick one");
 }
 
-unittest  // elicitUrl() rejects an empty url
+unittest  // elicitUrl() rejects an empty url with an internalError (server fault)
 {
-	import std.exception : assertThrown;
-	import mcp.protocol.errors : McpException;
-
 	auto probe = new ElicitProbe;
-	assertThrown!McpException(probe.elicitUrl("msg", "", "elic-1"));
+	assertInternalError(probe.elicitUrl("msg", "", "elic-1"));
 }
 
-unittest  // elicitUrl() rejects an empty elicitationId
+unittest  // elicitUrl() rejects an empty elicitationId with an internalError (server fault)
 {
-	import std.exception : assertThrown;
-	import mcp.protocol.errors : McpException;
-
 	auto probe = new ElicitProbe;
-	assertThrown!McpException(probe.elicitUrl("msg", "https://example.com", ""));
+	assertInternalError(probe.elicitUrl("msg", "https://example.com", ""));
 }
 
-unittest  // elicitUrl() rejects a malformed (non-URI) url
+unittest  // elicitUrl() rejects a malformed (non-URI) url with an internalError (server fault)
 {
-	import std.exception : assertThrown;
-	import mcp.protocol.errors : McpException;
-
 	auto probe = new ElicitProbe;
-	assertThrown!McpException(probe.elicitUrl("msg", "not a url", "elic-1"));
+	assertInternalError(probe.elicitUrl("msg", "not a url", "elic-1"));
 }
 
-unittest  // elicitUrl() rejects a relative url without a scheme/authority
+unittest  // elicitUrl() rejects a relative url without a scheme/authority with an internalError (server fault)
 {
-	import std.exception : assertThrown;
-	import mcp.protocol.errors : McpException;
-
 	auto probe = new ElicitProbe;
-	assertThrown!McpException(probe.elicitUrl("msg", "example.com/path", "elic-1"));
+	assertInternalError(probe.elicitUrl("msg", "example.com/path", "elic-1"));
 }
 
 unittest  // elicitUrl() throws when the client does not support elicitation
@@ -924,7 +1099,7 @@ unittest  // elicitUrl() is rejected on a stateless (MRTR) request
 	import mcp.protocol.errors : McpException;
 
 	auto probe = new ElicitProbe;
-	probe.stateless = true;
+	probe.inputRequired = true;
 	assertThrown!McpException(probe.elicitUrl("msg", "https://example.com", "elic-1"));
 }
 
@@ -981,9 +1156,9 @@ unittest  // form-mode elicit() returns a typed ElicitResult with the parsed act
 	assert(r.action == ElicitAction.accept);
 }
 
-unittest  // elicit!T derives requestedSchema from the struct via jsonSchemaOf
+unittest  // elicit!T derives requestedSchema from the struct via elicitationSchemaOf
 {
-	import mcp.protocol.schema : jsonSchemaOf;
+	import mcp.api.binding : elicitationSchemaOf;
 
 	static struct TripDetails
 	{
@@ -995,7 +1170,7 @@ unittest  // elicit!T derives requestedSchema from the struct via jsonSchemaOf
 	ElicitResult r = probe.elicit!TripDetails("Trip details?");
 	assert(probe.lastMethod == "elicitation/create");
 	assert(probe.lastParams["message"].get!string == "Trip details?");
-	assert(probe.lastParams["requestedSchema"] == jsonSchemaOf!TripDetails);
+	assert(probe.lastParams["requestedSchema"] == elicitationSchemaOf!TripDetails);
 	assert(r.action == ElicitAction.accept);
 }
 
@@ -1025,6 +1200,15 @@ unittest  // inputResponseAs!T decodes a typed answer from the MRTR inputRespons
 	auto r = probe.inputResponseAs!ElicitResult("q1");
 	assert(r.action == ElicitAction.accept);
 	assert(r.content["name"].get!string == "Ada");
+}
+
+unittest  // inputResponseAs!T throws -32602 when the client sent no answer for the id
+{
+	import std.exception : collectException;
+
+	auto probe = new ElicitProbe;
+	auto e = cast(McpException) collectException(probe.inputResponseAs!ElicitResult("q1"));
+	assert(e !is null && e.code == ErrorCode.invalidParams);
 }
 
 unittest  // listRoots() sends roots/list and parses the typed result
@@ -1097,9 +1281,10 @@ version (unittest) private final class LogProbe : BaseRequestContext
 
 unittest  // RequestScope drops log messages below the configured minimum level
 {
-	Json[string] empty;
 	auto probe = new LogProbe;
-	auto scope_ = new RequestScope(probe, false, empty, "error");
+	RequestScopeOptions opts;
+	opts.minLogLevel = "error";
+	auto scope_ = new RequestScope(probe, opts);
 
 	scope_.log("debug", Json("d"));
 	scope_.log("warning", Json("w"));
@@ -1112,9 +1297,8 @@ unittest  // RequestScope drops log messages below the configured minimum level
 
 unittest  // RequestScope with the default "info" minimum drops only debug
 {
-	Json[string] empty;
 	auto probe = new LogProbe;
-	auto scope_ = new RequestScope(probe, false, empty);
+	auto scope_ = new RequestScope(probe, RequestScopeOptions.init);
 
 	scope_.log("debug", Json("d"));
 	scope_.log("info", Json("i"));
@@ -1123,16 +1307,88 @@ unittest  // RequestScope with the default "info" minimum drops only debug
 	assert(probe.emittedLevels == ["info", "warning"]);
 }
 
+unittest  // RequestScope rejects a log level outside the RFC 5424 set as an internalError
+{
+	auto probe = new LogProbe;
+	RequestScopeOptions opts;
+	opts.minLogLevel = "error";
+	auto scope_ = new RequestScope(probe, opts);
+
+	assertInternalError(scope_.log("warn", Json("w")));
+	assertInternalError(scope_.log("Info", Json("i")));
+	assert(probe.emittedLevels.length == 0);
+}
+
+unittest  // RequestScope rejects an unknown log level even when logging was not requested
+{
+	RequestScopeOptions opts;
+	opts.inputRequired = true;
+	opts.loggingRequested = false;
+	auto scope_ = new RequestScope(new LogProbe, opts);
+
+	assertInternalError(scope_.log("verbose", Json("v")));
+}
+
 unittest  // RequestScope exposes the shared cancellation token via isCancelled
 {
-	Json[string] empty;
 	auto probe = new LogProbe;
 	auto token = new CancellationToken;
-	auto scope_ = new RequestScope(probe, false, empty, "info", true, token);
+	RequestScopeOptions opts;
+	opts.cancellation = token;
+	auto scope_ = new RequestScope(probe, opts);
 
 	assert(!scope_.isCancelled);
 	token.cancel();
 	assert(scope_.isCancelled);
+}
+
+unittest  // an undeclared client capability is reported as -32021 naming it
+{
+	auto e = new ElicitProbe;
+	e.supportsUrl = false;
+	try
+	{
+		e.elicitUrl("m", "https://example.com", "id");
+		assert(false, "elicitUrl must throw");
+	}
+	catch (McpException ex)
+	{
+		assert(ex.code == ErrorCode.missingRequiredClientCapability);
+		assert("url" in ex.data["requiredCapabilities"]["elicitation"]);
+	}
+
+	auto r = new RootsProbe;
+	r.supportsRoots = false;
+	try
+	{
+		r.listRoots();
+		assert(false, "listRoots must throw");
+	}
+	catch (McpException ex)
+	{
+		assert(ex.code == ErrorCode.missingRequiredClientCapability);
+		assert("roots" in ex.data["requiredCapabilities"]);
+	}
+}
+
+unittest  // a stateless RequestScope answers clientSupports from the request's own capabilities
+{
+	import mcp.protocol.versions : latestStable;
+
+	ClientCapabilities caps;
+	caps.elicitationForm = true;
+	RequestScopeOptions opts;
+	opts.inputRequired = true;
+	opts.effectiveVersion = latestStable;
+	opts.clientCaps = caps;
+	auto scope_ = new RequestScope(new LogProbe, opts);
+	assert(scope_.clientSupports(ClientCapability.elicitation));
+	assert(!scope_.clientSupports(ClientCapability.sampling));
+}
+
+unittest  // only the server constructs a RequestScope
+{
+	static assert(__traits(getVisibility, RequestScope.__ctor) == "package");
 }
 
 unittest  // a CancellationToken starts uncancelled and cancel() is idempotent
@@ -1153,27 +1409,28 @@ unittest  // NullContext reports never-cancelled (no out-of-band channel)
 
 unittest  // a stateless server's StdioContext refuses server->client requests on every transport
 {
-	import mcp.protocol.errors : McpException;
-	import std.exception : assertThrown;
-
 	// serverStateless = true mirrors McpServer.stateless(): even though the stdio
 	// channel is physically bidirectional, a stateless server has no per-peer
 	// connection to carry the round-trip, so elicit/sample/roots are refused —
 	// matching the HTTP transport rather than special-casing stdio.
-	auto ctx = new StdioContext((string) @safe {}, (string m, Json p) @safe => Json.emptyObject,
-			ClientCapabilities.init, Json.undefined, latestLegacy, true);
-	assertThrown!McpException(ctx.sampleRaw(Json.emptyObject));
-	assertThrown!McpException(ctx.elicitRaw(Json.emptyObject));
-	assertThrown!McpException(ctx.listRootsRaw());
+	StdioContextOptions opts;
+	opts.serverRequest = (string m, Json p) @safe => Json.emptyObject;
+	opts.serverStateless = true;
+	auto ctx = new StdioContext((string) @safe {}, opts);
+	assertInternalError(ctx.sampleRaw(Json.emptyObject));
+	assertInternalError(ctx.elicitRaw(Json.emptyObject));
+	assertInternalError(ctx.listRootsRaw());
 }
 
 unittest  // a stateful StdioContext issues server->client requests through the channel
 {
 	bool called;
-	auto ctx = new StdioContext((string) @safe {}, (string m, Json p) @safe {
+	StdioContextOptions opts;
+	opts.serverRequest = (string m, Json p) @safe {
 		called = true;
 		return Json.emptyObject;
-	}, ClientCapabilities.init, Json.undefined, latestLegacy, false);
+	};
+	auto ctx = new StdioContext((string) @safe {}, opts);
 	ctx.listRootsRaw();
 	assert(called);
 }
@@ -1225,7 +1482,8 @@ unittest  // StdioContext.reportProgress emits a frame only with a progress toke
 	import vibe.data.json : parseJsonString;
 
 	string[] frames;
-	auto withTok = new StdioContext((string s) @safe { frames ~= s; }, Json("tok"));
+	auto withTok = new StdioContext((string s) @safe { frames ~= s; },
+			StdioContextOptions(null, ClientCapabilities.init, Json("tok")));
 	withTok.reportProgress(0.25, nullableProgress(0.5), "quarter");
 	assert(frames.length == 1);
 	auto j = parseJsonString(frames[0]);
@@ -1241,8 +1499,8 @@ unittest  // StdioContext.reportProgress omits `message` on a 2024-11-05 peer
 	import vibe.data.json : parseJsonString;
 
 	string[] frames;
-	auto ctx = new StdioContext((string s) @safe { frames ~= s; }, Json("tok"),
-			ProtocolVersion.v2024_11_05);
+	auto ctx = new StdioContext((string s) @safe { frames ~= s; }, StdioContextOptions(null,
+			ClientCapabilities.init, Json("tok"), ProtocolVersion.v2024_11_05));
 	ctx.reportProgress(0.25, nullableProgress(0.5), "quarter");
 	assert(frames.length == 1);
 	auto j = parseJsonString(frames[0]);
@@ -1259,8 +1517,8 @@ unittest  // StdioContext.reportProgress keeps `message` from 2025-03-26 onward
 	import vibe.data.json : parseJsonString;
 
 	string[] frames;
-	auto ctx = new StdioContext((string s) @safe { frames ~= s; }, Json("tok"),
-			ProtocolVersion.v2025_03_26);
+	auto ctx = new StdioContext((string s) @safe { frames ~= s; }, StdioContextOptions(null,
+			ClientCapabilities.init, Json("tok"), ProtocolVersion.v2025_03_26));
 	ctx.reportProgress(0.25, Nullable!double.init, "quarter");
 	assert(frames.length == 1);
 	auto j = parseJsonString(frames[0]);
@@ -1275,19 +1533,38 @@ unittest  // StdioContext.reportProgress is a no-op without a progress token
 	assert(frames.length == 0);
 }
 
-unittest  // StdioContext has no server->client request channel
+unittest  // StdioContext without a request channel refuses server->client requests with an internalError
 {
-	import mcp.protocol.errors : McpException;
-
 	auto ctx = new StdioContext((string) @safe {});
 	assert(!ctx.clientSupports(ClientCapability.sampling));
 	assert(!ctx.isCancelled);
+	assertInternalError(ctx.sampleRaw(Json.emptyObject));
+}
+
+unittest  // a context with no server->client channel refuses requests with an internalError
+{
+	auto ctx = new NullContext;
+	assertInternalError(ctx.sampleRaw(Json.emptyObject));
+	assertInternalError(ctx.elicitRaw(Json.emptyObject));
+	assertInternalError(ctx.listRootsRaw());
+}
+
+/// Assert that evaluating `expr` throws an `McpException` carrying
+/// `internalError`: a handler's misuse of the context is a server fault, not a
+/// client error.
+version (unittest) private void assertInternalError(T)(lazy T expr) @safe
+{
+	import mcp.protocol.errors : McpException, ErrorCode;
+
 	bool threw;
 	try
-		ctx.sampleRaw(Json.emptyObject);
-	catch (McpException)
+		cast(void) expr;
+	catch (McpException e)
+	{
 		threw = true;
-	assert(threw);
+		assert(e.code == ErrorCode.internalError, e.msg);
+	}
+	assert(threw, "expected an internalError McpException");
 }
 
 version (unittest) private Nullable!double nullableProgress(double v) @safe
@@ -1301,7 +1578,7 @@ version (unittest) private final class StateProbe : BaseRequestContext
 	string state;
 	Json[string] responses;
 
-	override bool isStateless() @safe
+	override bool usesInputRequired() @safe
 	{
 		return true;
 	}
@@ -1352,6 +1629,52 @@ unittest  // requestStateAs!T returns T.init when requestState is empty
 	assert(c == Cursor.init);
 }
 
+unittest  // requestStateAs!T rejects a requestState nested past the depth cap
+{
+	import std.array : replicate;
+
+	auto probe = new StateProbe;
+	probe.state = "[".replicate(1000) ~ "]".replicate(1000);
+	try
+	{
+		probe.requestStateAs!Json;
+		assert(false, "a too-deep requestState must be rejected");
+	}
+	catch (McpException e)
+		assert(e.code == ErrorCode.invalidParams);
+}
+
+unittest  // requestStateAs!T rejects unparseable requestState as invalid params
+{
+	auto probe = new StateProbe;
+	probe.state = "not json";
+	try
+	{
+		probe.requestStateAs!Json;
+		assert(false, "a malformed requestState must be rejected");
+	}
+	catch (McpException e)
+		assert(e.code == ErrorCode.invalidParams);
+}
+
+unittest  // requestStateAs!T rejects requestState of the wrong shape as invalid params
+{
+	static struct Cursor
+	{
+		int step;
+	}
+
+	auto probe = new StateProbe;
+	probe.state = `{"step":"three"}`;
+	try
+	{
+		probe.requestStateAs!Cursor;
+		assert(false, "a mistyped requestState must be rejected");
+	}
+	catch (McpException e)
+		assert(e.code == ErrorCode.invalidParams);
+}
+
 unittest  // typed log(LogLevel, string) emits the same frame as the string/Json form
 {
 	auto probe = new LogProbe;
@@ -1379,7 +1702,8 @@ unittest  // reportProgress(long, long) forwards integer steps to the double/Nul
 	import vibe.data.json : parseJsonString;
 
 	string[] frames;
-	RequestContext ctx = new StdioContext((string str) @safe { frames ~= str; }, Json("tok"));
+	RequestContext ctx = new StdioContext((string str) @safe { frames ~= str; },
+			StdioContextOptions(null, ClientCapabilities.init, Json("tok")));
 	ctx.reportProgress(3L, 10L, "step 3 of 10");
 	assert(frames.length == 1);
 	auto j = parseJsonString(frames[0]);
@@ -1397,11 +1721,18 @@ unittest  // hasInputResponse reports whether the resubmitted request carries an
 	assert(!probe.hasInputResponse("q2"));
 }
 
-unittest  // isResubmit is true exactly when inputResponses is non-empty
+unittest  // isResubmit is true when inputResponses is non-empty
 {
 	auto probe = new StateProbe;
 	assert(!probe.isResubmit);
 	probe.responses["q1"] = Json.emptyObject;
+	assert(probe.isResubmit);
+}
+
+unittest  // isResubmit is true for a state-only resubmission
+{
+	auto probe = new StateProbe;
+	probe.state = `{"step":2}`;
 	assert(probe.isResubmit);
 }
 
@@ -1427,7 +1758,7 @@ unittest  // sample() on a stateless (MRTR) request throws an internalError (ser
 {
 	import mcp.protocol.errors : McpException, ErrorCode;
 
-	auto probe = new StateProbe; // isStateless() == true
+	auto probe = new StateProbe; // usesInputRequired() == true
 	bool threw;
 	try
 		probe.sample(Json.emptyObject);
@@ -1445,7 +1776,7 @@ unittest  // listRoots() on a stateless (MRTR) request throws an internalError (
 
 	// roots/list is a server->client round-trip like sample/elicit, so it has no
 	// channel on the stateless protocol and must fail fast (use MRTR instead).
-	auto probe = new StateProbe; // isStateless() == true
+	auto probe = new StateProbe; // usesInputRequired() == true
 	bool threw;
 	try
 		probe.listRoots();
@@ -1463,7 +1794,7 @@ unittest  // elicit() on a stateless (MRTR) request throws an internalError (ser
 	import std.algorithm.searching : canFind;
 
 	auto probe = new ElicitProbe;
-	probe.stateless = true;
+	probe.inputRequired = true;
 	bool threw;
 	try
 		probe.elicit("Pick one", Json.emptyObject);
@@ -1486,7 +1817,7 @@ unittest  // elicitUrl() on a stateless (MRTR) request throws an internalError (
 	import mcp.protocol.errors : McpException, ErrorCode;
 
 	auto probe = new ElicitProbe;
-	probe.stateless = true;
+	probe.inputRequired = true;
 	bool threw;
 	try
 		probe.elicitUrl("msg", "https://example.com", "elic-1");
@@ -1496,4 +1827,48 @@ unittest  // elicitUrl() on a stateless (MRTR) request throws an internalError (
 		assert(e.code == ErrorCode.internalError);
 	}
 	assert(threw);
+}
+
+version (unittest) private void assertStatefulRequired(void delegate() @safe call) @safe
+{
+	import mcp.protocol.errors : McpException, ErrorCode;
+	import std.algorithm.searching : canFind;
+
+	bool threw;
+	try
+		call();
+	catch (McpException e)
+	{
+		threw = true;
+		assert(e.code == ErrorCode.internalError, e.msg);
+		assert(e.msg.canFind("McpServer.stateful()"), e.msg);
+	}
+	assert(threw);
+}
+
+unittest  // sample() on a stateless server's legacy request names McpServer.stateful(), not a missing capability
+{
+	RequestScopeOptions opts;
+	opts.serverStateless = true;
+	auto scope_ = new RequestScope(new LogProbe, opts);
+	assertStatefulRequired(() @safe { scope_.sample(Json.emptyObject); });
+}
+
+unittest  // elicit() and elicitUrl() on a stateless server's legacy request name McpServer.stateful()
+{
+	RequestScopeOptions opts;
+	opts.serverStateless = true;
+	auto scope_ = new RequestScope(new LogProbe, opts);
+	assertStatefulRequired(() @safe { scope_.elicit("m", Json.emptyObject); });
+	assertStatefulRequired(() @safe {
+		scope_.elicitUrl("m", "https://example.com", "e-1");
+	});
+}
+
+unittest  // listRoots() on a stateless server's legacy request names McpServer.stateful()
+{
+	RequestScopeOptions opts;
+	opts.serverStateless = true;
+	auto scope_ = new RequestScope(new LogProbe, opts);
+	assertStatefulRequired(() @safe { scope_.listRoots(); });
 }

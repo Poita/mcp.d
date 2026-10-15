@@ -7,8 +7,9 @@ expected to follow, and the pull-request flow.
 
 ## Prerequisites
 
-- A D toolchain with frontend **2.100+** — DMD 2.100+, or LDC 1.30+ — and
-  [`dub`](https://dub.pm) (ships with the compiler).
+- A D toolchain with frontend **2.111+** — DMD 2.111+, or LDC 1.41+ (the
+  `toolchainRequirements` floor in `dub.json`) — and [`dub`](https://dub.pm)
+  (ships with the compiler).
 - **OpenSSL 3.x** on the system. The `openssl` / `vibe-d:tls` dependency links
   against it for TLS (HTTPS transport, OAuth 2.1).
   - **Ubuntu/Debian:** ships with OpenSSL 3.x (`apt install libssl-dev` if the
@@ -36,9 +37,10 @@ dub build              # build the library; downloads deps on first run
 Always run `ulimit -n 65536` before `dub` in a shell. Some terminals (notably
 **ghostty**) set `ulimit -n unlimited`, under which the D toolchain — which
 opens many files at once — misbehaves and builds/tests fail in confusing ways.
-Setting an explicit, finite descriptor limit fixes it. The conformance and
-lint scripts already raise the limit internally, but interactive `dub build` /
-`dub test` invocations do not, so set it yourself.
+Setting an explicit, finite descriptor limit fixes it. Every `just` recipe, plus
+`scripts/run-examples.sh` and `scripts/dscanner-lint.sh`, already raises the
+limit, but interactive `dub build` / `dub test` invocations do not, so set it
+yourself.
 
 ## Build, test, and lint commands
 
@@ -47,9 +49,9 @@ ulimit -n 65536                          # required (see gotcha above)
 
 dub build                                # build the library
 dub test                                 # run all unit tests (every module must pass)
+MCP_TEST_MODULES=mcp.server,mcp.protocol dub test   # macOS: only modules with these name prefixes
 
-dub run dfmt -- --inplace source/        # format the source in place
-dub run dfmt -- --inplace source/ conformance/   # format source + conformance (matches CI)
+just fmt                                 # format every D tree in place (matches CI)
 dub run dscanner -- --styleCheck source/ # static analysis / style lint
 ./scripts/dscanner-lint.sh               # the exact lint gate CI runs (with documented filters)
 ```
@@ -62,24 +64,48 @@ wraps these (and the conformance suites) as one-word recipes — each sets the
 just            # list all recipes
 just build      # dub build
 just test       # dub test
-just fmt        # dub run dfmt -- --inplace source/ conformance/
-just lint       # ./scripts/dscanner-lint.sh
-just conformance-server   # build + run the server conformance suite
-just conformance-client   # build + run the client conformance suite
+just fmt        # dub run dfmt -- --inplace source/ conformance/ examples/ bench/ deploy/ci-smoke/
+just lint       # ./scripts/dscanner-lint.sh + ./scripts/check-readme-versions.sh
+just examples   # ./scripts/run-examples.sh (build + e2e-run every example; ~15 min)
+just example tools   # ./scripts/run-examples.sh tools (one example; a minute or two)
+just docs       # ./scripts/gen-docs.sh (API docs into docs/)
+just conformance-build    # build the conformance server and client
+just conformance-server   # server conformance suite, both protocol revisions
+just conformance-client   # client conformance suite, both protocol revisions
 just conformance          # both suites
+just conformance-server-lane 2026-07-28   # one revision (likewise -client-lane)
 ```
 
-CI (`.github/workflows/ci.yml`) runs three gates on every push and PR, and your
+CI (`.github/workflows/ci.yml`) runs these jobs on every push and PR, and your
 change must pass all of them:
 
-1. **dfmt format check** — `dub run dfmt -- --inplace source/ conformance/`
+1. **dfmt format check** — `dub run dfmt -- --inplace source/ conformance/ examples/ bench/ deploy/ci-smoke/`
    followed by `git diff --exit-code` (dfmt has no `--check` flag, so the idiom
-   is format-in-place then fail if the tree changed). Run dfmt before you commit.
-2. **dscanner lint** — `./scripts/dscanner-lint.sh`. The dub config lives in
-   `dscanner.ini`; the wrapper documents the one libdparse false-positive that
-   is filtered out.
-3. **build-and-test** — `dub build` + `dub test` on `{ldc-latest, dmd-latest}` ×
-   `{ubuntu-latest, macos-latest}`.
+   is format-in-place then fail if the tree changed). Run `just fmt` before you
+   commit.
+2. **dscanner lint** — `./scripts/dscanner-lint.sh` (the dub config lives in
+   `dscanner.ini`; the wrapper documents the false positives it filters out),
+   plus `./scripts/check-readme-versions.sh`, which fails if the README's
+   DMD/LDC minimums drift from `dub.json`.
+3. **build-and-test** — `dub build` + `dub test` with `ldc-latest` on
+   `ubuntu-latest`, `macos-latest`, and `windows-latest`, and with `dmd-latest`
+   on `ubuntu-latest` (DMD has no Apple Silicon build, and Windows is gated on
+   LDC).
+4. **ed25519** — build and test the `library-ed25519` configuration (links
+   libsodium) on Ubuntu.
+5. **coverage** — `dub test --coverage` on Ubuntu, uploaded to Codecov
+   (non-blocking upload).
+6. **examples** — `./scripts/run-examples.sh` builds every example and runs each
+   client as a self-verifying end-to-end test on Ubuntu; **examples-windows**
+   runs the stdio examples end to end on `windows-latest`. The full run takes
+   roughly 15 minutes locally, since every example compiles its own server and
+   client against the SDK; while iterating, run just the examples you touched
+   with `just example <name>` (or `./scripts/run-examples.sh <name>...`).
+
+Separate workflows run the official conformance suites
+(`.github/workflows/conformance.yml`), build the reference deploy Dockerfile
+(`.github/workflows/deploy-dockerfile.yml`), and build the API docs
+(`.github/workflows/docs.yml`).
 
 ### API documentation
 
@@ -105,8 +131,7 @@ These conventions are enforced by review (and some by CI). Please follow them:
   failures isolated and readable.
 - **Commit per change.** Make small, focused commits — one logical change (or
   bug fix) per commit — rather than large mixed commits.
-- **Format and lint before committing.** Run `dub run dfmt -- --inplace source/`
-  (and `conformance/` if you touched it) and `./scripts/dscanner-lint.sh` so the
+- **Format and lint before committing.** Run `just fmt` and `just lint` so the
   CI format/lint gates stay green.
 - **Match the MCP spec exactly.** Field names, JSON shapes, and error codes must
   match the authoritative schema for the relevant protocol version. **Revision-specific
@@ -119,6 +144,15 @@ These conventions are enforced by review (and some by CI). Please follow them:
   via `source/mcp/package.d` and usable from `McpServer` / `McpClient` /
   `RequestContext` (or the UDA layer), with a runnable path for callers.
 - **Use `std.getopt`** for any command-line argument parsing.
+- **`@trusted` only around a specific `@system` operation.** Code is `@safe`
+  by default. Reach for `@trusted` only after the compiler rejects the `@safe`
+  version, and wrap just the offending call or cast (e.g.
+  `() @trusted { return cast(string) buf; }()`) rather than the surrounding
+  function, so the rest of the body stays checked. Most vibe.d and Phobos calls
+  are already `@safe`, and a vibe `Json` iterates safely via `byKeyValue` /
+  `byValue` rather than `foreach` over the `Json` itself. A whole function is
+  `@trusted` only when it presents a safe interface over a C API (OpenSSL,
+  POSIX, Win32) whose body is mostly foreign calls.
 
 ## Running the conformance suite locally
 
@@ -178,7 +212,7 @@ ones (extensions, scenarios added after a revision shipped) are reported only.
 3. **Run the gates locally** before pushing:
    ```bash
    ulimit -n 65536
-   dub run dfmt -- --inplace source/ conformance/
+   just fmt
    dub test
    ./scripts/dscanner-lint.sh
    ```

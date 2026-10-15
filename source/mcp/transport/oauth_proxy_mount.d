@@ -10,8 +10,6 @@
 ///
 ///   * `GET  /.well-known/oauth-authorization-server` — RFC 8414 AS metadata
 ///     (`proxy.metadataJson`), advertising the proxy's own endpoints + PKCE S256.
-///   * `GET  /.well-known/oauth-protected-resource` — RFC 9728 PRM document
-///     (`proxy.resourceMetadata.toJson`).
 ///   * `POST /register` — RFC 7591 DCR, echoing the request's `redirect_uris`
 ///     and handing back the fixed upstream `client_id` (`proxy.register`).
 ///   * `GET  /authorize` — gated on the confused-deputy consent MUST: persists
@@ -21,16 +19,20 @@
 ///     authorization endpoint; for an un-consented dynamically-registered client
 ///     it instead renders the proxy's own consent screen (no upstream forward).
 ///   * `POST /consent` — the consent-approval action reached from the consent
-///     screen's form submission: records user consent for the pending client
-///     (`proxy.grantConsent`) and resumes the upstream authorize 302 with the
-///     stored PKCE `code_challenge` + `scope`. A POST (not GET) so a state-changing
+///     screen's form submission: after checking the post comes from the browser
+///     that was shown the screen (consent cookie + anti-CSRF token), records that
+///     browser's consent for the pending client (`proxy.grantConsent`) and
+///     resumes the upstream authorize 302 with the stored PKCE `code_challenge`
+///     + `scope`. A POST (not GET) so a state-changing
 ///     grant cannot be auto-fired by link prefetch/preload.
 ///   * the fixed callback path (default `/auth/callback`) — receives the upstream
 ///     `code` + proxy `state`, looks up the stored client `redirect_uri`, and
 ///     302s the upstream code straight back to the client (transparent PKCE: the
 ///     client's `code_challenge` was forwarded upstream, so the client redeems
 ///     the relayed code with its own `code_verifier`).
-///   * `POST /token` — exchanges the (relayed upstream) `code` + the client's
+///   * `POST /token` — checks the relayed `code` against what the callback bound
+///     it to (the client's S256 `code_challenge`, `client_id` and `redirect_uri`;
+///     `proxy.redeemCode`), then exchanges the `code` + the client's
 ///     `code_verifier` at the upstream token endpoint using the fixed upstream
 ///     credentials (`proxy.tokenForm`/`proxy.tokenAuthHeader`). By default
 ///     (passthrough) it relays the upstream token response to the client
@@ -40,6 +42,10 @@
 /// The pure relay helpers (`buildClientCallbackRedirect`, `redirectUrisFrom`,
 /// `ProxyStateStore`, `consentScreenHtml`) carry no HTTP state and are unit-tested
 /// directly; the `mountOAuthProxy` wiring threads them onto the router.
+///
+/// The RFC 9728 Protected Resource Metadata document belongs to the protected
+/// MCP endpoint, not the AS: `mountMcp` serves it when given
+/// `OAuthProxyConfig.toResourceServer()` as `StreamableHttpOptions.auth`.
 module mcp.transport.oauth_proxy_mount;
 
 import std.string : startsWith, indexOf;
@@ -50,9 +56,14 @@ import vibe.http.server : HTTPServerRequest, HTTPServerResponse, HTTPStatus;
 import vibe.http.router : URLRouter;
 import vibe.http.common : HTTPMethod;
 
-import mcp.auth.oauth : isValidClientIdMetadataUrl, TokenSet;
-import mcp.auth.oauth_proxy : ConsentRequiredException, InvalidClientIdMetadataException,
-	InvalidRedirectUriException, OAuthProxy, OAuthProxyConfig;
+import mcp.auth.oauth : canonicalResourceUri, isValidClientIdMetadataUrl, TokenSet;
+import mcp.auth.oauth_proxy : BrokeredToken, ConsentRequiredException,
+	InvalidClientIdMetadataException,
+	InvalidScopeException,
+	InvalidRedirectUriException, OAuthProxy, OAuthProxyConfig, RelayedCodeBinding;
+import mcp.protocol.jsonrpc : parseUntrustedJson;
+import mcp.protocol.ssrf : SsrfPolicy;
+import mcp.transport.client_bucket : clientBucket, defaultIpv6BucketPrefix;
 
 @safe:
 
@@ -70,14 +81,18 @@ private string enc(string s) @safe
 /// proxy 302s to once the upstream callback fires. The client supplied the
 /// `redirect_uri` at `/authorize`; the proxy relays the upstream authorization
 /// `code` to it so the client can redeem it (with its own PKCE `code_verifier`)
-/// at the proxy `/token` endpoint.
-string buildClientCallbackRedirect(string clientRedirectUri, string code, string clientState) @safe
+/// at the proxy `/token` endpoint. A non-empty `issuer` (the proxy's own) is
+/// appended as the RFC 9207 `iss` parameter.
+string buildClientCallbackRedirect(string clientRedirectUri, string code,
+		string clientState, string issuer) @safe
 {
 	auto url = clientRedirectUri;
 	url ~= (clientRedirectUri.indexOf('?') < 0) ? "?" : "&";
 	url ~= "code=" ~ enc(code);
 	if (clientState.length)
 		url ~= "&state=" ~ enc(clientState);
+	if (issuer.length)
+		url ~= "&iss=" ~ enc(issuer);
 	return url;
 }
 
@@ -86,9 +101,10 @@ string buildClientCallbackRedirect(string clientRedirectUri, string code, string
 /// `redirect_uri`, producing the Location the proxy 302s to when the upstream
 /// authorization server redirects back with an `error` instead of a `code`.
 /// `error` is mandatory; `errorDescription` and `errorUri` are appended only
-/// when non-empty. Symmetric to `buildClientCallbackRedirect`.
+/// when non-empty, and a non-empty `issuer` as the RFC 9207 `iss` parameter.
+/// Symmetric to `buildClientCallbackRedirect`.
 string buildClientCallbackError(string clientRedirectUri, string error,
-		string errorDescription, string errorUri, string clientState) @safe
+		string errorDescription, string errorUri, string clientState, string issuer) @safe
 {
 	auto url = clientRedirectUri;
 	url ~= (clientRedirectUri.indexOf('?') < 0) ? "?" : "&";
@@ -99,6 +115,8 @@ string buildClientCallbackError(string clientRedirectUri, string error,
 		url ~= "&error_uri=" ~ enc(errorUri);
 	if (clientState.length)
 		url ~= "&state=" ~ enc(clientState);
+	if (issuer.length)
+		url ~= "&iss=" ~ enc(issuer);
 	return url;
 }
 
@@ -155,43 +173,104 @@ string[] redirectUrisFrom(Json body_) @safe
 /// `state` value sent upstream. The client's PKCE `code_challenge` and `scope`
 /// are also retained so the upstream authorize redirect can be (re)built after a
 /// consent-approval round-trip (confused-deputy mitigation).
-struct ProxyAuthState
+package struct ProxyAuthState
 {
 	string clientRedirectUri; /// the client's dynamic redirect URI (RFC 7591)
 	string clientState; /// the client's original OAuth `state`, relayed back verbatim
 	string codeChallenge; /// the client's PKCE S256 `code_challenge`, forwarded upstream
 	string scope_; /// the client's requested `scope`, forwarded upstream
 	string clientId; /// the SEP-991 CIMD `client_id` URL (empty for DCR clients); the consent identity for CIMD
+	string consentSession; /// the consent-cookie value of the browser that started this authorization
+	string csrfToken; /// the anti-CSRF token the consent form must echo back
+	string client; /// the rate-limit key of the caller that started this authorization
+}
+
+/// What the consent screen shows and posts back. `clientName` is the
+/// self-asserted name from a SEP-991 Client ID Metadata Document (empty for a
+/// DCR client); `clientId` is that CIMD `client_id` URL (empty for a DCR client),
+/// whose host is displayed because, unlike `clientName`, the client cannot pick
+/// it freely. `consentPath`, `proxyState` and `csrfToken` drive the approval
+/// form.
+struct ConsentScreen
+{
+	string clientName; /// the CIMD `client_name` (empty for DCR clients)
+	string clientId; /// the CIMD `client_id` URL (empty for DCR clients)
+	string clientRedirectUri; /// the redirect URI the code will be relayed to
+	string consentPath; /// the path the approval form posts to
+	string proxyState; /// the opaque proxy `state`, echoed as a hidden field
+	string csrfToken; /// the anti-CSRF token, echoed as a hidden field
+	string[] scopes; /// the scopes the approval covers (`OAuthProxy.forwardedScopes`)
 }
 
 /// Build the minimal HTML consent screen presented when a dynamically-registered
-/// client (identified by its `clientRedirectUri`) has not yet been approved to be
-/// forwarded to the upstream authorization server. The MCP authorization spec
-/// (Â§Security Considerations > Confused Deputy Problem) requires a proxy using a
+/// client has not yet been approved to be forwarded to the upstream
+/// authorization server. The MCP authorization spec
+/// (Security Considerations > Confused Deputy Problem) requires a proxy using a
 /// static upstream `client_id` to obtain user consent for EACH dynamically
 /// registered client before forwarding it upstream. The screen offers a single
 /// approval action: a `<form method="POST">` targeting `consentPath` and carrying
-/// the opaque proxy `state` as a hidden field. Posting it records consent and
-/// resumes the upstream redirect. Using a form POST (rather than a hyperlink GET)
-/// means link prefetch/preload cannot auto-fire the state-changing grant and the
-/// opaque `state` is not carried in a URL that could leak via Referer/history/logs.
+/// the opaque proxy `state` and the pending authorization's anti-CSRF token as
+/// hidden fields. Posting it records consent and resumes the upstream redirect.
+/// Using a form POST (rather than a hyperlink GET) means link prefetch/preload
+/// cannot auto-fire the state-changing grant and the opaque `state` is not
+/// carried in a URL that could leak via Referer/history/logs.
 ///
-/// `clientName` is the verified human-readable name from a SEP-991 Client ID
-/// Metadata Document; when non-empty it is displayed prominently so the user
-/// authorizes a named identity (phishing mitigation), and is empty for a DCR
-/// client, which has no attested name. The `clientRedirectUri` is always shown:
-/// the spec requires the redirect URI hostname be clearly displayed during
+/// The `scopes` being approved are listed, since the approval is recorded for
+/// exactly that set and a later request for more re-prompts.
+///
+/// A CIMD client's `clientName` is shown alongside the host of its `clientId`,
+/// since the name is chosen by whoever hosts the metadata document while the
+/// host identifies who that is. The `clientRedirectUri` is always shown: the
+/// spec requires the redirect URI hostname be clearly displayed during
 /// authorization, since under CIMD a localhost redirect cannot be attested.
-string consentScreenHtml(string clientName, string clientRedirectUri,
-		string consentPath, string proxyState) @safe
+string consentScreenHtml(ConsentScreen screen) @safe
 {
-	const safeName = htmlEscape(clientName);
-	const safeUri = htmlEscape(clientRedirectUri);
-	const safeAction = htmlEscape(consentPath);
-	const safeState = htmlEscape(proxyState);
-	const nameSection = clientName.length
+	const safeName = htmlEscape(screen.clientName);
+	const safeUri = htmlEscape(screen.clientRedirectUri);
+	const safeAction = htmlEscape(screen.consentPath);
+	const safeState = htmlEscape(screen.proxyState);
+	const safeCsrf = htmlEscape(screen.csrfToken);
+	const nameSection = screen.clientName.length
 		? "<p>Application: <strong>" ~ safeName ~ "</strong></p>" : "";
-	return "<!DOCTYPE html><html><head><meta charset=\"utf-8\">" ~ "<meta name=\"referrer\" content=\"no-referrer\">" ~ "<title>Authorize application</title></head><body>" ~ "<h1>Authorize application</h1>" ~ "<p>An application is requesting to sign in via this server and be" ~ " forwarded to the upstream identity provider.</p>" ~ nameSection ~ "<p>Redirect URI: <code>" ~ safeUri ~ "</code></p>" ~ "<form method=\"post\" action=\"" ~ safeAction ~ "\">" ~ "<input type=\"hidden\" name=\"state\" value=\"" ~ safeState ~ "\">" ~ "<button type=\"submit\">Approve and continue</button></form>" ~ "</body></html>";
+	const clientHost = urlHost(screen.clientId);
+	const hostSection = clientHost.length
+		? "<p>Published by: <strong>" ~ htmlEscape(clientHost) ~ "</strong></p>" : "";
+	string scopeSection = "<p>Requested access: the upstream provider's default scopes.</p>";
+	if (screen.scopes.length)
+	{
+		scopeSection = "<p>Requested access:</p><ul>";
+		foreach (sc; screen.scopes)
+			scopeSection ~= "<li><code>" ~ htmlEscape(sc) ~ "</code></li>";
+		scopeSection ~= "</ul>";
+	}
+	return "<!DOCTYPE html><html><head><meta charset=\"utf-8\">"
+		~ "<meta name=\"referrer\" content=\"no-referrer\">"
+		~ "<title>Authorize application</title></head><body>" ~ "<h1>Authorize application</h1>"
+		~ "<p>An application is requesting to sign in via this server and be"
+		~ " forwarded to the upstream identity provider.</p>" ~ nameSection ~ hostSection
+		~ scopeSection ~ "<p>Redirect URI: <code>"
+		~ safeUri ~ "</code></p>" ~ "<form method=\"post\" action=\"" ~ safeAction
+		~ "\">" ~ "<input type=\"hidden\" name=\"state\" value=\"" ~ safeState
+		~ "\">" ~ "<input type=\"hidden\" name=\"csrf\" value=\"" ~ safeCsrf
+		~ "\">" ~ "<button type=\"submit\">Approve and continue</button></form>" ~ "</body></html>";
+}
+
+/// The host (with any port) of an absolute URL, or empty when `url` is empty or
+/// does not parse.
+private string urlHost(string url) @safe
+{
+	import std.conv : to;
+	import vibe.inet.url : URL;
+
+	if (url.length == 0)
+		return "";
+	try
+	{
+		auto u = URL(url);
+		return u.port && u.port != u.defaultPort ? u.host ~ ":" ~ u.port.to!string : u.host;
+	}
+	catch (Exception)
+		return "";
 }
 
 private string htmlEscape(string s) @safe
@@ -202,63 +281,418 @@ private string htmlEscape(string s) @safe
 		.replace("\"", "&quot;");
 }
 
-/// A thread-safe in-memory store mapping a proxy `state` to the client's
+/// Bounds for a `ProxyStateStore`.
+struct ProxyStateStoreOptions
+{
+	import core.time : Duration, MonoTime, minutes;
+
+	/// Lifetime of a pending authorization (authorize -> consent -> callback). An
+	/// abandoned or un-consented flow is swept after this elapses.
+	Duration ttl = 10.minutes;
+
+	/// Maximum number of live pending authorizations. When reached on `put`, the
+	/// oldest entries are evicted so a flood cannot exhaust memory inside the TTL.
+	size_t maxEntries = 10_000;
+
+	/// Maximum number of live pending authorizations started by one browser
+	/// (`ProxyAuthState.consentSession`); 0 means unlimited. Past it, that
+	/// browser's oldest pending authorization is dropped.
+	size_t maxPerConsentSession = 10;
+
+	/// Maximum number of live pending authorizations started by one client
+	/// (`ProxyAuthState.client`, the key `/authorize` is rate limited under);
+	/// 0 means unlimited. Past it, that client's oldest pending authorization
+	/// is dropped, so a client that sends no consent cookie cannot push out
+	/// other users' pending sign-ins.
+	size_t maxPerClient = 20;
+
+	/// Injectable monotonic clock (tests drive expiry with it). Null uses
+	/// `MonoTime.currTime`.
+	MonoTime delegate() @safe clock;
+}
+
+/// An in-memory store mapping a proxy `state` to the client's
 /// pending-authorization details. Entries are consumed (single use) on lookup so
-/// a relayed callback cannot be replayed.
+/// a relayed callback cannot be replayed. It does no locking: it is used from
+/// the fibers of the server's single event-loop thread, like `OAuthProxy`.
 ///
 /// The store is bounded so the unauthenticated `/authorize` route cannot grow
 /// process memory without limit: each entry carries an insertion timestamp, and
 /// every `put`/`take` sweeps entries older than the authorization-flow TTL and
 /// caps the live entry count, evicting the oldest by insertion time when the cap
-/// is reached. The clock is injectable so the bounds are unit-testable.
-final class ProxyStateStore
+/// is reached. One browser's and one client's pending authorizations are capped
+/// separately (`ProxyStateStoreOptions.maxPerConsentSession` and
+/// `maxPerClient`). The clock is injectable so the bounds are unit-testable.
+package final class ProxyStateStore
 {
-	import core.time : Duration, MonoTime, minutes;
-	import mcp.transport.session : BoundedExpiringMap;
+	import mcp.internal.expiring_map : BoundedExpiringMap;
 
-	/// Lifetime of a pending authorization (authorize -> consent -> callback). An
-	/// abandoned or un-consented flow is swept after this elapses.
-	enum Duration defaultTtl = 10.minutes;
-
-	/// Maximum number of live pending authorizations. When reached on `put`, the
-	/// oldest entries are evicted so a flood cannot exhaust memory inside the TTL.
-	enum size_t defaultMaxEntries = 10_000;
-
-	// `synchronized(this)` serializes access; the container itself does no locking.
 	private BoundedExpiringMap!ProxyAuthState entries;
+	private StatesByKey bySession;
+	private StatesByKey byClient;
 
 	this() @safe
 	{
-		this(defaultTtl, defaultMaxEntries, null);
+		this(ProxyStateStoreOptions.init);
 	}
 
-	/// Construct with explicit bounds and an optional injectable clock (used by
-	/// tests to drive TTL expiry deterministically). A null clock uses `MonoTime.currTime`.
-	this(Duration ttl, size_t maxEntries, MonoTime delegate() @safe clock) @safe
+	/// A store bounded by `opts`.
+	this(ProxyStateStoreOptions opts) @safe
 	{
-		entries = BoundedExpiringMap!ProxyAuthState(ttl, maxEntries, clock);
+		entries = BoundedExpiringMap!ProxyAuthState(opts.ttl, opts.maxEntries, opts.clock);
+		entries.onEvict = (string key, ProxyAuthState st) @safe {
+			forget(key, st);
+		};
+		bySession.cap = opts.maxPerConsentSession;
+		byClient.cap = opts.maxPerClient;
 	}
 
 	/// Record the client's authorization details under the proxy `state`.
 	void put(string proxyState, ProxyAuthState st) @safe
 	{
-		synchronized (this)
-			entries.put(proxyState, st);
+		makeRoom(bySession, st.consentSession, proxyState);
+		makeRoom(byClient, st.client, proxyState);
+		entries.put(proxyState, st);
+		bySession.add(st.consentSession, proxyState);
+		byClient.add(st.client, proxyState);
 	}
 
 	/// Consume and return the details for `proxyState`, setting `found`.
 	ProxyAuthState take(string proxyState, out bool found) @safe
 	{
-		synchronized (this)
-			return entries.take(proxyState, found);
+		auto st = entries.take(proxyState, found);
+		if (found)
+			forget(proxyState, st);
+		return st;
+	}
+
+	/// Return the details for `proxyState` without consuming them, setting
+	/// `found`.
+	ProxyAuthState peek(string proxyState, out bool found) @safe
+	{
+		auto p = entries.get(proxyState, false);
+		found = p !is null;
+		return found ? *p : ProxyAuthState.init;
 	}
 
 	/// Number of live pending authorizations (test/diagnostic use).
 	size_t length() @safe
 	{
-		synchronized (this)
-			return entries.length;
+		return entries.length;
 	}
+
+	// Drop `key`'s oldest pending authorizations in `index` until `proxyState`
+	// fits under its cap.
+	private void makeRoom(ref StatesByKey index, string key, string proxyState) @safe
+	{
+		while (index.full(key, proxyState))
+		{
+			bool found;
+			const oldest = index.oldest(key);
+			auto st = entries.take(oldest, found);
+			if (found)
+				forget(oldest, st);
+			else
+				index.remove(key, oldest);
+		}
+	}
+
+	private void forget(string proxyState, ProxyAuthState st) @safe
+	{
+		bySession.remove(st.consentSession, proxyState);
+		byClient.remove(st.client, proxyState);
+	}
+}
+
+// The live proxy states recorded under each key, oldest first, capped per key
+// (0: unlimited). An empty key is never tracked.
+private struct StatesByKey
+{
+	size_t cap;
+	private string[][string] states;
+
+	// Whether adding `proxyState` under `key` would exceed the cap.
+	bool full(string key, string proxyState) @safe
+	{
+		import std.algorithm : canFind;
+
+		if (key.length == 0 || cap == 0)
+			return false;
+		auto list = key in states;
+		return list !is null && !(*list).canFind(proxyState) && (*list).length >= cap;
+	}
+
+	string oldest(string key) @safe
+	{
+		return states[key][0];
+	}
+
+	void add(string key, string proxyState) @safe
+	{
+		import std.algorithm : canFind;
+
+		if (key.length == 0)
+			return;
+		auto list = key in states;
+		if (list is null)
+			states[key] = [proxyState];
+		else if (!(*list).canFind(proxyState))
+			*list ~= proxyState;
+	}
+
+	void remove(string key, string proxyState) @safe
+	{
+		import std.algorithm : countUntil, remove;
+
+		auto list = key in states;
+		if (list is null)
+			return;
+		const i = (*list).countUntil(proxyState);
+		if (i < 0)
+			return;
+		*list = (*list).remove(i);
+		if ((*list).length == 0)
+			states.remove(key);
+	}
+}
+
+/// Counts the requests each client makes to the proxy's unauthenticated
+/// `/authorize` and `/register` endpoints in fixed windows, refusing them past
+/// a per-window budget. Clients are told apart by a caller-supplied key (by
+/// default the peer address).
+package final class ClientRateLimiter
+{
+	import core.time : Duration, MonoTime;
+	import mcp.internal.expiring_map : BoundedExpiringMap;
+
+	private static struct Window
+	{
+		MonoTime start;
+		size_t count;
+	}
+
+	private BoundedExpiringMap!Window windows;
+	private size_t maxRequests;
+	private Duration window;
+	private MonoTime delegate() @safe clock;
+
+	/// Allow `maxRequests` per `window` per client, tracking at most
+	/// `maxClients` clients at once (the least recently seen is forgotten
+	/// first). A null `clock` uses `MonoTime.currTime`.
+	this(size_t maxRequests, Duration window, size_t maxClients, MonoTime delegate() @safe clock) @safe
+	{
+		this.maxRequests = maxRequests;
+		this.window = window;
+		this.clock = clock;
+		windows = BoundedExpiringMap!Window(window, maxClients, clock);
+	}
+
+	/// Count a request from `client`, returning false when its budget for the
+	/// current window is already spent.
+	bool allow(string client) @safe
+	{
+		const t = clock !is null ? clock() : MonoTime.currTime;
+		auto w = windows.get(client, false);
+		if (w is null || t - w.start >= window)
+		{
+			windows.put(client, Window(t, 1));
+			return true;
+		}
+		if (w.count >= maxRequests)
+			return false;
+		++w.count;
+		return true;
+	}
+}
+
+/// Settings for `mountOAuthProxy`.
+struct OAuthProxyMountOptions
+{
+	import core.time : Duration, MonoTime, minutes;
+
+	/// Bounds on the pending authorizations held between `/authorize` and the
+	/// upstream callback.
+	ProxyStateStoreOptions pendingAuthorizations;
+
+	/// Maximum number of `/authorize` and `/register` requests (together) one
+	/// client may make per `rateLimitWindow`; 0 disables the limit.
+	size_t maxRequestsPerClient = 60;
+
+	/// The window `maxRequestsPerClient` applies to.
+	Duration rateLimitWindow = 1.minutes;
+
+	/// Maximum number of clients the rate limiter tracks at once.
+	size_t maxRateLimitedClients = 100_000;
+
+	/// The key a request is rate limited under. Null uses the peer address,
+	/// with IPv6 peers grouped by `ipv6BucketPrefix`; behind a reverse proxy,
+	/// derive it from the forwarding header that proxy sets, or every user
+	/// shares one budget.
+	string delegate(scope HTTPServerRequest req) @safe clientKey;
+
+	/// The IPv6 prefix length, in bits, that the default `clientKey` groups
+	/// peers by, so a client cannot multiply its budget by rotating through its
+	/// own block. IPv4 peers are keyed per address.
+	uint ipv6BucketPrefix = defaultIpv6BucketPrefix;
+
+	/// The secret that signs consent cookies, so the proxy honours only cookie
+	/// values it minted. Empty uses a random key per mount: browsers are then
+	/// shown the consent screen again after a restart, and every instance
+	/// behind a load balancer needs the same configured key.
+	immutable(ubyte)[] consentCookieKey;
+
+	/// Injectable monotonic clock for the rate limiter (tests). Null uses
+	/// `MonoTime.currTime`.
+	MonoTime delegate() @safe clock;
+}
+
+/// A rate limit check for one mounted route: whether `req` may proceed.
+/// `mountOAuthProxy` builds one from `OAuthProxyMountOptions` and shares it
+/// between `/authorize` and `/register`.
+alias ProxyRequestLimit = bool delegate(scope HTTPServerRequest req) @safe;
+
+/// The key a request's client is told apart by: `OAuthProxyMountOptions.clientKey`.
+alias ProxyClientKey = string delegate(scope HTTPServerRequest req) @safe;
+
+/// The `ProxyClientKey` `opts` describes: its `clientKey`, else the peer
+/// address bucketed by `clientBucket`.
+ProxyClientKey proxyClientKey(OAuthProxyMountOptions opts) @safe
+{
+	if (opts.clientKey !is null)
+		return opts.clientKey;
+	const prefix = opts.ipv6BucketPrefix;
+	return (scope HTTPServerRequest req) @safe => clientBucket(req.clientAddress, prefix);
+}
+
+/// The `ProxyRequestLimit` `opts` describes, or null when rate limiting is off.
+ProxyRequestLimit proxyRequestLimit(OAuthProxyMountOptions opts) @safe
+{
+	if (opts.maxRequestsPerClient == 0)
+		return null;
+	auto limiter = new ClientRateLimiter(opts.maxRequestsPerClient,
+			opts.rateLimitWindow, opts.maxRateLimitedClients, opts.clock);
+	auto key = proxyClientKey(opts);
+	return (scope HTTPServerRequest req) @safe => limiter.allow(key(req));
+}
+
+// Answer a request refused by a `ProxyRequestLimit` with 429.
+private void writeRateLimited(scope HTTPServerResponse res) @safe
+{
+	Json err = Json.emptyObject;
+	err["error"] = "temporarily_unavailable";
+	err["error_description"] = "too many requests; try again later";
+	res.statusCode = HTTPStatus.tooManyRequests;
+	res.writeJsonBody(err);
+}
+
+/// The cookie that identifies a browser to the consent gate when the proxy is
+/// served over https. Its value is an unguessable random handle; consent recorded
+/// under it lets only that browser skip the consent screen for an approved client.
+/// The `__Host-` prefix makes the browser reject the cookie unless it is Secure,
+/// host-only and scoped to `/`, so a sibling subdomain cannot plant one.
+enum string consentCookieName = "__Host-mcp_proxy_consent";
+
+/// The consent cookie name used when the proxy is served over plain http (a
+/// loopback development deployment), where a `__Host-` cookie cannot be set.
+enum string insecureConsentCookieName = "mcp_proxy_consent";
+
+/// How long a browser's consent cookie lives. A browser whose cookie has expired
+/// is shown the consent screen again.
+private enum long consentCookieMaxAgeSeconds = 30L * 24 * 60 * 60;
+
+/// Mints, sets and reads back the consent cookie. A value is a random handle
+/// followed by its HMAC-SHA256 under `key`, and a request's cookie is honoured
+/// only when that MAC verifies, so a cookie planted with a value of someone
+/// else's choosing (possible over plain http, which has no `__Host-` prefix)
+/// is ignored.
+package struct ConsentCookie
+{
+	private immutable(ubyte)[] key;
+	private bool secure;
+
+	/// A cookie signed with `key` (a fresh random key when empty), served
+	/// under the https name when `secure`.
+	this(immutable(ubyte)[] key, bool secure) @safe
+	{
+		if (key.length == 0)
+		{
+			import mcp.auth.csprng : cryptoRandomFill;
+
+			auto fresh = new ubyte[32];
+			cryptoRandomFill(fresh);
+			key = (() @trusted => cast(immutable(ubyte)[]) fresh)();
+		}
+		this.key = key;
+		this.secure = secure;
+	}
+
+	/// A fresh signed cookie value.
+	string mint() @safe
+	{
+		return sign(mintState());
+	}
+
+	/// The signed cookie value for the handle `id`.
+	string sign(string id) @safe
+	{
+		return id ~ "." ~ mac(id);
+	}
+
+	/// The request's consent cookie value when it carries a valid signature,
+	/// else "".
+	string of(scope HTTPServerRequest req) @safe
+	{
+		import std.string : lastIndexOf;
+		import mcp.auth.oauth : constantTimeEquals;
+
+		const value = req.cookies.get(consentCookieNameFor(secure), "");
+		const dot = value.lastIndexOf('.');
+		if (dot <= 0)
+			return "";
+		return constantTimeEquals(value[dot + 1 .. $], mac(value[0 .. dot])) ? value : "";
+	}
+
+	/// Set the cookie to `value` on `res`.
+	void set(scope HTTPServerResponse res, string value) @safe
+	{
+		import vibe.http.common : Cookie;
+
+		auto c = res.setCookie(consentCookieNameFor(secure), value, "/");
+		c.httpOnly = true;
+		c.secure = secure;
+		// Lax: the cookie must accompany the top-level GET /authorize navigation a
+		// client starts from another site; the consent POST itself is same-site.
+		c.sameSite = Cookie.SameSite.lax;
+		c.maxAge = consentCookieMaxAgeSeconds;
+	}
+
+	private string mac(string id) @safe
+	{
+		import std.digest.hmac : hmac;
+		import std.digest.sha : SHA256;
+		import std.string : representation;
+		import mcp.auth.oauth : base64UrlNoPad;
+
+		auto h = hmac!SHA256(key);
+		h.put(id.representation);
+		const digest = h.finish();
+		return base64UrlNoPad(digest[]);
+	}
+}
+
+private string consentCookieNameFor(bool secure) @safe
+{
+	return secure ? consentCookieName : insecureConsentCookieName;
+}
+
+/// Headers that keep the consent screen from being cached, leaking the proxy
+/// state via Referer, or being framed by another site (clickjacking).
+private void setConsentPageHeaders(scope HTTPServerResponse res) @safe
+{
+	res.headers["Cache-Control"] = "no-store";
+	res.headers["Referrer-Policy"] = "no-referrer";
+	res.headers["X-Frame-Options"] = "DENY";
+	res.headers["Content-Security-Policy"] = "frame-ancestors 'none'";
 }
 
 /// Mint a fresh, unguessable proxy `state` value (the only `state` sent
@@ -280,48 +714,111 @@ private string mintState() @safe
 // ===========================================================================
 
 /// Mount the full client-facing OAuth surface of an `OAuthProxy` onto a vibe.d
-/// `URLRouter`. Registers the AS-metadata + PRM well-known documents, the RFC
+/// `URLRouter`. Registers the AS-metadata well-known document, the RFC
 /// 7591 `/register` endpoint, the `/authorize` -> upstream redirect (persisting
 /// the client's dynamic redirect URI), the fixed callback that relays the
 /// upstream code back to the client, and the `/token` endpoint that exchanges the
 /// relayed code at the upstream with the fixed credentials. Paths are derived
 /// from the proxy's own configured endpoints so they line up exactly with the AS
 /// metadata it publishes.
-void mountOAuthProxy(URLRouter router, OAuthProxy proxy) @safe
+///
+/// `opts` bounds the pending authorizations and rate limits each client's
+/// `/authorize` and `/register` requests, so an unauthenticated flood cannot
+/// evict other users' sign-ins or registrations.
+void mountOAuthProxy(URLRouter router, OAuthProxy proxy,
+		OAuthProxyMountOptions opts = OAuthProxyMountOptions.init) @safe
 {
-	auto store = new ProxyStateStore;
+	auto store = new ProxyStateStore(opts.pendingAuthorizations);
+	auto limit = proxyRequestLimit(opts);
 	mountOAuthMetadata(router, proxy);
-	mountOAuthRegister(router, proxy);
-	mountOAuthAuthorize(router, proxy, store);
-	mountOAuthConsent(router, proxy, store);
-	mountOAuthCallback(router, proxy, store);
+	mountOAuthRegister(router, proxy, limit);
+	auto cookie = ConsentCookie(opts.consentCookieKey, proxy.config()
+			.baseUrl.startsWith("https://"));
+	mountOAuthAuthorize(router, proxy, store, cookie, limit, proxyClientKey(opts));
+	mountOAuthConsent(router, proxy, store, cookie);
+	mountOAuthCallback(router, proxy, store, cookie);
 	mountOAuthToken(router, proxy);
 }
 
-/// Mount the RFC 8414 Authorization Server Metadata and RFC 9728 Protected
-/// Resource Metadata well-known documents. The proxy advertises ITSELF as the
-/// AS, so these live at the proxy's own well-known paths.
+/// The proxy's issuer identifier, as its AS metadata publishes it.
+private string proxyIssuer(OAuthProxy proxy) @safe
+{
+	return proxy.metadataJson()["issuer"].get!string;
+}
+
+/// Mount the RFC 8414 Authorization Server Metadata well-known document. The
+/// proxy advertises ITSELF as the AS, so it lives at the proxy's own well-known
+/// path, derived from the issuer (`OAuthProxyConfig.baseUrl`) as RFC 8414 §3.1
+/// requires: an issuer with a path component (`https://host/auth`) is served at
+/// `/.well-known/oauth-authorization-server/auth`.
+///
+/// The document is public and carries no credentials, so it is served with
+/// `Access-Control-Allow-Origin: *` and a CORS preflight is answered, letting a
+/// browser-based MCP client discover the proxy from another origin.
 void mountOAuthMetadata(URLRouter router, OAuthProxy proxy) @safe
 {
-	router.get("/.well-known/oauth-authorization-server",
-			(HTTPServerRequest req, HTTPServerResponse res) @safe {
+	const asPath = authServerMetadataPath(proxy.config().baseUrl);
+
+	router.get(asPath, (HTTPServerRequest req, HTTPServerResponse res) @safe {
+		setAnyOriginCorsHeader(res);
 		res.statusCode = HTTPStatus.ok;
 		res.writeJsonBody(proxy.metadataJson());
 	});
 
-	router.get("/.well-known/oauth-protected-resource", (HTTPServerRequest req,
-			HTTPServerResponse res) @safe {
-		res.statusCode = HTTPStatus.ok;
-		res.writeJsonBody(proxy.resourceMetadata().toJson());
+	router.match(HTTPMethod.OPTIONS, asPath, (HTTPServerRequest req, HTTPServerResponse res) @safe {
+		setAnyOriginCorsHeader(res);
+		res.headers["Access-Control-Allow-Methods"] = "GET, OPTIONS";
+		res.headers["Access-Control-Max-Age"] = "86400";
+		res.statusCode = HTTPStatus.noContent;
+		res.writeVoidBody();
+	});
+}
+
+/// The RFC 8414 §3.1 well-known path of the AS metadata for `issuer`: the
+/// well-known suffix inserted between the host and the issuer's path.
+private string authServerMetadataPath(string issuer) @safe
+{
+	auto path = pathOf(issuer);
+	while (path.length > 1 && path[$ - 1] == '/')
+		path = path[0 .. $ - 1];
+	return "/.well-known/oauth-authorization-server" ~ (path == "/" ? "" : path);
+}
+
+private void setAnyOriginCorsHeader(scope HTTPServerResponse res) @safe
+{
+	res.headers["Access-Control-Allow-Origin"] = "*";
+}
+
+/// Answer CORS preflights for a POST-only OAuth endpoint at `path`. `/register`
+/// and `/token` authenticate with request parameters, never cookies, so any
+/// origin may call them and the responses carry `Access-Control-Allow-Origin: *`.
+private void mountPostPreflight(URLRouter router, string path) @safe
+{
+	router.match(HTTPMethod.OPTIONS, path, (HTTPServerRequest req, HTTPServerResponse res) @safe {
+		setAnyOriginCorsHeader(res);
+		res.headers["Access-Control-Allow-Methods"] = "POST, OPTIONS";
+		res.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization";
+		res.headers["Access-Control-Max-Age"] = "86400";
+		res.statusCode = HTTPStatus.noContent;
+		res.writeVoidBody();
 	});
 }
 
 /// Mount the RFC 7591 Dynamic Client Registration endpoint: echo the requested
 /// redirect_uris and hand back the fixed upstream client_id (public PKCE client).
-void mountOAuthRegister(URLRouter router, OAuthProxy proxy) @safe
+/// Like `/token`, it is CORS-enabled for any origin (with a preflight answered)
+/// so a browser-based MCP client can register cross-origin.
+///
+/// A request `limit` refuses is answered 429; pass `proxyRequestLimit(opts)`, or
+/// null to admit every request.
+void mountOAuthRegister(URLRouter router, OAuthProxy proxy, ProxyRequestLimit limit) @safe
 {
 	const registerPath = pathOf(proxy.config().registrationEndpoint());
+	mountPostPreflight(router, registerPath);
 	router.post(registerPath, (HTTPServerRequest req, HTTPServerResponse res) @safe {
+		setAnyOriginCorsHeader(res);
+		if (limit !is null && !limit(req))
+			return writeRateLimited(res);
 		Json body_;
 		if (!tryReadJsonBody(req, body_))
 		{
@@ -337,8 +834,21 @@ void mountOAuthRegister(URLRouter router, OAuthProxy proxy) @safe
 				"redirect_uris is required and must contain at least one usable URI"));
 			return;
 		}
+		Json registration;
+		try
+			registration = proxy.register(uris);
+		catch (InvalidRedirectUriException e)
+		{
+			// RFC 7591 §3.2.2: a redirect URI the server will not accept.
+			Json err = Json.emptyObject;
+			err["error"] = "invalid_redirect_uri";
+			err["error_description"] = e.msg;
+			res.statusCode = HTTPStatus.badRequest;
+			res.writeJsonBody(err);
+			return;
+		}
 		res.statusCode = HTTPStatus.created;
-		res.writeJsonBody(proxy.register(uris));
+		res.writeJsonBody(registration);
 	});
 }
 
@@ -356,16 +866,34 @@ void mountOAuthRegister(URLRouter router, OAuthProxy proxy) @safe
 /// `ConsentRequiredException` for an un-consented client; the handler then renders
 /// the proxy's own consent screen instead of forwarding.
 ///
+/// The client is checked first: a DCR request must name the shared upstream
+/// `client_id` and a registered `redirect_uri`, a CIMD request a valid metadata
+/// document listing its `redirect_uri`; otherwise the request is answered 400
+/// `invalid_request` and never redirected (RFC 6749 §4.1.2.1). Once the
+/// `redirect_uri` is known good, any other error is redirected to it with the
+/// client's `state`: a `response_type` other than `code` (`invalid_request` when
+/// absent, `unsupported_response_type` otherwise), a missing `code_challenge` or a
+/// `code_challenge_method` other than `S256` (`invalid_request`), a `resource`
+/// other than the proxy's own (`invalid_target`, RFC 8707), or too many scopes
+/// (`invalid_scope`).
+///
 /// The `store` MUST be shared with `mountOAuthConsent` and `mountOAuthCallback`
 /// so the consent approval and the upstream callback can read back the pending
-/// authorization this leg wrote.
-void mountOAuthAuthorize(URLRouter router, OAuthProxy proxy, ProxyStateStore store) @safe
+/// authorization this leg wrote. A request `limit` refuses is answered 429; a
+/// null `limit` admits all. Each pending authorization records the `clientKey`
+/// of the request that started it, which `store` caps per client; a null
+/// `clientKey` records none.
+package void mountOAuthAuthorize(URLRouter router, OAuthProxy proxy, ProxyStateStore store,
+		ConsentCookie cookie, ProxyRequestLimit limit = null, ProxyClientKey clientKey = null) @safe
 {
 	auto cfg = proxy.config();
 	const authorizePath = pathOf(cfg.authorizeEndpoint());
+	const issuer = proxyIssuer(proxy);
 	const consentPath = pathOf(cfg.consentEndpoint());
 
 	router.get(authorizePath, (HTTPServerRequest req, HTTPServerResponse res) @safe {
+		if (limit !is null && !limit(req))
+			return writeRateLimited(res);
 		const codeChallenge = req.query.get("code_challenge", "");
 		const codeChallengeMethod = req.query.get("code_challenge_method", "");
 		const scope_ = req.query.get("scope", "");
@@ -373,31 +901,106 @@ void mountOAuthAuthorize(URLRouter router, OAuthProxy proxy, ProxyStateStore sto
 		const clientState = req.query.get("state", "");
 		const clientId = req.query.get("client_id", "");
 
+		// Identify the client and validate its redirect_uri first: until both are
+		// known good, an error is shown here rather than redirected (RFC 6749
+		// §4.1.2.1), so the endpoint cannot be used as an open redirector.
+		//
 		// A URL-formatted client_id selects the SEP-991 Client ID Metadata Document
 		// flow (when CIMD is enabled): the client's allowlist of redirect URIs comes
 		// from its hosted document rather than a prior DCR /register, and consent is
-		// keyed on the stable client_id URL. Otherwise this is a DCR client and the
-		// redirect_uri is validated against the registry.
+		// keyed on the stable client_id URL. Otherwise this is a DCR client, whose
+		// client_id is the shared upstream one and whose redirect_uri is validated
+		// against the registry.
+		import mcp.auth.oauth : ClientIdMetadataDocument;
+		import mcp.auth.oauth_proxy : validateClientIdMetadata;
+
 		const isCimd = cfg.clientIdMetadataDocumentSupported && isValidClientIdMetadataUrl(clientId);
+		ClientIdMetadataDocument doc;
+		if (isCimd)
+		{
+			// Fetch (SSRF-guarded) and validate the document: a bad document, a
+			// mismatched client_id, or a redirect_uri not listed in it is
+			// invalid_request, and nothing is forwarded.
+			try
+			{
+				doc = proxy.fetchClientIdMetadata(clientId);
+				validateClientIdMetadata(clientId, doc, clientRedirect);
+			}
+			catch (InvalidClientIdMetadataException)
+			{
+				res.statusCode = HTTPStatus.badRequest;
+				res.writeJsonBody(invalidRequestJson("invalid client_id metadata document"));
+				return;
+			}
+		}
+		else
+		{
+			if (clientId != cfg.upstreamClientId)
+			{
+				res.statusCode = HTTPStatus.badRequest;
+				res.writeJsonBody(invalidRequestJson("unknown client_id"));
+				return;
+			}
+			// Reject an unregistered or disallowed redirect_uri BEFORE minting any
+			// proxy state or rendering the consent screen (RFC 6749 §3.1.2.2 /
+			// §10.6, RFC 8252), so the upstream code can never be relayed to a URI
+			// the client never registered.
+			try
+				proxy.validateRedirectUri(clientRedirect);
+			catch (InvalidRedirectUriException)
+			{
+				res.statusCode = HTTPStatus.badRequest;
+				res.writeJsonBody(invalidRequestJson("invalid redirect_uri"));
+				return;
+			}
+		}
+
+		void redirectError(string error, string description) @safe
+		{
+			res.redirect(buildClientCallbackError(clientRedirect, error,
+				description, "", clientState, issuer), HTTPStatus.found);
+		}
+
+		// The proxy supports only the authorization-code grant (RFC 6749 §4.1.1).
+		const responseType = req.query.get("response_type", "");
+		if (responseType.length == 0)
+			return redirectError("invalid_request", "response_type is required");
+		if (responseType != "code")
+			return redirectError("unsupported_response_type", "response_type must be code");
 
 		// Enforce PKCE on the proxy->upstream leg. The proxy advertises S256-only
-		// support, so a missing code_challenge — or a code_challenge_method other
-		// than S256 — is refused with RFC 6749 §5.2 invalid_request rather than
-		// forwarding a non-PKCE / malformed-PKCE request upstream.
+		// support and checks S256 at /token, so a missing code_challenge — or a
+		// code_challenge_method other than S256, including an absent one (which
+		// RFC 7636 §4.3 defines as plain) — is refused with invalid_request rather
+		// than forwarding a non-PKCE / malformed-PKCE request upstream.
 		if (codeChallenge.length == 0)
-		{
-			res.statusCode = HTTPStatus.badRequest;
-			res.writeJsonBody(invalidRequestJson("code_challenge is required"));
-			return;
-		}
-		if (codeChallengeMethod.length && codeChallengeMethod != "S256")
-		{
-			res.statusCode = HTTPStatus.badRequest;
-			res.writeJsonBody(invalidRequestJson("code_challenge_method must be S256"));
-			return;
-		}
+			return redirectError("invalid_request", "code_challenge is required");
+		if (codeChallengeMethod != "S256")
+			return redirectError("invalid_request", "code_challenge_method must be S256");
 
-		void renderConsent(string clientNameForDisplay, string redirectForDisplay, string proxyState) @safe
+		// RFC 8707 §2: tokens from this proxy are only ever for its own resource.
+		const resource = req.query.get("resource", "");
+		if (resource.length && canonicalResourceUri(resource) != canonicalResourceUri(cfg.resource))
+			return redirectError("invalid_target",
+				"resource is not served by this authorization server");
+
+		try
+			cast(void) proxy.forwardedScopes(scope_);
+		catch (InvalidScopeException e)
+			return redirectError("invalid_scope", e.msg);
+
+		// Consent is recorded per browser: the consent cookie names this browser,
+		// and a browser without one is given a fresh, unguessable handle (set only
+		// if the consent screen is shown).
+		string consentSession = cookie.of(req);
+		const newConsentSession = consentSession.length == 0;
+		if (newConsentSession)
+			consentSession = cookie.mint();
+		const csrfToken = mintState();
+		const client = clientKey !is null ? clientKey(req) : "";
+
+		void renderConsent(string clientNameForDisplay,
+			string clientIdForDisplay, string redirectForDisplay, string proxyState) @safe
 		{
 			// Un-consented client: present the consent screen rather than forwarding
 			// to the upstream authorization server. The screen's approval control is a
@@ -405,72 +1008,51 @@ void mountOAuthAuthorize(URLRouter router, OAuthProxy proxy, ProxyStateStore sto
 			// than a URL, so it cannot leak via Referer/history and cannot be auto-fired
 			// by link prefetch/preload. `clientNameForDisplay` is the verified CIMD
 			// client_name (empty for a DCR client, which has no attested name).
-			res.headers["Cache-Control"] = "no-store";
-			res.headers["Referrer-Policy"] = "no-referrer";
+			setConsentPageHeaders(res);
+			if (newConsentSession)
+				cookie.set(res, consentSession);
 			res.statusCode = HTTPStatus.ok;
-			res.writeBody(consentScreenHtml(clientNameForDisplay, redirectForDisplay,
-				consentPath, proxyState), "text/html; charset=utf-8");
+			res.writeBody(consentScreenHtml(ConsentScreen(clientNameForDisplay,
+				clientIdForDisplay, redirectForDisplay,
+				consentPath, proxyState, csrfToken,
+				proxy.forwardedScopes(scope_))), "text/html; charset=utf-8");
 		}
 
 		if (isCimd)
 		{
-			// Fetch + validate the document up front (SSRF-guarded). A fetch/validation
-			// failure — bad document, mismatched client_id, or a redirect_uri not listed
-			// in the document — is RFC 6749 §5.2 invalid_request; nothing is forwarded.
-			import mcp.auth.oauth : ClientIdMetadataDocument;
-
-			ClientIdMetadataDocument doc;
-			try
-				doc = proxy.fetchClientIdMetadata(clientId);
-			catch (InvalidClientIdMetadataException)
-			{
-				res.statusCode = HTTPStatus.badRequest;
-				res.writeJsonBody(invalidRequestJson("invalid client_id metadata document"));
-				return;
-			}
-
 			const proxyState = mintState();
 			store.put(proxyState, ProxyAuthState(clientRedirect, clientState,
-				codeChallenge, scope_, clientId));
+				codeChallenge, scope_, clientId, consentSession, csrfToken, client));
 			try
 			{
-				const location = proxy.authorizeWithClientIdMetadata(clientId,
-					doc, clientRedirect, codeChallenge, scope_, proxyState);
+				const location = proxy.authorizeWithClientIdMetadata(consentSession,
+					clientId, doc, clientRedirect, codeChallenge, scope_, proxyState);
 				res.redirect(location, HTTPStatus.found);
 			}
 			catch (ConsentRequiredException)
-				renderConsent(doc.clientName, clientRedirect, proxyState);
+				renderConsent(doc.clientName, clientId, clientRedirect, proxyState);
 			catch (InvalidClientIdMetadataException)
 			{
+				bool dropped;
+				store.take(proxyState, dropped);
 				res.statusCode = HTTPStatus.badRequest;
 				res.writeJsonBody(invalidRequestJson("invalid client_id metadata document"));
 			}
-			return;
-		}
-
-		// DCR client: reject an unregistered or disallowed-scheme redirect_uri BEFORE
-		// minting any proxy state or rendering the consent screen (RFC 6749 §3.1.2.2 /
-		// §10.6, RFC 8252). Failing closed here means the upstream code can never be
-		// relayed to a URI the client never registered.
-		try
-			proxy.validateRedirectUri(clientRedirect);
-		catch (InvalidRedirectUriException)
-		{
-			res.statusCode = HTTPStatus.badRequest;
-			res.writeJsonBody(invalidRequestJson("invalid redirect_uri"));
 			return;
 		}
 
 		const proxyState = mintState();
-		store.put(proxyState, ProxyAuthState(clientRedirect, clientState, codeChallenge, scope_));
+		store.put(proxyState, ProxyAuthState(clientRedirect, clientState,
+			codeChallenge, scope_, "", consentSession, csrfToken, client));
 
 		try
 		{
-			const location = proxy.authorize(clientRedirect, codeChallenge, scope_, proxyState);
+			const location = proxy.authorize(consentSession, clientRedirect,
+				codeChallenge, scope_, proxyState);
 			res.redirect(location, HTTPStatus.found);
 		}
 		catch (ConsentRequiredException)
-			renderConsent("", clientRedirect, proxyState);
+			renderConsent("", "", clientRedirect, proxyState);
 	});
 }
 
@@ -481,21 +1063,59 @@ void mountOAuthAuthorize(URLRouter router, OAuthProxy proxy, ProxyStateStore sto
 /// re-stored under the same proxy state so the eventual upstream callback can
 /// still relay the code.
 ///
+/// The approval is honoured only when it comes from the browser that was shown
+/// the consent screen: the request must carry that browser's consent cookie and
+/// echo the pending authorization's anti-CSRF token. Anything else is refused
+/// with 403, so a cross-site form post cannot grant consent on a user's behalf,
+/// and consent is recorded for that browser only.
+///
 /// Registered as POST (not GET): granting consent is a state change, so it is
 /// driven by the consent screen's form submission. A GET cannot trigger it, which
 /// keeps link prefetch/preload from auto-firing the grant and keeps the opaque
 /// proxy state out of the URL (no Referer/history/log leakage).
 ///
 /// The `store` MUST be the one `mountOAuthAuthorize` writes to.
-void mountOAuthConsent(URLRouter router, OAuthProxy proxy, ProxyStateStore store) @safe
+package void mountOAuthConsent(URLRouter router, OAuthProxy proxy,
+		ProxyStateStore store, ConsentCookie cookie) @safe
 {
+	import mcp.auth.oauth : constantTimeEquals;
+
 	const consentPath = pathOf(proxy.config().consentEndpoint());
 	router.post(consentPath, (HTTPServerRequest req, HTTPServerResponse res) @safe {
 		const form = readFormString(req);
+		if (!formDecodes(form))
+		{
+			res.statusCode = HTTPStatus.badRequest;
+			res.writeJsonBody(invalidRequestJson("malformed form encoding or repeated parameter"));
+			return;
+		}
 		const proxyState = formField(form, "state");
 		bool found;
-		auto st = store.take(proxyState, found);
+		// Peek rather than take: a refused approval (a forged cross-site post, a
+		// missing token) must not destroy the user's pending authorization.
+		auto st = store.peek(proxyState, found);
 		if (!found || st.clientRedirectUri.length == 0)
+		{
+			res.statusCode = HTTPStatus.badRequest;
+			res.writeBody("Unknown or expired authorization state", "text/plain");
+			return;
+		}
+		const browserSession = cookie.of(req);
+		const fromSameBrowser = st.consentSession.length
+			&& constantTimeEquals(browserSession, st.consentSession);
+		const csrfOk = st.csrfToken.length && constantTimeEquals(formField(form,
+			"csrf"), st.csrfToken);
+		if (!fromSameBrowser || !csrfOk)
+		{
+			res.statusCode = HTTPStatus.forbidden;
+			res.writeBody(
+				"Consent must be approved from the browser that was shown the consent screen",
+				"text/plain");
+			return;
+		}
+		// Consume the entry now that the approval is genuine, so it is single use.
+		store.take(proxyState, found);
+		if (!found)
 		{
 			res.statusCode = HTTPStatus.badRequest;
 			res.writeBody("Unknown or expired authorization state", "text/plain");
@@ -518,16 +1138,19 @@ void mountOAuthConsent(URLRouter router, OAuthProxy proxy, ProxyStateStore store
 				res.writeJsonBody(invalidRequestJson("invalid client_id metadata document"));
 				return;
 			}
-			proxy.grantConsent(st.clientId);
+			proxy.grantConsent(st.consentSession, st.clientId, proxy.forwardedScopes(st.scope_));
 			store.put(proxyState, st);
 			try
 			{
-				const location = proxy.authorizeWithClientIdMetadata(st.clientId, doc,
-					st.clientRedirectUri, st.codeChallenge, st.scope_, proxyState);
+				const location = proxy.authorizeWithClientIdMetadata(st.consentSession,
+					st.clientId, doc, st.clientRedirectUri, st.codeChallenge,
+					st.scope_, proxyState);
 				res.redirect(location, HTTPStatus.found);
 			}
 			catch (InvalidClientIdMetadataException)
 			{
+				bool dropped;
+				store.take(proxyState, dropped);
 				res.statusCode = HTTPStatus.badRequest;
 				res.writeJsonBody(invalidRequestJson("invalid client_id metadata document"));
 			}
@@ -544,11 +1167,12 @@ void mountOAuthConsent(URLRouter router, OAuthProxy proxy, ProxyStateStore store
 			res.writeJsonBody(invalidRequestJson("invalid redirect_uri"));
 			return;
 		}
-		proxy.grantConsent(st.clientRedirectUri);
+		proxy.grantConsent(st.consentSession, st.clientRedirectUri,
+			proxy.forwardedScopes(st.scope_));
 		// Re-store the pending authorization so the upstream callback can relay it.
 		store.put(proxyState, st);
-		const location = proxy.authorize(st.clientRedirectUri,
-			st.codeChallenge, st.scope_, proxyState);
+		const location = proxy.authorize(st.consentSession,
+			st.clientRedirectUri, st.codeChallenge, st.scope_, proxyState);
 		res.redirect(location, HTTPStatus.found);
 	});
 }
@@ -557,20 +1181,63 @@ void mountOAuthConsent(URLRouter router, OAuthProxy proxy, ProxyStateStore store
 /// the proxy state in `store` and relay the upstream code straight back to the
 /// client.
 ///
+/// The callback is honoured only in the browser that consented to the client:
+/// the request must carry the consent cookie the pending authorization was
+/// started under, and that browser must hold consent for the client. Otherwise
+/// an attacker could approve their own client, hand a victim the resulting
+/// upstream authorize URL, and have the victim's code relayed to the attacker's
+/// redirect_uri. A refused callback leaves the pending authorization in place.
+///
 /// The `store` MUST be the one `mountOAuthAuthorize` writes to.
-void mountOAuthCallback(URLRouter router, OAuthProxy proxy, ProxyStateStore store) @safe
+package void mountOAuthCallback(URLRouter router, OAuthProxy proxy,
+		ProxyStateStore store, ConsentCookie cookie) @safe
 {
-	const callbackPath = proxy.config().redirectPath;
+	import mcp.auth.oauth : constantTimeEquals;
+
+	const callbackPath = pathOf(proxy.config().callbackUrl());
+	const issuer = proxyIssuer(proxy);
+	const upstreamIssuer = proxy.config().upstreamIssuer;
 	router.get(callbackPath, (HTTPServerRequest req, HTTPServerResponse res) @safe {
 		const code = req.query.get("code", "");
 		const upstreamError = req.query.get("error", "");
 		const proxyState = req.query.get("state", "");
 		bool found;
-		auto st = store.take(proxyState, found);
-		if (!found || st.clientRedirectUri.length == 0)
+		const pending = store.peek(proxyState, found);
+		if (!found || pending.clientRedirectUri.length == 0)
 		{
 			res.statusCode = HTTPStatus.badRequest;
 			res.writeBody("Unknown or expired authorization state", "text/plain");
+			return;
+		}
+		const browserSession = cookie.of(req);
+		const consentIdentity = pending.clientId.length ? pending.clientId
+			: pending.clientRedirectUri;
+		if (pending.consentSession.length == 0 || !constantTimeEquals(browserSession,
+			pending.consentSession)
+			|| !proxy.hasConsent(pending.consentSession, consentIdentity,
+			proxy.forwardedScopes(pending.scope_)))
+		{
+			res.statusCode = HTTPStatus.forbidden;
+			res.writeBody("The authorization must be completed in the browser that approved it",
+				"text/plain");
+			return;
+		}
+		auto st = store.take(proxyState, found);
+		if (!found)
+		{
+			res.statusCode = HTTPStatus.badRequest;
+			res.writeBody("Unknown or expired authorization state", "text/plain");
+			return;
+		}
+		// RFC 9207: a response naming an issuer other than the configured upstream
+		// one came from a different authorization server (a mix-up attack), so its
+		// code is never relayed.
+		const responseIssuer = req.query.get("iss", "");
+		if (upstreamIssuer.length && responseIssuer.length && responseIssuer != upstreamIssuer)
+		{
+			res.redirect(buildClientCallbackError(st.clientRedirectUri, "server_error",
+				"the authorization response came from an unexpected issuer",
+				"", st.clientState, issuer), HTTPStatus.found);
 			return;
 		}
 		// Relay an upstream authorization failure (RFC 6749 §4.1.2.1) to the client
@@ -581,11 +1248,14 @@ void mountOAuthCallback(URLRouter router, OAuthProxy proxy, ProxyStateStore stor
 			const error = upstreamError.length ? upstreamError : "access_denied";
 			const location = buildClientCallbackError(st.clientRedirectUri, error,
 				req.query.get("error_description",
-				""), req.query.get("error_uri", ""), st.clientState);
+				""), req.query.get("error_uri", ""), st.clientState, issuer);
 			res.redirect(location, HTTPStatus.found);
 			return;
 		}
-		const location = buildClientCallbackRedirect(st.clientRedirectUri, code, st.clientState);
+		proxy.recordRelayedCode(code, RelayedCodeBinding(st.codeChallenge,
+			st.clientRedirectUri, st.clientId));
+		const location = buildClientCallbackRedirect(st.clientRedirectUri,
+			code, st.clientState, issuer);
 		res.redirect(location, HTTPStatus.found);
 	});
 }
@@ -619,7 +1289,8 @@ void mountOAuthToken(URLRouter router, OAuthProxy proxy) @safe
 {
 	mountOAuthToken(router, proxy, (string endpoint, string body_,
 			string authHeader, out string responseBody, out int status) @safe {
-		exchangeUpstream(endpoint, body_, authHeader, responseBody, status);
+		exchangeUpstream(endpoint, body_, authHeader, responseBody, status,
+			proxy.config.upstreamSsrfPolicy);
 	});
 }
 
@@ -629,7 +1300,14 @@ void mountOAuthToken(URLRouter router, OAuthProxy proxy) @safe
 /// the client's code_verifier (or a relayed refresh_token) at the upstream token
 /// endpoint with the fixed credentials, relaying the upstream token response back
 /// to the client verbatim — the client presents the UPSTREAM token as its MCP
-/// bearer.
+/// bearer. A refresh grant is forwarded only for a refresh token this proxy
+/// relayed (`OAuthProxy.takeRelayedRefreshToken`); any other is refused with
+/// `invalid_grant`.
+///
+/// In both modes a 2xx upstream response that carries an OAuth `error` member
+/// (GitHub answers a bad code this way) or no `access_token` is answered as an
+/// RFC 6749 §5.2 error: 400 with the upstream `error`/`error_description`, or
+/// 502 `server_error` when the upstream names no error.
 ///
 /// In ISSUE-OWN-TOKEN (broker) mode (when the proxy's `issueToken` + `tokenStore`
 /// are set) the endpoint still exchanges upstream, but then mints the MCP
@@ -637,7 +1315,8 @@ void mountOAuthToken(URLRouter router, OAuthProxy proxy) @safe
 /// the upstream token server-side, and returns OUR token — never the upstream
 /// token. Refresh-token grants are refused with `unsupported_grant_type` in
 /// broker mode (the proxy issues non-refreshable opaque tokens), so the upstream
-/// token is never relayed to the client.
+/// token is never relayed to the client. When minting fails (the `issueToken`
+/// hook or the token store throws) the client gets a 500 `server_error`.
 ///
 /// An integrator building a spec-compliant token broker can also skip this leg
 /// and register their own `/token`, reusing `exchangeUpstream`.
@@ -648,16 +1327,41 @@ in (exchange !is null)
 	const tokenPath = pathOf(cfg.tokenEndpoint());
 	const upstreamTokenEndpoint = cfg.upstreamTokenEndpoint;
 
+	mountPostPreflight(router, tokenPath);
 	router.post(tokenPath, (HTTPServerRequest req, HTTPServerResponse res) @safe {
+		setAnyOriginCorsHeader(res);
+		// Token responses carry credentials and MUST NOT be cached (RFC 6749 §5.1).
+		res.headers["Cache-Control"] = "no-store";
+		res.headers["Pragma"] = "no-cache";
 		const form = readFormString(req);
+		if (!formDecodes(form))
+		{
+			res.statusCode = HTTPStatus.badRequest;
+			res.writeJsonBody(invalidRequestJson("malformed form encoding or repeated parameter"));
+			return;
+		}
 		// Branch on the OAuth grant the client requests. The proxy advertises both
 		// `authorization_code` and `refresh_token` in its AS metadata, so the /token
-		// endpoint MUST honour either: an authorization_code exchange (default, also
-		// when grant_type is omitted, for backward compatibility) and a
+		// endpoint MUST honour either: an authorization_code exchange and a
 		// refresh_token exchange (OAuth 2.1 §4.3), relaying the refresh token to the
-		// upstream token endpoint with the fixed upstream credentials.
+		// upstream token endpoint with the fixed upstream credentials. grant_type
+		// is required (RFC 6749 §4.1.3); any other grant is refused (§5.2).
 		const grantType = formField(form, "grant_type");
+		if (grantType.length == 0)
+		{
+			res.statusCode = HTTPStatus.badRequest;
+			res.writeJsonBody(invalidRequestJson("grant_type is required"));
+			return;
+		}
 		const isRefresh = grantType == "refresh_token";
+		if (grantType != "authorization_code" && !isRefresh)
+		{
+			Json err = Json.emptyObject;
+			err["error"] = "unsupported_grant_type";
+			res.statusCode = HTTPStatus.badRequest;
+			res.writeJsonBody(err);
+			return;
+		}
 
 		// Broker mode issues non-refreshable opaque tokens and keeps the upstream
 		// token server-side. Honouring a refresh grant here would exchange and
@@ -672,40 +1376,151 @@ in (exchange !is null)
 		}
 
 		string upstreamBody;
+		const refreshToken = isRefresh ? formField(form, "refresh_token") : "";
 		if (isRefresh)
 		{
-			const refreshToken = formField(form, "refresh_token");
+			if (!proxy.brokerEnabled() && !proxy.takeRelayedRefreshToken(refreshToken))
+			{
+				Json err = Json.emptyObject;
+				err["error"] = "invalid_grant";
+				err["error_description"] = "refresh token was not issued through this proxy";
+				res.statusCode = HTTPStatus.badRequest;
+				res.writeJsonBody(err);
+				return;
+			}
 			upstreamBody = proxy.refreshTokenForm(refreshToken);
 		}
 		else
 		{
 			const code = formField(form, "code");
 			const verifier = formField(form, "code_verifier");
+			if (!proxy.redeemCode(code, verifier, formField(form,
+				"client_id"), formField(form, "redirect_uri")))
+			{
+				Json err = Json.emptyObject;
+				err["error"] = "invalid_grant";
+				err["error_description"] = "authorization code, code_verifier, client_id or redirect_uri is invalid";
+				res.statusCode = HTTPStatus.badRequest;
+				res.writeJsonBody(err);
+				return;
+			}
 			upstreamBody = proxy.tokenForm(code, verifier);
 		}
 		const authHeader = proxy.tokenAuthHeader();
 		string responseBody;
 		int status;
-		exchange(upstreamTokenEndpoint, upstreamBody, authHeader, responseBody, status);
+		try
+			exchange(upstreamTokenEndpoint, upstreamBody, authHeader, responseBody, status);
+		catch (Exception e)
+		{
+			import vibe.core.log : logWarn;
+
+			proxy.recordRelayedRefreshToken(refreshToken);
+
+			// An SSRF refusal, connect failure or timeout: the upstream never
+			// answered, so report it as an RFC 6749 error rather than letting the
+			// exception surface as an HTML 500.
+			logWarn("/token: upstream token exchange failed: %s", e.msg);
+			Json err = Json.emptyObject;
+			err["error"] = "server_error";
+			err["error_description"] = "the upstream token endpoint could not be reached";
+			res.statusCode = HTTPStatus.badGateway;
+			res.writeJsonBody(err);
+			return;
+		}
+
+		// Some IdPs (GitHub) report a failed exchange as a 2xx with an OAuth
+		// `error` body. A 2xx that carries an error, or no access_token, is
+		// answered as an RFC 6749 §5.2 error in both modes rather than relayed
+		// or minted from.
+		const is2xx = status >= 200 && status < 300;
+		const upstreamJson = is2xx ? parseJsonBody(responseBody) : Json.undefined;
+		if (is2xx)
+		{
+			Json err;
+			HTTPStatus errStatus;
+			if (upstreamTokenError(upstreamJson, err, errStatus))
+			{
+				proxy.recordRelayedRefreshToken(refreshToken);
+				res.statusCode = errStatus;
+				res.writeJsonBody(err);
+				return;
+			}
+		}
 
 		// In broker mode, mint OUR token for the client from the upstream response
 		// and keep the upstream token server-side — the client never sees the
 		// upstream token. (Broker-mode refresh grants are already refused above.)
 		// Otherwise — passthrough mode, or a non-2xx upstream — relay the upstream
 		// body to the client verbatim.
-		if (proxy.brokerEnabled() && !isRefresh && status >= 200 && status < 300)
+		if (proxy.brokerEnabled() && !isRefresh && is2xx)
 		{
-			const upstream = TokenSet.fromJson(parseJsonBody(responseBody));
-			const brokered = proxy.issueClientToken(upstream);
+			import std.array : join;
+
+			BrokeredToken brokered;
+			try
+				brokered = proxy.issueClientToken(TokenSet.fromJson(upstreamJson));
+			catch (Exception e)
+			{
+				import vibe.core.log : logWarn;
+
+				// The integrator's issueToken hook or the token store failed; the
+				// cause stays in the log rather than reaching the client.
+				logWarn("/token: minting a client token failed: %s", e.msg);
+				Json err = Json.emptyObject;
+				err["error"] = "server_error";
+				err["error_description"] = "the access token could not be issued";
+				res.statusCode = HTTPStatus.internalServerError;
+				res.writeJsonBody(err);
+				return;
+			}
 			res.statusCode = HTTPStatus.ok;
 			res.writeJsonBody(brokerTokenResponseJson(brokered.token,
-				upstream.expiresIn, upstream.scope_));
+				brokered.expiresIn, brokered.issued.scopes.join(" ")));
 			return;
 		}
 
+		// A relayed refresh token (new, or rotated from the presented one) is
+		// remembered so the client can refresh with it; one the upstream did not
+		// rotate stays valid.
+		const relayedRefresh = is2xx ? relayedRefreshToken(responseBody) : "";
+		proxy.recordRelayedRefreshToken(relayedRefresh.length ? relayedRefresh : refreshToken);
 		res.statusCode = cast(HTTPStatus) status;
 		res.writeBody(responseBody.length ? responseBody : "{}", "application/json");
 	});
+}
+
+/// Whether a 2xx upstream token response is in fact a failure: it carries an
+/// OAuth `error` member or no `access_token`. On failure `err` is the RFC 6749
+/// §5.2 body for the client — the upstream `error` code (400) when it names
+/// one, else `server_error` (502) — and `status` its HTTP status.
+private bool upstreamTokenError(const Json upstreamJson, out Json err, out HTTPStatus status) @safe
+{
+	const isObject = upstreamJson.type == Json.Type.object;
+	const upstreamError = isObject && "error" in upstreamJson ? upstreamJson["error"]
+		: Json.undefined;
+	if (upstreamError.type == Json.Type.undefined
+			&& TokenSet.fromJson(upstreamJson).accessToken.length)
+		return false;
+	const errorCode = upstreamError.type == Json.Type.string ? upstreamError.get!string : "";
+	err = Json.emptyObject;
+	err["error"] = errorCode.length ? errorCode : "server_error";
+	if (isObject)
+		if (auto d = "error_description" in upstreamJson)
+			if (d.type == Json.Type.string)
+				err["error_description"] = *d;
+	status = errorCode.length ? HTTPStatus.badRequest : HTTPStatus.badGateway;
+	return true;
+}
+
+/// The `refresh_token` an upstream token response carries, or empty.
+private string relayedRefreshToken(string responseBody) @safe
+{
+	const j = parseJsonBody(responseBody);
+	if (j.type != Json.Type.object)
+		return "";
+	const rt = j["refresh_token"];
+	return rt.type == Json.Type.string ? rt.get!string : "";
 }
 
 // ===========================================================================
@@ -722,40 +1537,50 @@ private string pathOf(string url) @safe
 	return slash >= 0 ? rest[slash .. $] : "/";
 }
 
-/// Read the request body as JSON, distinguishing a malformed body (returns
-/// false, so the caller can reply 400) from an absent body (permitted; yields an
-/// empty object). A malformed body is logged rather than silently treated as
-/// empty, which would let an unparseable `/register` request succeed with no
-/// redirect URIs.
+/// Upper bound on a request body read by the proxy's unauthenticated endpoints
+/// (`/register`, `/consent`, `/token`). Legitimate bodies are a few hundred
+/// bytes; a larger one is refused rather than buffered.
+package enum size_t maxProxyRequestBodyBytes = 64 * 1024;
+
+/// Read the request body as JSON, distinguishing a malformed or oversized body
+/// (returns false, so the caller can reply 400) from an absent body (permitted;
+/// yields an empty object). A malformed body is logged rather than silently
+/// treated as empty, which would let an unparseable `/register` request succeed
+/// with no redirect URIs.
 private bool tryReadJsonBody(scope HTTPServerRequest req, out Json body_) @safe
 {
 	import vibe.stream.operations : readAllUTF8;
 
-	const payload = req.bodyReader.readAllUTF8();
-	if (payload.length == 0)
-	{
-		body_ = Json.emptyObject;
-		return true;
-	}
 	try
 	{
-		body_ = parseJsonString(payload);
+		const payload = req.bodyReader.readAllUTF8(false, maxProxyRequestBodyBytes);
+		if (payload.length == 0)
+		{
+			body_ = Json.emptyObject;
+			return true;
+		}
+		body_ = parseUntrustedJson(payload);
 		return true;
 	}
 	catch (Exception e)
 	{
 		import vibe.core.log : logWarn;
 
-		logWarn("/register: rejecting malformed JSON body: %s", e.msg);
+		logWarn("/register: rejecting malformed or oversized body: %s", e.msg);
 		return false;
 	}
 }
 
+/// Read an `application/x-www-form-urlencoded` request body; an oversized body
+/// reads as empty, so the handler rejects it as missing its fields.
 private string readFormString(scope HTTPServerRequest req) @safe
 {
 	import vibe.stream.operations : readAllUTF8;
 
-	return req.bodyReader.readAllUTF8();
+	try
+		return req.bodyReader.readAllUTF8(false, maxProxyRequestBodyBytes);
+	catch (Exception)
+		return "";
 }
 
 /// Parse a JSON token-response body into a `Json` object, tolerating an empty or
@@ -766,9 +1591,39 @@ private Json parseJsonBody(string payload) @safe
 	if (payload.length == 0)
 		return Json.emptyObject;
 	try
-		return parseJsonString(payload);
+		return parseUntrustedJson(payload);
 	catch (Exception)
 		return Json.emptyObject;
+}
+
+/// Whether every name and value in an `application/x-www-form-urlencoded` body
+/// percent-decodes cleanly, so `formField` cannot throw on it, and no
+/// parameter name repeats (RFC 6749 §3.1: parameters MUST NOT be included more
+/// than once).
+private bool formDecodes(string form) @safe
+{
+	import std.array : replace, split;
+	import std.uri : decodeComponent;
+
+	bool[string] seen;
+	foreach (pair; form.split("&"))
+	{
+		if (pair.length == 0)
+			continue;
+		const eq = pair.indexOf('=');
+		string name;
+		try
+		{
+			decodeComponent(pair);
+			name = decodeComponent((eq < 0 ? pair : pair[0 .. eq]).replace("+", " "));
+		}
+		catch (Exception)
+			return false;
+		if (name in seen)
+			return false;
+		seen[name] = true;
+	}
+	return true;
 }
 
 /// Extract a single field value from an `application/x-www-form-urlencoded`
@@ -786,9 +1641,7 @@ private string formField(string form, string name) @safe
 		if (pair[0 .. eq] == name) // RFC 1866 §8.2.1 and the HTML Living Standard §4.10.21.6 define
 			// '+' as a space in application/x-www-form-urlencoded values; replace
 			// it before passing to decodeComponent, which handles %xx sequences.
-			return () @trusted {
 			return decodeComponent(pair[eq + 1 .. $].replace("+", " "));
-		}();
 	}
 	return "";
 }
@@ -798,21 +1651,22 @@ private string formField(string form, string name) @safe
 /// resolved address (DNS-rebinding mitigation) and refuses an insecure transport
 /// (must be https, or http to a loopback host for dev) or an internal/link-local
 /// address, so the upstream credentials cannot be steered to a rebinding-chosen
-/// internal target. An integrator overriding `/token` can reuse this for the
-/// SSRF-pinned upstream call.
+/// internal target. `policy` is `OAuthProxyConfig.upstreamSsrfPolicy`. An
+/// integrator overriding `/token` can reuse this for the SSRF-pinned upstream
+/// call.
 void exchangeUpstream(string endpoint, string body_, string authHeader,
-		out string responseBody, out int status) @trusted
+		out string responseBody, out int status, SsrfPolicy policy = SsrfPolicy.allowLoopback) @safe
 {
 	import vibe.http.client : HTTPClientRequest, HTTPClientResponse;
 	import vibe.stream.operations : readAllUTF8;
-	import mcp.auth.oauth : secureRequestHTTP;
+	import mcp.auth.oauth : maxAuthResponseBytes, secureRequestHTTP;
 
 	// secureRequestHTTP throws on an unsafe or unresolvable host and pins the
 	// connect to the pre-vetted resolved address, so the upstream client_secret
 	// cannot be steered to a rebinding-chosen internal target.
 	int st = 502;
 	string rb;
-	secureRequestHTTP(endpoint, (scope HTTPClientRequest creq) {
+	secureRequestHTTP(endpoint, policy, (scope HTTPClientRequest creq) {
 		creq.method = HTTPMethod.POST;
 		creq.headers["Content-Type"] = "application/x-www-form-urlencoded";
 		creq.headers["Accept"] = "application/json";
@@ -821,7 +1675,7 @@ void exchangeUpstream(string endpoint, string body_, string authHeader,
 		creq.writeBody(cast(const(ubyte)[]) body_);
 	}, (scope HTTPClientResponse cres) {
 		st = cres.statusCode;
-		rb = cres.bodyReader.readAllUTF8();
+		rb = cres.bodyReader.readAllUTF8(false, maxAuthResponseBytes);
 	});
 	status = st;
 	responseBody = rb;
@@ -836,17 +1690,18 @@ unittest  // the relay redirect appends code (and state) to the client redirect_
 	import std.algorithm : canFind;
 
 	const url = buildClientCallbackRedirect("http://localhost:5000/callback",
-			"UPSTREAM-CODE", "cs-1");
+			"UPSTREAM-CODE", "cs-1", "https://mcp.example.com");
 	assert(url.startsWith("http://localhost:5000/callback?"));
 	assert(url.canFind("code=UPSTREAM-CODE"));
 	assert(url.canFind("state=cs-1"));
+	assert(url.canFind("iss=https%3A%2F%2Fmcp.example.com"));
 }
 
 unittest  // the relay redirect uses & when the client redirect_uri already has a query
 {
 	import std.algorithm : canFind;
 
-	const url = buildClientCallbackRedirect("http://localhost/cb?x=1", "C", "");
+	const url = buildClientCallbackRedirect("http://localhost/cb?x=1", "C", "", "");
 	assert(url.canFind("?x=1&code=C"));
 	// no state appended when the client supplied none
 	assert(!url.canFind("state="));
@@ -856,13 +1711,14 @@ unittest  // the error relay appends error (+ description/uri/state) to the clie
 {
 	import std.algorithm : canFind;
 
-	const url = buildClientCallbackError("http://localhost:5000/cb",
-			"access_denied", "the user said no", "https://err.example", "cs-1");
+	const url = buildClientCallbackError("http://localhost:5000/cb", "access_denied",
+			"the user said no", "https://err.example", "cs-1", "https://mcp.example.com");
 	assert(url.startsWith("http://localhost:5000/cb?"));
 	assert(url.canFind("error=access_denied"));
 	assert(url.canFind("error_description=the%20user%20said%20no"));
 	assert(url.canFind("error_uri=https"));
 	assert(url.canFind("state=cs-1"));
+	assert(url.canFind("iss=https%3A%2F%2Fmcp.example.com"));
 	// No code is relayed on an error.
 	assert(!url.canFind("code="));
 }
@@ -871,11 +1727,12 @@ unittest  // the error relay omits absent optional params and uses & with an exi
 {
 	import std.algorithm : canFind;
 
-	const url = buildClientCallbackError("http://localhost/cb?x=1", "server_error", "", "", "");
+	const url = buildClientCallbackError("http://localhost/cb?x=1", "server_error", "", "", "", "");
 	assert(url.canFind("?x=1&error=server_error"));
 	assert(!url.canFind("error_description="));
 	assert(!url.canFind("error_uri="));
 	assert(!url.canFind("state="));
+	assert(!url.canFind("iss="));
 }
 
 unittest  // redirectUrisFrom pulls the array out of a DCR request body
@@ -942,7 +1799,8 @@ unittest  // the store sweeps entries older than the TTL on the next put/take
 	import core.time : MonoTime, minutes;
 
 	auto clk = MonoTime.currTime;
-	auto store = new ProxyStateStore(10.minutes, 10_000, () @safe => clk);
+	auto store = new ProxyStateStore(ProxyStateStoreOptions(10.minutes, 10_000,
+			0, 0, () @safe => clk));
 	store.put("old", ProxyAuthState("http://localhost/cb", "s"));
 	assert(store.length == 1);
 
@@ -957,12 +1815,138 @@ unittest  // the store sweeps entries older than the TTL on the next put/take
 	assert(found);
 }
 
+unittest  // the store caps pending authorizations per consent session, dropping that session's oldest
+{
+	ProxyStateStoreOptions opts;
+	opts.maxPerConsentSession = 2;
+	auto store = new ProxyStateStore(opts);
+	ProxyAuthState st;
+	st.clientRedirectUri = "http://localhost/cb";
+	st.consentSession = "s1";
+	store.put("a", st);
+	store.put("b", st);
+	store.put("c", st);
+	st.consentSession = "s2";
+	store.put("d", st);
+	bool found;
+	store.take("a", found);
+	assert(!found);
+	foreach (k; ["b", "c", "d"])
+	{
+		store.take(k, found);
+		assert(found);
+	}
+}
+
+unittest  // RATE LIMIT: /register and /authorize refuse a client past maxRequestsPerClient per window
+{
+	OAuthProxyMountOptions opts;
+	opts.maxRequestsPerClient = 2;
+	opts.clientKey = (scope HTTPServerRequest req) @safe => req.query.get("k", "");
+	auto proxy = mountSampleProxy();
+	auto router = new URLRouter;
+	mountOAuthProxy(router, proxy, opts);
+
+	const body_ = `{"redirect_uris":["http://localhost:5000/cb"]}`;
+	assert(browserPost(router, "https://mcp.example.com/register?k=a", body_, "").status == 201);
+	assert(browserPost(router, "https://mcp.example.com/register?k=a", body_, "").status == 201);
+	assert(browserPost(router, "https://mcp.example.com/register?k=a", body_, "").status == 429);
+	const authorize = browserGet(router,
+			"https://mcp.example.com/authorize?client_id=Iv1.upstream&k=a&response_type=code"
+			~ "&code_challenge=CH&code_challenge_method=S256"
+			~ "&redirect_uri=http%3A%2F%2Flocalhost%3A5000%2Fcb&state=cs", "");
+	assert(authorize.status == 429);
+	// Another client has its own budget.
+	assert(browserPost(router, "https://mcp.example.com/register?k=b", body_, "").status == 201);
+}
+
+unittest  // the store caps pending authorizations per client, dropping that client's oldest
+{
+	ProxyStateStoreOptions opts;
+	opts.maxPerClient = 2;
+	auto store = new ProxyStateStore(opts);
+	ProxyAuthState st;
+	st.clientRedirectUri = "http://localhost/cb";
+	st.client = "c1";
+	foreach (k; ["a", "b", "c"])
+	{
+		st.consentSession = k;
+		store.put(k, st);
+	}
+	st.client = "c2";
+	store.put("d", st);
+	bool found;
+	store.take("a", found);
+	assert(!found);
+	foreach (k; ["b", "c", "d"])
+	{
+		store.take(k, found);
+		assert(found);
+	}
+}
+
+unittest  // an anonymous /authorize flood from one client does not evict another client's sign-in
+{
+	OAuthProxyMountOptions opts;
+	opts.maxRequestsPerClient = 0;
+	opts.pendingAuthorizations.maxEntries = 3;
+	opts.pendingAuthorizations.maxPerClient = 2;
+	opts.clientKey = (scope HTTPServerRequest req) @safe => req.query.get("k", "");
+	auto proxy = new OAuthProxy(consentMountConfig());
+	proxy.register(["http://localhost:5000/cb"]);
+	auto router = new URLRouter;
+	mountOAuthProxy(router, proxy, opts);
+
+	const authorize = "https://mcp.example.com/authorize?client_id=Iv1.upstream"
+		~ "&response_type=code&code_challenge_method=S256&code_challenge=CH"
+		~ "&scope=read&redirect_uri=http%3A%2F%2Flocalhost%3A5000%2Fcb&state=cs&k=";
+	const victim = browserGet(router, authorize ~ "b", "");
+	assert(hiddenField(victim.body_, "state").length > 0);
+	foreach (_; 0 .. 5)
+		assert(browserGet(router, authorize ~ "a", "").status == 200);
+
+	const approved = browserPost(router, "https://mcp.example.com/consent",
+			consentForm(victim.body_), victim.setCookie);
+	assert(approved.status == 302, approved.body_);
+}
+
+version (unittest) private HTTPServerRequest requestFrom(string from) @safe
+{
+	import vibe.core.net : resolveHost;
+	import vibe.http.server : createTestHTTPServerRequest;
+	import vibe.inet.url : URL;
+
+	auto req = createTestHTTPServerRequest(URL("https://mcp.example.com/register"));
+	req.clientAddress = resolveHost(from);
+	return req;
+}
+
+unittest  // RATE LIMIT: callers in one IPv6 /64 share a budget
+{
+	OAuthProxyMountOptions opts;
+	opts.maxRequestsPerClient = 1;
+	auto limit = proxyRequestLimit(opts);
+	assert(limit(requestFrom("2001:db8:1:2::1")));
+	assert(!limit(requestFrom("2001:db8:1:2::2")));
+	assert(limit(requestFrom("2001:db8:1:3::1")), "another /64 has its own budget");
+}
+
+unittest  // RATE LIMIT: the IPv6 bucket prefix is configurable
+{
+	OAuthProxyMountOptions opts;
+	opts.maxRequestsPerClient = 1;
+	opts.ipv6BucketPrefix = 128;
+	auto limit = proxyRequestLimit(opts);
+	assert(limit(requestFrom("2001:db8:1:2::1")));
+	assert(limit(requestFrom("2001:db8:1:2::2")));
+}
+
 unittest  // the store caps live entries, evicting the oldest by insertion time
 {
 	import core.time : MonoTime, minutes, seconds;
 
 	auto clk = MonoTime.currTime;
-	auto store = new ProxyStateStore(10.minutes, 2, () @safe => clk);
+	auto store = new ProxyStateStore(ProxyStateStoreOptions(10.minutes, 2, 0, 0, () @safe => clk));
 	store.put("a", ProxyAuthState("http://localhost/a", ""));
 	clk += 1.seconds;
 	store.put("b", ProxyAuthState("http://localhost/b", ""));
@@ -977,6 +1961,32 @@ unittest  // the store caps live entries, evicting the oldest by insertion time
 	assert(found);
 	store.take("c", found);
 	assert(found);
+}
+
+unittest  // /token rejects a repeated parameter with invalid_request (RFC 6749 §3.1)
+{
+	auto proxy = new OAuthProxy(consentMountConfig());
+	auto router = new URLRouter;
+	mountOAuthProxy(router, proxy);
+	const hit = browserPost(router, "https://mcp.example.com/token",
+			"grant_type=refresh_token&refresh_token=A&refresh_token=B", "");
+	assert(hit.status == 400);
+	assert(hit.body_.canFind(`"invalid_request"`), hit.body_);
+}
+
+unittest  // /consent rejects a repeated parameter with invalid_request
+{
+	auto proxy = new OAuthProxy(consentMountConfig());
+	proxy.register(["http://localhost:5000/cb"]);
+	auto router = new URLRouter;
+	mountOAuthProxy(router, proxy);
+	const page = browserGet(router, "https://mcp.example.com/authorize?client_id=Iv1.upstream"
+			~ "&response_type=code&code_challenge_method=S256&code_challenge=CH"
+			~ "&scope=read&redirect_uri=http%3A%2F%2Flocalhost%3A5000%2Fcb&state=cs", "");
+	const hit = browserPost(router, "https://mcp.example.com/consent",
+			consentForm(page.body_) ~ "&state=other", page.setCookie);
+	assert(hit.status == 400);
+	assert(hit.body_.canFind(`"invalid_request"`), hit.body_);
 }
 
 unittest  // formField URL-decodes a value and returns "" for an absent field
@@ -1041,6 +2051,31 @@ unittest  // mountOAuthProxy registers the full client-facing OAuth surface
 	mountOAuthProxy(router, proxy);
 }
 
+unittest  // the upstream callback route is registered on the normalized redirect path
+{
+	import vibe.http.server : createTestHTTPServerRequest,
+		createTestHTTPServerResponse, TestHTTPResponseMode;
+	import vibe.inet.url : URL;
+
+	OAuthProxyConfig cfg;
+	cfg.upstreamAuthorizationEndpoint = "https://github.com/login/oauth/authorize";
+	cfg.upstreamTokenEndpoint = "https://github.com/login/oauth/access_token";
+	cfg.upstreamClientId = "Iv1.upstream";
+	cfg.baseUrl = "https://mcp.example.com";
+	cfg.resource = "https://mcp.example.com/mcp";
+	cfg.redirectPath = "cb";
+
+	auto proxy = new OAuthProxy(cfg);
+	auto router = new URLRouter;
+	mountOAuthProxy(router, proxy);
+
+	auto res = createTestHTTPServerResponse(null, null, TestHTTPResponseMode.bodyOnly);
+	router.handleRequest(
+			createTestHTTPServerRequest(URL(cfg.callbackUrl() ~ "?state=unknown")), res);
+	// The route exists (an unknown state is a 400), rather than falling through to a 404.
+	assert(res.statusCode == 400);
+}
+
 unittest  // mintState yields unique, non-empty values
 {
 	const a = mintState();
@@ -1070,6 +2105,46 @@ unittest  // exchangeUpstream refuses a plaintext (non-loopback) upstream endpoi
 	string rb;
 	int st;
 	assertThrown(exchangeUpstream("http://upstream.example.com/token", "grant_type=x", "", rb, st));
+}
+
+unittest  // exchangeUpstream refuses an upstream response larger than maxAuthResponseBytes
+{
+	import std.array : replicate;
+	import std.conv : to;
+	import std.exception : assertThrown;
+	import mcp.auth.oauth : maxAuthResponseBytes;
+	import vibe.http.server : HTTPServerSettings, listenHTTP;
+
+	auto settings = new HTTPServerSettings;
+	settings.bindAddresses = ["127.0.0.1"];
+	settings.port = 0;
+	auto listener = listenHTTP(settings, (scope HTTPServerRequest req,
+			scope HTTPServerResponse res) @safe {
+		res.writeBody(`{"access_token":"at","pad":"` ~ "x".replicate(maxAuthResponseBytes) ~ `"}`,
+			"application/json");
+	});
+	scope (exit)
+		listener.stopListening();
+
+	string rb;
+	int st;
+	assertThrown(exchangeUpstream(
+			"http://127.0.0.1:" ~ listener.bindAddresses[0].port.to!string ~ "/token",
+			"grant_type=x", "", rb, st));
+}
+
+unittest  // /register refuses an oversized request body with 400
+{
+	import std.array : replicate;
+
+	auto proxy = mountSampleProxy();
+	auto router = new URLRouter;
+	mountOAuthRegister(router, proxy, null);
+
+	const res = browserPost(router, "https://mcp.example.com/register",
+			`{"redirect_uris":["http://localhost:5000/cb"],"pad":"` ~ "x".replicate(
+				maxProxyRequestBodyBytes) ~ `"}`, "");
+	assert(res.status == 400);
 }
 
 unittest  // exchangeUpstream fails CLOSED for an https host that cannot be resolved
@@ -1102,7 +2177,8 @@ unittest  // CONSENT SCREEN: HTML names the client redirect_uri and a POST appro
 {
 	import std.algorithm : canFind;
 
-	const html = consentScreenHtml("", "http://localhost:5000/cb", "/consent", "abc");
+	const html = consentScreenHtml(ConsentScreen("", "",
+			"http://localhost:5000/cb", "/consent", "abc", "tok"));
 	assert(html.canFind("Authorize application"));
 	assert(html.canFind("http://localhost:5000/cb"));
 	assert(html.canFind("method=\"post\""));
@@ -1114,7 +2190,8 @@ unittest  // CONSENT SCREEN: the approve control is a form POST, not a GET hyper
 {
 	import std.algorithm : canFind;
 
-	const html = consentScreenHtml("", "http://localhost:5000/cb", "/consent", "abc");
+	const html = consentScreenHtml(ConsentScreen("", "",
+			"http://localhost:5000/cb", "/consent", "abc", "tok"));
 	// No hyperlink that link prefetch/preload could auto-fire as a GET grant, and the
 	// opaque state is in a hidden field rather than a URL that could leak.
 	assert(!html.canFind("<a href"));
@@ -1125,7 +2202,8 @@ unittest  // CONSENT SCREEN: the untrusted client redirect_uri and proxy state a
 {
 	import std.algorithm : canFind;
 
-	const html = consentScreenHtml("", `http://x/cb?a=1&b="<script>`, "/consent", `"><b>`);
+	const html = consentScreenHtml(ConsentScreen("", "",
+			`http://x/cb?a=1&b="<script>`, "/consent", `"><b>`, "tok"));
 	assert(html.canFind("&amp;"));
 	assert(html.canFind("&lt;script&gt;"));
 	assert(html.canFind("&quot;"));
@@ -1138,17 +2216,84 @@ unittest  // CONSENT SCREEN: a CIMD client_name is displayed (verified identity)
 {
 	import std.algorithm : canFind;
 
-	const html = consentScreenHtml(`Acme <Client>`, "http://localhost:5000/cb", "/consent", "abc");
+	const html = consentScreenHtml(ConsentScreen(`Acme <Client>`, "",
+			"http://localhost:5000/cb", "/consent", "abc", "tok"));
 	// The verified client_name from the metadata document is surfaced to the user.
 	assert(html.canFind("Acme &lt;Client&gt;"));
 	assert(!html.canFind("<Client>"));
+}
+
+unittest  // CONSENT SCREEN: a CIMD client shows its client_id host beside the self-asserted name
+{
+	import std.algorithm : canFind;
+
+	ConsentScreen s;
+	s.clientName = "Totally Legit Bank";
+	s.clientId = "https://evil.example/oauth/client.json";
+	s.clientRedirectUri = "http://localhost:5000/cb";
+	s.consentPath = "/consent";
+	s.proxyState = "abc";
+	s.csrfToken = "tok";
+	const html = consentScreenHtml(s);
+	assert(html.canFind("Totally Legit Bank"));
+	assert(html.canFind("evil.example"), "the client_id host must be shown");
+}
+
+unittest  // CONSENT SCREEN: the requested scopes are listed, HTML-escaped
+{
+	import std.algorithm : canFind;
+
+	ConsentScreen s;
+	s.clientRedirectUri = "http://localhost:5000/cb";
+	s.scopes = ["read:user", "<repo>"];
+	s.consentPath = "/consent";
+	const html = consentScreenHtml(s);
+	assert(html.canFind("read:user"));
+	assert(html.canFind("&lt;repo&gt;"));
+	assert(!html.canFind("<repo>"));
+}
+
+unittest  // CONSENT: a consented browser asking for broader scopes sees the consent screen again
+{
+	import vibe.http.server : createTestHTTPServerRequest,
+		createTestHTTPServerResponse, TestHTTPResponseMode;
+	import vibe.inet.url : URL;
+	import vibe.stream.memory : createMemoryOutputStream;
+
+	OAuthProxyConfig cfg;
+	cfg.upstreamAuthorizationEndpoint = "https://github.com/login/oauth/authorize";
+	cfg.upstreamTokenEndpoint = "https://github.com/login/oauth/access_token";
+	cfg.upstreamClientId = "Iv1.upstream";
+	cfg.baseUrl = "https://mcp.example.com";
+	cfg.resource = "https://mcp.example.com/mcp";
+	cfg.scopesSupported = ["read", "write"];
+
+	auto proxy = new OAuthProxy(cfg);
+	proxy.register(["http://localhost:5000/cb"]);
+	proxy.grantConsent(browser1, "http://localhost:5000/cb", ["read"]);
+	auto router = new URLRouter;
+	mountOAuthProxy(router, proxy, testMountOptions());
+
+	int statusFor(string scope_) @safe
+	{
+		auto sink = createMemoryOutputStream();
+		auto req = createTestHTTPServerRequest(URL("https://mcp.example.com/authorize?client_id=Iv1.upstream&response_type=code&code_challenge_method=S256&code_challenge=CH&scope=" ~ scope_ ~ "&redirect_uri=http%3A%2F%2Flocalhost%3A5000%2Fcb&state=cs"));
+		req.headers["Cookie"] = consentCookieName ~ "=" ~ browser1;
+		auto res = createTestHTTPServerResponse(sink, null, TestHTTPResponseMode.bodyOnly);
+		router.handleRequest(req, res);
+		return res.statusCode;
+	}
+
+	assert(statusFor("read") == 302);
+	assert(statusFor("read%20write") == 200, "a broader request must re-prompt for consent");
 }
 
 unittest  // CONSENT SCREEN: an empty client_name (DCR client) renders no name section
 {
 	import std.algorithm : canFind;
 
-	const html = consentScreenHtml("", "http://localhost:5000/cb", "/consent", "abc");
+	const html = consentScreenHtml(ConsentScreen("", "",
+			"http://localhost:5000/cb", "/consent", "abc", "tok"));
 	// The redirect_uri is still shown; there is no empty "Application:" label.
 	assert(html.canFind("http://localhost:5000/cb"));
 	assert(!html.canFind("Application:"));
@@ -1177,7 +2322,7 @@ unittest  // CONFUSED DEPUTY: an un-consented client gets the consent screen, NO
 	mountOAuthProxy(router, proxy);
 
 	auto sink = createMemoryOutputStream();
-	auto req = createTestHTTPServerRequest(URL("https://mcp.example.com/authorize?code_challenge=CH&scope=read&redirect_uri=http%3A%2F%2Flocalhost%3A5000%2Fcb&state=cs"));
+	auto req = createTestHTTPServerRequest(URL("https://mcp.example.com/authorize?client_id=Iv1.upstream&response_type=code&code_challenge_method=S256&code_challenge=CH&scope=read&redirect_uri=http%3A%2F%2Flocalhost%3A5000%2Fcb&state=cs"));
 	auto res = createTestHTTPServerResponse(sink, null, TestHTTPResponseMode.bodyOnly);
 	router.handleRequest(req, res);
 
@@ -1186,62 +2331,314 @@ unittest  // CONFUSED DEPUTY: an un-consented client gets the consent screen, NO
 	assert(body_.canFind("Authorize application"));
 	assert(body_.canFind("http://localhost:5000/cb"));
 	// The client has NOT been forwarded upstream yet.
-	assert(!proxy.hasConsent("http://localhost:5000/cb"));
+	assert(res.statusCode != 302);
 }
 
 unittest  // CONFUSED DEPUTY: after the user approves, POST /consent records consent + 302s upstream
 {
-	import std.algorithm : canFind, startsWith;
-	import vibe.http.server : createTestHTTPServerRequest,
-		createTestHTTPServerResponse, TestHTTPResponseMode;
-	import vibe.http.common : HTTPMethod;
-	import vibe.inet.url : URL;
-	import vibe.stream.memory : createMemoryOutputStream, createMemoryStream;
-
-	OAuthProxyConfig cfg;
-	cfg.upstreamAuthorizationEndpoint = "https://github.com/login/oauth/authorize";
-	cfg.upstreamTokenEndpoint = "https://github.com/login/oauth/access_token";
-	cfg.upstreamClientId = "Iv1.upstream";
-	cfg.baseUrl = "https://mcp.example.com";
-	cfg.resource = "https://mcp.example.com/mcp";
-
-	auto proxy = new OAuthProxy(cfg);
+	auto proxy = new OAuthProxy(consentMountConfig());
 	proxy.register(["http://localhost:5000/cb"]);
 	auto router = new URLRouter;
 	mountOAuthProxy(router, proxy);
 
-	// 1) /authorize renders the consent screen and stashes the pending auth under a
-	//    proxy state we can read back from the form's hidden state field.
-	auto sink = createMemoryOutputStream();
-	auto req = createTestHTTPServerRequest(URL("https://mcp.example.com/authorize?code_challenge=CH&scope=read&redirect_uri=http%3A%2F%2Flocalhost%3A5000%2Fcb&state=cs"));
-	auto res = createTestHTTPServerResponse(sink, null, TestHTTPResponseMode.bodyOnly);
-	router.handleRequest(req, res);
-	const html = () @trusted { return cast(string) sink.data; }();
+	// 1) /authorize renders the consent screen, stashing the pending auth under the
+	//    proxy state carried in the form, and sets this browser's consent cookie.
+	const page = browserGet(router, "https://mcp.example.com/authorize?client_id=Iv1.upstream&response_type=code&code_challenge_method=S256&code_challenge=CH" ~ "&scope=read&redirect_uri=http%3A%2F%2Flocalhost%3A5000%2Fcb&state=cs",
+			"");
+	assert(hiddenField(page.body_, "state").length > 0);
+	assert(page.setCookie.length > 0);
 
-	// Extract the hidden state value (name="state" value="...").
-	import std.string : indexOf;
+	// 2) POSTing the form from the same browser grants consent and 302s upstream.
+	const approved = browserPost(router, "https://mcp.example.com/consent",
+			consentForm(page.body_), page.setCookie);
+	assert(proxy.hasConsent(page.setCookie, "http://localhost:5000/cb", ["read"]));
+	assert(approved.status == 302);
+	assert(approved.location.startsWith("https://github.com/login/oauth/authorize?"));
+	assert(approved.location.canFind("client_id=Iv1.upstream"));
+	assert(approved.location.canFind("code_challenge=CH"));
+}
 
-	const stateMark = `name="state" value="`;
-	const hi = html.indexOf(stateMark);
-	assert(hi >= 0);
-	const rest = html[hi + stateMark.length .. $];
-	const close = rest.indexOf('"');
-	const proxyState = rest[0 .. close];
-	assert(proxyState.length > 0);
+version (unittest)
+{
+	import std.algorithm : canFind;
 
-	// 2) POSTing the form to /consent grants consent and 302s to the upstream authorize.
-	auto res2 = createTestHTTPServerResponse(null, null, TestHTTPResponseMode.bodyOnly);
-	auto formBody = () @trusted { return cast(ubyte[])("state=" ~ proxyState).dup; }();
-	auto req2 = createTestHTTPServerRequest(URL("https://mcp.example.com/consent"),
-			HTTPMethod.POST, createMemoryStream(formBody, false));
-	req2.headers["Content-Type"] = "application/x-www-form-urlencoded";
-	router.handleRequest(req2, res2);
+	private OAuthProxyConfig consentMountConfig() @safe
+	{
+		OAuthProxyConfig cfg;
+		cfg.upstreamAuthorizationEndpoint = "https://github.com/login/oauth/authorize";
+		cfg.upstreamTokenEndpoint = "https://github.com/login/oauth/access_token";
+		cfg.upstreamClientId = "Iv1.upstream";
+		cfg.baseUrl = "https://mcp.example.com";
+		cfg.resource = "https://mcp.example.com/mcp";
+		return cfg;
+	}
 
-	assert(proxy.hasConsent("http://localhost:5000/cb"));
-	assert(res2.statusCode == 302);
-	assert(res2.headers["Location"].startsWith("https://github.com/login/oauth/authorize?"));
-	assert(res2.headers["Location"].canFind("client_id=Iv1.upstream"));
-	assert(res2.headers["Location"].canFind("code_challenge=CH"));
+	/// The outcome of one browser request against the mounted proxy.
+	private struct BrowserHit
+	{
+		int status;
+		string location;
+		string body_;
+		string setCookie; /// the consent-session cookie value set by the response, if any
+		string xFrameOptions;
+		string csp;
+	}
+
+	private BrowserHit browserGet(URLRouter router, string url, string cookie) @safe
+	{
+		import vibe.http.server : createTestHTTPServerRequest,
+			createTestHTTPServerResponse, TestHTTPResponseMode;
+		import vibe.inet.url : URL;
+		import vibe.stream.memory : createMemoryOutputStream;
+
+		auto sink = createMemoryOutputStream();
+		auto req = createTestHTTPServerRequest(URL(url));
+		if (cookie.length)
+			req.headers["Cookie"] = consentCookieName ~ "=" ~ cookie;
+		auto res = createTestHTTPServerResponse(sink, null, TestHTTPResponseMode.bodyOnly);
+		router.handleRequest(req, res);
+		return browserHitOf(res, () @trusted { return cast(string) sink.data; }());
+	}
+
+	private BrowserHit browserPost(URLRouter router, string url, string form, string cookie) @safe
+	{
+		import vibe.http.common : HTTPMethod;
+		import vibe.http.server : createTestHTTPServerRequest,
+			createTestHTTPServerResponse, TestHTTPResponseMode;
+		import vibe.inet.url : URL;
+		import vibe.stream.memory : createMemoryOutputStream, createMemoryStream;
+
+		auto formBody = cast(ubyte[]) form.dup;
+		auto req = createTestHTTPServerRequest(URL(url), HTTPMethod.POST,
+				createMemoryStream(formBody, false));
+		req.headers["Content-Type"] = "application/x-www-form-urlencoded";
+		if (cookie.length)
+			req.headers["Cookie"] = consentCookieName ~ "=" ~ cookie;
+		auto sink = createMemoryOutputStream();
+		auto res = createTestHTTPServerResponse(sink, null, TestHTTPResponseMode.bodyOnly);
+		router.handleRequest(req, res);
+		return browserHitOf(res, () @trusted { return cast(string) sink.data; }());
+	}
+
+	private BrowserHit browserHitOf(HTTPServerResponse res, string body_) @safe
+	{
+		BrowserHit h;
+		h.status = res.statusCode;
+		h.location = res.headers.get("Location", "");
+		h.body_ = body_;
+		h.xFrameOptions = res.headers.get("X-Frame-Options", "");
+		h.csp = res.headers.get("Content-Security-Policy", "");
+		if (auto c = consentCookieName in res.cookies)
+			h.setCookie = c.value;
+		return h;
+	}
+
+	/// Read a hidden form field's value out of the consent screen HTML.
+	private string hiddenField(string html, string name) @safe
+	{
+		import std.string : indexOf;
+
+		const mark = `name="` ~ name ~ `" value="`;
+		const i = html.indexOf(mark);
+		if (i < 0)
+			return "";
+		const rest = html[i + mark.length .. $];
+		return rest[0 .. rest.indexOf('"')];
+	}
+
+	private string consentForm(string html) @safe
+	{
+		return "state=" ~ encodeComponent(hiddenField(html,
+				"state")) ~ "&csrf=" ~ encodeComponent(hiddenField(html, "csrf"));
+	}
+}
+
+unittest  // CONSENT BINDING: one browser's approval does not let another browser skip the consent screen
+{
+	auto proxy = new OAuthProxy(consentMountConfig());
+	// The attacker registers their own redirect_uri and approves it in their browser.
+	proxy.register(["https://evil.example/cb"]);
+	auto router = new URLRouter;
+	mountOAuthProxy(router, proxy);
+
+	const authorizeUrl = "https://mcp.example.com/authorize?client_id=Iv1.upstream&response_type=code&code_challenge_method=S256&code_challenge=ATTACKER" ~ "&redirect_uri=https%3A%2F%2Fevil.example%2Fcb&state=x";
+	const attackerPage = browserGet(router, authorizeUrl, "");
+	assert(attackerPage.body_.canFind("Authorize application"));
+	const approved = browserPost(router, "https://mcp.example.com/consent",
+			consentForm(attackerPage.body_), attackerPage.setCookie);
+	assert(approved.status == 302);
+
+	// A victim lured to the same /authorize URL, with no consent of their own, is
+	// shown the consent screen rather than being forwarded upstream.
+	const victim = browserGet(router, authorizeUrl, "");
+	assert(victim.status != 302);
+	assert(victim.body_.canFind("Authorize application"));
+
+	// Nor does presenting some other browser's session cookie value help.
+	const other = browserGet(router, authorizeUrl, "victim-session");
+	assert(other.status != 302);
+}
+
+version (unittest)
+{
+	private immutable(ubyte)[] testCookieKey() @safe
+	{
+		return cast(immutable(ubyte)[]) "test consent cookie key";
+	}
+
+	// The consent cookie the test mounts sign with.
+	private ConsentCookie testCookie() @safe
+	{
+		return ConsentCookie(testCookieKey, true);
+	}
+
+	private OAuthProxyMountOptions testMountOptions() @safe
+	{
+		OAuthProxyMountOptions opts;
+		opts.consentCookieKey = testCookieKey;
+		return opts;
+	}
+
+	// A browser's consent cookie value, valid under the test mounts.
+	private string browser1() @safe
+	{
+		return testCookie.sign("browser-1");
+	}
+}
+
+unittest  // CONSENT COOKIE: a planted cookie value the proxy never minted is ignored
+{
+	auto proxy = new OAuthProxy(consentMountConfig());
+	proxy.register(["http://localhost:5000/cb"]);
+	proxy.grantConsent("planted", "http://localhost:5000/cb", ["read"]);
+	auto router = new URLRouter;
+	mountOAuthProxy(router, proxy);
+
+	const hit = browserGet(router, "https://mcp.example.com/authorize?client_id=Iv1.upstream"
+			~ "&response_type=code&code_challenge_method=S256&code_challenge=CH"
+			~ "&scope=read&redirect_uri=http%3A%2F%2Flocalhost%3A5000%2Fcb&state=cs", "planted");
+	assert(hit.status == 200, "consent recorded under a planted value must not be honoured");
+	assert(hit.setCookie.length && hit.setCookie != "planted");
+}
+
+unittest  // CONSENT COOKIE: a configured signing key keeps consent cookies valid across mounts
+{
+	OAuthProxyMountOptions opts;
+	opts.consentCookieKey = cast(immutable(ubyte)[]) "a stable consent cookie key";
+	auto proxy = new OAuthProxy(consentMountConfig());
+	proxy.register(["http://localhost:5000/cb"]);
+	const authorizeUrl = "https://mcp.example.com/authorize?client_id=Iv1.upstream"
+		~ "&response_type=code&code_challenge_method=S256&code_challenge=CH"
+		~ "&scope=read&redirect_uri=http%3A%2F%2Flocalhost%3A5000%2Fcb&state=cs";
+
+	auto first = new URLRouter;
+	mountOAuthProxy(first, proxy, opts);
+	const page = browserGet(first, authorizeUrl, "");
+	assert(browserPost(first, "https://mcp.example.com/consent",
+			consentForm(page.body_), page.setCookie).status == 302);
+
+	auto restarted = new URLRouter;
+	mountOAuthProxy(restarted, proxy, opts);
+	assert(browserGet(restarted, authorizeUrl, page.setCookie).status == 302);
+}
+
+unittest  // CONSENT BINDING: the approving browser skips the consent screen on its next authorization
+{
+	auto proxy = new OAuthProxy(consentMountConfig());
+	proxy.register(["http://localhost:5000/cb"]);
+	auto router = new URLRouter;
+	mountOAuthProxy(router, proxy);
+
+	const authorizeUrl = "https://mcp.example.com/authorize?client_id=Iv1.upstream&response_type=code&code_challenge_method=S256&code_challenge=CH" ~ "&redirect_uri=http%3A%2F%2Flocalhost%3A5000%2Fcb&state=cs";
+	const page = browserGet(router, authorizeUrl, "");
+	assert(page.setCookie.length);
+	assert(browserPost(router, "https://mcp.example.com/consent",
+			consentForm(page.body_), page.setCookie).status == 302);
+
+	const again = browserGet(router, authorizeUrl, page.setCookie);
+	assert(again.status == 302);
+	assert(again.location.startsWith("https://github.com/login/oauth/authorize?"));
+}
+
+unittest  // CONSENT CSRF: a POST /consent from a browser other than the one shown the screen is refused
+{
+	auto proxy = new OAuthProxy(consentMountConfig());
+	proxy.register(["http://localhost:5000/cb"]);
+	auto router = new URLRouter;
+	mountOAuthProxy(router, proxy);
+
+	const page = browserGet(router, "https://mcp.example.com/authorize?client_id=Iv1.upstream&response_type=code&code_challenge_method=S256&code_challenge=CH" ~ "&redirect_uri=http%3A%2F%2Flocalhost%3A5000%2Fcb&state=cs",
+			"");
+	// A cross-site form auto-submitted from the victim's browser carries the
+	// victim's cookie (or none), not the one bound to this pending authorization.
+	const forged = browserPost(router, "https://mcp.example.com/consent",
+			consentForm(page.body_), "");
+	assert(forged.status == 403);
+	assert(forged.location.length == 0);
+}
+
+unittest  // CONSENT CSRF: a POST /consent without the anti-CSRF token is refused
+{
+	auto proxy = new OAuthProxy(consentMountConfig());
+	proxy.register(["http://localhost:5000/cb"]);
+	auto router = new URLRouter;
+	mountOAuthProxy(router, proxy);
+
+	const page = browserGet(router, "https://mcp.example.com/authorize?client_id=Iv1.upstream&response_type=code&code_challenge_method=S256&code_challenge=CH" ~ "&redirect_uri=http%3A%2F%2Flocalhost%3A5000%2Fcb&state=cs",
+			"");
+	const noToken = browserPost(router, "https://mcp.example.com/consent",
+			"state=" ~ encodeComponent(hiddenField(page.body_, "state")), page.setCookie);
+	assert(noToken.status == 403);
+}
+
+unittest  // CONSENT CSRF: a refused POST /consent leaves the pending authorization intact
+{
+	auto proxy = new OAuthProxy(consentMountConfig());
+	proxy.register(["http://localhost:5000/cb"]);
+	auto router = new URLRouter;
+	mountOAuthProxy(router, proxy);
+
+	const page = browserGet(router, "https://mcp.example.com/authorize?client_id=Iv1.upstream&response_type=code&code_challenge_method=S256&code_challenge=CH" ~ "&redirect_uri=http%3A%2F%2Flocalhost%3A5000%2Fcb&state=cs",
+			"");
+	// A forged cross-site post (no consent cookie) and one missing the token.
+	assert(browserPost(router, "https://mcp.example.com/consent",
+			consentForm(page.body_), "").status == 403);
+	assert(browserPost(router, "https://mcp.example.com/consent",
+			"state=" ~ encodeComponent(hiddenField(page.body_, "state")), page.setCookie).status
+			== 403);
+
+	// The real user's approval still completes the flow.
+	const approved = browserPost(router, "https://mcp.example.com/consent",
+			consentForm(page.body_), page.setCookie);
+	assert(approved.status == 302);
+	assert(approved.location.startsWith("https://github.com/login/oauth/authorize?"));
+}
+
+unittest  // /consent answers a malformed percent-encoding with a 400 JSON invalid_request
+{
+	import vibe.data.json : parseJsonString;
+
+	auto proxy = new OAuthProxy(consentMountConfig());
+	proxy.register(["http://localhost:5000/cb"]);
+	auto router = new URLRouter;
+	mountOAuthProxy(router, proxy);
+
+	const res = browserPost(router, "https://mcp.example.com/consent", "state=%zz&csrf=x", "");
+	assert(res.status == 400);
+	assert(parseJsonString(res.body_)["error"].get!string == "invalid_request");
+}
+
+unittest  // CONSENT HARDENING: the consent screen cannot be framed (clickjacking)
+{
+	auto proxy = new OAuthProxy(consentMountConfig());
+	proxy.register(["http://localhost:5000/cb"]);
+	auto router = new URLRouter;
+	mountOAuthProxy(router, proxy);
+
+	const page = browserGet(router, "https://mcp.example.com/authorize?client_id=Iv1.upstream&response_type=code&code_challenge_method=S256&code_challenge=CH" ~ "&redirect_uri=http%3A%2F%2Flocalhost%3A5000%2Fcb&state=cs",
+			"");
+	assert(page.xFrameOptions == "DENY");
+	assert(page.csp.canFind("frame-ancestors 'none'"));
 }
 
 unittest  // CONSENT HARDENING: a GET to /consent cannot grant consent (no auto-fire by prefetch)
@@ -1265,7 +2662,7 @@ unittest  // CONSENT HARDENING: a GET to /consent cannot grant consent (no auto-
 
 	// Drive /authorize to mint a proxy state and stash the pending authorization.
 	auto sink = createMemoryOutputStream();
-	auto req = createTestHTTPServerRequest(URL("https://mcp.example.com/authorize?code_challenge=CH&scope=read&redirect_uri=http%3A%2F%2Flocalhost%3A5000%2Fcb&state=cs"));
+	auto req = createTestHTTPServerRequest(URL("https://mcp.example.com/authorize?client_id=Iv1.upstream&response_type=code&code_challenge_method=S256&code_challenge=CH&scope=read&redirect_uri=http%3A%2F%2Flocalhost%3A5000%2Fcb&state=cs"));
 	auto res = createTestHTTPServerResponse(sink, null, TestHTTPResponseMode.bodyOnly);
 	router.handleRequest(req, res);
 	const html = () @trusted { return cast(string) sink.data; }();
@@ -1286,7 +2683,8 @@ unittest  // CONSENT HARDENING: a GET to /consent cannot grant consent (no auto-
 			URL("https://mcp.example.com/consent?state=" ~ proxyState));
 	router.handleRequest(req2, res2);
 
-	assert(!proxy.hasConsent("http://localhost:5000/cb"));
+	assert(!proxy.hasConsent(res.cookies[consentCookieName].value,
+			"http://localhost:5000/cb", ["read"]));
 }
 
 unittest  // CONSENT HARDENING: the consent screen sets no-store + no-referrer headers
@@ -1309,7 +2707,7 @@ unittest  // CONSENT HARDENING: the consent screen sets no-store + no-referrer h
 	mountOAuthProxy(router, proxy);
 
 	auto sink = createMemoryOutputStream();
-	auto req = createTestHTTPServerRequest(URL("https://mcp.example.com/authorize?code_challenge=CH&scope=read&redirect_uri=http%3A%2F%2Flocalhost%3A5000%2Fcb&state=cs"));
+	auto req = createTestHTTPServerRequest(URL("https://mcp.example.com/authorize?client_id=Iv1.upstream&response_type=code&code_challenge_method=S256&code_challenge=CH&scope=read&redirect_uri=http%3A%2F%2Flocalhost%3A5000%2Fcb&state=cs"));
 	auto res = createTestHTTPServerResponse(sink, null, TestHTTPResponseMode.bodyOnly);
 	router.handleRequest(req, res);
 
@@ -1334,13 +2732,14 @@ unittest  // UPSTREAM ERROR: /callback relays an upstream error to the client, n
 
 	auto proxy = new OAuthProxy(cfg);
 	proxy.register(["http://localhost:5000/cb"]);
-	proxy.grantConsent("http://localhost:5000/cb");
+	proxy.grantConsent(browser1, "http://localhost:5000/cb", ["read"]);
 	auto router = new URLRouter;
-	mountOAuthProxy(router, proxy);
+	mountOAuthProxy(router, proxy, testMountOptions());
 
 	// Drive /authorize to mint a proxy state and stash the pending authorization.
 	auto sink = createMemoryOutputStream();
-	auto req = createTestHTTPServerRequest(URL("https://mcp.example.com/authorize?code_challenge=CH&scope=read&redirect_uri=http%3A%2F%2Flocalhost%3A5000%2Fcb&state=cs"));
+	auto req = createTestHTTPServerRequest(URL("https://mcp.example.com/authorize?client_id=Iv1.upstream&response_type=code&code_challenge_method=S256&code_challenge=CH&scope=read&redirect_uri=http%3A%2F%2Flocalhost%3A5000%2Fcb&state=cs"));
+	req.headers["Cookie"] = consentCookieName ~ "=" ~ browser1;
 	auto res = createTestHTTPServerResponse(sink, null, TestHTTPResponseMode.bodyOnly);
 	router.handleRequest(req, res);
 	assert(res.statusCode == 302);
@@ -1357,6 +2756,7 @@ unittest  // UPSTREAM ERROR: /callback relays an upstream error to the client, n
 	// The upstream redirects back with an error and no code.
 	auto res2 = createTestHTTPServerResponse(null, null, TestHTTPResponseMode.bodyOnly);
 	auto req2 = createTestHTTPServerRequest(URL("https://mcp.example.com/auth/callback?error=access_denied&error_description=denied&state=" ~ proxyState));
+	req2.headers["Cookie"] = consentCookieName ~ "=" ~ browser1;
 	router.handleRequest(req2, res2);
 
 	assert(res2.statusCode == 302);
@@ -1413,14 +2813,18 @@ unittest  // CIMD MOUNT: /authorize with a URL client_id + prior consent 302s up
 
 	auto proxy = cimdProxyWithStubDoc(cimdMountConfig(), cimdMountDoc());
 	// Consent is keyed on the stable client_id URL for CIMD clients.
-	proxy.grantConsent("https://app.example.com/oauth/client.json");
+	proxy.grantConsent(browser1, "https://app.example.com/oauth/client.json", [
+		"read"
+	]);
 	auto router = new URLRouter;
-	mountOAuthProxy(router, proxy);
+	mountOAuthProxy(router, proxy, testMountOptions());
 
 	auto sink = createMemoryOutputStream();
-	auto req = createTestHTTPServerRequest(URL("https://mcp.example.com/authorize?"
+	auto req = createTestHTTPServerRequest(
+			URL("https://mcp.example.com/authorize?response_type=code&code_challenge_method=S256&"
 			~ "client_id=https%3A%2F%2Fapp.example.com%2Foauth%2Fclient.json"
 			~ "&code_challenge=CH&scope=read&redirect_uri=http%3A%2F%2F127.0.0.1%3A8765%2Fcb&state=cs"));
+	req.headers["Cookie"] = consentCookieName ~ "=" ~ browser1;
 	auto res = createTestHTTPServerResponse(sink, null, TestHTTPResponseMode.bodyOnly);
 	router.handleRequest(req, res);
 
@@ -1442,7 +2846,8 @@ unittest  // CIMD MOUNT: /authorize with a URL client_id and no consent renders 
 	mountOAuthProxy(router, proxy);
 
 	auto sink = createMemoryOutputStream();
-	auto req = createTestHTTPServerRequest(URL("https://mcp.example.com/authorize?"
+	auto req = createTestHTTPServerRequest(
+			URL("https://mcp.example.com/authorize?response_type=code&code_challenge_method=S256&"
 			~ "client_id=https%3A%2F%2Fapp.example.com%2Foauth%2Fclient.json"
 			~ "&code_challenge=CH&scope=read&redirect_uri=http%3A%2F%2F127.0.0.1%3A8765%2Fcb&state=cs"));
 	auto res = createTestHTTPServerResponse(sink, null, TestHTTPResponseMode.bodyOnly);
@@ -1453,48 +2858,29 @@ unittest  // CIMD MOUNT: /authorize with a URL client_id and no consent renders 
 	assert(body_.canFind("http://127.0.0.1:8765/cb"));
 	// The verified client_name from the metadata document is shown to the user.
 	assert(body_.canFind("Example MCP Client"));
-	assert(!proxy.hasConsent("https://app.example.com/oauth/client.json"));
+	assert(res.statusCode != 302);
 }
 
 unittest  // CIMD MOUNT: POST /consent for a CIMD client grants consent on the client_id URL + 302s upstream
 {
-	import std.algorithm : canFind, startsWith;
-	import std.string : indexOf;
-	import vibe.http.common : HTTPMethod;
-	import vibe.http.server : createTestHTTPServerRequest,
-		createTestHTTPServerResponse, TestHTTPResponseMode;
-	import vibe.inet.url : URL;
-	import vibe.stream.memory : createMemoryOutputStream, createMemoryStream;
-
 	auto proxy = cimdProxyWithStubDoc(cimdMountConfig(), cimdMountDoc());
 	auto router = new URLRouter;
 	mountOAuthProxy(router, proxy);
 
-	auto sink = createMemoryOutputStream();
-	auto req = createTestHTTPServerRequest(URL("https://mcp.example.com/authorize?"
+	const page = browserGet(router,
+			"https://mcp.example.com/authorize?response_type=code&code_challenge_method=S256&"
 			~ "client_id=https%3A%2F%2Fapp.example.com%2Foauth%2Fclient.json"
-			~ "&code_challenge=CH&scope=read&redirect_uri=http%3A%2F%2F127.0.0.1%3A8765%2Fcb&state=cs"));
-	auto res = createTestHTTPServerResponse(sink, null, TestHTTPResponseMode.bodyOnly);
-	router.handleRequest(req, res);
-	const html = () @trusted { return cast(string) sink.data; }();
+			~ "&code_challenge=CH&scope=read&redirect_uri=http%3A%2F%2F127.0.0.1%3A8765%2Fcb&state=cs",
+			"");
+	const approved = browserPost(router, "https://mcp.example.com/consent",
+			consentForm(page.body_), page.setCookie);
 
-	const stateMark = `name="state" value="`;
-	const hi = html.indexOf(stateMark);
-	assert(hi >= 0);
-	const rest = html[hi + stateMark.length .. $];
-	const proxyState = rest[0 .. rest.indexOf('"')];
-
-	auto res2 = createTestHTTPServerResponse(null, null, TestHTTPResponseMode.bodyOnly);
-	auto formBody = () @trusted { return cast(ubyte[])("state=" ~ proxyState).dup; }();
-	auto req2 = createTestHTTPServerRequest(URL("https://mcp.example.com/consent"),
-			HTTPMethod.POST, createMemoryStream(formBody, false));
-	req2.headers["Content-Type"] = "application/x-www-form-urlencoded";
-	router.handleRequest(req2, res2);
-
-	assert(proxy.hasConsent("https://app.example.com/oauth/client.json"));
-	assert(res2.statusCode == 302);
-	assert(res2.headers["Location"].startsWith("https://github.com/login/oauth/authorize?"));
-	assert(res2.headers["Location"].canFind("code_challenge=CH"));
+	assert(proxy.hasConsent(page.setCookie, "https://app.example.com/oauth/client.json", [
+		"read"
+	]));
+	assert(approved.status == 302);
+	assert(approved.location.startsWith("https://github.com/login/oauth/authorize?"));
+	assert(approved.location.canFind("code_challenge=CH"));
 }
 
 unittest  // CIMD MOUNT: a document whose client_id does not match the URL yields 400 invalid_request
@@ -1508,12 +2894,15 @@ unittest  // CIMD MOUNT: a document whose client_id does not match the URL yield
 	auto badDoc = cimdMountDoc();
 	badDoc.clientId = "https://app.example.com/oauth/DIFFERENT.json"; // mismatch
 	auto proxy = cimdProxyWithStubDoc(cimdMountConfig(), badDoc);
-	proxy.grantConsent("https://app.example.com/oauth/client.json");
+	proxy.grantConsent(browser1, "https://app.example.com/oauth/client.json", [
+		"read"
+	]);
 	auto router = new URLRouter;
-	mountOAuthProxy(router, proxy);
+	mountOAuthProxy(router, proxy, testMountOptions());
 
 	auto sink = createMemoryOutputStream();
-	auto req = createTestHTTPServerRequest(URL("https://mcp.example.com/authorize?"
+	auto req = createTestHTTPServerRequest(
+			URL("https://mcp.example.com/authorize?response_type=code&code_challenge_method=S256&"
 			~ "client_id=https%3A%2F%2Fapp.example.com%2Foauth%2Fclient.json"
 			~ "&code_challenge=CH&scope=read&redirect_uri=http%3A%2F%2F127.0.0.1%3A8765%2Fcb&state=cs"));
 	auto res = createTestHTTPServerResponse(sink, null, TestHTTPResponseMode.bodyOnly);
@@ -1534,13 +2923,16 @@ unittest  // CIMD MOUNT: a redirect_uri not listed in the document yields 400 in
 	import vibe.stream.memory : createMemoryOutputStream;
 
 	auto proxy = cimdProxyWithStubDoc(cimdMountConfig(), cimdMountDoc());
-	proxy.grantConsent("https://app.example.com/oauth/client.json");
+	proxy.grantConsent(browser1, "https://app.example.com/oauth/client.json", [
+		"read"
+	]);
 	auto router = new URLRouter;
-	mountOAuthProxy(router, proxy);
+	mountOAuthProxy(router, proxy, testMountOptions());
 
 	auto sink = createMemoryOutputStream();
 	// redirect_uri is not the one listed in the document.
-	auto req = createTestHTTPServerRequest(URL("https://mcp.example.com/authorize?"
+	auto req = createTestHTTPServerRequest(
+			URL("https://mcp.example.com/authorize?response_type=code&code_challenge_method=S256&"
 			~ "client_id=https%3A%2F%2Fapp.example.com%2Foauth%2Fclient.json"
 			~ "&code_challenge=CH&scope=read&redirect_uri=http%3A%2F%2F127.0.0.1%3A9999%2Fother&state=cs"));
 	auto res = createTestHTTPServerResponse(sink, null, TestHTTPResponseMode.bodyOnly);
@@ -1579,7 +2971,7 @@ unittest  // OPEN REDIRECT: /authorize 400s an unregistered redirect_uri and doe
 	mountOAuthProxy(router, proxy);
 
 	auto sink = createMemoryOutputStream();
-	auto req = createTestHTTPServerRequest(URL("https://mcp.example.com/authorize?code_challenge=CH&scope=read&redirect_uri=https%3A%2F%2Fattacker.example%2Fcb&state=cs"));
+	auto req = createTestHTTPServerRequest(URL("https://mcp.example.com/authorize?client_id=Iv1.upstream&response_type=code&code_challenge_method=S256&code_challenge=CH&scope=read&redirect_uri=https%3A%2F%2Fattacker.example%2Fcb&state=cs"));
 	auto res = createTestHTTPServerResponse(sink, null, TestHTTPResponseMode.bodyOnly);
 	router.handleRequest(req, res);
 
@@ -1588,7 +2980,6 @@ unittest  // OPEN REDIRECT: /authorize 400s an unregistered redirect_uri and doe
 	assert(body_.canFind("invalid_request"));
 	// The consent screen is NOT rendered for an unregistered redirect_uri.
 	assert(!body_.canFind("Authorize application"));
-	assert(!proxy.hasConsent("https://attacker.example/cb"));
 }
 
 unittest  // OPEN REDIRECT: /authorize 400s an http non-loopback redirect_uri even if registered
@@ -1606,13 +2997,17 @@ unittest  // OPEN REDIRECT: /authorize 400s an http non-loopback redirect_uri ev
 	cfg.baseUrl = "https://mcp.example.com";
 	cfg.resource = "https://mcp.example.com/mcp";
 
-	auto proxy = new OAuthProxy(cfg);
-	proxy.register(["http://app.example.com/cb"]);
+	import mcp.auth.oauth_proxy : InMemoryConsentStore, InMemoryRedirectUriRegistry;
+
+	// Even if a registry held such a URI, /authorize rejects it.
+	auto reg = new InMemoryRedirectUriRegistry();
+	reg.register("h", ["http://app.example.com/cb"]);
+	auto proxy = new OAuthProxy(cfg, new InMemoryConsentStore(), reg);
 	auto router = new URLRouter;
 	mountOAuthProxy(router, proxy);
 
 	auto sink = createMemoryOutputStream();
-	auto req = createTestHTTPServerRequest(URL("https://mcp.example.com/authorize?code_challenge=CH&scope=read&redirect_uri=http%3A%2F%2Fapp.example.com%2Fcb&state=cs"));
+	auto req = createTestHTTPServerRequest(URL("https://mcp.example.com/authorize?client_id=Iv1.upstream&response_type=code&code_challenge_method=S256&code_challenge=CH&scope=read&redirect_uri=http%3A%2F%2Fapp.example.com%2Fcb&state=cs"));
 	auto res = createTestHTTPServerResponse(sink, null, TestHTTPResponseMode.bodyOnly);
 	router.handleRequest(req, res);
 
@@ -1621,68 +3016,119 @@ unittest  // OPEN REDIRECT: /authorize 400s an http non-loopback redirect_uri ev
 	assert(body_.canFind("invalid_request"));
 }
 
-unittest  // PKCE: /authorize 400s a request with a missing code_challenge
+version (unittest)
 {
-	import std.algorithm : canFind;
-	import vibe.http.server : createTestHTTPServerRequest,
-		createTestHTTPServerResponse, TestHTTPResponseMode;
-	import vibe.inet.url : URL;
-	import vibe.stream.memory : createMemoryOutputStream;
+	/// Drive `/authorize` on a proxy with `http://localhost:5000/cb` registered,
+	/// appending `query` to a request that otherwise names that client.
+	private BrowserHit authorizeDcr(string query) @safe
+	{
+		auto proxy = mountSampleProxy();
+		proxy.register(["http://localhost:5000/cb"]);
+		auto router = new URLRouter;
+		mountOAuthProxy(router, proxy);
+		return browserGet(router, "https://mcp.example.com/authorize?client_id=Iv1.upstream"
+				~ "&redirect_uri=http%3A%2F%2Flocalhost%3A5000%2Fcb&state=cs" ~ query, "");
+	}
 
-	OAuthProxyConfig cfg;
-	cfg.upstreamAuthorizationEndpoint = "https://github.com/login/oauth/authorize";
-	cfg.upstreamTokenEndpoint = "https://github.com/login/oauth/access_token";
-	cfg.upstreamClientId = "Iv1.upstream";
-	cfg.baseUrl = "https://mcp.example.com";
-	cfg.resource = "https://mcp.example.com/mcp";
-
-	auto proxy = new OAuthProxy(cfg);
-	proxy.register(["http://localhost:5000/cb"]);
-	auto router = new URLRouter;
-	mountOAuthProxy(router, proxy);
-
-	auto sink = createMemoryOutputStream();
-	auto req = createTestHTTPServerRequest(URL("https://mcp.example.com/authorize?scope=read&redirect_uri=http%3A%2F%2Flocalhost%3A5000%2Fcb&state=cs"));
-	auto res = createTestHTTPServerResponse(sink, null, TestHTTPResponseMode.bodyOnly);
-	router.handleRequest(req, res);
-
-	const body_ = () @trusted { return cast(string) sink.data; }();
-	assert(res.statusCode == 400);
-	assert(body_.canFind("invalid_request"));
-	assert(body_.canFind("code_challenge"));
-	// The client was never forwarded upstream / asked to consent.
-	assert(!body_.canFind("Authorize application"));
+	/// Whether `hit` redirects to the registered client with OAuth `error`.
+	private bool redirectsError(const BrowserHit hit, string error) @safe
+	{
+		return hit.status == 302 && hit.location.startsWith("http://localhost:5000/cb?")
+			&& hit.location.canFind("error=" ~ error) && hit.location.canFind("state=cs");
+	}
 }
 
-unittest  // PKCE: /authorize 400s a non-S256 code_challenge_method
+unittest  // PKCE: /authorize redirects a request with a missing code_challenge back with invalid_request
 {
-	import std.algorithm : canFind;
-	import vibe.http.server : createTestHTTPServerRequest,
-		createTestHTTPServerResponse, TestHTTPResponseMode;
-	import vibe.inet.url : URL;
-	import vibe.stream.memory : createMemoryOutputStream;
+	const res = authorizeDcr("&response_type=code&code_challenge_method=S256&scope=read");
+	assert(redirectsError(res, "invalid_request"));
+	assert(!res.body_.canFind("Authorize application"));
+}
 
-	OAuthProxyConfig cfg;
-	cfg.upstreamAuthorizationEndpoint = "https://github.com/login/oauth/authorize";
-	cfg.upstreamTokenEndpoint = "https://github.com/login/oauth/access_token";
-	cfg.upstreamClientId = "Iv1.upstream";
-	cfg.baseUrl = "https://mcp.example.com";
-	cfg.resource = "https://mcp.example.com/mcp";
+unittest  // PKCE: /authorize redirects a non-S256 code_challenge_method back with invalid_request
+{
+	assert(redirectsError(authorizeDcr(
+			"&response_type=code&code_challenge=CH&code_challenge_method=plain"), "invalid_request"));
+}
 
-	auto proxy = new OAuthProxy(cfg);
+unittest  // PKCE: /authorize redirects a request with no code_challenge_method back (RFC 7636 defaults it to plain)
+{
+	assert(redirectsError(authorizeDcr("&response_type=code&code_challenge=CH"), "invalid_request"));
+}
+
+unittest  // /authorize redirects a response_type other than code back with unsupported_response_type
+{
+	assert(redirectsError(authorizeDcr(
+			"&response_type=token&code_challenge=CH&code_challenge_method=S256"),
+			"unsupported_response_type"));
+}
+
+unittest  // /authorize redirects a request with no response_type back with invalid_request
+{
+	assert(redirectsError(authorizeDcr("&code_challenge=CH&code_challenge_method=S256"),
+			"invalid_request"));
+}
+
+unittest  // /authorize never redirects an error to a redirect_uri it has not validated
+{
+	import vibe.data.json : parseJsonString;
+
+	auto proxy = mountSampleProxy();
+	auto router = new URLRouter;
+	mountOAuthProxy(router, proxy);
+	const res = browserGet(router, "https://mcp.example.com/authorize?client_id=Iv1.upstream"
+			~ "&response_type=token&redirect_uri=https%3A%2F%2Fattacker.example%2Fcb&state=cs", "");
+	assert(res.status == 400);
+	assert(res.location.length == 0);
+	assert(parseJsonString(res.body_)["error"].get!string == "invalid_request");
+}
+
+unittest  // /authorize refuses an unknown or missing client_id without redirecting
+{
+	import vibe.data.json : parseJsonString;
+
+	auto proxy = mountSampleProxy();
 	proxy.register(["http://localhost:5000/cb"]);
 	auto router = new URLRouter;
 	mountOAuthProxy(router, proxy);
+	foreach (clientId; ["&client_id=someone-else", ""])
+	{
+		const res = browserGet(router, "https://mcp.example.com/authorize?response_type=code"
+				~ "&code_challenge=CH&code_challenge_method=S256" ~ clientId
+				~ "&redirect_uri=http%3A%2F%2Flocalhost%3A5000%2Fcb&state=cs", "");
+		assert(res.status == 400);
+		assert(res.location.length == 0);
+		assert(parseJsonString(res.body_)["error"].get!string == "invalid_request");
+	}
+}
 
-	auto sink = createMemoryOutputStream();
-	auto req = createTestHTTPServerRequest(URL("https://mcp.example.com/authorize?code_challenge=CH&code_challenge_method=plain&redirect_uri=http%3A%2F%2Flocalhost%3A5000%2Fcb&state=cs"));
-	auto res = createTestHTTPServerResponse(sink, null, TestHTTPResponseMode.bodyOnly);
-	router.handleRequest(req, res);
+unittest  // RFC 8707: /authorize redirects a resource other than the protected one back with invalid_target
+{
+	assert(redirectsError(authorizeDcr(
+			"&response_type=code&code_challenge=CH&code_challenge_method=S256"
+			~ "&resource=https%3A%2F%2Fother.example%2Fmcp"), "invalid_target"));
+}
 
-	const body_ = () @trusted { return cast(string) sink.data; }();
-	assert(res.statusCode == 400);
-	assert(body_.canFind("invalid_request"));
-	assert(body_.canFind("S256"));
+unittest  // RFC 8707: /authorize accepts the protected resource in any canonical spelling
+{
+	const res = authorizeDcr("&response_type=code&code_challenge=CH&code_challenge_method=S256"
+			~ "&resource=https%3A%2F%2FMCP.example.com%2Fmcp%2F");
+	assert(res.status == 200);
+	assert(res.body_.canFind("Authorize application"));
+}
+
+unittest  // SCOPE CAP: /authorize redirects a request naming too many scopes back with invalid_scope
+{
+	import std.array : join;
+	import std.conv : to;
+	import std.range : iota;
+	import std.algorithm : map;
+	import mcp.auth.oauth_proxy : maxScopesPerRequest;
+
+	const scopes = iota(maxScopesPerRequest + 1).map!(i => "s" ~ i.to!string).join("+");
+	assert(redirectsError(authorizeDcr(
+			"&response_type=code&code_challenge=CH&code_challenge_method=S256&scope=" ~ scopes),
+			"invalid_scope"));
 }
 
 unittest  // CONSENT: evicted redirect_uri between /authorize and POST /consent yields 400 not 500
@@ -1692,7 +3138,8 @@ unittest  // CONSENT: evicted redirect_uri between /authorize and POST /consent 
 	// proxy.authorize throws InvalidRedirectUriException. The handler must catch it
 	// and return 400 (matching the /authorize handler) rather than leaking a 500.
 	import std.algorithm : canFind;
-	import mcp.auth.oauth_proxy : InMemoryConsentStore, InMemoryRedirectUriRegistry;
+	import mcp.auth.oauth_proxy : InMemoryConsentStore,
+		InMemoryRedirectUriRegistry, RedirectUriRegistryOptions;
 	import vibe.http.common : HTTPMethod;
 	import vibe.http.server : createTestHTTPServerRequest,
 		createTestHTTPServerResponse, TestHTTPResponseMode;
@@ -1707,7 +3154,7 @@ unittest  // CONSENT: evicted redirect_uri between /authorize and POST /consent 
 	cfg.resource = "https://mcp.example.com/mcp";
 
 	// Registry with cap=1: registering a second client evicts the first.
-	auto reg = new InMemoryRedirectUriRegistry(1);
+	auto reg = new InMemoryRedirectUriRegistry(RedirectUriRegistryOptions(1));
 	auto proxy = new OAuthProxy(cfg, new InMemoryConsentStore(), reg);
 	proxy.register(["http://localhost:5000/cb"]);
 	auto router = new URLRouter;
@@ -1715,7 +3162,7 @@ unittest  // CONSENT: evicted redirect_uri between /authorize and POST /consent 
 
 	// /authorize for the client's redirect_uri: returns the consent screen.
 	auto sink = createMemoryOutputStream();
-	auto req = createTestHTTPServerRequest(URL("https://mcp.example.com/authorize?code_challenge=CH&scope=read&redirect_uri=http%3A%2F%2Flocalhost%3A5000%2Fcb&state=cs"));
+	auto req = createTestHTTPServerRequest(URL("https://mcp.example.com/authorize?client_id=Iv1.upstream&response_type=code&code_challenge_method=S256&code_challenge=CH&scope=read&redirect_uri=http%3A%2F%2Flocalhost%3A5000%2Fcb&state=cs"));
 	auto res = createTestHTTPServerResponse(sink, null, TestHTTPResponseMode.bodyOnly);
 	router.handleRequest(req, res);
 	const html = () @trusted { return cast(string) sink.data; }();
@@ -1737,10 +3184,11 @@ unittest  // CONSENT: evicted redirect_uri between /authorize and POST /consent 
 
 	// POST /consent: with the redirect_uri evicted, proxy.authorize throws
 	// InvalidRedirectUriException. The handler must catch it and return 400.
-	auto formBody = () @trusted { return cast(ubyte[])("state=" ~ proxyState).dup; }();
+	auto formBody = cast(ubyte[]) consentForm(html).dup;
 	auto req2 = createTestHTTPServerRequest(URL("https://mcp.example.com/consent"),
 			HTTPMethod.POST, createMemoryStream(formBody, false));
 	req2.headers["Content-Type"] = "application/x-www-form-urlencoded";
+	req2.headers["Cookie"] = consentCookieName ~ "=" ~ res.cookies[consentCookieName].value;
 	auto sink2 = createMemoryOutputStream();
 	auto res2 = createTestHTTPServerResponse(sink2, null, TestHTTPResponseMode.bodyOnly);
 	router.handleRequest(req2, res2);
@@ -1790,6 +3238,183 @@ unittest  // COMPOSE: the per-route helpers reproduce the AS-metadata leg
 	assert(body_.canFind("authorization_endpoint"));
 }
 
+unittest  // with the proxy and an authenticated MCP mount, the MCP mount alone serves the PRM document
+{
+	import std.algorithm : canFind;
+	import vibe.http.common : HTTPMethod;
+	import vibe.http.server : createTestHTTPServerRequest,
+		createTestHTTPServerResponse, TestHTTPResponseMode;
+	import vibe.inet.url : URL;
+	import vibe.stream.memory : createMemoryOutputStream;
+	import mcp.server.server : McpServer;
+	import mcp.transport.streamable_http : mountMcp, StreamableHttpOptions;
+
+	OAuthProxyConfig cfg;
+	cfg.upstreamAuthorizationEndpoint = "https://github.com/login/oauth/authorize";
+	cfg.upstreamTokenEndpoint = "https://github.com/login/oauth/access_token";
+	cfg.upstreamClientId = "Iv1.upstream";
+	cfg.baseUrl = "https://mcp.example.com";
+	cfg.resource = "https://mcp.example.com/mcp";
+	auto router = new URLRouter;
+	mountOAuthProxy(router, new OAuthProxy(cfg));
+	StreamableHttpOptions opts;
+	opts.auth = cfg.toResourceServer();
+	mountMcp(router, McpServer.stateless("t", "1"), opts);
+
+	auto req = createTestHTTPServerRequest(
+			URL("https://mcp.example.com/.well-known/oauth-protected-resource/mcp"),
+			HTTPMethod.OPTIONS);
+	req.headers["Origin"] = "https://app.example.com";
+	req.headers["Access-Control-Request-Method"] = "GET";
+	req.headers["Access-Control-Request-Headers"] = "MCP-Protocol-Version";
+	auto res = createTestHTTPServerResponse(createMemoryOutputStream(), null,
+			TestHTTPResponseMode.bodyOnly);
+	router.handleRequest(req, res);
+	assert(res.statusCode == 204);
+	assert(res.headers.get("Access-Control-Allow-Headers", "").canFind("MCP-Protocol-Version"),
+			"the MCP mount's preflight must answer, not a second, narrower PRM route");
+}
+
+unittest  // an issuer with a path serves its AS metadata at the RFC 8414 path-inserted URL
+{
+	import std.algorithm : canFind;
+	import vibe.http.server : createTestHTTPServerRequest,
+		createTestHTTPServerResponse, TestHTTPResponseMode;
+	import vibe.inet.url : URL;
+	import vibe.stream.memory : createMemoryOutputStream;
+	import mcp.auth.oauth : authServerMetadataCandidates;
+
+	OAuthProxyConfig cfg;
+	cfg.upstreamAuthorizationEndpoint = "https://github.com/login/oauth/authorize";
+	cfg.upstreamTokenEndpoint = "https://github.com/login/oauth/access_token";
+	cfg.upstreamClientId = "Iv1.upstream";
+	cfg.baseUrl = "https://mcp.example.com/auth/";
+	cfg.resource = "https://mcp.example.com/mcp";
+	auto proxy = new OAuthProxy(cfg);
+	auto router = new URLRouter;
+	mountOAuthMetadata(router, proxy);
+
+	string bodyOf(string url)
+	{
+		auto sink = createMemoryOutputStream();
+		auto req = createTestHTTPServerRequest(URL(url));
+		auto res = createTestHTTPServerResponse(sink, null, TestHTTPResponseMode.bodyOnly);
+		router.handleRequest(req, res);
+		return cast(string) sink.data.idup;
+	}
+
+	// The URL an RFC 8414 client derives from the issuer is the one served.
+	const discovered = authServerMetadataCandidates(proxy.metadataJson()["issuer"].get!string)[0];
+	assert(discovered == "https://mcp.example.com/.well-known/oauth-authorization-server/auth");
+	assert(bodyOf(discovered).canFind(`"issuer":"https://mcp.example.com/auth"`));
+	assert(bodyOf("https://mcp.example.com/.well-known/oauth-authorization-server").length == 0);
+}
+
+unittest  // CORS: the AS metadata document is readable cross-origin
+{
+	import vibe.http.server : createTestHTTPServerRequest,
+		createTestHTTPServerResponse, TestHTTPResponseMode;
+	import vibe.inet.url : URL;
+	import vibe.stream.memory : createMemoryOutputStream;
+
+	auto proxy = mountSampleProxy();
+	auto router = new URLRouter;
+	mountOAuthMetadata(router, proxy);
+
+	auto req = createTestHTTPServerRequest(
+			URL("https://mcp.example.com/.well-known/oauth-authorization-server"));
+	req.headers["Origin"] = "https://app.example.com";
+	auto res = createTestHTTPServerResponse(createMemoryOutputStream(), null,
+			TestHTTPResponseMode.bodyOnly);
+	router.handleRequest(req, res);
+	assert(res.statusCode == 200);
+	assert(res.headers.get("Access-Control-Allow-Origin", "") == "*");
+}
+
+unittest  // CORS: a preflight to the AS metadata document is answered
+{
+	import std.algorithm : canFind;
+	import vibe.http.common : HTTPMethod;
+	import vibe.http.server : createTestHTTPServerRequest,
+		createTestHTTPServerResponse, TestHTTPResponseMode;
+	import vibe.inet.url : URL;
+	import vibe.stream.memory : createMemoryOutputStream;
+
+	auto proxy = mountSampleProxy();
+	auto router = new URLRouter;
+	mountOAuthMetadata(router, proxy);
+
+	auto req = createTestHTTPServerRequest(
+			URL("https://mcp.example.com/.well-known/oauth-authorization-server"),
+			HTTPMethod.OPTIONS);
+	req.headers["Origin"] = "https://app.example.com";
+	req.headers["Access-Control-Request-Method"] = "GET";
+	auto res = createTestHTTPServerResponse(createMemoryOutputStream(), null,
+			TestHTTPResponseMode.bodyOnly);
+	router.handleRequest(req, res);
+	assert(res.statusCode == 204);
+	assert(res.headers.get("Access-Control-Allow-Origin", "") == "*");
+	assert(res.headers.get("Access-Control-Allow-Methods", "").canFind("GET"));
+}
+
+unittest  // CORS: /register and /token responses are readable cross-origin
+{
+	import vibe.http.server : createTestHTTPServerRequest,
+		createTestHTTPServerResponse, TestHTTPResponseMode;
+	import vibe.inet.url : URL;
+	import vibe.stream.memory : createMemoryOutputStream, createMemoryStream;
+
+	auto proxy = mountSampleProxy();
+	auto router = new URLRouter;
+	mountOAuthRegister(router, proxy, null);
+	mountOAuthToken(router, proxy);
+
+	foreach (leg; [
+			["/register", `{"redirect_uris":["http://localhost:5000/cb"]}`],
+			["/token", "grant_type=password"]
+		])
+	{
+		auto reqBody = cast(ubyte[]) leg[1].dup;
+		auto req = createTestHTTPServerRequest(URL("https://mcp.example.com" ~ leg[0]),
+				HTTPMethod.POST, createMemoryStream(reqBody, false));
+		req.headers["Origin"] = "https://app.example.com";
+		auto res = createTestHTTPServerResponse(createMemoryOutputStream(),
+				null, TestHTTPResponseMode.bodyOnly);
+		router.handleRequest(req, res);
+		assert(res.headers.get("Access-Control-Allow-Origin", "") == "*", leg[0]);
+	}
+}
+
+unittest  // CORS: a preflight to /register or /token is answered
+{
+	import std.algorithm : canFind;
+	import vibe.http.server : createTestHTTPServerRequest,
+		createTestHTTPServerResponse, TestHTTPResponseMode;
+	import vibe.inet.url : URL;
+	import vibe.stream.memory : createMemoryOutputStream;
+
+	auto proxy = mountSampleProxy();
+	auto router = new URLRouter;
+	mountOAuthRegister(router, proxy, null);
+	mountOAuthToken(router, proxy);
+
+	foreach (path; ["/register", "/token"])
+	{
+		auto req = createTestHTTPServerRequest(URL("https://mcp.example.com" ~ path),
+				HTTPMethod.OPTIONS);
+		req.headers["Origin"] = "https://app.example.com";
+		req.headers["Access-Control-Request-Method"] = "POST";
+		req.headers["Access-Control-Request-Headers"] = "content-type";
+		auto res = createTestHTTPServerResponse(createMemoryOutputStream(),
+				null, TestHTTPResponseMode.bodyOnly);
+		router.handleRequest(req, res);
+		assert(res.statusCode == 204, path);
+		assert(res.headers.get("Access-Control-Allow-Origin", "") == "*", path);
+		assert(res.headers.get("Access-Control-Allow-Methods", "").canFind("POST"), path);
+		assert(res.headers.get("Access-Control-Allow-Headers", "").canFind("Content-Type"), path);
+	}
+}
+
 unittest  // COMPOSE: the per-route helpers reproduce the /register leg
 {
 	import vibe.http.common : HTTPMethod;
@@ -1800,11 +3425,9 @@ unittest  // COMPOSE: the per-route helpers reproduce the /register leg
 
 	auto proxy = mountSampleProxy();
 	auto router = new URLRouter;
-	mountOAuthRegister(router, proxy);
+	mountOAuthRegister(router, proxy, null);
 
-	auto formBody = () @trusted {
-		return cast(ubyte[]) `{"redirect_uris":["http://localhost:5000/cb"]}`.dup;
-	}();
+	auto formBody = cast(ubyte[]) `{"redirect_uris":["http://localhost:5000/cb"]}`.dup;
 	auto req = createTestHTTPServerRequest(URL("https://mcp.example.com/register"),
 			HTTPMethod.POST, createMemoryStream(formBody, false));
 	auto sink = createMemoryOutputStream();
@@ -1829,9 +3452,9 @@ unittest  // /register rejects a malformed JSON body with 400 invalid_client_met
 
 	auto proxy = mountSampleProxy();
 	auto router = new URLRouter;
-	mountOAuthRegister(router, proxy);
+	mountOAuthRegister(router, proxy, null);
 
-	auto formBody = () @trusted { return cast(ubyte[]) `{ not valid json`.dup; }();
+	auto formBody = cast(ubyte[]) `{ not valid json`.dup;
 	auto req = createTestHTTPServerRequest(URL("https://mcp.example.com/register"),
 			HTTPMethod.POST, createMemoryStream(formBody, false));
 	auto sink = createMemoryOutputStream();
@@ -1841,6 +3464,71 @@ unittest  // /register rejects a malformed JSON body with 400 invalid_client_met
 	const body_ = () @trusted { return cast(string) sink.data; }();
 	assert(res.statusCode == 400);
 	assert(body_.canFind("invalid_client_metadata"));
+}
+
+unittest  // /register rejects a body nested past the depth cap with 400 invalid_client_metadata
+{
+	import std.algorithm : canFind;
+	import std.array : replicate;
+	import vibe.http.common : HTTPMethod;
+	import vibe.http.server : createTestHTTPServerRequest,
+		createTestHTTPServerResponse, TestHTTPResponseMode;
+	import vibe.inet.url : URL;
+	import vibe.stream.memory : createMemoryOutputStream, createMemoryStream;
+
+	auto proxy = mountSampleProxy();
+	auto router = new URLRouter;
+	mountOAuthRegister(router, proxy, null);
+
+	const json = `{"redirect_uris":["http://localhost:5000/cb"],"x":` ~ "[".replicate(
+			1000) ~ "]".replicate(1000) ~ `}`;
+	auto payload = cast(ubyte[]) json.dup;
+	auto req = createTestHTTPServerRequest(URL("https://mcp.example.com/register"),
+			HTTPMethod.POST, createMemoryStream(payload, false));
+	auto sink = createMemoryOutputStream();
+	auto res = createTestHTTPServerResponse(sink, null, TestHTTPResponseMode.bodyOnly);
+	router.handleRequest(req, res);
+
+	const body_ = () @trusted { return cast(string) sink.data; }();
+	assert(res.statusCode == 400);
+	assert(body_.canFind("invalid_client_metadata"));
+}
+
+unittest  // an upstream token response nested past the depth cap parses as an empty object
+{
+	import std.array : replicate;
+
+	const deep = "[".replicate(1000) ~ "]".replicate(1000);
+	const j = parseJsonBody(`{"access_token":"at","x":` ~ deep ~ `}`);
+	assert(j.type == Json.Type.object && j.length == 0);
+}
+
+unittest  // /register rejects a redirect_uri /authorize would never accept with 400 invalid_redirect_uri
+{
+	import std.algorithm : canFind;
+	import vibe.http.common : HTTPMethod;
+	import vibe.http.server : createTestHTTPServerRequest,
+		createTestHTTPServerResponse, TestHTTPResponseMode;
+	import vibe.inet.url : URL;
+	import vibe.stream.memory : createMemoryOutputStream, createMemoryStream;
+
+	auto proxy = mountSampleProxy();
+	auto router = new URLRouter;
+	mountOAuthRegister(router, proxy, null);
+
+	foreach (uri; ["com.example.app:/oauth/cb", "http://app.example.com/cb"])
+	{
+		auto formBody = cast(ubyte[])(`{"redirect_uris":["` ~ uri ~ `"]}`).dup;
+		auto req = createTestHTTPServerRequest(URL("https://mcp.example.com/register"),
+				HTTPMethod.POST, createMemoryStream(formBody, false));
+		auto sink = createMemoryOutputStream();
+		auto res = createTestHTTPServerResponse(sink, null, TestHTTPResponseMode.bodyOnly);
+		router.handleRequest(req, res);
+
+		const body_ = () @trusted { return cast(string) sink.data; }();
+		assert(res.statusCode == 400, uri);
+		assert(body_.canFind("invalid_redirect_uri"), body_);
+	}
 }
 
 unittest  // /register rejects a body with no usable redirect_uris with 400
@@ -1854,9 +3542,9 @@ unittest  // /register rejects a body with no usable redirect_uris with 400
 
 	auto proxy = mountSampleProxy();
 	auto router = new URLRouter;
-	mountOAuthRegister(router, proxy);
+	mountOAuthRegister(router, proxy, null);
 
-	auto formBody = () @trusted { return cast(ubyte[]) `{"client_name":"x"}`.dup; }();
+	auto formBody = cast(ubyte[]) `{"client_name":"x"}`.dup;
 	auto req = createTestHTTPServerRequest(URL("https://mcp.example.com/register"),
 			HTTPMethod.POST, createMemoryStream(formBody, false));
 	auto sink = createMemoryOutputStream();
@@ -1885,31 +3573,27 @@ unittest  // COMPOSE: the authorize/consent/callback legs share a state store an
 	// threading a single shared store between them (no monolithic mount).
 	auto router = new URLRouter;
 	auto store = new ProxyStateStore;
-	mountOAuthAuthorize(router, proxy, store);
-	mountOAuthConsent(router, proxy, store);
-	mountOAuthCallback(router, proxy, store);
+	mountOAuthAuthorize(router, proxy, store, testCookie);
+	mountOAuthConsent(router, proxy, store, testCookie);
+	mountOAuthCallback(router, proxy, store, testCookie);
 
 	// /authorize renders the consent screen and stashes pending auth under a state.
 	auto sink = createMemoryOutputStream();
-	auto req = createTestHTTPServerRequest(URL("https://mcp.example.com/authorize?code_challenge=CH&scope=read&redirect_uri=http%3A%2F%2Flocalhost%3A5000%2Fcb&state=cs"));
+	auto req = createTestHTTPServerRequest(URL("https://mcp.example.com/authorize?client_id=Iv1.upstream&response_type=code&code_challenge_method=S256&code_challenge=CH&scope=read&redirect_uri=http%3A%2F%2Flocalhost%3A5000%2Fcb&state=cs"));
 	auto res = createTestHTTPServerResponse(sink, null, TestHTTPResponseMode.bodyOnly);
 	router.handleRequest(req, res);
 	const html = () @trusted { return cast(string) sink.data; }();
 	assert(html.canFind("Authorize application"));
-
-	const stateMark = `name="state" value="`;
-	const hi = html.indexOf(stateMark);
-	assert(hi >= 0);
-	const rest = html[hi + stateMark.length .. $];
-	const proxyState = rest[0 .. rest.indexOf('"')];
+	assert(hiddenField(html, "state").length > 0);
 
 	// POST /consent grants consent and 302s upstream (proving the consent leg sees
 	// the SAME store the authorize leg wrote to).
 	auto res2 = createTestHTTPServerResponse(null, null, TestHTTPResponseMode.bodyOnly);
-	auto formBody = () @trusted { return cast(ubyte[])("state=" ~ proxyState).dup; }();
+	auto formBody = cast(ubyte[]) consentForm(html).dup;
 	auto req2 = createTestHTTPServerRequest(URL("https://mcp.example.com/consent"),
 			HTTPMethod.POST, createMemoryStream(formBody, false));
 	req2.headers["Content-Type"] = "application/x-www-form-urlencoded";
+	req2.headers["Cookie"] = consentCookieName ~ "=" ~ res.cookies[consentCookieName].value;
 	router.handleRequest(req2, res2);
 	assert(res2.statusCode == 302);
 	assert(res2.headers["Location"].startsWith("https://github.com/login/oauth/authorize?"));
@@ -1929,15 +3613,13 @@ unittest  // COMPOSE: an integrator's own /token wins without route-ordering sha
 	// The integrator mounts the proxy's non-token legs plus their OWN /token, with
 	// no proxy /token registered at all — so there is no shadowing to rely on.
 	mountOAuthMetadata(router, proxy);
-	mountOAuthRegister(router, proxy);
+	mountOAuthRegister(router, proxy, null);
 	router.post("/token", (HTTPServerRequest req, HTTPServerResponse res) @safe {
 		res.statusCode = HTTPStatus.ok;
 		res.writeBody(`{"custom_broker":true}`, "application/json");
 	});
 
-	auto formBody = () @trusted {
-		return cast(ubyte[]) "grant_type=authorization_code&code=C&code_verifier=V".dup;
-	}();
+	auto formBody = cast(ubyte[]) "grant_type=authorization_code&code=C&code_verifier=V".dup;
 	auto req = createTestHTTPServerRequest(URL("https://mcp.example.com/token"),
 			HTTPMethod.POST, createMemoryStream(formBody, false));
 	req.headers["Content-Type"] = "application/x-www-form-urlencoded";
@@ -1972,6 +3654,11 @@ version (unittest)
 	// call is made: the injected exchange returns a fixed upstream token body.
 	private OAuthProxy brokerMountProxy(ReferenceTokenStore store) @safe
 	{
+		return new OAuthProxy(brokerMountConfig(store));
+	}
+
+	private OAuthProxyConfig brokerMountConfig(ReferenceTokenStore store) @safe
+	{
 		OAuthProxyConfig cfg;
 		cfg.upstreamAuthorizationEndpoint = "https://github.com/login/oauth/authorize";
 		cfg.upstreamTokenEndpoint = "https://github.com/login/oauth/access_token";
@@ -1988,7 +3675,20 @@ version (unittest)
 			t.expiresAt = long.max;
 			return t;
 		};
-		return new OAuthProxy(cfg);
+		return cfg;
+	}
+
+	/// Record a relayed code "C" for the verifier "V" and return a `/token` form
+	/// that redeems it.
+	private string redeemableCodeForm(OAuthProxy proxy) @safe
+	{
+		import std.digest.sha : sha256Of;
+		import mcp.auth.oauth : base64UrlNoPad;
+
+		proxy.recordRelayedCode("C", RelayedCodeBinding(base64UrlNoPad(sha256Of("V")[]),
+				"http://localhost:5000/cb", ""));
+		return "grant_type=authorization_code&code=C&code_verifier=V"
+			~ "&client_id=Iv1.upstream&redirect_uri=http%3A%2F%2Flocalhost%3A5000%2Fcb";
 	}
 
 	private UpstreamExchange fixedUpstream(string responseBody) @safe
@@ -1998,6 +3698,155 @@ version (unittest)
 			status = 200;
 		};
 	}
+}
+
+version (unittest)
+{
+	/// Drive a consented browser through /authorize and the upstream callback so
+	/// the proxy relays upstream code `code` to the client; returns the router.
+	private URLRouter relayedCodeRouter(OAuthProxy proxy, string code,
+			string codeChallenge, UpstreamExchange exchange) @safe
+	{
+		proxy.register(["http://localhost:5000/cb"]);
+		proxy.grantConsent(browser1, "http://localhost:5000/cb", ["read"]);
+		auto router = new URLRouter;
+		auto store = new ProxyStateStore;
+		mountOAuthAuthorize(router, proxy, store, testCookie);
+		mountOAuthCallback(router, proxy, store, testCookie);
+		mountOAuthToken(router, proxy, exchange);
+
+		const upstream = browserGet(router, "https://mcp.example.com/authorize?client_id=Iv1.upstream&response_type=code&code_challenge_method=S256&code_challenge=" ~ codeChallenge ~ "&redirect_uri=http%3A%2F%2Flocalhost%3A5000%2Fcb&state=cs",
+				browser1);
+		assert(upstream.status == 302);
+		const proxyState = upstream.location[upstream.location.indexOf("state=") + 6 .. $];
+		const relayed = browserGet(router,
+				"https://mcp.example.com/auth/callback?code=" ~ code ~ "&state=" ~ proxyState,
+				browser1);
+		assert(relayed.location.startsWith("http://localhost:5000/cb?code=" ~ code));
+		return router;
+	}
+}
+
+unittest  // PKCE: /token refuses a relayed code redeemed with the wrong code_verifier
+{
+	import mcp.auth.oauth : makePkce;
+
+	auto proxy = mountSampleProxy();
+	const pkce = makePkce(cast(const(ubyte)[]) "0123456789abcdef0123456789abcdef");
+	bool upstreamCalled;
+	auto router = relayedCodeRouter(proxy, "UPCODE", pkce.challenge, (string endpoint,
+			string body_, string authHeader, out string rb, out int status) @safe {
+		upstreamCalled = true;
+		rb = `{"access_token":"gho_upstream","token_type":"bearer"}`;
+		status = 200;
+	});
+
+	const res = browserPost(router, "https://mcp.example.com/token",
+			"grant_type=authorization_code&code=UPCODE&code_verifier=attacker-verifier"
+			~ "&client_id=Iv1.upstream&redirect_uri=http%3A%2F%2Flocalhost%3A5000%2Fcb", "");
+	assert(res.status == 400);
+	assert(res.body_.canFind("invalid_grant"));
+	assert(!upstreamCalled);
+}
+
+unittest  // PKCE: /token refuses a relayed code presented with a different redirect_uri
+{
+	import mcp.auth.oauth : makePkce;
+
+	auto proxy = mountSampleProxy();
+	const pkce = makePkce(cast(const(ubyte)[]) "0123456789abcdef0123456789abcdef");
+	bool upstreamCalled;
+	auto router = relayedCodeRouter(proxy, "UPCODE", pkce.challenge, (string endpoint,
+			string body_, string authHeader, out string rb, out int status) @safe {
+		upstreamCalled = true;
+		status = 200;
+	});
+
+	const res = browserPost(router, "https://mcp.example.com/token",
+			"grant_type=authorization_code&code=UPCODE&code_verifier=" ~ pkce.verifier
+			~ "&client_id=Iv1.upstream&redirect_uri=https%3A%2F%2Fother.example%2Fcb", "");
+	assert(res.status == 400);
+	assert(res.body_.canFind("invalid_grant"));
+	assert(!upstreamCalled);
+}
+
+unittest  // /token answers an upstream exchange failure with a 502 JSON server_error
+{
+	import vibe.data.json : parseJsonString;
+
+	auto proxy = mountSampleProxy();
+	auto router = new URLRouter;
+	mountOAuthToken(router, proxy, (string endpoint, string body_,
+			string authHeader, out string rb, out int status) @safe {
+		throw new Exception("Refusing to fetch URL whose host resolves to a private address");
+	});
+
+	const res = browserPost(router, "https://mcp.example.com/token",
+			redeemableCodeForm(proxy), "");
+	assert(res.status == 502);
+	assert(parseJsonString(res.body_)["error"].get!string == "server_error");
+}
+
+unittest  // /token answers a malformed percent-encoding with a 400 JSON invalid_request
+{
+	import vibe.data.json : parseJsonString;
+
+	bool upstreamCalled;
+	auto proxy = mountSampleProxy();
+	auto router = new URLRouter;
+	mountOAuthToken(router, proxy, (string endpoint, string body_,
+			string authHeader, out string rb, out int status) @safe {
+		upstreamCalled = true;
+		status = 200;
+	});
+
+	const res = browserPost(router, "https://mcp.example.com/token",
+			"grant_type=authorization_code&code=%zz&code_verifier=V", "");
+	assert(res.status == 400);
+	assert(parseJsonString(res.body_)["error"].get!string == "invalid_request");
+	assert(!upstreamCalled);
+}
+
+unittest  // PKCE: /token refuses a code the proxy never relayed
+{
+	bool upstreamCalled;
+	auto proxy = mountSampleProxy();
+	auto router = new URLRouter;
+	mountOAuthToken(router, proxy, (string endpoint, string body_,
+			string authHeader, out string rb, out int status) @safe {
+		upstreamCalled = true;
+		status = 200;
+	});
+
+	const res = browserPost(router, "https://mcp.example.com/token",
+			"grant_type=authorization_code&code=FORGED&code_verifier=V"
+			~ "&client_id=Iv1.upstream&redirect_uri=http%3A%2F%2Flocalhost%3A5000%2Fcb", "");
+	assert(res.status == 400);
+	assert(res.body_.canFind("invalid_grant"));
+	assert(!upstreamCalled);
+}
+
+unittest  // PKCE: /token exchanges a relayed code upstream once the verifier, client and redirect match
+{
+	import mcp.auth.oauth : makePkce;
+
+	auto proxy = mountSampleProxy();
+	const pkce = makePkce(cast(const(ubyte)[]) "0123456789abcdef0123456789abcdef");
+	string sentUpstream;
+	auto router = relayedCodeRouter(proxy, "UPCODE", pkce.challenge, (string endpoint,
+			string body_, string authHeader, out string rb, out int status) @safe {
+		sentUpstream = body_;
+		rb = `{"access_token":"gho_upstream","token_type":"bearer"}`;
+		status = 200;
+	});
+
+	const form = "grant_type=authorization_code&code=UPCODE&code_verifier=" ~ pkce.verifier
+		~ "&client_id=Iv1.upstream&redirect_uri=http%3A%2F%2Flocalhost%3A5000%2Fcb";
+	const res = browserPost(router, "https://mcp.example.com/token", form, "");
+	assert(res.status == 200);
+	assert(sentUpstream.canFind("code=UPCODE"));
+	// The code is single use.
+	assert(browserPost(router, "https://mcp.example.com/token", form, "").status == 400);
 }
 
 unittest  // BROKER MOUNT: /token returns OUR opaque token, never the upstream token
@@ -2015,9 +3864,7 @@ unittest  // BROKER MOUNT: /token returns OUR opaque token, never the upstream t
 	mountOAuthToken(router, proxy,
 			fixedUpstream(`{"access_token":"gho_upstream_secret","token_type":"bearer"}`));
 
-	auto formBody = () @trusted {
-		return cast(ubyte[]) "grant_type=authorization_code&code=C&code_verifier=V".dup;
-	}();
+	auto formBody = cast(ubyte[]) redeemableCodeForm(proxy).dup;
 	auto req = createTestHTTPServerRequest(URL("https://mcp.example.com/token"),
 			HTTPMethod.POST, createMemoryStream(formBody, false));
 	req.headers["Content-Type"] = "application/x-www-form-urlencoded";
@@ -2050,9 +3897,7 @@ unittest  // BROKER MOUNT: the resource server accepts the issued token and reje
 	mountOAuthToken(router, proxy,
 			fixedUpstream(`{"access_token":"gho_upstream_secret","token_type":"bearer"}`));
 
-	auto formBody = () @trusted {
-		return cast(ubyte[]) "grant_type=authorization_code&code=C&code_verifier=V".dup;
-	}();
+	auto formBody = cast(ubyte[]) redeemableCodeForm(proxy).dup;
 	auto req = createTestHTTPServerRequest(URL("https://mcp.example.com/token"),
 			HTTPMethod.POST, createMemoryStream(formBody, false));
 	req.headers["Content-Type"] = "application/x-www-form-urlencoded";
@@ -2085,9 +3930,7 @@ unittest  // BROKER MOUNT: the upstream token is retrievable server-side from th
 	mountOAuthToken(router, proxy,
 			fixedUpstream(`{"access_token":"gho_upstream_secret","token_type":"bearer"}`));
 
-	auto formBody = () @trusted {
-		return cast(ubyte[]) "grant_type=authorization_code&code=C&code_verifier=V".dup;
-	}();
+	auto formBody = cast(ubyte[]) redeemableCodeForm(proxy).dup;
 	auto req = createTestHTTPServerRequest(URL("https://mcp.example.com/token"),
 			HTTPMethod.POST, createMemoryStream(formBody, false));
 	req.headers["Content-Type"] = "application/x-www-form-urlencoded";
@@ -2105,6 +3948,150 @@ unittest  // BROKER MOUNT: the upstream token is retrievable server-side from th
 	assert(info.claims["upstream_access_token"].get!string == "gho_upstream_secret");
 }
 
+unittest  // BROKER MOUNT: a 200 upstream response carrying an OAuth error mints no token
+{
+	auto store = new ReferenceTokenStore();
+	auto proxy = brokerMountProxy(store);
+	auto router = new URLRouter;
+	// GitHub reports a bad code as HTTP 200 with an error body.
+	mountOAuthToken(router, proxy, fixedUpstream(`{"error":"bad_verification_code",`
+			~ `"error_description":"The code passed is incorrect or expired."}`));
+
+	const res = browserPost(router, "https://mcp.example.com/token",
+			redeemableCodeForm(proxy), "");
+	assert(res.status == 400);
+	assert(res.body_.canFind("bad_verification_code"));
+	assert(!res.body_.canFind("access_token"));
+}
+
+unittest  // BROKER MOUNT: an issueToken hook that throws is answered with a 500 JSON server_error
+{
+	import vibe.data.json : parseJsonString;
+
+	auto cfg = brokerMountConfig(new ReferenceTokenStore());
+	cfg.issueToken = (TokenSet upstream) @safe {
+		throw new Exception("user lookup failed");
+	};
+	auto proxy = new OAuthProxy(cfg);
+	auto router = new URLRouter;
+	mountOAuthToken(router, proxy,
+			fixedUpstream(`{"access_token":"gho_upstream","token_type":"bearer"}`));
+
+	const res = browserPost(router, "https://mcp.example.com/token",
+			redeemableCodeForm(proxy), "");
+	assert(res.status == 500);
+	const j = parseJsonString(res.body_);
+	assert(j["error"].get!string == "server_error");
+	assert(!res.body_.canFind("gho_upstream"));
+	assert(!res.body_.canFind("user lookup failed"));
+}
+
+unittest  // BROKER MOUNT: expires_in reflects the minted token's lifetime, not the upstream token's
+{
+	import mcp.auth.reference_token : ReferenceTokenStoreOptions;
+	import vibe.data.json : parseJsonString;
+
+	ReferenceTokenStoreOptions o;
+	o.clock = () @safe => 1_700_000_000L;
+	auto store = new ReferenceTokenStore(o);
+	auto cfg = brokerMountConfig(store);
+	cfg.issueToken = (TokenSet upstream) @safe {
+		IssuedToken t;
+		t.subject = "octocat";
+		t.expiresAt = 1_700_000_600;
+		return t;
+	};
+	auto proxy = new OAuthProxy(cfg);
+	auto router = new URLRouter;
+	mountOAuthToken(router, proxy,
+			fixedUpstream(
+				`{"access_token":"gho_upstream","token_type":"bearer","expires_in":28800}`));
+
+	const res = browserPost(router, "https://mcp.example.com/token",
+			redeemableCodeForm(proxy), "");
+	assert(res.status == 200);
+	assert(parseJsonString(res.body_)["expires_in"].get!long == 600);
+}
+
+unittest  // BROKER MOUNT: scope reflects the minted token's scopes, not the upstream token's
+{
+	import vibe.data.json : parseJsonString;
+
+	auto store = new ReferenceTokenStore();
+	auto cfg = brokerMountConfig(store);
+	cfg.issueToken = (TokenSet upstream) @safe {
+		IssuedToken t;
+		t.subject = "octocat";
+		t.scopes = ["mcp:read", "mcp:write"];
+		t.expiresAt = long.max;
+		return t;
+	};
+	auto proxy = new OAuthProxy(cfg);
+	auto router = new URLRouter;
+	mountOAuthToken(router, proxy,
+			fixedUpstream(
+				`{"access_token":"gho_upstream","token_type":"bearer","scope":"repo user"}`));
+
+	const res = browserPost(router, "https://mcp.example.com/token",
+			redeemableCodeForm(proxy), "");
+	assert(res.status == 200);
+	assert(parseJsonString(res.body_)["scope"].get!string == "mcp:read mcp:write");
+}
+
+unittest  // BROKER MOUNT: a minted token without scopes carries no scope
+{
+	import vibe.data.json : parseJsonString;
+
+	auto store = new ReferenceTokenStore();
+	auto cfg = brokerMountConfig(store);
+	cfg.issueToken = (TokenSet upstream) @safe {
+		IssuedToken t;
+		t.subject = "octocat";
+		t.expiresAt = long.max;
+		return t;
+	};
+	auto proxy = new OAuthProxy(cfg);
+	auto router = new URLRouter;
+	mountOAuthToken(router, proxy,
+			fixedUpstream(
+				`{"access_token":"gho_upstream","token_type":"bearer","scope":"repo user"}`));
+
+	const res = browserPost(router, "https://mcp.example.com/token",
+			redeemableCodeForm(proxy), "");
+	assert(res.status == 200);
+	assert("scope" !in parseJsonString(res.body_));
+}
+
+unittest  // BROKER MOUNT: a non-expiring minted token carries no expires_in
+{
+	import vibe.data.json : parseJsonString;
+
+	auto store = new ReferenceTokenStore();
+	auto proxy = brokerMountProxy(store); // mints expiresAt = long.max
+	auto router = new URLRouter;
+	mountOAuthToken(router, proxy,
+			fixedUpstream(
+				`{"access_token":"gho_upstream","token_type":"bearer","expires_in":28800}`));
+
+	const res = browserPost(router, "https://mcp.example.com/token",
+			redeemableCodeForm(proxy), "");
+	assert(res.status == 200);
+	assert("expires_in" !in parseJsonString(res.body_));
+}
+
+unittest  // BROKER MOUNT: a 200 upstream response with no access_token mints no token
+{
+	auto store = new ReferenceTokenStore();
+	auto proxy = brokerMountProxy(store);
+	auto router = new URLRouter;
+	mountOAuthToken(router, proxy, fixedUpstream(`{"token_type":"bearer"}`));
+
+	const res = browserPost(router, "https://mcp.example.com/token",
+			redeemableCodeForm(proxy), "");
+	assert(res.status >= 400);
+	assert(!res.body_.canFind("access_token"));
+}
+
 unittest  // PASSTHROUGH REGRESSION: with no issueToken/tokenStore the upstream body is relayed verbatim
 {
 	import std.algorithm : canFind;
@@ -2119,9 +4106,7 @@ unittest  // PASSTHROUGH REGRESSION: with no issueToken/tokenStore the upstream 
 	mountOAuthToken(router, proxy,
 			fixedUpstream(`{"access_token":"gho_upstream_secret","token_type":"bearer"}`));
 
-	auto formBody = () @trusted {
-		return cast(ubyte[]) "grant_type=authorization_code&code=C&code_verifier=V".dup;
-	}();
+	auto formBody = cast(ubyte[]) redeemableCodeForm(proxy).dup;
 	auto req = createTestHTTPServerRequest(URL("https://mcp.example.com/token"),
 			HTTPMethod.POST, createMemoryStream(formBody, false));
 	req.headers["Content-Type"] = "application/x-www-form-urlencoded";
@@ -2133,6 +4118,170 @@ unittest  // PASSTHROUGH REGRESSION: with no issueToken/tokenStore the upstream 
 	assert(res.statusCode == 200);
 	// Passthrough relays the upstream token to the client verbatim.
 	assert(body_.canFind("gho_upstream_secret"));
+}
+
+unittest  // PASSTHROUGH: a 200 upstream response carrying an OAuth error is answered 400
+{
+	import vibe.data.json : parseJsonString;
+
+	auto proxy = mountSampleProxy();
+	auto router = new URLRouter;
+	mountOAuthToken(router, proxy, fixedUpstream(`{"error":"bad_verification_code",`
+			~ `"error_description":"The code passed is incorrect or expired."}`));
+
+	const res = browserPost(router, "https://mcp.example.com/token",
+			redeemableCodeForm(proxy), "");
+	assert(res.status == 400);
+	const j = parseJsonString(res.body_);
+	assert(j["error"].get!string == "bad_verification_code");
+	assert(j["error_description"].get!string == "The code passed is incorrect or expired.");
+}
+
+unittest  // PASSTHROUGH: a 200 upstream response with no access_token is answered 502 server_error
+{
+	import vibe.data.json : parseJsonString;
+
+	auto proxy = mountSampleProxy();
+	auto router = new URLRouter;
+	mountOAuthToken(router, proxy, fixedUpstream(`{"token_type":"bearer"}`));
+
+	const res = browserPost(router, "https://mcp.example.com/token",
+			redeemableCodeForm(proxy), "");
+	assert(res.status == 502);
+	assert(parseJsonString(res.body_)["error"].get!string == "server_error");
+}
+
+unittest  // every /token response forbids caching (RFC 6749 §5.1)
+{
+	import vibe.http.common : HTTPMethod;
+	import vibe.http.server : createTestHTTPServerRequest,
+		createTestHTTPServerResponse, TestHTTPResponseMode;
+	import vibe.inet.url : URL;
+	import vibe.stream.memory : createMemoryOutputStream, createMemoryStream;
+
+	auto passthrough = mountSampleProxy();
+	auto brokered = brokerMountProxy(new ReferenceTokenStore());
+	foreach (proxy; [passthrough, brokered])
+	{
+		auto router = new URLRouter;
+		mountOAuthToken(router, proxy,
+				fixedUpstream(`{"access_token":"at","token_type":"bearer"}`));
+		foreach (form; [
+			redeemableCodeForm(proxy), "grant_type=authorization_code&code=bad"
+		])
+		{
+			auto formBody = cast(ubyte[]) form.dup;
+			auto req = createTestHTTPServerRequest(URL("https://mcp.example.com/token"),
+					HTTPMethod.POST, createMemoryStream(formBody, false));
+			req.headers["Content-Type"] = "application/x-www-form-urlencoded";
+			auto res = createTestHTTPServerResponse(createMemoryOutputStream(),
+					null, TestHTTPResponseMode.bodyOnly);
+			router.handleRequest(req, res);
+			assert(res.headers.get("Cache-Control", "") == "no-store");
+			assert(res.headers.get("Pragma", "") == "no-cache");
+		}
+	}
+}
+
+unittest  // PASSTHROUGH: a refresh token the proxy never relayed is refused without reaching the upstream
+{
+	import std.algorithm : canFind;
+
+	auto proxy = mountSampleProxy();
+	auto router = new URLRouter;
+	bool upstreamCalled;
+	mountOAuthToken(router, proxy, (string endpoint, string body_,
+			string authHeader, out string rb, out int status) @safe {
+		upstreamCalled = true;
+		rb = `{"access_token":"gho_upstream","token_type":"bearer"}`;
+		status = 200;
+	});
+
+	const hit = browserPost(router, "https://mcp.example.com/token",
+			"grant_type=refresh_token&refresh_token=ghr_stolen_elsewhere", "");
+	assert(hit.status == 400);
+	assert(hit.body_.canFind("invalid_grant"));
+	assert(!upstreamCalled, "the proxy's client secret must not back an unknown refresh token");
+}
+
+unittest  // PASSTHROUGH: a relayed refresh token refreshes once and is replaced by its rotation
+{
+	import std.algorithm : canFind;
+
+	auto proxy = mountSampleProxy();
+	auto router = new URLRouter;
+	string[] upstreamBodies;
+	int calls;
+	mountOAuthToken(router, proxy, (string endpoint, string body_,
+			string authHeader, out string rb, out int status) @safe {
+		upstreamBodies ~= body_;
+		++calls;
+		rb = calls == 1 ? `{"access_token":"at1","refresh_token":"rt1"}`
+			: `{"access_token":"at2","refresh_token":"rt2"}`;
+		status = 200;
+	});
+
+	assert(browserPost(router, "https://mcp.example.com/token",
+			redeemableCodeForm(proxy), "").status == 200);
+	const refreshed = browserPost(router, "https://mcp.example.com/token",
+			"grant_type=refresh_token&refresh_token=rt1", "");
+	assert(refreshed.status == 200);
+	assert(refreshed.body_.canFind("at2"));
+	assert(upstreamBodies[1].canFind("refresh_token=rt1"));
+	// rt1 was rotated away; only rt2 is redeemable now.
+	assert(browserPost(router, "https://mcp.example.com/token",
+			"grant_type=refresh_token&refresh_token=rt1", "").status == 400);
+	assert(calls == 2);
+	assert(browserPost(router, "https://mcp.example.com/token",
+			"grant_type=refresh_token&refresh_token=rt2", "").status == 200);
+}
+
+unittest  // an unknown grant_type is refused with unsupported_grant_type (RFC 6749 §5.2)
+{
+	import std.algorithm : canFind;
+	import std.array : replace;
+
+	auto proxy = mountSampleProxy();
+	auto router = new URLRouter;
+	bool upstreamCalled;
+	mountOAuthToken(router, proxy, (string endpoint, string body_,
+			string authHeader, out string rb, out int status) @safe {
+		upstreamCalled = true;
+		rb = `{"access_token":"gho_upstream","token_type":"bearer"}`;
+		status = 200;
+	});
+
+	// A redeemable code under an unsupported grant must not be exchanged.
+	const form = redeemableCodeForm(proxy).replace("grant_type=authorization_code",
+			"grant_type=password");
+	const hit = browserPost(router, "https://mcp.example.com/token", form, "");
+	assert(hit.status == 400);
+	assert(hit.body_.canFind("unsupported_grant_type"));
+	assert(!upstreamCalled);
+}
+
+unittest  // a /token request with no grant_type is refused with invalid_request (RFC 6749 §4.1.3)
+{
+	import std.algorithm : canFind;
+	import std.array : replace;
+	import vibe.data.json : parseJsonString;
+
+	auto proxy = mountSampleProxy();
+	auto router = new URLRouter;
+	bool upstreamCalled;
+	mountOAuthToken(router, proxy, (string endpoint, string body_,
+			string authHeader, out string rb, out int status) @safe {
+		upstreamCalled = true;
+		rb = `{"access_token":"gho_upstream","token_type":"bearer"}`;
+		status = 200;
+	});
+
+	const form = redeemableCodeForm(proxy).replace("grant_type=authorization_code&", "");
+	assert(!form.canFind("grant_type"));
+	const hit = browserPost(router, "https://mcp.example.com/token", form, "");
+	assert(hit.status == 400);
+	assert(parseJsonString(hit.body_)["error"].get!string == "invalid_request");
+	assert(!upstreamCalled);
 }
 
 unittest  // BROKER MOUNT: a refresh_token grant is refused, never relaying the upstream token
@@ -2155,9 +4304,7 @@ unittest  // BROKER MOUNT: a refresh_token grant is refused, never relaying the 
 		status = 200;
 	});
 
-	auto formBody = () @trusted {
-		return cast(ubyte[]) "grant_type=refresh_token&refresh_token=RT".dup;
-	}();
+	auto formBody = cast(ubyte[]) "grant_type=refresh_token&refresh_token=RT".dup;
 	auto req = createTestHTTPServerRequest(URL("https://mcp.example.com/token"),
 			HTTPMethod.POST, createMemoryStream(formBody, false));
 	req.headers["Content-Type"] = "application/x-www-form-urlencoded";
@@ -2173,4 +4320,180 @@ unittest  // BROKER MOUNT: a refresh_token grant is refused, never relaying the 
 	assert(body_.canFind("unsupported_grant_type"));
 	assert(!body_.canFind("gho_upstream_secret"));
 	assert(!upstreamCalled);
+}
+
+version (unittest)
+{
+	/// The proxy `state` carried in an upstream authorize redirect.
+	private string upstreamStateOf(string location) @safe
+	{
+		import std.string : indexOf;
+
+		const mark = "state=";
+		const i = location.indexOf(mark);
+		assert(i >= 0);
+		auto rest = location[i + mark.length .. $];
+		const amp = rest.indexOf('&');
+		return amp < 0 ? rest : rest[0 .. amp];
+	}
+}
+
+unittest  // CALLBACK BINDING: a callback from a browser other than the consenting one is refused
+{
+	import std.algorithm : canFind;
+
+	auto proxy = new OAuthProxy(consentMountConfig());
+	proxy.register(["https://evil.example/cb"]);
+	auto router = new URLRouter;
+	mountOAuthProxy(router, proxy);
+
+	// The attacker approves their own client in their own browser and captures
+	// the upstream authorize URL instead of following it.
+	const page = browserGet(router, "https://mcp.example.com/authorize?client_id=Iv1.upstream&response_type=code&code_challenge_method=S256&code_challenge=ATTACKER" ~ "&redirect_uri=https%3A%2F%2Fevil.example%2Fcb&state=x",
+			"");
+	const approved = browserPost(router, "https://mcp.example.com/consent",
+			consentForm(page.body_), page.setCookie);
+	assert(approved.status == 302);
+	const proxyState = upstreamStateOf(approved.location);
+
+	// The victim follows that URL; the upstream auto-approves and redirects the
+	// victim's browser (no consent cookie, or its own) back to the callback.
+	const noCookie = browserGet(router,
+			"https://mcp.example.com/auth/callback?code=VICTIM&state=" ~ proxyState, "");
+	assert(noCookie.status != 302);
+	assert(!noCookie.location.canFind("VICTIM"));
+	const otherCookie = browserGet(router,
+			"https://mcp.example.com/auth/callback?code=VICTIM&state=" ~ proxyState,
+			"victim-session");
+	assert(otherCookie.status != 302);
+	assert(!otherCookie.location.canFind("VICTIM"));
+}
+
+unittest  // CALLBACK BINDING: the consenting browser's callback relays the code
+{
+	import std.algorithm : canFind, startsWith;
+
+	auto proxy = new OAuthProxy(consentMountConfig());
+	proxy.register(["http://localhost:5000/cb"]);
+	auto router = new URLRouter;
+	mountOAuthProxy(router, proxy);
+
+	const page = browserGet(router, "https://mcp.example.com/authorize?client_id=Iv1.upstream&response_type=code&code_challenge_method=S256&code_challenge=CH" ~ "&redirect_uri=http%3A%2F%2Flocalhost%3A5000%2Fcb&state=cs",
+			"");
+	const approved = browserPost(router, "https://mcp.example.com/consent",
+			consentForm(page.body_), page.setCookie);
+	const proxyState = upstreamStateOf(approved.location);
+
+	const cb = browserGet(router,
+			"https://mcp.example.com/auth/callback?code=C1&state=" ~ proxyState, page.setCookie);
+	assert(cb.status == 302);
+	assert(cb.location.startsWith("http://localhost:5000/cb?"));
+	assert(cb.location.canFind("code=C1"));
+}
+
+version (unittest)
+{
+	/// Start a consented authorization for `http://localhost:5000/cb` and drive
+	/// the upstream callback with `callbackQuery` (appended after its `state`).
+	private BrowserHit completeCallback(OAuthProxyConfig cfg, string callbackQuery) @safe
+	{
+		auto proxy = new OAuthProxy(cfg);
+		proxy.register(["http://localhost:5000/cb"]);
+		auto router = new URLRouter;
+		mountOAuthProxy(router, proxy);
+		const page = browserGet(router,
+				"https://mcp.example.com/authorize?client_id=Iv1.upstream"
+				~ "&response_type=code&code_challenge_method=S256&code_challenge=CH"
+				~ "&redirect_uri=http%3A%2F%2Flocalhost%3A5000%2Fcb&state=cs", "");
+		const approved = browserPost(router, "https://mcp.example.com/consent",
+				consentForm(page.body_), page.setCookie);
+		return browserGet(router, "https://mcp.example.com/auth/callback?state=" ~ upstreamStateOf(
+				approved.location) ~ callbackQuery, page.setCookie);
+	}
+}
+
+unittest  // RFC 9207: a relayed code carries the proxy's iss
+{
+	const cb = completeCallback(consentMountConfig(), "&code=C1");
+	assert(cb.status == 302);
+	assert(cb.location.canFind("code=C1"));
+	assert(cb.location.canFind("iss=https%3A%2F%2Fmcp.example.com"));
+}
+
+unittest  // RFC 9207: a relayed upstream error carries the proxy's iss
+{
+	const cb = completeCallback(consentMountConfig(), "&error=access_denied");
+	assert(cb.status == 302);
+	assert(cb.location.canFind("error=access_denied"));
+	assert(cb.location.canFind("iss=https%3A%2F%2Fmcp.example.com"));
+}
+
+unittest  // RFC 9207: a callback whose iss is not the configured upstream issuer relays no code
+{
+	auto cfg = consentMountConfig();
+	cfg.upstreamIssuer = "https://github.com";
+	const bad = completeCallback(cfg, "&code=C1&iss=https%3A%2F%2Fevil.example");
+	assert(!bad.location.canFind("code=C1"));
+	assert(bad.status == 302 && bad.location.canFind("error="));
+	const good = completeCallback(cfg, "&code=C1&iss=https%3A%2F%2Fgithub.com");
+	assert(good.location.canFind("code=C1"));
+	const absent = completeCallback(cfg, "&code=C1");
+	assert(absent.location.canFind("code=C1"));
+}
+
+unittest  // RFC 9207: an /authorize error redirected to the client carries the proxy's iss
+{
+	const res = authorizeDcr("&response_type=token&code_challenge=CH&code_challenge_method=S256");
+	assert(res.location.canFind("iss=https%3A%2F%2Fmcp.example.com"));
+}
+
+unittest  // RFC 9207: the AS metadata advertises authorization_response_iss_parameter_supported
+{
+	auto proxy = new OAuthProxy(consentMountConfig());
+	assert(proxy.metadataJson()["authorization_response_iss_parameter_supported"].get!bool);
+}
+
+unittest  // CALLBACK BINDING: a pending authorization awaiting consent cannot be completed
+{
+	auto proxy = new OAuthProxy(consentMountConfig());
+	proxy.register(["http://localhost:5000/cb"]);
+	auto router = new URLRouter;
+	mountOAuthProxy(router, proxy);
+
+	const page = browserGet(router, "https://mcp.example.com/authorize?client_id=Iv1.upstream&response_type=code&code_challenge_method=S256&code_challenge=CH" ~ "&redirect_uri=http%3A%2F%2Flocalhost%3A5000%2Fcb&state=cs",
+			"");
+	const proxyState = hiddenField(page.body_, "state");
+	assert(proxyState.length);
+
+	const cb = browserGet(router,
+			"https://mcp.example.com/auth/callback?code=C1&state=" ~ proxyState, page.setCookie);
+	assert(cb.status != 302);
+}
+
+unittest  // CIMD MOUNT: a rejected CIMD authorization leaves no pending state behind
+{
+	import vibe.http.server : createTestHTTPServerRequest,
+		createTestHTTPServerResponse, TestHTTPResponseMode;
+	import vibe.inet.url : URL;
+	import vibe.stream.memory : createMemoryOutputStream;
+
+	auto proxy = cimdProxyWithStubDoc(cimdMountConfig(), cimdMountDoc());
+	proxy.grantConsent(browser1, "https://app.example.com/oauth/client.json", [
+		"read"
+	]);
+	auto router = new URLRouter;
+	auto store = new ProxyStateStore;
+	mountOAuthAuthorize(router, proxy, store, testCookie);
+
+	auto sink = createMemoryOutputStream();
+	auto req = createTestHTTPServerRequest(
+			URL("https://mcp.example.com/authorize?response_type=code&code_challenge_method=S256&"
+			~ "client_id=https%3A%2F%2Fapp.example.com%2Foauth%2Fclient.json"
+			~ "&code_challenge=CH&redirect_uri=http%3A%2F%2F127.0.0.1%3A9999%2Fother&state=cs"));
+	req.headers["Cookie"] = consentCookieName ~ "=" ~ browser1;
+	auto res = createTestHTTPServerResponse(sink, null, TestHTTPResponseMode.bodyOnly);
+	router.handleRequest(req, res);
+
+	assert(res.statusCode == 400);
+	assert(store.length == 0);
 }

@@ -6,10 +6,13 @@
 /// The verifier POSTs the presented token to the authorization server's
 /// introspection endpoint (authenticating as a resource server with
 /// `client_secret_basic` or `client_secret_post`), then maps the RFC 7662
-/// response to a `TokenInfo`: `active:false` (or any HTTP/parse error) yields an
-/// invalid result, while `active:true` yields a valid `TokenInfo` with `scope`,
-/// `sub`, and `aud` mapped across, after enforcing the configured audience and
-/// required scopes. Positive results may be briefly cached.
+/// response to a `TokenInfo`: `active:false` (or a 4xx answer or parse error)
+/// yields an invalid result, an unreachable endpoint or a 429/5xx answer yields
+/// `TokenInfo.temporarilyUnavailable`, and `active:true` yields a valid
+/// `TokenInfo` with `scope`, `sub`, and `aud` mapped across, after enforcing the
+/// configured audience and required scopes. Concurrent introspections of one
+/// token are coalesced, rejections are briefly cached, and positive results may
+/// be cached on request.
 module mcp.auth.introspection_verifier;
 
 import core.time : Duration, seconds;
@@ -18,9 +21,13 @@ import std.algorithm : canFind;
 
 import vibe.data.json : Json, parseJsonString;
 
-import mcp.auth.jwt_verifier : audiences, currentUnixTime, jsonStr, splitScopes;
+import mcp.auth.jwt_verifier : audiences, includesAudience, jsonStr, splitScopes;
 import mcp.auth.oauth : TokenEndpointAuthMethod, basicAuthHeader, secureRequestHTTP;
-import mcp.auth.resource_server : TokenInfo, TokenValidator;
+import mcp.auth.resource_server : TokenInfo, TokenValidator,
+	TokenVerifierUnavailableException, isSsrfRefusal, isUnavailableStatus, parseRetryAfter;
+import mcp.auth.token_cache : TokenCache, TokenCacheOptions;
+import mcp.protocol.jsonrpc : parseUntrustedJson;
+import mcp.protocol.ssrf : SsrfPolicy;
 
 @safe:
 
@@ -47,16 +54,27 @@ struct IntrospectionConfig
 	string audience;
 
 	/// Scopes the token must carry. All must be present in the introspection
-	/// response `scope` for the token to be accepted.
+	/// response `scope` for the token to be accepted. A token missing one is
+	/// rejected as invalid (401 `invalid_token`); to answer with 403
+	/// `insufficient_scope` so the client can step up, require the scopes via
+	/// `ResourceServerConfig.requiredScopes` instead.
 	string[] requiredScopes;
 
-	/// Optional TTL for caching positive (`active:true`) introspection results,
-	/// keyed by the raw token. Zero (the default) disables caching. Caching trades
-	/// revocation latency for performance: a token revoked at the AS, or one whose
-	/// own `exp` is sooner than the TTL, may be served as valid from cache until
-	/// the entry expires. Entry expiry is clamped to the token's `exp` (RFC 7662)
-	/// when present, so the staleness window never outlives the token itself.
-	Duration cacheTtl = Duration.zero;
+	/// How introspection results are reused. Concurrent introspections of the
+	/// same token always share one request. Rejections are cached for
+	/// `cache.negativeTtl` (10 seconds by default). Positive (`active:true`)
+	/// results are not cached by default (`cache.ttl` is zero): revocation that
+	/// takes effect at once is the usual reason to introspect rather than verify
+	/// a JWT locally, and a positive cache would serve a revoked token as valid
+	/// until its entry expires. Set `cache.ttl` to trade that latency for fewer
+	/// requests; an entry's expiry is clamped to the token's `exp` (RFC 7662), so
+	/// it never outlives the token itself.
+	TokenCacheOptions cache = TokenCacheOptions(Duration.zero);
+
+	/// The SSRF policy applied to the introspection request. The default
+	/// requires `https` to a public host (plain `http` only to loopback); an AS
+	/// on a private network needs `SsrfPolicy.allowUserConfigured`.
+	SsrfPolicy ssrfPolicy = SsrfPolicy.allowLoopback;
 }
 
 // ===========================================================================
@@ -68,34 +86,68 @@ struct IntrospectionConfig
 /// (`valid == false` on `active:false`, HTTP failure, or parse error). Plug it
 /// into `ResourceServerConfig.validator`.
 ///
-/// Concurrency: the returned validator and its internal `PositiveCache` hold
-/// unsynchronized mutable state (the cached positive results). Like the rest of
-/// the SDK they are bound to vibe.d's default single-threaded event loop. Do not
-/// share the validator across worker threads; running the router with
-/// `HTTPServerOption.distribute` or worker threads is unsupported (see the
-/// concurrency contract in `mcp.transport.session`).
+/// Concurrency: the returned validator and its internal `TokenCache` hold
+/// unsynchronized mutable state (the cached results and in-flight lookups).
+/// Like the rest of the SDK they are bound to vibe.d's default single-threaded
+/// event loop. Do not share the validator across worker threads; running the
+/// router with `HTTPServerOption.distribute` or worker threads is unsupported
+/// (see the concurrency contract in `mcp.transport.session`).
+///
+/// Throws when `cfg` names no introspection endpoint or client id, or an
+/// `authMethod` other than `clientSecretBasic`/`clientSecretPost`: RFC 7662
+/// requires the resource server to authenticate, and no other method is
+/// implemented here.
 TokenValidator introspectionVerifier(IntrospectionConfig cfg) @safe
 {
-	auto introspector = new HttpIntrospector(cfg);
-	auto cache = cfg.cacheTtl > Duration.zero ? new PositiveCache(cfg.cacheTtl) : null;
+	import std.exception : enforce;
+
+	enforce(cfg.introspectionEndpoint.length > 0,
+			"introspectionVerifier: introspectionEndpoint must be set.");
+	enforce(cfg.clientId.length > 0, "introspectionVerifier: clientId must be set.");
+	enforce(cfg.authMethod == TokenEndpointAuthMethod.clientSecretBasic
+			|| cfg.authMethod == TokenEndpointAuthMethod.clientSecretPost,
+			"introspectionVerifier: authMethod must be clientSecretBasic or clientSecretPost.");
+	return introspectionValidator(cfg, new HttpIntrospector(cfg));
+}
+
+/// `introspectionVerifier` over an arbitrary `Introspector`, so the validation
+/// path can be driven without HTTP. A failed introspection call is logged and
+/// rejects the token.
+package TokenValidator introspectionValidator(IntrospectionConfig cfg, Introspector introspector) @safe
+{
+	auto cache = new TokenCache(cfg.cache);
 	return (string token) @safe {
 		if (token.length == 0)
 			return TokenInfo.invalid();
-		if (cache !is null)
-			if (auto hit = cache.get(token, currentUnixTime()))
-				return *hit;
-		TokenInfo ti;
-		try
-		{
-			const doc = introspector.introspect(token);
-			ti = introspectionResult(cfg, doc);
-		}
-		catch (Exception)
-			return TokenInfo.invalid();
-		if (ti.valid && cache !is null)
-			cache.put(token, ti, currentUnixTime());
-		return ti;
+		return cache.lookup(token, () @safe => introspectOnce(cfg, introspector, token));
 	};
+}
+
+/// Introspect `token` once and map the answer, logging a failed call.
+private TokenInfo introspectOnce(IntrospectionConfig cfg, Introspector introspector, string token) @safe
+{
+	TokenInfo ti;
+	try
+	{
+		const doc = introspector.introspect(token);
+		ti = introspectionResult(cfg, doc);
+	}
+	catch (TokenVerifierUnavailableException e)
+	{
+		import vibe.core.log : logWarn;
+
+		logWarn("Token introspection at %s is unavailable: %s", cfg.introspectionEndpoint, e.msg);
+		return TokenInfo.temporarilyUnavailable(e.retryAfter);
+	}
+	catch (Exception e)
+	{
+		import vibe.core.log : logWarn;
+
+		logWarn("Token introspection at %s failed; rejecting the token: %s",
+				cfg.introspectionEndpoint, e.msg);
+		return TokenInfo.invalid();
+	}
+	return ti;
 }
 
 // ===========================================================================
@@ -106,20 +158,37 @@ TokenValidator introspectionVerifier(IntrospectionConfig cfg) @safe
 /// tests can drive verification against a stub endpoint.
 interface Introspector
 {
-	/// Return the raw RFC 7662 introspection response JSON for `token`.
+	/// Return the raw RFC 7662 introspection response JSON for `token`. Throws
+	/// `TokenVerifierUnavailableException` when the endpoint is unreachable or
+	/// answers 429/5xx, so the request gets 503 rather than 401.
 	string introspect(string token) @safe;
+}
+
+/// Whether an introspection `token_type` names a refresh token (`refresh_token`,
+/// or the `Refresh` some servers report).
+private bool isRefreshTokenType(string tokenType) @safe
+{
+	import std.uni : sicmp;
+
+	return sicmp(tokenType, "refresh_token") == 0 || sicmp(tokenType, "refresh") == 0;
 }
 
 /// Map a raw RFC 7662 introspection response document to a `TokenInfo`, applying
 /// the `cfg` audience and required-scope checks. `active:false`, a non-object
-/// response, or a missing/false `active` member yields an invalid result.
+/// response, a missing/false `active` member, or a `token_type` naming a
+/// refresh token yields an invalid result.
 TokenInfo introspectionResult(IntrospectionConfig cfg, string responseJson) @safe
 {
 	Json doc;
 	try
-		doc = parseJsonString(responseJson);
-	catch (Exception)
+		doc = parseUntrustedJson(responseJson);
+	catch (Exception e)
+	{
+		import vibe.core.log : logWarn;
+
+		logWarn("Token introspection returned a malformed response; rejecting the token: %s", e.msg);
 		return TokenInfo.invalid();
+	}
 
 	if (doc.type != Json.Type.object)
 		return TokenInfo.invalid();
@@ -128,8 +197,13 @@ TokenInfo introspectionResult(IntrospectionConfig cfg, string responseJson) @saf
 	if (active.type != Json.Type.bool_ || !active.get!bool)
 		return TokenInfo.invalid();
 
+	// The hint is advisory: an AS may still describe a refresh token presented
+	// as a bearer, which must never authorize a request.
+	if (isRefreshTokenType(jsonStr(doc, "token_type")))
+		return TokenInfo.invalid();
+
 	auto auds = audiences(doc);
-	if (cfg.audience.length && !auds.canFind(cfg.audience))
+	if (cfg.audience.length && !includesAudience(auds, cfg.audience))
 		return TokenInfo.invalid();
 
 	auto scopes = introspectionScopes(doc);
@@ -167,13 +241,15 @@ final class HttpIntrospector : Introspector
 	}
 }
 
-/// Build the form body for an introspection request (RFC 7662 2.1). For
-/// `client_secret_post`, the client credentials are appended to the body.
+/// Build the form body for an introspection request (RFC 7662 2.1). A bearer
+/// is always an access token, so the request carries
+/// `token_type_hint=access_token`. For `client_secret_post`, the client
+/// credentials are appended to the body.
 string introspectionBody(IntrospectionConfig cfg, string token) @safe
 {
 	import std.uri : encodeComponent;
 
-	string body_ = "token=" ~ encodeComponent(token);
+	string body_ = "token=" ~ encodeComponent(token) ~ "&token_type_hint=access_token";
 	if (cfg.authMethod == TokenEndpointAuthMethod.clientSecretPost)
 	{
 		body_ ~= "&client_id=" ~ encodeComponent(cfg.clientId);
@@ -182,145 +258,50 @@ string introspectionBody(IntrospectionConfig cfg, string token) @safe
 	return body_;
 }
 
-private string postIntrospect(IntrospectionConfig cfg, string token) @trusted
+private string postIntrospect(IntrospectionConfig cfg, string token) @safe
 {
 	import vibe.http.client : HTTPClientRequest, HTTPClientResponse;
 	import vibe.http.common : HTTPMethod;
 	import vibe.stream.operations : readAllUTF8;
 
-	// Refuse to introspect over an insecure transport (must be https, or http to
-	// a loopback host for dev) or against an internal/link-local address. The
-	// connect is pinned to a pre-vetted resolved address (DNS-rebinding
-	// mitigation); secureRequestHTTP throws on an unsafe or unresolvable host.
+	// The connect is pinned to a pre-vetted resolved address (DNS-rebinding
+	// mitigation); secureRequestHTTP throws on a host `cfg.ssrfPolicy` rejects.
 	const body_ = introspectionBody(cfg, token);
 	string responseBody;
-	bool ok = false;
-	secureRequestHTTP(cfg.introspectionEndpoint, (scope HTTPClientRequest req) {
-		req.method = HTTPMethod.POST;
-		req.headers["Content-Type"] = "application/x-www-form-urlencoded";
-		req.headers["Accept"] = "application/json";
-		if (cfg.authMethod == TokenEndpointAuthMethod.clientSecretBasic)
-			req.headers["Authorization"] = basicAuthHeader(cfg.clientId, cfg.clientSecret);
-		req.writeBody(cast(const(ubyte)[]) body_);
-	}, (scope HTTPClientResponse res) {
-		if (res.statusCode >= 200 && res.statusCode < 300)
-		{
-			responseBody = res.bodyReader.readAllUTF8(false, maxIntrospectionBodyBytes);
-			ok = true;
-		}
-		else
-			res.dropBody();
-	});
-	if (!ok)
-		return null;
+	int status;
+	Duration retryAfter;
+	try
+		secureRequestHTTP(cfg.introspectionEndpoint, cfg.ssrfPolicy, (scope HTTPClientRequest req) {
+			req.method = HTTPMethod.POST;
+			req.headers["Content-Type"] = "application/x-www-form-urlencoded";
+			req.headers["Accept"] = "application/json";
+			if (cfg.authMethod == TokenEndpointAuthMethod.clientSecretBasic)
+				req.headers["Authorization"] = basicAuthHeader(cfg.clientId, cfg.clientSecret);
+			req.writeBody(cast(const(ubyte)[]) body_);
+		}, (scope HTTPClientResponse res) {
+			status = res.statusCode;
+			retryAfter = parseRetryAfter(res.headers.get("Retry-After", ""));
+			if (status >= 200 && status < 300)
+				responseBody = res.bodyReader.readAllUTF8(false, maxIntrospectionBodyBytes);
+			else
+				res.dropBody();
+		});
+	catch (Exception e)
+	{
+		if (isSsrfRefusal(e))
+			throw e;
+		throw new TokenVerifierUnavailableException("introspection endpoint unreachable: " ~ e.msg);
+	}
+	if (status < 200 || status >= 300)
+	{
+		import std.format : format;
+
+		const msg = format("introspection endpoint returned HTTP %d", status);
+		if (isUnavailableStatus(status))
+			throw new TokenVerifierUnavailableException(msg, retryAfter);
+		throw new Exception(msg);
+	}
 	return responseBody;
-}
-
-// ===========================================================================
-// Positive-result cache
-// ===========================================================================
-
-/// A short-TTL cache of positive (`active:true`) introspection results, keyed by
-/// the raw token. Negative results are never cached.
-///
-/// The keyed lookup is not constant-time, but a hit requires the attacker to
-/// already present a token that introspected as active, so it is not a guessing
-/// oracle; opaque bearer tokens are assumed to be high-entropy secrets.
-///
-/// Every `put` sweeps entries whose `expiresAt` is in the past, and when a new
-/// key would push `entries.length` past `maxEntries`, the entry with the earliest
-/// `expiresAt` is evicted. This keeps memory bounded under sustained load with
-/// many distinct short-lived tokens.
-final class PositiveCache
-{
-	/// Default maximum number of live cache entries.
-	enum size_t defaultMaxEntries = 10_000;
-
-	private struct Entry
-	{
-		TokenInfo info;
-		long expiresAt; // unix seconds
-	}
-
-	private Duration ttl;
-	private size_t maxEntries;
-	private Entry[string] entries;
-
-	this(Duration ttl, size_t maxEntries = defaultMaxEntries) @safe
-	{
-		this.ttl = ttl;
-		this.maxEntries = maxEntries;
-	}
-
-	/// Number of live (not yet swept) entries.
-	size_t length() @safe
-	{
-		return entries.length;
-	}
-
-	/// Return the cached `TokenInfo` for `token` if present and unexpired.
-	TokenInfo* get(string token, long now) @safe
-	{
-		if (auto e = token in entries)
-		{
-			if (now < e.expiresAt)
-				return &e.info;
-			entries.remove(token);
-		}
-		return null;
-	}
-
-	/// Cache a positive result for `token`. The entry expiry is the TTL, clamped
-	/// down to the token's own `exp` (RFC 7662) when present, so a cached result
-	/// never outlives the token it represents. Expired entries are swept on every
-	/// call; when the cap would be exceeded by a new key, the soonest-expiring
-	/// entry is evicted first.
-	void put(string token, TokenInfo info, long now) @safe
-	{
-		long expiresAt = now + cast(long) ttl.total!"seconds";
-		const exp = introspectionExp(info.claims);
-		if (exp > 0 && exp < expiresAt)
-			expiresAt = exp;
-		if (expiresAt <= now)
-			return; // token is already expired — nothing to cache
-		sweep(now);
-		if (maxEntries != 0 && (token in entries) is null)
-			while (entries.length >= maxEntries)
-				evictOldest();
-		entries[token] = Entry(info, expiresAt);
-	}
-
-	// Remove all entries whose expiresAt is not in the future.
-	private void sweep(long now) @safe
-	{
-		if (entries.length == 0)
-			return;
-		string[] expired;
-		foreach (k, ref e; entries)
-			if (now >= e.expiresAt)
-				expired ~= k;
-		foreach (k; expired)
-			entries.remove(k);
-	}
-
-	// Evict the entry with the earliest expiresAt (closest to expiry / most stale).
-	private void evictOldest() @safe
-	{
-		string oldest;
-		long oldestExpiry = long.max;
-		bool found;
-		foreach (k, ref e; entries)
-		{
-			if (!found || e.expiresAt < oldestExpiry)
-			{
-				oldest = k;
-				oldestExpiry = e.expiresAt;
-				found = true;
-			}
-		}
-		if (found)
-			entries.remove(oldest);
-	}
 }
 
 // Maximum bytes accepted from an introspection endpoint response body.
@@ -332,21 +313,6 @@ package enum size_t maxIntrospectionBodyBytes = 256 * 1024;
 // ===========================================================================
 // Small helpers
 // ===========================================================================
-
-/// Extract the `exp` claim (token expiry, unix seconds) from an introspection
-/// response (RFC 7662 2.2 / RFC 7519 4.1.1). Returns 0 when absent or not a
-/// number, signalling "no known expiry".
-long introspectionExp(Json doc) @safe
-{
-	if (doc.type != Json.Type.object)
-		return 0;
-	auto e = doc["exp"];
-	if (e.type == Json.Type.int_)
-		return e.get!long;
-	if (e.type == Json.Type.float_)
-		return cast(long) e.get!double;
-	return 0;
-}
 
 /// Extract granted scopes from an introspection response: `scope` is a
 /// space-delimited string (RFC 7662 2.2).
@@ -383,18 +349,11 @@ version (unittest)
 		}
 	}
 
-	// Build a TokenValidator over a stub introspector (mirrors the production
-	// wiring in introspectionVerifier, minus the real HTTP).
+	// Build a TokenValidator over a stub introspector through the production
+	// wiring, minus the real HTTP.
 	private TokenValidator stubVerifier(IntrospectionConfig cfg, Introspector introspector) @safe
 	{
-		return (string token) @safe {
-			if (token.length == 0)
-				return TokenInfo.invalid();
-			try
-				return introspectionResult(cfg, introspector.introspect(token));
-			catch (Exception)
-				return TokenInfo.invalid();
-		};
+		return introspectionValidator(cfg, introspector);
 	}
 }
 
@@ -429,6 +388,15 @@ unittest  // a non-object / malformed response is invalid
 	assert(!introspectionResult(cfg, `not json at all`).valid);
 }
 
+unittest  // a response nested past the depth cap is invalid
+{
+	import std.array : replicate;
+
+	IntrospectionConfig cfg;
+	const deep = "[".replicate(1000) ~ "]".replicate(1000);
+	assert(!introspectionResult(cfg, `{"active":true,"sub":"u","x":` ~ deep ~ `}`).valid);
+}
+
 unittest  // aud may be an array of strings
 {
 	IntrospectionConfig cfg;
@@ -452,6 +420,15 @@ unittest  // a matching audience is accepted
 	cfg.audience = "https://mcp.example.com/mcp";
 	auto ti = introspectionResult(cfg, `{"active":true,"aud":["https://mcp.example.com/mcp"]}`);
 	assert(ti.valid);
+}
+
+unittest  // the configured audience is compared in canonical form
+{
+	IntrospectionConfig cfg;
+	cfg.audience = "https://MCP.example.com/mcp/";
+	assert(introspectionResult(cfg, `{"active":true,"aud":"https://mcp.example.com/mcp"}`).valid);
+	assert(!introspectionResult(cfg,
+			`{"active":true,"aud":"https://mcp.example.com/other"}`).valid);
 }
 
 unittest  // a missing required scope is rejected
@@ -486,13 +463,27 @@ unittest  // internal runs of spaces do not produce empty-string scopes
 	assert(ti.scopes == ["a", "b"]);
 }
 
-unittest  // introspectionBody for client_secret_basic carries only the token
+unittest  // introspectionBody for client_secret_basic carries only the token and its type hint
 {
 	IntrospectionConfig cfg;
 	cfg.authMethod = TokenEndpointAuthMethod.clientSecretBasic;
 	cfg.clientId = "rs";
 	cfg.clientSecret = "shh";
-	assert(introspectionBody(cfg, "abc 123") == "token=abc%20123");
+	assert(introspectionBody(cfg, "abc 123") == "token=abc%20123&token_type_hint=access_token");
+}
+
+unittest  // a response describing a refresh token is rejected
+{
+	IntrospectionConfig cfg;
+	assert(!introspectionResult(cfg, `{"active":true,"token_type":"refresh_token"}`).valid);
+	assert(!introspectionResult(cfg, `{"active":true,"token_type":"Refresh"}`).valid);
+}
+
+unittest  // a response describing a bearer access token is accepted
+{
+	IntrospectionConfig cfg;
+	assert(introspectionResult(cfg, `{"active":true,"token_type":"Bearer"}`).valid);
+	assert(introspectionResult(cfg, `{"active":true,"token_type":"access_token"}`).valid);
 }
 
 unittest  // introspectionBody for client_secret_post appends client credentials
@@ -502,7 +493,7 @@ unittest  // introspectionBody for client_secret_post appends client credentials
 	cfg.clientId = "rs";
 	cfg.clientSecret = "s e c";
 	const b = introspectionBody(cfg, "tok");
-	assert(b == "token=tok&client_id=rs&client_secret=s%20e%20c");
+	assert(b == "token=tok&token_type_hint=access_token&client_id=rs&client_secret=s%20e%20c");
 }
 
 unittest  // a stub-backed verifier validates an active token end to end
@@ -537,68 +528,6 @@ unittest  // an empty token is rejected without introspecting
 	assert(!stub.wasCalled);
 }
 
-unittest  // PositiveCache returns a hit before expiry and a miss after
-{
-	auto cache = new PositiveCache(30.seconds);
-	TokenInfo ti;
-	ti.valid = true;
-	ti.subject = "cached-user";
-	cache.put("tok", ti, 1000);
-
-	auto hit = cache.get("tok", 1010);
-	assert(hit !is null);
-	assert(hit.subject == "cached-user");
-
-	assert(cache.get("tok", 1040) is null); // expired (1000 + 30 == 1030)
-	assert(cache.get("other", 1010) is null); // never stored
-}
-
-unittest  // PositiveCache clamps entry expiry to the token's exp claim
-{
-	auto cache = new PositiveCache(30.seconds);
-	TokenInfo ti;
-	ti.valid = true;
-	// exp at 1005 is sooner than now(1000) + ttl(30) == 1030, so it must win.
-	ti.claims = parseJsonString(`{"active":true,"exp":1005}`);
-	cache.put("tok", ti, 1000);
-
-	assert(cache.get("tok", 1004) !is null); // still valid before exp
-	assert(cache.get("tok", 1005) is null); // expired at exp, not at 1030
-}
-
-unittest  // PositiveCache keeps the TTL when exp is later than now + ttl
-{
-	auto cache = new PositiveCache(30.seconds);
-	TokenInfo ti;
-	ti.valid = true;
-	ti.claims = parseJsonString(`{"active":true,"exp":9999}`);
-	cache.put("tok", ti, 1000);
-
-	assert(cache.get("tok", 1029) !is null); // within TTL window
-	assert(cache.get("tok", 1030) is null); // TTL (1030) bounds it, not exp
-}
-
-unittest  // PositiveCache falls back to the TTL when no exp is present
-{
-	auto cache = new PositiveCache(30.seconds);
-	TokenInfo ti;
-	ti.valid = true;
-	ti.claims = parseJsonString(`{"active":true}`);
-	cache.put("tok", ti, 1000);
-
-	assert(cache.get("tok", 1029) !is null);
-	assert(cache.get("tok", 1030) is null);
-}
-
-unittest  // introspectionExp parses integer and floating exp, 0 otherwise
-{
-	assert(introspectionExp(parseJsonString(`{"exp":1700}`)) == 1700);
-	assert(introspectionExp(parseJsonString(`{"exp":1700.9}`)) == 1700);
-	assert(introspectionExp(parseJsonString(`{"active":true}`)) == 0);
-	assert(introspectionExp(parseJsonString(`{"exp":"soon"}`)) == 0);
-	assert(introspectionExp(parseJsonString(`"not-an-object"`)) == 0);
-}
-
 unittest  // postIntrospect body read is capped at maxIntrospectionBodyBytes
 {
 	// Verify that readAllUTF8 throws when given more data than the cap allows.
@@ -625,10 +554,40 @@ unittest  // introspectionVerifier yields a usable TokenValidator
 {
 	IntrospectionConfig cfg;
 	cfg.introspectionEndpoint = "https://as.example.com/introspect";
+	cfg.clientId = "rs";
+	cfg.clientSecret = "rs-secret";
 	TokenValidator v = introspectionVerifier(cfg);
 	assert(v !is null);
 	// An empty token is rejected before any network call.
 	assert(!v("").valid);
+}
+
+unittest  // introspectionVerifier refuses an auth method that sends no client credentials
+{
+	import std.exception : assertThrown;
+
+	IntrospectionConfig cfg;
+	cfg.introspectionEndpoint = "https://as.example.com/introspect";
+	cfg.clientId = "rs";
+	cfg.clientSecret = "rs-secret";
+	cfg.authMethod = TokenEndpointAuthMethod.none;
+	assertThrown(introspectionVerifier(cfg));
+	cfg.authMethod = TokenEndpointAuthMethod.privateKeyJwt;
+	assertThrown(introspectionVerifier(cfg));
+	cfg.authMethod = TokenEndpointAuthMethod.clientSecretPost;
+	assert(introspectionVerifier(cfg) !is null);
+}
+
+unittest  // introspectionVerifier requires an endpoint and a client id
+{
+	import std.exception : assertThrown;
+
+	IntrospectionConfig cfg;
+	cfg.introspectionEndpoint = "https://as.example.com/introspect";
+	assertThrown(introspectionVerifier(cfg));
+	cfg.introspectionEndpoint = "";
+	cfg.clientId = "rs";
+	assertThrown(introspectionVerifier(cfg));
 }
 
 unittest  // HttpIntrospector refuses an insecure (plaintext http) introspection endpoint
@@ -643,6 +602,51 @@ unittest  // HttpIntrospector refuses an insecure (plaintext http) introspection
 	assertThrown(introspector.introspect("some-token"));
 }
 
+version (Posix) unittest  // an introspection endpoint on a non-loopback internal address is reached only when permitted
+{
+	import std.conv : to;
+	import std.exception : assertThrown;
+	import vibe.core.core : runTask, runEventLoop, exitEventLoop;
+	import vibe.http.server : HTTPServerRequest, HTTPServerResponse,
+		HTTPServerSettings, listenHTTP;
+
+	string failure, permitted;
+	bool defaultRefused;
+	runTask(() @safe nothrow{
+		try
+		{
+			auto settings = new HTTPServerSettings;
+			settings.port = 0;
+			settings.bindAddresses = ["0.0.0.0"];
+			auto listener = listenHTTP(settings, (scope HTTPServerRequest req,
+				scope HTTPServerResponse res) @safe {
+				res.writeBody(`{"active":true}`, "application/json");
+			});
+			scope (exit)
+				listener.stopListening();
+			// 0.0.0.0 is an internal, non-loopback address that still reaches
+			// this host's listener on POSIX (Windows refuses to connect to it).
+			IntrospectionConfig cfg;
+			cfg.introspectionEndpoint = "http://0.0.0.0:"
+				~ listener.bindAddresses[0].port.to!string ~ "/introspect";
+			try
+				cast(void) new HttpIntrospector(cfg).introspect("tok");
+			catch (Exception)
+				defaultRefused = true;
+			cfg.ssrfPolicy = SsrfPolicy.allowUserConfigured;
+			permitted = new HttpIntrospector(cfg).introspect("tok");
+		}
+		catch (Exception e)
+			failure = e.msg;
+		exitEventLoop();
+	});
+	runEventLoop();
+
+	assert(failure.length == 0, failure);
+	assert(defaultRefused);
+	assert(permitted == `{"active":true}`);
+}
+
 unittest  // HttpIntrospector refuses an internal/link-local introspection endpoint (SSRF)
 {
 	import std.exception : assertThrown;
@@ -653,50 +657,159 @@ unittest  // HttpIntrospector refuses an internal/link-local introspection endpo
 	assertThrown(introspector.introspect("some-token"));
 }
 
-unittest  // PositiveCache does not grow beyond the configured maxEntries cap
+version (unittest)
 {
-	// A cache with cap of 3 — inserting 5 distinct tokens must not keep all 5.
-	auto cache = new PositiveCache(60.seconds, 3);
-	TokenInfo ti;
-	ti.valid = true;
-	foreach (i; 0 .. 5)
+	import vibe.core.log : LogLevel, Logger, LogLine;
+
+	// Records the text of every warning-or-higher log line.
+	private final class CaptureLogger : Logger
 	{
-		import std.conv : to;
+		string[] lines;
+		this() @safe
+		{
+			minLevel = LogLevel.warn;
+		}
 
-		cache.put("tok-" ~ i.to!string, ti, 1000);
+		override void log(ref LogLine line) @safe
+		{
+			lines ~= line.text;
+		}
 	}
-	// The map must be capped; all 5 entries must NOT all be present.
-	assert(cache.length <= 3);
+
+	private final class ThrowingIntrospector : Introspector
+	{
+		string introspect(string token) @safe
+		{
+			throw new Exception("introspection endpoint unreachable");
+		}
+	}
 }
 
-unittest  // PositiveCache sweeps expired entries on put, reclaiming space
+unittest  // a failed introspection call is logged rather than silently rejected
 {
-	// All entries inserted at t=1000 with ttl=30s expire at t=1030.
-	// After advancing past expiry, a new put must sweep the stale entries.
-	auto cache = new PositiveCache(30.seconds, 10);
-	TokenInfo ti;
-	ti.valid = true;
-	cache.put("a", ti, 1000);
-	cache.put("b", ti, 1000);
-	// Advance past expiry and insert a new entry.
-	cache.put("c", ti, 1031);
-	// "a" and "b" should have been swept; only "c" should remain.
-	assert(cache.get("a", 1031) is null);
-	assert(cache.get("b", 1031) is null);
-	assert(cache.get("c", 1031) !is null);
+	import std.algorithm : any, canFind;
+	import vibe.core.log : deregisterLogger, registerLogger;
+
+	auto logger = new CaptureLogger;
+	auto shared_ = () @trusted { return cast(shared) logger; }();
+	() @trusted { registerLogger(shared_); }();
+	scope (exit)
+		() @trusted { deregisterLogger(shared_); }();
+
+	IntrospectionConfig cfg;
+	cfg.introspectionEndpoint = "https://as.example.com/introspect";
+	auto v = introspectionValidator(cfg, new ThrowingIntrospector);
+	assert(!v("tok").valid);
+	auto lines = (cast() logger).lines;
+	assert(lines.any!(l => l.canFind("introspection endpoint unreachable")));
 }
 
-unittest  // PositiveCache skips storing a token whose exp claim is already in the past
+unittest  // a caller mutating a cached result's claims, scopes, or audience leaves the cache intact
 {
-	// TTL = 30s, now = 1000, but exp = 500 (500 s in the past).
-	// The clamping sets expiresAt = 500, which is already expired relative to now.
-	// put must not store the entry; the cache must remain empty.
-	auto cache = new PositiveCache(30.seconds);
-	TokenInfo ti;
-	ti.valid = true;
-	ti.claims = parseJsonString(`{"active":true,"exp":500}`);
-	cache.put("tok", ti, 1000);
-	// The entry must not be stored — length stays 0 and a get returns null.
-	assert(cache.length == 0);
-	assert(cache.get("tok", 1000) is null);
+	IntrospectionConfig cfg;
+	cfg.cache.ttl = 60.seconds;
+	auto stub = new StubIntrospector(`{"active":true,"sub":"u1","scope":"mcp:read","aud":"https://mcp.example.com/mcp","role":"user"}`);
+	auto v = stubVerifier(cfg, stub);
+
+	auto first = v("tok");
+	first.claims["role"] = "admin";
+	first.scopes[0] = "mcp:admin";
+	first.audience[0] = "https://evil.example";
+
+	auto second = v("tok");
+	second.claims["role"] = "admin";
+	second.scopes[0] = "mcp:admin";
+
+	auto third = v("tok");
+	assert(third.claims["role"].get!string == "user");
+	assert(third.scopes == ["mcp:read"]);
+	assert(third.audience == ["https://mcp.example.com/mcp"]);
+}
+
+unittest  // positive introspection results are not cached by default, so a revocation takes effect at once
+{
+	IntrospectionConfig cfg;
+	auto stub = new StubIntrospector(`{"active":true,"sub":"u1"}`);
+	auto v = stubVerifier(cfg, stub);
+	assert(v("tok").valid);
+	stub.response = `{"active":false}`;
+	assert(!v("tok").valid);
+}
+
+unittest  // an inactive token is briefly negatively cached
+{
+	IntrospectionConfig cfg;
+	auto stub = new StubIntrospector(`{"active":false}`);
+	auto v = stubVerifier(cfg, stub);
+	assert(!v("tok").valid);
+	stub.wasCalled = false;
+	assert(!v("tok").valid);
+	assert(!stub.wasCalled, "a repeated dead token must not cost another introspection");
+}
+
+unittest  // an unavailable introspection endpoint yields a temporarily-unavailable TokenInfo
+{
+	final class DownIntrospector : Introspector
+	{
+		string introspect(string token) @safe
+		{
+			throw new TokenVerifierUnavailableException("HTTP 503", 12.seconds);
+		}
+	}
+
+	IntrospectionConfig cfg;
+	cfg.introspectionEndpoint = "https://as.example.com/introspect";
+	auto ti = introspectionValidator(cfg, new DownIntrospector)("tok");
+	assert(!ti.valid && ti.unavailable);
+	assert(ti.retryAfter == 12.seconds);
+
+	// Any other failure still rejects the token outright.
+	ti = introspectionValidator(cfg, new ThrowingIntrospector)("tok");
+	assert(!ti.valid && !ti.unavailable);
+}
+
+unittest  // a 503 introspection response is reported as an unavailable verifier with its status code and Retry-After
+{
+	import std.algorithm : canFind;
+	import std.conv : to;
+	import vibe.core.core : runTask, runEventLoop, exitEventLoop;
+	import vibe.http.server : HTTPServerRequest, HTTPServerResponse,
+		HTTPServerSettings, listenHTTP;
+
+	string failure, thrown;
+	Duration retryAfter;
+	runTask(() @safe nothrow{
+		try
+		{
+			auto settings = new HTTPServerSettings;
+			settings.port = 0;
+			settings.bindAddresses = ["127.0.0.1"];
+			auto listener = listenHTTP(settings, (scope HTTPServerRequest req,
+				scope HTTPServerResponse res) @safe {
+				res.statusCode = 503;
+				res.headers["Retry-After"] = "20";
+				res.writeBody("down for maintenance", "text/plain");
+			});
+			scope (exit)
+				listener.stopListening();
+			IntrospectionConfig cfg;
+			cfg.introspectionEndpoint = "http://127.0.0.1:"
+				~ listener.bindAddresses[0].port.to!string ~ "/introspect";
+			try
+				cast(void) new HttpIntrospector(cfg).introspect("tok");
+			catch (TokenVerifierUnavailableException e)
+			{
+				thrown = e.msg;
+				retryAfter = e.retryAfter;
+			}
+		}
+		catch (Exception e)
+			failure = e.msg;
+		exitEventLoop();
+	});
+	runEventLoop();
+
+	assert(failure.length == 0, failure);
+	assert(thrown.canFind("HTTP 503"), thrown);
+	assert(retryAfter == 20.seconds);
 }

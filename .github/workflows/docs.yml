@@ -4,10 +4,11 @@ name: Docs
 #
 # - Always builds the docs on every push/PR (and release) so doc generation can
 #   never silently break (the "docs generate in CI" acceptance criterion).
-# - Publishes to GitHub Pages only on a published release (or a manual
-#   workflow_dispatch), not on every push to main. Publishing is gated: it only
-#   runs when Pages is enabled for the repository. If Pages is not available the
-#   deploy step fails softly and the build job still succeeds.
+# - Publishes to GitHub Pages on every push to main (or a manual
+#   workflow_dispatch), so the published reference tracks the API the README
+#   documents. Publishing is gated: it only runs when Pages is enabled for the
+#   repository. If Pages is not available the deploy step fails softly and the
+#   build job still succeeds.
 
 on:
   push:
@@ -59,7 +60,7 @@ jobs:
           path: docs/
 
       - name: Upload Pages artifact
-        if: github.event_name == 'release' || github.event_name == 'workflow_dispatch'
+        if: (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch'
         uses: actions/upload-pages-artifact@v5
         with:
           path: docs/
@@ -67,12 +68,14 @@ jobs:
   publish-pages:
     name: Publish to GitHub Pages
     needs: build-docs
-    if: github.event_name == 'release' || github.event_name == 'workflow_dispatch'
+    if: (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     # GitHub Pages allows one in-flight deployment at a time; without a shared
-    # queue, two publishes started close together (e.g. two releases) supersede
-    # each other and the superseded one is marked "failure". A dedicated `pages`
-    # concurrency group with cancel-in-progress:false serialises them instead.
+    # queue, two publishes started close together (e.g. two quick pushes to main)
+    # supersede each other and the superseded one is marked "failure". A
+    # dedicated `pages` concurrency group with cancel-in-progress:false
+    # serialises them instead; a still-pending publish is replaced by a newer one,
+    # so Pages always ends on the latest main.
     concurrency:
       group: pages
       cancel-in-progress: false

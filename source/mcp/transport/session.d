@@ -3,245 +3,49 @@ module mcp.transport.session;
 import core.time : Duration, MonoTime, minutes;
 
 import mcp.protocol.errors : McpException, internalError;
+import mcp.internal.expiring_map : BoundedExpiringMap;
 import mcp.server.connection : ConnectionState;
 
-// fillSecureRandom binds BCryptGenRandom from bcrypt.dll on Windows; druntime
-// does not link its import library implicitly, so request it here.
-version (Windows) pragma(lib, "bcrypt");
-
-// extern (Windows) declarations must be at module scope to receive C linkage;
-// inside a function body they get D name mangling and the linker cannot resolve
-// them against bcrypt.lib.
-version (Windows)
+/// The bounds a `SessionManager` keeps its sessions within.
+struct SessionLimits
 {
-	import core.sys.windows.windows : ULONG, PUCHAR;
-
-	private alias NTSTATUS = int;
-	private enum ULONG BCRYPT_USE_SYSTEM_PREFERRED_RNG = 0x00000002;
-	private extern (Windows) NTSTATUS BCryptGenRandom(void* hAlgorithm,
-			PUCHAR pbBuffer, ULONG cbBuffer, ULONG dwFlags) nothrow @nogc;
+	/// A session with no request and no open GET stream for this long is
+	/// expired (`Duration.zero` disables expiry).
+	Duration idleTtl = 30.minutes;
+	/// The most sessions kept at once (`0`: unbounded). Past it, creating a
+	/// session evicts the least-recently-active never-used idle session first,
+	/// then the least-recently-active idle one; when every session is running a
+	/// request or holding a GET stream, the new session is refused instead.
+	size_t maxSessions = 10_000;
+	/// The most sessions one authenticated principal keeps at once (`0`:
+	/// unbounded). Past it, that principal's least-recently-active idle session
+	/// is evicted, so one principal cannot push out everyone else's sessions.
+	size_t maxPerPrincipal = 100;
+	/// The most unauthenticated sessions created from one remote address kept at
+	/// once (`0`: unbounded). Past it, that address's least-recently-active idle
+	/// anonymous session is evicted, so one anonymous caller cannot push out
+	/// everyone else's sessions. Behind a reverse proxy every anonymous caller
+	/// shares the proxy's address; raise this, or set it to `0`, there.
+	size_t maxAnonymousPerAddress = 100;
 }
 
-/// A string-keyed cache of `V` with a per-entry insertion/activity timestamp,
-/// bounded by an idle TTL and a maximum live-entry count. It owns the value map
-/// and the parallel timestamp map together so the "remove from both" invariant
-/// lives in one place, and runs the TTL sweep + LRU cap eviction internally.
-///
-/// `ttl == Duration.zero` disables the sweep; `maxEntries == 0` disables the
-/// cap. `clock` is injectable (`null` => `MonoTime.currTime`) so callers can
-/// drive expiry deterministically in tests. The container does no locking; the
-/// owner serializes access (e.g. `synchronized` on a `synchronized`-using class,
-/// or vibe.d's single-fiber loop).
-struct BoundedExpiringMap(V)
+/// The key a caller's per-client caps count it under: the authenticated
+/// `principal` when there is one, else its remote `address` ("" when neither is
+/// known). Distinct prefixes keep a principal named like an address out of that
+/// address's anonymous bucket.
+package string callerBucket(string principal, string address) @safe pure nothrow
 {
-	private V[string] values;
-	private MonoTime[string] stamps;
-	private Duration ttl;
-	private size_t maxEntries;
-	private MonoTime delegate() @safe clock;
-
-	this(Duration ttl, size_t maxEntries, MonoTime delegate() @safe clock) @safe
-	{
-		this.ttl = ttl;
-		this.maxEntries = maxEntries;
-		this.clock = clock;
-	}
-
-	private MonoTime now() @safe
-	{
-		return clock is null ? MonoTime.currTime : clock();
-	}
-
-	/// Sweep expired entries, evict the oldest if inserting a new key would
-	/// exceed the cap, then store `value` and stamp it as just-active.
-	void put(string key, V value) @safe
-	{
-		const t = now();
-		sweep(t);
-		if (maxEntries != 0 && (key in values) is null)
-			while (values.length >= maxEntries && evictOldest())
-			{
-			}
-		values[key] = value;
-		stamps[key] = t;
-	}
-
-	/// Sweep expired entries, then consume and return the entry for `key`,
-	/// setting `found`. The entry is removed (single use).
-	V take(string key, out bool found) @safe
-	{
-		sweep(now());
-		if (auto p = key in values)
-		{
-			found = true;
-			auto v = *p;
-			drop(key);
-			return v;
-		}
-		found = false;
-		return V.init;
-	}
-
-	/// Pointer to the live value for `key`, or `null` when absent. Sweeps expired
-	/// entries before the lookup so a session past its idle TTL is not returned.
-	/// When `refresh` is set, a hit stamps the entry as just-active so it survives
-	/// future idle sweeps.
-	V* get(string key, bool refresh) @safe
-	{
-		sweep(now());
-		if (auto p = key in values)
-		{
-			if (refresh)
-				stamps[key] = now();
-			return p;
-		}
-		return null;
-	}
-
-	/// Whether `key` has a live entry. Sweeps expired entries first so that a
-	/// session past its idle TTL is not reported as present.
-	bool contains(string key) @safe
-	{
-		sweep(now());
-		return (key in values) !is null;
-	}
-
-	/// Remove the entry for `key` from both maps. Returns whether it existed.
-	bool remove(string key) @safe
-	{
-		if ((key in values) is null)
-			return false;
-		drop(key);
-		return true;
-	}
-
-	/// Number of live entries.
-	size_t length() @safe
-	{
-		return values.length;
-	}
-
-	private void drop(string key) @safe
-	{
-		values.remove(key);
-		stamps.remove(key);
-	}
-
-	private void sweep(MonoTime t) @safe
-	{
-		if (ttl <= Duration.zero || values.length == 0)
-			return;
-		string[] expired;
-		foreach (k, ts; stamps)
-			if (t - ts >= ttl)
-				expired ~= k;
-		foreach (k; expired)
-			drop(k);
-	}
-
-	private bool evictOldest() @safe
-	{
-		string oldest;
-		MonoTime oldestTs;
-		bool found;
-		foreach (k, ts; stamps)
-			if (!found || ts < oldestTs)
-			{
-				oldest = k;
-				oldestTs = ts;
-				found = true;
-			}
-		if (!found)
-			return false;
-		drop(oldest);
-		return true;
-	}
+	return principal.length ? "\x1ep\x1e" ~ principal : address.length ? "\x1ea\x1e" ~ address : "";
 }
 
-unittest  // BoundedExpiringMap put/take round-trips and consumes the entry
+/// Thrown by `SessionManager.create` when a session cap is reached and every
+/// session that could make room is busy. The transport answers 503.
+class SessionCapacityException : Exception
 {
-	auto m = BoundedExpiringMap!int(Duration.zero, 0, null);
-	m.put("a", 7);
-	assert(m.length == 1);
-	bool found;
-	assert(m.take("a", found) == 7 && found);
-	// Consumed: a second take misses.
-	m.take("a", found);
-	assert(!found);
-}
-
-unittest  // BoundedExpiringMap sweeps entries older than the TTL on the next put/take
-{
-	import core.time : MonoTime, minutes;
-
-	auto clk = MonoTime.currTime;
-	auto m = BoundedExpiringMap!int(10.minutes, 0, () @safe => clk);
-	m.put("old", 1);
-	clk += 11.minutes;
-	m.put("fresh", 2);
-	assert(m.length == 1);
-	bool found;
-	m.take("old", found);
-	assert(!found);
-	m.take("fresh", found);
-	assert(found);
-}
-
-unittest  // BoundedExpiringMap caps live entries, evicting the oldest by timestamp
-{
-	import core.time : MonoTime, minutes, seconds;
-
-	auto clk = MonoTime.currTime;
-	auto m = BoundedExpiringMap!int(10.minutes, 2, () @safe => clk);
-	m.put("a", 1);
-	clk += 1.seconds;
-	m.put("b", 2);
-	clk += 1.seconds;
-	// Third put exceeds the cap of 2: the oldest ("a") is evicted.
-	m.put("c", 3);
-	assert(m.length == 2);
-	bool found;
-	m.take("a", found);
-	assert(!found);
-	m.take("b", found);
-	assert(found);
-	m.take("c", found);
-	assert(found);
-}
-
-unittest  // BoundedExpiringMap overwriting an existing key does not trigger eviction
-{
-	auto m = BoundedExpiringMap!int(Duration.zero, 1, null);
-	m.put("a", 1);
-	m.put("a", 2);
-	assert(m.length == 1);
-	bool found;
-	assert(m.take("a", found) == 2 && found);
-}
-
-unittest  // BoundedExpiringMap get(refresh) keeps an in-use entry off the eviction block
-{
-	import core.time : MonoTime, minutes, seconds;
-
-	auto clk = MonoTime.currTime;
-	auto m = BoundedExpiringMap!int(Duration.zero, 2, () @safe => clk);
-	m.put("a", 1);
-	clk += 1.seconds;
-	m.put("b", 2);
-	clk += 1.seconds;
-	// Touch "a" so "b" becomes least-recently-active.
-	assert(*m.get("a", true) == 1);
-	m.put("c", 3);
-	assert(m.contains("a") && m.contains("c") && !m.contains("b"));
-}
-
-unittest  // BoundedExpiringMap remove drops the entry and reports prior presence
-{
-	auto m = BoundedExpiringMap!int(Duration.zero, 0, null);
-	m.put("a", 1);
-	assert(m.remove("a"));
-	assert(!m.remove("a"));
-	assert(m.length == 0);
+	this(string msg, string file = __FILE__, size_t line = __LINE__) @safe pure nothrow
+	{
+		super(msg, file, line);
+	}
 }
 
 /// Tracks active Streamable HTTP sessions for a server mount.
@@ -273,55 +77,153 @@ final class SessionManager
 	// ids can never be observed through another's. The container bounds residency
 	// by idle TTL and active-session cap, evicting least-recently-active sessions
 	// so a never-DELETE client cannot grow the table without bound.
-	private BoundedExpiringMap!ConnectionState sessions;
+	private BoundedExpiringMap!Session sessions;
+	private size_t maxPerPrincipal;
+	private size_t maxAnonymousPerAddress;
+	/// Live sessions per non-empty `Session.bucket`.
+	private size_t[string] perBucket;
 
-	/// Default idle TTL applied when none is configured: a stateful session left
-	/// untouched for this long is swept on the next `create`.
-	enum Duration defaultIdleTtl = 30.minutes;
-
-	/// Default cap on concurrently-active sessions, bounding worst-case
-	/// `ConnectionState` residency for a server whose clients never issue DELETE.
-	enum size_t defaultMaxActive = 10_000;
-
-	/// Construct a session manager with the default idle TTL and active-session
-	/// cap, both bounding `ConnectionState` residency for abandoned sessions.
-	this() @safe
+	/// A session's state together with the authenticated principal (token
+	/// subject, "" when unauthenticated) that created it.
+	private static struct Session
 	{
-		this(defaultIdleTtl, defaultMaxActive);
+		ConnectionState state;
+		string principal;
+		/// The key its creator's session cap counts it under: the principal when
+		/// authenticated, else a key derived from the remote address ("" when
+		/// neither is known).
+		string bucket;
+		/// Standalone GET streams currently open on the session.
+		size_t streams;
 	}
 
-	/// Construct with an explicit idle TTL and active-session cap. `idleTtl`
-	/// `Duration.zero` disables the idle sweep; `maxActive` `0` disables the cap.
-	this(Duration idleTtl, size_t maxActive) @safe
+	/// Construct a session manager with the default `SessionLimits`.
+	this() @safe
 	{
-		sessions = BoundedExpiringMap!ConnectionState(idleTtl, maxActive, null);
+		this(SessionLimits.init);
+	}
+
+	/// Construct with explicit `limits`.
+	this(SessionLimits limits) @safe
+	{
+		sessions = BoundedExpiringMap!Session(limits.idleTtl, limits.maxSessions, null);
+		maxPerPrincipal = limits.maxPerPrincipal;
+		maxAnonymousPerAddress = limits.maxAnonymousPerAddress;
+		sessions.onEvict = &evicted;
+		sessions.busy = (ref Session s) @safe => s.state.inFlight.length > 0 || s.streams > 0;
+	}
+
+	/// Called with a session's id after the idle sweep or the active-session cap
+	/// removes it, so the transport can close the session's open streams. Not
+	/// called for `terminate`.
+	void delegate(string id) @safe onExpire;
+
+	/// Report the end of an expired or evicted session. Only idle sessions
+	/// expire or are evicted, so it has no request to cancel.
+	private void evicted(string id, Session s) @safe
+	{
+		forget(s.bucket);
+		if (onExpire !is null)
+			onExpire(id);
 	}
 
 	/// Generate a new cryptographically-secure session id, create and store the
-	/// per-session `ConnectionState` it owns, record it as active, and return the
-	/// id. The id is a 256-bit value rendered as lowercase hex, which satisfies the
+	/// per-session `ConnectionState` it owns, bind it to `principal` (the
+	/// authenticated subject of the `initialize` request, "" when unauthenticated),
+	/// record it as active, and return the id. The id is a 256-bit value rendered as lowercase hex, which satisfies the
 	/// spec requirement that the id "MUST only contain visible ASCII characters
 	/// (ranging from 0x21 to 0x7E)".
 	///
-	/// Before minting the new session the idle TTL sweep runs lazily and, if the
-	/// active-session cap would be exceeded, the least-recently-active session is
-	/// evicted — so a client that connects, initializes, and walks away without
-	/// DELETE cannot grow the table without bound.
+	/// Before minting the new session the idle TTL sweep runs lazily and, if a
+	/// cap would be exceeded, the least-recently-active idle session is evicted:
+	/// one of `principal`'s own sessions for the per-principal cap (or, when
+	/// unauthenticated, one of `address`'s anonymous sessions for the per-address
+	/// cap), any session for the global cap. So a client that connects,
+	/// initializes, and walks away without DELETE cannot grow the table without
+	/// bound. A session running a request or holding an open GET stream is never
+	/// evicted; when only such sessions remain, no session is minted.
 	///
-	/// Throws: `McpException` (`internalError`) when the host OS CSPRNG is
-	/// unavailable. This is fail-closed (see `generateSessionId`/`fillSecureRandom`),
+	/// Throws: `SessionCapacityException` when a cap is reached and every
+	/// candidate session is busy. `McpException` (`internalError`) when the host
+	/// OS CSPRNG is unavailable. This is fail-closed (see `generateSessionId`),
 	/// so callers on the request path (e.g. `streamable_http.handlePost`'s
 	/// `initialize` branch) must be prepared for it to throw rather than always
 	/// returning an id. vibe.d converts an escaping `McpException` to an HTTP 500;
 	/// `handlePost` additionally maps it to a JSON-RPC error response so the wire
 	/// shape matches every other error path.
-	string create() @safe
+	string create(string principal = "", string address = "") @safe
 	{
+		const bucket = callerBucket(principal, address);
+		const cap = principal.length ? maxPerPrincipal : maxAnonymousPerAddress;
+		if (cap != 0 && bucket.length)
+		{
+			bool mine(ref Session s) @safe
+			{
+				return s.bucket == bucket;
+			}
+
+			while (perBucket.get(bucket, 0) >= cap)
+				if (!sessions.evictOldest(&mine))
+					throw new SessionCapacityException(principal.length
+							? "too many active sessions for this principal"
+							: "too many active sessions for this address");
+		}
 		const id = generateSessionId();
 		// put() runs the lazy idle sweep and cap eviction before inserting, so an
 		// abandoned session is reclaimed the next time any client initializes.
-		sessions.put(id, new ConnectionState);
+		if (!sessions.put(id, Session(new ConnectionState, principal, bucket)))
+			throw new SessionCapacityException("too many active sessions");
+		if (bucket.length)
+			perBucket[bucket] = perBucket.get(bucket, 0) + 1;
 		return id;
+	}
+
+	/// Release one session's slot in `bucket`.
+	private void forget(string bucket) @safe
+	{
+		if (auto n = bucket in perBucket)
+		{
+			if (*n <= 1)
+				perBucket.remove(bucket);
+			else
+				(*n)--;
+		}
+	}
+
+	/// Record that a standalone GET stream opened on session `id`. While any is
+	/// open the session neither expires nor is evicted to make room.
+	void streamOpened(string id) @safe
+	{
+		if (auto p = sessions.get(id, true))
+			p.streams++;
+	}
+
+	/// Number of standalone GET streams open on session `id`.
+	size_t openStreams(string id) @safe
+	{
+		if (auto p = sessions.get(id, false))
+			return p.streams;
+		return 0;
+	}
+
+	/// Record that a standalone GET stream on session `id` closed.
+	void streamClosed(string id) @safe
+	{
+		if (auto p = sessions.get(id, true))
+			if (p.streams > 0)
+				p.streams--;
+	}
+
+	/// Whether `id` is an active session created by `principal`. A session id
+	/// presented under a different principal's token must be treated as unknown,
+	/// so possessing another client's session id does not grant use of it.
+	bool ownedBy(string id, string principal) @safe
+	{
+		if (id.length == 0)
+			return false;
+		if (auto p = sessions.get(id, false))
+			return p.principal == principal;
+		return false;
 	}
 
 	/// Whether `id` names a currently-active (non-terminated) session.
@@ -336,22 +238,36 @@ final class SessionManager
 	/// `null` when the id is empty, unknown, or already terminated. The request
 	/// path puts this on the request context so dispatch reads/writes only this
 	/// session's per-connection state. Resolving a session refreshes its
-	/// last-activity timestamp so an in-use session is never swept as idle.
-	ConnectionState stateFor(string id) @safe
+	/// last-activity timestamp so an in-use session is never swept as idle, and,
+	/// unless `countsAsUse` is false (the `initialize` that minted it), marks it
+	/// used so cap eviction removes never-used sessions first.
+	ConnectionState stateFor(string id, bool countsAsUse = true) @safe
 	{
 		if (id.length == 0)
 			return null;
 		if (auto p = sessions.get(id, true))
-			return *p;
+		{
+			if (countsAsUse)
+				sessions.markUsed(id);
+			return p.state;
+		}
 		return null;
 	}
 
-	/// Terminate `id`. Returns true if the session existed (and was removed,
-	/// dropping its `ConnectionState`), false if it was unknown/already terminated.
+	/// Terminate `id`, cancelling its in-flight requests so their handlers stop
+	/// work nobody will receive. Returns true if the session existed (and was
+	/// removed, dropping its `ConnectionState`), false if it was unknown/already
+	/// terminated.
 	bool terminate(string id) @safe
 	{
 		if (id.length == 0)
 			return false;
+		auto p = sessions.get(id, false);
+		if (p is null)
+			return false;
+		foreach (tok; p.state.inFlight)
+			tok.cancel();
+		forget(p.bucket);
 		return sessions.remove(id);
 	}
 
@@ -380,7 +296,7 @@ unittest  // create() past the active-session cap evicts the oldest rather than 
 	import core.thread : Thread;
 	import core.time : msecs;
 
-	auto mgr = new SessionManager(Duration.zero, 3);
+	auto mgr = new SessionManager(SessionLimits(Duration.zero, 3));
 	const a = mgr.create();
 	Thread.sleep(2.msecs);
 	const b = mgr.create();
@@ -400,7 +316,7 @@ unittest  // resolving a session via stateFor refreshes its activity so it is no
 	import core.thread : Thread;
 	import core.time : msecs;
 
-	auto mgr = new SessionManager(Duration.zero, 2);
+	auto mgr = new SessionManager(SessionLimits(Duration.zero, 2));
 	const a = mgr.create();
 	Thread.sleep(2.msecs);
 	const b = mgr.create();
@@ -421,13 +337,47 @@ unittest  // an idle session past the TTL is swept on the next create()
 	import core.thread : Thread;
 	import core.time : msecs;
 
-	auto mgr = new SessionManager(5.msecs, 0);
+	auto mgr = new SessionManager(SessionLimits(5.msecs, 0));
 	const stale = mgr.create();
 	assert(mgr.isActive(stale));
 	Thread.sleep(20.msecs);
 	const fresh = mgr.create();
 	assert(!mgr.isActive(stale), "an idle session past the TTL must be swept");
 	assert(mgr.isActive(fresh));
+}
+
+unittest  // a session with an in-flight request is not swept as idle
+{
+	import core.thread : Thread;
+	import core.time : msecs;
+	import mcp.server.context : CancellationToken;
+
+	auto mgr = new SessionManager(SessionLimits(5.msecs, 0));
+	const busy = mgr.create();
+	auto tok = new CancellationToken;
+	mgr.stateFor(busy).inFlight["i:1"] = tok;
+	Thread.sleep(20.msecs);
+	mgr.create();
+	assert(mgr.isActive(busy), "a session running a request must outlive the idle TTL");
+	assert(!tok.cancelled);
+}
+
+unittest  // a session's idle clock restarts when its last in-flight request ends
+{
+	import core.thread : Thread;
+	import core.time : msecs;
+	import mcp.server.context : CancellationToken;
+
+	auto mgr = new SessionManager(SessionLimits(30.msecs, 0));
+	const id = mgr.create();
+	auto state = mgr.stateFor(id);
+	state.inFlight["i:1"] = new CancellationToken;
+	Thread.sleep(40.msecs);
+	assert(mgr.isActive(id));
+	state.inFlight.remove("i:1");
+	assert(mgr.isActive(id), "a just-finished request leaves the session freshly active");
+	Thread.sleep(40.msecs);
+	assert(!mgr.isActive(id));
 }
 
 unittest  // isActive sweeps expired entries without needing a create() to trigger the sweep
@@ -439,7 +389,7 @@ unittest  // isActive sweeps expired entries without needing a create() to trigg
 	import core.thread : Thread;
 	import core.time : msecs;
 
-	auto mgr = new SessionManager(5.msecs, 0);
+	auto mgr = new SessionManager(SessionLimits(5.msecs, 0));
 	const stale = mgr.create();
 	assert(mgr.isActive(stale));
 	Thread.sleep(20.msecs);
@@ -457,7 +407,7 @@ unittest  // stateFor returns null for an expired session without needing a prio
 	import core.thread : Thread;
 	import core.time : msecs;
 
-	auto mgr = new SessionManager(5.msecs, 0);
+	auto mgr = new SessionManager(SessionLimits(5.msecs, 0));
 	const stale = mgr.create();
 	assert(mgr.isActive(stale));
 	Thread.sleep(20.msecs);
@@ -470,7 +420,7 @@ unittest  // stateFor returns null for an expired session without needing a prio
 
 unittest  // a disabled idle TTL and disabled cap leave sessions resident (historical behaviour)
 {
-	auto mgr = new SessionManager(Duration.zero, 0);
+	auto mgr = new SessionManager(SessionLimits(Duration.zero, 0));
 	string[] ids;
 	foreach (_; 0 .. 5)
 		ids ~= mgr.create();
@@ -514,7 +464,8 @@ unittest  // terminating a session drops its ConnectionState
 	assert(mgr.stateFor(id) is null);
 }
 
-/// Produce a cryptographically-secure, hex-encoded 256-bit session id.
+/// Produce a cryptographically-secure, hex-encoded 256-bit session id, drawn
+/// from the OS CSPRNG via `cryptoRandomFill`.
 ///
 /// Throws: `McpException` (`internalError`) when no OS CSPRNG can be read. There is
 /// deliberately no non-cryptographic fallback, so this is a fallible path; callers
@@ -522,65 +473,20 @@ unittest  // terminating a session drops its ConnectionState
 string generateSessionId() @safe
 {
 	import std.format : format;
-
-	ubyte[32] buf;
-	fillSecureRandom(buf[]);
-	return format("%(%02x%)", buf[]);
-}
-
-/// Fill `dst` with cryptographically-secure random bytes drawn from the host
-/// OS's CSPRNG (`/dev/urandom` on Posix, `BCryptGenRandom` on Windows). There is
-/// deliberately NO `std.random` fallback: a Mersenne-Twister-derived id would be
-/// predictable and would weaken session-hijacking protection. If no OS crypto
-/// source can be read, this fails closed by throwing rather than emitting a
-/// non-cryptographic id.
-private void fillSecureRandom(ubyte[] dst) @trusted
-{
-	if (dst.length == 0)
-		return;
+	import mcp.auth.csprng : CsprngException, cryptoRandomFill;
 
 	// Test seam: a build configured with this version simulates an unavailable OS
-	// CSPRNG so the fail-closed contract -- create()/generateSessionId() throw
-	// McpException rather than emitting a predictable id -- can be exercised by a
-	// regression test. Never defined in normal builds.
+	// CSPRNG so the fail-closed contract can be exercised by a regression test.
+	// Never defined in normal builds.
 	version (McpForceCsprngFailure)
 		throw internalError("forced CSPRNG failure (test seam)");
 
-	version (Posix)
-	{
-		import std.stdio : File;
-
-		try
-		{
-			auto f = File("/dev/urandom", "rb");
-			const got = f.rawRead(dst);
-			if (got.length == dst.length)
-				return;
-		}
-		catch (Exception)
-		{
-		}
-		throw internalError(
-				"unable to read cryptographically-secure random bytes from /dev/urandom");
-	}
-	else version (Windows)
-	{
-		// BCryptGenRandom with BCRYPT_USE_SYSTEM_PREFERRED_RNG draws from the
-		// system-preferred CSPRNG without needing an algorithm handle. NTSTATUS 0
-		// (STATUS_SUCCESS) indicates success.
-		const status = BCryptGenRandom(null, cast(PUCHAR) dst.ptr,
-				cast(ULONG) dst.length, BCRYPT_USE_SYSTEM_PREFERRED_RNG);
-		if (status == 0)
-			return;
-		throw internalError(
-				"BCryptGenRandom failed to provide cryptographically-secure random bytes");
-	}
-	else
-	{
-		// Fail closed on any platform without a known OS CSPRNG rather than
-		// emitting a predictable id.
-		throw internalError("no cryptographically-secure random source available on this platform");
-	}
+	ubyte[32] buf;
+	try
+		cryptoRandomFill(buf[]);
+	catch (CsprngException e)
+		throw internalError("unable to read cryptographically-secure random bytes: " ~ e.msg);
+	return format("%(%02x%)", buf[]);
 }
 
 unittest  // generated ids are visible-ASCII hex of the expected length
@@ -657,4 +563,239 @@ version (McpForceCsprngFailure) unittest  // create()/generateSessionId fail clo
 
 	auto mgr = new SessionManager;
 	assertThrown!McpException(mgr.create());
+}
+
+unittest  // terminate cancels the session's in-flight requests
+{
+	import mcp.server.context : CancellationToken;
+
+	auto mgr = new SessionManager;
+	const id = mgr.create();
+	auto tok = new CancellationToken;
+	mgr.stateFor(id).inFlight["i:1"] = tok;
+	assert(mgr.terminate(id));
+	assert(tok.cancelled, "a terminated session's in-flight request must be cancelled");
+}
+
+unittest  // a session evicted past the cap has its end reported
+{
+	import core.thread : Thread;
+	import core.time : msecs;
+
+	auto mgr = new SessionManager(SessionLimits(Duration.zero, 1));
+	string[] ended;
+	mgr.onExpire = (string id) @safe { ended ~= id; };
+	const a = mgr.create();
+	Thread.sleep(2.msecs);
+	mgr.create();
+	assert(!mgr.isActive(a));
+	assert(ended == [a], "an evicted session's end must be reported");
+}
+
+unittest  // a session swept past its idle TTL has its end reported
+{
+	import core.thread : Thread;
+	import core.time : msecs;
+
+	auto mgr = new SessionManager(SessionLimits(5.msecs, 0));
+	string[] ended;
+	mgr.onExpire = (string id) @safe { ended ~= id; };
+	const a = mgr.create();
+	Thread.sleep(20.msecs);
+	assert(!mgr.isActive(a));
+	assert(ended == [a], "an expired session's end must be reported");
+}
+
+unittest  // terminate is not reported as an expiry
+{
+	auto mgr = new SessionManager;
+	string[] ended;
+	mgr.onExpire = (string id) @safe { ended ~= id; };
+	assert(mgr.terminate(mgr.create()));
+	assert(ended.length == 0);
+}
+
+unittest  // a session is bound to the principal that created it
+{
+	auto mgr = new SessionManager;
+	const id = mgr.create("alice");
+	assert(mgr.ownedBy(id, "alice"));
+	assert(!mgr.ownedBy(id, "bob"));
+	assert(!mgr.ownedBy(id, ""));
+	assert(!mgr.ownedBy("unknown", "alice"));
+	const anon = mgr.create();
+	assert(mgr.ownedBy(anon, ""));
+	assert(!mgr.ownedBy(anon, "alice"));
+}
+
+unittest  // past the cap, never-used sessions are evicted before used ones
+{
+	import core.thread : Thread;
+	import core.time : msecs;
+
+	auto mgr = new SessionManager(SessionLimits(Duration.zero, 3));
+	const used = mgr.create();
+	assert(mgr.stateFor(used) !is null);
+	Thread.sleep(2.msecs);
+	string[] flood;
+	foreach (_; 0 .. 5)
+	{
+		flood ~= mgr.create();
+		Thread.sleep(2.msecs);
+	}
+	assert(mgr.activeCount() == 3);
+	assert(mgr.isActive(used), "an initialize flood must not evict a session in use");
+	assert(mgr.isActive(flood[$ - 1]) && mgr.isActive(flood[$ - 2]));
+}
+
+unittest  // resolving a just-minted session for its initialize does not count as use
+{
+	import core.thread : Thread;
+	import core.time : msecs;
+
+	auto mgr = new SessionManager(SessionLimits(Duration.zero, 2));
+	const a = mgr.create();
+	assert(mgr.stateFor(a, false) !is null);
+	Thread.sleep(2.msecs);
+	const b = mgr.create();
+	assert(mgr.stateFor(b) !is null);
+	Thread.sleep(2.msecs);
+	mgr.create();
+	assert(!mgr.isActive(a), "a never-used session is the first eviction victim");
+	assert(mgr.isActive(b));
+}
+
+unittest  // past the cap, a session running a request is never evicted; create fails instead
+{
+	import std.exception : assertThrown;
+	import mcp.server.context : CancellationToken;
+
+	auto mgr = new SessionManager(SessionLimits(Duration.zero, 1));
+	const a = mgr.create();
+	mgr.stateFor(a).inFlight["i:1"] = new CancellationToken;
+	assertThrown!SessionCapacityException(mgr.create());
+	assert(mgr.isActive(a), "a busy session must survive an initialize past the cap");
+	assert(mgr.activeCount == 1);
+}
+
+unittest  // past the cap, a session holding a GET stream is never evicted
+{
+	import std.exception : assertThrown;
+
+	auto mgr = new SessionManager(SessionLimits(Duration.zero, 1));
+	const a = mgr.create();
+	mgr.streamOpened(a);
+	assertThrown!SessionCapacityException(mgr.create());
+	assert(mgr.isActive(a));
+	mgr.streamClosed(a);
+	const b = mgr.create();
+	assert(!mgr.isActive(a) && mgr.isActive(b), "an idle session makes room once its stream ends");
+}
+
+unittest  // a session holding a GET stream does not expire as idle
+{
+	import core.thread : Thread;
+	import core.time : msecs;
+
+	auto mgr = new SessionManager(SessionLimits(5.msecs, 0));
+	const a = mgr.create();
+	mgr.streamOpened(a);
+	Thread.sleep(20.msecs);
+	assert(mgr.isActive(a));
+}
+
+unittest  // past the per-principal cap, the principal's own oldest idle session is evicted
+{
+	import core.thread : Thread;
+	import core.time : msecs;
+
+	SessionLimits limits;
+	limits.idleTtl = Duration.zero;
+	limits.maxPerPrincipal = 2;
+	auto mgr = new SessionManager(limits);
+	const bob = mgr.create("bob");
+	Thread.sleep(2.msecs);
+	const a1 = mgr.create("alice");
+	Thread.sleep(2.msecs);
+	const a2 = mgr.create("alice");
+	Thread.sleep(2.msecs);
+	const a3 = mgr.create("alice");
+	assert(!mgr.isActive(a1), "alice's oldest session makes room for her new one");
+	assert(mgr.isActive(a2) && mgr.isActive(a3));
+	assert(mgr.isActive(bob), "one principal's sessions never evict another's");
+}
+
+unittest  // past the per-principal cap with every session busy, create fails
+{
+	import std.exception : assertThrown;
+
+	SessionLimits limits;
+	limits.maxPerPrincipal = 1;
+	auto mgr = new SessionManager(limits);
+	const a = mgr.create("alice");
+	mgr.streamOpened(a);
+	assertThrown!SessionCapacityException(mgr.create("alice"));
+	assert(mgr.isActive(a));
+	mgr.create("bob");
+}
+
+unittest  // the per-principal cap bounds an authenticated principal by default
+{
+	auto mgr = new SessionManager(SessionLimits(Duration.zero, 0));
+	const first = mgr.create("alice");
+	foreach (_; 0 .. 200)
+		mgr.create("alice");
+	assert(!mgr.isActive(first), "a principal's sessions are bounded without configuration");
+	assert(mgr.activeCount < 200);
+}
+
+unittest  // past the per-address cap, an anonymous caller evicts only its own address's sessions
+{
+	import core.thread : Thread;
+	import core.time : msecs;
+
+	SessionLimits limits;
+	limits.idleTtl = Duration.zero;
+	limits.maxAnonymousPerAddress = 2;
+	auto mgr = new SessionManager(limits);
+	const other = mgr.create("", "10.0.0.2");
+	const alice = mgr.create("alice", "10.0.0.1");
+	Thread.sleep(2.msecs);
+	const a1 = mgr.create("", "10.0.0.1");
+	Thread.sleep(2.msecs);
+	const a2 = mgr.create("", "10.0.0.1");
+	Thread.sleep(2.msecs);
+	const a3 = mgr.create("", "10.0.0.1");
+	assert(!mgr.isActive(a1), "the address's oldest anonymous session makes room");
+	assert(mgr.isActive(a2) && mgr.isActive(a3));
+	assert(mgr.isActive(other), "another address's sessions are untouched");
+	assert(mgr.isActive(alice), "an authenticated session is not in the anonymous bucket");
+	assert(mgr.ownedBy(a3, ""), "an anonymous session is still owned by the empty principal");
+}
+
+unittest  // terminated and cap-evicted sessions free their slot in the creator's bucket
+{
+	import core.thread : Thread;
+	import core.time : msecs;
+
+	SessionLimits limits;
+	limits.idleTtl = Duration.zero;
+	limits.maxSessions = 3;
+	limits.maxPerPrincipal = 2;
+	auto mgr = new SessionManager(limits);
+	const a1 = mgr.create("alice");
+	Thread.sleep(2.msecs);
+	const a2 = mgr.create("alice");
+	Thread.sleep(2.msecs);
+	assert(mgr.terminate(a1));
+	const a3 = mgr.create("alice");
+	Thread.sleep(2.msecs);
+	assert(mgr.isActive(a2) && mgr.isActive(a3), "a terminated session frees its slot");
+	mgr.create("bob");
+	Thread.sleep(2.msecs);
+	mgr.create("bob");
+	assert(!mgr.isActive(a2), "the global cap evicts the oldest session");
+	mgr.streamOpened(a3);
+	mgr.create("alice");
+	assert(mgr.isActive(a3), "a cap-evicted session frees its slot");
 }

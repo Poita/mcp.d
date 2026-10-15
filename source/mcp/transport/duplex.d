@@ -4,11 +4,13 @@ import core.time : Duration, seconds;
 
 import vibe.core.core : runTask;
 import vibe.core.sync : TaskMutex;
-import vibe.data.json : Json;
+import vibe.core.task : Task;
+import vibe.data.json : Json, parseJsonString;
 
 import mcp.protocol.jsonrpc;
 import mcp.protocol.errors;
-import mcp.transport.coordinator : DuplexCoordinator;
+import mcp.server.context : CancellationToken;
+import mcp.transport.coordinator : DuplexCoordinator, cancelledNotification;
 
 @safe:
 
@@ -31,8 +33,8 @@ enum size_t defaultMaxLineBytes = 16 * 1024 * 1024;
 ///     `await` (so several requests can be in flight concurrently and replies may
 ///     arrive out of order);
 ///   - a *request* / *notification* line is handed to `onInbound` (the client's
-///     or server's inbound dispatcher), which a peer typically runs in its own
-///     task so multiple inbound requests are handled concurrently.
+///     or server's inbound dispatcher) on its own task, so a handler that blocks
+///     never stalls the read loop and inbound requests run concurrently.
 ///
 /// The read loop is a plain cooperative vibe task over an async `readLine`
 /// delegate — there is NO dedicated OS reader thread, so there is no OS-thread ⇄
@@ -52,7 +54,64 @@ final class DuplexChannel
 	private void delegate(string) @safe onInboundBatch;
 	private DuplexCoordinator coord;
 	private TaskMutex writeMutex;
+	// The lines `deliver` has handed to its writer tasks and not yet written,
+	// keyed by request id, so `abort` can withdraw one.
+	private PendingWrite[long] pendingWrites_;
 	private bool closed_;
+	// Set by `close`: nothing more is written.
+	private bool shut_;
+	// How many lines are being written right now (0 or 1: writes are serialized).
+	private size_t writing_;
+	// The task performing the write in progress, so `interruptWrite` can end it.
+	private Task writer_;
+	private Task readTask_;
+	// Set by `stopReadLoop` and `close`: the read loop exits at its next
+	// iteration and a read it was interrupted out of is not reported as a failure.
+	private bool stopping_;
+	// Tasks running inbound notification handlers, and the notifications waiting
+	// for one (see `maxNotificationTasks`).
+	private size_t notificationTasks_;
+	private Message[] notificationBacklog_;
+
+	/// Receives a description of each failure the read loop survives or ends on
+	/// (an unreadable input, a line whose handling threw). Defaults to stderr, the
+	/// stdio transport's logging channel, when null.
+	void delegate(string) @safe nothrow onError;
+
+	/// Whether an inbound line that is not a valid JSON-RPC message, and carries
+	/// no id to answer under, is answered with a null-id JSON-RPC error. The
+	/// server's inbound path sets this, as JSON-RPC asks of a server. A client
+	/// leaves it unset: such a line (a banner a server prints on stdout, say) is
+	/// reported to `onError` instead, since writing an error into the server's
+	/// stdin would only add a second malformed exchange.
+	bool answersMalformed;
+
+	/// The most inbound notifications handled at once (`0`: unbounded), so a
+	/// peer cannot spawn handler tasks without bound. Up to this many more wait,
+	/// in arrival order, for a running one to finish; a `list_changed`
+	/// notification already waiting absorbs a later one of the same kind, and
+	/// one arriving while the wait list is full is dropped and reported to
+	/// `onError`. `notifications/cancelled` is never held back.
+	size_t maxNotificationTasks = 64;
+
+	/// Report `msg` to `onError`, or to stderr when it is null.
+	void reportError(string msg) @safe nothrow
+	{
+		import std.stdio : stderr;
+
+		if (onError !is null)
+		{
+			onError(msg);
+			return;
+		}
+		() @trusted nothrow{
+			try
+				stderr.writeln("[mcp.transport.duplex] ", msg);
+			catch (Exception)
+			{
+			}
+		}();
+	}
 
 	/// `readLine` returns the next inbound line (without terminator) or `null` at
 	/// EOF (and the read loop ends). `writeLine` emits one outbound line. `onInbound`
@@ -86,7 +145,47 @@ final class DuplexChannel
 	/// loop (`runEventLoop`).
 	void start() @safe
 	{
-		runTask(&readLoop);
+		readTask_ = runTask(&readLoop);
+	}
+
+	/// Whether the read loop started by `start` is still running.
+	bool readLoopRunning() const @safe nothrow
+	{
+		return readTask_.running;
+	}
+
+	/// End the read loop started by `start` and wait for it to exit, so the
+	/// transport can release the byte stream the loop reads without racing it.
+	/// The loop gets `grace` to reach end-of-input by itself; a read still
+	/// pending after that is interrupted. Returns false only when called from
+	/// the read loop itself, which cannot wait for its own exit.
+	bool stopReadLoop(Duration grace) @safe
+	{
+		import core.time : msecs;
+		import std.datetime.stopwatch : StopWatch, AutoStart;
+		import vibe.core.core : sleep;
+		import vibe.core.task : Task;
+
+		if (!readTask_.running)
+			return true;
+		if (readTask_ == Task.getThis())
+			return false;
+		stopping_ = true;
+		auto sw = StopWatch(AutoStart.yes);
+		while (readTask_.running && sw.peek < grace)
+			sleep(1.msecs);
+		if (readTask_.running)
+			readTask_.interrupt();
+		readTask_.joinUninterruptible();
+		return true;
+	}
+
+	/// Whether `stopReadLoop` or `close` is ending the read loop. A `readLine` that keeps
+	/// consuming input without completing a line (a peer flooding an over-long
+	/// one) checks it to give up and return null.
+	bool stopping() const @safe nothrow
+	{
+		return stopping_;
 	}
 
 	/// Run the read loop inline on the current task (does not spawn a task).
@@ -99,15 +198,20 @@ final class DuplexChannel
 
 	private void readLoop() @safe nothrow
 	{
-		for (;;)
+		while (!stopping_)
 		{
 			string line;
-			bool eof;
 			try
 				line = readLineDg();
-			catch (Exception)
-				eof = true; // a read error is treated as end-of-input
-			if (eof || line is null)
+			catch (Exception e)
+			{
+				// An unreadable input cannot recover, so the loop ends as at
+				// end-of-input, but the failure is reported rather than hidden.
+				if (!stopping_)
+					reportError("readLoop: read failed: " ~ e.msg);
+				break;
+			}
+			if (line is null || stopping_)
 				break;
 			if (line.length == 0)
 				continue; // blank line, ignore
@@ -115,18 +219,9 @@ final class DuplexChannel
 				handleLine(line);
 			catch (Exception e)
 			{
-				// One malformed/erroring line — or a notification handler that throws —
-				// must not kill the loop; log the failure so it is visible rather than
-				// silently discarded, then continue with the next line.
-				import std.stdio : stderr;
-
-				() @trusted nothrow{
-					try
-						stderr.writeln("[mcp.transport.duplex] readLoop: ", e.message);
-					catch (Exception)
-					{
-					}
-				}();
+				// One malformed/erroring line must not kill the loop; report the failure
+				// so it is visible rather than silently discarded, then continue.
+				reportError("readLoop: " ~ e.msg);
 			}
 		}
 		closed_ = true;
@@ -148,9 +243,13 @@ final class DuplexChannel
 			input = parseAny(line);
 		catch (McpException e)
 		{
-			// A malformed/invalid line has no recoverable id, so reply with a
-			// null-id JSON-RPC error rather than dropping it silently.
-			send(makeErrorResponse(Json(null), e));
+			Json item;
+			try
+				item = parseJsonBounded(line);
+			catch (Exception)
+			{
+			}
+			answerMalformed(item, e);
 			return;
 		}
 		// A batch array on the server inbound path must be dispatched as a unit so the
@@ -165,20 +264,44 @@ final class DuplexChannel
 		}
 		foreach (m; input.messages)
 			routeMessage(m);
-		// A malformed batch member may still carry the id of a pending outbound
-		// request; wake that waiter with the member's error so the caller fails fast
-		// instead of blocking until its timeout. When no id is recoverable (the member
-		// is not an object, or its id is null/absent), reply with a null-id JSON-RPC
-		// error so the peer is still notified rather than dropped silently.
 		foreach (e; input.errors)
+			answerMalformed(e.item, e.error);
+	}
+
+	/// Answer an inbound message `item` that failed validation with `error`. A
+	/// malformed request is answered under its own id. Anything else carrying
+	/// the id of a pending outbound request wakes that waiter with `error`, so
+	/// the caller fails fast instead of blocking until its timeout. Otherwise
+	/// the peer gets a null-id JSON-RPC error when `answersMalformed` is set, and
+	/// the line is reported to `onError` when it is not. Replies are posted, so
+	/// the read loop never waits on a peer that has stopped reading.
+	private void answerMalformed(Json item, McpException error) @safe
+	{
+		const replyId = errorReplyId(error);
+		if (replyId.type != Json.Type.null_)
 		{
-			Json id = (e.item.type == Json.Type.object && "id" in e.item) ? e.item["id"] : Json(
-					null);
-			if (id.type == Json.Type.null_ || id.type == Json.Type.undefined)
-				send(makeErrorResponse(Json(null), e.error));
-			else if (!coord.resolve(id, Json.undefined, toErrorJson(e.error)))
-				send(makeErrorResponse(Json(null), e.error));
+			post(makeErrorResponse(replyId, error));
+			return;
 		}
+		Json id = (item.type == Json.Type.object && "id" in item) ? item["id"] : Json(null);
+		if (id.type != Json.Type.null_ && id.type != Json.Type.undefined
+				&& coord.resolve(id, Json.undefined, toErrorJson(error)))
+			return;
+		if (answersMalformed)
+			post(makeErrorResponse(Json(null), error));
+		else
+			reportError("malformed message from the peer: " ~ error.msg);
+	}
+
+	/// Wake the outbound request that `reply` (a response or error response)
+	/// answers. A batch handed to `onInboundBatch` passes its reply members here,
+	/// since the handler dispatches requests and notifications only.
+	void resolveReply(Message reply) @safe
+	{
+		if (reply.kind == MessageKind.response)
+			coord.resolve(reply.id, reply.result, Json.undefined);
+		else if (reply.kind == MessageKind.errorResponse)
+			coord.resolve(reply.id, Json.undefined, reply.error);
 	}
 
 	private void routeMessage(Message m) @safe
@@ -197,49 +320,207 @@ final class DuplexChannel
 			// error responses are always correlated by the coordinator above and never
 			// reach the delegate.
 			if (onInbound !is null)
-				onInbound(m);
+				dispatchInbound(m);
 			break;
+		}
+	}
+
+	/// Run `onInbound` for `m` on its own task so a handler that blocks — on user
+	/// work, or on a reply to a request it sends back over this channel — never
+	/// stalls the read loop that must deliver that reply. `runTask` switches to the
+	/// new task immediately, so a handler that does not block runs to completion
+	/// before the next line is read and arrival order is preserved (e.g.
+	/// `notifications/initialized` is handled before the request that follows it).
+	private void dispatchInbound(Message m) @safe
+	{
+		if (m.kind == MessageKind.notification && m.method != "notifications/cancelled")
+		{
+			dispatchNotification(m);
+			return;
+		}
+		runTask((Message msg) nothrow{ runInbound(msg); }, m);
+	}
+
+	private void runInbound(Message m) @safe nothrow
+	{
+		try
+			onInbound(m);
+		catch (Exception e)
+			reportError("inbound handler: " ~ e.msg);
+	}
+
+	/// Run notification `m` on a task of its own when fewer than
+	/// `maxNotificationTasks` are running, else queue, coalesce or drop it.
+	private void dispatchNotification(Message m) @safe
+	{
+		import std.algorithm : any, endsWith;
+
+		const method = m.method;
+		if (maxNotificationTasks == 0 || notificationTasks_ < maxNotificationTasks)
+		{
+			++notificationTasks_;
+			runTask((Message first) nothrow{ runNotifications(first); }, m);
+			return;
+		}
+		if (method.endsWith("/list_changed")
+				&& notificationBacklog_.any!((ref Message q) => q.method == method))
+			return;
+		if (notificationBacklog_.length >= maxNotificationTasks)
+		{
+			reportError("dropped inbound " ~ method ~ ": too many notifications in progress");
+			return;
+		}
+		notificationBacklog_ ~= m;
+	}
+
+	/// Handle `first`, then whatever notifications are waiting, on the current
+	/// task, which holds one notification slot until it returns.
+	private void runNotifications(Message first) @safe nothrow
+	{
+		scope (exit)
+			--notificationTasks_;
+		for (auto m = first;;)
+		{
+			runInbound(m);
+			if (notificationBacklog_.length == 0)
+				break;
+			m = notificationBacklog_[0];
+			notificationBacklog_ = notificationBacklog_[1 .. $];
 		}
 	}
 
 	/// Send a request whose id was already chosen by the caller (the CLIENT path:
 	/// `McpClient` pre-allocates the id), and block the current task until the
-	/// correlated reply arrives. Returns its result, or throws `McpException` on an
-	/// error reply / timeout / channel close.
-	Json deliver(Json message, long expectId, Duration timeout = 60.seconds) @safe
+	/// correlated reply arrives or `timeout` elapses (`Duration.max`: no limit).
+	/// Returns its result, or throws `McpException` on an error reply / channel
+	/// close, what writing the line threw, or `RequestTimeoutException`.
+	///
+	/// The line is written on a task of its own while the caller awaits the reply,
+	/// so a peer that stops reading parks only that writer: `abort` (a timeout or
+	/// cancellation) still releases the caller. Interrupting the write instead
+	/// would leave a partial line on the wire and break the framing of every
+	/// later message. A line still queued behind another writer when its request
+	/// is aborted or times out is never written; one already being written when
+	/// it times out is followed by a posted `notifications/cancelled`.
+	Json deliver(Json message, long expectId, Duration timeout) @safe
 	{
 		if (closed_)
 			throw internalError("stdio channel closed");
 		coord.register(expectId);
+		return awaitReply(expectId, startWrite(message, expectId), timeout);
+	}
+
+	/// Wait up to `timeout` for the reply to request `id`, whose line `write` is
+	/// writing. On a timeout the line is withdrawn if not yet being written, and
+	/// otherwise followed by a posted `notifications/cancelled`. A failure is
+	/// reported as what writing the line threw, when it threw.
+	private Json awaitReply(long id, PendingWrite write, Duration timeout) @safe
+	{
 		try
-			send(message);
-		catch (Exception e)
+			return coord.await(id, timeout);
+		catch (RequestTimeoutException e)
 		{
-			coord.cancel(expectId);
+			abandon(id, write, "request timed out");
 			throw e;
 		}
-		return coord.await(expectId, timeout);
+		catch (McpException e)
+		{
+			if (write.failure !is null)
+				throw write.failure;
+			throw e;
+		}
+	}
+
+	/// Write request `id`'s line on a writer task of its own. A write that
+	/// fails resolves `id` with the failure.
+	private PendingWrite startWrite(Json message, long id) @safe
+	{
+		auto write = new PendingWrite;
+		pendingWrites_[id] = write;
+		runTask((Json msg, long id, PendingWrite w) nothrow{
+			try
+				writeLine(msg.toString(), w);
+			catch (Exception e)
+			{
+				w.failure = e;
+				try
+					coord.resolve(Json(id), Json.undefined, toErrorJson(internalError(e.msg)));
+				catch (Exception)
+				{
+				}
+			}
+			if (auto p = id in pendingWrites_)
+				if (*p is w)
+					pendingWrites_.remove(id);
+		}, message, id, write);
+		return write;
+	}
+
+	/// Wake the task blocked awaiting request `id` with `reason` as its error, as
+	/// if the peer had replied with it, and withdraw its line if it is not yet
+	/// being written. A later reply for `id` is then ignored. A no-op when `id`
+	/// is not pending.
+	void abort(long id, McpException reason) @safe
+	{
+		if (auto w = id in pendingWrites_)
+			(*w).abandoned = true;
+		coord.resolve(Json(id), Json.undefined, toErrorJson(reason));
 	}
 
 	/// Originate a server->client request (the SERVER path: sampling / elicitation
 	/// / roots / ping), allocating a fresh id, and block until the peer replies.
-	/// Returns its result, or throws `McpException` on an error reply / timeout /
-	/// channel close.
-	Json request(string method, Json params, Duration timeout = 60.seconds) @safe
+	/// Returns its result, or throws `McpException` on an error reply / channel
+	/// close, what writing the line threw, or `RequestTimeoutException` after
+	/// `timeout`. As in `deliver`, the line is written on a task of its own, so
+	/// the timeout also bounds a write the peer does not drain: a line not yet
+	/// being written then is withdrawn, and one that was is followed by a posted
+	/// `notifications/cancelled`.
+	///
+	/// `cancellation` is the token of the inbound request this one is made on
+	/// behalf of (null: none). Cancelling it ends the wait at once with a
+	/// `requestCancelled` error, handled like a timeout: the line is withdrawn
+	/// or followed by a posted `notifications/cancelled`.
+	Json request(string method, Json params, Duration timeout, CancellationToken cancellation = null) @safe
 	{
 		if (closed_)
 			throw internalError("stdio channel closed");
 		const id = coord.alloc();
 		coord.register(id);
-		Json req = makeRequest(Json(id), method, params);
-		try
-			send(req);
-		catch (Exception e)
+		auto write = startWrite(makeRequest(Json(id), method, params), id);
+		bool settled;
+		scope (exit)
+			settled = true;
+		if (cancellation !is null)
+			cancellation.onCancel(() @safe nothrow{
+				if (settled)
+					return;
+				abandon(id, write, "the request it serves was cancelled");
+				try
+					coord.resolve(Json(id), Json.undefined,
+						toErrorJson(new McpException(ErrorCode.requestCancelled,
+						"request cancelled")));
+				catch (Exception)
+				{
+				}
+			});
+		return awaitReply(id, write, timeout);
+	}
+
+	/// Stop writing request `id`'s line: withdraw it if not yet being written,
+	/// else tell the peer with a posted `notifications/cancelled`.
+	private void abandon(long id, PendingWrite write, string reason) @safe nothrow
+	{
+		if (write.abandoned)
+			return;
+		write.abandoned = true;
+		if (write.started)
 		{
-			coord.cancel(id);
-			throw e;
+			try
+				post(cancelledNotification(id, reason));
+			catch (Exception)
+			{
+			}
 		}
-		return coord.await(id, timeout);
 	}
 
 	/// Write one JSON-RPC `message` as a single newline-delimited line, serialized
@@ -257,10 +538,80 @@ final class DuplexChannel
 	/// the text being one valid MCP message with no embedded newline.
 	void sendRaw(string text) @safe
 	{
+		writeLine(text, null);
+	}
+
+	/// Write `message` on a task of its own and return at once, without waiting
+	/// for the line to be written or learning whether it was. For teardown
+	/// traffic (a `notifications/cancelled`) that must not park its caller
+	/// behind a peer that stopped reading. Nothing is written once the channel
+	/// has closed.
+	void post(Json message) @safe nothrow
+	{
+		if (shut_)
+			return;
+		runTask((Json msg) nothrow{
+			try
+				writeLine(msg.toString(), null);
+			catch (Exception)
+			{
+			}
+		}, message);
+	}
+
+	/// Whether a line is being written right now. A write the peer does not
+	/// drain stays in progress until the peer reads or goes away.
+	bool writing() const @safe nothrow
+	{
+		return writing_ != 0;
+	}
+
+	/// End a write in progress by interrupting the task performing it, which then
+	/// fails as a write failure. Only for a peer known to be gone: the line may be
+	/// left partly written, and an event loop may never report a pipe whose
+	/// reader has exited (epoll does not wake a write parked on it), so such a
+	/// write would otherwise never end. A no-op when nothing is being written.
+	void interruptWrite() @safe nothrow
+	{
+		if (writing_ != 0 && writer_ != Task.init && writer_.running)
+		{
+			try
+				writer_.interrupt();
+			catch (Exception)
+			{
+			}
+		}
+	}
+
+	/// Write `text` under the writer lock, unless `write` was abandoned while it
+	/// waited for the lock. Throws once `close` has been called, including for a
+	/// line that was waiting for the lock then.
+	private void writeLine(string text, PendingWrite write) @safe
+	{
+		if (shut_)
+			throw internalError("stdio channel closed");
 		writeMutex.lock();
 		scope (exit)
 			writeMutex.unlock();
-		writeLineDg(text);
+		if (shut_)
+			throw internalError("stdio channel closed");
+		if (write !is null)
+		{
+			if (write.abandoned)
+				return;
+			write.started = true;
+		}
+		++writing_;
+		writer_ = Task.getThis();
+		scope (exit)
+		{
+			--writing_;
+			writer_ = Task.init;
+		}
+		try
+			writeLineDg(text);
+		catch (Exception e)
+			throw new ChannelWriteException("writing to the peer failed: " ~ e.msg);
 	}
 
 	/// Whether the channel has closed: the read loop ended (EOF or read error) or
@@ -273,16 +624,40 @@ final class DuplexChannel
 
 	/// Close the channel. Marks it closed and fails every still-pending request so
 	/// awaiting callers are released immediately instead of waiting out their
-	/// timeout; any request issued after this point also fails fast. The owning
-	/// transport still closes the underlying byte stream to stop the read loop;
-	/// `close` is idempotent and the read loop's own EOF path is equivalent.
+	/// timeout; any request issued after this point also fails fast, and every
+	/// send throws. The read loop ends without dispatching another line: it exits
+	/// once its pending read returns (the owning transport ends that read by
+	/// closing the byte stream, or with `stopReadLoop`). `close` is idempotent.
 	void close() @safe
 	{
-		if (closed_)
+		if (shut_)
 			return;
+		shut_ = true;
+		stopping_ = true;
 		closed_ = true;
 		coord.failPending(internalError("stdio channel closed"));
 	}
+}
+
+/// Thrown by a `DuplexChannel` send when writing the line fails. The byte stream
+/// is broken (typically the peer closed its end), so the peer is gone.
+class ChannelWriteException : McpException
+{
+	this(string message) @safe pure nothrow
+	{
+		super(ErrorCode.internalError, message);
+	}
+}
+
+/// A request line `DuplexChannel.deliver` handed to its writer task.
+private final class PendingWrite
+{
+	// Set by `abort`: a line not yet being written is dropped.
+	bool abandoned;
+	// Set once the line's write begins.
+	bool started;
+	// What writing the line threw, rethrown to the awaiting caller.
+	Exception failure;
 }
 
 version (unittest)
@@ -323,7 +698,7 @@ version (unittest) private final class LineLink
 		while (queue.length == 0 && !closed)
 		{
 			auto ec = evt.emitCount;
-			() @trusted { evt.wait(ec); }();
+			evt.wait(ec);
 		}
 		if (queue.length == 0)
 			return null; // EOF
@@ -385,7 +760,8 @@ unittest  // two concurrent deliver() calls get their correct, distinct results 
 			runTask(() nothrow{
 				try
 				{
-					auto r = channel.deliver(makeRequest(Json(1L), "ping", Json.emptyObject), 1);
+					auto r = channel.deliver(makeRequest(Json(1L), "ping",
+					Json.emptyObject), 1, 60.seconds);
 					got1 = r["v"].get!long;
 				}
 				catch (Exception)
@@ -397,7 +773,8 @@ unittest  // two concurrent deliver() calls get their correct, distinct results 
 			runTask(() nothrow{
 				try
 				{
-					auto r = channel.deliver(makeRequest(Json(2L), "ping", Json.emptyObject), 2);
+					auto r = channel.deliver(makeRequest(Json(2L), "ping",
+					Json.emptyObject), 2, 60.seconds);
 					got2 = r["v"].get!long;
 				}
 				catch (Exception)
@@ -408,7 +785,7 @@ unittest  // two concurrent deliver() calls get their correct, distinct results 
 			});
 			auto ec = done.emitCount;
 			if (remaining > 0)
-				() @trusted { done.wait(ec); }();
+				done.wait(ec);
 		}
 		catch (Exception)
 		{
@@ -419,6 +796,98 @@ unittest  // two concurrent deliver() calls get their correct, distinct results 
 	// Each deliver got its OWN id's result despite the out-of-order reply.
 	assert(got1 == 1, "deliver(id=1) must return id 1's result");
 	assert(got2 == 2, "deliver(id=2) must return id 2's result");
+}
+
+unittest  // inbound notifications run on at most maxNotificationTasks tasks, cancellations always
+{
+	import std.conv : to;
+
+	auto inbound = new LineLink;
+	auto release = createManualEvent();
+	size_t running, peak, handled;
+	bool cancelSeen;
+	runTask(() nothrow{
+		scope (exit)
+			exitEventLoop();
+		try
+		{
+			auto channel = new DuplexChannel(() @safe { return inbound.take(); }, (string) @safe {
+			}, (Message m) @safe {
+				if (m.method == "notifications/cancelled")
+				{
+					cancelSeen = true;
+					return;
+				}
+				++running;
+				if (running > peak)
+					peak = running;
+				release.wait(release.emitCount);
+				--running;
+				++handled;
+			});
+			channel.maxNotificationTasks = 4;
+			channel.onError = (string) @safe nothrow{};
+			channel.start();
+			foreach (i; 0 .. 6)
+				inbound.put(`{"jsonrpc":"2.0","method":"notifications/n` ~ i.to!string ~ `"}`);
+			inbound.put(
+				`{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":1}}`);
+			foreach (_; 0 .. 16)
+				yield();
+			assert(peak == 4, "no more than maxNotificationTasks notifications run at once ");
+			assert(cancelSeen, "a cancellation is handled while the notification slots are full");
+			foreach (_; 0 .. 4)
+			{
+				release.emit();
+				foreach (__; 0 .. 8)
+					yield();
+			}
+			inbound.closeEnd();
+		}
+		catch (Exception)
+		{
+		}
+	});
+	runEventLoop();
+	assert(handled == 6, "queued notifications run once a slot frees up");
+}
+
+unittest  // queued list_changed notifications of one kind are coalesced
+{
+	auto inbound = new LineLink;
+	auto release = createManualEvent();
+	string[] handled;
+	runTask(() nothrow{
+		scope (exit)
+			exitEventLoop();
+		try
+		{
+			auto channel = new DuplexChannel(() @safe { return inbound.take(); }, (string) @safe {
+			}, (Message m) @safe {
+				if (m.method == "notifications/block")
+					release.wait(release.emitCount);
+				handled ~= m.method;
+			});
+			channel.maxNotificationTasks = 1;
+			channel.start();
+			inbound.put(`{"jsonrpc":"2.0","method":"notifications/block"}`);
+			foreach (_; 0 .. 5)
+				inbound.put(`{"jsonrpc":"2.0","method":"notifications/tools/list_changed"}`);
+			foreach (_; 0 .. 16)
+				yield();
+			release.emit();
+			foreach (_; 0 .. 16)
+				yield();
+			inbound.closeEnd();
+		}
+		catch (Exception)
+		{
+		}
+	});
+	runEventLoop();
+	assert(handled == [
+		"notifications/block", "notifications/tools/list_changed"
+	], "waiting list_changed notifications of one kind collapse into one");
 }
 
 unittest  // an inbound notification line is routed to onInbound (not the coordinator)
@@ -475,7 +944,7 @@ unittest  // deliver() throws when the channel reaches EOF before the response (
 				}
 			});
 			try
-				channel.deliver(makeRequest(Json(1L), "ping", Json.emptyObject), 1);
+				channel.deliver(makeRequest(Json(1L), "ping", Json.emptyObject), 1, 60.seconds);
 			catch (McpException)
 				threw = true;
 		}
@@ -501,6 +970,7 @@ unittest  // a malformed inbound line does not kill the read loop
 				if (m.kind == MessageKind.notification)
 					seen++;
 			});
+			channel.onError = (string) @safe nothrow{};
 			channel.start();
 			inbound.put("this is not json");
 			inbound.put(`{"jsonrpc":"2.0","method":"notifications/a"}`);
@@ -515,6 +985,37 @@ unittest  // a malformed inbound line does not kill the read loop
 	runEventLoop();
 	// The good notification after the garbage line was still dispatched.
 	assert(seen == 1);
+}
+
+unittest  // an inbound request with by-position params is answered with -32602 carrying its id
+{
+	import vibe.data.json : parseJsonString;
+
+	auto inbound = new LineLink;
+	string[] written;
+	runTask(() nothrow{
+		scope (exit)
+			exitEventLoop();
+		try
+		{
+			auto channel = new DuplexChannel(() @safe { return inbound.take(); }, (string s) @safe {
+				written ~= s;
+			}, (Message) @safe {});
+			channel.start();
+			inbound.put(`{"jsonrpc":"2.0","id":3,"method":"ping","params":[]}`);
+			inbound.closeEnd();
+			foreach (_; 0 .. 8)
+				yield();
+		}
+		catch (Exception)
+		{
+		}
+	});
+	runEventLoop();
+	assert(written.length == 1);
+	auto j = parseJsonString(written[0]);
+	assert(j["error"]["code"].get!int == ErrorCode.invalidParams);
+	assert(j["id"] == Json(3));
 }
 
 unittest  // an inbound batch array routes every contained request/notification to onInbound
@@ -603,15 +1104,15 @@ version (Posix) unittest  // an exception thrown by the onInbound notification h
 	import core.sys.posix.fcntl : fcntl, F_SETFL, O_NONBLOCK;
 
 	int[2] errPipe;
-	assert(() @trusted { return pipe(errPipe); }() == 0, "pipe() failed");
+	assert(pipe(errPipe) == 0, "pipe() failed");
 	scope (exit)
-		() @trusted { close(errPipe[0]); }();
+		close(errPipe[0]);
 
 	// Save the real stderr fd and redirect stderr to the write end of the pipe.
 	import std.stdio : stderr;
 
 	const stderrFd = () @trusted { return stderr.fileno(); }();
-	const savedStderrFd = () @trusted {
+	const savedStderrFd = () {
 		import core.sys.posix.unistd : dup;
 
 		return dup(stderrFd);
@@ -626,12 +1127,12 @@ version (Posix) unittest  // an exception thrown by the onInbound notification h
 			close(savedStderrFd);
 		}();
 	}
-	() @trusted {
+	{
 		import core.sys.posix.unistd : dup2;
 
 		dup2(errPipe[1], stderrFd);
 		close(errPipe[1]);
-	}();
+	}
 
 	auto inbound = new LineLink;
 	int goodSeen;
@@ -689,6 +1190,7 @@ unittest  // a malformed inbound line is answered with a null-id JSON-RPC error 
 			auto channel = new DuplexChannel(() @safe { return inbound.take(); }, (string s) @safe {
 				written = s;
 			}, (Message) @safe {});
+			channel.answersMalformed = true;
 			channel.start();
 			inbound.put("this is not json");
 			inbound.closeEnd();
@@ -709,6 +1211,69 @@ unittest  // a malformed inbound line is answered with a null-id JSON-RPC error 
 	assert("error" in j);
 }
 
+unittest  // answering a malformed line does not stall the read loop behind a peer that stopped reading
+{
+	auto inbound = new LineLink;
+	auto never = createManualEvent();
+	int seen;
+	runTask(() nothrow{
+		scope (exit)
+			exitEventLoop();
+		try
+		{
+			auto channel = new DuplexChannel(() @safe { return inbound.take(); }, (string) @safe {
+				never.wait(never.emitCount); // the peer never drains its input
+			}, (Message m) @safe {
+				if (m.kind == MessageKind.notification)
+					seen++;
+			});
+			channel.answersMalformed = true;
+			channel.start();
+			inbound.put("this is not json");
+			inbound.put(`{"jsonrpc":"2.0","id":4,"method":"ping","params":[]}`);
+			inbound.put(`{"jsonrpc":"2.0","method":"notifications/a"}`);
+			foreach (_; 0 .. 16)
+				yield();
+			channel.close();
+			inbound.closeEnd();
+		}
+		catch (Exception)
+		{
+		}
+	});
+	runEventLoop();
+	assert(seen == 1, "lines after a malformed one are still read while its reply is unwritten");
+}
+
+unittest  // a channel not answering malformed lines reports an unparseable line without replying
+{
+	auto inbound = new LineLink;
+	string[] written;
+	string[] errors;
+	runTask(() nothrow{
+		scope (exit)
+			exitEventLoop();
+		try
+		{
+			auto channel = new DuplexChannel(() @safe { return inbound.take(); }, (string s) @safe {
+				written ~= s;
+			}, (Message) @safe {});
+			channel.onError = (string msg) @safe nothrow{ errors ~= msg; };
+			channel.start();
+			inbound.put("server v1.2 starting up");
+			inbound.closeEnd();
+			foreach (_; 0 .. 8)
+				yield();
+		}
+		catch (Exception)
+		{
+		}
+	});
+	runEventLoop();
+	assert(written.length == 0, "nothing is written back for an unparseable line");
+	assert(errors.length == 1, "the unparseable line is reported");
+}
+
 unittest  // a failing writeLine propagates out of request() instead of being swallowed
 {
 	// Mirrors the stdio write path surfacing a broken pipe: when the writer throws
@@ -727,7 +1292,7 @@ unittest  // a failing writeLine propagates out of request() instead of being sw
 				throw new Exception("stdout write failed (peer closed its read end)");
 			}, (Message) @safe {});
 			try
-				channel.request("ping", Json.emptyObject);
+				channel.request("ping", Json.emptyObject, 30.seconds);
 			catch (Exception)
 				threw = true;
 		}
@@ -887,6 +1452,55 @@ unittest  // a malformed batch member carrying a pending id wakes its deliver() 
 			"the waiter must wake with the member's -32600 error, not a -32603 timeout");
 }
 
+unittest  // a malformed single-line reply carrying a pending id wakes its deliver() with an error, not a timeout
+{
+	auto toResponder = new LineLink;
+	auto toClient = new LineLink;
+
+	bool threw;
+	int errCode;
+	string[] extraWrites;
+	runTask(() nothrow{
+		scope (exit)
+			exitEventLoop();
+		try
+		{
+			auto channel = new DuplexChannel(() @safe { return toClient.take(); }, (string s) @safe {
+				toResponder.put(s);
+			}, (Message) @safe {});
+			channel.start();
+
+			runTask(() nothrow{
+				try
+				{
+					toResponder.take(); // the deliver() request frame
+					toClient.put(`{"jsonrpc":"2.0","id":1,"error":"boom"}`);
+				}
+				catch (Exception)
+				{
+				}
+			});
+
+			try
+				channel.deliver(makeRequest(Json(1L), "ping", Json.emptyObject), 1, 5.seconds);
+			catch (McpException e)
+			{
+				threw = true;
+				errCode = e.code;
+			}
+			extraWrites = toResponder.queue;
+		}
+		catch (Exception)
+		{
+		}
+	});
+	runEventLoop();
+	assert(threw, "a malformed reply for a pending id must wake its deliver()");
+	assert(errCode != ErrorCode.internalError,
+			"the waiter must wake with the reply's parse error, not a -32603 timeout");
+	assert(extraWrites.length == 0, "a reply resolved locally is not answered back to the peer");
+}
+
 unittest  // a malformed batch member with a non-integer (string) id sends a null-id error, not silence
 {
 	// coord.resolve() returns false for any non-integer id; the else branch must fall
@@ -901,6 +1515,7 @@ unittest  // a malformed batch member with a non-integer (string) id sends a nul
 			auto channel = new DuplexChannel(() @safe { return inbound.take(); }, (string s) @safe {
 				written = s;
 			}, (Message) @safe {});
+			channel.answersMalformed = true;
 			channel.start();
 			// A batch where member 0 has a string id and is malformed (both result and error).
 			inbound.put(
@@ -920,6 +1535,95 @@ unittest  // a malformed batch member with a non-integer (string) id sends a nul
 	auto j = parseJsonString(written);
 	assert(j["id"].type == Json.Type.null_, "the fallback error reply must carry a null id");
 	assert("error" in j, "the fallback reply must be an error response");
+}
+
+unittest  // deliver() that times out withdraws its line still queued behind another write
+{
+	import core.time : msecs;
+
+	auto inbound = new LineLink;
+	auto release = createManualEvent();
+	string[] written;
+	bool timedOut;
+	runTask(() nothrow{
+		scope (exit)
+			exitEventLoop();
+		try
+		{
+			auto channel = new DuplexChannel(() @safe { return inbound.take(); }, (string s) @safe {
+				if (s == `"block"`)
+					release.wait(release.emitCount);
+				written ~= s;
+			}, (Message) @safe {});
+			channel.start();
+			runTask(() nothrow{
+				try
+					channel.sendRaw(`"block"`);
+				catch (Exception)
+				{
+				}
+			});
+			try
+				channel.deliver(makeRequest(Json(1L), "ping", Json.emptyObject), 1, 20.msecs);
+			catch (RequestTimeoutException)
+				timedOut = true;
+			release.emit();
+			foreach (_; 0 .. 8)
+				yield();
+			channel.close();
+			inbound.closeEnd();
+		}
+		catch (Exception)
+		{
+		}
+	});
+	runEventLoop();
+	assert(timedOut);
+	assert(written == [`"block"`], "a timed-out request's queued line is never written");
+}
+
+unittest  // deliver() that times out mid-write posts notifications/cancelled for its request
+{
+	import core.time : msecs;
+	import std.algorithm : canFind;
+
+	auto inbound = new LineLink;
+	auto release = createManualEvent();
+	string[] written;
+	bool timedOut;
+	runTask(() nothrow{
+		scope (exit)
+			exitEventLoop();
+		try
+		{
+			bool first = true;
+			auto channel = new DuplexChannel(() @safe { return inbound.take(); }, (string s) @safe {
+				if (first)
+				{
+					first = false;
+					release.wait(release.emitCount);
+				}
+				written ~= s;
+			}, (Message) @safe {});
+			channel.start();
+			try
+				channel.deliver(makeRequest(Json(1L), "ping", Json.emptyObject), 1, 20.msecs);
+			catch (RequestTimeoutException)
+				timedOut = true;
+			release.emit();
+			foreach (_; 0 .. 8)
+				yield();
+			channel.close();
+			inbound.closeEnd();
+		}
+		catch (Exception)
+		{
+		}
+	});
+	runEventLoop();
+	assert(timedOut);
+	assert(written.length == 2 && written[1].canFind(`"notifications/cancelled"`),
+			"the peer is told the request it is receiving was abandoned");
 }
 
 unittest  // deliver() after close() fails fast
@@ -947,4 +1651,306 @@ unittest  // deliver() after close() fails fast
 	});
 	runEventLoop();
 	assert(threw, "deliver() after close() must throw immediately");
+}
+
+unittest  // an inbound request handler that calls back into the channel does not stall the read loop
+{
+	// The handler for an inbound request issues its own outbound request and
+	// awaits the reply. That reply arrives on the same read loop, so the handler
+	// must run off the read loop or the two wait on each other until the timeout.
+	auto toResponder = new LineLink;
+	auto toClient = new LineLink;
+	bool handlerGotReply;
+	runTask(() nothrow{
+		scope (exit)
+			exitEventLoop();
+		try
+		{
+			DuplexChannel channel;
+			channel = new DuplexChannel(() @safe { return toClient.take(); }, (string s) @safe {
+				toResponder.put(s);
+			}, (Message m) @safe {
+				if (m.kind != MessageKind.request)
+					return;
+				auto r = channel.deliver(makeRequest(Json(7L), "ping",
+				Json.emptyObject), 7, 2.seconds);
+				handlerGotReply = r["ok"].get!bool;
+			});
+			channel.start();
+			toClient.put(`{"jsonrpc":"2.0","id":"s1","method":"sampling/createMessage"}`);
+			// The peer answers the handler's nested request.
+			auto nested = toResponder.take();
+			import vibe.data.json : parseJsonString;
+
+			Json reply = Json.emptyObject;
+			reply["jsonrpc"] = "2.0";
+			reply["id"] = parseJsonString(nested)["id"];
+			reply["result"] = Json(["ok": Json(true)]);
+			toClient.put(reply.toString());
+			foreach (_; 0 .. 16)
+				yield();
+			toClient.closeEnd();
+		}
+		catch (Exception)
+		{
+		}
+	});
+	runEventLoop();
+	assert(handlerGotReply, "a request handler must be able to await a reply read by the same loop");
+}
+
+unittest  // an inbound notification handler that blocks does not stall the read loop
+{
+	auto toResponder = new LineLink;
+	auto toClient = new LineLink;
+	bool handlerGotReply;
+	runTask(() nothrow{
+		scope (exit)
+			exitEventLoop();
+		try
+		{
+			DuplexChannel channel;
+			channel = new DuplexChannel(() @safe { return toClient.take(); }, (string s) @safe {
+				toResponder.put(s);
+			}, (Message m) @safe {
+				if (m.kind != MessageKind.notification)
+					return;
+				auto r = channel.request("roots/list", Json.emptyObject, 2.seconds);
+				handlerGotReply = r["ok"].get!bool;
+			});
+			channel.start();
+			toClient.put(`{"jsonrpc":"2.0","method":"notifications/roots/list_changed"}`);
+			auto nested = toResponder.take();
+			import vibe.data.json : parseJsonString;
+
+			Json reply = Json.emptyObject;
+			reply["jsonrpc"] = "2.0";
+			reply["id"] = parseJsonString(nested)["id"];
+			reply["result"] = Json(["ok": Json(true)]);
+			toClient.put(reply.toString());
+			foreach (_; 0 .. 16)
+				yield();
+			toClient.closeEnd();
+		}
+		catch (Exception)
+		{
+		}
+	});
+	runEventLoop();
+	assert(handlerGotReply,
+			"a notification handler must be able to await a reply read by the same loop");
+}
+
+unittest  // inbound messages whose handlers do not block are handled in arrival order
+{
+	auto inbound = new LineLink;
+	string[] seen;
+	runTask(() nothrow{
+		scope (exit)
+			exitEventLoop();
+		try
+		{
+			auto channel = new DuplexChannel(() @safe { return inbound.take(); }, (string) @safe {
+			}, (Message m) @safe { seen ~= m.method; });
+			channel.start();
+			inbound.put(`{"jsonrpc":"2.0","method":"notifications/initialized"}`);
+			inbound.put(`{"jsonrpc":"2.0","id":1,"method":"tools/list"}`);
+			inbound.put(`{"jsonrpc":"2.0","method":"notifications/b"}`);
+			inbound.closeEnd();
+			foreach (_; 0 .. 8)
+				yield();
+		}
+		catch (Exception)
+		{
+		}
+	});
+	runEventLoop();
+	assert(seen == [
+		"notifications/initialized", "tools/list", "notifications/b"
+	]);
+}
+
+unittest  // a failed read ends the loop and is reported rather than passed off as EOF
+{
+	import std.algorithm : canFind;
+
+	auto ch = new DuplexChannel(() @safe {
+		throw new Exception("input/output error");
+		return "";
+	}, (string) @safe {}, (Message) @safe {});
+	string[] reported;
+	ch.onError = (string msg) @safe nothrow{ reported ~= msg; };
+	ch.runReadLoop();
+	assert(ch.closed);
+	assert(reported.length == 1 && reported[0].canFind("input/output error"));
+}
+
+unittest  // an inbound handler's exception is reported through onError
+{
+	import std.algorithm : canFind;
+
+	auto inbound = new LineLink;
+	string[] reported;
+	runTask(() nothrow{
+		scope (exit)
+			exitEventLoop();
+		try
+		{
+			auto ch = new DuplexChannel(() @safe { return inbound.take(); }, (string) @safe {
+			}, (Message) @safe { throw new Exception("handler exploded"); });
+			ch.onError = (string msg) @safe nothrow{ reported ~= msg; };
+			ch.start();
+			inbound.put(`{"jsonrpc":"2.0","method":"notifications/x"}`);
+			inbound.closeEnd();
+			foreach (_; 0 .. 8)
+				yield();
+		}
+		catch (Exception)
+		{
+		}
+	});
+	runEventLoop();
+	assert(reported.length == 1 && reported[0].canFind("handler exploded"));
+}
+
+unittest  // reaching end-of-input reports nothing
+{
+	auto ch = new DuplexChannel(() @safe => cast(string) null, (string) @safe {}, (Message) @safe {
+	});
+	string[] reported;
+	ch.onError = (string msg) @safe nothrow{ reported ~= msg; };
+	ch.runReadLoop();
+	assert(reported.length == 0);
+}
+
+unittest  // a timed-out server->client request is followed by notifications/cancelled for its id
+{
+	import core.time : msecs;
+	import vibe.data.json : parseJsonString;
+
+	auto toClient = new LineLink;
+	string[] sent;
+	bool timedOut;
+	runTask(() nothrow{
+		scope (exit)
+			exitEventLoop();
+		try
+		{
+			auto channel = new DuplexChannel(() @safe { return toClient.take(); }, (string s) @safe {
+				sent ~= s;
+			}, (Message) @safe {});
+			channel.start();
+			try
+				channel.request("elicitation/create", Json.emptyObject, 20.msecs);
+			catch (RequestTimeoutException)
+				timedOut = true;
+			toClient.closeEnd();
+		}
+		catch (Exception)
+		{
+		}
+	});
+	runEventLoop();
+	assert(timedOut);
+	assert(sent.length == 2, "the timed-out request must be cancelled on the wire");
+	const req = parseJsonString(sent[0]);
+	const note = parseJsonString(sent[1]);
+	assert(note["method"].get!string == "notifications/cancelled");
+	assert(note["params"]["requestId"] == req["id"]);
+}
+
+unittest  // request() times out on schedule while its line is stalled on a peer that stopped reading
+{
+	import core.time : msecs, MonoTime;
+	import vibe.core.core : sleep;
+
+	auto toClient = new LineLink;
+	bool timedOut;
+	Duration took;
+	runTask(() nothrow{
+		scope (exit)
+			exitEventLoop();
+		try
+		{
+			auto channel = new DuplexChannel(() @safe { return toClient.take(); }, (string) @safe {
+				sleep(2.seconds);
+			}, (Message) @safe {});
+			channel.start();
+			const start = MonoTime.currTime;
+			try
+				channel.request("elicitation/create", Json.emptyObject, 100.msecs);
+			catch (RequestTimeoutException)
+				timedOut = true;
+			took = MonoTime.currTime - start;
+			sleep(2500.msecs);
+			toClient.closeEnd();
+		}
+		catch (Exception)
+		{
+		}
+	});
+	runEventLoop();
+	assert(timedOut);
+	assert(took < 1.seconds, "a stalled write must not hold request() past its timeout");
+}
+
+unittest  // close() ends the read loop: a line arriving afterwards is not dispatched
+{
+	auto inbound = new LineLink;
+	int dispatched;
+	bool loopRunning = true;
+	runTask(() nothrow{
+		scope (exit)
+			exitEventLoop();
+		try
+		{
+			auto channel = new DuplexChannel(() @safe { return inbound.take(); }, (string) @safe {
+			}, (Message) @safe { dispatched++; });
+			channel.start();
+			yield();
+			channel.close();
+			inbound.put(`{"jsonrpc":"2.0","method":"notifications/x"}`);
+			foreach (_; 0 .. 8)
+				yield();
+			loopRunning = channel.readLoopRunning;
+			inbound.closeEnd();
+		}
+		catch (Exception)
+		{
+		}
+	});
+	runEventLoop();
+	assert(dispatched == 0, "a closed channel must not dispatch inbound lines");
+	assert(!loopRunning, "close() must end the read loop");
+}
+
+unittest  // send() and sendRaw() on a closed channel throw instead of writing
+{
+	string[] written;
+	int threw;
+	runTask(() nothrow{
+		scope (exit)
+			exitEventLoop();
+		try
+		{
+			auto channel = new DuplexChannel(() @safe => cast(string) null, (string s) @safe {
+				written ~= s;
+			}, (Message) @safe {});
+			channel.close();
+			try
+				channel.send(Json.emptyObject);
+			catch (McpException)
+				threw++;
+			try
+				channel.sendRaw("{}");
+			catch (McpException)
+				threw++;
+		}
+		catch (Exception)
+		{
+		}
+	});
+	runEventLoop();
+	assert(threw == 2, "sends on a closed channel must throw");
+	assert(written.length == 0, "a closed channel must write nothing");
 }

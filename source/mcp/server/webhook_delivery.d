@@ -12,6 +12,7 @@ import std.typecons : Nullable, nullable;
 import vibe.data.json : Json;
 
 import mcp.protocol.events : DeliveryErrorCategory;
+import mcp.protocol.errors : McpException, ErrorCode;
 
 @safe:
 
@@ -75,12 +76,15 @@ interface WebhookTransport
 final class SecureWebhookTransport : WebhookTransport
 {
 	import core.time : Duration, seconds;
+	import vibe.http.common : HTTPMethod;
 
 	private Duration requestTimeout_;
 
-	/// `requestTimeout` bounds each HTTP attempt (connect + read). The runtime keeps
-	/// it well under the delivery lease so a slow callback can never hold a leased
-	/// job open past its lease (which would let another worker re-deliver it).
+	/// `requestTimeout` bounds each HTTP attempt as a whole — connect, send, and
+	/// reading the response — however slowly the callback trickles bytes. The
+	/// runtime keeps it well under the delivery lease so a slow callback can never
+	/// hold a leased job open past its lease (which would let another worker
+	/// re-deliver it).
 	this(Duration requestTimeout = 10.seconds) @safe
 	{
 		requestTimeout_ = requestTimeout;
@@ -88,66 +92,123 @@ final class SecureWebhookTransport : WebhookTransport
 
 	WebhookHttpResult post(string url, string[string] headers, string body, bool allowPrivate) @safe
 	{
-		import vibe.http.client : HTTPClientRequest, HTTPClientResponse, HTTPMethod;
-		import vibe.stream.operations : readAllUTF8;
-		import mcp.protocol.ssrf : secureRequestHTTP, SsrfPolicy;
-
-		const policy = allowPrivate ? SsrfPolicy.allowUserConfigured : SsrfPolicy.blockInternal;
-		WebhookHttpResult result;
-		try
-		{
-			secureRequestHTTP(url, policy, (scope HTTPClientRequest req) {
-				req.method = HTTPMethod.POST;
-				req.contentType = "application/json";
-				foreach (k, v; headers)
-					req.headers[k] = v;
-				req.writeBody(cast(const(ubyte)[])
-					body);
-			}, (scope HTTPClientResponse res) {
-				auto rbody = res.bodyReader.readAllUTF8();
-				if (res.statusCode / 100 == 2)
-					result = WebhookHttpResult.success(res.statusCode, rbody);
-				else
-					result = WebhookHttpResult.failure(categoryForStatus(res.statusCode),
-						res.statusCode);
-			}, requestTimeout_);
-		}
-		catch (Exception e)
-			result = WebhookHttpResult.failure(categoryForException(e.msg));
-		return result;
+		return request(url, HTTPMethod.POST, headers, body, allowPrivate);
 	}
 
 	WebhookHttpResult get(string url, bool allowPrivate) @safe
 	{
-		import vibe.http.client : HTTPClientRequest, HTTPClientResponse, HTTPMethod;
-		import vibe.stream.operations : readAllUTF8;
-		import mcp.protocol.ssrf : secureRequestHTTP, SsrfPolicy;
+		return request(url, HTTPMethod.GET, null, null, allowPrivate);
+	}
+
+	// One request under the connector's overall `requestTimeout_` deadline, so a
+	// drip-fed response cannot outlive it. Only the status decides the outcome;
+	// the body is read raw (no UTF-8 validation) and at most
+	// `maxWebhookResponseBytes` of it, the rest dropped with the connection.
+	private WebhookHttpResult request(string url, HTTPMethod method,
+			string[string] headers, string body, bool allowPrivate) @safe
+	{
+		import vibe.http.client : HTTPClientRequest, HTTPClientResponse;
+		import mcp.protocol.ssrf : FetchOptions, secureRequestHTTP, SsrfPolicy;
 
 		const policy = allowPrivate ? SsrfPolicy.allowUserConfigured : SsrfPolicy.blockInternal;
 		WebhookHttpResult result;
+		bool answered;
 		try
 		{
 			secureRequestHTTP(url, policy, (scope HTTPClientRequest req) {
-				req.method = HTTPMethod.GET;
+				req.method = method;
+				if (method == HTTPMethod.POST)
+				{
+					req.contentType = "application/json";
+					foreach (k, v; headers)
+						req.headers[k] = v;
+					req.writeBody(cast(const(ubyte)[])
+						body);
+				}
 			}, (scope HTTPClientResponse res) {
-				auto rbody = res.bodyReader.readAllUTF8();
+				bool truncated;
+				auto rbody = readBoundedBody(res.bodyReader, maxWebhookResponseBytes, truncated);
+				if (truncated)
+					res.disconnect();
 				if (res.statusCode / 100 == 2)
 					result = WebhookHttpResult.success(res.statusCode, rbody);
 				else
 					result = WebhookHttpResult.failure(categoryForStatus(res.statusCode),
 						res.statusCode);
-			}, requestTimeout_);
+				answered = true;
+			}, FetchOptions(requestTimeout_));
+		}
+		catch (McpException e)
+		{
+			// The connector raises `-32600` only for a policy refusal (scheme,
+			// unresolvable host, or an internal address), before connecting.
+			if (!answered && e.code == ErrorCode.invalidRequest)
+			{
+				logCallbackRefused(url, e.msg);
+				result = WebhookHttpResult.failure(DeliveryErrorCategory.connectionRefused);
+			}
+			else if (!answered)
+				result = WebhookHttpResult.failure(categoryForException(e.msg));
 		}
 		catch (Exception e)
-			result = WebhookHttpResult.failure(categoryForException(e.msg));
+		{
+			if (!answered)
+				result = WebhookHttpResult.failure(categoryForException(e.msg));
+		}
 		return result;
 	}
 }
 
-/// Map an HTTP status to its delivery-error category.
+/// Log, at warning level, a callback request refused by the SSRF/callback
+/// policy before anything was sent. The wire reports such a refusal only as
+/// `connection_refused` (it has no policy or DNS category), so the log is
+/// where an operator learns the reason. The URL is redacted.
+package(mcp) void logCallbackRefused(string url, string reason) @safe nothrow
+{
+	import vibe.core.log : logWarn;
+	import mcp.protocol.ssrf : redactUrl;
+
+	try
+		logWarn("[mcp.events] webhook callback %s refused by policy: %s", redactUrl(url), reason);
+	catch (Exception)
+	{
+	}
+}
+
+/// The most of a callback's response body a delivery reads: ample for a
+/// verification echo or a well-known receiver document.
+enum size_t maxWebhookResponseBytes = 64 * 1024;
+
+/// Read at most `cap` bytes of `stream` as raw bytes (no UTF-8 validation),
+/// setting `truncated` when more remained unread.
+string readBoundedBody(S)(S stream, size_t cap, out bool truncated) @safe
+{
+	import std.algorithm : min;
+
+	ubyte[] buf;
+	ubyte[4096] chunk;
+	while (!stream.empty)
+	{
+		if (buf.length >= cap)
+		{
+			truncated = true;
+			break;
+		}
+		const n = cast(size_t) min(stream.leastSize, chunk.length, cap - buf.length);
+		stream.read(chunk[0 .. n]);
+		buf ~= chunk[0 .. n];
+	}
+	// `buf` is a local nothing else references, so it can be viewed as immutable.
+	return () @trusted { return cast(string) buf; }();
+}
+
+/// Map a non-2xx HTTP status to its delivery-error category. Only a 5xx is a
+/// server-side failure; any other final status — a 4xx, a redirect (deliveries
+/// never follow one), or a stray 1xx — means the endpoint is misconfigured for
+/// receiving deliveries, which the wire's `http_4xx` category reports.
 DeliveryErrorCategory categoryForStatus(int status) @safe pure nothrow @nogc
 {
-	return (status / 100 == 4) ? DeliveryErrorCategory.http4xx : DeliveryErrorCategory.http5xx;
+	return (status / 100 == 5) ? DeliveryErrorCategory.http5xx : DeliveryErrorCategory.http4xx;
 }
 
 /// Best-effort classification of a connector exception message into a category.
@@ -165,25 +226,40 @@ DeliveryErrorCategory categoryForException(string msg) @safe
 	return DeliveryErrorCategory.connectionRefused;
 }
 
-/// Build the signed Standard Webhooks request headers for a delivery: the
-/// `webhook-id`/`-timestamp`/`-signature` triplet (symmetric `v1,` HMAC over the
-/// raw body), the MCP `X-MCP-Subscription-Id` header, plus — during a secret
+/// The keys, identity and clock a delivery is signed with.
+struct DeliverySigning
+{
+	string secret; /// current Standard Webhooks `whsec_` secret
+	string previousSecret; /// rotated-out secret, also signed with during its grace window ("" if none)
+	long previousSecretGraceUntilMs; /// end of the rotation grace window (ms since epoch)
+	long nowMs; /// current time (ms since epoch), checked against the grace window
+	string messageId; /// `webhook-id`
+	long timestamp; /// `webhook-timestamp` (seconds since epoch)
+	string subscriptionId; /// sent as `X-MCP-Subscription-Id`
+	V1aSigner v1aSigner; /// optional asymmetric signer appending a `v1a,` signature
+}
+
+/// Build the signed Standard Webhooks request headers for a delivery of `body`:
+/// the `webhook-id`/`-timestamp`/`-signature` triplet (symmetric `v1,` HMAC over
+/// the raw body), the MCP `X-MCP-Subscription-Id` header, plus — during a secret
 /// rotation grace window — a second `v1,` signature under the previous secret,
 /// and — when an asymmetric signer is supplied — an appended `v1a,` signature.
-string[string] signDeliveryHeaders(string secret, string previousSecret, long graceUntilMs,
-		long nowMs, string msgId, long ts, string body, string subscriptionId, V1aSigner v1aSigner) @safe
+string[string] signDeliveryHeaders(DeliverySigning signing, string body) @safe
 {
 	import standardwebhooks : Webhook;
 
-	auto wh = Webhook(secret);
+	const msgId = signing.messageId;
+	const ts = signing.timestamp;
+	auto wh = Webhook(signing.secret);
 	auto headers = wh.signHeaders(msgId, ts, body);
 	string sig = headers["webhook-signature"];
 
 	// Secret rotation: dual-sign with the prior secret during the grace window so
-	// in-flight deliveries verify under either (Standard Webhooks multi-signature).
-	if (previousSecret.length && nowMs < graceUntilMs)
+	// a receiver not yet updated verifies under either (Standard Webhooks
+	// multi-signature).
+	if (signing.previousSecret.length && signing.nowMs < signing.previousSecretGraceUntilMs)
 	{
-		auto prev = Webhook(previousSecret);
+		auto prev = Webhook(signing.previousSecret);
 		auto ph = prev.signHeaders(msgId, ts, body);
 		sig = sig ~ " " ~ ph["webhook-signature"];
 	}
@@ -192,15 +268,15 @@ string[string] signDeliveryHeaders(string secret, string previousSecret, long gr
 	// (over the same signed content). The signer mirrors Standard Webhooks'
 	// `sign(msgId, ts, payload)`, so `standardwebhooks.ed25519.AsymmetricWebhook`
 	// drops straight in (wired by the events-ed25519 build configuration).
-	if (v1aSigner !is null)
+	if (signing.v1aSigner !is null)
 	{
-		const token = v1aSigner(msgId, ts, body);
+		const token = signing.v1aSigner(msgId, ts, body);
 		if (token.length)
 			sig = sig ~ " " ~ token;
 	}
 
 	headers["webhook-signature"] = sig;
-	headers[subscriptionIdHeader] = subscriptionId;
+	headers[subscriptionIdHeader] = signing.subscriptionId;
 	return headers;
 }
 
@@ -212,11 +288,11 @@ bool callbackHostAllowed(string url, bool allowPrivate) @safe
 {
 	import mcp.protocol.ssrf : classifyHostLexical, AddressClass;
 
-	if (allowPrivate)
-		return true;
 	const host = hostOf(url);
 	if (host.length == 0)
 		return false;
+	if (allowPrivate)
+		return true;
 	// A registered name classifies as public_ lexically; the connector re-checks
 	// the resolved IP at delivery time, so only reject literals that are provably
 	// internal here.
@@ -241,11 +317,11 @@ private string hostOf(string url) @safe
 /// timing side-channel cannot leak the nonce.
 bool challengeEchoed(string body, string expected) @safe
 {
-	import vibe.data.json : parseJsonString;
+	import mcp.protocol.jsonrpc : parseUntrustedJson;
 
 	Json j;
 	try
-		j = parseJsonString(body);
+		j = parseUntrustedJson(body);
 	catch (Exception)
 		return false;
 	if (j.type != Json.Type.object || "challenge" !in j || j["challenge"].type != Json.Type.string)
@@ -281,8 +357,11 @@ unittest  // signDeliveryHeaders produces verifiable Standard Webhooks headers
 
 	const 
 	body = `{"eventId":"evt_1","name":"n","timestamp":"t","data":{}}`;
-	auto headers = signDeliveryHeaders(testSecret, "", 0, 1_000_000, "evt_1",
-			1_739_980_800, body, "sub_abc", null);
+	DeliverySigning signing = {
+		secret: testSecret, messageId: "evt_1", timestamp: 1_739_980_800,
+		subscriptionId: "sub_abc"
+	};
+	auto headers = signDeliveryHeaders(signing, body);
 	assert(headers["webhook-id"] == "evt_1");
 	assert(headers[subscriptionIdHeader] == "sub_abc");
 	// An off-the-shelf Standard Webhooks verifier accepts the signed delivery.
@@ -298,8 +377,11 @@ unittest  // a rotated secret dual-signs so either secret verifies during the gr
 	enum prev = "whsec_BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBA=";
 	const 
 	body = `{"x":1}`;
-	auto headers = signDeliveryHeaders(testSecret, prev, 2_000_000, 1_000_000,
-			"evt", 1700, body, "sub", null);
+	DeliverySigning signing = {
+		secret: testSecret, previousSecret: prev, previousSecretGraceUntilMs: 2_000_000,
+		nowMs: 1_000_000, messageId: "evt", timestamp: 1700, subscriptionId: "sub"
+	};
+	auto headers = signDeliveryHeaders(signing, body);
 	// both the new and the previous secret verify the delivery
 	assert(Webhook(testSecret).verifyIgnoringTimestamp(body, headers) == body);
 	assert(Webhook(prev).verifyIgnoringTimestamp(body, headers) == body);
@@ -314,8 +396,11 @@ unittest  // the rotation dual-signature is dropped once the grace window has pa
 	const 
 	body = `{"x":1}`;
 	// nowMs (3_000_000) is past graceUntilMs (2_000_000): only the new secret signs.
-	auto headers = signDeliveryHeaders(testSecret, prev, 2_000_000, 3_000_000,
-			"evt", 1700, body, "sub", null);
+	DeliverySigning signing = {
+		secret: testSecret, previousSecret: prev, previousSecretGraceUntilMs: 2_000_000,
+		nowMs: 3_000_000, messageId: "evt", timestamp: 1700, subscriptionId: "sub"
+	};
+	auto headers = signDeliveryHeaders(signing, body);
 	assert(Webhook(testSecret).verifyIgnoringTimestamp(body, headers) == body);
 	// a single signature (no space-delimited second one)
 	assert(!headers["webhook-signature"].canFind(' '));
@@ -327,10 +412,129 @@ unittest  // an asymmetric signer appends a v1a, signature alongside the v1, HMA
 
 	const 
 	body = `{"x":1}`;
-	auto headers = signDeliveryHeaders(testSecret, "", 0, 1000, "evt", 1700,
-			body, "sub", (string id, long ts, string p) @safe => "v1a,ZmFrZQ==");
+	DeliverySigning signing = {
+		secret: testSecret, messageId: "evt", timestamp: 1700, subscriptionId: "sub",
+		v1aSigner: (string id, long ts, string p) @safe => "v1a,ZmFrZQ=="
+	};
+	auto headers = signDeliveryHeaders(signing, body);
 	assert(headers["webhook-signature"].canFind("v1a,ZmFrZQ=="));
 	assert(headers["webhook-signature"].canFind("v1,"));
+}
+
+version (unittest)
+{
+	// Serve one canned HTTP response per connection on a loopback port and run
+	// `client` against it inside the event loop. `respond` writes the response.
+	private void withLoopbackServer(void delegate(scope TCPConnection conn) @safe respond,
+			void delegate(ushort port) @safe client) @safe
+	{
+		import vibe.core.core : runTask, runEventLoop, exitEventLoop;
+		import vibe.core.net : listenTCP;
+
+		auto listener = listenTCP(0, (TCPConnection conn) @safe nothrow{
+			try
+			{
+				// Consume the request head and body before answering.
+				ubyte[1] b;
+				string head;
+				while (!head.endsWith("\r\n\r\n"))
+				{
+					conn.read(b[]);
+					head ~= cast(char) b[0];
+				}
+				auto cl = head.toLower.findSplitAfter("content-length:")[1];
+				const len = cl.length ? cl.until("\r").to!string
+					.strip
+					.to!size_t : 0;
+				foreach (_; 0 .. len)
+					conn.read(b[]);
+				respond(conn);
+			}
+			catch (Exception)
+			{
+			}
+		}, "127.0.0.1");
+		const port = listener.bindAddress.port;
+		runTask(() nothrow{
+			try
+			{
+				client(port);
+				listener.stopListening();
+			}
+			catch (Exception)
+			{
+			}
+			exitEventLoop();
+		});
+		runEventLoop();
+	}
+
+	import vibe.core.net : TCPConnection;
+	import std.algorithm : endsWith, findSplitAfter, until;
+	import std.string : strip;
+	import std.uni : toLower;
+	import std.conv : to;
+}
+
+unittest  // a drip-fed response body is cut off at the request deadline
+{
+	import core.time : Duration, msecs, MonoTime, seconds;
+	import vibe.core.core : sleep;
+
+	WebhookHttpResult result;
+	Duration took;
+	withLoopbackServer((scope TCPConnection conn) @safe {
+		conn.write("HTTP/1.1 200 OK\r\nContent-Length: 100000\r\n\r\n");
+		foreach (_; 0 .. 100_000)
+		{
+			conn.write("x");
+			conn.flush();
+			sleep(20.msecs);
+		}
+	}, (ushort port) @safe {
+		auto t = new SecureWebhookTransport(300.msecs);
+		const start = MonoTime.currTime;
+		result = t.post("http://127.0.0.1:" ~ port.to!string ~ "/hook", null, "{}", true);
+		took = MonoTime.currTime - start;
+	});
+	assert(took < 3.seconds);
+	assert(!result.ok && result.error.get == DeliveryErrorCategory.timeout);
+}
+
+unittest  // a 2xx response whose body is not UTF-8 still counts as delivered
+{
+	WebhookHttpResult result;
+	withLoopbackServer((scope TCPConnection conn) @safe {
+		conn.write("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n");
+		conn.write(cast(const(ubyte)[])[0xff, 0xfe]);
+		conn.flush();
+	}, (ushort port) @safe {
+		import core.time : seconds;
+
+		auto t = new SecureWebhookTransport(5.seconds);
+		result = t.post("http://127.0.0.1:" ~ port.to!string ~ "/hook", null, "{}", true);
+	});
+	assert(result.ok && result.statusCode == 200);
+}
+
+unittest  // a response body is read only up to the cap
+{
+	import core.time : seconds;
+	import std.array : replicate;
+
+	WebhookHttpResult result;
+	withLoopbackServer((scope TCPConnection conn) @safe {
+		enum size = 4 * 1024 * 1024;
+		conn.write("HTTP/1.1 200 OK\r\nContent-Length: " ~ size.to!string ~ "\r\n\r\n");
+		const chunk = "y".replicate(64 * 1024);
+		foreach (_; 0 .. size / chunk.length)
+			conn.write(chunk);
+		conn.flush();
+	}, (ushort port) @safe {
+		auto t = new SecureWebhookTransport(5.seconds);
+		result = t.post("http://127.0.0.1:" ~ port.to!string ~ "/hook", null, "{}", true);
+	});
+	assert(result.ok && result.body.length <= maxWebhookResponseBytes);
 }
 
 unittest  // categoryForStatus splits 4xx and 5xx
@@ -339,11 +543,25 @@ unittest  // categoryForStatus splits 4xx and 5xx
 	assert(categoryForStatus(503) == DeliveryErrorCategory.http5xx);
 }
 
+unittest  // categoryForStatus reports a redirect or informational final status as http4xx
+{
+	assert(categoryForStatus(301) == DeliveryErrorCategory.http4xx);
+	assert(categoryForStatus(307) == DeliveryErrorCategory.http4xx);
+	assert(categoryForStatus(101) == DeliveryErrorCategory.http4xx);
+	assert(categoryForStatus(500) == DeliveryErrorCategory.http5xx);
+}
+
 unittest  // categoryForException classifies common failures
 {
 	assert(categoryForException("TLS handshake failed") == DeliveryErrorCategory.tlsError);
 	assert(categoryForException("operation timed out") == DeliveryErrorCategory.timeout);
 	assert(categoryForException("connection refused") == DeliveryErrorCategory.connectionRefused);
+}
+
+unittest  // callbackHostAllowed rejects a URL with no host even when private hosts are allowed
+{
+	assert(!callbackHostAllowed("https:///hooks", true));
+	assert(!callbackHostAllowed("not a url", true));
 }
 
 unittest  // callbackHostAllowed rejects internal literals but permits public names
@@ -371,9 +589,66 @@ unittest  // challengeEchoed accepts a matching echo and rejects mismatches
 	assert(!challengeEchoed(`{"other":"x"}`, "nonce123"));
 }
 
+unittest  // challengeEchoed rejects an echo nested past the depth cap
+{
+	import std.array : replicate;
+
+	const deep = "[".replicate(1000) ~ "]".replicate(1000);
+	assert(!challengeEchoed(`{"challenge":"nonce123","x":` ~ deep ~ `}`, "nonce123"));
+}
+
 unittest  // constantTimeEquals matches std equality semantics
 {
 	assert(constantTimeEquals("abc", "abc"));
 	assert(!constantTimeEquals("abc", "abd"));
 	assert(!constantTimeEquals("abc", "abcd"));
+}
+
+version (unittest)
+{
+	import vibe.core.log : LogLevel, Logger, LogLine;
+
+	// Records every warning-or-higher log line while registered.
+	private final class WarnCaptureLogger : Logger
+	{
+		string[] lines;
+		this() @safe
+		{
+			minLevel = LogLevel.warn;
+		}
+
+		override void log(ref LogLine line) @safe
+		{
+			lines ~= line.text;
+		}
+	}
+
+	private string[] captureWarnings(scope void delegate() @safe fn) @safe
+	{
+		import vibe.core.log : deregisterLogger, registerLogger;
+
+		auto logger = new WarnCaptureLogger;
+		auto shared_ = () @trusted { return cast(shared) logger; }();
+		() @trusted { registerLogger(shared_); }();
+		scope (exit)
+			() @trusted { deregisterLogger(shared_); }();
+		fn();
+		return (cast() logger).lines;
+	}
+}
+
+unittest  // a callback the SSRF policy refuses is logged as a warning with the reason
+{
+	import core.time : seconds;
+	import std.algorithm : any, canFind;
+
+	auto transport = new SecureWebhookTransport(1.seconds);
+	WebhookHttpResult r;
+	auto lines = captureWarnings(() @safe {
+		r = transport.post("http://127.0.0.1:1/hook?token=secret", null, "{}", false);
+	});
+	assert(!r.ok);
+	assert(r.error.get == DeliveryErrorCategory.connectionRefused);
+	assert(lines.any!(l => l.canFind("refused") && l.canFind("insecure")));
+	assert(!lines.any!(l => l.canFind("secret")));
 }

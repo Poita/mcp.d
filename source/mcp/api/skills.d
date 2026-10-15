@@ -4,8 +4,9 @@ import std.typecons : nullable;
 import vibe.data.json : Json;
 
 import mcp.server.server : McpServer;
+import mcp.server.context : RequestContext;
 import mcp.server.skill_index : SkillIndex;
-import mcp.protocol.types : Resource, ResourceContents;
+import mcp.protocol.types : Resource, ResourceContents, SkillEntry, SkillResourceRef;
 
 @safe:
 
@@ -54,9 +55,10 @@ struct SkillFile
 }
 
 /// A declarative skill: a `SKILL.md` (its `instructions` body, with frontmatter
-/// synthesized from `path`'s final segment, `description`, and `metadata`) plus
-/// any supporting `files`. Register it with `registerSkill`; the `@skill` UDA
-/// builds one of these from an annotated method.
+/// synthesized from `path`'s final segment, `description`, the optional
+/// `license` / `compatibility` / `allowedTools`, and `metadata`) plus any
+/// supporting `files`. Register it with `registerSkill`; the `@skill` UDA builds
+/// one of these from an annotated method.
 struct Skill
 {
 	/// The skill path: a `/`-separated locator whose final segment is the skill
@@ -70,6 +72,13 @@ struct Skill
 	/// extensions (none are currently defined).
 	string[string] metadata;
 	SkillFile[] files; /// optional supporting files served as sibling resources
+	string license; /// optional `license`: a license name or bundled license file
+	/// Optional `compatibility`: the environment the skill needs (at most 500
+	/// characters), e.g. "Requires git and network access".
+	string compatibility;
+	/// Optional `allowed-tools`: the space-delimited tools the skill may use
+	/// without asking, e.g. "Bash(git:*) Read".
+	string allowedTools;
 
 	/// The skill name: the final segment of `path`, per SEP-2640's requirement
 	/// that the last `<skill-path>` segment equal the frontmatter `name`.
@@ -77,6 +86,104 @@ struct Skill
 	{
 		return skillName(path);
 	}
+
+	/// The frontmatter this skill's `SKILL.md` and entry carry.
+	SkillFrontmatter frontmatter() @safe
+	{
+		return SkillFrontmatter(name, description, license, compatibility, allowedTools, metadata);
+	}
+}
+
+/// The YAML frontmatter of a synthesized `SKILL.md`, per the Agent Skills
+/// format: the required `name` and `description` plus the optional `license`,
+/// `compatibility`, `allowed-tools`, and `metadata`, each emitted only when set.
+struct SkillFrontmatter
+{
+	string name; /// the skill name (the final segment of its path)
+	string description; /// what the skill does and when to use it (1..1024 characters)
+	string license; /// optional license name or bundled license file
+	string compatibility; /// optional environment requirements (at most 500 characters)
+	string allowedTools; /// optional space-delimited pre-approved tools (`allowed-tools`)
+	string[string] metadata; /// optional extra string pairs under `metadata:`
+
+	/// Why this frontmatter breaks the Agent Skills limits (see
+	/// `skillFieldProblem`), or `null` when it is within them.
+	string problem() const @safe pure
+	{
+		return skillFieldProblem(description, compatibility);
+	}
+
+	/// The frontmatter as a JSON object, matching the YAML `toYaml` renders:
+	/// the verbatim `frontmatter` SEP-2640 requires in each skill entry.
+	Json toJson() const @safe
+	{
+		import std.algorithm : sort;
+
+		Json fm = Json.emptyObject;
+		fm["name"] = name;
+		fm["description"] = description;
+		if (license.length)
+			fm["license"] = license;
+		if (compatibility.length)
+			fm["compatibility"] = compatibility;
+		if (allowedTools.length)
+			fm["allowed-tools"] = allowedTools;
+		if (metadata.length)
+		{
+			Json m = Json.emptyObject;
+			foreach (key; metadata.keys.sort)
+				m[key] = metadata[key];
+			fm["metadata"] = m;
+		}
+		return fm;
+	}
+
+	/// The frontmatter as a `---`-fenced YAML block. Every value is YAML-quoted,
+	/// including `name`: a valid skill name such as `yes`, `null`, or `123`
+	/// would otherwise parse as a boolean, null, or number.
+	string toYaml() const @safe
+	{
+		import std.array : Appender;
+		import std.algorithm : sort;
+
+		Appender!string a;
+		a ~= "---\n";
+		a ~= "name: " ~ yamlQuote(name) ~ "\n";
+		a ~= "description: " ~ yamlQuote(description) ~ "\n";
+		if (license.length)
+			a ~= "license: " ~ yamlQuote(license) ~ "\n";
+		if (compatibility.length)
+			a ~= "compatibility: " ~ yamlQuote(compatibility) ~ "\n";
+		if (allowedTools.length)
+			a ~= "allowed-tools: " ~ yamlQuote(allowedTools) ~ "\n";
+		if (metadata.length)
+		{
+			a ~= "metadata:\n";
+			// Emit keys in a stable (sorted) order so the rendered SKILL.md is
+			// deterministic regardless of the associative array's iteration order.
+			foreach (key; metadata.keys.sort)
+				a ~= "  " ~ yamlQuote(key) ~ ": " ~ yamlQuote(metadata[key]) ~ "\n";
+		}
+		a ~= "---\n";
+		return a.data;
+	}
+}
+
+/// Why a skill's `description` or `compatibility` breaks the Agent Skills
+/// limits — a `description` must be 1..1024 characters and a `compatibility` at
+/// most 500, counted in code points — or `null` when both are within them.
+/// Usable at compile time.
+string skillFieldProblem(string description, string compatibility) @safe pure
+{
+	import std.utf : count;
+
+	if (description.length == 0)
+		return "a skill description must not be empty";
+	if (count(description) > 1024)
+		return "a skill description must be at most 1024 characters";
+	if (count(compatibility) > 500)
+		return "a skill compatibility must be at most 500 characters";
+	return null;
 }
 
 /// The final segment of a skill path — the skill's `name`. For `acme/billing/refunds`
@@ -116,7 +223,8 @@ bool isValidSkillName(string name) @safe pure nothrow
 
 /// Whether `path` is a valid skill path: one or more non-empty `/`-separated
 /// segments whose final segment is a valid skill name (`isValidSkillName`).
-/// Prefix segments only need to be non-empty (RFC 3986 path segments).
+/// Prefix segments need only be non-empty RFC 3986 path segments other than
+/// the dot segments `.` and `..`, which a URI resolver would collapse.
 bool isValidSkillPath(string path) @safe pure nothrow
 {
 	if (path.length == 0)
@@ -130,6 +238,8 @@ bool isValidSkillPath(string path) @safe pure nothrow
 		if (i == segStart) // empty segment (leading, trailing, or doubled '/')
 			return false;
 		last = path[segStart .. i];
+		if (last == "." || last == "..")
+			return false;
 		segStart = i + 1;
 	}
 	if (segStart == path.length) // trailing '/' leaves an empty final segment
@@ -138,16 +248,41 @@ bool isValidSkillPath(string path) @safe pure nothrow
 	return isValidSkillName(last);
 }
 
-/// The `skill://<path>/SKILL.md` resource URI for a skill.
-string skillUri(string path) @safe pure
+/// The `skill://<path>/SKILL.md` resource URI for a skill. Each `/`-separated
+/// segment of `path` is percent-encoded.
+string skillUri(string path) @safe
 {
-	return "skill://" ~ path ~ "/SKILL.md";
+	return "skill://" ~ encodeSegments(path) ~ "/SKILL.md";
 }
 
-/// The `skill://<path>/<file>` resource URI for a skill's supporting file.
-string skillFileUri(string path, string file) @safe pure
+/// The `skill://<path>/<file>` resource URI for a skill's supporting file. Each
+/// `/`-separated segment of `path` and `file` is percent-encoded, so a file
+/// name containing a space, `#`, `?`, or `%` still yields a URI naming it.
+string skillFileUri(string path, string file) @safe
 {
-	return "skill://" ~ path ~ "/" ~ file;
+	return "skill://" ~ encodeSegments(path) ~ "/" ~ encodeSegments(file);
+}
+
+/// Percent-encode every `/`-separated segment of `path`, keeping the separators.
+private string encodeSegments(string path) @safe
+{
+	import std.algorithm : joiner, map, splitter;
+	import std.conv : to;
+	import std.uri : encodeComponent;
+
+	return path.splitter('/').map!(seg => encodeComponent(seg)).joiner("/").to!string;
+}
+
+/// Whether `path` is an admissible supporting-file path: relative to the skill
+/// root, `/`-separated, with no empty, `.`, or `..` segments and no
+/// backslashes, so it can neither escape the skill nor alias another file.
+bool isValidSkillFilePath(string path) @safe pure
+{
+	import std.algorithm : any, canFind, splitter;
+
+	if (path.length == 0 || path.canFind('\\'))
+		return false;
+	return !path.splitter('/').any!(seg => seg.length == 0 || seg == "." || seg == "..");
 }
 
 /// A `sha256:<hex>` digest of `bytes`, the integrity form SEP-2640 requires for
@@ -167,70 +302,56 @@ private string yamlQuote(string s) @safe pure
 {
 	import std.array : Appender;
 
+	import std.format : formattedWrite;
+
 	Appender!string a;
 	a ~= '"';
-	foreach (c; s)
+	foreach (dchar c; s)
 	{
-		if (c == '\\' || c == '"')
-			a ~= '\\';
-		if (c == '\n')
+		switch (c)
 		{
-			a ~= "\\n";
-			continue;
+		case '\\':
+			a ~= `\\`;
+			break;
+		case '"':
+			a ~= `\"`;
+			break;
+		case '\n':
+			a ~= `\n`;
+			break;
+		case '\r':
+			a ~= `\r`;
+			break;
+		case '\t':
+			a ~= `\t`;
+			break;
+			// YAML treats NEL, LS and PS as line breaks and rejects them raw in a
+			// flow scalar, so they use YAML's dedicated escapes.
+		case '\u0085':
+			a ~= `\N`;
+			break;
+		case '\u2028':
+			a ~= `\L`;
+			break;
+		case '\u2029':
+			a ~= `\P`;
+			break;
+		default:
+			if (c < 0x20 || c == 0x7F)
+				a.formattedWrite!`\x%02X`(cast(uint) c);
+			else
+				a ~= c;
 		}
-		a ~= c;
 	}
 	a ~= '"';
 	return a.data;
 }
 
-/// Render a complete `SKILL.md`: the YAML frontmatter (synthesized from `name`,
-/// `description`, and any `metadata`) followed by the `instructions` body. The
-/// `name` is emitted unquoted (it is constrained to a URI-safe token); the
-/// description and metadata values are YAML-quoted so any content is safe.
-string skillMarkdown(string name, string description, string instructions,
-		string[string] metadata = null) @safe
+/// Render a complete `SKILL.md`: the YAML frontmatter `fm` followed by the
+/// `instructions` body.
+string skillMarkdown(SkillFrontmatter fm, string instructions) @safe
 {
-	import std.array : Appender;
-	import std.algorithm : sort;
-
-	Appender!string a;
-	a ~= "---\n";
-	a ~= "name: " ~ name ~ "\n";
-	a ~= "description: " ~ yamlQuote(description) ~ "\n";
-	if (metadata.length)
-	{
-		a ~= "metadata:\n";
-		// Emit keys in a stable (sorted) order so the rendered SKILL.md is
-		// deterministic regardless of the associative array's iteration order.
-		foreach (key; metadata.keys.sort)
-			a ~= "  " ~ yamlQuote(key) ~ ": " ~ yamlQuote(metadata[key]) ~ "\n";
-	}
-	a ~= "---\n\n";
-	a ~= instructions;
-	return a.data;
-}
-
-/// The skill's frontmatter rendered as a JSON object, matching the YAML
-/// `skillMarkdown` synthesizes: `name` and `description` always, plus a nested
-/// `metadata` object when present. This is the verbatim `frontmatter` SEP-2640
-/// requires in each skill entry — identical in content to the `SKILL.md` it
-/// describes.
-private Json frontmatterJson(string name, string description, string[string] metadata) @safe
-{
-	import std.algorithm : sort;
-
-	Json fm = Json.emptyObject;
-	fm["name"] = name;
-	fm["description"] = description;
-	if (metadata.length)
-	{
-		Json m = Json.emptyObject;
-		foreach (key; metadata.keys.sort)
-			m[key] = metadata[key];
-		fm["metadata"] = m;
-	}
-	return fm;
+	return fm.toYaml() ~ "\n" ~ instructions;
 }
 
 /// Advertise the SEP-2640 skills extension on `server`, committing it to the
@@ -239,6 +360,9 @@ private Json frontmatterJson(string name, string description, string[string] met
 /// `registerSkill`, and called for you by `registerSkill` and the `@skill` UDA.
 /// Declare it (directly or via a `registerSkill`) before `initialize` /
 /// `server/discover` so the extension appears in the negotiated capabilities.
+/// Call it as `server.enableSkills()`, like `server.enableTasks()`; it is a free
+/// function only because `mcp.api` builds on `mcp.server`, not the other way
+/// round.
 void enableSkills(McpServer server) @safe
 {
 	auto index = server.ensureSkillIndex();
@@ -252,7 +376,7 @@ void enableSkills(McpServer server) @safe
 	// `registerSkill` calls must not re-clobber the negotiated settings.
 	Json settings = Json.emptyObject;
 	settings["directoryRead"] = true;
-	server.enableExtension(skillsExtensionKey, settings);
+	server.advertiseExtension(skillsExtensionKey, settings);
 	server.enableDirectoryRead();
 }
 
@@ -266,7 +390,33 @@ package(mcp) void addSkillEntry(McpServer server, Json entry) @safe
 	if (uri in index.byUri)
 		throw new Exception("a skill entry for '" ~ uri ~ "' is already registered");
 	index.byUri[uri] = entry;
-	index.order ~= uri;
+}
+
+/// Remove the skill registered at `path`: its entry, every resource its entry
+/// lists (or its `SKILL.md` alone for a dynamic skill), and the entry of any
+/// nested skill whose `SKILL.md` is among those resources. Undoes a
+/// `registerSkill`, `registerDynamicSkill`, or `registerSkillDir`; does nothing
+/// when no skill is registered at `path`.
+package(mcp) void unregisterSkill(McpServer server, string path) @safe
+{
+	auto index = server.ensureSkillIndex();
+	const uri = skillUri(path);
+	auto entry = uri in index.byUri;
+	if (entry is null)
+		return;
+	const manifest = (*entry)["resources"];
+	index.byUri.remove(uri);
+	if (manifest.type != Json.Type.array)
+	{
+		server.removeResource(uri);
+		return;
+	}
+	foreach (i; 0 .. manifest.length)
+	{
+		const fileUri = manifest[i]["uri"].get!string;
+		server.removeResource(fileUri);
+		index.byUri.remove(fileUri);
+	}
 }
 
 // Build a resource reader that closes over its file/uri by PARAMETER. Capturing a
@@ -287,11 +437,18 @@ private ResourceContents delegate() @safe makeFileReader(SkillFile f, string uri
 /// `path` is not a valid skill path (see `isValidSkillPath`).
 void registerSkill(McpServer server, Skill skill) @safe
 {
-	const name = skill.name;
-	registerSkillResources(server, skill.path, skillMarkdown(name, skill.description,
-			skill.instructions, skill.metadata), frontmatterJson(name,
-			skill.description, skill.metadata), skill.files);
+	auto fm = skill.frontmatter;
+	if (auto problem = fm.problem)
+		throw new Exception("skill '" ~ skill.path ~ "': " ~ problem);
+	registerSkillResources(server, skill.path, skillMarkdown(fm,
+			skill.instructions), fm.toJson(), skill.files);
 }
+
+/// What makes a skill path valid (see `isValidSkillPath`), for error messages.
+package(mcp) enum skillPathRule = "each '/'-separated segment must be non-empty and "
+	~ "not '.' or '..', and the final segment must be a valid skill name (1..64 chars "
+	~ "of lowercase letters, digits, and single hyphens, no leading/trailing/consecutive "
+	~ "hyphens)";
 
 /// The shared registration core both `registerSkill` (which synthesizes the
 /// `SKILL.md` and frontmatter from a `Skill`) and `registerSkillDir` (which
@@ -314,10 +471,7 @@ package(mcp) void registerSkillResources(McpServer server, string path,
 	import std.conv : to;
 
 	if (!isValidSkillPath(path))
-		throw new Exception("invalid skill path '" ~ path
-				~ "': each '/'-separated segment must be non-empty and the final segment "
-				~ "must be a valid skill name (1..64 chars of lowercase letters, digits, "
-				~ "and single hyphens, no leading/trailing/consecutive hyphens)");
+		throw new Exception("invalid skill path '" ~ path ~ "': " ~ skillPathRule);
 
 	const name = skillName(path);
 	const uri = skillUri(path);
@@ -344,6 +498,10 @@ package(mcp) void registerSkillResources(McpServer server, string path,
 	size_t total = skillMd.length;
 	foreach (file; files)
 	{
+		if (!isValidSkillFilePath(file.path))
+			throw new Exception("invalid supporting file path '" ~ file.path ~ "' in skill '"
+					~ path ~ "': it must be relative to the skill root, '/'-separated, "
+					~ "with no empty, '.', or '..' segments and no backslashes");
 		const fu = skillFileUri(path, file.path);
 		if (fu in localUris)
 			throw new Exception("duplicate skill resource uri '" ~ fu
@@ -359,8 +517,6 @@ package(mcp) void registerSkillResources(McpServer server, string path,
 					~ "extension allows at most 16 MiB per skill");
 		manifest ~= resourceRef(fu, skillDigest(bytes), bytes.length);
 	}
-
-	enableSkills(server);
 
 	// Roll back any resources registered for THIS skill if a later registration
 	// throws (e.g. a URI already taken by another skill), so a failed registration
@@ -402,6 +558,9 @@ package(mcp) void registerSkillResources(McpServer server, string path,
 	entry["frontmatter"] = frontmatter;
 	entry["resources"] = manifest;
 	addSkillEntry(server, entry);
+	// Advertised only once the skill is fully registered, so a throw above
+	// leaves the server unchanged.
+	server.enableSkills();
 }
 
 /// One `{uri, digest, size}` element of a skill entry's `resources` manifest:
@@ -414,14 +573,6 @@ package(mcp) Json resourceRef(string uri, string digest, size_t size) @safe
 	r["digest"] = digest;
 	r["size"] = cast(long) size;
 	return r;
-}
-
-/// Convenience overload registering a skill from its parts (no supporting files
-/// or metadata). Equivalent to `registerSkill(server, Skill(path, description,
-/// instructions))`.
-void registerSkill(McpServer server, string path, string description, string instructions) @safe
-{
-	registerSkill(server, Skill(path, description, instructions));
 }
 
 /// A skill whose `SKILL.md` body is generated on each read, so no stable digest
@@ -445,11 +596,20 @@ struct DynamicSkill
 	string delegate() @safe instructions;
 	/// Optional extra frontmatter under `metadata:` (see `Skill.metadata`).
 	string[string] metadata;
+	string license; /// optional `license` (see `Skill.license`)
+	string compatibility; /// optional `compatibility` (see `Skill.compatibility`)
+	string allowedTools; /// optional `allowed-tools` (see `Skill.allowedTools`)
 
 	/// The skill name: the final segment of `path`.
 	string name() const @safe pure
 	{
 		return skillName(path);
+	}
+
+	/// The fixed frontmatter every read of this skill's `SKILL.md` carries.
+	SkillFrontmatter frontmatter() @safe
+	{
+		return SkillFrontmatter(name, description, license, compatibility, allowedTools, metadata);
 	}
 }
 
@@ -462,33 +622,30 @@ struct DynamicSkill
 void registerDynamicSkill(McpServer server, DynamicSkill skill) @safe
 {
 	if (!isValidSkillPath(skill.path))
-		throw new Exception("invalid skill path '" ~ skill.path
-				~ "': each '/'-separated segment must be non-empty and the final segment "
-				~ "must be a valid skill name (1..64 chars of lowercase letters, digits, "
-				~ "and single hyphens, no leading/trailing/consecutive hyphens)");
+		throw new Exception("invalid skill path '" ~ skill.path ~ "': " ~ skillPathRule);
 	if (skill.instructions is null)
 		throw new Exception("registerDynamicSkill: '" ~ skill.path
 				~ "' has no instructions delegate");
+	auto fm = skill.frontmatter;
+	if (auto problem = fm.problem)
+		throw new Exception("skill '" ~ skill.path ~ "': " ~ problem);
 
 	const name = skill.name;
 	const uri = skillUri(skill.path);
 	if (uri in server.ensureSkillIndex().byUri)
 		throw new Exception("a skill at '" ~ uri ~ "' is already registered");
 
-	enableSkills(server);
-
 	Resource descriptor;
 	descriptor.uri = uri;
 	descriptor.name = name;
 	descriptor.description = nullable(skill.description);
 	descriptor.mimeType = nullable(skillMimeType);
-	// Copied into locals so the reader closure captures values, not the struct.
-	string description = skill.description;
-	string[string] metadata = skill.metadata;
+	// The frontmatter is fixed, so it is rendered once; only the body is
+	// regenerated per read.
+	const header = skillMarkdown(fm, "");
 	auto body_ = skill.instructions;
 	server.registerResource(descriptor, () @safe {
-		return ResourceContents.makeText(uri, skillMimeType,
-			skillMarkdown(name, description, body_(), metadata));
+		return ResourceContents.makeText(uri, skillMimeType, header ~ body_());
 	});
 	// The entry is added last, after the resource is in place, so a throw here
 	// leaves no listed-but-unserved skill; the resource is rolled back to match.
@@ -497,126 +654,23 @@ void registerDynamicSkill(McpServer server, DynamicSkill skill) @safe
 
 	Json entry = Json.emptyObject;
 	entry["uri"] = uri;
-	entry["frontmatter"] = frontmatterJson(name, description, metadata);
+	entry["frontmatter"] = fm.toJson();
 	entry["resources"] = "dynamic";
 	addSkillEntry(server, entry);
+	server.enableSkills();
 }
 
-/// Whether the connected client advertised the skills extension at
-/// initialization (valid after `initialize` / `server/discover`).
-bool clientSupportsSkills(McpServer server) @safe
+/// Whether the client behind `ctx` advertised the skills extension (at
+/// `initialize` for its session, or in the request's `_meta` on 2026-07-28).
+bool clientSupportsSkills(RequestContext ctx) @safe
 {
-	auto ext = server.clientExtensions();
+	auto ext = ctx.clientCapabilities.extensions;
 	return ext.type == Json.Type.object && (skillsExtensionKey in ext) !is null;
 }
 
 // --- Client-side convenience (non-normative SEP-2640 wrappers) --------------
 
 import mcp.client.client : McpClient;
-
-/// One `{uri, digest, size}` entry from a skill entry's `resources` manifest: a
-/// file the skill serves, the sha256 of the bytes it serves, and how many bytes
-/// those are.
-struct SkillResourceRef
-{
-	string uri; /// resource URI of the file
-	string digest; /// `sha256:<hex>` digest of the file's raw bytes
-	long size; /// byte length of the file's raw content (the bytes `digest` covers)
-
-	static SkillResourceRef fromJson(Json j) @safe
-	{
-		SkillResourceRef r;
-		if ("uri" in j && j["uri"].type == Json.Type.string)
-			r.uri = j["uri"].get!string;
-		if ("digest" in j && j["digest"].type == Json.Type.string)
-			r.digest = j["digest"].get!string;
-		if ("size" in j && j["size"].type == Json.Type.int_)
-			r.size = j["size"].get!long;
-		return r;
-	}
-}
-
-/// One skill entry, as carried by `skills/list` and `skills/get`. `name` and
-/// `description` are read from the verbatim `frontmatter` object (always present
-/// per the Agent Skills spec); `uri` addresses the `SKILL.md` directly, and
-/// `resources` is the complete per-file manifest a host verifies reads against.
-/// A dynamically generated skill publishes the string `"dynamic"` in place of a
-/// manifest: `isDynamic` is set and `resources` is empty, and the skill offers
-/// no content integrity. An entry with neither (`!isValid`) is malformed and
-/// must not be loaded. Within the frontmatter's `metadata` object, keys prefixed
-/// `io.modelcontextprotocol/` are reserved for MCP extensions; ignore
-/// unrecognized keys under that prefix.
-struct SkillEntry
-{
-	string uri; /// resource URI of the `SKILL.md`
-	Json frontmatter; /// verbatim `SKILL.md` frontmatter as JSON
-	SkillResourceRef[] resources; /// complete `{uri, digest, size}` manifest of the skill's files
-	bool isDynamic; /// `resources` was the string `"dynamic"`: generated content, no digests
-
-	/// Whether `resources` took one of the two shapes the extension allows: a
-	/// manifest array (never legitimately empty, as it always lists `SKILL.md`)
-	/// or the string `"dynamic"`. A host must not load an entry that is not valid.
-	bool isValid() const @safe pure nothrow
-	{
-		return isDynamic || resources.length > 0;
-	}
-
-	/// The skill `name` from the frontmatter, or empty if absent.
-	string name() const @safe
-	{
-		if (frontmatter.type == Json.Type.object && "name" in frontmatter
-				&& frontmatter["name"].type == Json.Type.string)
-			return frontmatter["name"].get!string;
-		return null;
-	}
-
-	/// The skill `description` from the frontmatter, or empty if absent.
-	string description() const @safe
-	{
-		if (frontmatter.type == Json.Type.object && "description" in frontmatter
-				&& frontmatter["description"].type == Json.Type.string)
-			return frontmatter["description"].get!string;
-		return null;
-	}
-
-	static SkillEntry fromJson(Json j) @safe
-	{
-		SkillEntry e;
-		if ("uri" in j && j["uri"].type == Json.Type.string)
-			e.uri = j["uri"].get!string;
-		if ("frontmatter" in j)
-			e.frontmatter = j["frontmatter"];
-		if ("resources" in j && j["resources"].type == Json.Type.array)
-			foreach (i; 0 .. j["resources"].length)
-				e.resources ~= SkillResourceRef.fromJson(j["resources"][i]);
-		else if ("resources" in j && j["resources"].type == Json.Type.string
-						&& j["resources"].get!string == "dynamic")
-					e.isDynamic = true;
-		return e;
-	}
-}
-
-/// The skills the server publishes, via `skills/list` (paginating to
-/// completion). May be empty — which, per the spec, does NOT prove the server
-/// has no skills: large or generated catalogs may list nothing, and a skill
-/// known only by URI is still readable and retrievable via `getSkill`.
-SkillEntry[] listSkills(McpClient client) @safe
-{
-	SkillEntry[] entries;
-	auto result = client.skillsList();
-	foreach (s; result.skills)
-		entries ~= SkillEntry.fromJson(s);
-	return entries;
-}
-
-/// The entry for the single skill whose `SKILL.md` URI is `uri`, via
-/// `skills/get` — the same `{uri, frontmatter, resources}` a listing would
-/// carry, available even for skills no listing mentioned. Throws `McpException`
-/// (-32602) if the server does not serve `uri` as a skill.
-SkillEntry getSkill(McpClient client, string uri) @safe
-{
-	return SkillEntry.fromJson(client.skillsGet(uri).skill);
-}
 
 /// Verify `bytes`, read from `uri`, against `entry`'s `resources` manifest, as
 /// the Skills extension requires of hosts: the file must be listed in the
@@ -625,7 +679,7 @@ SkillEntry getSkill(McpClient client, string uri) @safe
 /// an unlisted file or a length mismatch is a verification failure equivalent
 /// to a digest mismatch, and a skill without `resources` offers no integrity at
 /// all. Whatever the cause, failed content must not be used; refresh the entry
-/// via `getSkill` and re-read.
+/// via `McpClient.skillsGet` and re-read.
 string verifyResourceDigest(const SkillEntry entry, string uri, scope const(ubyte)[] bytes) @safe
 {
 	import std.conv : to;
@@ -692,43 +746,6 @@ string readSkill(McpClient client, string path) @safe
 	return readSkillUri(client, skillUri(path));
 }
 
-/// One direct child reported by `resources/directory/read`: either a file (read
-/// it with `resources/read`) or a subdirectory (`isDirectory`, descend with a
-/// further `readDirectory`).
-struct SkillDirEntry
-{
-	string uri; /// the child's resource URI
-	string name; /// the child's directory-relative name (basename)
-	string mimeType; /// the child's MIME type (`inode/directory` for a subdirectory)
-
-	/// Whether this child is a subdirectory rather than a file.
-	bool isDirectory() const @safe
-	{
-		return mimeType == skillDirectoryMimeType;
-	}
-}
-
-/// List the direct children of a directory resource via the SEP-2640
-/// `resources/directory/read` method (a wrapper over `client.readDirectory`).
-/// Only valid against a server that advertised `directoryRead: true`. Files come
-/// back with their own MIME type; subdirectories carry `inode/directory`
-/// (`SkillDirEntry.isDirectory`) and are descended with a further call.
-SkillDirEntry[] readDirectory(McpClient client, string uri) @safe
-{
-	SkillDirEntry[] entries;
-	auto result = client.readDirectory(uri);
-	foreach (r; result.resources)
-	{
-		SkillDirEntry e;
-		e.uri = r.uri;
-		e.name = r.name;
-		if (!r.mimeType.isNull)
-			e.mimeType = r.mimeType.get;
-		entries ~= e;
-	}
-	return entries;
-}
-
 // --- Tests ------------------------------------------------------------------
 
 unittest  // the extension key and discovery constants carry the SEP-2640 literals
@@ -737,6 +754,41 @@ unittest  // the extension key and discovery constants carry the SEP-2640 litera
 	assert(skillMimeType == "text/markdown");
 	assert(skillUri("git-workflow") == "skill://git-workflow/SKILL.md");
 	assert(skillFileUri("pdf", "references/FORMS.md") == "skill://pdf/references/FORMS.md");
+}
+
+unittest  // skillFileUri percent-encodes each file path segment
+{
+	assert(skillFileUri("pdf", "my docs/a#b?c%d.md") == "skill://pdf/my%20docs/a%23b%3Fc%25d.md");
+	assert(skillFileUri("pdf", "ref/über.md") == "skill://pdf/ref/%C3%BCber.md");
+}
+
+unittest  // a supporting file with URI-reserved characters is served at its encoded URI
+{
+	import mcp.protocol.jsonrpc : Message, makeRequest;
+
+	auto s = new McpServer("t", "1");
+	registerSkill(s, Skill("pdf", "PDF help", "# PDF", null,
+			[SkillFile("notes/a b#1.md", "text/markdown", "hello")]));
+	Json rp = Json.emptyObject;
+	rp["uri"] = "skill://pdf/notes/a%20b%231.md";
+	auto r = s.handle(Message(makeRequest(Json(1), "resources/read", rp))).get;
+	assert("error" !in r, r.toString);
+	assert(r["result"]["contents"][0]["text"].get!string == "hello");
+}
+
+unittest  // registerSkill rejects supporting file paths that escape or are not skill-relative
+{
+	import std.exception : assertThrown;
+
+	foreach (bad; [
+		"../secret.md", "a/../../b.md", "./a.md", "/abs.md", "a\\b.md", "a//b.md",
+		"", "dir/"
+	])
+	{
+		auto s = new McpServer("t", "1");
+		assertThrown(registerSkill(s, Skill("pdf", "PDF help", "# PDF", null,
+				[SkillFile(bad, "text/plain", "x")])), bad);
+	}
 }
 
 unittest  // the Skills extension negotiates from 2025-11-25
@@ -788,6 +840,15 @@ unittest  // isValidSkillPath allows multi-segment prefixes but constrains the f
 	assert(!isValidSkillPath("acme/Bad_Name")); // invalid final segment
 }
 
+unittest  // isValidSkillPath rejects a '.' or '..' prefix segment
+{
+	assert(!isValidSkillPath("../refunds"));
+	assert(!isValidSkillPath("./refunds"));
+	assert(!isValidSkillPath("acme/../refunds"));
+	assert(!isValidSkillPath("acme/./refunds"));
+	assert(isValidSkillPath("acme/.well-known/refunds"));
+}
+
 unittest  // skillDigest renders a lowercase sha256:<hex> of the bytes
 {
 	// SHA-256 of the empty input is a well-known constant.
@@ -797,24 +858,44 @@ unittest  // skillDigest renders a lowercase sha256:<hex> of the bytes
 
 unittest  // skillMarkdown synthesizes frontmatter with name/description and body
 {
-	auto md = skillMarkdown("git-workflow", "Follow Git conventions",
-			"# Git Workflow\n\n1. Branch.\n");
-	assert(md == "---\nname: git-workflow\ndescription: \"Follow Git conventions\"\n---\n\n"
+	auto md = skillMarkdown(SkillFrontmatter("git-workflow",
+			"Follow Git conventions"), "# Git Workflow\n\n1. Branch.\n");
+	assert(md == "---\nname: \"git-workflow\"\ndescription: \"Follow Git conventions\"\n---\n\n"
 			~ "# Git Workflow\n\n1. Branch.\n");
 }
 
 unittest  // skillMarkdown quotes/escapes a description with special characters
 {
-	auto md = skillMarkdown("x", `He said "hi"`, "body");
+	auto md = skillMarkdown(SkillFrontmatter("x", `He said "hi"`), "body");
 	import std.algorithm : canFind;
 
 	assert(md.canFind(`description: "He said \"hi\""`));
 }
 
+unittest  // skillMarkdown round-trips control and line-separator characters through the frontmatter parser
+{
+	import mcp.api.skill_dir : parseSkillFrontmatter;
+
+	const desc = "a\rb\tc\x01d\x1Fe\x7Ff\u0085g\u2028h\u2029i\\j\"k\nl";
+	auto fm = parseSkillFrontmatter(skillMarkdown(SkillFrontmatter("x", desc,
+metadata: ["k\r": "v\x02"]), "body"));
+	assert(fm["description"].get!string == desc);
+	assert(fm["metadata"]["k\r"].get!string == "v\x02");
+}
+
+unittest  // skillMarkdown frontmatter lines contain no raw control characters
+{
+	import std.algorithm : any;
+
+	auto md = skillMarkdown(SkillFrontmatter("x", "a\rb\x01c\x7F"), "body");
+	auto front = md[0 .. md.length - "body".length];
+	assert(!front.any!(c => c != '\n' && (c < 0x20 || c == 0x7F)));
+}
+
 unittest  // skillMarkdown emits metadata in a deterministic sorted order
 {
 	string[string] meta = ["zeta": "1", "alpha": "2"];
-	auto md = skillMarkdown("x", "d", "body", meta);
+	auto md = skillMarkdown(SkillFrontmatter("x", "d", metadata: meta), "body");
 	import std.string : indexOf;
 
 	const a = md.indexOf(`"alpha"`);
@@ -828,7 +909,7 @@ unittest  // enableSkills advertises the extension (with directoryRead) and noth
 	import mcp.protocol.mrtr : MetaKey;
 
 	auto s = new McpServer("t", "1");
-	enableSkills(s);
+	s.enableSkills();
 
 	Json params = Json.emptyObject;
 	Json m = Json.emptyObject;
@@ -859,8 +940,8 @@ unittest  // registerSkill serves SKILL.md and skills/list carries a conformant 
 	import mcp.protocol.jsonrpc : Message, makeRequest;
 
 	auto s = new McpServer("t", "1");
-	registerSkill(s, "git-workflow", "Follow Git conventions",
-			"# Git Workflow\n\n1. Branch from main.\n");
+	registerSkill(s, Skill("git-workflow", "Follow Git conventions",
+			"# Git Workflow\n\n1. Branch from main.\n"));
 
 	// The SKILL.md resource carries the markdown mime type and the rendered body.
 	Json rp = Json.emptyObject;
@@ -871,7 +952,7 @@ unittest  // registerSkill serves SKILL.md and skills/list carries a conformant 
 	const md = contents["text"].get!string;
 	import std.algorithm : canFind;
 
-	assert(md.canFind("name: git-workflow"));
+	assert(md.canFind(`name: "git-workflow"`));
 	assert(md.canFind("# Git Workflow"));
 
 	// skills/list carries the entry: verbatim frontmatter, the SKILL.md uri, and
@@ -1017,8 +1098,8 @@ unittest  // skills/list paginates whole entries with cursor/nextCursor
 
 	auto s = new McpServer("t", "1");
 	s.setPageSize(1);
-	registerSkill(s, "alpha", "First", "a");
-	registerSkill(s, "beta", "Second", "b");
+	registerSkill(s, Skill("alpha", "First", "a"));
+	registerSkill(s, Skill("beta", "Second", "b"));
 
 	auto page1 = s.handle(Message(makeRequest(Json(1), "skills/list",
 			Json.emptyObject))).get["result"];
@@ -1039,7 +1120,7 @@ unittest  // skills/list on a server with the extension but no skills is empty
 	import mcp.protocol.jsonrpc : Message, makeRequest;
 
 	auto s = new McpServer("t", "1");
-	enableSkills(s);
+	s.enableSkills();
 	auto result = s.handle(Message(makeRequest(Json(1), "skills/list",
 			Json.emptyObject))).get["result"];
 	assert(result["skills"].type == Json.Type.array);
@@ -1116,8 +1197,9 @@ unittest  // skills/list and skills/get do not exist below 2025-11-25
 	conn.negotiated = ProtocolVersion.v2025_06_18;
 	foreach (method; ["skills/list", "skills/get"])
 	{
-		auto outText = s.handleRaw(`{"jsonrpc":"2.0","id":1,"method":"` ~ method
-				~ `","params":{"uri":"skill://office/pdf-forms/SKILL.md"}}`, conn);
+		auto outText = s.handleRaw(`{"jsonrpc":"2.0","id":1,"method":"`
+				~ method ~ `","params":{"uri":"skill://office/pdf-forms/SKILL.md"}}`,
+				conn, "", TokenInfo.invalid());
 		auto resp = parseJsonString(outText);
 		assert(resp["error"]["code"].get!int == cast(int) ErrorCode.methodNotFound);
 	}
@@ -1205,7 +1287,7 @@ unittest  // declaring the skills extension also declares the resources capabili
 	// requires a server that supports resources to declare the capability — even
 	// before the first skill (and so the first resource) is registered.
 	auto s = new McpServer("t", "1");
-	enableSkills(s);
+	s.enableSkills();
 
 	Json params = Json.emptyObject;
 	Json m = Json.emptyObject;
@@ -1304,7 +1386,7 @@ unittest  // a dynamic skill's SKILL.md is generated on each read, under fixed f
 	const second = read();
 	assert(first.canFind("# Read 1") && second.canFind("# Read 2"));
 	// The frontmatter is fixed and identical to the entry's, however the body varies.
-	assert(first.canFind("name: counter") && second.canFind("name: counter"));
+	assert(first.canFind(`name: "counter"`) && second.canFind(`name: "counter"`));
 	assert(first.canFind(`"version": "1"`));
 	auto e = s.handle(Message(makeRequest(Json(3), "skills/list",
 			Json.emptyObject))).get["result"]["skills"][0];
@@ -1321,7 +1403,7 @@ unittest  // registerDynamicSkill rejects an invalid path and a duplicate uri
 	};
 	assertThrown!Exception(registerDynamicSkill(s, bad));
 
-	registerSkill(s, "taken", "First", "a");
+	registerSkill(s, Skill("taken", "First", "a"));
 	DynamicSkill dup = {
 		path: "taken", description: "d", instructions: () @safe => "x"
 	};
@@ -1333,7 +1415,7 @@ unittest  // a prefixed skill path lists frontmatter.name as the final segment
 	import mcp.protocol.jsonrpc : Message, makeRequest;
 
 	auto s = new McpServer("t", "1");
-	registerSkill(s, "acme/billing/refunds", "Process refunds", "# Refunds\n");
+	registerSkill(s, Skill("acme/billing/refunds", "Process refunds", "# Refunds\n"));
 
 	Json rp = Json.emptyObject;
 	rp["uri"] = skillUri("acme/billing/refunds");
@@ -1416,7 +1498,7 @@ unittest  // registerSkill rejects an invalid skill path
 	import std.exception : assertThrown;
 
 	auto s = new McpServer("t", "1");
-	assertThrown!Exception(registerSkill(s, "Bad Name", "d", "body"));
+	assertThrown!Exception(registerSkill(s, Skill("Bad Name", "d", "body")));
 }
 
 unittest  // a duplicate supporting-file path is rejected and rolls back cleanly
@@ -1455,8 +1537,8 @@ unittest  // registering the same skill path twice is rejected, leaving one entr
 	import mcp.protocol.jsonrpc : Message, makeRequest;
 
 	auto s = new McpServer("t", "1");
-	registerSkill(s, "twice", "First", "a");
-	assertThrown!Exception(registerSkill(s, "twice", "Second", "b"));
+	registerSkill(s, Skill("twice", "First", "a"));
+	assertThrown!Exception(registerSkill(s, Skill("twice", "Second", "b")));
 
 	// The first registration is intact: still listed once, still served.
 	auto result = s.handle(Message(makeRequest(Json(1), "skills/list",
@@ -1478,13 +1560,13 @@ unittest  // a supporting file named SKILL.md collides with the skill markdown a
 	assertThrown!Exception(registerSkill(s, bad));
 }
 
-unittest  // multiple skills accumulate in the listing in registration order
+unittest  // multiple skills accumulate in the listing in SKILL.md URI order
 {
 	import mcp.protocol.jsonrpc : Message, makeRequest;
 
 	auto s = new McpServer("t", "1");
-	registerSkill(s, "alpha", "First", "a");
-	registerSkill(s, "beta", "Second", "b");
+	registerSkill(s, Skill("beta", "Second", "b"));
+	registerSkill(s, Skill("alpha", "First", "a"));
 
 	auto result = s.handle(Message(makeRequest(Json(1), "skills/list",
 			Json.emptyObject))).get["result"];
@@ -1493,32 +1575,40 @@ unittest  // multiple skills accumulate in the listing in registration order
 	assert(result["skills"][1]["frontmatter"]["name"].get!string == "beta");
 }
 
-unittest  // clientSupportsSkills reflects what the client advertised at initialize
+version (unittest) private bool probeClientSupportsSkills(Json initCaps) @safe
 {
 	import mcp.protocol.jsonrpc : Message, makeRequest;
+	import mcp.protocol.types : Tool, CallToolResult;
 
 	auto s = new McpServer("t", "1");
+	bool seen;
+	Tool probe = {name: "probe"};
+	s.registerTool(probe, (Json args, RequestContext ctx) @safe {
+		seen = clientSupportsSkills(ctx);
+		return CallToolResult.init;
+	});
+	Json params = Json.emptyObject;
+	params["protocolVersion"] = "2025-06-18";
+	params["capabilities"] = initCaps;
+	s.handle(Message(makeRequest(Json(1), "initialize", params)));
+	Json call = Json.emptyObject;
+	call["name"] = "probe";
+	s.handle(Message(makeRequest(Json(2), "tools/call", call)));
+	return seen;
+}
+
+unittest  // clientSupportsSkills reflects what the request's client advertised
+{
 	Json caps = Json.emptyObject;
 	Json ext = Json.emptyObject;
 	ext[skillsExtensionKey] = Json.emptyObject;
 	caps["extensions"] = ext;
-	Json params = Json.emptyObject;
-	params["protocolVersion"] = "2025-06-18";
-	params["capabilities"] = caps;
-	s.handle(Message(makeRequest(Json(1), "initialize", params)));
-	assert(clientSupportsSkills(s));
+	assert(probeClientSupportsSkills(caps));
 }
 
 unittest  // clientSupportsSkills is false when the client did not advertise it
 {
-	import mcp.protocol.jsonrpc : Message, makeRequest;
-
-	auto s = new McpServer("t", "1");
-	Json params = Json.emptyObject;
-	params["protocolVersion"] = "2025-06-18";
-	params["capabilities"] = Json.emptyObject;
-	s.handle(Message(makeRequest(Json(1), "initialize", params)));
-	assert(!clientSupportsSkills(s));
+	assert(!probeClientSupportsSkills(Json.emptyObject));
 }
 
 unittest  // SkillEntry.fromJson reads uri, frontmatter, and the resources manifest
@@ -1744,8 +1834,12 @@ unittest  // verifyResourceDigest fails everything for an entry without a manife
 
 version (unittest)
 {
+	import mcp.auth.resource_server : TokenInfo;
 	import mcp.protocol.jsonrpc : Message, makeRequest;
-	import mcp.client.transport : ClientTransport, SubscriptionStream, ClientProtocol;
+	import core.time : Duration;
+	import mcp.client.transport : BearerProvider, ClientTransport,
+		SubscriptionStream, ClientProtocol, InboundOrigin;
+	import mcp.protocol.errors : McpException;
 
 	// A client transport that hands each request straight to an in-process
 	// McpServer, so the typed client helpers can be exercised end-to-end
@@ -1777,9 +1871,17 @@ version (unittest)
 			server_.handle(Message(message));
 		}
 
-		bool repliesSynchronously() @safe
+		void postOneway(Json message) @safe nothrow
 		{
-			return true;
+			try
+				sendOneway(message);
+			catch (Exception)
+			{
+			}
+		}
+
+		void abort(long, McpException) @safe
+		{
 		}
 
 		void startServerStream() @safe
@@ -1791,7 +1893,7 @@ version (unittest)
 			return null;
 		}
 
-		void setInboundHandler(void delegate(Message) @safe) @safe
+		void setInboundHandler(void delegate(Message, InboundOrigin) @safe) @safe
 		{
 		}
 
@@ -1807,7 +1909,15 @@ version (unittest)
 		{
 		}
 
+		void setBearerProvider(BearerProvider) @safe
+		{
+		}
+
 		void setModernProtocol(bool) @safe
+		{
+		}
+
+		void setRequestTimeout(Duration) @safe
 		{
 		}
 
@@ -1848,12 +1958,12 @@ version (unittest)
 	}
 }
 
-unittest  // listSkills returns typed entries from a live in-process server
+unittest  // skillsList entries are typed from a live in-process server from a live in-process server
 {
 	auto s = pdfSkillServer();
 	auto client = new McpClient(new ServerBackedTransport(s));
 
-	auto skills = listSkills(client);
+	auto skills = client.skillsList().entries;
 	assert(skills.length == 1);
 	assert(skills[0].uri == "skill://office/pdf-forms/SKILL.md");
 	assert(skills[0].name == "pdf-forms");
@@ -1862,26 +1972,26 @@ unittest  // listSkills returns typed entries from a live in-process server
 	assert(skills[0].resources[0].uri == skills[0].uri);
 }
 
-unittest  // listSkills drains a paginated listing to completion
+unittest  // skillsList entries span a paginated listing a paginated listing to completion
 {
 	auto s = new McpServer("t", "1");
 	s.setPageSize(1);
-	registerSkill(s, "alpha", "First", "a");
-	registerSkill(s, "beta", "Second", "b");
+	registerSkill(s, Skill("alpha", "First", "a"));
+	registerSkill(s, Skill("beta", "Second", "b"));
 	auto client = new McpClient(new ServerBackedTransport(s));
 
-	auto skills = listSkills(client);
+	auto skills = client.skillsList().entries;
 	assert(skills.length == 2);
 	assert(skills[0].name == "alpha");
 	assert(skills[1].name == "beta");
 }
 
-unittest  // getSkill returns the same typed entry the listing carries
+unittest  // skillsGet's entry is the same typed entry the listing carries
 {
 	auto s = pdfSkillServer();
 	auto client = new McpClient(new ServerBackedTransport(s));
 
-	auto entry = getSkill(client, "skill://office/pdf-forms/SKILL.md");
+	auto entry = client.skillsGet("skill://office/pdf-forms/SKILL.md").entry;
 	assert(entry.uri == "skill://office/pdf-forms/SKILL.md");
 	assert(entry.name == "pdf-forms");
 	assert(entry.resources.length == 2);
@@ -1891,30 +2001,31 @@ unittest  // getSkill returns the same typed entry the listing carries
 	assert(verifyResourceDigest(entry, entry.uri, cast(const(ubyte)[]) md) is null);
 }
 
-unittest  // listSkills surfaces a dynamic entry as isDynamic with an empty manifest
+unittest  // skillsList surfaces a dynamic entry as isDynamic with an empty manifest
 {
 	auto s = new McpServer("t", "1");
-	registerSkill(s, "static-one", "Static", "# S\n");
+	registerSkill(s, Skill("static-one", "Static", "# S\n"));
 	DynamicSkill dyn = {
 		path: "dynamic-one", description: "Dynamic", instructions: () @safe => "# D\n"
 	};
 	registerDynamicSkill(s, dyn);
 	auto client = new McpClient(new ServerBackedTransport(s));
 
-	auto skills = listSkills(client);
+	auto skills = client.skillsList().entries;
 	assert(skills.length == 2);
-	assert(!skills[0].isDynamic && skills[0].resources.length == 1);
-	assert(skills[1].isDynamic && skills[1].resources.length == 0 && skills[1].isValid);
+	// Listed in SKILL.md URI order: dynamic-one sorts before static-one.
+	assert(skills[0].isDynamic && skills[0].resources.length == 0 && skills[0].isValid);
+	assert(!skills[1].isDynamic && skills[1].resources.length == 1);
 }
 
-unittest  // getSkill surfaces the server's -32602 for a non-skill uri
+unittest  // skillsGet surfaces the server's -32602 for a non-skill uri
 {
 	import std.exception : assertThrown;
 	import mcp.protocol.errors : McpException;
 
 	auto s = pdfSkillServer();
 	auto client = new McpClient(new ServerBackedTransport(s));
-	assertThrown!McpException(getSkill(client, "skill://nope/SKILL.md"));
+	assertThrown!McpException(client.skillsGet("skill://nope/SKILL.md"));
 }
 
 unittest  // resources/directory/read lists a skill root's files and subdirectories
@@ -2008,7 +2119,148 @@ unittest  // resources/directory/read does not exist below 2025-11-25
 	auto conn = new ConnectionState;
 	conn.negotiated = ProtocolVersion.v2025_06_18;
 	auto outText = s.handleRaw(`{"jsonrpc":"2.0","id":1,"method":"resources/directory/read",`
-			~ `"params":{"uri":"skill://office/pdf-forms"}}`, conn);
+			~ `"params":{"uri":"skill://office/pdf-forms"}}`, conn, "", TokenInfo.invalid());
 	auto resp = parseJsonString(outText);
 	assert(resp["error"]["code"].get!int == cast(int) ErrorCode.methodNotFound);
+}
+
+unittest  // a skill registration that throws registering its resource leaves the extension unadvertised
+{
+	import std.exception : assertThrown;
+	import mcp.protocol.jsonrpc : Message, makeRequest;
+	import mcp.protocol.mrtr : MetaKey;
+
+	auto s = new McpServer("t", "1");
+	Resource taken;
+	taken.uri = skillUri("clash");
+	taken.name = "taken";
+	s.registerResource(taken, () @safe => ResourceContents.makeText(taken.uri, "text/plain", ""));
+	Skill sk;
+	sk.path = "clash";
+	sk.description = "d";
+	sk.instructions = "body";
+	assertThrown(registerSkill(s, sk));
+	DynamicSkill dyn;
+	dyn.path = "clash";
+	dyn.description = "d";
+	dyn.instructions = () @safe => "body";
+	assertThrown(registerDynamicSkill(s, dyn));
+
+	Json params = Json.emptyObject;
+	Json m = Json.emptyObject;
+	m[MetaKey.protocolVersion] = "2026-07-28";
+	m[MetaKey.clientInfo] = Json(["name": Json("c"), "version": Json("1")]);
+	m[MetaKey.clientCapabilities] = Json.emptyObject;
+	params["_meta"] = m;
+	auto caps = s.handle(Message(makeRequest(Json(1), "server/discover",
+			params))).get["result"]["capabilities"];
+	assert("extensions" !in caps || skillsExtensionKey !in caps["extensions"], caps.toString);
+}
+
+version (unittest) private Json listedSkill(McpServer s) @safe
+{
+	import mcp.protocol.jsonrpc : Message, makeRequest;
+
+	return s.handle(Message(makeRequest(Json(1), "skills/list",
+			Json.emptyObject))).get["result"]["skills"][0];
+}
+
+version (unittest) private string servedSkillMd(McpServer s, string path) @safe
+{
+	import mcp.protocol.jsonrpc : Message, makeRequest;
+
+	Json rp = Json.emptyObject;
+	rp["uri"] = skillUri(path);
+	return s.handle(Message(makeRequest(Json(2), "resources/read", rp)))
+		.get["result"]["contents"][0]["text"].get!string;
+}
+
+unittest  // a Skill's license, compatibility, and allowed-tools reach SKILL.md and its entry
+{
+	import std.algorithm.searching : canFind;
+	import mcp.api.skill_dir : parseSkillFrontmatter;
+
+	auto s = new McpServer("t", "1");
+	Skill sk = {
+		path: "pdf-forms", description: "Fill PDF forms", instructions: "# Body\n", license: "Apache-2.0",
+		compatibility: "Requires poppler", allowedTools: "Bash(pdftk:*) Read"
+	};
+	registerSkill(s, sk);
+
+	auto fm = listedSkill(s)["frontmatter"];
+	assert(fm["license"].get!string == "Apache-2.0", fm.toString);
+	assert(fm["compatibility"].get!string == "Requires poppler", fm.toString);
+	assert(fm["allowed-tools"].get!string == "Bash(pdftk:*) Read", fm.toString);
+	// The served SKILL.md frontmatter parses to the same object as the entry's.
+	assert(parseSkillFrontmatter(servedSkillMd(s, "pdf-forms")) == fm);
+}
+
+unittest  // a Skill without the optional fields omits them from its frontmatter
+{
+	auto s = new McpServer("t", "1");
+	registerSkill(s, Skill("plain", "A plain skill", "# Body\n"));
+	auto fm = listedSkill(s)["frontmatter"];
+	assert("license" !in fm && "compatibility" !in fm && "allowed-tools" !in fm, fm.toString);
+}
+
+unittest  // a DynamicSkill's license, compatibility, and allowed-tools reach its entry and SKILL.md
+{
+	import std.algorithm.searching : canFind;
+
+	auto s = new McpServer("t", "1");
+	DynamicSkill dyn = {
+		path: "live", description: "Live skill", instructions: () @safe => "# Body\n",
+		license: "MIT", compatibility: "Any", allowedTools: "Read"
+	};
+	registerDynamicSkill(s, dyn);
+	auto fm = listedSkill(s)["frontmatter"];
+	assert(fm["license"].get!string == "MIT" && fm["allowed-tools"].get!string == "Read");
+	assert(servedSkillMd(s, "live").canFind("license: \"MIT\""));
+}
+
+unittest  // a Skill with an empty description is rejected
+{
+	import std.exception : assertThrown;
+
+	auto s = new McpServer("t", "1");
+	assertThrown(registerSkill(s, Skill("x", "", "# Body\n")));
+}
+
+unittest  // a Skill description over 1024 characters is rejected
+{
+	import std.array : replicate;
+	import std.exception : assertNotThrown, assertThrown;
+
+	auto s = new McpServer("t", "1");
+	assertThrown(registerSkill(s, Skill("x", "é".replicate(1025), "# Body\n")));
+	assertNotThrown(registerSkill(s, Skill("y", "é".replicate(1024), "# Body\n")));
+}
+
+unittest  // a Skill compatibility over 500 characters is rejected
+{
+	import std.array : replicate;
+	import std.exception : assertThrown;
+
+	auto s = new McpServer("t", "1");
+	Skill sk = {
+		path: "x", description: "d", instructions: "# Body\n", compatibility: "c".replicate(501)
+	};
+	assertThrown(registerSkill(s, sk));
+}
+
+unittest  // a DynamicSkill with an empty description is rejected
+{
+	import std.exception : assertThrown;
+
+	auto s = new McpServer("t", "1");
+	DynamicSkill dyn = {
+		path: "x", description: "", instructions: () @safe => "# Body\n"
+	};
+	assertThrown(registerDynamicSkill(s, dyn));
+}
+
+unittest  // a skill is registered only from a Skill value, not from loose parts
+{
+	auto s = new McpServer("t", "1");
+	static assert(!__traits(compiles, registerSkill(s, "x", "d", "body")));
 }

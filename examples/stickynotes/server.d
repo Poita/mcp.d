@@ -73,7 +73,7 @@ struct RemoveAllResult
 }
 
 /// The elicitation form `remove_all` sends to the client: a single required
-/// boolean the user must set to actually proceed. `jsonSchemaOf!ConfirmClear`
+/// boolean the user must set to actually proceed. `elicitationSchemaOf!ConfirmClear`
 /// derives the whole `requestedSchema` (an object with one required boolean and
 /// a display title) — no hand-built schema Json.
 struct ConfirmClear

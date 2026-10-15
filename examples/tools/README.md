@@ -2,7 +2,7 @@
 
 A focused, self-contained example demonstrating **Tools** in the D MCP SDK
 ([mcp.d](https://github.com/Poita/mcp.d)) from both sides. It is its own dub
-package with a path dependency on the root `mcp` library, so it never touches
+package with a path dependency on the root `mcp-d` library, so it never touches
 the root `dub.json`.
 
 The single server binary speaks MCP over **either stdio or Streamable HTTP**,

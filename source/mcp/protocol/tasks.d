@@ -3,7 +3,8 @@ module mcp.protocol.tasks;
 import std.typecons : Nullable, nullable;
 import vibe.data.json : Json;
 
-import mcp.protocol.jsonhelpers : getOr, tryGet;
+import mcp.protocol.errors : invalidParams;
+import mcp.protocol.jsonhelpers : getOr, tryGet, tryGetWhole, requireObject;
 
 /// How a tool relates to the Tasks extension (SEP-2663 "task support"). The
 /// server decides whether a call creates a task; the client only declares the
@@ -22,14 +23,24 @@ enum TaskSupport
 @safe:
 
 /// A task's lifecycle status (SEP-2663). `working` and `inputRequired` are
-/// non-terminal; `completed`, `failed`, and `cancelled` are terminal.
+/// non-terminal; `completed`, `failed`, and `cancelled` are terminal. `unknown`
+/// stands for a wire status this SDK does not recognize; it is treated as
+/// terminal so a poller stops rather than waiting on a state it cannot
+/// interpret. The server never produces it.
 enum TaskStatus
 {
 	working,
 	inputRequired,
 	completed,
 	failed,
-	cancelled
+	cancelled,
+	unknown
+}
+
+/// Whether `s` is terminal: `completed`, `failed`, `cancelled`, or `unknown`.
+bool isTerminal(TaskStatus s) @safe pure nothrow @nogc
+{
+	return s != TaskStatus.working && s != TaskStatus.inputRequired;
 }
 
 /// The wire string for a `TaskStatus` (e.g. `inputRequired` -> "input_required").
@@ -47,15 +58,19 @@ string taskStatusToWire(TaskStatus s) @safe pure nothrow
 		return "failed";
 	case TaskStatus.cancelled:
 		return "cancelled";
+	case TaskStatus.unknown:
+		return "unknown";
 	}
 }
 
-/// Parse a wire status string into a `TaskStatus`. Unknown strings map to
-/// `working` (the seed status), keeping a forward-compatible default.
+/// Parse a wire status string into a `TaskStatus`. An unrecognized string maps
+/// to `TaskStatus.unknown`.
 TaskStatus taskStatusFromWire(string s) @safe pure nothrow
 {
 	switch (s)
 	{
+	case "working":
+		return TaskStatus.working;
 	case "input_required":
 		return TaskStatus.inputRequired;
 	case "completed":
@@ -65,15 +80,17 @@ TaskStatus taskStatusFromWire(string s) @safe pure nothrow
 	case "cancelled":
 		return TaskStatus.cancelled;
 	default:
-		return TaskStatus.working;
+		return TaskStatus.unknown;
 	}
 }
 
 /// Operational metadata about an asynchronous task (SEP-2663 `Task`).
 ///
-/// `ttlMs` is the time-to-live from creation in integer milliseconds; a null
-/// `ttlMs` means unlimited, and the field is always emitted (as `null` when
-/// unlimited). `pollIntervalMs` is the suggested polling interval and is omitted
+/// `ttlMs` is the time-to-live from creation in integer milliseconds, after
+/// which the server may delete the task whatever its status; a null `ttlMs`
+/// means unlimited, and the field is always emitted (as `null` when unlimited).
+/// mcp.d's `TaskRuntime` is more lenient: it never deletes a task that has not
+/// settled, and counts the TTL from when it settles. `pollIntervalMs` is the suggested polling interval and is omitted
 /// when unset. `statusMessage` is an optional human-readable description of the
 /// current state.
 struct Task
@@ -103,19 +120,40 @@ struct Task
 
 	static Task fromJson(Json j) @safe
 	{
+		requireObject(j, "Task");
 		Task t;
-		t.taskId = j.getOr("taskId", "");
-		t.status = taskStatusFromWire(j.getOr("status", "working"));
+		auto id = "taskId" in j;
+		if (id is null || id.type != Json.Type.string || id.get!string.length == 0)
+			throw invalidParams("'Task.taskId' must be a non-empty string");
+		t.taskId = id.get!string;
+		// A missing or non-string status parses as `unknown` (terminal), so a
+		// poller stops instead of waiting forever on a state it cannot read.
+		t.status = taskStatusFromWire(j.getOr("status", ""));
 		tryGet(j, "statusMessage", t.statusMessage);
 		t.createdAt = j.getOr("createdAt", "");
 		t.lastUpdatedAt = j.getOr("lastUpdatedAt", "");
-		// `ttlMs` is always present on the wire: a JSON null means unlimited
-		// (leave `ttlMs` null), a number sets the duration.
-		if ("ttlMs" in j && j["ttlMs"].type != Json.Type.null_)
-			tryGet(j, "ttlMs", t.ttlMs);
-		tryGet(j, "pollIntervalMs", t.pollIntervalMs);
+		// `ttlMs` is required on the wire: a JSON null means unlimited (leave
+		// `ttlMs` null), a number sets the duration.
+		if ("ttlMs" !in j)
+			throw invalidParams("'Task.ttlMs' is required");
+		readDurationMs(j, "ttlMs", t.ttlMs);
+		readDurationMs(j, "pollIntervalMs", t.pollIntervalMs);
 		return t;
 	}
+}
+
+/// Read the millisecond duration `j[key]` into `val`: absent or null leaves
+/// `val` null, a non-negative whole number (`60000` or `60000.0`) sets it, and
+/// any other value throws -32602.
+private void readDurationMs(Json j, string key, ref Nullable!long val) @safe
+{
+	auto p = key in j;
+	if (p is null || p.type == Json.Type.null_)
+		return;
+	long ms;
+	if (!tryGetWhole(j, key, ms) || ms < 0)
+		throw invalidParams("'Task." ~ key ~ "' must be a non-negative integer or null");
+	val = ms;
 }
 
 /// Build the `CreateTaskResult` a server returns in lieu of the standard result
@@ -334,4 +372,114 @@ unittest  // makeDetailedTask(none) carries no status-specific payload (working)
 	auto j = makeDetailedTask(t, DetailedTaskPayload.none());
 	assert(j["resultType"].get!string == "complete");
 	assert("result" !in j && "error" !in j && "inputRequests" !in j);
+}
+
+unittest  // an unrecognized wire status parses as unknown, which is terminal
+{
+	assert(taskStatusFromWire("expired") == TaskStatus.unknown);
+	assert(isTerminal(TaskStatus.unknown));
+	assert(isTerminal(TaskStatus.completed) && isTerminal(TaskStatus.failed)
+			&& isTerminal(TaskStatus.cancelled));
+	assert(!isTerminal(TaskStatus.working) && !isTerminal(TaskStatus.inputRequired));
+	assert(Task.fromJson(Json([
+		"taskId": Json("x"),
+		"status": Json("expired"),
+		"ttlMs": Json(null)
+	])).status == TaskStatus.unknown);
+}
+
+unittest  // Task.fromJson treats a missing status as unknown, which is terminal
+{
+	auto t = Task.fromJson(Json(["taskId": Json("x"), "ttlMs": Json(null)]));
+	assert(t.status == TaskStatus.unknown && isTerminal(t.status));
+}
+
+unittest  // Task.fromJson treats a non-string status as unknown, which is terminal
+{
+	auto t = Task.fromJson(Json([
+		"taskId": Json("x"),
+		"status": Json(3),
+		"ttlMs": Json(null)
+	]));
+	assert(t.status == TaskStatus.unknown && isTerminal(t.status));
+}
+
+unittest  // Task.fromJson rejects a non-object value with -32602
+{
+	import mcp.protocol.errors : ErrorCode, McpException;
+	import std.exception : collectException;
+
+	auto ex = cast(McpException) collectException(Task.fromJson(Json(5)));
+	assert(ex !is null && ex.code == ErrorCode.invalidParams);
+}
+
+unittest  // Task.fromJson reads whole-number float ttlMs and pollIntervalMs
+{
+	auto t = Task.fromJson(Json([
+		"taskId": Json("x"),
+		"ttlMs": Json(60000.0),
+		"pollIntervalMs": Json(250.0)
+	]));
+	assert(!t.ttlMs.isNull && t.ttlMs.get == 60000);
+	assert(!t.pollIntervalMs.isNull && t.pollIntervalMs.get == 250);
+}
+
+version (unittest) private bool rejectsTask(Json j) @safe
+{
+	import mcp.protocol.errors : ErrorCode, McpException;
+	import std.exception : collectException;
+
+	auto ex = cast(McpException) collectException(Task.fromJson(j));
+	return ex !is null && ex.code == ErrorCode.invalidParams;
+}
+
+unittest  // Task.fromJson rejects a missing ttlMs with -32602
+{
+	assert(rejectsTask(Json(["taskId": Json("x")])));
+}
+
+unittest  // Task.fromJson rejects a negative ttlMs with -32602
+{
+	assert(rejectsTask(Json(["taskId": Json("x"), "ttlMs": Json(-1)])));
+}
+
+unittest  // Task.fromJson rejects a fractional ttlMs with -32602
+{
+	assert(rejectsTask(Json(["taskId": Json("x"), "ttlMs": Json(60000.5)])));
+}
+
+unittest  // Task.fromJson rejects a string ttlMs with -32602
+{
+	assert(rejectsTask(Json(["taskId": Json("x"), "ttlMs": Json("60000")])));
+}
+
+unittest  // Task.fromJson rejects a negative pollIntervalMs with -32602
+{
+	assert(rejectsTask(Json([
+		"taskId": Json("x"),
+		"ttlMs": Json(null),
+		"pollIntervalMs": Json(-5)
+	])));
+}
+
+unittest  // Task.fromJson reads a null ttlMs as unlimited and a missing pollIntervalMs as unset
+{
+	auto t = Task.fromJson(Json(["taskId": Json("x"), "ttlMs": Json(null)]));
+	assert(t.ttlMs.isNull);
+	assert(t.pollIntervalMs.isNull);
+}
+
+unittest  // Task.fromJson rejects a missing taskId with -32602
+{
+	assert(rejectsTask(Json(["ttlMs": Json(null)])));
+}
+
+unittest  // Task.fromJson rejects an empty taskId with -32602
+{
+	assert(rejectsTask(Json(["taskId": Json(""), "ttlMs": Json(null)])));
+}
+
+unittest  // Task.fromJson rejects a non-string taskId with -32602
+{
+	assert(rejectsTask(Json(["taskId": Json(7), "ttlMs": Json(null)])));
 }

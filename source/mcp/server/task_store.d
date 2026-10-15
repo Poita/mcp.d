@@ -30,17 +30,47 @@ struct TaskRecord
 	Json inputRequests = Json.emptyObject; /// outstanding requests when input_required
 	Json[string] inputResponses; /// answers delivered via tasks/update, keyed by request id
 	bool cancelRequested; /// cooperative cancel flag, honored by the executor
+	/// The executor handed the task off via `TaskContext.detach`: no dispatch is
+	/// running, so a cancel settles the task at once.
+	bool detached;
 	string toolName; /// executor key — which registered task executor drives this task
 	/// The authenticated principal (token subject) whose request created the
 	/// task; every later tasks/* request must come from the same principal. Empty
 	/// when the creating request was unauthenticated, which leaves the task open.
 	string owner;
+	/// Incremented by the store on every successful `compareAndSwap`; the
+	/// optimistic-concurrency token that lets writers on different fibers or
+	/// nodes detect a concurrent change instead of overwriting it.
+	ulong revision;
 	Json executorInput = Json.undefined; /// durable input, reconstituted on each dispatch
 	Json[string] checkpoints; /// re-entry state persisted via TaskContext.checkpoint
 
-	/// Serialize to a self-contained JSON object. A real store persists this; the
-	/// in-memory store round-trips through it to guarantee stored records do not
-	/// alias the caller's mutable state (mirroring a network/disk boundary).
+	/// A deep copy sharing no mutable state (`Json` values or associative
+	/// arrays) with this record.
+	TaskRecord dup() const @safe
+	{
+		TaskRecord r;
+		r.meta = meta;
+		if (!result.isNull)
+			r.result = nullable(cloneJson(result.get));
+		if (!error.isNull)
+			r.error = nullable(cloneJson(error.get));
+		r.inputRequests = cloneJson(inputRequests);
+		foreach (k, v; inputResponses)
+			r.inputResponses[k] = cloneJson(v);
+		r.cancelRequested = cancelRequested;
+		r.detached = detached;
+		r.toolName = toolName;
+		r.owner = owner;
+		r.revision = revision;
+		r.executorInput = cloneJson(executorInput);
+		foreach (k, v; checkpoints)
+			r.checkpoints[k] = cloneJson(v);
+		return r;
+	}
+
+	/// Serialize to a self-contained JSON object, the form a persistent store
+	/// writes. `fromJson` is its inverse.
 	Json toJson() const @safe
 	{
 		Json j = Json.emptyObject;
@@ -55,7 +85,10 @@ struct TaskRecord
 			ir[k] = v;
 		j["inputResponses"] = ir;
 		j["cancelRequested"] = cancelRequested;
+		if (detached)
+			j["detached"] = true;
 		j["toolName"] = toolName;
+		j["revision"] = revision;
 		if (owner.length)
 			j["owner"] = owner;
 		if (executorInput.type != Json.Type.undefined)
@@ -75,41 +108,37 @@ struct TaskRecord
 		if ("meta" in j)
 			r.meta = Task.fromJson(j["meta"]);
 		if ("result" in j && j["result"].type != Json.Type.undefined)
-			r.result = nullable(j["result"]);
+			r.result = nullable(cloneJson(j["result"]));
 		if ("error" in j && j["error"].type != Json.Type.undefined)
-			r.error = nullable(j["error"]);
+			r.error = nullable(cloneJson(j["error"]));
 		r.inputRequests = ("inputRequests" in j && j["inputRequests"].type == Json.Type.object)
 			? cloneJson(j["inputRequests"]) : Json.emptyObject;
 		if ("inputResponses" in j && j["inputResponses"].type == Json.Type.object)
-			() @trusted {
-			foreach (string k, v; j["inputResponses"])
+			foreach (k, v; j["inputResponses"].byKeyValue)
 				r.inputResponses[k] = cloneJson(v);
-		}();
 		r.cancelRequested = ("cancelRequested" in j)
 			&& j["cancelRequested"].type == Json.Type.bool_ && j["cancelRequested"].get!bool;
+		r.detached = ("detached" in j) && j["detached"].type == Json.Type.bool_
+			&& j["detached"].get!bool;
 		if ("toolName" in j && j["toolName"].type == Json.Type.string)
 			r.toolName = j["toolName"].get!string;
+		if ("revision" in j && j["revision"].type == Json.Type.int_)
+			r.revision = j["revision"].get!ulong;
 		if ("owner" in j && j["owner"].type == Json.Type.string)
 			r.owner = j["owner"].get!string;
 		r.executorInput = ("executorInput" in j) ? cloneJson(j["executorInput"]) : Json.undefined;
 		if ("checkpoints" in j && j["checkpoints"].type == Json.Type.object)
-			() @trusted {
-			foreach (string k, v; j["checkpoints"])
+			foreach (k, v; j["checkpoints"].byKeyValue)
 				r.checkpoints[k] = cloneJson(v);
-		}();
 		return r;
 	}
 }
 
-/// Deep-copy a `Json` value by serializing and re-parsing, so the copy shares no
-/// underlying storage with the original. Used at the store boundary.
-private Json cloneJson(Json j) @safe
+/// Deep-copy a `Json` value, so the copy shares no underlying storage with the
+/// original. Used at the store boundary.
+private Json cloneJson(const Json j) @safe
 {
-	import vibe.data.json : parseJsonString;
-
-	if (j.type == Json.Type.undefined)
-		return Json.undefined;
-	return parseJsonString(j.toString());
+	return j.clone();
 }
 
 /// Durable storage for the complete `TaskRecord`, keyed by task ID. The SDK
@@ -121,51 +150,98 @@ private Json cloneJson(Json j) @safe
 /// — the task ID is the only handle.
 interface TaskStore
 {
-	/// Store a newly created record. The runtime guarantees `record.meta.taskId`
-	/// is not already present.
-	void put(TaskRecord record) @safe;
+	/// Store a newly created record unless a record with `record.meta.taskId`
+	/// already exists. Returns false, changing nothing, when the id is taken; the
+	/// runtime then retries with a fresh id. A shared store implements this as
+	/// one atomic insert-if-absent (e.g. Redis `SET NX` or a SQL `INSERT` on a
+	/// unique key), so two nodes minting the same id cannot clobber each other.
+	bool put(TaskRecord record) @safe;
 
 	/// The record with `taskId`, or null if unknown (or already removed/expired).
 	Nullable!TaskRecord get(string taskId) @safe;
 
-	/// Replace the stored record identified by `record.meta.taskId`. A no-op if
-	/// unknown.
-	void update(TaskRecord record) @safe;
+	/// Replace the stored record identified by `record.meta.taskId` only if its
+	/// stored `revision` still equals `expectedRevision`, storing `record` with
+	/// `revision = expectedRevision + 1`. Returns false, changing nothing, when
+	/// the record is unknown or another writer changed it first; the runtime then
+	/// re-reads and retries. A shared store implements this as one atomic
+	/// conditional write (e.g. a Redis WATCH/MULTI or a SQL `UPDATE ... WHERE
+	/// revision = ?`).
+	bool compareAndSwap(TaskRecord record, ulong expectedRevision) @safe;
 
 	/// Drop the record identified by `taskId`. A no-op if unknown.
 	void remove(string taskId) @safe;
+
+	/// Drop every record for which `pred` returns true, returning how many were
+	/// removed. The runtime's TTL sweep uses it to expire settled tasks; a store
+	/// with native key expiry may apply the same rule itself.
+	size_t removeIf(scope bool delegate(const TaskRecord) @safe pred) @safe;
+
+	/// How many records owned by `owner` ("" for unbound tasks) are not yet
+	/// terminal. The runtime enforces its per-principal task caps with it; a
+	/// shared store answers from an index on `(owner, status)`.
+	size_t countUnsettled(string owner) @safe;
 }
 
 /// In-memory `TaskStore` backed by an associative array. The default store; it
-/// keeps task records for the lifetime of the server process. Records are stored
-/// as serialized JSON and re-parsed on read, so a returned record never aliases
+/// keeps task records until the runtime expires them. Records are deep-copied
+/// on the way in and out (`TaskRecord.dup`), so a returned record never aliases
 /// stored state — the same isolation a networked store provides for free, which
 /// makes the in-memory store a faithful single-process stand-in for a shared one.
 final class InMemoryTaskStore : TaskStore
 {
-	private Json[string] records;
+	private TaskRecord[string] records;
 
-	void put(TaskRecord record) @safe
+	bool put(TaskRecord record) @safe
 	{
-		records[record.meta.taskId] = record.toJson();
+		if (record.meta.taskId in records)
+			return false;
+		records[record.meta.taskId] = record.dup;
+		return true;
 	}
 
 	Nullable!TaskRecord get(string taskId) @safe
 	{
 		if (auto p = taskId in records)
-			return nullable(TaskRecord.fromJson(*p));
+			return nullable(p.dup);
 		return Nullable!TaskRecord.init;
 	}
 
-	void update(TaskRecord record) @safe
+	bool compareAndSwap(TaskRecord record, ulong expectedRevision) @safe
 	{
-		if (record.meta.taskId in records)
-			records[record.meta.taskId] = record.toJson();
+		auto p = record.meta.taskId in records;
+		if (p is null || p.revision != expectedRevision)
+			return false;
+		*p = record.dup;
+		p.revision = expectedRevision + 1;
+		return true;
 	}
 
 	void remove(string taskId) @safe
 	{
 		records.remove(taskId);
+	}
+
+	size_t removeIf(scope bool delegate(const TaskRecord) @safe pred) @safe
+	{
+		string[] doomed;
+		foreach (id, ref r; records)
+			if (pred(r))
+				doomed ~= id;
+		foreach (id; doomed)
+			records.remove(id);
+		return doomed.length;
+	}
+
+	size_t countUnsettled(string owner) @safe
+	{
+		import mcp.protocol.tasks : isTerminal;
+
+		size_t n;
+		foreach (ref r; records)
+			if (r.owner == owner && !isTerminal(r.meta.status))
+				n++;
+		return n;
 	}
 }
 
@@ -179,6 +255,19 @@ string defaultTaskIdGenerator() @safe
 	import mcp.auth.csprng : cryptoRandomBytes;
 
 	return format("%(%02x%)", cryptoRandomBytes(16));
+}
+
+unittest  // TaskRecord.fromJson shares no Json with its source
+{
+	auto j = Json([
+		"result": Json(["structuredContent": Json(["ok": Json(true)])]),
+		"error": Json(["code": Json(-32603), "message": Json("m")])
+	]);
+	auto r = TaskRecord.fromJson(j);
+	j["result"]["structuredContent"]["ok"] = false;
+	j["error"]["message"] = "mutated";
+	assert(r.result.get["structuredContent"]["ok"].get!bool);
+	assert(r.error.get["message"].get!string == "m");
 }
 
 unittest  // TaskRecord round-trips all execution state through JSON
@@ -207,6 +296,20 @@ unittest  // TaskRecord round-trips all execution state through JSON
 	assert(back.checkpoints["stage"].get!string == "approved");
 }
 
+unittest  // InMemoryTaskStore.put refuses an id that is already stored
+{
+	import mcp.protocol.tasks : TaskStatus;
+
+	auto s = new InMemoryTaskStore();
+	TaskRecord r;
+	r.meta.taskId = "id1";
+	r.toolName = "first";
+	assert(s.put(r));
+	r.toolName = "second";
+	assert(!s.put(r));
+	assert(s.get("id1").get.toolName == "first");
+}
+
 unittest  // InMemoryTaskStore stores, fetches, updates, and removes a record
 {
 	import mcp.protocol.tasks : TaskStatus;
@@ -221,17 +324,18 @@ unittest  // InMemoryTaskStore stores, fetches, updates, and removes a record
 
 	r.meta.status = TaskStatus.completed;
 	r.result = nullable(Json(["content": Json.emptyArray]));
-	s.update(r);
+	assert(s.compareAndSwap(r, 0));
 	auto got = s.get("id1").get;
 	assert(got.meta.status == TaskStatus.completed);
 	assert(!got.result.isNull);
+	assert(got.revision == 1);
 
 	assert(s.get("missing").isNull);
 	s.remove("id1");
 	assert(s.get("id1").isNull);
 }
 
-unittest  // update on an unknown taskId is a no-op (does not insert)
+unittest  // compareAndSwap on an unknown taskId fails and does not insert
 {
 	import mcp.protocol.tasks : TaskStatus;
 
@@ -239,8 +343,26 @@ unittest  // update on an unknown taskId is a no-op (does not insert)
 	TaskRecord r;
 	r.meta.taskId = "ghost";
 	r.meta.status = TaskStatus.working;
-	s.update(r);
+	assert(!s.compareAndSwap(r, 0));
 	assert(s.get("ghost").isNull);
+}
+
+unittest  // compareAndSwap rejects a write based on a stale revision
+{
+	import mcp.protocol.tasks : TaskStatus;
+
+	auto s = new InMemoryTaskStore();
+	TaskRecord r;
+	r.meta.taskId = "cas";
+	r.meta.status = TaskStatus.working;
+	s.put(r);
+	auto a = s.get("cas").get;
+	auto b = s.get("cas").get;
+	a.meta.status = TaskStatus.completed;
+	assert(s.compareAndSwap(a, a.revision));
+	b.meta.status = TaskStatus.cancelled;
+	assert(!s.compareAndSwap(b, b.revision));
+	assert(s.get("cas").get.meta.status == TaskStatus.completed);
 }
 
 unittest  // a returned record does not alias stored state (store boundary isolation)
@@ -254,10 +376,50 @@ unittest  // a returned record does not alias stored state (store boundary isola
 	r.inputResponses["k"] = Json("first");
 	s.put(r);
 
-	// Mutate a fetched copy; the store must be unaffected until update() is called.
+	// Mutate a fetched copy; the store must be unaffected until it is written back.
 	auto fetched = s.get("iso").get;
 	fetched.inputResponses["k"] = Json("mutated");
 	assert(s.get("iso").get.inputResponses["k"].get!string == "first");
+}
+
+unittest  // nested Json in a fetched or written record does not alias stored state
+{
+	import mcp.protocol.tasks : TaskStatus;
+
+	auto s = new InMemoryTaskStore();
+	TaskRecord r;
+	r.meta.taskId = "deep";
+	r.meta.status = TaskStatus.working;
+	r.inputRequests = Json(["k": Json(["method": Json("elicitation/create")])]);
+	r.executorInput = Json(["list": Json([Json(1)])]);
+	r.checkpoints["c"] = Json(["v": Json(1)]);
+	r.result = nullable(Json(["ok": Json(true)]));
+	s.put(r);
+
+	// The caller's own copy stays independent after the write.
+	r.inputRequests["k"]["method"] = "sampling/createMessage";
+	r.executorInput["list"][0] = 2;
+	// Checkpoints are written through `in` pointers: DMD 2.113 crashes compiling
+	// a chained `aa[k][k2] = v` on a `Json[string]`.
+	(*("c" in r.checkpoints))["v"] = 2;
+	r.result.get["ok"] = false;
+
+	auto fetched = s.get("deep").get;
+	fetched.inputRequests["k"]["method"] = "roots/list";
+	fetched.executorInput["list"][0] = 3;
+	(*("c" in fetched.checkpoints))["v"] = 3;
+	fetched.result.get["ok"] = false;
+
+	auto again = s.get("deep").get;
+	assert(again.inputRequests["k"]["method"].get!string == "elicitation/create");
+	assert(again.executorInput["list"][0].get!int == 1);
+	assert(again.checkpoints["c"]["v"].get!int == 1);
+	assert(again.result.get["ok"].get!bool);
+
+	// compareAndSwap stores its own copy too.
+	assert(s.compareAndSwap(again, again.revision));
+	(*("c" in again.checkpoints))["v"] = 4;
+	assert(s.get("deep").get.checkpoints["c"]["v"].get!int == 1);
 }
 
 unittest  // defaultTaskIdGenerator yields distinct 32-char hex ids
@@ -269,4 +431,18 @@ unittest  // defaultTaskIdGenerator yields distinct 32-char hex ids
 	assert(a != b, "two generated task ids must differ");
 	foreach (c; a)
 		assert((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'), "id must be lowercase hex");
+}
+
+unittest  // removeIf drops exactly the records matching the predicate
+{
+	auto s = new InMemoryTaskStore();
+	foreach (id; ["a", "b", "c"])
+	{
+		TaskRecord r;
+		r.meta.taskId = id;
+		s.put(r);
+	}
+	assert(s.removeIf((const TaskRecord r) @safe => r.meta.taskId != "b") == 2);
+	assert(s.get("a").isNull && s.get("c").isNull);
+	assert(!s.get("b").isNull);
 }
