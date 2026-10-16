@@ -455,12 +455,20 @@ struct SubscribeParams
 
 	static SubscribeParams fromJson(Json j) @safe
 	{
+		import mcp.protocol.errors : invalidParams;
+
 		requireObject(j, "SubscribeParams");
 		SubscribeParams p;
 		p.name = j.getOr("name", "");
 		readArguments(j, p.arguments);
 		if ("delivery" in j && j["delivery"].type == Json.Type.object)
+		{
+			// events/subscribe serves webhook delivery only, and says so explicitly.
+			auto mode = "mode" in j["delivery"];
+			if (mode is null || mode.type != Json.Type.string || mode.get!string != "webhook")
+				throw invalidParams("delivery.mode must be \"webhook\"");
 			p.delivery = WebhookDelivery.fromJson(j["delivery"]);
+		}
 		readCursor(j, p.cursor);
 		readNonNegative(j, "maxAgeMs", p.maxAgeMs);
 		if ("ttlMs" in j)
@@ -1196,6 +1204,26 @@ unittest  // SubscribeParams rejects a negative maxAgeMs with InvalidParams
 	assert(e !is null && e.code == ErrorCode.invalidParams);
 }
 
+unittest  // SubscribeParams rejects a delivery whose mode is not webhook
+{
+	import std.exception : collectException;
+	import vibe.data.json : parseJsonString;
+	import mcp.protocol.errors : McpException, ErrorCode;
+
+	foreach (d; [
+			`{"mode":"push","url":"https://h/x"}`, `{"url":"https://h/x"}`,
+			`{"mode":1}`
+		])
+	{
+		auto e = collectException!McpException(SubscribeParams.fromJson(
+				parseJsonString(`{"name":"n","delivery":` ~ d ~ `}`)));
+		assert(e !is null && e.code == ErrorCode.invalidParams, d);
+	}
+	auto ok = SubscribeParams.fromJson(parseJsonString(
+			`{"name":"n","delivery":{"mode":"webhook","url":"https://h/x"}}`));
+	assert(ok.delivery.url == "https://h/x");
+}
+
 unittest  // SubscribeParams keeps ttlMs null as an explicit no-expiry request
 {
 	import vibe.data.json : parseJsonString;
@@ -1260,6 +1288,7 @@ unittest  // SubscribeParams: absent ttlMs leaves ttlMsPresent false (server def
 	Json j = Json.emptyObject;
 	j["name"] = "incident.created";
 	Json d = Json.emptyObject;
+	d["mode"] = "webhook";
 	d["url"] = "https://x/y";
 	d["secret"] = "whsec_z";
 	j["delivery"] = d;
