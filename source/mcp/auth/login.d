@@ -1054,11 +1054,35 @@ final class OAuthSession
 	/// retries that request once when it returns true.
 	bool invalidate(string rejectedAccessToken) @safe
 	{
-		import mcp.auth.oauth : constantTimeEquals;
-
 		refreshLock_.lock();
 		scope (exit)
 			refreshLock_.unlock();
+		if (store_ is null)
+			return invalidateHoldingLocks(rejectedAccessToken);
+		bool result;
+		store_.withLock(resource_, () @safe {
+			result = invalidateHoldingLocks(rejectedAccessToken);
+		});
+		return result;
+	}
+
+	/// The body of `invalidate`, run holding `refreshLock_` and the token
+	/// store's lock. A record another session has stored since this one last
+	/// read it is adopted first, so a rejection never overwrites a rotated
+	/// refresh token with the one it replaced.
+	private bool invalidateHoldingLocks(string rejectedAccessToken) @safe
+	{
+		import mcp.auth.oauth : constantTimeEquals;
+
+		// A record that differs only by the access token this session discarded
+		// is this session's own write, not a newer token to adopt.
+		if (store_ !is null)
+		{
+			const stored = store_.load(resource_);
+			if (stored.refreshToken != token_.refreshToken || (stored.hasToken
+					&& stored.accessToken != token_.accessToken))
+				adoptStoredToken();
+		}
 		const replaceable = token_.refreshToken.length > 0;
 		if (!token_.hasToken || !constantTimeEquals(token_.accessToken, rejectedAccessToken))
 			return token_.hasToken || replaceable;
@@ -1904,6 +1928,62 @@ unittest  // invalidating a token that has already been replaced keeps the curre
 	sess.invalidate("stale-access");
 	assert(sess.bearerForRequest(5000) == "current-access");
 	assert(refreshes == 0);
+}
+
+unittest  // a rejection of a token another session already refreshed adopts the stored rotation
+{
+	auto store = new MemoryTokenStore();
+	StoredToken t;
+	t.accessToken = "AT1";
+	t.refreshToken = "RT1";
+	t.expiresAt = 2_000_000_000;
+	t.issuer = "https://as.example.com";
+	store.save("https://mcp.example.com", t);
+
+	string[] presented;
+	auto sess = new OAuthSession("https://mcp.example.com", t, store, (string rt) @safe {
+		presented ~= rt;
+		TokenSet ts;
+		ts.accessToken = "AT3";
+		ts.refreshToken = "RT3";
+		ts.expiresIn = 3600;
+		return ts;
+	});
+
+	// Another session sharing the store rotates RT1 to RT2.
+	StoredToken rotated = t;
+	rotated.accessToken = "AT2";
+	rotated.refreshToken = "RT2";
+	store.save("https://mcp.example.com", rotated);
+
+	assert(sess.invalidate("AT1"));
+	assert(store.load("https://mcp.example.com").refreshToken == "RT2");
+	assert(sess.bearerForRequest(1_000_000_000) == "AT2");
+	assert(presented.length == 0);
+}
+
+unittest  // a rejection discards the token in the store only when the store still holds it
+{
+	auto store = new MemoryTokenStore();
+	StoredToken t;
+	t.accessToken = "AT1";
+	t.refreshToken = "RT1";
+	t.expiresAt = 2_000_000_000;
+	t.issuer = "https://as.example.com";
+	store.save("https://mcp.example.com", t);
+
+	string[] presented;
+	auto sess = new OAuthSession("https://mcp.example.com", t, store, (string rt) @safe {
+		presented ~= rt;
+		TokenSet ts;
+		ts.accessToken = "AT2";
+		ts.expiresIn = 3600;
+		return ts;
+	});
+	assert(sess.invalidate("AT1"));
+	assert(!store.load("https://mcp.example.com").hasToken);
+	assert(sess.bearerForRequest(1_000_000_000) == "AT2");
+	assert(presented == ["RT1"]);
 }
 
 version (unittest) private string delegate(string) @safe fakeEnv(string[string] vars) @safe
