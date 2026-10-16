@@ -955,11 +955,15 @@ final class EventsRuntime
 	/// hooks / `match`, and for `publish`. The typed surface is the primary author
 	/// API; `register(EventRegistration)` remains the dynamic (raw-`Json`) escape
 	/// hatch. A freshly-defined type is emit-only until `onFetch` is set. An empty
-	/// `description` or `title` is left unset.
+	/// `description` or `title` is left unset. Throws when `name` is already
+	/// registered: a second definition would silently drop the first one's fetch
+	/// handler and hooks; `unregister` it first to replace it.
 	EventHandle!(A, P) define(A, P)(string name, string description = "", string title = "") @safe
 	{
 		import mcp.api.binding : jsonSchemaOf, SchemaUse;
 
+		if (has(name))
+			throw new Exception("Event type " ~ name ~ " is already defined");
 		EventRegistration reg;
 		reg.descriptor.name = name;
 		if (description.length)
@@ -9802,4 +9806,15 @@ unittest  // events missed while suspended cost no store write per emit, and the
 	rt.subscribeWebhook(webhookSub("n", "https://proxy/hooks"), "user-1");
 	auto gapPosts = controlPostsOf(ft, "gap");
 	assert(parseJsonString(gapPosts[$ - 1].body)["cursor"].get!string == seqCursor(13));
+}
+
+unittest  // defining an event type twice throws and keeps the first definition
+{
+	import std.exception : collectException;
+
+	auto rt = testRuntime();
+	rt.define!(DemoArgs, DemoPayload)("incident.created").onFetch((DemoArgs a,
+			scope FetchContext ctx) @safe => EventBatch!DemoPayload.empty("c0"));
+	assert(collectException(rt.define!(DemoArgs, DemoPayload)("incident.created")) !is null);
+	assert(!rt.isEmitOnly("incident.created"));
 }
