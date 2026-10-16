@@ -3138,11 +3138,18 @@ private string removeDotSegments(string path) @safe
 /// messages to. A reference naming its own scheme or authority is only accepted
 /// when it is an http(s) URL with the base's origin; anything else yields null so
 /// the legacy fallback fails closed rather than POSTing the bearer token
-/// off-origin.
+/// off-origin. A reference containing whitespace or a control character also
+/// yields null. Redirect `Location` targets are resolved the same way.
 private string resolveEndpointUri(string baseUrl, string endpoint) @safe
 {
-	import std.string : lastIndexOf;
+	import std.algorithm.searching : any;
+	import std.string : lastIndexOf, representation;
 
+	// The result is written into a raw request line, so a reference with
+	// whitespace or a control character (which no valid URI carries) could
+	// split the request.
+	if (endpoint.representation.any!(c => c <= 0x20 || c == 0x7F))
+		return null;
 	const base = splitUri(baseUrl);
 	if (!base.hasScheme)
 		return endpoint;
@@ -3479,6 +3486,15 @@ unittest  // resolveEndpointUri keeps a same-origin absolute URI unchanged
 {
 	assert(resolveEndpointUri("http://host:8080/mcp",
 			"http://host:8080/messages") == "http://host:8080/messages");
+}
+
+unittest  // resolveEndpointUri rejects a reference carrying whitespace or control characters
+{
+	assert(resolveEndpointUri("http://host:8080/mcp", "/next\nX-Injected: 1") is null);
+	assert(resolveEndpointUri("http://host:8080/mcp", "/next\rX-Injected: 1") is null);
+	assert(resolveEndpointUri("http://host:8080/mcp", "/a b") is null);
+	assert(resolveEndpointUri("http://host:8080/mcp", "http://host:8080/a\x7f") is null);
+	assert(resolveEndpointUri("http://host:8080/mcp", "/next?x=1") == "http://host:8080/next?x=1");
 }
 
 unittest  // resolveEndpointUri rejects a cross-origin absolute URI (returns null)
