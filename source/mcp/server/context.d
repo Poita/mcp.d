@@ -550,18 +550,6 @@ final class NullContext : BaseRequestContext
 {
 }
 
-/// A `RequestContext` for the stdio transport. The stdio transport is a single
-/// newline-delimited byte stream, and the MCP stdio spec permits the server to
-/// write any valid MCP message to stdout at any time — so server->client
-/// notifications (`notifications/message` logging and `notifications/progress`)
-/// are serialised and pushed to the transport's write sink as the handler emits
-/// them, out-of-band of the request's eventual reply.
-///
-/// The stdio transport runs each request handler in its own cooperative vibe
-/// task while the channel's read loop keeps demultiplexing inbound lines, so an
-/// out-of-band `notifications/cancelled` is dispatched (flipping the matching
-/// in-flight `CancellationToken`) *concurrently* with a running handler — the
-/// handler's `ctx.isCancelled()` simply observes the flipped token.
 /// The per-request settings of a `StdioContext`.
 struct StdioContextOptions
 {
@@ -587,6 +575,18 @@ struct StdioContextOptions
 	bool serverStateless;
 }
 
+/// A `RequestContext` for the stdio transport. The stdio transport is a single
+/// newline-delimited byte stream, and the MCP stdio spec permits the server to
+/// write any valid MCP message to stdout at any time — so server->client
+/// notifications (`notifications/message` logging and `notifications/progress`)
+/// are serialised and pushed to the transport's write sink as the handler emits
+/// them, out-of-band of the request's eventual reply.
+///
+/// The stdio transport runs each request handler in its own cooperative vibe
+/// task while the channel's read loop keeps demultiplexing inbound lines, so an
+/// out-of-band `notifications/cancelled` is dispatched (flipping the matching
+/// in-flight `CancellationToken`) *concurrently* with a running handler — the
+/// handler's `ctx.isCancelled()` simply observes the flipped token.
 final class StdioContext : RequestContext
 {
 	private void delegate(string) @safe sink;
@@ -741,13 +741,6 @@ private McpException missingClientCapability(ClientCapability cap, string messag
 	return missingRequiredClientCapability(c, message);
 }
 
-/// Wraps a transport-supplied `RequestContext` with the per-request protocol
-/// state the server determines only after parsing the message: whether the
-/// request gathers input through MRTR, and the input responses the client
-/// attached. The server installs this around the transport context before
-/// dispatching, so handlers observe correct `usesInputRequired`/`inputResponses`
-/// and `elicit`/`sample` fail fast on MRTR requests. Notifications and server->client requests
-/// delegate to the wrapped context unchanged.
 /// The per-request state the server installs on a `RequestScope`.
 package(mcp) struct RequestScopeOptions
 {
@@ -774,6 +767,13 @@ package(mcp) struct RequestScopeOptions
 	bool serverStateless;
 }
 
+/// Wraps a transport-supplied `RequestContext` with the per-request protocol
+/// state the server determines only after parsing the message: whether the
+/// request gathers input through MRTR, and the input responses the client
+/// attached. The server installs this around the transport context before
+/// dispatching, so handlers observe correct `usesInputRequired`/`inputResponses`
+/// and `elicit`/`sample` fail fast on MRTR requests. Notifications and server->client requests
+/// delegate to the wrapped context unchanged.
 final class RequestScope : RequestContext, ConnectionScoped
 {
 	private RequestContext inner;
