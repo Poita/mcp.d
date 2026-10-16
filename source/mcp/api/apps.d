@@ -224,20 +224,20 @@ void setUiToolMeta(ref Tool tool, UiToolMeta ui) @safe
 /// Advertise MCP Apps support in the server's extension capabilities. The
 /// extension is carried in the `extensions` negotiation map (emitted to clients
 /// from 2025-11-25 onward), declaring the content types this server's UI
-/// resources use. `mimeTypes` defaults to `[mcpAppMimeType]`. Call it as
+/// resources use: always `mcpAppMimeType`, which `registerUiResource` serves,
+/// followed by any other `mimeTypes`. Call it as
 /// `server.enableApps()`, like `server.enableTasks()`; it is a free function
 /// only because `mcp.api` builds on `mcp.server`, not the other way round.
 ///
 /// Registering a `@ui` tool or a UI resource enables the extension with the
 /// default `mimeTypes` when it is not yet enabled, so an explicit call is only
-/// needed to declare other content types; it may come before or after them.
+/// needed to declare additional content types; it may come before or after them.
 void enableApps(McpServer server, string[] mimeTypes = null) @safe
 {
 	Json arr = Json.emptyArray;
-	if (mimeTypes.length == 0)
-		arr ~= Json(mcpAppMimeType);
-	else
-		foreach (m; mimeTypes)
+	arr ~= Json(mcpAppMimeType);
+	foreach (m; mimeTypes)
+		if (m != mcpAppMimeType)
 			arr ~= Json(m);
 	Json settings = Json.emptyObject;
 	settings["mimeTypes"] = arr;
@@ -722,7 +722,17 @@ unittest  // an explicit enableApps keeps its settings when a @ui tool registers
 	s.enableApps(["text/html;profile=custom"]);
 	registerHandlers(s, new UiToolApi);
 	auto ext = advertisedExtensions(s);
-	assert(ext[appsExtensionKey]["mimeTypes"][0].get!string == "text/html;profile=custom");
+	assert(ext[appsExtensionKey]["mimeTypes"][1].get!string == "text/html;profile=custom");
+}
+
+unittest  // enableApps declares extra content types alongside the one UI resources are served as
+{
+	auto s = new McpServer("t", "1");
+	s.enableApps(["text/html;profile=custom", mcpAppMimeType]);
+	auto types = advertisedExtensions(s)[appsExtensionKey]["mimeTypes"];
+	assert(types.length == 2, types.toString);
+	assert(types[0].get!string == mcpAppMimeType);
+	assert(types[1].get!string == "text/html;profile=custom");
 }
 
 unittest  // registerUiResource takes a UiResource and serves its static html

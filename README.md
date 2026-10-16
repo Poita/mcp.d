@@ -817,8 +817,9 @@ read.
 A `@tool` carries its UI link via `@ui(resourceUri, visibility…)` (folded into the
 tool's `_meta.ui`); the dynamic path uses `setUiToolMeta(tool, UiToolMeta(...))`.
 Registering a `@ui` tool or a UI resource advertises the extension; call
-`server.enableApps(mimeTypes)` only to declare content types other than
-`text/html;profile=mcp-app` (before or after registering).
+`server.enableApps(mimeTypes)` only to declare content types in addition to
+`text/html;profile=mcp-app`, which is always advertised (before or after
+registering).
 `clientSupportsApps(ctx)` reports whether the calling client opted into the
 extension. The runnable [Apps example](examples/apps/) verifies the whole surface
 over both transports.

@@ -28,7 +28,8 @@ the same assertions over either transport.
   `prefersBorder` hint.
 - Registering the `@ui` tool and the UI resource declares the extension
   capability, surfaced to modern clients in the `extensions` map (call
-  `server.enableApps(mimeTypes)` only to declare other content types).
+  `server.enableApps(mimeTypes)` only to declare content types besides
+  `text/html;profile=mcp-app`, which is always advertised).
 - **`registerModule!(apps_server)(server)`** registers every module-level
   `@tool` in one call; `runServerFromArgs` picks the transport.
 
