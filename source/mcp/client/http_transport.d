@@ -1063,6 +1063,9 @@ final class HttpClientTransport : ClientTransport
 				case ResumeOutcome.refused:
 					idle = maxIdleResumes;
 					break;
+				case ResumeOutcome.sessionGone:
+					throw new SessionExpiredException(404,
+							"MCP session expired (server answered HTTP 404 for the session)");
 				case ResumeOutcome.failed:
 					if (failedInRow++ == 0)
 						failingSince = started;
@@ -1097,6 +1100,7 @@ final class HttpClientTransport : ClientTransport
 	{
 		opened, /// The stream opened and has since closed.
 		refused, /// The server refused resumption with a 4xx status.
+		sessionGone, /// The server answered 404 for the session the GET carried.
 		failed, /// The connection failed or the server answered with a transient error.
 	}
 
@@ -1423,7 +1427,8 @@ final class HttpClientTransport : ClientTransport
 	///
 	/// The GET carries `cursor.lastEventId` and the resumed stream's `id:`/`retry:`
 	/// fields update `cursor`, so a further resume continues from the latest event.
-	/// Reports whether the stream opened, the server refused it with a 4xx (other
+	/// Reports whether the stream opened, the server answered 404 for the session
+	/// (which marks it expired), refused it with another 4xx (other
 	/// than 408/429), or it failed transiently: a connection failure or another
 	/// non-200 status, whose description is left in `failure`.
 	private ResumeOutcome resumeViaGet(long expectId, string bearer, ref SseCursor cursor,
@@ -1467,12 +1472,25 @@ final class HttpClientTransport : ClientTransport
 				auto conn = openClientStream(sock, ep.tls ? tlsContext() : null, ep.host);
 				scope (exit)
 					conn.release();
+				const sentSession = sessionId;
 				const getReq = buildHttpRequest("GET", ep.path, ep.hostHeader,
 						"text/event-stream", "keep-alive", bearer, verHeaders,
 						cursor.lastEventId, null);
 				conn.write(cast(const(ubyte)[]) getReq);
 
 				const head = readResponseHead(conn);
+				if (head.status == 404 && sentSession.length)
+				{
+					// The session is gone: later requests fail until a new one starts.
+					// A session started since this GET was sent is left alone.
+					if (sessionId == sentSession)
+					{
+						sessionExpired = true;
+						sessionId = null;
+					}
+					outcome = ResumeOutcome.sessionGone;
+					return;
+				}
 				if (head.status != 200)
 				{
 					failure = "resume GET answered HTTP " ~ idStr(head.status);
@@ -4563,6 +4581,56 @@ unittest  // ClientSettings.reinitializeOnSessionExpiry starts a new session and
 	assert(tools == 0, "the request must succeed on the new session");
 	assert(srv.initializeSessionHeaders == ["", ""],
 			"the expiry must trigger one fresh initialize without a session id");
+}
+
+unittest  // a resume GET answered 404 for the session reports the session expired
+{
+	import mcp.client.client : McpClient;
+
+	int listPosts;
+	auto router = new URLRouter;
+	router.post("/mcp", (HTTPServerRequest req, HTTPServerResponse res) @safe {
+		auto j = requestJson(req);
+		const method = ("method" in j) ? j["method"].get!string : "";
+		if (method == "initialize")
+		{
+			res.headers["Mcp-Session-Id"] = "s1";
+			res.writeBody(initializeReply(j, "2025-11-25").toString(), "application/json");
+			return;
+		}
+		if (method == "tools/list")
+		{
+			++listPosts;
+			// The stream announces an event id, then closes before the response.
+			res.headers["Content-Type"] = "text/event-stream";
+			res.bodyWriter.write("id: e1\nretry: 10\n\n");
+			return;
+		}
+		res.statusCode = 202;
+		res.writeBody("", "text/plain");
+	});
+	router.get("/mcp", (HTTPServerRequest req, HTTPServerResponse res) @safe {
+		res.statusCode = 404;
+		res.writeBody("", "text/plain");
+	});
+
+	int expired;
+	const failure = runAgainstFakeServer(router, (string url) @safe {
+		auto client = McpClient.http(url);
+		scope (exit)
+			client.close();
+		client.initialize("2025-11-25");
+		foreach (_; 0 .. 2)
+		{
+			try
+				client.listTools();
+			catch (SessionExpiredException)
+				++expired;
+		}
+	});
+	assert(failure.length == 0, "scenario failed: " ~ failure);
+	assert(expired == 2, "the resume 404 must report the expired session");
+	assert(listPosts == 1, "a request after the expiry must not be sent");
 }
 
 unittest  // a failed legacy fallback closes the GET stream it opened
