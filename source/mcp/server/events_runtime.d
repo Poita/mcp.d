@@ -2672,12 +2672,20 @@ final class EventsRuntime
 			deliveryQueue_.touch(job.jobId, job.attempt, opts_.nowMs() + verifyBackoffBaseMs);
 			return true;
 		}
-		if (verification == Verification.failed || verification == Verification.backingOff)
+		if (verification == Verification.backingOff)
 		{
-			// Only a challenge actually sent is a sample for the suspension policy;
-			// a burst queued behind one failed probe must not suspend on its own.
-			if (verification == Verification.failed)
-				recordFailure(subId, DeliveryErrorCategory.challengeFailed);
+			// No challenge was sent, so nothing was attempted: the job waits for
+			// the endpoint's next probe without spending an attempt, and is not a
+			// sample for the suspension policy.
+			const key = s0.get.principal ~ "\0" ~ s0.get.url;
+			auto b = key in pendingVerification_;
+			const retryAt = b is null ? opts_.nowMs() + verifyBackoffBaseMs : b.nextProbeMs;
+			deliveryQueue_.touch(job.jobId, job.attempt, retryAt);
+			return true;
+		}
+		if (verification == Verification.failed)
+		{
+			recordFailure(subId, DeliveryErrorCategory.challengeFailed);
 			// The endpoint may verify later: retry after a backoff, counting the
 			// attempt so a never-verifying endpoint's jobs are eventually dropped.
 			const attempt = job.attempt + 1;
@@ -9568,4 +9576,38 @@ unittest  // dot segments never place a callback path under an allowlisted prefi
 	assert(rt.urlAllowlisted("https://hooks.example.com/mcp/a"));
 	assert(!rt.urlAllowlisted("https://hooks.example.com/mcp/../admin/x"));
 	assert(!rt.urlAllowlisted("https://hooks.example.com/mcp/%2e%2e/admin"));
+}
+
+unittest  // a delivery waiting out the verification backoff is held, not dropped, until the next probe
+{
+	long now = 1_000_000;
+	auto ft = new FakeWebhookTransport();
+	auto queue = new InMemoryDeliveryQueue();
+	EventsOptions o;
+	o.nowMs = () @safe => now;
+	o.nowIso = () @safe => "t";
+	o.allowPrivateCallbackHosts = true;
+	o.webhookTransport = ft;
+	o.deliveryQueue = queue;
+	o.webhookTtlCap = 120.minutes;
+	o.deliveryExecutor = (void delegate() @safe job) @safe { job(); };
+	o.deliverySleep = (Duration d) @safe {};
+	auto rt = new EventsRuntime(null, o);
+	EventRegistration reg = {descriptor: EventType("n"), emitOnly: true};
+	rt.register(reg);
+	// Earlier failed probes of this endpoint deferred the next one by the cap.
+	rt.pendingVerification_["user-1\0https://proxy/hooks"] = VerifyBackoff(
+			now + verifyBackoffCapMs, verifyBackoffCapMs);
+	auto r = rt.subscribeWebhook(webhookSub("n", "https://proxy/hooks"), "user-1");
+	rt.emit(EventOccurrence("evt_1", "n", "t"));
+	foreach (_; 0 .. 5)
+	{
+		now += 5 * 60 * 1000;
+		rt.drainDeliveries();
+	}
+	assert(ft.posts.length == 0, "no probe is sent inside the backoff window");
+	assert(!rt.webhookStore().get(r.id).get.owesGap);
+	now += 6 * 60 * 1000;
+	rt.drainDeliveries();
+	assert(ft.eventPosts().length == 1, "the held delivery goes out once the endpoint verifies");
 }
