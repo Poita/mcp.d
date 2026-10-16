@@ -50,11 +50,13 @@ struct RegisteredTool
 {
 	Tool descriptor;
 	MrtrToolHandler handler;
-	/// Client capabilities this tool's handler requires to run. On 2026-07-28
-	/// protocol, `tools/call` rejects with a `-32021`
-	/// `MissingRequiredClientCapabilityError` (whose `data.requiredCapabilities`
-	/// lists the unmet ones) when the request's declared client capabilities do
-	/// not cover these. Empty (the default) means no gating.
+	/// Client capabilities this tool's handler requires to run. `tools/call`
+	/// rejects with a `-32021` `MissingRequiredClientCapabilityError` (whose
+	/// `data.requiredCapabilities` lists the unmet ones) when the client's declared
+	/// capabilities do not cover these: the request's `_meta` capabilities on
+	/// 2026-07-28, or the session's `initialize` capabilities on the 2025-era
+	/// protocols (empty on stateless HTTP, which keeps no session).
+	/// Empty (the default) means no gating.
 	ClientCapabilities requiredClientCapabilities;
 	/// The tool's relationship to the Tasks extension: `none` for an ordinary
 	/// tool; `optional`/`required` for a task tool, which decides what a call
@@ -89,11 +91,13 @@ struct RegisteredResource
 	ResourceReader reader;
 	/// Per-resource modern `CacheableResult` freshness hint for `resources/read`.
 	Nullable!CacheHint cache;
-	/// Client capabilities this resource's reader requires to run. On 2026-07-28
-	/// protocol, `resources/read` rejects with a `-32021`
-	/// `MissingRequiredClientCapabilityError` (whose `data.requiredCapabilities`
-	/// lists the unmet ones) when the request's declared client capabilities do
-	/// not cover these. Empty (the default) means no gating.
+	/// Client capabilities this resource's reader requires to run. `resources/read`
+	/// rejects with a `-32021` `MissingRequiredClientCapabilityError` (whose
+	/// `data.requiredCapabilities` lists the unmet ones) when the client's declared
+	/// capabilities do not cover these: the request's `_meta` capabilities on
+	/// 2026-07-28, or the session's `initialize` capabilities on the 2025-era
+	/// protocols (empty on stateless HTTP, which keeps no session).
+	/// Empty (the default) means no gating.
 	ClientCapabilities requiredClientCapabilities;
 }
 
@@ -105,11 +109,13 @@ struct RegisteredTemplate
 	TemplateReader reader;
 	/// Per-template modern `CacheableResult` freshness hint for `resources/read`.
 	Nullable!CacheHint cache;
-	/// Client capabilities this template's reader requires to run. On 2026-07-28
-	/// protocol, `resources/read` rejects with a `-32021`
-	/// `MissingRequiredClientCapabilityError` (whose `data.requiredCapabilities`
-	/// lists the unmet ones) when the request's declared client capabilities do
-	/// not cover these. Empty (the default) means no gating.
+	/// Client capabilities this template's reader requires to run. `resources/read`
+	/// rejects with a `-32021` `MissingRequiredClientCapabilityError` (whose
+	/// `data.requiredCapabilities` lists the unmet ones) when the client's declared
+	/// capabilities do not cover these: the request's `_meta` capabilities on
+	/// 2026-07-28, or the session's `initialize` capabilities on the 2025-era
+	/// protocols (empty on stateless HTTP, which keeps no session).
+	/// Empty (the default) means no gating.
 	ClientCapabilities requiredClientCapabilities;
 }
 
@@ -120,11 +126,13 @@ struct RegisteredPrompt
 {
 	Prompt descriptor;
 	MrtrPromptHandler handler;
-	/// Client capabilities this prompt's handler requires to run. On 2026-07-28
-	/// protocol, `prompts/get` rejects with a `-32021`
-	/// `MissingRequiredClientCapabilityError` (whose `data.requiredCapabilities`
-	/// lists the unmet ones) when the request's declared client capabilities do
-	/// not cover these. Empty (the default) means no gating.
+	/// Client capabilities this prompt's handler requires to run. `prompts/get`
+	/// rejects with a `-32021` `MissingRequiredClientCapabilityError` (whose
+	/// `data.requiredCapabilities` lists the unmet ones) when the client's declared
+	/// capabilities do not cover these: the request's `_meta` capabilities on
+	/// 2026-07-28, or the session's `initialize` capabilities on the 2025-era
+	/// protocols (empty on stateless HTTP, which keeps no session).
+	/// Empty (the default) means no gating.
 	ClientCapabilities requiredClientCapabilities;
 }
 
