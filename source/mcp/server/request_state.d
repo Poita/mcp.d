@@ -99,8 +99,9 @@ struct RequestStateSecurity
 	/// verification and re-elicits. Defaults to 5 minutes.
 	Duration ttl = 5.minutes;
 
-	/// Identity binding. Defaults to `authSubject`.
-	RequestStateBinding bindTo = RequestStateBinding.authSubject;
+	/// Identity binding. Defaults to `authSubjectAndTool`, so a blob one tool
+	/// issued cannot be redeemed by another tool or prompt.
+	RequestStateBinding bindTo = RequestStateBinding.authSubjectAndTool;
 }
 
 /// The codec the dispatch path installs when an operator enables
@@ -308,15 +309,20 @@ package string requestStateTarget(string method, Json params) @safe
 /// request's authenticated subject and tool name; on success the inner state
 /// is returned, and on ANY failure (tamper / GCM auth fail / expiry /
 /// wrong-subject / unparseable) it fails closed to null, with a warning
-/// logged. The caller then runs the request as a fresh round, so no rejection
-/// is surfaced to the handler.
+/// logged. An absent blob is also null (without a warning): every
+/// input-required result carries a blob once the codec is enabled, so a
+/// request without one is a fresh round and any `inputResponses` it carries
+/// answer no round this server issued. The caller then runs the request as a
+/// fresh round, so no rejection is surfaced to the handler.
 package Nullable!string verifyIncomingRequestState(RequestStateCodec codec,
 		string raw, string method, Json params, RequestContext ctx) @safe
 {
 	import vibe.core.log : logWarn;
 
-	if (codec is null || raw.length == 0)
+	if (codec is null)
 		return nullable(raw);
+	if (raw.length == 0)
+		return Nullable!string.init;
 	auto decoded = codec.decode(raw, requestStateSubject(ctx), requestStateTarget(method, params));
 	if (decoded.isNull)
 		logWarn("secureRequestState: rejected an echoed requestState on %s "
@@ -326,20 +332,26 @@ package Nullable!string verifyIncomingRequestState(RequestStateCodec codec,
 
 /// Wrap an outgoing MRTR `requestState` on an input-required result. With no
 /// codec configured (`codec is null`) the result is returned unchanged
-/// (plaintext, no wire change). With the codec enabled, a non-empty top-level
+/// (plaintext, no wire change). With the codec enabled, the top-level
 /// `requestState` string is replaced by an integrity-protected (and optionally
 /// encrypted), expiry-stamped, user-bound blob bound to the same subject/tool
-/// the incoming seam will verify against. Tool and prompt input-required results
+/// the incoming seam will verify against. A result carrying `inputRequests`
+/// but no `requestState` gets a blob of the empty state, so the retry that
+/// answers it can prove it answers this round. Tool and prompt input-required results
 /// share this single top-level field, so one seam covers both.
 package Json secureOutgoingRequestState(RequestStateCodec codec, Json result,
 		string method, Json params, RequestContext ctx) @safe
 {
 	if (codec is null || result.type != Json.Type.object)
 		return result;
-	if ("requestState" !in result || result["requestState"].type != Json.Type.string)
-		return result;
-	const plain = result["requestState"].get!string;
-	if (plain.length == 0)
+	string plain;
+	if (auto p = "requestState" in result)
+	{
+		if (p.type != Json.Type.string)
+			return result;
+		plain = p.get!string;
+	}
+	if (plain.length == 0 && "inputRequests" !in result)
 		return result;
 	result["requestState"] = codec.encode(plain, requestStateSubject(ctx),
 			requestStateTarget(method, params));
@@ -738,4 +750,57 @@ unittest  // requestStateSubject ignores the subject of a token that is not vali
 	}
 
 	assert(requestStateSubject(new InvalidAliceCtx) == "");
+}
+
+version (unittest)
+{
+	import mcp.server.context : BaseRequestContext;
+
+	// A request with no authenticated identity.
+	private final class AnonymousCtx : BaseRequestContext
+	{
+		import mcp.auth.resource_server : TokenInfo;
+
+		override TokenInfo auth() @safe
+		{
+			return TokenInfo.init;
+		}
+	}
+}
+
+unittest  // the default binding ties a requestState to both the subject and the tool
+{
+	RequestStateSecurity sec;
+	assert(sec.bindTo == RequestStateBinding.authSubjectAndTool);
+}
+
+unittest  // with the codec enabled, a retry carrying no requestState is unverified
+{
+	auto codec = signedCodec();
+	auto ctx = new AnonymousCtx();
+	Json params = Json(["name": Json("x")]);
+	assert(verifyIncomingRequestState(codec, "", "tools/call", params, ctx).isNull);
+	assert(verifyIncomingRequestState(null, "", "tools/call", params, ctx).get == "");
+}
+
+unittest  // an input-required result without requestState still gets a verifiable blob
+{
+	auto codec = signedCodec();
+	auto ctx = new AnonymousCtx();
+	Json params = Json(["name": Json("x")]);
+	Json result = Json([
+		"inputRequests": Json(["a": Json(["method": Json("roots/list")])])
+	]);
+	const wire = secureOutgoingRequestState(codec, result, "tools/call", params, ctx)["requestState"]
+		.get!string;
+	assert(verifyIncomingRequestState(codec, wire, "tools/call", params, ctx).get == "");
+}
+
+unittest  // a complete result without requestState is left unchanged
+{
+	auto codec = signedCodec();
+	Json result = Json(["content": Json.emptyArray]);
+	auto out_ = secureOutgoingRequestState(codec, result, "tools/call",
+			Json.emptyObject, new AnonymousCtx());
+	assert("requestState" !in out_);
 }

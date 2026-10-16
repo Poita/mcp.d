@@ -73,12 +73,13 @@ void main(string[] args) @safe
 	// SEP-2322 says the server MUST validate the client-echoed `requestState` and
 	// SHOULD protect it, since it round-trips through the untrusted client. Opt in
 	// to the SDK's codec: it signs (HMAC-SHA256) the opaque blob, stamps a short
-	// expiry, and binds it to the authenticated subject — so a tampered, expired,
-	// or cross-user blob is rejected and the round is re-elicited. This is
-	// transparent: `bookMeeting` keeps using `inputRequired(reqs, T)` /
-	// `requestStateAs!T` unchanged. (This example is unauthenticated, so the
-	// subject binding is a no-op here; integrity + expiry still apply, and an
-	// authenticated server gets per-user binding for free.)
+	// expiry, and binds it to the authenticated subject and the tool — so a
+	// tampered, expired, cross-user, or cross-tool blob is rejected and the round
+	// is re-elicited. This is transparent: `bookMeeting` keeps using
+	// `inputRequired(reqs, T)` / `requestStateAs!T` unchanged. (This example is
+	// unauthenticated, so the subject binding is a no-op here; integrity, expiry
+	// and the tool binding still apply, and an authenticated server gets per-user
+	// binding for free.)
 	server.secureRequestState(RequestStateSecurity(cast(ubyte[]) demoRequestStateKey.dup));
 
 	// The scaffold picks the transport from argv and blocks until exit.
