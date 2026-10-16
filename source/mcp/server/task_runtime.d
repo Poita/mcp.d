@@ -215,6 +215,12 @@ final class TaskRuntime
 		const cap = owner.length ? opts_.maxUnsettledPerPrincipal : opts_.maxUnsettledAnonymous;
 		if (cap == 0 || store_.countUnsettled(owner) < cap)
 			return;
+		// Tasks idle past `maxUnsettledIdle` are settled only when accessed or
+		// swept, so settle them now rather than let abandoned tasks hold the
+		// principal's slots (the sweeper may be disabled).
+		sweepExpired();
+		if (store_.countUnsettled(owner) < cap)
+			return;
 		throw resourceExhausted("too many unsettled tasks", owner.length
 				? "maxUnsettledPerPrincipal" : "maxUnsettledAnonymous", cast(long) cap);
 	}
@@ -1705,6 +1711,22 @@ unittest  // createFor refuses a principal past its unsettled-task cap
 
 	rt.complete(first.taskId, Json.emptyObject);
 	rt.create(alice);
+}
+
+unittest  // a task idle past maxUnsettledIdle frees its unsettled slot without a sweep
+{
+	string now = "2026-06-07T10:00:00Z";
+	TaskOptions o;
+	o.nowIso = () @safe => now;
+	o.maxUnsettledIdle = 1.hours;
+	o.maxUnsettledPerPrincipal = 1;
+	auto rt = new TaskRuntime(o);
+	TaskCreateOptions alice;
+	alice.owner = "alice";
+	auto hung = rt.createFor("slow", Json.undefined, alice);
+	now = "2026-06-07T11:00:00Z";
+	rt.createFor("slow", Json.undefined, alice);
+	assert(rt.store.get(hung.taskId).get.meta.status == TaskStatus.failed);
 }
 
 unittest  // unauthenticated tasks share the anonymous unsettled-task cap
