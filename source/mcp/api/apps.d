@@ -727,7 +727,7 @@ unittest  // an explicit enableApps keeps its settings when a @ui tool registers
 
 unittest  // enableApps declares extra content types alongside the one UI resources are served as
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	s.enableApps(["text/html;profile=custom", mcpAppMimeType]);
 	auto types = advertisedExtensions(s)[appsExtensionKey]["mimeTypes"];
 	assert(types.length == 2, types.toString);

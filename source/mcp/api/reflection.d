@@ -2762,7 +2762,7 @@ version (unittest) private class RefParamApi
 
 unittest  // an out or ref argument parameter is rejected at compile time
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	assert(!__traits(compiles, registerHandlers(s, new OutParamApi)));
 	assert(!__traits(compiles, registerHandlers(s, new RefParamApi)));
 }
@@ -3950,7 +3950,7 @@ version (unittest) private Json readUri(McpServer s, string uri) @safe
 
 unittest  // a resource-template array param binds an exploded path variable segment by segment
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	registerHandlers(s, new ListTemplateApi);
 	auto rr = readUri(s, "files://root/a/b/c");
 	assert("error" !in rr, rr.toString);
@@ -3959,7 +3959,7 @@ unittest  // a resource-template array param binds an exploded path variable seg
 
 unittest  // a resource-template array param binds a comma-separated list value element by element
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	registerHandlers(s, new ListTemplateApi);
 	auto rr = readUri(s, "tagged://x?tags=1,2,3");
 	assert("error" !in rr, rr.toString);
@@ -3968,7 +3968,7 @@ unittest  // a resource-template array param binds a comma-separated list value 
 
 unittest  // a resource-template array element that does not parse is an InvalidParams error
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	registerHandlers(s, new ListTemplateApi);
 	auto rr = readUri(s, "tagged://x?tags=1,zz");
 	assert(rr["error"]["code"].get!int == -32602, rr.toString);
@@ -3985,7 +3985,7 @@ unittest  // a NaN parameter default is not advertised, since JSON has no NaN
 		}
 	}
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	registerHandlers(s, new NanDefaultApi);
 	auto props = s.handle(MakeListMessage()).get["result"]["tools"][0]["inputSchema"]["properties"];
 	assert("default" !in props["ratio"], props.toString);
@@ -3994,7 +3994,7 @@ unittest  // a NaN parameter default is not advertised, since JSON has no NaN
 
 unittest  // a resource-template static array param requires exactly its length of elements
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	registerHandlers(s, new ListTemplateApi);
 	auto ok = readUri(s, "pair://3,4");
 	assert("error" !in ok, ok.toString);
