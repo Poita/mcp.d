@@ -236,6 +236,7 @@ version (Posix)
 	// unrelated descriptor for the same file does not release it.
 	private extern (C) int flock(int fd, int operation) nothrow @nogc @system;
 	private enum int LOCK_EX = 2;
+	private enum int LOCK_NB = 4;
 	private enum int LOCK_UN = 8;
 }
 
@@ -445,10 +446,23 @@ class FileTokenStore : TokenStore
 			}();
 			if (fd < 0)
 				throw internalError("FileTokenStore: could not open lock file " ~ lockPath);
+			import core.stdc.errno : EWOULDBLOCK;
+
+			// Poll without blocking: another process holds the lock across a
+			// network refresh, and a blocking flock would stall the event loop.
 			int rc;
-			do
-				rc = () @trusted { return flock(fd, LOCK_EX); }();
-			while (rc != 0 && (()@trusted => errno)() == EINTR);
+			while (true)
+			{
+				rc = () @trusted { return flock(fd, LOCK_EX | LOCK_NB); }();
+				if (rc == 0)
+					break;
+				const err = (() @trusted => errno)();
+				if (err == EINTR)
+					continue;
+				if (err != EWOULDBLOCK)
+					break;
+				pauseForLock();
+			}
 			if (rc != 0)
 			{
 				close(fd);
@@ -458,10 +472,12 @@ class FileTokenStore : TokenStore
 		}
 		else version (Windows)
 		{
-			import core.sys.windows.windows : CloseHandle, CreateFileW,
-				FILE_ATTRIBUTE_NORMAL, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
-				GENERIC_READ, GENERIC_WRITE, INVALID_HANDLE_VALUE,
-				LOCKFILE_EXCLUSIVE_LOCK, LockFileEx, OPEN_ALWAYS, OVERLAPPED;
+			import core.sys.windows.windows : CloseHandle, CreateFileW, FILE_ATTRIBUTE_NORMAL,
+				FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, GENERIC_READ,
+				GENERIC_WRITE, INVALID_HANDLE_VALUE, GetLastError,
+				LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY, LockFileEx,
+				OPEN_ALWAYS, OVERLAPPED;
+			import core.sys.windows.winerror : ERROR_LOCK_VIOLATION;
 			import std.utf : toUTF16z;
 
 			auto h = () @trusted {
@@ -471,15 +487,45 @@ class FileTokenStore : TokenStore
 			}();
 			if (h == INVALID_HANDLE_VALUE)
 				throw internalError("FileTokenStore: could not open lock file " ~ lockPath);
-			OVERLAPPED ov;
-			if (!()@trusted {
-					return LockFileEx(h, LOCKFILE_EXCLUSIVE_LOCK, 0, 1, 0, &ov);
-				}())
+			// Poll without blocking, as on POSIX, so waiting never stalls the
+			// event loop.
+			while (true)
 			{
-				() @trusted { CloseHandle(h); }();
-				throw internalError("FileTokenStore: could not lock " ~ lockPath);
+				OVERLAPPED ov;
+				if (()@trusted {
+						return LockFileEx(h,
+							LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY, 0, 1, 0, &ov);
+					}())
+					break;
+				if ((()@trusted => GetLastError())() != ERROR_LOCK_VIOLATION)
+				{
+					() @trusted { CloseHandle(h); }();
+					throw internalError("FileTokenStore: could not lock " ~ lockPath);
+				}
+				pauseForLock();
 			}
 			l.handle = h;
+		}
+	}
+
+	/// Wait briefly before retrying a held lock: yield to other tasks inside a
+	/// vibe task, else sleep the thread.
+	private static void pauseForLock() @safe
+	{
+		import core.time : msecs;
+		import vibe.core.task : Task;
+
+		if (Task.getThis() != Task.init)
+		{
+			import vibe.core.core : sleep;
+
+			sleep(10.msecs);
+		}
+		else
+		{
+			import core.thread : Thread;
+
+			() @trusted { Thread.sleep(10.msecs); }();
 		}
 	}
 
@@ -3734,6 +3780,73 @@ version (Posix) @system unittest  // save() waits for the token file's lock, so 
 	writer.join();
 	assert(atomicLoad(saved));
 	assert(new FileTokenStore(file).load("https://b.example.com").accessToken == "from-writer");
+}
+
+version (Posix) @system unittest  // waiting for another process's token-file lock leaves the event loop running
+{
+	import core.atomic : atomicLoad, atomicStore;
+	import core.sys.posix.fcntl : open, O_CREAT, O_RDWR;
+	import core.sys.posix.unistd : close;
+	import core.thread : Thread;
+	import core.time : msecs;
+	import std.conv : to;
+	import std.datetime.systime : Clock;
+	import std.file : tempDir, mkdirRecurse, rmdirRecurse;
+	import std.path : buildPath;
+	import std.string : toStringz;
+	import vibe.core.core : runTask, sleep;
+
+	auto root = buildPath(tempDir, "mcp-login-lockwait-" ~ Clock.currTime().stdTime.to!string);
+	mkdirRecurse(root);
+	scope (exit)
+		rmdirRecurse(root);
+	auto file = buildPath(root, "tokens.json");
+
+	const fd = () @trusted {
+		return open((file ~ ".lock").toStringz, O_CREAT | O_RDWR, 384);
+	}();
+	assert(fd >= 0);
+	assert(() @trusted { return flock(fd, LOCK_EX); }() == 0);
+	auto releaser = new Thread(() {
+		Thread.sleep(300.msecs);
+		flock(fd, LOCK_UN);
+		close(fd);
+	});
+	releaser.start();
+	scope (exit)
+		releaser.join();
+
+	int ticks;
+	int ticksWhenSaved = -1;
+	bool done;
+	auto ticker = runTask(() nothrow{
+		try
+			while (!done)
+			{
+				++ticks;
+				sleep(10.msecs);
+			}
+				catch (Exception)
+				{
+				}
+	});
+	auto saver = runTask(() nothrow{
+		try
+		{
+			StoredToken t;
+			t.accessToken = "waited";
+			new FileTokenStore(file).save("https://mcp.example.com", t);
+		}
+		catch (Exception)
+		{
+		}
+		ticksWhenSaved = ticks;
+		done = true;
+	});
+	saver.join();
+	ticker.join();
+	assert(ticksWhenSaved > 5, "other tasks must run while the save waits for the lock");
+	assert(new FileTokenStore(file).load("https://mcp.example.com").accessToken == "waited");
 }
 
 version (Posix) unittest  // save() backs up an unparseable token file instead of silently destroying it
