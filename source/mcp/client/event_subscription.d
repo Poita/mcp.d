@@ -59,7 +59,9 @@ final class EventSubscription
 
 	/// Idempotently stop the subscription: ends the poll loop, closes the push
 	/// stream (deregistering its handlers), or unsubscribes the webhook and stops
-	/// its refresh loop — whichever the factory wired.
+	/// its refresh loop — whichever the factory wired. Returns without waiting
+	/// for the server: a webhook's `events/unsubscribe` is sent on a task of its
+	/// own, after its receiver registration is already dropped.
 	void cancel() @safe
 	{
 		if (cancelled_)

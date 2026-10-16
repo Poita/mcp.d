@@ -980,7 +980,9 @@ final class McpClient : ClientProtocol
 	/// Release the underlying transport (stdio terminates the subprocess; HTTP
 	/// stops any background streams), first cancelling every managed event
 	/// subscription and every stream opened by `subscriptionsListen` /
-	/// `streamEvents`, so no background loop outlives the client. A closed client
+	/// `streamEvents`, so no background loop outlives the client. A webhook
+	/// subscription's `events/unsubscribe` gets up to five seconds to complete
+	/// before the transport is released. A closed client
 	/// opens no new streams, and every later request or notification fails with
 	/// an `McpException` ("the client is closed") without being sent.
 	void close() @safe
@@ -994,10 +996,74 @@ final class McpClient : ClientProtocol
 		foreach (stream; liveStreams_.keys)
 			stream.cancel();
 		liveStreams_ = null;
-		// Teardown above may still unsubscribe or cancel on the server; every
-		// request and notification after this point is refused.
+		// Teardown above may still be unsubscribing on the server; it gets a
+		// bounded grace, after which every request and notification is refused
+		// and releasing the transport aborts what is left.
+		awaitTeardowns();
 		released_ = true;
 		transport.close();
+	}
+
+	// How long `close()` waits for the server-side teardown of its managed
+	// subscriptions (a webhook's `events/unsubscribe`) before releasing the
+	// transport, which aborts whatever is still outstanding.
+	package Duration teardownGrace_ = 5.seconds;
+	// Server-side teardown requests still running, and the event each emits
+	// when it finishes.
+	private uint teardownsInFlight_;
+	private LocalManualEvent teardownDone_;
+	private bool teardownDoneInit_;
+
+	/// Run the server-side teardown `work` of a cancelled subscription on a task
+	/// of its own, so `cancel()` (and `close()`) never parks on a server that has
+	/// stopped answering. Failures are ignored: the local side is already torn
+	/// down.
+	private void runTeardownTask(void delegate() @safe work) @safe nothrow
+	{
+		import vibe.core.core : runTask;
+
+		try
+		{
+			if (!teardownDoneInit_)
+			{
+				teardownDone_ = createManualEvent();
+				teardownDoneInit_ = true;
+			}
+			teardownsInFlight_++;
+			scope (failure)
+				teardownsInFlight_--;
+			runTask(() nothrow{
+				scope (exit)
+				{
+					teardownsInFlight_--;
+					teardownDone_.emit();
+				}
+				try
+					work();
+				catch (Exception)
+				{
+				}
+			});
+		}
+		catch (Exception)
+		{
+		}
+	}
+
+	/// Wait up to `teardownGrace_` for the teardown tasks still running.
+	private void awaitTeardowns() @safe
+	{
+		if (teardownsInFlight_ == 0)
+			return;
+		const deadline = MonoTime.currTime + teardownGrace_;
+		while (teardownsInFlight_ > 0)
+		{
+			const now = MonoTime.currTime;
+			if (now >= deadline)
+				break;
+			const ec = teardownDone_.emitCount;
+			teardownDone_.wait(deadline - now, ec);
+		}
 	}
 
 	/// Remember an opened listen stream so `close()` can cancel it, dropping
@@ -3387,17 +3453,13 @@ final class McpClient : ClientProtocol
 			catch (Exception)
 			{
 			}
-			try
-			{
+			runTeardownTask(() @safe {
 				UnsubscribeParams u;
 				u.name = p.name;
 				u.arguments = p.arguments;
 				u.url = p.delivery.url;
 				unsubscribeWebhookEvents(u);
-			}
-			catch (Exception)
-			{
-			}
+			});
 		});
 		sub.onEnd(() @safe nothrow{
 			try
@@ -11405,8 +11467,15 @@ unittest  // subscribeWebhook registers the receiver under the server id and tea
 	assert(rx.processDelivery("{}", unknown).status == 503);
 
 	sub.cancel();
+	assert(rx.processDelivery("{}", known).status == 503); // deregistered at once
+	// The unsubscribe runs on a task of its own; let the loop run it.
+	{
+		import vibe.core.core : exitEventLoop, runEventLoop, runTask;
+
+		runTask(() nothrow{ exitEventLoop(); });
+		runEventLoop();
+	}
 	assert(unsubs == 1);
-	assert(rx.processDelivery("{}", known).status == 503); // deregistered
 }
 
 unittest  // cancelling a webhook subscription wakes its refresh loop from a long sleep
@@ -11468,6 +11537,53 @@ unittest  // cancelling a webhook subscription deregisters the receiver even whe
 	known["x-mcp-subscription-id"] = "sub_x";
 	assert(rx.processDelivery("{}", known).status == 503,
 			"a cancelled subscription must stop being routed by the receiver");
+}
+
+unittest  // close() does not wait out an unresponsive server's webhook unsubscribe
+{
+	import vibe.core.core : exitEventLoop, runEventLoop, runTask, sleep;
+
+	auto c = new McpClient(new RecordingClientTransport());
+	c.enableModern();
+	c.teardownGrace_ = 100.msecs;
+	auto release = createManualEvent();
+	c.onRpcForTest = (string method, Json params) @safe {
+		if (method == "events/unsubscribe")
+		{
+			// The server never answers: the request waits until the test releases it.
+			release.wait(5.seconds, release.emitCount);
+			return Json.emptyObject;
+		}
+		SubscribeResult r;
+		r.id = "sub_x";
+		return r.toJson();
+	};
+	Duration took = Duration.max;
+	runTask(() nothrow{
+		scope (exit)
+			exitEventLoop();
+		try
+		{
+			auto rx = new WebhookReceiver();
+			SubscribeParams sp;
+			sp.name = "incident.created";
+			sp.delivery = WebhookDelivery("https://hook/x", managedTestWhsec);
+			c.subscribeWebhook(rx, sp, (EventOccurrence o) @safe {});
+			const start = MonoTime.currTime;
+			c.close();
+			took = MonoTime.currTime - start;
+			// Let the abandoned unsubscribe finish before the loop exits, so no
+			// task of this test outlives it.
+			release.emit();
+			while (c.teardownsInFlight_ > 0)
+				sleep(1.msecs);
+		}
+		catch (Exception)
+		{
+		}
+	});
+	runEventLoop();
+	assert(took < 2.seconds, "close() must bound how long it waits for a webhook unsubscribe");
 }
 
 version (unittest)
