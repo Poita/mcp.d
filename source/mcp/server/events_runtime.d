@@ -68,7 +68,7 @@ struct EventRegistration
 	bool emitOnly; /// true => no check function; poll reads the ring buffer
 	Nullable!Duration pollInterval; /// suggested client poll cadence
 	DeliveryMode[] disabledModes; /// modes the author opted out of
-	Validator inputValidator; /// compiled from `descriptor.inputSchema` by `register`; null = unconstrained
+	private Validator inputValidator; // compiled from `descriptor.inputSchema` by `register`; null = unconstrained
 }
 
 /// A strongly-typed handle to an event type defined via `EventsRuntime.define`.

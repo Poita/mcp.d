@@ -13563,3 +13563,12 @@ unittest  // a push stream's subscription state is read-only outside the events 
 	static assert(!__traits(compiles, (PushStream s) { s.name = "n"; }));
 	static assert(__traits(compiles, (PushStream s) => s.terminated && s.cursor.isNull));
 }
+
+unittest  // an event registration's compiled validator is owned by the runtime
+{
+	import mcp.server.events_runtime : EventRegistration;
+
+	static assert(!__traits(compiles, (EventRegistration r) {
+			r.inputValidator = null;
+		}));
+}
