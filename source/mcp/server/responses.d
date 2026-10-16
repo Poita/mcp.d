@@ -198,9 +198,34 @@ struct ToolResponse
 	/// `CallToolResult.structured`, so a fieldwise struct becomes the
 	/// `structuredContent` object and any other value is wrapped under `result`,
 	/// with `content` defaulting to a text block holding that same JSON.
-	static ToolResponse complete(T)(T value) @safe if (!is(T : CallToolResult))
+	static ToolResponse complete(T)(T value) @safe
+			if (!is(T : CallToolResult) && !is(T : Json) && !is(T : string))
 	{
 		return ToolResponse.complete(CallToolResult.structured(value));
+	}
+
+	/// Convenience: build a final result from dynamic JSON. A JSON object is the
+	/// `structuredContent` itself, so it can match an object `outputSchema`; any
+	/// other value is wrapped under `result`, since `structuredContent` must be
+	/// an object. `content` is a text block holding that same JSON.
+	static ToolResponse complete(Json value) @safe
+	{
+		Json sc = value;
+		if (value.type != Json.Type.object)
+		{
+			sc = Json.emptyObject;
+			sc["result"] = value;
+		}
+		CallToolResult r;
+		r.structuredContent = sc;
+		r.content = [Content.makeText(sc.toString())];
+		return ToolResponse.complete(r);
+	}
+
+	/// Convenience: a final result carrying `text` as a single text content block.
+	static ToolResponse complete(string text) @safe
+	{
+		return ToolResponse.complete(CallToolResult.text(text));
 	}
 
 	/// The handler created an asynchronous task: `j` is the `CreateTaskResult`
@@ -393,4 +418,25 @@ unittest  // inputRequired rejects two input requests sharing an id
 	];
 	assertThrown!Exception(ToolResponse.inputRequired(reqs));
 	assertThrown!Exception(PromptResponse.inputRequired(reqs, "s"));
+}
+
+unittest  // ToolResponse.complete(Json) emits a JSON object as the structuredContent itself
+{
+	auto r = ToolResponse.complete(Json(["a": Json(1)])).toJson();
+	assert(r["structuredContent"]["a"].get!int == 1, r.toString);
+	assert("result" !in r["structuredContent"]);
+	assert(r["content"][0]["text"].get!string == `{"a":1}`);
+}
+
+unittest  // ToolResponse.complete(Json) wraps a non-object JSON value under `result`
+{
+	auto r = ToolResponse.complete(Json([Json(1), Json(2)])).toJson();
+	assert(r["structuredContent"]["result"].length == 2);
+}
+
+unittest  // ToolResponse.complete(string) is a plain text result
+{
+	auto r = ToolResponse.complete("hello").toJson();
+	assert(r["content"][0]["text"].get!string == "hello");
+	assert("structuredContent" !in r);
 }
