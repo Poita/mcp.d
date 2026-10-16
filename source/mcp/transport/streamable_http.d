@@ -78,10 +78,16 @@ struct StreamLimits
 	/// caller shares the proxy's address; raise this, or set it to `0`, there.
 	size_t maxPushStreamsPerAddress = 100;
 	/// Bytes queued for one long-lived SSE stream whose client is not reading.
-	/// Past it, delivery waits briefly (`SseWriter.queueStallTimeout`) for the
+	/// Past it, delivery waits up to `stallTimeout` for the
 	/// client to catch up, then closes and drops the stream, so a stalled client
 	/// never blocks delivery to anyone else for long.
 	size_t maxQueuedStreamBytes = defaultMaxQueuedStreamBytes;
+	/// How long a write to an SSE stream may wait on a client that has stopped
+	/// reading before the client is deemed gone and the stream closed: a
+	/// response stream's write must make progress (one 16 KiB slice) within
+	/// it, and a long-lived stream's full queue must drain within it. Raise it
+	/// for clients on slow links that receive large messages.
+	Duration stallTimeout = defaultSseStallTimeout;
 }
 
 /// Counts a mount's open streams of one kind against a mount-wide cap and a
@@ -593,8 +599,7 @@ void mountLegacyHttpSse(URLRouter router, McpServer server,
 		}
 		scope (exit)
 			streams.release(principal, address);
-		handleLegacyGet(server, channel, push, principal,
-			opts.streamLimits.maxQueuedStreamBytes, res);
+		handleLegacyGet(server, channel, push, principal, opts.streamLimits, res);
 	});
 
 	router.post(opts.legacyMessagePath, (HTTPServerRequest req, HTTPServerResponse res) @safe {
@@ -903,12 +908,13 @@ private final class SseWriter
 
 	/// How long a full queue waits for its client to read before the stream is
 	/// closed.
-	enum Duration queueStallTimeout = sseStallTimeout;
+	private Duration queueStallTimeout;
 
-	this(HTTPServerResponse res, size_t maxQueued) @safe
+	this(HTTPServerResponse res, size_t maxQueued, Duration stallTimeout) @safe
 	{
 		this.res = res;
 		this.maxQueued = maxQueued;
+		this.queueStallTimeout = stallTimeout;
 		wake = createManualEvent();
 		drained = createManualEvent();
 		finished = createManualEvent();
@@ -1033,10 +1039,9 @@ private final class SseWriter
 }
 
 /// The queued writer for one SSE response; see `SseWriter`.
-private SseWriter sseFrameWriter(HTTPServerResponse res,
-		size_t maxQueued = defaultMaxQueuedStreamBytes) @safe
+private SseWriter sseFrameWriter(HTTPServerResponse res, StreamLimits limits = StreamLimits.init) @safe
 {
-	return new SseWriter(res, maxQueued);
+	return new SseWriter(res, limits.maxQueuedStreamBytes, limits.stallTimeout);
 }
 
 /// Hold an SSE connection open, emitting a comment heartbeat every 15s so a write
@@ -1083,12 +1088,12 @@ private void holdSessionStream(void delegate(string) @safe writeFrame, ServerPus
 /// token, so server notifications and requests reach it as `message` events;
 /// `notifications/resources/updated` is gated on the stream's own subscriptions.
 private void handleLegacyGet(McpServer server, LegacySseChannel channel,
-		ServerPushChannel push, string principal, size_t maxQueued, HTTPServerResponse res) @safe
+		ServerPushChannel push, string principal, StreamLimits limits, HTTPServerResponse res) @safe
 {
 	res.contentType = "text/event-stream";
 	applySseStreamHeaders(res, false);
 
-	auto writeFrame = sseFrameWriter(res, maxQueued);
+	auto writeFrame = sseFrameWriter(res, limits);
 	scope (exit)
 		writeFrame.close();
 
@@ -1929,7 +1934,7 @@ private void handleGet(McpServer server, ServerPushChannel push,
 	// X-Accel-Buffering: no SHOULD is a modern-only rule, so it is not emitted here.
 	applySseStreamHeaders(res, false);
 
-	auto writeFrame = sseFrameWriter(res, opts.streamLimits.maxQueuedStreamBytes);
+	auto writeFrame = sseFrameWriter(res, opts.streamLimits);
 	scope (exit)
 		writeFrame.close();
 
@@ -1989,7 +1994,7 @@ private void handleGet(McpServer server, ServerPushChannel push,
 /// heartbeats) until the client disconnects.
 private void handleListenStream(McpServer server, ServerPushChannel push, Message msg,
 		HTTPServerResponse res, string protoHeader, string connToken,
-		TokenInfo token, size_t maxQueued) @safe
+		TokenInfo token, StreamLimits limits) @safe
 {
 	// Record the opted-in filters (route -> doSubscribeListen). The one-shot JSON
 	// result is discarded on success: the acknowledgement is delivered as the
@@ -2021,7 +2026,7 @@ private void handleListenStream(McpServer server, ServerPushChannel push, Messag
 	// §Receiving Messages).
 	applySseStreamHeaders(res, true);
 
-	auto writeFrame = sseFrameWriter(res, maxQueued);
+	auto writeFrame = sseFrameWriter(res, limits);
 	scope (exit)
 		writeFrame.close();
 
@@ -2125,7 +2130,7 @@ private EventStreamTick eventStreamTick(bool emitOnly, long sinceHeartbeatMs) @s
 /// advances during quiet periods. Every frame is stamped with the request id in
 /// `_meta` so a client multiplexing several streams can route it.
 private void handleEventsStream(McpServer server, Message msg,
-		HTTPServerResponse res, string principal, size_t maxQueued) @safe
+		HTTPServerResponse res, string principal, StreamLimits limits) @safe
 {
 	import core.time : msecs;
 
@@ -2158,7 +2163,7 @@ private void handleEventsStream(McpServer server, Message msg,
 		return;
 	}
 
-	auto writeFrame = sseFrameWriter(res, maxQueued);
+	auto writeFrame = sseFrameWriter(res, limits);
 	scope (exit)
 		writeFrame.close();
 	const subId = msg.id;
@@ -2574,7 +2579,7 @@ private void handlePost(McpServer server, ServerPushChannel push,
 		TokenInfo token, string payload, HTTPServerRequest req, HTTPServerResponse res) @safe
 {
 	auto coord = push.coordinator;
-	const maxQueued = opts.streamLimits.maxQueuedStreamBytes;
+	const limits = opts.streamLimits;
 
 	ParsedInput input;
 	try
@@ -2904,7 +2909,7 @@ private void handlePost(McpServer server, ServerPushChannel push,
 			scope (exit)
 				pushStreams.release(principal, address);
 			handleListenStream(server, push, msg, res,
-					req.headers.get(HttpHeader.protocolVersion, ""), connToken, token, maxQueued);
+					req.headers.get(HttpHeader.protocolVersion, ""), connToken, token, limits);
 			return;
 		}
 		// Modern events/stream (push): like subscriptions/listen, this POST opens a
@@ -2932,7 +2937,7 @@ private void handlePost(McpServer server, ServerPushChannel push,
 			}
 			scope (exit)
 				pushStreams.release(principal, address);
-			handleEventsStream(server, msg, res, principal, maxQueued);
+			handleEventsStream(server, msg, res, principal, limits);
 			return;
 		}
 		// Resolve THIS request's per-connection state and hand it to
@@ -2956,6 +2961,7 @@ private void handlePost(McpServer server, ServerPushChannel push,
 				reqState), extractProgressToken(msg.params),
 				token, isModernReq, effVersion, requestScope(cancelScope, mintedSessionId),
 				reqState, server.mode == ServerMode.stateless, reqAcceptsSse);
+		ctx.setStallTimeout(opts.streamLimits.stallTimeout);
 		// A session-bound 2025-11-25 stream advertises resumability with its
 		// priming event, so record its events for a GET Last-Event-ID resume.
 		if (sessions !is null && sendsPrimingEvent(effVersion))
@@ -4497,6 +4503,41 @@ version (unittest) private final class StallingSink : OutputStream
 	}
 }
 
+unittest  // a full SSE queue gives up on a stalled client after StreamLimits.stallTimeout
+{
+	import core.time : MonoTime, msecs;
+	import std.array : replicate;
+	import vibe.core.core : runTask, exitEventLoop, runEventLoop;
+	import vibe.http.server : createTestHTTPServerResponse, TestHTTPResponseMode;
+
+	auto stalled = new StallingSink;
+	StreamLimits limits;
+	limits.maxQueuedStreamBytes = 1024;
+	limits.stallTimeout = 50.msecs;
+	auto writer = sseFrameWriter(createTestHTTPServerResponse(stalled, null,
+			TestHTTPResponseMode.bodyOnly), limits);
+	Duration took;
+	bool threw;
+	runTask(() @safe nothrow{
+		const started = MonoTime.currTime;
+		try
+		{
+			const frame = "x".replicate(800);
+			writer(frame);
+			writer(frame);
+			writer(frame);
+		}
+		catch (Exception)
+			threw = true;
+		took = MonoTime.currTime - started;
+		stalled.released = true;
+		exitEventLoop();
+	});
+	runEventLoop();
+	assert(threw, "a client that never reads is dropped");
+	assert(took < 1.seconds, "the configured stall timeout bounds the wait");
+}
+
 version (unittest) private final class SlowSink : OutputStream
 {
 @safe:
@@ -4592,7 +4633,7 @@ unittest  // a stalled SSE reader blocks neither notify nor other streams, and i
 		exitEventLoop();
 	});
 	runEventLoop();
-	assert(took < SseWriter.queueStallTimeout + 1.seconds,
+	assert(took < defaultSseStallTimeout + 1.seconds,
 			"a stalled reader must hold up notify only until its queue gives up on it");
 	assert(received == 40, "a healthy stream must receive every notification");
 	assert(remaining == 1, "a stream whose client stopped reading must be dropped");
@@ -4625,8 +4666,10 @@ unittest  // a write waiting on a full SSE queue fails as soon as the writer die
 	import vibe.core.core : runTask, exitEventLoop, runEventLoop;
 	import vibe.http.server : createTestHTTPServerResponse, TestHTTPResponseMode;
 
+	StreamLimits limits;
+	limits.maxQueuedStreamBytes = 10;
 	auto writer = sseFrameWriter(createTestHTTPServerResponse(new FailingSink,
-			null, TestHTTPResponseMode.bodyOnly), 10);
+			null, TestHTTPResponseMode.bodyOnly), limits);
 	Duration took;
 	bool failed;
 	runTask(() @safe nothrow{
@@ -4694,7 +4737,7 @@ unittest  // several stalled SSE readers hold up a fan-out for one stall timeout
 		exitEventLoop();
 	});
 	runEventLoop();
-	assert(took < SseWriter.queueStallTimeout + 1.seconds,
+	assert(took < defaultSseStallTimeout + 1.seconds,
 			"stalled readers must not each add a stall timeout to the fan-out");
 	assert(remaining == 0, "every stream whose client stopped reading must be dropped");
 }

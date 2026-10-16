@@ -2661,8 +2661,9 @@ void applySseStreamHeaders(HTTPServerResponse res, bool modern) @safe
 }
 
 /// How long an SSE write may wait on a client that has stopped reading before
-/// the client is deemed gone and its connection closed.
-package(mcp) enum Duration sseStallTimeout = 2.seconds;
+/// the client is deemed gone and its connection closed, unless
+/// `StreamLimits.stallTimeout` says otherwise.
+enum Duration defaultSseStallTimeout = 2.seconds;
 
 /// Close the TCP connection under `res`, so a write blocked on a client that
 /// stopped reading fails at once. vibe.d exposes no public close for a server
@@ -2799,6 +2800,7 @@ final class HttpStreamContext : RequestContext, ConnectionScoped
 	// Set once a GET listener resumes this stream; later frames go only to it.
 	private bool resumedElsewhere_;
 	private TaskMutex writeMtx_;
+	private Duration stallTimeout_ = defaultSseStallTimeout;
 
 	this(HTTPServerResponse res, StreamCoordinator coord, ClientCapabilities caps, Json progressToken,
 			TokenInfo auth = TokenInfo.invalid(),
@@ -2858,6 +2860,13 @@ final class HttpStreamContext : RequestContext, ConnectionScoped
 	void setConnectionProbe(bool delegate() @safe alive) @safe
 	{
 		this.connAlive_ = alive;
+	}
+
+	/// How long a write to this stream may wait on a client that has stopped
+	/// reading before the client is deemed gone and its connection closed.
+	void setStallTimeout(Duration timeout) @safe
+	{
+		stallTimeout_ = timeout;
 	}
 
 	/// The globally-unique id this stream will assign to its next SSE event.
@@ -2987,7 +2996,7 @@ final class HttpStreamContext : RequestContext, ConnectionScoped
 	//
 	// A client that stops reading fills the socket and parks the write, which
 	// would pin the handler and its session. The frame is therefore written in
-	// slices under a watchdog: when no slice is accepted within `sseStallTimeout`
+	// slices under a watchdog: when no slice is accepted within the stall timeout
 	// the watchdog interrupts the writing task, which cancels the pending socket
 	// write, and closes the connection. Closing alone does not wake a pending
 	// write on every event driver (Windows only sends a disconnect).
@@ -3001,7 +3010,7 @@ final class HttpStreamContext : RequestContext, ConnectionScoped
 			return;
 		enum size_t slice = 16 * 1024;
 		auto writer = Task.getThis();
-		auto watchdog = setTimer(sseStallTimeout, () nothrow @safe {
+		auto watchdog = setTimer(stallTimeout_, () nothrow @safe {
 			closeRawConnection(res);
 			writer.interrupt();
 		});
@@ -3015,7 +3024,7 @@ final class HttpStreamContext : RequestContext, ConnectionScoped
 				const n = min(slice, bytes.length);
 				res.bodyWriter.write(bytes[0 .. n]);
 				bytes = bytes[n .. $];
-				watchdog.rearm(sseStallTimeout);
+				watchdog.rearm(stallTimeout_);
 			}
 			res.bodyWriter.flush();
 		}
@@ -4257,6 +4266,56 @@ version (unittest) private final class BrokenPipeSink : OutputStream
 	void finalize() @safe
 	{
 	}
+}
+
+version (unittest) private final class NeverDrainingSink : OutputStream
+{
+@safe:
+	size_t write(scope const(ubyte)[] bytes, IOMode) @safe
+	{
+		import vibe.core.sync : createManualEvent;
+
+		auto never = createManualEvent();
+		never.wait(never.emitCount); // ends only when the writer is interrupted
+		return bytes.length;
+	}
+
+	void flush()
+	{
+	}
+
+	void finalize()
+	{
+	}
+}
+
+unittest  // a POST stream's write gives up on a client that stopped reading after its stall timeout
+{
+	import core.time : MonoTime, msecs;
+	import vibe.core.core : runTask, runEventLoop, exitEventLoop;
+	import vibe.http.server : createTestHTTPServerResponse, TestHTTPResponseMode;
+
+	auto res = createTestHTTPServerResponse(new NeverDrainingSink, null,
+			TestHTTPResponseMode.bodyOnly);
+	ClientCapabilities caps;
+	auto ctx = new HttpStreamContext(res, new StreamCoordinator, caps, Json("tok"));
+	ctx.setStallTimeout(50.msecs);
+	Duration took;
+	runTask(() nothrow{
+		scope (exit)
+			exitEventLoop();
+		try
+		{
+			const started = MonoTime.currTime;
+			ctx.log("info", Json("x"));
+			took = MonoTime.currTime - started;
+		}
+		catch (Exception)
+		{
+		}
+	});
+	runEventLoop();
+	assert(took < 1.seconds, "the configured stall timeout bounds the write");
 }
 
 unittest  // a dropped POST stream does not abort the handler's progress/log/final writes
