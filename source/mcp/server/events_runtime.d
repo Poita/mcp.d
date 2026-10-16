@@ -2126,14 +2126,32 @@ final class EventsRuntime
 	// Whether `path` is `prefix` itself or lies below it, matching whole path
 	// segments: "/hooks" covers "/hooks" and "/hooks/a" but not "/hooks-other".
 	// A prefix ending in '/' (or empty) covers everything under it.
-	private static bool pathUnder(string path, string prefix) @safe pure nothrow
+	private static bool pathUnder(string path, string prefix) @safe pure
 	{
 		import std.algorithm : startsWith, endsWith;
 
-		if (!path.startsWith(prefix))
+		if (hasDotSegment(path) || !path.startsWith(prefix))
 			return false;
 		return prefix.length == 0 || prefix.endsWith('/')
 			|| path.length == prefix.length || path[prefix.length] == '/';
+	}
+
+	// Whether `path` has a `.` or `..` segment, literal or percent-encoded, or a
+	// percent-encoded or backslash separator. A receiver normalizes these away, so
+	// such a path reaches a different resource than the one it lexically names.
+	private static bool hasDotSegment(string path) @safe pure
+	{
+		import std.algorithm : canFind, splitter;
+		import std.array : replace;
+		import std.uni : toLower;
+
+		auto p = path.toLower;
+		if (p.canFind("%2f") || p.canFind("%5c") || p.canFind('\\'))
+			return true;
+		foreach (seg; p.replace("%2e", ".").splitter('/'))
+			if (seg == "." || seg == "..")
+				return true;
+		return false;
 	}
 
 	// Parse a URL into its scheme, host, effective port, path and whether it carries
@@ -2198,6 +2216,11 @@ final class EventsRuntime
 		// (or a URL with no host) is refused before it takes quota or fires on_subscribe.
 		if (!callbackHostAllowed(url, opts_.allowPrivateCallbackHosts))
 			throw invalidParams("delivery.url must name a publicly routable host");
+		string scheme, host, path;
+		ushort port;
+		bool hasUserinfo;
+		if (parseAuthority(url, scheme, host, port, path, hasUserinfo) && hasDotSegment(path))
+			throw invalidParams("delivery.url must not contain dot segments or encoded separators");
 	}
 
 	// Whether the host of an `http://` URL classifies as loopback or
@@ -9514,4 +9537,35 @@ unittest  // a push backlog page the stream's filter empties does not end the ba
 	rt.startPushStream(h.stream, nullable(start), Nullable!long.init);
 	assert(ids.length == 150);
 	assert(ids[100] == "e200" && ids[$ - 1] == "e249");
+}
+
+unittest  // a callback URL with dot segments is refused at subscribe
+{
+	import std.exception : collectException;
+
+	auto rt = testRuntime();
+	EventRegistration reg = {descriptor: EventType("n"), emitOnly: true};
+	rt.register(reg);
+	foreach (url; [
+		"https://proxy.example.com/mcp/../admin",
+		"https://proxy.example.com/mcp/%2e%2E/admin",
+		"https://proxy.example.com/mcp/./x",
+		"https://proxy.example.com/mcp%2f..%2fadmin"
+	])
+	{
+		auto e = collectException!McpException(rt.subscribeWebhook(webhookSub("n", url), "u"));
+		assert(e !is null && e.code == -32602, url);
+	}
+}
+
+unittest  // dot segments never place a callback path under an allowlisted prefix
+{
+	EventsOptions o;
+	o.nowMs = () @safe => 1_000_000L;
+	o.nowIso = () @safe => "t";
+	o.callbackAllowlist = ["https://hooks.example.com/mcp/"];
+	auto rt = new EventsRuntime(null, o);
+	assert(rt.urlAllowlisted("https://hooks.example.com/mcp/a"));
+	assert(!rt.urlAllowlisted("https://hooks.example.com/mcp/../admin/x"));
+	assert(!rt.urlAllowlisted("https://hooks.example.com/mcp/%2e%2e/admin"));
 }
