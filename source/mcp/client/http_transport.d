@@ -338,6 +338,10 @@ enum size_t defaultMaxMessageBytes = 16 * 1024 * 1024;
 private enum size_t maxHeaderLineBytes = 8 * 1024;
 private enum size_t maxHeaderBlockBytes = 64 * 1024;
 
+/// The longest SSE `retry:` reconnect delay honoured, in milliseconds; a larger
+/// one is capped so a server cannot park a reconnect for an unbounded time.
+private enum long maxRetryMs = 60_000;
+
 /// The error raised when the server sends more than `limit` bytes in one message.
 private McpException messageTooLarge(size_t limit) @safe
 {
@@ -1865,7 +1869,10 @@ final class HttpClientTransport : ClientTransport
 				else if (line.startsWith("retry:"))
 				{
 					try
-						cursor.retryMs = line["retry:".length .. $].strip.to!long;
+					{
+						const ms = line["retry:".length .. $].strip.to!long;
+						cursor.retryMs = ms > maxRetryMs ? maxRetryMs : ms;
+					}
 					catch (Exception)
 					{
 					}
@@ -4774,6 +4781,45 @@ unittest  // a subscriptions/listen POST follows a same-origin 307
 	});
 	assert(failure.length == 0, "scenario failed: " ~ failure);
 	assert(streamError is null);
+}
+
+unittest  // close() ends a server stream reader waiting out a reconnect delay
+{
+	import core.time : msecs;
+	import vibe.core.core : sleep;
+
+	auto router = new URLRouter;
+	router.get("/mcp", (HTTPServerRequest req, HTTPServerResponse res) @safe {
+		res.headers["Content-Type"] = "text/event-stream";
+		res.bodyWriter.write("retry: 100000000\n\n");
+	});
+	bool aliveBeforeClose;
+	bool aliveAfterClose = true;
+	const failure = runAgainstFakeServer(router, (string url) @safe {
+		auto t = new HttpClientTransport(url);
+		t.startServerStream();
+		// The stream opens and closes, leaving the reader waiting to reconnect.
+		sleep(300.msecs);
+		aliveBeforeClose = t.serverStreamAlive;
+		t.close();
+		sleep(100.msecs);
+		aliveAfterClose = t.serverStreamAlive;
+	});
+	assert(failure.length == 0, "scenario failed: " ~ failure);
+	assert(aliveBeforeClose, "the reader must wait to reconnect");
+	assert(!aliveAfterClose, "close() must end the reader's reconnect wait");
+}
+
+unittest  // an SSE retry: delay is capped
+{
+	import vibe.stream.memory : createMemoryStream;
+
+	auto t = new HttpClientTransport("http://127.0.0.1:1/mcp");
+	SseCursor cursor;
+	auto conn = createMemoryStream(cast(ubyte[]) "retry: 100000000\n\n".dup, false);
+	t.readSseBody(conn, false, cursor, () @safe => false, (string eventType, string data) @safe {
+	});
+	assert(cursor.retryMs == maxRetryMs);
 }
 
 unittest  // a request resumes across a polling server's quick stream closes
