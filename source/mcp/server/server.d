@@ -4127,7 +4127,8 @@ final class McpServer : ServerCore
 /// Outside a fragment, a value with a `.` or `..` path segment (raw or
 /// percent-encoded, delimited by `/` or `\`) does not match, so a captured
 /// value never walks out of the path the template names.
-/// Values are percent-decoded per RFC 3986; a malformed escape does not match.
+/// Values are percent-decoded per RFC 3986; a malformed escape, or a decoded
+/// control character such as NUL, does not match.
 /// Comma-separated variable lists are supported. A prefix modifier (`:n`) caps
 /// its variable's decoded value at `n` code points. An explode modifier (`*`) on
 /// the last variable of a `/` or `.` expression takes the remaining segments.
@@ -4407,6 +4408,11 @@ private bool decodeUriValue(string raw, bool allowSlash, out string value) @safe
 		value = decodeComponent(raw);
 	catch (URIException)
 		return false;
+	// A control character (notably NUL, which truncates a C-string path) is never
+	// a legitimate part of a resource identifier.
+	foreach (char c; value)
+		if (c < 0x20 || c == 0x7F)
+			return false;
 	return allowSlash || !value.canFind('/', '\\');
 }
 
@@ -4429,6 +4435,21 @@ unittest  // template matching captures a trailing parameter
 	string[string] params;
 	assert(matchUriTemplate("file:///{name}", "file:///notes.txt", params));
 	assert(params["name"] == "notes.txt");
+}
+
+unittest  // a captured value never carries a percent-encoded NUL or control character
+{
+	// A reader passing the value to a C API would see the path truncated at NUL.
+	foreach (tmpl, uri; [
+		"res://{id}": "res://a%00b",
+		"res://{+path}": "res://a/b%00.txt",
+		"res://x{?q}": "res://x?q=a%0Ab",
+		"res://{id}#{#frag}": "res://a#%7F"
+	])
+	{
+		string[string] params;
+		assert(!matchUriTemplate(tmpl, uri, params), uri);
+	}
 }
 
 unittest  // a simple {var} never captures a '/' (no path traversal)
