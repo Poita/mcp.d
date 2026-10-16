@@ -963,6 +963,24 @@ struct ToolAnnotations
 	}
 }
 
+/// The MCP tool-naming rule, phrased for error messages.
+enum string toolNameRule = "a tool name must be 1..128 characters of "
+	~ "A-Z, a-z, 0-9, '_', '-', and '.'";
+
+/// Whether `name` follows the MCP tool-naming guidance (2025-11-25 onward): 1..128
+/// characters, each an ASCII letter, digit, underscore, hyphen, or dot.
+bool isValidToolName(string name) @safe pure nothrow @nogc
+{
+	import std.ascii : isAlphaNum;
+
+	if (name.length == 0 || name.length > 128)
+		return false;
+	foreach (char c; name)
+		if (!(isAlphaNum(c) || c == '_' || c == '-' || c == '.'))
+			return false;
+	return true;
+}
+
 /// A tool the server exposes for the model to call.
 struct Tool
 {

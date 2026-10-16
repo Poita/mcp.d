@@ -540,23 +540,6 @@ private void checkUdaRepeats(string memberName, alias f)()
 				}
 }
 
-private enum toolNameRule = "a tool name must be 1..128 characters of "
-	~ "A-Z, a-z, 0-9, '_', '-', and '.'";
-
-/// Whether `name` follows the MCP tool-naming guidance (2025-11-25 onward): 1..128
-/// characters, each an ASCII letter, digit, underscore, hyphen, or dot.
-private bool isValidToolName(string name) @safe pure nothrow @nogc
-{
-	import std.ascii : isAlphaNum;
-
-	if (name.length == 0 || name.length > 128)
-		return false;
-	foreach (char c; name)
-		if (!(isAlphaNum(c) || c == '_' || c == '-' || c == '.'))
-			return false;
-	return true;
-}
-
 /// The wire names of `func`'s parameters, in order: each identifier with one
 /// trailing underscore dropped (see `wireName`), the names the input schema,
 /// prompt arguments, and URI template variables use.

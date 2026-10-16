@@ -504,11 +504,14 @@ final class McpServer : ServerCore
 		tools[descriptor.name] = withCompiledValidators(RegisteredTool(descriptor, handler));
 	}
 
-	/// Throw when a tool with `name` is already registered. Registration entry
-	/// points reject a name collision rather than silently clobbering the prior
-	/// entry; call `removeTool` first to replace one intentionally.
+	/// Throw when `name` breaks the MCP tool-naming rule (`isValidToolName`) or a
+	/// tool with `name` is already registered. Registration entry points reject a
+	/// name collision rather than silently clobbering the prior entry; call
+	/// `removeTool` first to replace one intentionally.
 	private void requireToolNameAvailable(string name) @safe
 	{
+		if (!isValidToolName(name))
+			throw new Exception("invalid tool name '" ~ name ~ "': " ~ toolNameRule);
 		if (name in tools)
 			throw alreadyRegistered("a tool named '" ~ name ~ "'", "removeTool");
 	}
@@ -1050,10 +1053,12 @@ final class McpServer : ServerCore
 				RequestContext ctx) => PromptResponse.complete(handler(args, ctx)));
 	}
 
-	/// Throw when a prompt with `name` is already registered, mirroring the tool
-	/// registration collision guard.
+	/// Throw when `name` is empty or a prompt with `name` is already registered,
+	/// mirroring the tool registration guard.
 	private void requirePromptNameAvailable(string name) @safe
 	{
+		if (name.length == 0)
+			throw new Exception("a prompt needs a non-empty name");
 		if (name in prompts)
 			throw alreadyRegistered("a prompt named '" ~ name ~ "'", "removePrompt");
 	}
@@ -13461,4 +13466,28 @@ unittest  // enableExtension rejects the extensions the SDK serves itself, namin
 	}
 	s.enableExtension("com.example/custom");
 	assert(s.extensionEnabled("com.example/custom"));
+}
+
+unittest  // registerTool rejects a name outside the MCP tool-naming rule
+{
+	import std.array : replicate;
+	import std.exception : assertThrown;
+
+	auto s = McpServer.stateless("t", "1");
+	foreach (bad; ["", "has space", "slash/name", "x".replicate(129)])
+	{
+		Tool t = {name: bad};
+		assertThrown(s.registerTool(t, (Json) @safe => CallToolResult.init), bad);
+	}
+	Tool ok = {name: "get_weather.v2-beta"};
+	s.registerTool(ok, (Json) @safe => CallToolResult.init);
+}
+
+unittest  // registerPrompt rejects an empty name
+{
+	import std.exception : assertThrown;
+
+	auto s = McpServer.stateless("t", "1");
+	Prompt p = {name: ""};
+	assertThrown(s.registerPrompt(p, (Json) @safe => GetPromptResult.init));
 }
