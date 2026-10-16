@@ -85,7 +85,8 @@ struct Icon
 		return j;
 	}
 
-	/// Throws -32602 when `j` is not an object or a `sizes` entry is not a string.
+	/// Throws -32602 when `j` is not an object, its required `src` is missing,
+	/// empty or not a string, or a `sizes` entry is not a string.
 	static Icon fromJson(Json j) @safe
 	{
 		import mcp.protocol.errors : invalidParams;
@@ -94,6 +95,8 @@ struct Icon
 			throw invalidParams("an icon must be an object");
 		Icon icon;
 		icon.src = j.getOr("src", "");
+		if (icon.src.length == 0)
+			throw invalidParams("an icon requires a non-empty string 'src'");
 		tryGet(j, "mimeType", icon.mimeType);
 		if ("sizes" in j && j["sizes"].type == Json.Type.array)
 			foreach (i; 0 .. j["sizes"].length)
@@ -143,6 +146,27 @@ Icon[] readIcons(Json obj) @safe
 	auto icons = readIcons(parseJsonString(`{"icons":[1,{"src":"a"},{"src":"b","sizes":[2]}]}`));
 	assert(icons.length == 1 && icons[0].src == "a");
 	assert(readIcons(parseJsonString(`{"icons":"x"}`)).length == 0);
+}
+
+@safe unittest  // Icon.fromJson rejects an icon without a string src with -32602
+{
+	import mcp.protocol.errors : ErrorCode, McpException;
+	import std.exception : collectException;
+	import vibe.data.json : parseJsonString;
+
+	foreach (icon; [`{"mimeType":"image/png"}`, `{"src":5}`, `{"src":""}`])
+	{
+		auto e = collectException!McpException(Icon.fromJson(parseJsonString(icon)));
+		assert(e !is null && e.code == ErrorCode.invalidParams, icon);
+	}
+}
+
+@safe unittest  // readIcons skips an icon without a src
+{
+	import vibe.data.json : parseJsonString;
+
+	auto icons = readIcons(parseJsonString(`{"icons":[{"mimeType":"image/png"},{"src":"a"}]}`));
+	assert(icons.length == 1 && icons[0].src == "a");
 }
 
 @safe unittest  // Icon.dup deep-copies sizes so the copy does not alias the original
