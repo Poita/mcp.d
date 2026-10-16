@@ -785,10 +785,13 @@ final class TaskRuntime
 		return r.isNull ? Nullable!TaskStatus.init : nullable(r.get.meta.status);
 	}
 
-	/// Persist a re-entry checkpoint value under `key`.
+	/// Persist a re-entry checkpoint value under `key`. A no-op if the task is
+	/// already terminal, since no executor will run to read it.
 	void putCheckpoint(string id, string key, Json value) @safe
 	{
 		modify(id, (ref TaskRecord r) @safe {
+			if (isTerminal(r.meta.status))
+				return Change.none;
 			r.checkpoints[key] = value;
 			return Change.state;
 		});
@@ -948,6 +951,17 @@ unittest  // checkpoints persist and read back
 	rt.putCheckpoint(t.taskId, "stage", Json("approved"));
 	assert(rt.getCheckpoint(t.taskId, "stage").get!string == "approved");
 	assert(rt.getCheckpoint(t.taskId, "missing").type == Json.Type.undefined);
+}
+
+unittest  // putCheckpoint leaves a terminal task untouched
+{
+	auto rt = new TaskRuntime(TaskOptions.init);
+	auto t = rt.createFor("multi", Json.undefined);
+	rt.complete(t.taskId, Json.emptyObject);
+	const rev = rt.store.get(t.taskId).get.revision;
+	rt.putCheckpoint(t.taskId, "late", Json(1));
+	assert(rt.getCheckpoint(t.taskId, "late").type == Json.Type.undefined);
+	assert(rt.store.get(t.taskId).get.revision == rev);
 }
 
 unittest  // getDetailed throws -32602 with the taskId for an unknown task
