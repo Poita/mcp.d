@@ -1898,8 +1898,18 @@ final class HttpClientTransport : ClientTransport
 		// clobbering this stream's Last-Event-ID resume on reconnect.
 		SseCursor cursor;
 		auto backoff = 250.msecs;
+		// The session this stream serves. Once that session is gone (cleared by a
+		// request that found it expired, or by a re-initialize in progress), a GET
+		// without a session id would only be refused, so the stream is left for the
+		// next session's `notifications/initialized` to reopen.
+		const streamSession = sessionId;
 		while (!closing)
 		{
+			if (streamSession.length && sessionId.length == 0)
+			{
+				reopenServerStream = true;
+				break;
+			}
 			bool refused;
 			bool sawData;
 			int status;
@@ -4385,6 +4395,7 @@ version (unittest)
 		// accepted stream carried.
 		bool serveStream;
 		string[] streamSessions;
+		int sessionlessStreams; // stream GETs that carried no Mcp-Session-Id
 
 		void expire() @safe
 		{
@@ -4432,6 +4443,13 @@ version (unittest)
 					import vibe.core.core : sleep;
 
 					const sid = req.headers.get("Mcp-Session-Id", "");
+					if (sid.length == 0)
+					{
+						++sessionlessStreams;
+						res.statusCode = 400;
+						res.writeBody("Missing Mcp-Session-Id header", "text/plain");
+						return;
+					}
 					if (sid != live || live.length == 0)
 					{
 						res.statusCode = 404;
@@ -4522,6 +4540,38 @@ unittest  // the server stream an expired session ended is reopened once the cli
 	assert(failure.length == 0, "scenario failed: " ~ failure);
 	assert(srv.streamSessions.length >= 2 && srv.streamSessions[0] == "s1"
 			&& srv.streamSessions[$ - 1] == "s2",
+			"the server stream must be reopened for the new session");
+}
+
+unittest  // the server stream is reopened after a request finds the session expired before the stream reconnects
+{
+	import core.time : msecs;
+	import vibe.core.core : sleep;
+	import mcp.client.client : McpClient;
+
+	auto srv = new SessionFakeServer;
+	srv.serveStream = true;
+	const failure = runAgainstFakeServer(srv.router(), (string url) @safe {
+		auto client = McpClient.http(url);
+		scope (exit)
+			client.close();
+		client.initialize("2025-11-25");
+		client.startServerStream();
+		sleep(50.msecs);
+		srv.expire();
+		// The request learns of the expiry while the stream waits to reconnect.
+		try
+			client.listTools();
+		catch (SessionExpiredException)
+		{
+		}
+		sleep(800.msecs);
+		client.initialize("2025-11-25");
+		sleep(300.msecs);
+	});
+	assert(failure.length == 0, "scenario failed: " ~ failure);
+	assert(srv.sessionlessStreams == 0, "the stream must not reconnect without a session id");
+	assert(srv.streamSessions.length >= 2 && srv.streamSessions[$ - 1] == "s2",
 			"the server stream must be reopened for the new session");
 }
 
