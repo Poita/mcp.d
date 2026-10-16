@@ -72,6 +72,7 @@ final class DuplexChannel
 	// for one (see `maxNotificationTasks`).
 	private size_t notificationTasks_;
 	private Message[] notificationBacklog_;
+	private PostQueue posts_;
 
 	/// Receives a description of each failure the read loop survives or ends on
 	/// (an unreadable input, a line whose handling threw). Defaults to stderr, the
@@ -93,6 +94,22 @@ final class DuplexChannel
 	/// one arriving while the wait list is full is dropped and reported to
 	/// `onError`. `notifications/cancelled` is never held back.
 	size_t maxNotificationTasks = 64;
+
+	/// The most posted lines (error replies to malformed input, teardown
+	/// `notifications/cancelled`) held waiting for the peer to read at once
+	/// (`0`: unbounded). Past it a posted line is dropped and reported to
+	/// `onError`, so a peer that floods input while not reading its own cannot
+	/// park writer tasks without bound.
+	@property size_t maxPostedWrites() const @safe nothrow
+	{
+		return posts_.cap;
+	}
+
+	/// ditto
+	@property void maxPostedWrites(size_t cap) @safe nothrow
+	{
+		posts_.cap = cap;
+	}
 
 	/// Report `msg` to `onError`, or to stderr when it is null.
 	void reportError(string msg) @safe nothrow
@@ -139,6 +156,12 @@ final class DuplexChannel
 		this.onInboundBatch = onInboundBatch;
 		this.coord = new DuplexCoordinator;
 		this.writeMutex = new TaskMutex;
+		this.posts_ = new PostQueue((string text) @safe {
+			this.writeLine(text, null);
+		}, 64, (string) @safe nothrow{
+			reportError("dropped an outbound message: " ~ intToString(
+				posts_.cap) ~ " writes are already waiting for the peer to read");
+		});
 	}
 
 	/// Start the cooperative read loop as a vibe task. Requires a running event
@@ -550,13 +573,15 @@ final class DuplexChannel
 	{
 		if (shut_)
 			return;
-		runTask((Json msg) nothrow{
-			try
-				writeLine(msg.toString(), null);
-			catch (Exception)
-			{
-			}
-		}, message);
+		string text;
+		try
+			text = message.toString();
+		catch (Exception e)
+		{
+			reportError("post: " ~ e.msg);
+			return;
+		}
+		posts_.post(text);
 	}
 
 	/// Whether a line is being written right now. A write the peer does not
@@ -637,6 +662,65 @@ final class DuplexChannel
 		closed_ = true;
 		coord.failPending(internalError("stdio channel closed"));
 	}
+}
+
+/// Writes lines on tasks of their own, so the caller never waits on a peer that
+/// has stopped reading, with at most `cap` such writes outstanding at once
+/// (`0`: unbounded). A line posted past the cap is handed to `onDrop` instead,
+/// so a flood cannot park writer tasks without bound. A write that throws is
+/// ignored: a posted line carries nothing its sender waits on.
+package(mcp) final class PostQueue
+{
+	/// The most writes outstanding at once.
+	size_t cap;
+	private void delegate(string) @safe write;
+	private void delegate(string) @safe nothrow onDrop;
+	private size_t pending_;
+
+	this(void delegate(string) @safe write, size_t cap, void delegate(string) @safe nothrow onDrop) @safe nothrow
+	{
+		this.write = write;
+		this.cap = cap;
+		this.onDrop = onDrop;
+	}
+
+	/// Write `line` on a task of its own, or drop it when `cap` writes are
+	/// already outstanding.
+	void post(string line) @safe nothrow
+	{
+		if (cap != 0 && pending_ >= cap)
+		{
+			if (onDrop !is null)
+				onDrop(line);
+			return;
+		}
+		++pending_;
+		runTask((string l) nothrow{
+			scope (exit)
+				--pending_;
+			try
+				write(l);
+			catch (Exception)
+			{
+			}
+		}, line);
+	}
+
+	/// Writes posted and not yet finished.
+	size_t pending() const @safe nothrow
+	{
+		return pending_;
+	}
+}
+
+private string intToString(size_t n) @safe nothrow
+{
+	import std.conv : to;
+
+	try
+		return n.to!string;
+	catch (Exception)
+		return "?";
 }
 
 /// Thrown by a `DuplexChannel` send when writing the line fails. The byte stream
@@ -1243,6 +1327,81 @@ unittest  // answering a malformed line does not stall the read loop behind a pe
 	});
 	runEventLoop();
 	assert(seen == 1, "lines after a malformed one are still read while its reply is unwritten");
+}
+
+unittest  // PostQueue holds at most cap writes outstanding and drops the rest
+{
+	auto never = createManualEvent();
+	string[] dropped;
+	size_t pendingAfter;
+	runTask(() nothrow{
+		scope (exit)
+			exitEventLoop();
+		auto q = new PostQueue((string) @safe { never.wait(never.emitCount); },
+			3, (string l) @safe nothrow{ dropped ~= l; });
+		foreach (i; 0 .. 5)
+			q.post(i == 3 ? "d" : i == 4 ? "e" : "x");
+		pendingAfter = q.pending;
+		never.emit();
+	});
+	runEventLoop();
+	assert(pendingAfter == 3);
+	assert(dropped == ["d", "e"]);
+}
+
+unittest  // PostQueue frees a slot once a write finishes
+{
+	string[] written;
+	string[] dropped;
+	runTask(() nothrow{
+		scope (exit)
+			exitEventLoop();
+		auto q = new PostQueue((string l) @safe { written ~= l; }, 1, (string l) @safe nothrow{
+			dropped ~= l;
+		});
+		// runTask starts each writer at once, so a write that does not block
+		// finishes before `post` returns.
+		q.post("a");
+		q.post("b");
+		q.post("c");
+	});
+	runEventLoop();
+	assert(written == ["a", "b", "c"]);
+	assert(dropped.length == 0);
+}
+
+unittest  // replies to malformed lines waiting on a peer that stopped reading are bounded
+{
+	import std.algorithm : canFind, count;
+
+	auto inbound = new LineLink;
+	auto never = createManualEvent();
+	string[] errors;
+	runTask(() nothrow{
+		scope (exit)
+			exitEventLoop();
+		try
+		{
+			auto channel = new DuplexChannel(() @safe { return inbound.take(); }, (string) @safe {
+				never.wait(never.emitCount); // the peer never drains its input
+			}, (Message) @safe {});
+			channel.answersMalformed = true;
+			channel.onError = (string msg) @safe nothrow{ errors ~= msg; };
+			channel.start();
+			foreach (_; 0 .. 200)
+				inbound.put("this is not json");
+			foreach (_; 0 .. 16)
+				yield();
+			channel.close();
+			inbound.closeEnd();
+		}
+		catch (Exception)
+		{
+		}
+	});
+	runEventLoop();
+	assert(errors.count!(e => e.canFind("dropped")) == 200 - 64,
+			"past the cap a reply is dropped and reported rather than parked");
 }
 
 unittest  // a channel not answering malformed lines reports an unparseable line without replying

@@ -8,7 +8,7 @@ import mcp.protocol.versions : ProtocolVersion;
 import mcp.server.server;
 import mcp.server.settings : ServerSettings;
 import mcp.transport.coordinator : defaultServerRequestTimeout;
-import mcp.transport.duplex : DuplexChannel, defaultMaxLineBytes;
+import mcp.transport.duplex : DuplexChannel, PostQueue, defaultMaxLineBytes;
 import mcp.transport.lines : FrameHead, LineReader;
 
 @safe:
@@ -632,6 +632,13 @@ void runStdio(McpServer server, StdioOptions opts = StdioOptions.init)
 			throw new Exception("runStdio: write to stdout failed (peer closed its read end?)");
 	}
 
+	// The error replies to over-long lines are posted, so the read loop never
+	// waits on a stdout the peer is not draining, and bounded, so a flood of
+	// such lines cannot park writers without bound.
+	auto oversizedPosts = new PostQueue(&writeLine, 64, (string) @safe nothrow{
+		reportStdioError(opts.onError, "dropped the reply to an over-long line: 64 writes are already waiting for the peer to read");
+	});
+
 	string readLine() @safe
 	{
 		for (;;)
@@ -640,7 +647,7 @@ void runStdio(McpServer server, StdioOptions opts = StdioOptions.init)
 			FrameHead head;
 			if (!reader.takeOversized(head))
 				return line;
-			auto substitute = answerOversized(head, maxLineBytes, &writeLine);
+			auto substitute = answerOversized(head, maxLineBytes, &oversizedPosts.post);
 			if (substitute !is null)
 				return substitute;
 			if (line is null)
@@ -673,6 +680,26 @@ void runStdio(McpServer server, StdioOptions opts = StdioOptions.init)
 			}
 		});
 		runEventLoop();
+	}();
+}
+
+/// Report `msg` to `onError`, or to stderr when it is null: stdout carries only
+/// MCP messages.
+private void reportStdioError(void delegate(string) @safe nothrow onError, string msg) @safe nothrow
+{
+	import std.stdio : stderr;
+
+	if (onError !is null)
+	{
+		onError(msg);
+		return;
+	}
+	() @trusted nothrow{
+		try
+			stderr.writeln("[mcp.transport.stdio] ", msg);
+		catch (Exception)
+		{
+		}
 	}();
 }
 
@@ -1306,11 +1333,12 @@ else version (Windows)
 /// with a null-id one. A notification gets no reply. A response is never
 /// answered: the returned error-response line stands in for it so the request it
 /// replies to fails at once. Returns null when nothing stands in for the frame.
+/// A reply is handed to `post`, which must not wait for the write: the caller is
+/// the read loop, which must keep reading while the peer is not draining stdout.
 private string answerOversized(FrameHead head, size_t maxLineBytes,
-		void delegate(string) @safe writeLine) @safe
+		void delegate(string) @safe nothrow post) @safe
 {
 	import std.conv : to;
-	import vibe.core.core : runTask;
 	import mcp.protocol.errors : internalError, invalidRequest;
 	import mcp.protocol.jsonrpc : makeErrorResponse;
 
@@ -1321,15 +1349,7 @@ private string answerOversized(FrameHead head, size_t maxLineBytes,
 				internalError("the peer's response exceeds the " ~ limit)).toString() : null;
 	if (head.hasMethod && !hasId)
 		return null;
-	// Written on a task of its own: the caller is the read loop, which must keep
-	// reading while a peer that is not draining stdout holds the write.
-	runTask((string line) nothrow{
-		try
-			writeLine(line);
-		catch (Exception)
-		{
-		}
-	}, makeErrorResponse(head.id, invalidRequest("message exceeds the " ~ limit)).toString());
+	post(makeErrorResponse(head.id, invalidRequest("message exceeds the " ~ limit)).toString());
 	return null;
 }
 
@@ -1432,8 +1452,9 @@ version (unittest) private string[] oversizedReplies(FrameHead head, out string 
 			exitEventLoop();
 		try
 		{
-			sub = answerOversized(head, 16, (string s) @safe { written ~= s; });
-			yield(); // let the posted reply's writer task run
+			sub = answerOversized(head, 16, (string s) @safe nothrow{
+				written ~= s;
+			});
 		}
 		catch (Exception)
 		{
@@ -1489,7 +1510,7 @@ unittest  // an over-long frame of unknown kind is answered with a null-id error
 	assert(parseJsonString(written[0])["id"].type == Json.Type.null_);
 }
 
-unittest  // answering an over-long request does not wait for a stdout the peer is not draining
+unittest  // answering an over-long request through a PostQueue does not wait for a stdout the peer is not draining
 {
 	import vibe.core.core : runTask, runEventLoop, exitEventLoop;
 	import vibe.core.sync : createManualEvent;
@@ -1501,10 +1522,10 @@ unittest  // answering an over-long request does not wait for a stdout the peer 
 			exitEventLoop();
 		try
 		{
-			answerOversized(FrameHead(Json(5), true, false), 16, (string) @safe {
-				never.wait(never.emitCount);
-			});
+			auto q = new PostQueue((string) @safe { never.wait(never.emitCount); }, 1, null);
+			answerOversized(FrameHead(Json(5), true, false), 16, &q.post);
 			returned = true;
+			never.emit();
 		}
 		catch (Exception)
 		{
