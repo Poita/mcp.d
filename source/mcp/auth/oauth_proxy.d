@@ -1080,10 +1080,11 @@ ClientIdMetadataDocument parseClientIdMetadataDocument(string clientIdUrl, strin
 ///     keeps in a cookie. Binding consent to it means an approval recorded in one
 ///     browser (e.g. an attacker approving their own redirect_uri) never lets a
 ///     different browser skip the consent screen.
-///   * `client` — the per-client identity: the `redirectUriMatchKey` of the
-///     client-supplied `redirect_uri` for a DCR client (the `client_id` is
-///     shared; a loopback IP literal's port is not part of it), or the stable
-///     `client_id` URL for a SEP-991 CIMD client.
+///   * `client` — the per-client identity: the exact client-supplied
+///     `redirect_uri` for a DCR client (the `client_id` is shared; a loopback
+///     IP literal's port is part of it, so an approval for one running native
+///     client does not carry over to another), or the stable `client_id` URL
+///     for a SEP-991 CIMD client.
 ///
 /// Each approval also records the scopes the user saw and approved, so a later
 /// request for broader access re-prompts rather than riding on the earlier
