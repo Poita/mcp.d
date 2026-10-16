@@ -1588,7 +1588,13 @@ struct TokenSet
 			if (e.type == Json.Type.int_)
 				t.expiresIn = e.get!long;
 			else if (e.type == Json.Type.float_)
-				t.expiresIn = cast(long) e.get!double;
+			{
+				// Only a value a long can hold converts; anything else means no
+				// known expiry rather than an undefined cast.
+				const d = e.get!double;
+				if (d > 0 && d < 9.0e18)
+					t.expiresIn = cast(long) d;
+			}
 		}
 		t.refreshToken = strField(j, "refresh_token");
 		t.scope_ = strField(j, "scope");
@@ -1919,6 +1925,14 @@ unittest  // DCR request + responses round-trip
 			`{"access_token":"tok","token_type":"Bearer","expires_in":3600,"refresh_token":"r"}`));
 	assert(ts.accessToken == "tok" && ts.tokenType == "Bearer" && ts.expiresIn == 3600);
 	assert(ts.refreshToken == "r");
+}
+
+unittest  // TokenSet.fromJson ignores a float expires_in outside the range of a long
+{
+	auto ts = TokenSet.fromJson(parseJson(`{"access_token":"tok","expires_in":1e300}`));
+	assert(ts.expiresIn == 0);
+	ts = TokenSet.fromJson(parseJson(`{"access_token":"tok","expires_in":-5.0}`));
+	assert(ts.expiresIn == 0);
 }
 
 unittest  // TokenSet.fromJson parses expires_in when AS returns it as a JSON float

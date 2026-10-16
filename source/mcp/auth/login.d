@@ -115,7 +115,9 @@ struct StoredToken
 		StoredToken s;
 		s.accessToken = ts.accessToken;
 		s.tokenType = ts.tokenType.length ? ts.tokenType : "Bearer";
-		s.expiresAt = ts.expiresIn > 0 ? now + ts.expiresIn : 0;
+		// Saturate so an absurd expires_in cannot wrap to a past expiry.
+		s.expiresAt = ts.expiresIn <= 0 ? 0 : ts.expiresIn > long.max - now
+			? long.max : now + ts.expiresIn;
 		s.refreshToken = ts.refreshToken.length ? ts.refreshToken : prevRefresh;
 		s.scope_ = ts.scope_;
 		s.resource = resource;
@@ -1205,8 +1207,10 @@ final class OAuthSession
 			return token_.accessToken;
 		if (token_.refreshToken.length == 0)
 		{
-			if (token_.hasToken && token_.expiresAt == 0)
-				return token_.accessToken; // no expiry known, no refresh possible
+			// No refresh is possible, so a token without a known expiry, or one
+			// only inside the refresh skew, is used until it actually expires.
+			if (token_.hasToken && (token_.expiresAt == 0 || now < token_.expiresAt))
+				return token_.accessToken;
 			throw internalError(
 					"OAuth access token has expired or was rejected and no refresh token "
 					~ "is available; call useOAuth again to re-authenticate");
@@ -1825,6 +1829,29 @@ unittest  // fromTokenSet expiresAt is anchored to the timestamp passed in, not 
 	assert(freshPath.expiresAt == nowAfter + expiresIn);
 	assert(stalePaths.expiresAt == nowBefore + expiresIn);
 	assert(freshPath.expiresAt - stalePaths.expiresAt == 180);
+}
+
+unittest  // fromTokenSet saturates an expires_in too large to add to now
+{
+	TokenSet ts;
+	ts.accessToken = "a";
+	ts.expiresIn = long.max;
+	auto s = StoredToken.fromTokenSet(ts, "r", 1_700_000_000);
+	assert(s.expiresAt > 1_700_000_000);
+	assert(!needsRefresh(s, 1_700_000_000));
+}
+
+unittest  // a token inside the refresh skew but not yet expired is still used when it cannot be refreshed
+{
+	auto store = new MemoryTokenStore();
+	StoredToken t;
+	t.accessToken = "short-lived";
+	t.expiresAt = 1_000_010;
+	auto sess = new OAuthSession("https://mcp.example.com", t, store, (string rt) @safe {
+		assert(0, "no refresh token to present");
+		return TokenSet.init;
+	});
+	assert(sess.bearerForRequest(1_000_000) == "short-lived");
 }
 
 unittest  // fromTokenSet keeps the previous refresh token when the AS omits one
