@@ -758,7 +758,11 @@ schema also admits an explicit `null`, as LLM clients often send one) or give it
 D default value (`int page = 1`), which is also emitted as the property's
 `"default"`. A `@schemaDefault(v)` parameter is optional too: `v` is advertised
 as its `"default"` and is what an omitted argument binds to, over any D default
-(likewise for a struct field). A `Nullable` parameter mirrored into a header with `@mcpHeader` keeps
+(likewise for a struct field). Only a `Nullable` parameter's schema admits
+`null`: input validation rejects an explicit `null` for a parameter that merely
+has a default. When clients may send `null`, declare the parameter `Nullable!T`
+and apply the fallback in the handler (`page.get(1)`), since an explicit `null`
+binds as unset rather than taking a D default. A `Nullable` parameter mirrored into a header with `@mcpHeader` keeps
 the bare primitive type `x-mcp-header` requires. A parameter is named on the wire
 like a struct field, minus one trailing `_`, so `string version_` is the `version`
 argument (and `@describeParam` / `@mcpHeader` name it `"version"`).
