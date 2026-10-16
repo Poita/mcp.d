@@ -3097,7 +3097,7 @@ final class McpServer : ServerCore
 	/// Hand task `id` to the dispatcher. A dispatch that throws leaves no
 	/// executor to settle the task, so the task is failed before the error
 	/// propagates; otherwise it would sit `working`, holding an unsettled slot,
-	/// until `maxUnsettledAge`.
+	/// until `maxUnsettledIdle`.
 	private void dispatchOrFail(string id) @safe
 	{
 		try
@@ -8858,11 +8858,11 @@ unittest  // a task whose first dispatch fails is settled failed, so it holds no
 	desc.name = "work";
 	desc.inputSchema = Json(["type": Json("object")]);
 	s.registerTaskTool(desc, (TaskContext tc) @safe => Json([
-			"content": Json.emptyArray
+		"content": Json.emptyArray
 	]));
 	auto resp = s.handle(modernReq(1, "tools/call", Json([
-				"name": Json("work"),
-				"arguments": Json.emptyObject
+		"name": Json("work"),
+		"arguments": Json.emptyObject
 	]))).get;
 	// A throwing tool handler is reported as an `isError` tool result.
 	assert(resp["result"]["isError"].get!bool);

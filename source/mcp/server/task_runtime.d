@@ -31,10 +31,12 @@ enum Duration unlimitedTaskTtl = Duration.max;
 /// TTL / suggested poll cadence when a creator does not specify them. A task's
 /// TTL is how long its record is kept once it settles (`unlimitedTaskTtl` keeps
 /// it forever); a task that is still working or awaiting input does not expire
-/// by TTL. `maxUnsettledAge` bounds that instead: a task still unsettled that
-/// long after `createdAt` (its executor hung or its node vanished) is failed —
-/// or cancelled, when a cancel was requested — and then expires by its TTL like
-/// any settled task; zero disables the bound.
+/// by TTL. `maxUnsettledIdle` bounds that instead: a task still unsettled that
+/// long after its last status change (`lastUpdatedAt`: creation, a progress
+/// message, an input round) is taken to be abandoned — its executor hung or its
+/// node vanished — and is failed, or cancelled when a cancel was requested, then
+/// expires by its TTL like any settled task. An executor that runs longer keeps
+/// its task alive by reporting progress; zero disables the bound.
 /// `sweepInterval` is how often `enableTasks`'s background sweep removes expired
 /// tasks (zero disables it; expired tasks are still hidden on access). `nowIso` is an
 /// injectable clock returning an ISO-8601 extended timestamp (the runtime throws
@@ -47,7 +49,7 @@ struct TaskOptions
 	Duration defaultTtl = 10.minutes;
 	Duration defaultPollInterval = 5.seconds;
 	Duration sweepInterval = 30.seconds;
-	Duration maxUnsettledAge = 24.hours;
+	Duration maxUnsettledIdle = 24.hours;
 	/// Most unsettled (working or input_required) tasks one authenticated
 	/// principal may hold; creating another fails with `-32013` (0 = unlimited).
 	size_t maxUnsettledPerPrincipal = 100;
@@ -249,7 +251,7 @@ final class TaskRuntime
 	}
 
 	/// The stored record for `id`, or null when unknown or expired. An expired
-	/// record is removed on sight, and one unsettled past `maxUnsettledAge` is
+	/// record is removed on sight, and one idle past `maxUnsettledIdle` is
 	/// settled on sight, so both hold between sweeps.
 	private Nullable!TaskRecord fetch(string id) @safe
 	{
@@ -267,14 +269,15 @@ final class TaskRuntime
 		return r;
 	}
 
-	/// Whether `r` is still unsettled `maxUnsettledAge` after it was created.
+	/// Whether `r` is still unsettled `maxUnsettledIdle` after its last status
+	/// change.
 	private bool isOverdue(const TaskRecord r, SysTime now) @safe
 	{
-		if (opts_.maxUnsettledAge <= Duration.zero || isTerminal(r.meta.status))
+		if (opts_.maxUnsettledIdle <= Duration.zero || isTerminal(r.meta.status))
 			return false;
-		// An unparseable `createdAt` cannot be aged, so it counts as overdue.
+		// An unparseable `lastUpdatedAt` cannot be aged, so it counts as overdue.
 		try
-			return now >= SysTime.fromISOExtString(r.meta.createdAt) + opts_.maxUnsettledAge;
+			return now >= SysTime.fromISOExtString(r.meta.lastUpdatedAt) + opts_.maxUnsettledIdle;
 		catch (Exception)
 			return true;
 	}
@@ -293,7 +296,7 @@ final class TaskRuntime
 		{
 			transition(r, TaskStatus.failed);
 			r.error = nullable(toErrorJson(internalError(
-					"Task did not settle within the server's maximum unsettled age")));
+					"Task made no progress within the server's maximum unsettled idle time")));
 		}
 		r.cancelRequested = true;
 		r.inputRequests = Json.emptyObject;
@@ -344,7 +347,7 @@ final class TaskRuntime
 	}
 
 	/// Remove every expired task from the store, returning how many were removed,
-	/// and settle every task unsettled past `maxUnsettledAge`. `enableTasks` runs
+	/// and settle every task idle past `maxUnsettledIdle`. `enableTasks` runs
 	/// this every `TaskOptions.sweepInterval`.
 	size_t sweepExpired() @safe
 	{
@@ -1169,14 +1172,14 @@ unittest  // a defaultTtl of unlimitedTaskTtl makes tasks unlimited unless a ttl
 	assert(rt.create(TaskCreateOptions(nullable(1_000.msecs))).ttlMs.get == 1_000);
 }
 
-unittest  // a task unsettled past maxUnsettledAge fails, stops its executor, then expires by ttl
+unittest  // a task unsettled past maxUnsettledIdle fails, stops its executor, then expires by ttl
 {
 	import std.exception : collectException;
 
 	string now = "2026-06-07T10:00:00Z";
 	TaskOptions o;
 	o.nowIso = () @safe => now;
-	o.maxUnsettledAge = 1.hours;
+	o.maxUnsettledIdle = 1.hours;
 	auto store = new InMemoryTaskStore();
 	o.store = store;
 	auto rt = new TaskRuntime(o);
@@ -1198,12 +1201,28 @@ unittest  // a task unsettled past maxUnsettledAge fails, stops its executor, th
 	assert(ex !is null && ex.code == ErrorCode.invalidParams);
 }
 
-unittest  // the sweep fails a task unsettled past maxUnsettledAge
+unittest  // a task whose status keeps changing is not settled as overdue
 {
 	string now = "2026-06-07T10:00:00Z";
 	TaskOptions o;
 	o.nowIso = () @safe => now;
-	o.maxUnsettledAge = 1.hours;
+	o.maxUnsettledIdle = 1.hours;
+	auto rt = new TaskRuntime(o);
+	auto t = rt.createFor("slow", Json.undefined);
+	now = "2026-06-07T10:50:00Z";
+	rt.progress(t.taskId, "still going");
+	now = "2026-06-07T11:30:00Z";
+	assert(rt.getDetailed(t.taskId)["status"].get!string == "working");
+	now = "2026-06-07T11:50:00Z";
+	assert(rt.getDetailed(t.taskId)["status"].get!string == "failed");
+}
+
+unittest  // the sweep fails a task unsettled past maxUnsettledIdle
+{
+	string now = "2026-06-07T10:00:00Z";
+	TaskOptions o;
+	o.nowIso = () @safe => now;
+	o.maxUnsettledIdle = 1.hours;
 	auto store = new InMemoryTaskStore();
 	o.store = store;
 	auto rt = new TaskRuntime(o);
@@ -1216,12 +1235,12 @@ unittest  // the sweep fails a task unsettled past maxUnsettledAge
 	assert(store.get(t.taskId).get.meta.status == TaskStatus.failed);
 }
 
-unittest  // a task whose cancel never settled is cancelled, not failed, at maxUnsettledAge
+unittest  // a task whose cancel never settled is cancelled, not failed, at maxUnsettledIdle
 {
 	string now = "2026-06-07T10:00:00Z";
 	TaskOptions o;
 	o.nowIso = () @safe => now;
-	o.maxUnsettledAge = 1.hours;
+	o.maxUnsettledIdle = 1.hours;
 	auto rt = new TaskRuntime(o);
 	auto t = rt.createFor("slow", Json.undefined);
 	rt.cancel(t.taskId);
@@ -1230,12 +1249,12 @@ unittest  // a task whose cancel never settled is cancelled, not failed, at maxU
 	assert(rt.getDetailed(t.taskId)["status"].get!string == "cancelled");
 }
 
-unittest  // a zero maxUnsettledAge never fails an unsettled task
+unittest  // a zero maxUnsettledIdle never fails an unsettled task
 {
 	string now = "2026-06-07T10:00:00Z";
 	TaskOptions o;
 	o.nowIso = () @safe => now;
-	o.maxUnsettledAge = Duration.zero;
+	o.maxUnsettledIdle = Duration.zero;
 	auto rt = new TaskRuntime(o);
 	auto t = rt.createFor("slow", Json.undefined);
 	now = "2027-06-07T10:00:00Z";
@@ -1243,10 +1262,10 @@ unittest  // a zero maxUnsettledAge never fails an unsettled task
 	assert(rt.getDetailed(t.taskId)["status"].get!string == "working");
 }
 
-unittest  // the default maxUnsettledAge bounds an unsettled task to a day
+unittest  // the default maxUnsettledIdle bounds an unsettled task to a day
 {
 	TaskOptions o;
-	assert(o.maxUnsettledAge == 24.hours);
+	assert(o.maxUnsettledIdle == 24.hours);
 }
 
 unittest  // deliverInput rejects a key the task has not requested and records nothing

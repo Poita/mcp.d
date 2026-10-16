@@ -863,10 +863,11 @@ band via `rt.complete` / `rt.fail` — no fiber held, so it works on any node. S
 A task's TTL (`@taskTtl`, else `TaskOptions.defaultTtl`, 10 minutes) is how long
 its record is kept after it settles, so the client has that long to collect the
 result (`unlimitedTaskTtl` keeps it forever). A task that is still working or
-awaiting input does not expire by TTL; instead `TaskOptions.maxUnsettledAge`
-(24 hours; zero disables it) fails one still unsettled that long after creation —
-so a detached task whose callback never arrives is failed then, unless you
-`rt.fail` or cancel it first.
+awaiting input does not expire by TTL; instead `TaskOptions.maxUnsettledIdle`
+(24 hours; zero disables it) fails one whose status has not changed for that
+long — so a detached task whose callback never arrives is failed then, unless you
+`rt.fail` or cancel it first. A long-running executor keeps its task alive by
+reporting progress (`tc.progress`).
 
 On the client, `callToolAwait(name, args, opts, onInputRequired)` hides the whole
 flow — it drives the poll loop and returns the final `CallToolResult`, so task and
