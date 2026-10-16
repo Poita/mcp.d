@@ -1175,7 +1175,8 @@ struct CallToolResult
 		j["content"] = arr;
 		if (isError)
 			j["isError"] = true;
-		if (structuredContent.type != Json.Type.undefined)
+		// The schema types `structuredContent` as a JSON object.
+		if (structuredContent.type == Json.Type.object)
 			j["structuredContent"] = structuredContent;
 		emitMetaField(j);
 		return j;
@@ -1201,7 +1202,7 @@ struct CallToolResult
 		}
 		if ("isError" in j && j["isError"].type == Json.Type.bool_)
 			r.isError = j["isError"].get!bool;
-		if ("structuredContent" in j)
+		if ("structuredContent" in j && j["structuredContent"].type == Json.Type.object)
 			r.structuredContent = j["structuredContent"];
 		r.parseMetaField(j);
 		// MRTR (SEP-2322): detect an `InputRequiredResult` (the server asks for
@@ -1407,6 +1408,29 @@ unittest  // CallToolResult.text builds a non-error single-text result
 	auto j = r.toJson();
 	assert(j["content"][0]["text"].get!string == "ok");
 	assert("isError" !in j);
+}
+
+unittest  // CallToolResult.toJson emits structuredContent only when it is an object
+{
+	foreach (sc; [Json(null), Json("x"), Json(5), Json.emptyArray])
+	{
+		auto r = CallToolResult.text("ok");
+		r.structuredContent = sc;
+		assert("structuredContent" !in r.toJson(), sc.toString);
+	}
+	auto r = CallToolResult.text("ok");
+	r.structuredContent = Json(["k": Json(1)]);
+	assert(r.toJson()["structuredContent"]["k"].get!int == 1);
+}
+
+unittest  // CallToolResult.fromJson ignores a structuredContent that is not an object
+{
+	foreach (sc; [`null`, `"x"`, `5`, `[1]`])
+	{
+		auto r = CallToolResult.fromJson(
+				parseJsonString(`{"content":[],"structuredContent":` ~ sc ~ `}`));
+		assert(r.structuredContent.type == Json.Type.undefined, sc);
+	}
 }
 
 unittest  // CallToolResult.error flags isError and carries the message
