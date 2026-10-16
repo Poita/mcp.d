@@ -1280,8 +1280,10 @@ struct CallToolResult
 	/// untrusted/possibly non-conforming server, so — mirroring the inbound
 	/// `argsAs!T` accessor — a deserialization failure on a shape that does not
 	/// match `T` is likewise mapped to `invalidParams` (rather than leaking a raw
-	/// vibe exception); an `McpException` propagates unchanged. Enum fields are
-	/// read by member name, as `structured` and the reflection layer write them.
+	/// vibe exception); an `McpException` propagates unchanged. Decoding follows
+	/// the binding rules the reflected output schema advertises: enum fields are
+	/// read by member name, and a `Nullable`, vibe-`@optional`, or defaulted
+	/// field may be omitted.
 	/// A `T` that is not a fieldwise-serialized struct is read from the `result`
 	/// member, matching the wrapping `structured` applies.
 	T structuredContentAs(T)() const @safe
@@ -1292,17 +1294,15 @@ struct CallToolResult
 			throw invalidParams("structuredContent: expected a JSON object, got " ~ (
 					structuredContent.type == Json.Type.undefined
 					? "no structuredContent" : "a non-object value"));
+		import mcp.api.binding : bindJson;
 		import mcp.protocol.jsonhelpers : isFieldwiseStruct;
-		import mcp.protocol.schema : EnumByNamePolicy;
-		import vibe.data.json : JsonSerializer;
-		import vibe.data.serialization : deserializeWithPolicy;
 
 		static if (isFieldwiseStruct!T)
-			const Json src = structuredContent;
+			Json src = structuredContent;
 		else
-			const Json src = structuredContent["result"];
+			Json src = structuredContent["result"];
 		try
-			return deserializeWithPolicy!(JsonSerializer, EnumByNamePolicy, T)(src);
+			return bindJson!T(src);
 		catch (McpException e)
 			throw e;
 		catch (Exception e)
@@ -1535,6 +1535,41 @@ unittest  // CallToolResult.structured!T wraps a non-struct value under `result`
 	assert(r.structuredContent.type == Json.Type.object);
 	assert(r.structuredContent["result"].length == 3);
 	assert(r.structuredContentAs!(int[]) == [1, 2, 3]);
+}
+
+unittest  // structuredContentAs!T accepts an object omitting fields its output schema leaves optional
+{
+	static struct Report
+	{
+		int a;
+		Nullable!int b;
+		int limit = 10;
+	}
+
+	CallToolResult r;
+	r.structuredContent = parseJsonString(`{"a":1}`);
+	auto back = r.structuredContentAs!Report;
+	assert(back.a == 1);
+	assert(back.b.isNull);
+	assert(back.limit == 10);
+}
+
+unittest  // structuredContentAs!T names a missing required field without D-side detail
+{
+	import std.exception : collectException;
+	import std.algorithm.searching : canFind;
+
+	static struct Report
+	{
+		int a;
+	}
+
+	CallToolResult r;
+	r.structuredContent = Json.emptyObject;
+	auto e = collectException!McpException(r.structuredContentAs!Report);
+	assert(e !is null);
+	assert(e.msg.canFind("'a'"), e.msg);
+	assert(!e.msg.canFind("Policy"), e.msg);
 }
 
 /// Result of `tools/list` (paginated).
