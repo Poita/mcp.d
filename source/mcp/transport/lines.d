@@ -4,10 +4,6 @@ import vibe.data.json : Json;
 
 @safe:
 
-/// How many leading bytes of a dropped over-long line a reader that does not
-/// stream it through a `FrameHeadScanner` keeps for `scanFrameHead`.
-package(mcp) enum size_t frameHeadScanBytes = 4096;
-
 /// Newline-delimited line assembly over a byte source, shared by both ends of the
 /// stdio transport (the server reading its stdin, the client reading a spawned
 /// server's stdout).
@@ -601,7 +597,7 @@ unittest  // LineReader finds the id of an over-long request that follows its la
 	import std.array : replicate;
 
 	Json[] ids;
-	const big = "a".replicate(3 * frameHeadScanBytes);
+	const big = "a".replicate(12 * 1024);
 	auto text = `{"jsonrpc":"2.0","method":"tools/call","params":{"x":"` ~ big ~ `"},"id":7}`;
 	auto lines = drainLineReader(64, [
 		cast(ubyte[]) text[0 .. 100].dup, cast(ubyte[]) text[100 .. 5000].dup,
@@ -619,7 +615,7 @@ unittest  // LineReader finds a late id when the over-long line and its newline 
 	import std.array : replicate;
 
 	Json[] ids;
-	const big = "b".replicate(2 * frameHeadScanBytes);
+	const big = "b".replicate(8 * 1024);
 	auto text = `{"method":"m","params":{"x":"` ~ big ~ `"},"id":"req-9"}` ~ "\n";
 	drainLineReader(64, [cast(ubyte[]) text.dup], ids);
 	assert(ids.length == 1 && ids[0].get!string == "req-9");
