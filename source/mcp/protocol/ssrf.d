@@ -549,8 +549,9 @@ private AddressClass classifyIpv6Literal(string inner) @safe pure nothrow @nogc
 	if (b[0] == 0xFF)
 		return AddressClass.privateOrLinkLocal;
 
-	// IPv4-mapped ::ffff:a.b.c.d/96 and IPv4-compatible ::/96 (first 12 bytes
-	// either 0...0 ffff or all zero) — extract the embedded IPv4 and classify it.
+	// IPv4-mapped ::ffff:a.b.c.d/96 reaches the embedded IPv4, so classify it.
+	// The deprecated IPv4-compatible ::/96 (RFC 4291 §2.5.5.1) is not routed to
+	// the embedded IPv4, so it names neither that host nor loopback.
 	bool mapped = true;
 	foreach (k; 0 .. 10)
 		if (b[k] != 0)
@@ -558,8 +559,10 @@ private AddressClass classifyIpv6Literal(string inner) @safe pure nothrow @nogc
 			mapped = false;
 			break;
 		}
-	if (mapped && ((b[10] == 0xFF && b[11] == 0xFF) || (b[10] == 0 && b[11] == 0)))
+	if (mapped && b[10] == 0xFF && b[11] == 0xFF)
 		return classifyIpv4Octets(b[12], b[13], b[14], b[15]);
+	if (mapped && b[10] == 0 && b[11] == 0)
+		return AddressClass.privateOrLinkLocal;
 
 	// IPv4-translated ::ffff:0:a.b.c.d/96 (RFC 2765 SIIT): bytes 0..7 zero,
 	// then ff ff 00 00, then the IPv4 a translator routes to.
@@ -1500,7 +1503,19 @@ unittest  // an embedded IPv4 tail after hextets parses into the low 32 bits
 
 unittest  // an embedded IPv4 tail octet of a single zero is still accepted
 {
-	assert(classifyIpv6Literal("::8.8.0.8") == AddressClass.public_);
+	assert(classifyIpv6Literal("::ffff:8.8.0.8") == AddressClass.public_);
+}
+
+unittest  // a deprecated IPv4-compatible ::a.b.c.d address is internal, never the loopback allowance
+{
+	// The kernel does not route ::/96 to the embedded IPv4, so `::127.0.0.1` is
+	// not loopback and `::8.8.8.8` is not the public host it names.
+	assert(classifyIpv6Literal("::127.0.0.1") == AddressClass.privateOrLinkLocal);
+	assert(classifyIpv6Literal("::7f00:1") == AddressClass.privateOrLinkLocal);
+	assert(classifyIpv6Literal("::8.8.8.8") == AddressClass.privateOrLinkLocal);
+	assert(!pinnedConnectAddress("[::127.0.0.1]", false, SsrfPolicy.allowLoopback).ok);
+	assert(pinnedConnectAddress("[::ffff:127.0.0.1]", false, SsrfPolicy.allowLoopback).ok);
+	assert(classifyIpv6Literal("::1") == AddressClass.loopback);
 }
 
 unittest  // classifyHost pins an IPv6 literal as the canonical rendering of its bytes
