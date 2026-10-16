@@ -116,20 +116,13 @@ void serveStdio(McpServer server, string delegate() @safe readLine,
 			return;
 		tickerStarted = true;
 		runTask(() nothrow{
-			import vibe.core.core : sleep;
 			import core.time : seconds;
 			import mcp.server.event_store : nowUnixMs;
 
-			while (!readLoopDone)
-			{
-				try
-				{
-					sleep(1.seconds);
-					server.tickStdioEventStreams(nowUnixMs());
-				}
-				catch (Exception)
-					break;
-			}
+			runTicker(() @safe => server.tickStdioEventStreams(nowUnixMs()),
+				() @safe nothrow => readLoopDone, (string msg) @safe nothrow{
+				channel.reportError(msg);
+			}, 1.seconds);
 		});
 	}
 
@@ -344,6 +337,49 @@ void serveStdio(McpServer server, string delegate() @safe readLine,
 	// until every dispatched handler task has finished, bounded by
 	// `opts.drainTimeout` so a stuck handler cannot hold the process open forever.
 	inflight.awaitIdle(opts.drainTimeout);
+}
+
+/// Call `tick` every `period` until `done` reports true. A tick that throws is
+/// passed to `report` and the next tick still runs, so one failure does not
+/// stop every later poll and heartbeat.
+private void runTicker(void delegate() @safe tick, bool delegate() @safe nothrow done,
+		void delegate(string) @safe nothrow report, Duration period) @safe nothrow
+{
+	import vibe.core.core : sleep;
+
+	while (!done())
+	{
+		try
+			sleep(period);
+		catch (Exception)
+			break; // interrupted: the task is being torn down
+		try
+			tick();
+		catch (Exception e)
+			report("events ticker: " ~ e.msg);
+	}
+}
+
+unittest  // runTicker reports a failing tick and keeps ticking
+{
+	import core.time : msecs;
+	import vibe.core.core : runTask, runEventLoop, exitEventLoop;
+
+	int ticks;
+	string[] reports;
+	runTask(() nothrow{
+		scope (exit)
+			exitEventLoop();
+		runTicker(() @safe {
+			if (++ticks == 1)
+				throw new Exception("boom");
+		}, () @safe nothrow => ticks >= 3, (string msg) @safe nothrow{
+			reports ~= msg;
+		}, 1.msecs);
+	});
+	runEventLoop();
+	assert(ticks == 3, "a failing tick does not stop the ticker");
+	assert(reports.length == 1 && reports[0] == "events ticker: boom");
 }
 
 /// An inbound request, or a batch line (`batch` non-null), admitted for handling
