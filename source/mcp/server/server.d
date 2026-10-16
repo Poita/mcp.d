@@ -2180,9 +2180,11 @@ final class McpServer : ServerCore
 	/// Dispatch a single parsed message. Returns the JSON-RPC response for
 	/// requests, or `Nullable.init` for notifications (which get no reply).
 	/// `ctx` is the channel for any server->client traffic the handler emits;
-	/// when omitted, a `NullContext` is used (no streaming).
+	/// when omitted or `null`, a `NullContext` is used (no streaming).
 	Nullable!Json handle(Message msg, RequestContext ctx) @safe
 	{
+		if (ctx is null)
+			ctx = new NullContext;
 		final switch (msg.kind)
 		{
 		case MessageKind.request:
@@ -10600,7 +10602,7 @@ unittest  // setListCacheHint configures the modern resources/directory/read fre
 	s.registerResource(r, () @safe => ResourceContents.makeText("s://d/a", "text/plain", "x"));
 	s.setListCacheHint("resources/directory/read", CacheHint(30.seconds));
 	auto res = s.handle(modernReq(1, "resources/directory/read", Json([
-				"uri": Json("s://d")
+		"uri": Json("s://d")
 	]))).get;
 	assert(res["result"]["ttlMs"].get!long == 30_000, res.toString);
 }
@@ -13525,4 +13527,21 @@ unittest  // prompts/get rejects a non-string argument value with -32602
 	assert("error" in resp, resp.toString);
 	assert(resp["error"]["code"].get!int == ErrorCode.invalidParams);
 	assert(!ran);
+}
+
+unittest  // handle with a null context dispatches as with a NullContext
+{
+	auto s = McpServer.stateless("t", "1");
+	Tool t = {name: "noisy"};
+	s.enableLogging();
+	s.registerTool(t, (Json, RequestContext ctx) @safe {
+		ctx.log(LogLevel.error, "e");
+		ctx.reportProgress(1, 2);
+		return CallToolResult.text(ctx.isCancelled ? "cancelled" : "ok");
+	});
+	Json params = Json.emptyObject;
+	params["name"] = "noisy";
+	auto resp = s.handle(Message(makeRequest(Json(1), "tools/call", params)), null).get;
+	assert(resp["result"]["content"][0]["text"].get!string == "ok", resp.toString);
+	assert(s.handle(Message(makeNotification("notifications/initialized")), null).isNull);
 }

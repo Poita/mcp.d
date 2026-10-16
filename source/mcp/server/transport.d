@@ -62,9 +62,9 @@ interface ServerCore
 	/// `Mcp-Session-Id`, `stateless` never does.
 	ServerMode mode() const @safe;
 
-	/// Dispatch one parsed message against `ctx` (the server->client channel).
-	/// Returns the JSON-RPC response for a request, or `Nullable.init` for a
-	/// notification.
+	/// Dispatch one parsed message against `ctx` (the server->client channel;
+	/// `null` means a `NullContext`). Returns the JSON-RPC response for a
+	/// request, or `Nullable.init` for a notification.
 	Nullable!Json handle(Message msg, RequestContext ctx) @safe;
 
 	/// `handle` with a `NullContext` (no server->client channel).
