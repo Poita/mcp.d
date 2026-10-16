@@ -114,6 +114,7 @@ final class EmitBuffer
 	private Entry[][string] byName_;
 	private long[string] evictedThrough_; // name -> highest sequence evicted for it
 	private long seqCounter_;
+	version (unittest) private size_t visited_; // entries a read has examined
 	private EmitBufferOptions opts_;
 
 	/// Injectable clock (ms since epoch) so tests can drive eviction by age.
@@ -203,11 +204,28 @@ final class EmitBuffer
 		const hasFloor = !maxAgeMs.isNull;
 		const floorMs = hasFloor ? (nowMs() - maxAgeMs.get) : 0;
 
-		EventOccurrence[] selected;
-		foreach (const ref e; entries)
+		// Entries are in sequence order: start at the first one after the cursor,
+		// and stop once one more than the cap is selected (enough to know there
+		// is more), so a read costs its batch rather than the whole buffer.
+		size_t lo = 0, hi = entries.length;
+		while (lo < hi)
 		{
-			if (e.seq <= fromSeq)
-				continue;
+			const mid = lo + (hi - lo) / 2;
+			version (unittest)
+				visited_++;
+			if (entries[mid].seq <= fromSeq)
+				lo = mid + 1;
+			else
+				hi = mid;
+		}
+		const capped = !maxEvents.isNull && maxEvents.get >= 1;
+		EventOccurrence[] selected;
+		foreach (const ref e; entries[lo .. $])
+		{
+			version (unittest)
+				visited_++;
+			if (capped && selected.length > maxEvents.get)
+				break;
 			if (hasFloor && e.atMs < floorMs)
 			{
 				// An event newer than the cursor but older than the floor is
@@ -229,7 +247,7 @@ final class EmitBuffer
 		bool hasMore;
 		// A non-positive cap is treated as no cap: capping to zero would drop the whole
 		// batch yet still advance the cursor, silently losing the window.
-		if (!maxEvents.isNull && maxEvents.get >= 1 && selected.length > maxEvents.get)
+		if (capped && selected.length > maxEvents.get)
 		{
 			selected = selected[0 .. cast(size_t) maxEvents.get];
 			hasMore = true;
@@ -1134,6 +1152,27 @@ unittest  // EmitBuffer maxAgeMs floor skips too-old events and flags truncation
 	auto r = buf.readSince("n", nullable(start), nullable(300_000L), Nullable!long.init);
 	assert(r.truncated);
 	assert(r.events.length == 1 && r.events[0].eventId == "new");
+}
+
+unittest  // EmitBuffer reads visit only the entries after the cursor, up to the cap
+{
+	auto buf = new EmitBuffer(EmitBufferOptions(10.minutes, 0));
+	const start = buf.headCursor();
+	string near;
+	foreach (i; 0 .. 5000)
+	{
+		const c = buf.append("n", EventOccurrence("e", "n", "t"));
+		if (i == 4989)
+			near = c;
+	}
+	buf.visited_ = 0;
+	auto tail = buf.readSince("n", nullable(near), Nullable!long.init, Nullable!long.init);
+	assert(tail.events.length == 10);
+	assert(buf.visited_ <= 40);
+	buf.visited_ = 0;
+	auto head = buf.readSince("n", nullable(start), Nullable!long.init, nullable(10L));
+	assert(head.events.length == 10 && head.hasMore);
+	assert(buf.visited_ <= 40);
 }
 
 unittest  // EmitBuffer evicts by maxEvents so the buffer stays bounded
