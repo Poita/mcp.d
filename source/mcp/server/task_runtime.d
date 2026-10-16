@@ -636,8 +636,9 @@ final class TaskRuntime
 	/// is recorded but leaves the task `input_required`. Throws `-32602` when
 	/// `inputResponses` is not a non-empty object, when the task is unknown, when
 	/// it is already terminal (no executor will ever read the answers), or when
-	/// any key is not among the task's current `inputRequests` (nothing is
-	/// recorded then; `data.keys` lists them).
+	/// any key is not among the task's current `inputRequests`, or when an
+	/// accepted form elicitation's `content` violates its `requestedSchema`
+	/// (nothing is recorded then; `data.keys` lists the offending keys).
 	bool deliverInput(string id, Json inputResponses) @safe
 	{
 		import mcp.protocol.errors : invalidParams;
@@ -670,6 +671,25 @@ final class TaskRuntime
 				throw new McpException(ErrorCode.invalidParams,
 					"Task has not requested input for: " ~ unrequested.join(", "), data);
 			}
+			string[] invalid;
+			string reasons;
+			foreach (k, v; inputResponses.byKeyValue)
+			{
+				const why = elicitationContentError(r.inputRequests[k], v);
+				if (why.length)
+				{
+					invalid ~= k;
+					reasons ~= (reasons.length ? "; " : "") ~ k ~ ": " ~ why;
+				}
+			}
+			if (invalid.length)
+			{
+				Json data = Json.emptyObject;
+				data["taskId"] = id;
+				data["keys"] = serializeToJson(invalid);
+				throw new McpException(ErrorCode.invalidParams,
+					"Input does not match the requested schema: " ~ reasons, data);
+			}
 			foreach (k, v; inputResponses.byKeyValue)
 				r.inputResponses[k] = v;
 			if (r.toolName.length == 0 || r.meta.status != TaskStatus.inputRequired)
@@ -684,6 +704,30 @@ final class TaskRuntime
 			return Change.status;
 		});
 		return resumed;
+	}
+
+	/// Why `answer` does not satisfy the form elicitation `request`, or "" when
+	/// it does or nothing can be checked. Only accepted form answers carry
+	/// `content`, which must conform to the request's `requestedSchema`; a
+	/// rejected answer is refused at `tasks/update`, so the client can correct
+	/// it instead of the executor failing on it.
+	private static string elicitationContentError(Json request, Json answer) @safe
+	{
+		import mcp.protocol.schema : validateAgainstSchema;
+
+		if (request.type != Json.Type.object || answer.type != Json.Type.object)
+			return "";
+		auto method = "method" in request;
+		auto params = "params" in request;
+		if (method is null || *method != Json("elicitation/create")
+				|| params is null || params.type != Json.Type.object)
+			return "";
+		auto schema = "requestedSchema" in *params;
+		auto action = "action" in answer;
+		if (schema is null || action is null || *action != Json("accept"))
+			return "";
+		auto content = "content" in answer;
+		return validateAgainstSchema(content is null ? Json.emptyObject : *content, *schema);
 	}
 
 	/// The stored record for `id`, or null when unknown or expired.
@@ -1288,6 +1332,62 @@ unittest  // deliverInput rejects a key the task has not requested and records n
 	assert(rt.takenInput(t.taskId).length == 0);
 	rt.deliverInput(t.taskId, Json(["a": Json(1)]));
 	assert(rt.takenInput(t.taskId)["a"].get!int == 1);
+}
+
+unittest  // deliverInput rejects accepted elicitation content that violates the requested schema
+{
+	import std.exception : collectException;
+
+	auto rt = new TaskRuntime(TaskOptions.init);
+	auto t = rt.createFor("gate", Json.undefined);
+	Json schema = Json([
+		"type": Json("object"),
+		"properties": Json(["n": Json(["type": Json("integer")])]),
+		"required": Json([Json("n")])
+	]);
+	rt.requireInput(t.taskId, Json([
+		"q": Json([
+			"method": Json("elicitation/create"),
+			"params": Json(["message": Json("n?"), "requestedSchema": schema])
+		])
+	]));
+	auto bad = Json([
+		"q": Json([
+			"action": Json("accept"),
+			"content": Json(["n": Json("abc")])
+		])
+	]);
+	auto ex = cast(McpException) collectException(rt.deliverInput(t.taskId, bad));
+	assert(ex !is null && ex.code == ErrorCode.invalidParams);
+	assert(ex.data["keys"][0].get!string == "q");
+	assert(rt.takenInput(t.taskId).length == 0);
+	assert(rt.statusOf(t.taskId).get == TaskStatus.inputRequired);
+
+	auto good = Json([
+		"q": Json(["action": Json("accept"), "content": Json(["n": Json(3)])])
+	]);
+	assert(rt.deliverInput(t.taskId, good));
+}
+
+unittest  // deliverInput accepts a declined elicitation without checking its content
+{
+	auto rt = new TaskRuntime(TaskOptions.init);
+	auto t = rt.createFor("gate", Json.undefined);
+	rt.requireInput(t.taskId, Json([
+		"q": Json([
+			"method": Json("elicitation/create"),
+			"params": Json([
+				"message": Json("n?"),
+				"requestedSchema": Json([
+					"type": Json("object"),
+					"required": Json([Json("n")])
+				])
+			])
+		])
+	]));
+	assert(rt.deliverInput(t.taskId, Json([
+				"q": Json(["action": Json("decline")])
+	])));
 }
 
 unittest  // progress, requireInput, and resumeWorking leave a terminal task untouched

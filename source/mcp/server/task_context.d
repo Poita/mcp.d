@@ -115,10 +115,17 @@ struct TaskContext
 		return Json.undefined;
 	}
 
-	/// The delivered answer for `key`, decoded as `T`.
+	/// The delivered answer for `key`, decoded as `T`. Throws -32602 (with the
+	/// key in `data.key`) when the answer does not decode as `T`: the client
+	/// supplied it, so the failure is reported as bad input, not a server fault.
 	T inputAs(T)(string key) @safe
 	{
-		return deserializeJson!T(input(key));
+		try
+			return deserializeJson!T(input(key));
+		catch (Exception e)
+			throw new McpException(ErrorCode.invalidParams,
+					"input '" ~ key ~ "' is not a valid " ~ T.stringof ~ ": " ~ e.msg,
+					Json(["key": Json(key)]));
 	}
 
 	/// Persist a checkpoint value under `key` so it survives a suspension and is
@@ -908,6 +915,30 @@ unittest  // an executor's input and checkpoint reads share one store read per d
 		return Json(["content": Json.emptyArray]);
 	});
 	assert(rt.getDetailed(t.taskId)["status"].get!string == "completed");
+}
+
+unittest  // an answer that does not decode as the requested type fails the task with -32602 naming the key
+{
+	import mcp.server.task_runtime : TaskOptions;
+
+	auto rt = new TaskRuntime(TaskOptions.init);
+	auto t = rt.createFor("typed", Json.undefined);
+	TaskExecutor exec = (TaskContext tc) @safe {
+		if (!tc.hasInput("n"))
+			return tc.requireInput([
+				InputRequest("n", "roots", Json.emptyObject)
+		]);
+		return Json([
+			"structuredContent": Json(["n": Json(tc.inputAs!int("n"))])
+		]);
+	};
+	runTaskExecutor(rt, t.taskId, exec);
+	rt.deliverInput(t.taskId, Json(["n": Json("abc")]));
+	runTaskExecutor(rt, t.taskId, exec);
+	auto d = rt.getDetailed(t.taskId);
+	assert(d["status"].get!string == "failed");
+	assert(d["error"]["code"].get!int == cast(int) ErrorCode.invalidParams);
+	assert(d["error"]["data"]["key"].get!string == "n");
 }
 
 unittest  // an inline executor forwards its request's cancellation to the task only once
