@@ -9304,7 +9304,7 @@ unittest  // a synchronous task-tool call is not refused by the unsettled-task c
 	desc.name = "noop";
 	desc.inputSchema = Json(["type": Json("object")]);
 	s.registerTaskTool(desc, (TaskContext tc) @safe => Json([
-			"content": Json.emptyArray
+		"content": Json.emptyArray
 	]));
 	auto resp = s.handle(modernReqNoTasks(1, "tools/call",
 			Json(["name": Json("noop"), "arguments": Json.emptyObject]))).get;
@@ -13552,4 +13552,14 @@ unittest  // handle with a null context dispatches as with a NullContext
 	auto resp = s.handle(Message(makeRequest(Json(1), "tools/call", params)), null).get;
 	assert(resp["result"]["content"][0]["text"].get!string == "ok", resp.toString);
 	assert(s.handle(Message(makeNotification("notifications/initialized")), null).isNull);
+}
+
+unittest  // a push stream's subscription state is read-only outside the events runtime
+{
+	import mcp.server.events_runtime : PushStream;
+
+	static assert(!__traits(compiles, (PushStream s) { s.terminated = true; }));
+	static assert(!__traits(compiles, (PushStream s) { s.cursor = "c"; }));
+	static assert(!__traits(compiles, (PushStream s) { s.name = "n"; }));
+	static assert(__traits(compiles, (PushStream s) => s.terminated && s.cursor.isNull));
 }

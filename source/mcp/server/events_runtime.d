@@ -559,15 +559,59 @@ private enum long verifyBackoffCapMs = 30 * 60 * 1000;
 /// the subscription id) on the stream.
 final class PushStream
 {
-	string name;
-	Json arguments;
-	string principal;
-	Json subscriptionId; /// the events/stream request's JSON-RPC id
-	Nullable!string cursor; /// last position delivered on this stream
-	long lastHeartbeatMs; /// when a heartbeat was last sent (used by the stdio ticker)
-	void delegate(string method, Json taggedParams) @safe deliver;
-	bool terminated; /// set once the server ended the stream (`terminatePush`)
+	long lastHeartbeatMs; /// when a heartbeat was last sent (owned by the stdio ticker)
 	void delegate() @safe onTerminated; /// transport hook run after the terminated frame: write the final result, drop the stream
+	private string name_;
+	private Json arguments_;
+	private string principal_;
+	private Json subscriptionId_;
+	private Nullable!string cursor_;
+	private void delegate(string method, Json taggedParams) @safe deliver_;
+	private bool terminated_;
+
+	/// The subscribed event type.
+	string name() const @safe nothrow
+	{
+		return name_;
+	}
+
+	/// The subscription arguments.
+	Json arguments() @safe nothrow
+	{
+		return arguments_;
+	}
+
+	/// The principal that opened the stream ("" if unauthenticated).
+	string principal() const @safe nothrow
+	{
+		return principal_;
+	}
+
+	/// The events/stream request's JSON-RPC id.
+	Json subscriptionId() @safe nothrow
+	{
+		return subscriptionId_;
+	}
+
+	/// The last position delivered on this stream.
+	Nullable!string cursor() const @safe nothrow
+	{
+		return cursor_;
+	}
+
+	/// Whether the server ended the stream (`EventsRuntime.terminatePush`).
+	bool terminated() const @safe nothrow
+	{
+		return terminated_;
+	}
+
+	/// Write a `notifications/events/*` frame (already tagged with the
+	/// subscription id) through the transport's sink.
+	void deliver(string method, Json taggedParams) @safe
+	{
+		deliver_(method, taggedParams);
+	}
+
 	private bool started_; // `startPushStream` has written the leading frames; live events flow
 	private EventOccurrence[] pending_; // live events not yet written, in arrival order
 	private bool writerScheduled_; // a writer is draining (or about to drain) `pending_`
@@ -1216,11 +1260,11 @@ final class EventsRuntime
 		validateArguments(*p, arguments);
 
 		auto s = new PushStream();
-		s.name = name;
-		s.arguments = (arguments.type == Json.Type.object) ? arguments : Json.emptyObject;
-		s.principal = principal;
-		s.subscriptionId = subscriptionId;
-		s.deliver = deliver;
+		s.name_ = name;
+		s.arguments_ = (arguments.type == Json.Type.object) ? arguments : Json.emptyObject;
+		s.principal_ = principal;
+		s.subscriptionId_ = subscriptionId;
+		s.deliver_ = deliver;
 		if (regIsEmitOnly(p))
 			s.openHead_ = buffer_.headCursor();
 		// on_subscribe runs first: when it throws, no stream is left registered.
@@ -1271,7 +1315,7 @@ final class EventsRuntime
 			foreach (ev; first.events)
 				s.deliver(eventsEventNotification,
 						withSubscriptionId(ev.toJson(), s.subscriptionId));
-		s.cursor = read && !first.cursor.isNull ? first.cursor : cursor;
+		s.cursor_ = read && !first.cursor.isNull ? first.cursor : cursor;
 		bool hasMore = read && first.hasMore;
 		if (regIsEmitOnly(reg))
 		{
@@ -1292,7 +1336,7 @@ final class EventsRuntime
 				const advanced = !page.cursor.isNull && (s.cursor.isNull
 						|| page.cursor.get != s.cursor.get);
 				if (!page.cursor.isNull)
-					s.cursor = page.cursor;
+					s.cursor_ = page.cursor;
 				hasMore = page.hasMore && advanced;
 			}
 			hasMore = false;
@@ -1397,7 +1441,7 @@ final class EventsRuntime
 		foreach (ev; r.events)
 			s.deliver(eventsEventNotification, withSubscriptionId(ev.toJson(), s.subscriptionId));
 		if (!r.cursor.isNull)
-			s.cursor = r.cursor;
+			s.cursor_ = r.cursor;
 		return r.hasMore;
 	}
 
@@ -1420,7 +1464,7 @@ final class EventsRuntime
 	{
 		if (s.terminated)
 			return;
-		s.terminated = true;
+		s.terminated_ = true;
 		try
 			s.deliver(eventsTerminatedNotification,
 					withSubscriptionId(terminatedParams(error), s.subscriptionId));
@@ -2384,7 +2428,7 @@ final class EventsRuntime
 		// ticker resumes that check() from s.cursor — so leave s.cursor for the
 		// ticker's poll() to advance from check results.
 		if (regIsEmitOnly(reg) && !shaped.cursor.isNull)
-			s.cursor = shaped.cursor;
+			s.cursor_ = shaped.cursor;
 		auto params = withSubscriptionId(shaped.toJson(), s.subscriptionId);
 		s.deliver(eventsEventNotification, params);
 	}
@@ -5000,7 +5044,7 @@ unittest  // emit does not pollute a check-backed type's push-stream cursor with
 	auto handle = openLive(rt, "email.received", Json.emptyObject, "u",
 			Json(1), (string m, Json p) @safe {});
 	// Seed the stream with the author's own cursor, as the leading poll would.
-	handle.stream.cursor = nullable("c-author");
+	handle.stream.cursor_ = nullable("c-author");
 	rt.emit(EventOccurrence("e1", "email.received", "t"));
 	// The stream cursor must still be the author cursor, never a numeric buffer seq,
 	// so the stdio ticker resumes the author's check() correctly.
@@ -8375,7 +8419,7 @@ unittest  // a push stream advance is batch-capped and reports when more remain
 		if (m == eventsEventNotification)
 			delivered++;
 	});
-	handle.stream.cursor = "c0";
+	handle.stream.cursor_ = "c0";
 	assert(rt.advancePushStream(handle.stream));
 	assert(delivered == 2);
 	assert(rt.advancePushStream(handle.stream));
