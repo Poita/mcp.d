@@ -1375,7 +1375,7 @@ final class McpServer : ServerCore
 		auto exec = name in taskExecutors_;
 		TaskCreateOptions copts;
 		copts.owner = requestPrincipal(ctx);
-		auto seed = taskRuntime_.createFor(name, args, copts);
+		auto seed = taskRuntime_.createForRequest(name, args, copts);
 		// The client never learns this task's id, so the record dies with the call
 		// and its status changes are not pushed as notifications/tasks.
 		taskRuntime_.setSilent(seed.taskId, true);
@@ -9232,6 +9232,25 @@ unittest  // a synchronous task-tool call leaves no task record behind
 			Json(["name": Json("boom"), "arguments": Json.emptyObject]))).get;
 	assert("error" in failed);
 	assert(s.tasks.store.get("inline-1").isNull);
+}
+
+unittest  // a synchronous task-tool call is not refused by the unsettled-task cap
+{
+	auto o = syncTasks();
+	o.maxUnsettledAnonymous = 1;
+	auto s = new McpServer("t", "1");
+	s.enableTasks(o);
+	s.tasks.create();
+	Tool desc;
+	desc.name = "noop";
+	desc.inputSchema = Json(["type": Json("object")]);
+	s.registerTaskTool(desc, (TaskContext tc) @safe => Json([
+			"content": Json.emptyArray
+	]));
+	auto resp = s.handle(modernReqNoTasks(1, "tools/call",
+			Json(["name": Json("noop"), "arguments": Json.emptyObject]))).get;
+	assert("result" in resp);
+	assert("isError" !in resp["result"] || !resp["result"]["isError"].get!bool);
 }
 
 unittest  // a task tool that requires the extension rejects a client without it with -32021

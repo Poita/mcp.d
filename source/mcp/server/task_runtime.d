@@ -175,11 +175,26 @@ final class TaskRuntime
 	Task createFor(string toolName, Json executorInput,
 			TaskCreateOptions opts = TaskCreateOptions.init) @safe
 	{
+		enforceUnsettledCap(opts.owner);
+		return insertTask(toolName, executorInput, opts);
+	}
+
+	/// `createFor` exempt from the unsettled-task caps, for the record backing a
+	/// synchronous call: it lives only as long as the request that creates it,
+	/// so it pins nothing beyond that request, and a client that never sees
+	/// tasks must not be refused for a task limit.
+	package(mcp) Task createForRequest(string toolName, Json executorInput,
+			TaskCreateOptions opts = TaskCreateOptions.init) @safe
+	{
+		return insertTask(toolName, executorInput, opts);
+	}
+
+	private Task insertTask(string toolName, Json executorInput, TaskCreateOptions opts) @safe
+	{
 		const ttlDur = opts.ttl.isNull ? opts_.defaultTtl : opts.ttl.get;
 		const pollDur = opts.pollInterval.isNull ? opts_.defaultPollInterval : opts
 			.pollInterval.get;
 		validateTiming(ttlDur, pollDur);
-		enforceUnsettledCap(opts.owner);
 
 		TaskRecord r;
 		r.meta.status = TaskStatus.working;
