@@ -134,6 +134,10 @@ final class WebhookReceiver
 	/// or for a retry of a delivery whose callback is still running (the server
 	/// retries again, and that retry is acknowledged or routed depending on how
 	/// the first copy finished).
+	///
+	/// An exception thrown by the subscription's `onEvent`/`onControl` callback
+	/// propagates out of this call, and the delivery is not recorded as seen:
+	/// the HTTP adapter should answer it with a 5xx so the server retries it.
 	ReceiverResponse processDelivery(string body, string[string] headers) @safe
 	{
 		const subId = headerGet(headers, "x-mcp-subscription-id");
