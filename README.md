@@ -735,7 +735,7 @@ is predictable when porting a hand-built server):
 | `V[string]` | `{"type": "object", "additionalProperties": <V>}` |
 | `struct` | `{"type": "object", "properties": …, "required": […]}`, keyed by the serialized field name (vibe's `@name`, else the field name minus one trailing `_`); a `Nullable`, vibe-`@optional`, or defaulted field (an initializer differing from the type's `.init`, which an input schema also advertises as its `"default"`) is not required, and `@allOptional` on the struct makes every field optional |
 | `Json` | `{}` (any JSON value) |
-| `std.datetime` `SysTime` / `Date` | `{"type": "string", "format": "date-time"/"date"}` |
+| `std.datetime` `SysTime` / `Date` | `{"type": "string", "format": "date-time"/"date"}`; a `SysTime` argument must carry a UTC offset (`Z` or `+hh:mm`), as RFC 3339 requires |
 | `std.datetime` `DateTime` / `TimeOfDay` | `{"type": "string", "pattern": …}` matching `YYYY-MM-DDTHH:MM:SS` / `HH:MM:SS` (no UTC offset, so not the RFC 3339 `date-time`/`time` formats) |
 | `SumType!(A, B, …)` | `{"anyOf": [<A>, <B>, …]}`; an argument binds to the member its JSON type natively matches (an integer to `int` over `double`), else the first member that accepts it; a result is written as the value it holds |
 | `Nullable!T` (tool parameter / input field) | `<T>` widened to admit `null` (`"type": [<T's type>, "null"]`, plus `null` in an `enum`), made optional by omission from `required`; an explicit `null` binds as unset |

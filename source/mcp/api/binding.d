@@ -914,6 +914,7 @@ private T bindLeaf(T)(Json v, string path)
 	import std.conv : to;
 	import vibe.data.json : JsonSerializer;
 	import vibe.data.serialization : deserializeWithPolicy;
+	import std.datetime.systime : SysTime;
 
 	static if (is(T == enum))
 	{
@@ -926,6 +927,16 @@ private T bindLeaf(T)(Json v, string path)
 		static foreach (i, m; __traits(allMembers, T))
 			names ~= (i ? ", " : "") ~ `"` ~ m ~ `"`;
 		throw new BindException(located(path, "expected one of " ~ names ~ ", got " ~ v.toString));
+	}
+	else static if (is(T == SysTime))
+	{
+		// The schema advertises an RFC 3339 `date-time`, which carries an offset;
+		// without one, vibe would read the time in the server's local zone.
+		if (v.type != Json.Type.string)
+			throw new BindException(located(path, "expected a string, got " ~ jsonTypeName(v)));
+		if (!hasUtcOffset(v.get!string))
+			throw new BindException(located(path,
+					"expected a date-time with a UTC offset (Z or +hh:mm), got " ~ v.toString));
 	}
 	else static if (is(T == bool))
 	{
@@ -1003,6 +1014,21 @@ private T bindLeaf(T)(Json v, string path)
 		return deserializeWithPolicy!(JsonSerializer, EnumByNamePolicy, T)(v);
 	catch (Exception e)
 		throw new BindException(located(path, e.msg));
+}
+
+/// Whether the ISO 8601 date-time `s` ends its time with a UTC offset: `Z`, or
+/// a `+` / `-` after the `T` separating date from time.
+private bool hasUtcOffset(string s) @safe pure nothrow
+{
+	import std.string : indexOf;
+
+	const t = s.indexOf('T');
+	if (t < 0)
+		return false;
+	const time = s[t + 1 .. $];
+	if (time.length && (time[$ - 1] == 'Z' || time[$ - 1] == 'z'))
+		return true;
+	return time.indexOf('+') >= 0 || time.indexOf('-') >= 0;
 }
 
 /// How a JSON value's type reads in an error message: "a string", "an array".
@@ -1828,4 +1854,17 @@ unittest  // a struct whose default construction is disabled cannot be bound fro
 	}
 
 	static assert(unsupportedTypeReason!(NoDefault, SchemaUse.input)().length);
+}
+
+unittest  // a SysTime binds only from a date-time carrying a UTC offset
+{
+	import std.datetime.systime : SysTime;
+	import std.datetime.timezone : UTC;
+	import std.exception : collectException;
+
+	assert(bindJson!SysTime(Json("2024-01-01T10:00:00Z")) == SysTime.fromISOExtString(
+			"2024-01-01T10:00:00Z"));
+	assert(bindJson!SysTime(Json("2024-01-01T10:00:00.5+02:00")).toUTC.hour == 8);
+	assert(collectException!BindException(bindJson!SysTime(Json("2024-01-01T10:00:00"))));
+	assert(collectException!BindException(bindJson!SysTime(Json("2024-01-01T10:00:00.25"))));
 }
