@@ -1627,21 +1627,28 @@ private bool formDecodes(string form) @safe
 }
 
 /// Extract a single field value from an `application/x-www-form-urlencoded`
-/// body (the field is URL-decoded). Returns "" when absent.
+/// body. Names and values are both URL-decoded, so a percent-encoded name
+/// matches, as it does in `formDecodes`. Returns "" when absent.
 private string formField(string form, string name) @safe
 {
 	import std.array : replace, split;
 	import std.uri : decodeComponent;
+
+	// RFC 1866 §8.2.1 and the HTML Living Standard §4.10.21.6 define '+' as a
+	// space in application/x-www-form-urlencoded; it is replaced before
+	// decodeComponent, which handles %xx sequences.
+	string decode(string s) @safe
+	{
+		return decodeComponent(s.replace("+", " "));
+	}
 
 	foreach (pair; form.split("&"))
 	{
 		const eq = pair.indexOf('=');
 		if (eq < 0)
 			continue;
-		if (pair[0 .. eq] == name) // RFC 1866 §8.2.1 and the HTML Living Standard §4.10.21.6 define
-			// '+' as a space in application/x-www-form-urlencoded values; replace
-			// it before passing to decodeComponent, which handles %xx sequences.
-			return decodeComponent(pair[eq + 1 .. $].replace("+", " "));
+		if (decode(pair[0 .. eq]) == name)
+			return decode(pair[eq + 1 .. $]);
 	}
 	return "";
 }
@@ -2024,6 +2031,12 @@ unittest  // the /token dispatch reads grant_type + refresh_token from a refresh
 	assert(formField(form, "refresh_token") == "RT-123");
 	// authorization_code-only fields are absent on a refresh request.
 	assert(formField(form, "code") == "");
+}
+
+unittest  // formField matches a percent-encoded parameter name by its decoded form
+{
+	assert(formField("grant_type=authorization_code&code%5Fverifier=V", "code_verifier") == "V");
+	assert(formField("redirect+uri=x&redirect_uri=y", "redirect_uri") == "y");
 }
 
 unittest  // pathOf strips scheme+host, leaving the path the routes register on
