@@ -1631,9 +1631,22 @@ final class HttpClientTransport : ClientTransport
 			PostRequest req = slot is null ? null : *slot;
 			if (req !is null)
 				req.inHandler++;
+			// The notification runs on the task that holds this request's in-flight
+			// permit, so a request its handler issues skips the cap rather than
+			// waiting for a permit only this task can release.
+			auto self = Task.getThis();
+			handlerTasks ~= self;
 			scope (exit)
+			{
+				import std.algorithm.mutation : remove;
+				import std.algorithm.searching : countUntil;
+
 				if (req !is null)
 					req.inHandler--;
+				const i = handlerTasks.countUntil(self);
+				if (i >= 0)
+					handlerTasks = handlerTasks.remove(i);
+			}
 			dispatch(msg, InboundOrigin.of(expectId));
 			break;
 		}
@@ -4536,6 +4549,65 @@ unittest  // ClientSettings.reinitializeOnSessionExpiry starts a new session and
 	assert(tools == 0, "the request must succeed on the new session");
 	assert(srv.initializeSessionHeaders == ["", ""],
 			"the expiry must trigger one fresh initialize without a session id");
+}
+
+unittest  // with maxInFlight = 1 a notification callback on a request's stream can issue a request
+{
+	import core.time : msecs, MonoTime;
+	import vibe.core.core : sleep;
+	import mcp.client.client : McpClient, ClientSettings;
+
+	bool sawList, listedDuringCall;
+	auto router = new URLRouter;
+	router.post("/mcp", (HTTPServerRequest req, HTTPServerResponse res) @safe {
+		auto j = requestJson(req);
+		const method = ("method" in j) ? j["method"].get!string : "";
+		if (method == "initialize")
+		{
+			res.writeBody(initializeReply(j, "2025-11-25").toString(), "application/json");
+			return;
+		}
+		if (method == "tools/list")
+		{
+			sawList = true;
+			auto resp = parseJsonString(`{"jsonrpc":"2.0","result":{"tools":[]}}`);
+			resp["id"] = j["id"];
+			res.writeBody(resp.toString(), "application/json");
+			return;
+		}
+		if (method == "tools/call")
+		{
+			res.headers["Content-Type"] = "text/event-stream";
+			res.bodyWriter.write(
+				"data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/tools/list_changed\"}\n\n");
+			res.bodyWriter.flush();
+			const deadline = MonoTime.currTime + 1500.msecs;
+			while (!sawList && MonoTime.currTime < deadline)
+				sleep(10.msecs);
+			listedDuringCall = sawList;
+			auto resp = parseJsonString(`{"jsonrpc":"2.0","result":{"content":[]}}`);
+			resp["id"] = j["id"];
+			res.bodyWriter.write("data: " ~ resp.toString() ~ "\n\n");
+			return;
+		}
+		res.statusCode = 202;
+		res.writeBody("", "text/plain");
+	});
+
+	const failure = runAgainstFakeServer(router, (string url) @safe {
+		ClientSettings s;
+		s.maxInFlight = 1;
+		s.requestTimeout = 3.seconds;
+		auto client = McpClient.http(url, s);
+		scope (exit)
+			client.close();
+		client.initialize("2025-11-25");
+		client.onToolsListChanged = () @safe { client.listTools(); };
+		client.callTool("t");
+	});
+	assert(failure.length == 0, "scenario failed: " ~ failure);
+	assert(listedDuringCall,
+			"a request from a notification callback must not wait on its own stream's permit");
 }
 
 unittest  // concurrent requests that find the session expired share one re-initialize
