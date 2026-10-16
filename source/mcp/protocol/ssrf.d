@@ -347,7 +347,9 @@ private bool parseIpv6Literal(string s, out ubyte[16] outBytes) @safe pure nothr
 		const rn = parseHextets(right, rbuf[]);
 		if (rn < 0)
 			return false;
-		if (ln + rn > totalHextetBytes)
+		// "::" stands for one or more zero groups (RFC 4291 §2.2), so the
+		// explicit groups must leave at least one group for it.
+		if (ln + rn >= totalHextetBytes)
 			return false;
 		outBytes[] = 0;
 		outBytes[0 .. ln] = lbuf[0 .. ln];
@@ -1248,6 +1250,25 @@ unittest  // canonicalizeNumericIpv4 rejects non-numeric / malformed hosts
 	assert(!canonicalizeNumericIpv4("0x", oct)); // empty hex
 	assert(!canonicalizeNumericIpv4("1..2", oct)); // empty part
 	assert(!canonicalizeNumericIpv4("0192.168.0.1", oct)); // 9 is not an octal digit
+}
+
+unittest  // parseIpv6Literal rejects a `::` that stands for no zero group
+{
+	ubyte[16] b;
+	assert(!parseIpv6Literal("1:2:3:4:5:6:7::8", b));
+	assert(!parseIpv6Literal("::1:2:3:4:5:6:7:8", b));
+	assert(!parseIpv6Literal("1:2:3:4:5:6:7:8::", b));
+	assert(!parseIpv6Literal("1:2:3:4:5::6:1.2.3.4", b));
+	assert(parseIpv6Literal("1:2:3:4:5:6::8", b));
+	assert(parseIpv6Literal("1:2:3:4:5::1.2.3.4", b));
+	assert(parseIpv6Literal("::", b));
+}
+
+unittest  // classifyHost fails closed on a `::` that stands for no zero group
+{
+	string pin;
+	assert(classifyHost("[1:2:3:4:5:6:7::8]", pin) == AddressClass.privateOrLinkLocal);
+	assert(pin.length == 0);
 }
 
 unittest  // canonicalizeNumericIpv4 decodes the documented inet_aton forms
