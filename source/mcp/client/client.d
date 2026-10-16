@@ -489,8 +489,10 @@ struct EventClientSettings
 	/// The delivery modes this client is willing to use, in preference order.
 	/// `subscribeEvents` picks the first one the event type also advertises;
 	/// webhook additionally requires `webhook` to be configured. Remove a mode to
-	/// forbid it (e.g. drop `push` on a connection-capped deployment).
-	DeliveryMode[] preferredModes = [
+	/// forbid it (e.g. drop `push` on a connection-capped deployment). Assign a
+	/// new list to change it; the elements are read-only because the default
+	/// list is shared by every `EventClientSettings`.
+	const(DeliveryMode)[] preferredModes = [
 		DeliveryMode.webhook, DeliveryMode.push, DeliveryMode.poll
 	];
 
@@ -10600,6 +10602,18 @@ unittest  // selectDeliveryMode prefers webhook, then push, then poll among adve
 
 	EventType pollOnly = EventType(name: "t", delivery: [DeliveryMode.poll]);
 	assert(c.selectDeliveryMode(pollOnly) == DeliveryMode.poll);
+}
+
+unittest  // the default preferredModes cannot be modified in place through one settings value
+{
+	static assert(!__traits(compiles, () {
+			EventClientSettings es;
+			es.preferredModes[0] = DeliveryMode.poll;
+		}), "an element write would change the default every EventClientSettings shares");
+	EventClientSettings fresh;
+	assert(fresh.preferredModes == [
+		DeliveryMode.webhook, DeliveryMode.push, DeliveryMode.poll
+	]);
 }
 
 unittest  // a mode the client removed from preferredModes is never selected
