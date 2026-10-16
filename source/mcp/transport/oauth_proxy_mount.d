@@ -303,7 +303,11 @@ struct ProxyStateStoreOptions
 	/// (`ProxyAuthState.client`, the key `/authorize` is rate limited under);
 	/// 0 means unlimited. Past it, that client's oldest pending authorization
 	/// is dropped, so a client that sends no consent cookie cannot push out
-	/// other users' pending sign-ins.
+	/// other users' pending sign-ins. Behind a reverse proxy, without an
+	/// `OAuthProxyMountOptions.clientKey` derived from its forwarding header,
+	/// every user shares the proxy's key and so this one cap: set that key, or
+	/// raise this (or set it to `0`), there. A caller not connected over IP (a
+	/// Unix socket) has an empty key and is not capped.
 	size_t maxPerClient = 20;
 
 	/// Injectable monotonic clock (tests drive expiry with it). Null uses
@@ -527,7 +531,9 @@ struct OAuthProxyMountOptions
 	/// The key a request is rate limited under. Null uses the peer address,
 	/// with IPv6 peers grouped by `ipv6BucketPrefix`; behind a reverse proxy,
 	/// derive it from the forwarding header that proxy sets, or every user
-	/// shares one budget.
+	/// shares one budget and one `ProxyStateStoreOptions.maxPerClient` cap.
+	/// Callers not connected over IP (a Unix socket) all get the empty key, so
+	/// they share one budget too.
 	string delegate(scope HTTPServerRequest req) @safe clientKey;
 
 	/// The IPv6 prefix length, in bits, that the default `clientKey` groups
