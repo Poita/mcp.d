@@ -394,6 +394,7 @@ struct EventsOptions
 	/// with the defaults the effective lease is 500 seconds.
 	Duration deliveryLease = 1.minutes;
 	size_t deliveryLeaseBatch = 100; /// most jobs one drain claims from the queue, leaving the rest to other nodes and later passes (0 = unlimited)
+	size_t webhookMaxConcurrency = 64; /// most outbound webhook tasks (terminated-envelope posts) one node runs at once (0 = unlimited)
 	Duration webhookHttpTimeout = 10.seconds; /// per-attempt HTTP bound (default transport); also the worst-case-retry budget input
 	WebhookTransport webhookTransport; /// outbound HTTP (default SSRF-hardened); tests inject a fake
 	void delegate(void delegate() @safe job) @safe deliveryExecutor; /// runs a delivery (default: a fiber)
@@ -520,6 +521,14 @@ private struct WebhookRef
 	string principal;
 }
 
+/// A signed `terminated` envelope waiting to be posted to a callback.
+private struct TerminatePost
+{
+	string url;
+	string[string] headers;
+	string body;
+}
+
 /// The path of the receiver-published document that declares which paths under
 /// a callback origin accept MCP webhook deliveries.
 enum string wellKnownReceiverPath = "/.well-known/mcp-webhook-receiver.json";
@@ -638,6 +647,8 @@ final class EventsRuntime
 	private Nullable!string[string] emitBackfill_; // emit-only subscription id -> ring-buffer position its paged backfill has reached
 	private BackgroundLoop worker_; // the periodic worker `startDeliveryWorker` runs
 	private bool backlogged_; // the last drain claimed a full batch, so more may be ready
+	private TerminatePost[] terminatePosts_; // terminated envelopes waiting for a poster
+	private size_t terminatePosters_; // tasks posting terminated envelopes
 
 	this(WebhookSubscriptionStore webhookStore = null, EventsOptions opts = EventsOptions.init) @safe
 	{
@@ -3135,10 +3146,42 @@ final class EventsRuntime
 		const now = opts_.nowMs();
 		auto headers = signDeliveryHeaders(signingFor(sub,
 				controlMessageId("terminated"), now), body);
-		opts_.deliveryExecutor(() @safe {
-			postToCallback(sub.url, headers, body);
-		});
+		terminatePosts_ ~= TerminatePost(sub.url, headers, body);
+		pumpTerminatePosts();
 		removeWebhookState(sub);
+	}
+
+	// Start posters for the queued terminated envelopes, up to the node's
+	// concurrency bound; each poster drains the queue until it is empty.
+	private void pumpTerminatePosts() @safe
+	{
+		const cap = opts_.webhookMaxConcurrency;
+		while (terminatePosts_.length > terminatePosters_ && (cap == 0 || outboundTasks() < cap))
+		{
+			terminatePosters_++;
+			scope (failure)
+				terminatePosters_--;
+			opts_.deliveryExecutor(() @safe {
+				scope (exit)
+					terminatePosters_--;
+				while (terminatePosts_.length)
+				{
+					auto post = terminatePosts_[0];
+					terminatePosts_ = terminatePosts_[1 .. $];
+					try
+						postToCallback(post.url, post.headers, post.body);
+					catch (Exception e)
+						logEventsError("terminated envelope post threw", e);
+				}
+			});
+		}
+	}
+
+	// Outbound webhook tasks this node is running, counted against
+	// `webhookMaxConcurrency`.
+	private size_t outboundTasks() @safe
+	{
+		return terminatePosters_;
 	}
 
 	/// Atomically apply `mutate` to the stored subscription `id`: read it, let
@@ -9610,4 +9653,29 @@ unittest  // a delivery waiting out the verification backoff is held, not droppe
 	now += 6 * 60 * 1000;
 	rt.drainDeliveries();
 	assert(ft.eventPosts().length == 1, "the held delivery goes out once the endpoint verifies");
+}
+
+unittest  // terminating many webhook subscriptions posts their envelopes from a bounded set of tasks
+{
+	auto ft = new FakeWebhookTransport();
+	void delegate() @safe[] tasks;
+	EventsOptions o;
+	o.nowMs = () @safe => 1_000_000L;
+	o.nowIso = () @safe => "t";
+	o.allowPrivateCallbackHosts = true;
+	o.webhookTransport = ft;
+	o.callbackAllowlist = ["https://proxy/"];
+	o.webhookMaxConcurrency = 2;
+	o.deliveryExecutor = (void delegate() @safe job) @safe { tasks ~= job; };
+	auto rt = new EventsRuntime(null, o);
+	EventRegistration reg = {descriptor: EventType("n"), emitOnly: true};
+	rt.register(reg);
+	foreach (i; 0 .. 5)
+		rt.subscribeWebhook(webhookSub("n", "https://proxy/h" ~ i.to!string), "user-1");
+	rt.terminateEventType("n", Json(["code": Json(-32011)]));
+	assert(tasks.length == 2);
+	for (size_t i = 0; i < tasks.length; i++)
+		tasks[i]();
+	assert(tasks.length == 2);
+	assert(controlPostsOf(ft, "terminated").length == 5);
 }
