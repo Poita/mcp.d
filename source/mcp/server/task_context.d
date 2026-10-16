@@ -17,7 +17,9 @@ import mcp.server.task_runtime : TaskRuntime;
 /// top) once the answers arrive via `tasks/update`. Do not catch this in executor
 /// code; an executor that does anyway (e.g. with a blanket `catch (Exception)`)
 /// still ends the dispatch suspended, since the dispatcher also records the
-/// suspension on the `TaskContext`. It derives from `Exception` rather than
+/// suspension on the `TaskContext`. The code it keeps running may overlap a
+/// re-dispatch, so from then on the context's writes (`progress`,
+/// `checkpoint`, `requireInput`, `detach`) change nothing. It derives from `Exception` rather than
 /// `Throwable` so `finally` / `scope(exit)` cleanup in the executor always runs.
 final class TaskSuspended : Exception
 {
@@ -84,6 +86,8 @@ struct TaskContext
 	/// Set the task's human-readable status message (visible via `tasks/get`).
 	void progress(string statusMessage) @safe
 	{
+		if (unwound)
+			return;
 		rt_.progress(taskId_, statusMessage);
 	}
 
@@ -132,6 +136,8 @@ struct TaskContext
 	/// available when the executor is re-invoked.
 	void checkpoint(T)(string key, T value) @safe
 	{
+		if (unwound)
+			return;
 		auto j = serializeToJson(value);
 		rt_.putCheckpoint(taskId_, key, j);
 		snapshot().checkpoints[key] = j;
@@ -160,6 +166,8 @@ struct TaskContext
 	/// write `return tc.requireInput(...);` from a value-returning method.
 	noreturn requireInput(const(InputRequest)[] requests) @safe
 	{
+		if (unwound)
+			throw new TaskSuspended(taskId_);
 		rt_.requireInput(taskId_, inputRequestsToJson(requests));
 		if (outcome_ !is null)
 			outcome_.unwound = true;
@@ -188,6 +196,8 @@ struct TaskContext
 	/// a -32021 `McpException` naming the extension instead.
 	noreturn detach() @safe
 	{
+		if (unwound)
+			throw new TaskDetached(taskId_);
 		if (requestCancelled_ !is null)
 			throw tasksExtensionRequired("The tool finishes out of band, which requires the "
 					~ tasksExtensionKey ~ " extension");
@@ -195,6 +205,13 @@ struct TaskContext
 		if (outcome_ !is null)
 			outcome_.unwound = true;
 		throw new TaskDetached(taskId_);
+	}
+
+	/// Whether this dispatch already suspended or detached: the task no longer
+	/// belongs to it, so its writes are dropped.
+	private bool unwound() @safe
+	{
+		return outcome_ !is null && outcome_.unwound;
 	}
 
 	/// The task's durable input, delivered answers and checkpoints, read from the
@@ -224,7 +241,7 @@ struct TaskContext
 	/// on the next `tasks/get`).
 	noreturn detach(string statusMessage) @safe
 	{
-		rt_.progress(taskId_, statusMessage);
+		progress(statusMessage);
 		return detach();
 	}
 }
@@ -758,6 +775,34 @@ unittest  // an executor that swallows its suspension still leaves the task inpu
 	assert(rt.getDetailed(t.taskId)["status"].get!string == "input_required");
 }
 
+unittest  // an executor that swallows its suspension can no longer write to the task
+{
+	import mcp.server.task_runtime : TaskOptions;
+
+	auto rt = new TaskRuntime(TaskOptions.init);
+	auto t = rt.createFor("gate", Json.undefined);
+	runTaskExecutor(rt, t.taskId, (TaskContext tc) @safe {
+		try
+			tc.requireInput([InputRequest.elicitation("ok", "Proceed?")]);
+		catch (Exception)
+		{
+		}
+		tc.progress("still running");
+		tc.checkpoint("late", 1);
+		try
+			tc.requireInput([InputRequest.elicitation("other", "Other?")]);
+		catch (Exception)
+		{
+		}
+		return Json(["structuredContent": Json.emptyObject]);
+	});
+	auto d = rt.getDetailed(t.taskId);
+	assert(d["status"].get!string == "input_required");
+	assert("statusMessage" !in d);
+	assert("ok" in d["inputRequests"] && "other" !in d["inputRequests"]);
+	assert(rt.getCheckpoint(t.taskId, "late").type == Json.Type.undefined);
+}
+
 unittest  // an executor that swallows its detach leaves the task working
 {
 	import mcp.server.task_store : InMemoryTaskStore;
@@ -926,7 +971,7 @@ unittest  // an answer that does not decode as the requested type fails the task
 	TaskExecutor exec = (TaskContext tc) @safe {
 		if (!tc.hasInput("n"))
 			return tc.requireInput([
-				InputRequest("n", "roots", Json.emptyObject)
+			InputRequest("n", "roots", Json.emptyObject)
 		]);
 		return Json([
 			"structuredContent": Json(["n": Json(tc.inputAs!int("n"))])
