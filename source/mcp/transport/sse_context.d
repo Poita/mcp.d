@@ -748,18 +748,19 @@ final class ServerPushChannel : PushChannel
 					}
 					attach(id, resumeOrdinal);
 					touchHistory(resumeOrdinal);
-					long maxSeq = resumeSeq;
+					// The stream continues after the last event issued on it; the
+					// client's cursor only selects what is replayed, so a cursor past
+					// the issued events cannot move the sequence.
+					long next = nextSeq.get(resumeOrdinal, 0);
 					foreach (ref e; history[resumeOrdinal].entries)
 					{
-						if (e.seq <= resumeSeq)
-							continue;
-						replay ~= e.frame;
-						if (e.seq > maxSeq)
-							maxSeq = e.seq;
+						if (e.seq >= next)
+							next = e.seq + 1;
+						if (e.seq > resumeSeq)
+							replay ~= e.frame;
 					}
 					live[id] = true;
-					if (nextSeq.get(resumeOrdinal, 0) < maxSeq + 1)
-						nextSeq[resumeOrdinal] = maxSeq + 1;
+					nextSeq[resumeOrdinal] = next;
 				}
 				else
 				{
@@ -1904,6 +1905,29 @@ unittest  // an unknown / empty Last-Event-ID falls back to a fresh stream ordin
 	string[] bogus;
 	ch.addListener((string f) @safe { bogus ~= f; }, Json(""), ListenFilter.init, "999-5");
 	assert(bogus.length == 0); // unknown ordinal -> no replay
+}
+
+unittest  // a Last-Event-ID beyond the issued events does not advance the stream's ids
+{
+	import std.string : indexOf;
+
+	auto coord = new StreamCoordinator;
+	auto ch = new ServerPushChannel(coord);
+	string[] frames;
+	const first = ch.addListener((string f) @safe { frames ~= f; });
+	ch.notify("notifications/message");
+	const id0 = frames[0]["id: ".length .. frames[0].indexOf("\n")];
+	const ordinal = id0[0 .. id0.indexOf('-')];
+	ch.removeListener(first);
+
+	string[] resumed;
+	ch.addListener((string f) @safe { resumed ~= f; }, Json.init,
+			ListenFilter.init, ordinal ~ "-9223372036854775806");
+	assert(resumed.length == 0, "no issued event follows the cursor");
+	ch.notify("notifications/message");
+	assert(resumed.length == 1);
+	assert(resumed[0][0 .. resumed[0].indexOf("\n")] == "id: " ~ ordinal ~ "-1",
+			"the next event continues the issued sequence");
 }
 
 unittest  // replay never crosses streams (MUST NOT replay a different stream)
