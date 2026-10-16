@@ -2676,7 +2676,8 @@ final class McpServer : ServerCore
 	/// Configure the modern `CacheableResult` freshness hint (`ttlMs`/`cacheScope`)
 	/// emitted on a specific cacheable result when speaking the modern protocol.
 	/// `listMethod` MUST be one of `tools/list`, `resources/list`,
-	/// `resources/templates/list`, `prompts/list`, `server/discover`
+	/// `resources/templates/list`, `prompts/list`, `resources/directory/read`
+	/// (its result is a `ListResourcesResult`), `server/discover`
 	/// (`DiscoverResult extends CacheableResult` in the 2026-07-28 schema), or the
 	/// Skills extension's `skills/list` and `skills/get` (both extend
 	/// `CacheableResult`; for `skills/get` the hint says how long a host may
@@ -2687,6 +2688,7 @@ final class McpServer : ServerCore
 		if (listMethod != "tools/list" && listMethod != "resources/list"
 				&& listMethod != "resources/templates/list"
 				&& listMethod != "prompts/list"
+				&& listMethod != "resources/directory/read"
 				&& listMethod != "server/discover"
 				&& listMethod != "skills/list" && listMethod != "skills/get")
 			throw new Exception("setListCacheHint: unknown list method '" ~ listMethod ~ "'");
@@ -10588,6 +10590,19 @@ unittest  // resources/directory/read reports a URI that is both a file and a su
 	assert(res.length == 2);
 	assert(res[0]["uri"].get!string == "s://d/a");
 	assert(res[1]["uri"].get!string == "s://d/c");
+}
+
+unittest  // setListCacheHint configures the modern resources/directory/read freshness hint
+{
+	auto s = new McpServer("t", "1");
+	s.enableDirectoryRead();
+	Resource r = {uri: "s://d/a", name: "a"};
+	s.registerResource(r, () @safe => ResourceContents.makeText("s://d/a", "text/plain", "x"));
+	s.setListCacheHint("resources/directory/read", CacheHint(30.seconds));
+	auto res = s.handle(modernReq(1, "resources/directory/read", Json([
+				"uri": Json("s://d")
+	]))).get;
+	assert(res["result"]["ttlMs"].get!long == 30_000, res.toString);
 }
 
 unittest  // modern resources/read unknown uri uses invalidParams (-32602)
