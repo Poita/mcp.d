@@ -780,7 +780,11 @@ struct Content
 			return Content(c);
 		case "resource":
 			EmbeddedResource c;
-			c.resource = ("resource" in j) ? j["resource"] : Json.emptyObject;
+			// `resource` is a required resource contents object; without one the
+			// block cannot be read or re-serialized.
+			if ("resource" !in j || j["resource"].type != Json.Type.object)
+				throw invalidParams("an embedded resource requires a 'resource' object");
+			c.resource = j["resource"];
 			c.parseMeta(j);
 			return Content(c);
 		case "tool_use":
@@ -6560,6 +6564,27 @@ unittest  // Content.fromJson rejects a non-object block with -32602
 	import std.exception : collectException;
 
 	auto ex = cast(McpException) collectException(Content.fromJson(Json("text")));
+	assert(ex !is null && ex.code == ErrorCode.invalidParams);
+}
+
+unittest  // Content.fromJson rejects an embedded resource whose resource is not an object with -32602
+{
+	import std.exception : collectException;
+
+	foreach (r; [`"x"`, `5`, `null`, `[]`])
+	{
+		auto ex = cast(McpException) collectException(Content.fromJson(
+				parseJsonString(`{"type":"resource","resource":` ~ r ~ `}`)));
+		assert(ex !is null && ex.code == ErrorCode.invalidParams, r);
+	}
+}
+
+unittest  // Content.fromJson rejects an embedded resource with no resource with -32602
+{
+	import std.exception : collectException;
+
+	auto ex = cast(McpException) collectException(
+			Content.fromJson(parseJsonString(`{"type":"resource"}`)));
 	assert(ex !is null && ex.code == ErrorCode.invalidParams);
 }
 
