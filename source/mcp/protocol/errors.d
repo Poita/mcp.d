@@ -201,9 +201,10 @@ McpException resourceNotFound(string uri, ProtocolVersion v, Json data = Json.un
 /// it carries a `//authority`. (The spec only SHOULDs HTTPS, so plain `http` is
 /// accepted rather than rejected here.) Beyond the scheme this requires an
 /// absolute URI: the scheme is followed by `:` and a hierarchical `//authority`
-/// with a non-empty host. Relative references, bare strings such as
-/// `"not a url"`, `scheme:`-only values, whitespace, control characters, a
-/// backslash and an unbalanced IPv6 bracket are rejected. Validation is
+/// with a non-empty host and no userinfo. Relative references, bare strings
+/// such as `"not a url"`, `scheme:`-only values, userinfo (`user@host`),
+/// whitespace, control characters, a backslash and an unbalanced IPv6 bracket
+/// are rejected. Validation is
 /// permissive about the path/query/fragment so any real `https://…` consent or
 /// OAuth URL passes.
 bool isValidElicitationUrl(string url) @safe pure nothrow @nogc
@@ -257,17 +258,11 @@ bool isValidElicitationUrl(string url) @safe pure nothrow @nogc
 	while (authEnd < url.length && url[authEnd] != '/' && url[authEnd] != '?' && url[authEnd] != '#')
 		authEnd++;
 	auto authority = url[i .. authEnd];
-	// Userinfo is separated from host by the last '@' in the authority component
-	// (RFC 3986 §3.2.1). Scan backward to locate it so that a URL with multiple
-	// '@' characters does not cause an out-of-bounds re-slice.
-	foreach_reverse (j, c; authority)
-	{
-		if (c == '@')
-		{
-			authority = authority[j + 1 .. $];
-			break;
-		}
-	}
+	// The user is shown this URL before navigating to it, and userinfo lets it
+	// open with a trusted-looking name that is not the host
+	// (`https://trusted.example@evil.example/`), so any userinfo is refused.
+	if (indexOf(authority, '@') >= 0)
+		return false;
 	// A bracketed IPv6 literal must close its bracket and be followed only by
 	// an optional port; brackets are not allowed anywhere else in the host.
 	if (authority.length && authority[0] == '[')
@@ -553,17 +548,16 @@ unittest  // isValidElicitationUrl accepts ordinary https/http URLs
 	assert(isValidElicitationUrl("https://example.com/consent"));
 	assert(isValidElicitationUrl("http://example.com"));
 	assert(isValidElicitationUrl("https://mcp.example.com/connect?elicitationId=abc#frag"));
-	assert(isValidElicitationUrl("https://user@host.example/path"));
+	assert(isValidElicitationUrl("https://host.example/p@th?q=a@b#f@g"));
 }
 
-unittest  // isValidElicitationUrl handles multiple '@' in authority without crashing
+unittest  // isValidElicitationUrl rejects userinfo, which can disguise the real host
 {
-	// A double-'@' userinfo is syntactically valid per RFC 3986; the host is
-	// everything after the last '@'. The foreach loop that mutated the authority
-	// slice mid-iteration would produce an ArraySliceError here.
-	assert(isValidElicitationUrl("https://user1@user2@host.example/path"));
-	assert(isValidElicitationUrl("https://a@b@c@host.example/"));
-	assert(!isValidElicitationUrl("https://user1@user2@/path")); // empty host after last '@'
+	assert(!isValidElicitationUrl("https://accounts.google.com@evil.example/login"));
+	assert(!isValidElicitationUrl("https://user@host.example/path"));
+	assert(!isValidElicitationUrl("https://user:pass@host.example/"));
+	assert(!isValidElicitationUrl("https://user1@user2@host.example/path"));
+	assert(!isValidElicitationUrl("https://@host.example/"));
 }
 
 unittest  // isValidElicitationUrl rejects malformed / non-absolute values
