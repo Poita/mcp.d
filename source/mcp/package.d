@@ -12,8 +12,9 @@
  *     `@prompt`, `registerModule`, schema generation),
  *   - the error builders (`McpException`, `ErrorCode`, `toErrorJson`,
  *     `makeErrorResponse`), and
- *   - vibe's `Json` value type and `parseJsonString`, which the handler and
- *     client signatures use.
+ *   - vibe's `Json` value type and `parseJsonString`, Phobos's `Nullable` /
+ *     `nullable`, and the `core.time` `Duration` helpers, which the handler,
+ *     descriptor, settings, and client signatures use.
  *
  * Transport wiring and auth plumbing are deliberately kept out of the
  * top-level surface to avoid name collisions and to signal stable-public-API
@@ -28,6 +29,10 @@ module mcp;
 
 // --- JSON value type used throughout the public signatures ---
 public import vibe.data.json : Json, parseJsonString;
+
+// --- Optional values and durations used throughout the public signatures ---
+public import std.typecons : Nullable, nullable;
+public import core.time : Duration, dur, msecs, seconds, minutes, hours, days;
 
 // --- Protocol types ---
 public import mcp.protocol.versions;

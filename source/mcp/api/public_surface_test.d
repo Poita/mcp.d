@@ -421,3 +421,18 @@ unittest
 			mountOAuthRegister(URLRouter.init, OAuthProxy.init);
 		}));
 }
+
+// The Nullable and Duration vocabulary the public signatures use comes with
+// `import mcp;`, so handlers, descriptors, and settings need no extra imports.
+unittest
+{
+	static assert(visibleFromMcp!"Nullable");
+	static assert(visibleFromMcp!"nullable");
+	static assert(visibleFromMcp!"Duration");
+	static assert(__traits(compiles, {
+			import mcp;
+
+			Duration d = 30.seconds + 2.minutes + 1.hours + 5.msecs + 1.days;
+			Nullable!bool b = nullable(true);
+		}));
+}
