@@ -1027,7 +1027,8 @@ final class HttpClientTransport : ClientTransport
 		// §Resumability and Redelivery — not a re-POST), repeating from the latest
 		// id each time the resumed stream closes too. Resumption stops when the
 		// server refuses the GET with a 4xx, after `maxIdleResumes` resumed streams
-		// in a row close within `idleResumeWindow_` without a new event, or when
+		// in a row close within `idleResumeWindow_` without a new event (unless the
+		// server sent a `retry:` delay, which asks the client to keep polling), or when
 		// resume GETs keep failing past the request timeout (or `maxIdleResumes`
 		// failures with none); the client's request timeout bounds it overall. The
 		// 2026-07-28 protocol has no resumability (a modern server answers the GET
@@ -1082,7 +1083,7 @@ final class HttpClientTransport : ClientTransport
 						idle = 0;
 						backoff = initialBackoff;
 					}
-					else if (MonoTime.currTime - started < idleResumeWindow_)
+					else if (cursor.retryMs <= 0 && MonoTime.currTime - started < idleResumeWindow_)
 					{
 						idle++;
 						backoff = nextBackoff(backoff, 5.seconds);
@@ -4757,6 +4758,55 @@ unittest  // a subscriptions/listen POST follows a same-origin 307
 	});
 	assert(failure.length == 0, "scenario failed: " ~ failure);
 	assert(streamError is null);
+}
+
+unittest  // a request resumes across a polling server's quick stream closes
+{
+	import mcp.client.client : McpClient;
+
+	int gets;
+	auto router = new URLRouter;
+	router.post("/mcp", (HTTPServerRequest req, HTTPServerResponse res) @safe {
+		auto j = requestJson(req);
+		const method = ("method" in j) ? j["method"].get!string : "";
+		if (method == "initialize")
+		{
+			res.writeBody(initializeReply(j, "2025-11-25").toString(), "application/json");
+			return;
+		}
+		if (method == "tools/list")
+		{
+			// The server asks the client to poll: an event id and a retry delay.
+			res.headers["Content-Type"] = "text/event-stream";
+			res.bodyWriter.write("id: e1\nretry: 20\n\n");
+			return;
+		}
+		res.statusCode = 202;
+		res.writeBody("", "text/plain");
+	});
+	router.get("/mcp", (HTTPServerRequest req, HTTPServerResponse res) @safe {
+		res.headers["Content-Type"] = "text/event-stream";
+		// Each poll closes at once until the result is ready.
+		if (++gets < 6)
+		{
+			res.bodyWriter.write(": poll\n\n");
+			return;
+		}
+		res.bodyWriter.write(
+			"id: e2\ndata: {\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"tools\":[]}}\n\n");
+	});
+
+	size_t tools = size_t.max;
+	const failure = runAgainstFakeServer(router, (string url) @safe {
+		auto client = McpClient.http(url);
+		scope (exit)
+			client.close();
+		client.initialize("2025-11-25");
+		tools = client.listTools().tools.length;
+	});
+	assert(failure.length == 0, "scenario failed: " ~ failure);
+	assert(tools == 0);
+	assert(gets == 6);
 }
 
 unittest  // a resume GET follows a same-origin redirect
