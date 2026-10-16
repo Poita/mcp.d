@@ -907,6 +907,7 @@ final class HttpClientTransport : ClientTransport
 
 		// As in `deliver`: a rejected bearer is reported once, and the POST
 		// retried once with the refreshed token.
+		const sentSession = sessionId;
 		const sentBearer = currentBearer();
 		attempt(sentBearer);
 		if (bearerProvider.onRejected !is null && sentBearer.length
@@ -916,7 +917,7 @@ final class HttpClientTransport : ClientTransport
 		// invisible: 404/410 under a session means the session is gone (drop its id
 		// and mark it so the next non-initialize request surfaces a clear error);
 		// any other non-2xx is logged so the rejection is at least observable.
-		if ((status == 404 || status == 410) && sessionId.length)
+		if ((status == 404 || status == 410) && sentSession.length && sessionId == sentSession)
 		{
 			sessionExpired = true;
 			sessionId = null;
@@ -971,7 +972,7 @@ final class HttpClientTransport : ClientTransport
 		// approach `runServerStream`/`resumeViaGet` use for long-lived SSE)
 		// delivers each event immediately, so the client can reply and the
 		// round-trip completes.
-		const sentSession = sessionId.length > 0;
+		const sentSession = sessionId;
 		int status;
 		string failure;
 		// A same-origin 307/308 is followed with the same method and body
@@ -995,10 +996,14 @@ final class HttpClientTransport : ClientTransport
 
 		// A 404 under a session means the session is gone: drop the id and mark it
 		// so later requests fail until an `initialize` starts a new session.
-		if (status == 404 && sentSession && !got && err is null)
+		if (status == 404 && sentSession.length && !got && err is null)
 		{
-			sessionExpired = true;
-			sessionId = null;
+			// A session started since this request was sent is left alone.
+			if (sessionId == sentSession)
+			{
+				sessionExpired = true;
+				sessionId = null;
+			}
 			throw new SessionExpiredException(status,
 					"MCP session expired (server answered HTTP 404 for the session)");
 		}
@@ -4396,6 +4401,12 @@ version (unittest)
 		bool serveStream;
 		string[] streamSessions;
 		int sessionlessStreams; // stream GETs that carried no Mcp-Session-Id
+		// How long `initialize` takes to answer, so concurrent requests overlap it.
+		Duration initializeDelay;
+		// The `Mcp-Session-Id` each `notifications/initialized` carried.
+		string[] initializedSessions;
+		// `tools/list` requests served on a session before its `notifications/initialized`.
+		int requestsBeforeInitialized;
 
 		void expire() @safe
 		{
@@ -4411,8 +4422,13 @@ version (unittest)
 				const sid = req.headers.get("Mcp-Session-Id", "");
 				if (method == "initialize")
 				{
+					import vibe.core.core : sleep;
+
 					initializeSessionHeaders ~= sid;
-					live = "s" ~ (++minted).to!string;
+					const mintedId = "s" ~ (++minted).to!string;
+					if (initializeDelay > Duration.zero)
+						sleep(initializeDelay);
+					live = mintedId;
 					res.headers["Mcp-Session-Id"] = live;
 					res.writeBody(initializeReply(j, "2025-11-25").toString(), "application/json");
 					return;
@@ -4425,8 +4441,14 @@ version (unittest)
 					res.writeBody("", "text/plain");
 					return;
 				}
+				if (method == "notifications/initialized")
+					initializedSessions ~= sid;
 				if (method == "tools/list")
 				{
+					import std.algorithm.searching : canFind;
+
+					if (!initializedSessions.canFind(sid))
+						++requestsBeforeInitialized;
 					auto resp = parseJsonString(`{"jsonrpc":"2.0","result":{"tools":[]}}`);
 					resp["id"] = j["id"];
 					res.writeBody(resp.toString(), "application/json");
@@ -4514,6 +4536,52 @@ unittest  // ClientSettings.reinitializeOnSessionExpiry starts a new session and
 	assert(tools == 0, "the request must succeed on the new session");
 	assert(srv.initializeSessionHeaders == ["", ""],
 			"the expiry must trigger one fresh initialize without a session id");
+}
+
+unittest  // concurrent requests that find the session expired share one re-initialize
+{
+	import core.time : msecs;
+	import vibe.core.core : runTask, sleep;
+	import mcp.client.client : McpClient, ClientSettings;
+
+	auto srv = new SessionFakeServer;
+	int succeeded;
+	string[] errors;
+	const failure = runAgainstFakeServer(srv.router(), (string url) @safe {
+		ClientSettings s;
+		s.reinitializeOnSessionExpiry = true;
+		auto client = McpClient.http(url, s);
+		scope (exit)
+			client.close();
+		client.initialize("2025-11-25");
+		srv.expire();
+		srv.initializeDelay = 100.msecs;
+		void call() @safe nothrow
+		{
+			try
+			{
+				client.listTools();
+				++succeeded;
+			}
+			catch (Exception e)
+				errors ~= e.msg;
+		}
+
+		auto tasks = [runTask(&call), runTask(&call), runTask(&call)];
+		// A request issued while the re-initialize is under way.
+		sleep(50.msecs);
+		tasks ~= runTask(&call);
+		foreach (t; tasks)
+			t.join();
+	});
+	assert(failure.length == 0, "scenario failed: " ~ failure);
+	assert(errors.length == 0, "a request failed: " ~ (errors.length ? errors[0] : ""));
+	assert(succeeded == 4);
+	assert(srv.initializeSessionHeaders.length == 2,
+			"the expiry must trigger exactly one re-initialize");
+	assert(srv.sessionlessRequests == 0, "no request may go out without a session id");
+	assert(srv.requestsBeforeInitialized == 0,
+			"no request may use the new session before notifications/initialized");
 }
 
 unittest  // the server stream an expired session ended is reopened once the client re-initializes

@@ -560,6 +560,16 @@ final class McpClient : ClientProtocol
 	private ClientTransport transport;
 	private ProtocolVersion negotiated = latestLegacy;
 	private bool didInitialize;
+	// The initialize handshake in progress, if any: the fiber running it and the
+	// event emitted when it ends. Requests from other fibers wait for it, so none
+	// goes out without the new session's id or before `notifications/initialized`.
+	private bool initializing_;
+	private void* initializingFiber_;
+	private LocalManualEvent initializeEnded_;
+	private bool initializeEndedInit_;
+	// Bumped each time an initialize handshake completes, so a request that found
+	// its session expired can tell whether a new session has started since it was sent.
+	private ulong sessionEpoch_;
 	private bool useModern;
 	private long nextId = 1;
 	// Opt-in: validate tool results against the tool's outputSchema (client side).
@@ -1251,6 +1261,16 @@ final class McpClient : ClientProtocol
 	/// Perform the initialize handshake and send `notifications/initialized`.
 	InitializeResult initialize(string requestedVersion = latestLegacy.toWire) @safe
 	{
+		awaitInitializeEnded();
+		initializing_ = true;
+		initializingFiber_ = currentFiberKey();
+		scope (exit)
+		{
+			initializing_ = false;
+			initializingFiber_ = null;
+			if (initializeEndedInit_)
+				initializeEnded_.emit();
+		}
 		// The initialize handshake belongs to the stable protocols, so it runs
 		// (and the session continues) without modern per-request framing.
 		useModern = false;
@@ -1285,7 +1305,26 @@ final class McpClient : ClientProtocol
 		serverInstructions_ = init.instructions;
 		didInitialize = true;
 		notify("notifications/initialized", Json.emptyObject);
+		sessionEpoch_++;
 		return init;
+	}
+
+	/// Park the calling fiber while another fiber runs the initialize handshake.
+	/// The fiber running it passes straight through.
+	private void awaitInitializeEnded() @safe
+	{
+		while (initializing_ && initializingFiber_ !is currentFiberKey())
+		{
+			if (!initializeEndedInit_)
+			{
+				initializeEnded_ = createManualEvent();
+				initializeEndedInit_ = true;
+			}
+			const ec = initializeEnded_.emitCount;
+			if (!initializing_)
+				break;
+			initializeEnded_.wait(ec);
+		}
 	}
 
 	/// Connect to a server whose protocol era is unknown, per the transport
@@ -3744,15 +3783,34 @@ final class McpClient : ClientProtocol
 	private Json rpc(string method, Json params,
 			Nullable!ProtocolVersion framing = Nullable!ProtocolVersion.init) @safe
 	{
+		if (method != "initialize")
+			awaitInitializeEnded();
+		const epoch = sessionEpoch_;
 		try
 			return rpcOnce(method, params, framing);
 		catch (SessionExpiredException e)
 		{
 			if (!reinitializeOnSessionExpiry_ || !didInitialize || method == "initialize")
 				throw e;
-			initialize(lastRequestedVersion_);
+			reinitializeAfterExpiry(epoch, e);
 			return rpcOnce(method, params, framing);
 		}
+	}
+
+	/// Start a new session for a request sent in session epoch `epoch` that
+	/// failed with `expired`. One fiber runs the initialize; the others wait for
+	/// it and reuse its session, so concurrent failures never start competing
+	/// sessions. A request that waited on an initialize that failed rethrows
+	/// `expired` rather than trying again.
+	private void reinitializeAfterExpiry(ulong epoch, SessionExpiredException expired) @safe
+	{
+		const waited = initializing_ && initializingFiber_ !is currentFiberKey();
+		awaitInitializeEnded();
+		if (sessionEpoch_ != epoch)
+			return;
+		if (waited)
+			throw expired;
+		initialize(lastRequestedVersion_);
 	}
 
 	/// One attempt of `rpc`.
