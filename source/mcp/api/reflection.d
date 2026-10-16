@@ -22,8 +22,8 @@ import mcp.api.attributes;
 import mcp.api.apps : UiToolMeta, setUiToolMeta, ensureApps;
 import mcp.api.skills : Skill, isValidSkillPath, registerSkill,
 	skillFieldProblem, skillPathRule, unregisterSkill;
-import mcp.api.binding : bindJson, bindString, defaultAs, schemaNode,
-	jsonSchemaOf, SchemaUse, setBound, wireName;
+import mcp.api.binding : bindJson, bindString, defaultAs, isAdvertisableDefault,
+	schemaNode, jsonSchemaOf, SchemaUse, setBound, wireName;
 import mcp.protocol.schema;
 import mcp.protocol.jsonhelpers : isFieldwiseStruct;
 
@@ -833,7 +833,7 @@ private Json parametersSchema(alias func)() @safe
 						{
 						auto d = serializeWithPolicy!(JsonSerializer, EnumByNamePolicy)(
 								cast(P) defs[i]);
-						if (d.type != Json.Type.null_ && d.type != Json.Type.undefined)
+						if (isAdvertisableDefault(d))
 							ps["default"] = d;
 					}
 				props[names[i]] = ps;
@@ -3956,6 +3956,24 @@ unittest  // a resource-template array element that does not parse is an Invalid
 	registerHandlers(s, new ListTemplateApi);
 	auto rr = readUri(s, "tagged://x?tags=1,zz");
 	assert(rr["error"]["code"].get!int == -32602, rr.toString);
+}
+
+unittest  // a NaN parameter default is not advertised, since JSON has no NaN
+{
+	static final class NanDefaultApi
+	{
+		@tool("nan_default", "Takes a parameter defaulting to NaN")
+		string f(double ratio = double.nan, double scale = 2.5) @safe
+		{
+			return "";
+		}
+	}
+
+	auto s = new McpServer("t", "1");
+	registerHandlers(s, new NanDefaultApi);
+	auto props = s.handle(MakeListMessage()).get["result"]["tools"][0]["inputSchema"]["properties"];
+	assert("default" !in props["ratio"], props.toString);
+	assert(props["scale"]["default"].get!double == 2.5, props.toString);
 }
 
 unittest  // a resource-template static array param requires exactly its length of elements

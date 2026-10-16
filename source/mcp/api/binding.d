@@ -222,7 +222,7 @@ package(mcp) JsonNode schemaNode(T, SchemaUse use, Ancestors...)()
 
 							const d = serializeWithPolicy!(JsonSerializer, EnumByNamePolicy)(
 									__traits(getMember, T.init, field));
-							if (d.type != Json.Type.null_ && d.type != Json.Type.undefined)
+							if (isAdvertisableDefault(d))
 								prop.set("default", vibeJsonToNode(d));
 						}
 					}
@@ -276,6 +276,42 @@ package(mcp) JsonNode schemaNode(T, SchemaUse use, Ancestors...)()
 		else
 			return s;
 	}
+}
+
+/// Whether the serialized default `d` can be advertised as a schema `default`:
+/// it is a value, and no number in it is NaN or infinite, which vibe would
+/// write as `null` and so misstate the default.
+package(mcp) bool isAdvertisableDefault(const Json d) @safe
+{
+	import std.math : isFinite;
+
+	static bool finite(const Json j) @safe
+	{
+		final switch (j.type)
+		{
+		case Json.Type.float_:
+			return isFinite(j.get!double);
+		case Json.Type.array:
+			foreach (i; 0 .. j.length)
+				if (!finite(j[i]))
+					return false;
+			return true;
+		case Json.Type.object:
+			foreach (kv; j.byKeyValue)
+				if (!finite(kv.value))
+					return false;
+			return true;
+		case Json.Type.undefined:
+		case Json.Type.null_:
+		case Json.Type.bool_:
+		case Json.Type.int_:
+		case Json.Type.bigInt:
+		case Json.Type.string:
+			return true;
+		}
+	}
+
+	return d.type != Json.Type.null_ && d.type != Json.Type.undefined && finite(d);
 }
 
 /// Why `T` cannot be described by `jsonSchemaOf` and bound from JSON (`use` is
@@ -1731,4 +1767,23 @@ unittest  // bindJson prefers the SumType struct member with no fields beyond th
 	}
 
 	assert(bindJson!(SumType!(B, A))(parseJsonString(`{"x":1}`)).has!A);
+}
+
+unittest  // a struct field default holding a NaN is not advertised
+{
+	static struct Point
+	{
+		double x = 0;
+		double y = 0;
+	}
+
+	static struct Shape
+	{
+		Point origin = Point(1, double.nan);
+		Point corner = Point(2, 3);
+	}
+
+	auto props = jsonSchemaOf!Shape()["properties"];
+	assert("default" !in props["origin"], props.toString);
+	assert(props["corner"]["default"]["x"].get!double == 2, props.toString);
 }
