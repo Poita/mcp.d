@@ -187,7 +187,9 @@ unittest  // a SumType of structs prefers the member with no keys beyond the inp
 }
 
 /// Compile a vibe `Json` schema document into a reusable `Validator`, or `null`
-/// when `schema` is not a JSON object (and so imposes no constraint). Throws
+/// when `schema` imposes no constraint (the boolean schema `true`, or any value
+/// that is neither an object nor a boolean). The boolean schema `false` yields a
+/// validator that rejects every value. Throws
 /// -32602 (`McpException`) when the schema is a malformed object or declares an
 /// unsupported `$schema` dialect, surfacing a bad schema where the tool is
 /// registered rather than silently under-validating each request, and keeping a
@@ -198,6 +200,13 @@ Validator makeValidator(Json schema)
 	import jsonschema.vibejson : compileSchema;
 	import mcp.protocol.errors : invalidParams;
 
+	if (schema.type == Json.Type.bool_)
+	{
+		if (schema.get!bool)
+			return null;
+		// `false` is the schema no value satisfies, spelled as an object.
+		schema = Json(["not": Json.emptyObject]);
+	}
 	if (schema.type != Json.Type.object)
 		return null;
 	try
@@ -312,6 +321,21 @@ unittest  // a draft-07 dialect schema is accepted and enforced (not rejected)
 	assert(v !is null);
 	assert(validationError(v, Json(7)) == "");
 	assert(validationError(v, Json("no")).length > 0);
+}
+
+unittest  // a boolean false schema rejects every value
+{
+	auto v = makeValidator(Json(false));
+	assert(v !is null);
+	assert(validationError(v, Json(1)).length > 0);
+	assert(validationError(v, Json.emptyObject).length > 0);
+	assert(validateAgainstSchema(Json("x"), Json(false)).length > 0);
+}
+
+unittest  // a boolean true schema imposes no constraint
+{
+	assert(makeValidator(Json(true)) is null);
+	assert(validateAgainstSchema(Json("x"), Json(true)) == "");
 }
 
 unittest  // makeValidator returns null for a non-object schema
