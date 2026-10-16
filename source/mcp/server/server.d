@@ -7210,6 +7210,22 @@ unittest  // modern request with an unrecognised logLevel is rejected with -3260
 	assert(ctx.emitted.length == 0);
 }
 
+unittest  // modern request with a non-string logLevel is rejected with -32602
+{
+	auto s = makeNoisyLogServer();
+	auto ctx = new ModernLogCtx;
+	Json callP = Json.emptyObject;
+	callP["name"] = "noisy";
+	auto req = modernReq(2, "tools/call", callP);
+	Json raw = req.raw;
+	raw["params"]["_meta"][cast(string) MetaKey.logLevel] = 7;
+	auto resp = s.handle(Message(raw), ctx).get;
+
+	assert("error" in resp, resp.toString);
+	assert(resp["error"]["code"].get!int == ErrorCode.invalidParams);
+	assert(ctx.emitted.length == 0);
+}
+
 unittest  // a modern request's logLevel does not leak into a later request
 {
 	auto s = makeNoisyLogServer();

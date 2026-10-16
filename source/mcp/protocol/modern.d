@@ -44,8 +44,12 @@ struct RequestMeta
 			m.clientCapabilities = ClientCapabilities.fromJson(meta[MetaKey.clientCapabilities]);
 			m.hasClientCapabilities = true;
 		}
-		if (MetaKey.logLevel in meta && meta[MetaKey.logLevel].type == Json.Type.string)
-			m.logLevel = meta[MetaKey.logLevel].get!string;
+		if (auto lvl = MetaKey.logLevel in meta)
+		{
+			// A non-string level keeps its JSON text, which names no log level, so
+			// the dispatcher rejects it as invalid rather than treating it as absent.
+			m.logLevel = lvl.type == Json.Type.string ? lvl.get!string : lvl.toString();
+		}
 		return m;
 	}
 }
