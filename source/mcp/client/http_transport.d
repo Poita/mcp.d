@@ -1429,16 +1429,13 @@ final class HttpClientTransport : ClientTransport
 	/// fields update `cursor`, so a further resume continues from the latest event.
 	/// Reports whether the stream opened, the server answered 404 for the session
 	/// (which marks it expired), refused it with another 4xx (other
-	/// than 408/429), or it failed transiently: a connection failure or another
-	/// non-200 status, whose description is left in `failure`.
+	/// than 408/429) or a redirect it does not follow, or it failed transiently:
+	/// a connection failure or another non-200 status, whose description is left
+	/// in `failure`. A same-origin redirect is followed a bounded number of times.
 	private ResumeOutcome resumeViaGet(long expectId, string bearer, ref SseCursor cursor,
 			ref Json result, ref bool got, ref McpException err,
 			ref string failure, PostRequest req = null) @safe
 	{
-		const ep = parseHttpEndpoint(url);
-		// Resolve + pin the user-configured endpoint host to a numeric address.
-		const pinnedHost = pinnedEndpointHost(ep);
-
 		// Protocol-version header for the GET stream (set after initialize).
 		auto verHeaders = requestHeaders(Json.undefined);
 
@@ -1459,9 +1456,15 @@ final class HttpClientTransport : ClientTransport
 		}
 
 		auto outcome = ResumeOutcome.failed;
-		() {
+		string target = url;
+		string next;
+		void attempt()
+		{
 			try
 			{
+				const ep = parseHttpEndpoint(target);
+				// Resolve + pin the endpoint host to a numeric address.
+				const pinnedHost = pinnedEndpointHost(ep);
 				auto sock = connectTimed(pinnedHost, ep.port);
 				// `attach` closes `sock` immediately if a `close()` already ran during
 				// the `connectTCP` yield, so the socket is never leaked or left parked.
@@ -1494,7 +1497,16 @@ final class HttpClientTransport : ClientTransport
 				if (head.status != 200)
 				{
 					failure = "resume GET answered HTTP " ~ idStr(head.status);
-					if (head.status >= 400 && head.status < 500
+					if (head.status >= 300 && head.status < 400)
+					{
+						// Only a same-origin target keeps the bearer on the configured
+						// origin; any other redirect would recur, so it is refused.
+						if (isGetRedirect(head.status) && head.location.length)
+							next = resolveEndpointUri(target, head.location);
+						if (next.length == 0)
+							outcome = ResumeOutcome.refused;
+					}
+					else if (head.status >= 400 && head.status < 500
 							&& head.status != 408 && head.status != 429)
 						outcome = ResumeOutcome.refused;
 					return;
@@ -1516,8 +1528,18 @@ final class HttpClientTransport : ClientTransport
 			}
 			catch (Exception e)
 				failure = e.msg;
-		}();
-		return outcome;
+		}
+
+		foreach (hop; 0 .. maxStreamRedirects + 1)
+		{
+			next = null;
+			attempt();
+			if (next.length == 0)
+				return outcome;
+			slot.detach();
+			target = next;
+		}
+		return ResumeOutcome.refused;
 	}
 
 	private static bool isInitialize(Json message) @safe
@@ -1914,7 +1936,9 @@ final class HttpClientTransport : ClientTransport
 	/// carries a fresh token; a 401 that no refresh answers ends the reader. Any
 	/// other 4xx except 408 and 429 would recur on every attempt (a 405: the
 	/// server offers no standalone stream; a 404: no stream at the endpoint, or
-	/// the session is gone), so it ends the reader too.
+	/// the session is gone), so it ends the reader too, as does a 501. A
+	/// same-origin redirect is followed at once, a bounded number of times in a
+	/// row; any other redirect ends the reader.
 	private void runServerStream() @safe
 	{
 		import core.time : msecs;
@@ -1926,10 +1950,12 @@ final class HttpClientTransport : ClientTransport
 		scope (exit)
 			serverStreamAlive = false;
 
-		// Parse scheme://host[:port]/path.
-		const ep = parseHttpEndpoint(url);
-		// Resolve + pin the user-configured endpoint host to a numeric address.
-		const pinnedHost = pinnedEndpointHost(ep);
+		// The URL the stream is opened at: the endpoint, or where it redirected.
+		string target = url;
+		HttpEndpoint ep;
+		string pinnedHost;
+		string pinnedTarget;
+		size_t redirects;
 
 		// `id:`/`retry:` resumption state is tracked in this reconnect loop's own
 		// cursor by the decoder; the loop reads it between attempts. Keeping it local
@@ -1949,10 +1975,18 @@ final class HttpClientTransport : ClientTransport
 				reopenServerStream = true;
 				break;
 			}
+			if (pinnedTarget != target)
+			{
+				// Resolve + pin the endpoint host to a numeric address.
+				ep = parseHttpEndpoint(target);
+				pinnedHost = pinnedEndpointHost(ep);
+				pinnedTarget = target;
+			}
 			bool refused;
 			bool sawData;
 			int status;
 			string wwwAuthenticate;
+			string redirect;
 			const sentSession = sessionId;
 			const bearer = currentBearer();
 			const sentBearer = bearerProvider.onRejected !is null ? bearer : null;
@@ -1992,12 +2026,22 @@ final class HttpClientTransport : ClientTransport
 					const head = readResponseHead(conn);
 					status = head.status;
 					wwwAuthenticate = head.wwwAuthenticate;
-					if (status != 200)
+					if (status >= 300 && status < 400)
 					{
-						refused = status >= 400 && status < 500 && status != 408
-							&& status != 429 && status != 401;
+						// Only a same-origin target keeps the bearer on the configured
+						// origin; any other redirect would recur, so it is refused.
+						if (isGetRedirect(status) && head.location.length)
+							redirect = resolveEndpointUri(target, head.location);
+						refused = redirect.length == 0 || redirects >= maxStreamRedirects;
 						return;
 					}
+					if (status != 200)
+					{
+						refused = (status >= 400 && status < 500 && status != 408
+								&& status != 429 && status != 401) || status == 501;
+						return;
+					}
+					redirects = 0;
 
 					readSseBody(conn, head.chunked, cursor, () @safe => closing,
 							(string eventType, string data) @safe {
@@ -2043,6 +2087,12 @@ final class HttpClientTransport : ClientTransport
 				if (status == 404 && sentSession.length && sessionId != sentSession)
 					reopenServerStream = true;
 				break;
+			}
+			if (redirect.length)
+			{
+				redirects++;
+				target = redirect;
+				continue;
 			}
 			if (status == 401 && !(sentBearer.length && isRejectedBearer(status,
 					wwwAuthenticate) && refreshBearer(sentBearer)))
@@ -2134,9 +2184,9 @@ final class HttpClientTransport : ClientTransport
 	private void runListenStream(Json message, shared(bool)* cancelled, ListenSocketSlot slot,
 			SubscriptionStream stream, void delegate(bool frame) @safe nothrow onEstablished) @safe
 	{
-		const ep = parseHttpEndpoint(url);
-		// Resolve + pin the user-configured endpoint host to a numeric address.
-		const pinnedHost = pinnedEndpointHost(ep);
+		// The URL the request is POSTed to: the endpoint, or where a same-origin
+		// 307/308 sent it.
+		string target = url;
 
 		// Protocol-derived headers (version + modern method) for this POST.
 		auto reqHeaders = requestHeaders(message);
@@ -2187,10 +2237,15 @@ final class HttpClientTransport : ClientTransport
 				// A 401 rejecting the bearer is reported to the provider's
 				// `onRejected`, and the stream is opened once more with the
 				// refreshed token, as `deliver` does for a request.
-				for (bool mayRetry = true;; mayRetry = false)
+				bool mayRetry = true;
+				size_t redirects;
+				for (;;)
 				{
 					if (isCancelled())
 						return;
+					const ep = parseHttpEndpoint(target);
+					// Resolve + pin the endpoint host to a numeric address.
+					const pinnedHost = pinnedEndpointHost(ep);
 					const bearer = currentBearer();
 					const sentBearer = mayRetry && bearerProvider.onRejected !is null ? bearer
 						: null;
@@ -2217,13 +2272,29 @@ final class HttpClientTransport : ClientTransport
 					const status = head.status;
 					const chunked = head.chunked;
 					const wwwAuthenticate = head.wwwAuthenticate;
+					if ((status == 307 || status == 308) && head.location.length
+							&& redirects < maxStreamRedirects)
+					{
+						// `resolveEndpointUri` yields null for a cross-origin target, whose
+						// redirect is surfaced as the HTTP error below instead.
+						const next = resolveEndpointUri(target, head.location);
+						if (next.length)
+						{
+							redirects++;
+							target = next;
+							continue;
+						}
+					}
 					if (status < 200 || status >= 300)
 					{
 						const b = readRemaining(conn, chunked,
 								maxMessageBytes, head.contentLength);
 						if (sentBearer.length && isRejectedBearer(status,
 								wwwAuthenticate) && refreshBearer(sentBearer))
+						{
+							mayRetry = false;
 							continue;
+						}
 						failure = httpStatusError(status, b, wwwAuthenticate);
 						return;
 					}
@@ -2883,6 +2954,16 @@ private ClientStream openClientStream(TCPConnection conn, TLSContext ctx, string
 		return new ClientStream(interfaceProxy!Stream(t), plain);
 	}
 	return new ClientStream(interfaceProxy!Stream(conn), null);
+}
+
+/// How many redirects in a row a raw request path follows before giving up.
+private enum size_t maxStreamRedirects = 5;
+
+/// Whether `status` redirects a GET to the `Location` with the method kept
+/// (RFC 9110 §15.4).
+private bool isGetRedirect(int status) pure nothrow @safe @nogc
+{
+	return status == 301 || status == 302 || status == 303 || status == 307 || status == 308;
 }
 
 /// Whether an HTTP status from the initial modern POST should trigger the
@@ -4581,6 +4662,147 @@ unittest  // ClientSettings.reinitializeOnSessionExpiry starts a new session and
 	assert(tools == 0, "the request must succeed on the new session");
 	assert(srv.initializeSessionHeaders == ["", ""],
 			"the expiry must trigger one fresh initialize without a session id");
+}
+
+unittest  // the standalone server stream follows a same-origin redirect
+{
+	import core.time : msecs, MonoTime;
+	import vibe.core.core : sleep;
+
+	auto router = new URLRouter;
+	router.get("/mcp", (HTTPServerRequest req, HTTPServerResponse res) @safe {
+		res.statusCode = 307;
+		res.headers["Location"] = "/mcp2";
+		res.writeBody("", "text/plain");
+	});
+	router.get("/mcp2", (HTTPServerRequest req, HTTPServerResponse res) @safe {
+		res.headers["Content-Type"] = "text/event-stream";
+		res.bodyWriter.write(
+			"data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/tools/list_changed\"}\n\n");
+		res.bodyWriter.flush();
+		sleep(300.msecs);
+	});
+
+	string[] seen;
+	const failure = runAgainstFakeServer(router, (string url) @safe {
+		auto t = new HttpClientTransport(url);
+		scope (exit)
+			t.close();
+		t.setInboundHandler((Message m, InboundOrigin) @safe { seen ~= m.method; });
+		t.startServerStream();
+		const deadline = MonoTime.currTime + 2.seconds;
+		while (seen.length == 0 && MonoTime.currTime < deadline)
+			sleep(20.msecs);
+	});
+	assert(failure.length == 0, "scenario failed: " ~ failure);
+	assert(seen == ["notifications/tools/list_changed"],
+			"the redirected stream must deliver its notification");
+}
+
+unittest  // a server stream answered 501 is not retried
+{
+	import core.time : msecs;
+	import vibe.core.core : sleep;
+
+	int gets;
+	auto router = new URLRouter;
+	router.get("/mcp", (HTTPServerRequest req, HTTPServerResponse res) @safe {
+		++gets;
+		res.statusCode = 501;
+		res.writeBody("", "text/plain");
+	});
+	const failure = runAgainstFakeServer(router, (string url) @safe {
+		auto t = new HttpClientTransport(url);
+		scope (exit)
+			t.close();
+		t.startServerStream();
+		sleep(900.msecs);
+	});
+	assert(failure.length == 0, "scenario failed: " ~ failure);
+	assert(gets == 1, "a 501 must end the server stream");
+}
+
+unittest  // a subscriptions/listen POST follows a same-origin 307
+{
+	import core.time : msecs;
+	import vibe.core.core : sleep;
+	import mcp.client.client : McpClient;
+	import mcp.client.subscription : SubscriptionFilter;
+
+	auto router = new URLRouter;
+	router.post("/mcp", (HTTPServerRequest req, HTTPServerResponse res) @safe {
+		res.statusCode = 307;
+		res.headers["Location"] = "/mcp2";
+		res.writeBody("", "text/plain");
+	});
+	router.post("/mcp2", (HTTPServerRequest req, HTTPServerResponse res) @safe {
+		res.headers["Content-Type"] = "text/event-stream";
+		res.bodyWriter.write(
+			`data: {"jsonrpc":"2.0","method":"notifications/subscriptions/acknowledged",`
+			~ `"params":{"notifications":{}}}` ~ "\n\n");
+		res.bodyWriter.flush();
+		sleep(300.msecs);
+	});
+
+	McpException streamError;
+	const failure = runAgainstFakeServer(router, (string url) @safe {
+		auto client = McpClient.http(url);
+		scope (exit)
+			client.close();
+		client.enableModern();
+		SubscriptionFilter filter = {toolsListChanged: true};
+		auto stream = client.subscriptionsListen(filter);
+		streamError = stream.error;
+		stream.cancel();
+	});
+	assert(failure.length == 0, "scenario failed: " ~ failure);
+	assert(streamError is null);
+}
+
+unittest  // a resume GET follows a same-origin redirect
+{
+	import mcp.client.client : McpClient;
+
+	auto router = new URLRouter;
+	router.post("/mcp", (HTTPServerRequest req, HTTPServerResponse res) @safe {
+		auto j = requestJson(req);
+		const method = ("method" in j) ? j["method"].get!string : "";
+		if (method == "initialize")
+		{
+			res.writeBody(initializeReply(j, "2025-11-25").toString(), "application/json");
+			return;
+		}
+		if (method == "tools/list")
+		{
+			res.headers["Content-Type"] = "text/event-stream";
+			res.bodyWriter.write("id: e1\nretry: 10\n\n");
+			return;
+		}
+		res.statusCode = 202;
+		res.writeBody("", "text/plain");
+	});
+	router.get("/mcp", (HTTPServerRequest req, HTTPServerResponse res) @safe {
+		res.statusCode = 307;
+		res.headers["Location"] = "/mcp2";
+		res.writeBody("", "text/plain");
+	});
+	router.get("/mcp2", (HTTPServerRequest req, HTTPServerResponse res) @safe {
+		// Request ids start at 1 with initialize, so tools/list is 2.
+		res.headers["Content-Type"] = "text/event-stream";
+		res.bodyWriter.write(
+			"id: e2\ndata: {\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"tools\":[]}}\n\n");
+	});
+
+	size_t tools = size_t.max;
+	const failure = runAgainstFakeServer(router, (string url) @safe {
+		auto client = McpClient.http(url);
+		scope (exit)
+			client.close();
+		client.initialize("2025-11-25");
+		tools = client.listTools().tools.length;
+	});
+	assert(failure.length == 0, "scenario failed: " ~ failure);
+	assert(tools == 0);
 }
 
 unittest  // a resume GET answered 404 for the session reports the session expired
