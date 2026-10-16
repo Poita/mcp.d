@@ -1076,6 +1076,19 @@ final class McpClient : ClientProtocol
 		liveStreams_[stream] = true;
 	}
 
+	/// Track a stream just opened, or cancel it and throw when the client closed
+	/// while the open was in flight, since `close()` has already cancelled the
+	/// streams it knew of.
+	private void trackOrCancel(SubscriptionStream stream) @safe
+	{
+		if (closed_)
+		{
+			stream.cancel();
+			throw new TransportClosedException("the client is closed");
+		}
+		trackStream(stream);
+	}
+
 	/// Remember a managed event subscription so `close()` can cancel it, dropping
 	/// any that already ended.
 	private void trackSubscription(EventSubscription sub) @safe
@@ -2830,7 +2843,7 @@ final class McpClient : ClientProtocol
 		auto message = makeRequest(Json(id), "subscriptions/listen", params);
 		ensureOpen();
 		auto stream = transport.openListen(message);
-		trackStream(stream);
+		trackOrCancel(stream);
 		return stream;
 	}
 
@@ -2917,7 +2930,7 @@ final class McpClient : ClientProtocol
 			throw e;
 		}
 		stream.addCleanup(() @safe nothrow{ eventStreams_.remove(key); });
-		trackStream(stream);
+		trackOrCancel(stream);
 		return stream;
 	}
 
@@ -3468,6 +3481,13 @@ final class McpClient : ClientProtocol
 			{
 			}
 		});
+		// The client may have closed while the subscribe was in flight, after
+		// `close()` cancelled the subscriptions it knew of.
+		if (closed_)
+		{
+			sub.cancel();
+			throw new TransportClosedException("the client is closed");
+		}
 		trackSubscription(sub);
 		spawnEventTask(() @safe { runWebhookRefreshLoop(sub, p, res, onControl); });
 		return sub;
@@ -11537,6 +11557,64 @@ unittest  // cancelling a webhook subscription deregisters the receiver even whe
 	known["x-mcp-subscription-id"] = "sub_x";
 	assert(rx.processDelivery("{}", known).status == 503,
 			"a cancelled subscription must stop being routed by the receiver");
+}
+
+unittest  // a webhook subscription whose subscribe completes after close() is torn down
+{
+	import std.exception : collectException;
+
+	auto c = new McpClient(new RecordingClientTransport());
+	c.enableModern();
+	c.onRpcForTest = (string method, Json params) @safe {
+		if (method == "events/subscribe")
+			c.close(); // the client closes while the subscribe is in flight
+		SubscribeResult r;
+		r.id = "sub_x";
+		return r.toJson();
+	};
+	auto rx = new WebhookReceiver();
+	SubscribeParams sp;
+	sp.name = "incident.created";
+	sp.delivery = WebhookDelivery("https://hook/x", managedTestWhsec);
+	auto e = collectException!TransportClosedException(c.subscribeWebhook(rx,
+			sp, (EventOccurrence o) @safe {}));
+	assert(e !is null, "a subscription completing after close() must fail");
+	string[string] known;
+	known["x-mcp-subscription-id"] = "sub_x";
+	assert(rx.processDelivery("{}", known).status == 503,
+			"the receiver must not route deliveries for a client that has closed");
+}
+
+unittest  // an event stream that opens after close() is cancelled
+{
+	import std.exception : collectException;
+
+	auto t = new RecordingClientTransport();
+	auto c = new McpClient(t);
+	c.enableModern();
+	t.onListen = () @safe { c.close(); };
+	StreamParams sp;
+	sp.name = "incident.created";
+	auto e = collectException!TransportClosedException(c.streamEvents(sp, (EventOccurrence o) @safe {
+		}));
+	assert(e !is null, "a stream opening after close() must fail");
+	assert(t.streams.length == 1 && t.streams[0].cancelled,
+			"the stream opened after close() must be cancelled");
+	assert(c.eventStreams_.length == 0, "its handlers must be dropped");
+}
+
+unittest  // a subscriptions/listen stream that opens after close() is cancelled
+{
+	import std.exception : collectException;
+
+	auto t = new RecordingClientTransport();
+	auto c = new McpClient(t);
+	c.enableModern();
+	t.onListen = () @safe { c.close(); };
+	auto e = collectException!TransportClosedException(
+			c.subscriptionsListen(SubscriptionFilter.init));
+	assert(e !is null, "a listen stream opening after close() must fail");
+	assert(t.streams.length == 1 && t.streams[0].cancelled);
 }
 
 unittest  // close() does not wait out an unresponsive server's webhook unsubscribe
