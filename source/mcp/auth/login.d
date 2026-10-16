@@ -325,29 +325,38 @@ class FileTokenStore : TokenStore
 	}
 
 	/// Read the on-disk token map. A genuinely absent file yields an empty map
-	/// silently (a normal first run). A present-but-unreadable/corrupt file also
-	/// yields an empty map (so the caller re-authenticates rather than crashing)
-	/// but sets `corrupt` and logs, so the failure is observable instead of looking
-	/// like a fresh store.
-	private Json tryReadMap(out bool corrupt) @safe
+	/// silently (a normal first run). A file that cannot be read, or whose bytes
+	/// do not deserialize, also yields an empty map (so the caller
+	/// re-authenticates rather than crashing) but logs, so the failure is
+	/// observable instead of looking like a fresh store. `unreadable` is set
+	/// when reading the file failed, `corrupt` when its bytes were read but did
+	/// not deserialize.
+	private Json tryReadMap(out bool corrupt, out bool unreadable) @safe
 	{
 		import std.file : exists, read;
 		import vibe.core.log : logWarn;
 
-		corrupt = false;
 		if (!path.length || !path.exists)
 			return Json.emptyObject;
+		const(ubyte)[] data;
+		try
+			data = cast(const(ubyte)[]) read(path);
+		catch (Exception e)
+		{
+			unreadable = true;
+			logWarn("FileTokenStore: token file %s could not be read (%s); treating as empty.",
+					path, e.msg);
+			return Json.emptyObject;
+		}
 		try
 		{
-			auto data = cast(const(ubyte)[]) read(path);
 			auto j = deserialize(data);
 			return j.type == Json.Type.object ? j : Json.emptyObject;
 		}
 		catch (Exception e)
 		{
 			corrupt = true;
-			logWarn(
-					"FileTokenStore: token file %s is unreadable/corrupt (%s); treating as empty. "
+			logWarn("FileTokenStore: token file %s is corrupt (%s); treating as empty. "
 					~ "Re-authentication will be required.", path, e.msg);
 			return Json.emptyObject;
 		}
@@ -355,8 +364,8 @@ class FileTokenStore : TokenStore
 
 	private Json readAll() @safe
 	{
-		bool corrupt;
-		return tryReadMap(corrupt);
+		bool corrupt, unreadable;
+		return tryReadMap(corrupt, unreadable);
 	}
 
 	override StoredToken load(string resource) @safe
@@ -386,23 +395,42 @@ class FileTokenStore : TokenStore
 		}
 
 		withFileLock(() @safe {
-			bool corrupt;
-			auto all = tryReadMap(corrupt);
+			bool corrupt, unreadable;
+			auto all = tryReadMap(corrupt, unreadable);
+			// A file that could not be read may hold other resources' tokens, so
+			// it is never replaced by a map rebuilt without them.
+			if (unreadable)
+				throw internalError("FileTokenStore: token file " ~ path
+					~ " could not be read; refusing to overwrite it");
 			// Do not silently overwrite an unparseable token file: preserve its bytes
-			// alongside (path~) so any recoverable tokens for other resources are not
+			// alongside so any recoverable tokens for other resources are not
 			// destroyed by this save.
 			if (corrupt)
-			{
-				try
-					rename(path, path ~ "~");
-				catch (Exception)
-				{
-				}
-			}
+				backUpCorruptFile();
 			all[resource] = token.toJson();
 			auto bytes = serialize(all);
 			writeSecretFile(bytes);
 		});
+	}
+
+	/// Move the token file aside to the first free name of `path~`, `path~1`,
+	/// `path~2`, ..., so earlier backups are kept, and restrict it to the owner
+	/// since it holds plaintext secrets. Throws when it cannot be moved, as the
+	/// save would otherwise destroy it.
+	private void backUpCorruptFile() @safe
+	{
+		import std.conv : to;
+		import std.file : exists, rename;
+
+		string backup = path ~ "~";
+		for (size_t n = 1; backup.exists; ++n)
+			backup = path ~ "~" ~ n.to!string;
+		try
+			rename(path, backup);
+		catch (Exception e)
+			throw internalError(
+					"FileTokenStore: could not back up corrupt token file " ~ path ~ ": " ~ e.msg);
+		restrictPermissionsOf(backup);
 	}
 
 	override void withLock(string resource, scope void delegate() @safe dg) @safe
@@ -663,33 +691,40 @@ class FileTokenStore : TokenStore
 	/// it can leave the plaintext OAuth tokens readable by other local users.
 	private void restrictPermissions() @safe
 	{
+		restrictPermissionsOf(path);
+	}
+
+	/// Restrict the file at `file` to owner-only access, as `restrictPermissions`
+	/// does for the token file.
+	private static void restrictPermissionsOf(string file) @safe
+	{
 		version (Posix)
 		{
 			import std.file : setAttributes, getAttributes, exists;
 			import core.sys.posix.sys.stat : S_IRUSR, S_IWUSR;
 			import vibe.core.log : logWarn;
 
-			if (!path.exists)
+			if (!file.length || !file.exists)
 				return;
 			try
-				setAttributes(path, S_IRUSR | S_IWUSR);
+				setAttributes(file, S_IRUSR | S_IWUSR);
 			catch (Exception e)
 			{
 				logWarn("FileTokenStore: could not restrict token file %s to owner-only (0600); "
-						~ "OAuth tokens may be readable by other local users: %s", path, e.msg);
+						~ "OAuth tokens may be readable by other local users: %s", file, e.msg);
 				return;
 			}
-			const mode = getAttributes(path);
+			const mode = getAttributes(file);
 			if (stillGroupOrOtherAccessible(mode))
 				logWarn("FileTokenStore: token file %s remains group/other-accessible after "
-						~ "chmod; OAuth tokens may be exposed to other local users", path);
+						~ "chmod; OAuth tokens may be exposed to other local users", file);
 		}
 		else version (Windows)
 		{
 			import std.file : exists;
 
-			if (path.length && path.exists)
-				restrictWindowsAcl(path, false);
+			if (file.length && file.exists)
+				restrictWindowsAcl(file, false);
 		}
 	}
 
@@ -3901,6 +3936,68 @@ version (Posix) unittest  // save() backs up an unparseable token file instead o
 	assert((() @trusted => readText(file ~ "~"))() == "{ this is not valid json");
 	// The fresh store holds the new token.
 	assert(store.load("https://mcp.example.com").accessToken == "new-secret");
+}
+
+version (Posix) unittest  // a second corrupt token file is backed up beside the first, not over it
+{
+	import std.file : tempDir, mkdirRecurse, rmdirRecurse, write, readText, getAttributes;
+	import std.path : buildPath;
+	import std.conv : octal, to;
+	import std.datetime.systime : Clock;
+	import core.sys.posix.sys.stat : S_IRWXG, S_IRWXO;
+
+	auto root = buildPath(tempDir, "mcp-login-corrupt2-" ~ Clock.currTime().stdTime.to!string);
+	mkdirRecurse(root);
+	scope (exit)
+		rmdirRecurse(root);
+	auto file = buildPath(root, "tokens.json");
+	auto store = new FileTokenStore(file);
+	StoredToken t;
+	t.accessToken = "x";
+
+	write(file, "first corrupt");
+	() @trusted {
+		import std.file : setAttributes;
+
+		setAttributes(file, octal!644);
+	}();
+	store.save("https://a.example.com", t);
+	write(file, "second corrupt");
+	store.save("https://b.example.com", t);
+
+	assert((() @trusted => readText(file ~ "~"))() == "first corrupt");
+	assert((() @trusted => readText(file ~ "~1"))() == "second corrupt");
+	assert((getAttributes(file ~ "~") & (S_IRWXG | S_IRWXO)) == 0,
+			"a backup of plaintext tokens must be owner-only");
+}
+
+version (Posix) @system unittest  // a token file that cannot be read fails the save and is left in place
+{
+	import core.sys.posix.unistd : geteuid;
+	import std.exception : assertThrown;
+	import std.file : tempDir, mkdirRecurse, rmdirRecurse, write, readText, exists, setAttributes;
+	import std.path : buildPath;
+	import std.conv : octal, to;
+	import std.datetime.systime : Clock;
+
+	if (geteuid() == 0)
+		return; // root reads a mode-000 file, so the read cannot be made to fail
+	auto root = buildPath(tempDir, "mcp-login-unreadable-" ~ Clock.currTime().stdTime.to!string);
+	mkdirRecurse(root);
+	scope (exit)
+		rmdirRecurse(root);
+	auto file = buildPath(root, "tokens.json");
+	write(file, `{"https://a.example.com":{"access_token":"keep"}}`);
+	setAttributes(file, octal!0);
+	scope (exit)
+		setAttributes(file, octal!600);
+
+	StoredToken t;
+	t.accessToken = "new";
+	assertThrown(new FileTokenStore(file).save("https://b.example.com", t));
+	assert(!exists(file ~ "~"));
+	setAttributes(file, octal!600);
+	assert(readText(file) == `{"https://a.example.com":{"access_token":"keep"}}`);
 }
 
 version (Posix) unittest  // stillGroupOrOtherAccessible flags any lingering group/other permission bit
