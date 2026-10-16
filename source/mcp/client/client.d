@@ -300,10 +300,12 @@ struct ClientSettings
 
 	/// The largest message the client accepts from the server: an HTTP response
 	/// body or SSE event, or a stdout line of a server started by `spawn`. A
-	/// larger HTTP message fails the request it belongs to, and a longer stdio
-	/// line closes the channel, so a hostile or broken server cannot make the
-	/// client allocate without bound. Ignored by `McpClient.stdio`, whose caller
-	/// supplies `readLine`.
+	/// larger HTTP message fails the request it belongs to. A longer stdio line
+	/// is skipped without being buffered: the request it answers fails (or the
+	/// server request it carries is refused) when its id is among the line's
+	/// first bytes, and the connection keeps working. Either way a hostile or
+	/// broken server cannot make the client allocate without bound. Ignored by
+	/// `McpClient.stdio`, whose caller supplies `readLine`.
 	size_t maxMessageBytes = defaultMaxMessageBytes;
 
 	/// HTTP transport only: how https servers are validated. The default
