@@ -1356,7 +1356,7 @@ final class McpServer : ServerCore
 		// (if any), so every later tasks/* request must come from the same one.
 		opts.owner = requestPrincipal(ctx);
 		auto seed = taskRuntime_.createFor(name, input, opts);
-		taskDispatcher_.dispatch(seed.taskId, &runTaskExecutorById);
+		dispatchOrFail(seed.taskId);
 		return ToolResponse.task(makeCreateTaskResult(seed));
 	}
 
@@ -3090,8 +3090,23 @@ final class McpServer : ServerCore
 		// is moved back to `working` by `deliverInput`; re-dispatch it so the
 		// executor re-runs and consumes the answers.
 		if (taskRuntime_.deliverInput(id, responses))
-			taskDispatcher_.dispatch(id, &runTaskExecutorById);
+			dispatchOrFail(id);
 		return Json.emptyObject; // empty acknowledgement
+	}
+
+	/// Hand task `id` to the dispatcher. A dispatch that throws leaves no
+	/// executor to settle the task, so the task is failed before the error
+	/// propagates; otherwise it would sit `working`, holding an unsettled slot,
+	/// until `maxUnsettledAge`.
+	private void dispatchOrFail(string id) @safe
+	{
+		try
+			taskDispatcher_.dispatch(id, &runTaskExecutorById);
+		catch (Exception e)
+		{
+			taskRuntime_.fail(id, internalError("the task could not be dispatched"));
+			throw e;
+		}
 	}
 
 	private Json doTasksCancel(Json params, RequestContext ctx, ProtocolVersion ver) @safe
@@ -8780,6 +8795,79 @@ unittest  // tasks/update resumes the executor only once every requested key is 
 	assert("error" !in rest);
 	assert(*runs == 2);
 	assert(s.tasks.statusOf(id).get == TaskStatus.completed);
+}
+
+version (unittest) private final class FailingAfterDispatcher : TaskDispatcher
+{
+	// Dispatches run synchronously until `failFrom` dispatches have happened;
+	// every later one throws, as a queue-backed dispatcher with a broker down.
+	size_t dispatched;
+	size_t failFrom;
+
+	this(size_t failFrom) @safe
+	{
+		this.failFrom = failFrom;
+	}
+
+	void dispatch(string taskId, void delegate(string taskId) @safe run) @safe
+	{
+		if (dispatched++ >= failFrom)
+			throw new Exception("dispatcher unavailable");
+		run(taskId);
+	}
+}
+
+unittest  // a tasks/update whose re-dispatch fails settles the task failed instead of leaving it working
+{
+	import mcp.protocol.tasks : TaskStatus;
+
+	TaskOptions o;
+	o.dispatcher = new FailingAfterDispatcher(1);
+	auto s = new McpServer("t", "1");
+	s.enableTasks(o);
+	Tool desc;
+	desc.name = "ask";
+	desc.inputSchema = Json(["type": Json("object")]);
+	s.registerTaskTool(desc, (TaskContext tc) @safe {
+		if (!tc.hasInput("a"))
+			return tc.requireInput([InputRequest.elicitation("a", "A?")]);
+		return Json(["content": Json.emptyArray]);
+	});
+	auto created = s.handle(modernReq(1, "tools/call",
+			Json(["name": Json("ask"), "arguments": Json.emptyObject]))).get;
+	const id = created["result"]["taskId"].get!string;
+	assert(s.tasks.statusOf(id).get == TaskStatus.inputRequired);
+
+	auto resp = s.handle(modernReq(2, "tasks/update", taskUpdate(id,
+			Json(["a": Json(["action": Json("accept")])])))).get;
+	assert("error" in resp);
+	assert(s.tasks.statusOf(id).get == TaskStatus.failed);
+	assert(s.tasks.store.countUnsettled("") == 0);
+}
+
+unittest  // a task whose first dispatch fails is settled failed, so it holds no unsettled slot
+{
+	import mcp.protocol.tasks : TaskStatus;
+
+	TaskOptions o;
+	o.dispatcher = new FailingAfterDispatcher(0);
+	o.idGenerator = () @safe => "undispatched";
+	auto s = new McpServer("t", "1");
+	s.enableTasks(o);
+	Tool desc;
+	desc.name = "work";
+	desc.inputSchema = Json(["type": Json("object")]);
+	s.registerTaskTool(desc, (TaskContext tc) @safe => Json([
+			"content": Json.emptyArray
+	]));
+	auto resp = s.handle(modernReq(1, "tools/call", Json([
+				"name": Json("work"),
+				"arguments": Json.emptyObject
+	]))).get;
+	// A throwing tool handler is reported as an `isError` tool result.
+	assert(resp["result"]["isError"].get!bool);
+	assert(s.tasks.statusOf("undispatched").get == TaskStatus.failed);
+	assert(s.tasks.store.countUnsettled("") == 0);
 }
 
 unittest  // tasks/update with no or empty inputResponses is -32602 and re-runs nothing
