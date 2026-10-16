@@ -136,7 +136,10 @@ ResourceServerConfig resourceServer(JwtVerifierConfig vc, string resource) @safe
 /// accepts only tokens bearing the access-token-only `scp` (delegated) or
 /// `roles` (app-only) claim, which Entra never puts in an id_token.
 ///
-/// `tenant` must be a concrete tenant GUID or a registered domain name.
+/// `tenant` must be the directory (tenant) id GUID. Entra stamps that GUID in
+/// the `iss` of every v2.0 token, even when its configuration is looked up by a
+/// registered domain name, so a domain name would reject every token and is
+/// refused.
 /// The pseudo-tenants `"common"`, `"organizations"`, and `"consumers"` are
 /// rejected because Entra ID never stamps them in the `iss` claim of a real
 /// token — every token would fail the issuer check at runtime. For a
@@ -185,7 +188,7 @@ private bool hasEntraAccessTokenClaim(Json claims) @safe
 }
 
 /// Microsoft Entra ID for a multi-tenant app: accepts tokens from any of the
-/// allowed `tenants` (GUIDs or registered domain names) and no other. Each
+/// allowed `tenants` (directory id GUIDs, as for `entraId`) and no other. Each
 /// tenant's v2.0 issuer is pinned as in `entraId`, and a token is verified only
 /// by the tenant its `iss` names (so that tenant's JWKS outage answers 503), so
 /// the `iss` check is never dropped — with
@@ -244,13 +247,32 @@ private void requireEntraAudience(JwtPresetOptions opts, string fn) @safe
 
 private void requireConcreteEntraTenant(string tenant, string fn) @safe
 {
-	enforce(tenant.length > 0,
-			fn ~ ": tenant must be a concrete tenant GUID or domain name, not an empty string.");
+	enforce(tenant.length > 0, fn ~ ": tenant must be a concrete tenant GUID, not an empty string.");
 	enforce(tenant != "common" && tenant != "organizations" && tenant != "consumers",
 			fn ~ ": pseudo-tenants (\"common\", \"organizations\", \"consumers\") are not "
 			~ "supported — Entra ID never stamps them in the iss claim, so every token "
-			~ "would be rejected. Pass a concrete tenant GUID or domain; for a multi-tenant "
+			~ "would be rejected. Pass a concrete tenant GUID; for a multi-tenant "
 			~ "app, list the tenants it serves with entraIdTenants.");
+	enforce(isGuid(tenant),
+			fn ~ ": tenant must be the directory (tenant) id GUID. Entra ID stamps the GUID "
+			~ "in the iss claim even when a domain name is used, so a domain name would "
+			~ "reject every token.");
+}
+
+/// Whether `s` has the 8-4-4-4-12 hexadecimal form of a GUID.
+private bool isGuid(string s) @safe pure nothrow @nogc
+{
+	import std.ascii : isHexDigit;
+
+	if (s.length != 36)
+		return false;
+	foreach (i, c; s)
+	{
+		const dash = i == 8 || i == 13 || i == 18 || i == 23;
+		if (dash ? c != '-' : !isHexDigit(c))
+			return false;
+	}
+	return true;
 }
 
 /// Auth0. Pins the issuer `https://{domain}/` (Auth0 issuers carry the trailing
@@ -721,9 +743,12 @@ unittest  // entraId and entraIdTenants require an explicit audience instead of 
 	import std.algorithm : canFind;
 	import std.exception : collectExceptionMsg;
 
-	const one = collectExceptionMsg(entraId("tenant-a", JwtPresetOptions(mcpUrl)));
+	const one = collectExceptionMsg(entraId("11111111-1111-1111-1111-111111111111",
+			JwtPresetOptions(mcpUrl)));
 	assert(one.canFind("audience"), one);
-	const many = collectExceptionMsg(entraIdTenants(["tenant-a"], JwtPresetOptions(mcpUrl)));
+	const many = collectExceptionMsg(entraIdTenants([
+			"11111111-1111-1111-1111-111111111111"
+	], JwtPresetOptions(mcpUrl)));
 	assert(many.canFind("audience"), many);
 }
 
@@ -760,13 +785,16 @@ unittest  // entraId's pseudo-tenant error points at an issuer-checked multi-ten
 
 unittest  // entraIdTenants pins one v2.0 issuer per allowed tenant
 {
-	auto cfg = entraIdTenants(["tenant-a", "tenant-b"],
-			JwtPresetOptions(mcpUrl, "api://my-mcp-server", ["mcp.read"]));
+	auto cfg = entraIdTenants([
+		"11111111-1111-1111-1111-111111111111",
+		"22222222-2222-2222-2222-222222222222"
+	], JwtPresetOptions(mcpUrl, "api://my-mcp-server", ["mcp.read"]));
 	assert(cfg.enabled);
 	assert(cfg.resource == mcpUrl);
-	assert(cfg.authorizationServers == [
-		"https://login.microsoftonline.com/tenant-a/v2.0",
-		"https://login.microsoftonline.com/tenant-b/v2.0"
+	assert(cfg.authorizationServers
+			== [
+				"https://login.microsoftonline.com/11111111-1111-1111-1111-111111111111/v2.0",
+				"https://login.microsoftonline.com/22222222-2222-2222-2222-222222222222/v2.0"
 	]);
 	assert(cfg.scopesSupported == ["mcp.read"]);
 	assert(!cfg.validator("not-a-jwt").valid);
@@ -819,7 +847,29 @@ unittest  // entraIdTenants rejects an empty allowlist and pseudo-tenants
 	import std.exception : assertThrown;
 
 	assertThrown(entraIdTenants([], JwtPresetOptions(mcpUrl)));
-	assertThrown(entraIdTenants(["tenant-a", "common"], JwtPresetOptions(mcpUrl, "api://my-app")));
+	assertThrown(entraIdTenants([
+			"11111111-1111-1111-1111-111111111111", "common"
+	], JwtPresetOptions(mcpUrl, "api://my-app")));
+}
+
+unittest  // entraId rejects a tenant domain name, which never appears in a v2.0 token's iss
+{
+	import std.algorithm : canFind;
+	import std.exception : collectExceptionMsg;
+
+	const msg = collectExceptionMsg(entraId("contoso.onmicrosoft.com",
+			JwtPresetOptions(mcpUrl, "api://my-app")));
+	assert(msg !is null && msg.canFind("GUID"), msg);
+	assert(collectExceptionMsg(entraIdTenants(["contoso.onmicrosoft.com"],
+			JwtPresetOptions(mcpUrl, "api://my-app"))) !is null);
+}
+
+unittest  // entraId accepts a tenant GUID in either letter case
+{
+	cast(void) entraId("11111111-2222-3333-4444-555555555555",
+			JwtPresetOptions(mcpUrl, "api://my-app"));
+	cast(void) entraId("ABCDEF01-2345-6789-ABCD-EF0123456789",
+			JwtPresetOptions(mcpUrl, "api://my-app"));
 }
 
 unittest  // entraId rejects an empty tenant string at call time
@@ -866,7 +916,7 @@ unittest  // BROKER: google(...).brokered(...) reaches issue-own-token mode thro
 unittest  // a JWT preset wires a working validator that rejects garbage tokens
 {
 	// No live network: the validator parses the bearer and fails closed on junk.
-	auto cfg = entraId("tenant", JwtPresetOptions(mcpUrl, "api://x"));
+	auto cfg = entraId("11111111-1111-1111-1111-111111111111", JwtPresetOptions(mcpUrl, "api://x"));
 	assert(cfg.validator !is null);
 	assert(!cfg.validator("not-a-jwt").valid);
 }
