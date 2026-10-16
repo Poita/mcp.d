@@ -218,8 +218,8 @@ final class EventHandle(A, P)
 	/// NODE-LOCAL: like `onSubscribe`, the 1->0 transition is per-node — the refcount
 	/// is held in this `EventsRuntime` instance, not in the shared store. On a
 	/// multi-node deployment this fires once per node as each node's last local
-	/// subscription lapses, not once cluster-wide. Cluster-coherent teardown via a
-	/// shared-store atomic refcount is future work.
+	/// subscription lapses, not once cluster-wide. Write the hook to be idempotent
+	/// across nodes.
 	EventHandle onUnsubscribe(void delegate(A args, scope SubContext ctx) @safe hook) @safe
 	{
 		auto reg = rt_.liveRegistration(name_);
