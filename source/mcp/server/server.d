@@ -3705,6 +3705,11 @@ final class McpServer : ServerCore
 			throw missingRequiredClientCapability(missing.get);
 
 		Json args = requestArguments(params, "prompts/get");
+		// GetPromptRequest types `arguments` as a map of string to string; a null
+		// value reads as an absent argument.
+		foreach (key, value; args.byKeyValue)
+			if (value.type != Json.Type.string && value.type != Json.Type.null_)
+				throw invalidParams("prompts/get argument '" ~ key ~ "' must be a string");
 		// Validate declared required arguments before invoking the handler so a
 		// missing required argument yields -32602 instead of a default-valued
 		// prompt (spec: server/prompts § Error Handling / Implementation
@@ -13490,4 +13495,19 @@ unittest  // registerPrompt rejects an empty name
 	auto s = McpServer.stateless("t", "1");
 	Prompt p = {name: ""};
 	assertThrown(s.registerPrompt(p, (Json) @safe => GetPromptResult.init));
+}
+
+unittest  // prompts/get rejects a non-string argument value with -32602
+{
+	auto s = McpServer.stateless("t", "1");
+	bool ran;
+	Prompt p = {name: "pr"};
+	s.registerPrompt(p, (Json) @safe { ran = true; return GetPromptResult.init; });
+	Json params = Json.emptyObject;
+	params["name"] = "pr";
+	params["arguments"] = Json(["x": Json(5)]);
+	auto resp = s.handle(Message(makeRequest(Json(1), "prompts/get", params))).get;
+	assert("error" in resp, resp.toString);
+	assert(resp["error"]["code"].get!int == ErrorCode.invalidParams);
+	assert(!ran);
 }
