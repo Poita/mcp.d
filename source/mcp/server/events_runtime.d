@@ -648,6 +648,7 @@ final class EventsRuntime
 	private BackgroundLoop worker_; // the periodic worker `startDeliveryWorker` runs
 	private bool backlogged_; // the last drain claimed a full batch, so more may be ready
 	private TerminatePost[] terminatePosts_; // terminated envelopes waiting for a poster
+	private string[string] coalescedMisses_; // subscription id -> furthest position missed while suspended, not yet in the store
 	private size_t terminatePosters_; // tasks posting terminated envelopes
 
 	this(WebhookSubscriptionStore webhookStore = null, EventsOptions opts = EventsOptions.init) @safe
@@ -1754,6 +1755,7 @@ final class EventsRuntime
 				trackedJobs_.remove(jobId);
 		emitBackfill_.remove(subId);
 		nextFetchAt_.remove(subId);
+		coalescedMisses_.remove(subId);
 		if (auto held = subId in heldWebhookRefs_)
 		{
 			auto key = *held;
@@ -2411,7 +2413,15 @@ final class EventsRuntime
 				catch (Exception e)
 					logEventsError("match threw", e);
 				if (matched)
-					noteMissed(sub.id, occ.cursor);
+				{
+					// Once the store records a debt, later misses only move its
+					// position forward: they are kept here and written by the
+					// worker or the reactivating refresh, not once per emit.
+					if (sub.owesGap && !occ.cursor.isNull)
+						coalescedMisses_[sub.id] = occ.cursor.get;
+					else
+						noteMissed(sub.id, occ.cursor);
+				}
 				continue;
 			}
 			// A backfill still paging reaches this event in the ring buffer.
@@ -2598,7 +2608,7 @@ final class EventsRuntime
 
 	/// Run the periodic worker until `stopDeliveryWorker` is called: every
 	/// `interval` it evicts aged emit-buffer events, expires poll leases, sweeps lapsed webhook subscriptions,
-	/// reconciles delivery bookkeeping with the shared store and queue, runs the
+	/// records the positions suspended subscriptions missed, reconciles delivery bookkeeping with the shared store and queue, runs the
 	/// poll-driven webhook pass, and drains the delivery queue.
 	/// `enableEvents` starts one per server at `workerInterval`; starting again
 	/// replaces (and stops) a worker already running. A multi-node deployment
@@ -2642,6 +2652,7 @@ final class EventsRuntime
 		guarded("emit buffer eviction", &buffer_.evictExpired);
 		guarded("poll-lease sweep", &sweepPollLeases);
 		guarded("webhook sweep", &sweepWebhookSubscriptions);
+		guarded("missed-position flush", &flushCoalescedMisses);
 		guarded("delivery reconciliation", &reconcileDeliveries);
 		guarded("poll-driven webhook pass", &pollWebhookSubscriptions);
 		guarded("delivery drain", &drainDeliveries);
@@ -2894,6 +2905,7 @@ final class EventsRuntime
 	// is queued first, so a crash in between re-sends it rather than losing it.
 	private void flushMissed(WebhookSubscription sub) @safe
 	{
+		recordCoalescedMiss(sub.id);
 		auto sn = webhookStore_.get(sub.id);
 		if (sn.isNull || !sn.get.owesGap)
 			return;
@@ -2907,6 +2919,25 @@ final class EventsRuntime
 			cur.missedCursor = Nullable!string.init;
 			return true;
 		});
+	}
+
+	// Write the furthest position `subId` missed while suspended to the store.
+	private void recordCoalescedMiss(string subId) @safe
+	{
+		if (auto c = subId in coalescedMisses_)
+		{
+			const cursor = *c;
+			coalescedMisses_.remove(subId);
+			noteMissed(subId, nullable(cursor));
+		}
+	}
+
+	/// Write every coalesced missed position to the store. The periodic worker
+	/// calls this, so a refresh on another node sees the furthest miss.
+	void flushCoalescedMisses() @safe
+	{
+		foreach (id; coalescedMisses_.keys)
+			recordCoalescedMiss(id);
 	}
 
 	private static bool sameCursor(const Nullable!string a, const Nullable!string b) @safe pure nothrow
@@ -9723,4 +9754,52 @@ unittest  // a drain starts no more delivery runs than the node's concurrency bo
 	assert(rt.runningSubscriptions_.length == 2);
 	// The third job stays in the queue for a later drain or another node.
 	assert(queue.lease(1_000_000L, 1000, 0).length == 1);
+}
+
+unittest  // events missed while suspended cost no store write per emit, and the gap still covers them
+{
+	static final class CasCountingStore : ForwardingStore
+	{
+		int casCalls;
+
+		override bool compareAndSwap(WebhookSubscription sub, ulong expectedRevision) @safe
+		{
+			casCalls++;
+			return inner.compareAndSwap(sub, expectedRevision);
+		}
+	}
+
+	auto store = new CasCountingStore();
+	auto ft = new FakeWebhookTransport();
+	EventsOptions o;
+	o.nowMs = () @safe => 1_000_000L;
+	o.nowIso = () @safe => "t";
+	o.allowPrivateCallbackHosts = true;
+	o.webhookTransport = ft;
+	o.deliveryExecutor = (void delegate() @safe job) @safe { job(); };
+	o.deliverySleep = (Duration d) @safe {};
+	o.webhookMaxAttempts = 1;
+	o.webhookSuspension.minAttempts = 2;
+	auto rt = new EventsRuntime(store, o);
+	EventRegistration reg = {descriptor: EventType("n"), emitOnly: true};
+	rt.register(reg);
+	auto r = rt.subscribeWebhook(webhookSub("n", "https://proxy/hooks"), "user-1");
+	ft.eventStatuses = [500, 500];
+	rt.emit(EventOccurrence("evt_1", "n", "t"));
+	rt.emit(EventOccurrence("evt_2", "n", "t"));
+	assert(!store.get(r.id).get.active);
+
+	store.casCalls = 0;
+	foreach (i; 3 .. 13)
+		rt.emit(EventOccurrence("evt_" ~ i.to!string, "n", "t"));
+	assert(store.casCalls <= 1);
+
+	// The worker records the furthest missed position in the store.
+	rt.tick();
+	assert(store.get(r.id).get.missedCursor.get == seqCursor(12));
+
+	rt.emit(EventOccurrence("evt_13", "n", "t"));
+	rt.subscribeWebhook(webhookSub("n", "https://proxy/hooks"), "user-1");
+	auto gapPosts = controlPostsOf(ft, "gap");
+	assert(parseJsonString(gapPosts[$ - 1].body)["cursor"].get!string == seqCursor(13));
 }
