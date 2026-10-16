@@ -3817,7 +3817,14 @@ struct ElicitParams
 		p.raw = j;
 		if (j.type != Json.Type.object)
 			return p;
-		tryGet(j, "mode", p.mode);
+		if ("mode" in j)
+		{
+			import mcp.protocol.jsonhelpers : stringOrThrow;
+
+			p.mode = stringOrThrow(j["mode"], "mode");
+			if (p.mode != "form" && p.mode != "url")
+				throw invalidParams("Unknown elicitation mode: " ~ p.mode);
+		}
 		tryGet(j, "message", p.message);
 		if ("requestedSchema" in j && j["requestedSchema"].type == Json.Type.object)
 			p.requestedSchema = j["requestedSchema"];
@@ -3827,6 +3834,9 @@ struct ElicitParams
 		// malformed `url` from the server is refused before any handler sees it.
 		if (p.isUrl && !isValidElicitationUrl(p.url))
 			throw invalidParams("URL-mode elicitation requires a valid http(s) url");
+		// The id correlates the request with its completion notification.
+		if (p.isUrl && p.elicitationId.length == 0)
+			throw invalidParams("URL-mode elicitation requires an elicitationId");
 		return p;
 	}
 }
@@ -4139,6 +4149,45 @@ unittest  // ElicitParams rejects a url-mode request whose url is not a valid we
 		auto e = collectException!McpException(ElicitParams.fromJson(p));
 		assert(e !is null && e.code == ErrorCode.invalidParams, url);
 	}
+}
+
+unittest  // ElicitParams rejects an unknown mode with -32602
+{
+	import std.exception : collectException;
+
+	foreach (mode; [`"bogus"`, `"URL"`, `""`])
+	{
+		auto e = collectException!McpException(ElicitParams.fromJson(
+				parseJsonString(`{"mode":` ~ mode ~ `,"message":"m"}`)));
+		assert(e !is null && e.code == ErrorCode.invalidParams, mode);
+	}
+}
+
+unittest  // ElicitParams rejects a non-string mode with -32602
+{
+	import std.exception : collectException;
+
+	auto e = collectException!McpException(
+			ElicitParams.fromJson(parseJsonString(`{"mode":1,"message":"m"}`)));
+	assert(e !is null && e.code == ErrorCode.invalidParams);
+}
+
+unittest  // ElicitParams rejects a url-mode request without an elicitationId with -32602
+{
+	import std.exception : collectException;
+
+	foreach (id; [``, `,"elicitationId":""`, `,"elicitationId":7`])
+	{
+		auto e = collectException!McpException(ElicitParams.fromJson(parseJsonString(
+				`{"mode":"url","message":"m","url":"https://example.com/c"` ~ id ~ `}`)));
+		assert(e !is null && e.code == ErrorCode.invalidParams, id);
+	}
+}
+
+unittest  // ElicitParams accepts an explicit form mode
+{
+	auto p = ElicitParams.fromJson(parseJsonString(`{"mode":"form","message":"m"}`));
+	assert(p.mode == "form" && !p.isUrl);
 }
 
 unittest  // ElicitParams.toJson omits mode for the form default
