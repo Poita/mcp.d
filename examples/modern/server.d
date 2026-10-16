@@ -74,7 +74,7 @@ final class StatelessModernApi
 
 void main(string[] args) @safe
 {
-	auto server = new McpServer("modern-server", "1.0.0",
+	auto server = McpServer.stateless("modern-server", "1.0.0",
 			nullable("A modern (2026-07-28) demo server: server/discover + per-request _meta."));
 
 	// Register every @tool / @resource annotated method in one call; input

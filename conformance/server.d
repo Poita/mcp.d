@@ -41,10 +41,10 @@ void main(string[] args)
 	// Mcp-Session-Id, so that lane runs STATEFUL. 2026-07-28 has no initialize
 	// handshake: per-request _meta, server/discover, MRTR input, so that lane runs
 	// the (default) stateless server.
-	auto server = stateless ? new McpServer("dlang-mcp-conformance", "0.1.0",
-			nullable("Conformance test server for dlang-mcp-sdk.")) : McpServer.stateful(
-			"dlang-mcp-conformance",
-			"0.1.0", nullable("Conformance test server for dlang-mcp-sdk."));
+	auto server = stateless ? McpServer.stateless("dlang-mcp-conformance",
+			"0.1.0", nullable("Conformance test server for dlang-mcp-sdk."))
+		: McpServer.stateful("dlang-mcp-conformance",
+				"0.1.0", nullable("Conformance test server for dlang-mcp-sdk."));
 
 	registerEchoTool(server);
 	registerAddTool(server);

@@ -47,7 +47,7 @@ void main(string[] args) @safe
 	// Single-threaded path: the plain SDK entry point (one event loop, one core).
 	if (threads == 1)
 	{
-		auto server = new McpServer("bench-server", "1.0.0");
+		auto server = McpServer.stateless("bench-server", "1.0.0");
 		registerModule!(bench_server)(server);
 		StreamableHttpOptions opts;
 		opts.port = port;
@@ -69,7 +69,7 @@ private void runMultiThreaded(ushort port, string host, int threads) @trusted
 
 	void serve()
 	{
-		auto server = new McpServer("bench-server", "1.0.0");
+		auto server = McpServer.stateless("bench-server", "1.0.0");
 		registerModule!(bench_server)(server);
 
 		auto router = new URLRouter;

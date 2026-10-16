@@ -104,7 +104,7 @@ import mcp.transport.streamable_http : runStreamableHttp, StreamableHttpOptions;
 
 void main()
 {
-    auto server = new McpServer("my-server", "1.0.0");
+    auto server = McpServer.stateless("my-server", "1.0.0");
     // ... register tools, resources, and prompts ...
 
     StreamableHttpOptions o;

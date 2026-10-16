@@ -345,19 +345,14 @@ final class McpServer : ServerCore
 	// `onClientNotification_`. Set via `setRootsListChangedHandler`.
 	private void delegate(RequestContext ctx) @safe onRootsListChanged_;
 
-	this(string name, string version_, Nullable!string instructions = Nullable!string.init) @safe
+	// Construction goes through the `stateless`/`stateful` factories, so every
+	// server names its mode explicitly.
+	private this(string name, string version_, Nullable!string instructions = Nullable!string.init) @safe
 	{
 		this(Implementation(name, version_), instructions);
 	}
 
-	/// Construct a server from a fully-populated `Implementation`, letting the
-	/// author advertise a display `title` (>= 2025-06-18) plus `description`,
-	/// `websiteUrl`, and `icons` (>= 2025-11-25) in the `initialize` /
-	/// `server/discover` `serverInfo`. Fields newer than the negotiated protocol
-	/// version are stripped from the wire response (see `Implementation.forVersion`),
-	/// so older peers see only what they understand. Mirrors the client's full
-	/// `Implementation clientInfo` support.
-	this(Implementation serverInfo, Nullable!string instructions = Nullable!string.init) @safe
+	private this(Implementation serverInfo, Nullable!string instructions = Nullable!string.init) @safe
 	{
 		this.serverInfo_ = serverInfo;
 		this.instructions = instructions;
@@ -400,7 +395,12 @@ final class McpServer : ServerCore
 		return s;
 	}
 
-	/// As `stateless(string, string, ...)`, from a full `Implementation`.
+	/// As `stateless(string, string, ...)`, from a fully-populated
+	/// `Implementation`, letting the author advertise a display `title`
+	/// (>= 2025-06-18) plus `description`, `websiteUrl`, and `icons`
+	/// (>= 2025-11-25) in the `initialize` / `server/discover` `serverInfo`. Fields
+	/// newer than the negotiated protocol version are stripped from the wire
+	/// response (see `Implementation.forVersion`).
 	static McpServer stateless(Implementation serverInfo,
 			Nullable!string instructions = Nullable!string.init) @safe
 	{
@@ -4678,7 +4678,7 @@ unittest  // registerResourceTemplate rejects a duplicate uriTemplate
 {
 	import std.exception : assertThrown;
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	ResourceTemplate t = {uriTemplate: "res://items/{id}", name: "items"};
 	auto reader = delegate(string uri, string[string] params) @safe => ResourceContents.makeText(
 			uri, "text/plain", "x");
@@ -4688,7 +4688,7 @@ unittest  // registerResourceTemplate rejects a duplicate uriTemplate
 
 unittest  // removeResourceTemplate unregisters a template by its uriTemplate
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	ResourceTemplate t = {uriTemplate: "res://items/{id}", name: "items"};
 	auto reader = delegate(string uri, string[string] params) @safe => ResourceContents.makeText(
 			uri, "text/plain", "x");
@@ -4704,7 +4704,7 @@ unittest  // removeResourceTemplate unregisters a template by its uriTemplate
 
 unittest  // registerResourceTemplate accepts a path variable followed by a query expression
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	ResourceTemplate t = {
 		uriTemplate: "res://items/{id}{?fields}", name: "items"
 	};
@@ -4739,7 +4739,7 @@ version (unittest)
 {
 	private McpServer makeTestServer() @safe
 	{
-		auto s = new McpServer("test-srv", "0.1.0");
+		auto s = McpServer.stateless("test-srv", "0.1.0");
 		registerAddTool(s);
 		return s;
 	}
@@ -4778,7 +4778,7 @@ unittest  // public flagship type uses single-cap Mcp* casing
 	// The server class must be reachable under the consistent `McpServer`
 	// name (matching McpException, MrtrToolHandler, etc.), not `MCPServer`.
 	static assert(is(McpServer == class));
-	auto s = new McpServer("casing-srv", "0.1.0");
+	auto s = McpServer.stateless("casing-srv", "0.1.0");
 	assert(s !is null);
 }
 
@@ -5038,7 +5038,7 @@ unittest  // a request with a fractional id is tracked in flight and cancellable
 {
 	import vibe.data.json : parseJsonString;
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	string[] keys;
 	Tool t = {name: "probe"};
 	s.registerTool(t, (Json args, RequestContext ctx) @safe {
@@ -5063,7 +5063,7 @@ unittest  // Implementation constructor advertises full serverInfo on 2025-11-25
 				Icon("https://example.com/i.png")
 		]
 	};
-	auto s = new McpServer(info);
+	auto s = McpServer.stateless(info);
 	Json params = Json.emptyObject;
 	params["protocolVersion"] = "2025-11-25";
 	params["capabilities"] = Json.emptyObject;
@@ -5088,7 +5088,7 @@ unittest  // serverInfo strips 2025-11-25-only fields when negotiating 2025-06-1
 				Icon("https://example.com/i.png")
 		]
 	};
-	auto s = new McpServer(info);
+	auto s = McpServer.stateless(info);
 	Json params = Json.emptyObject;
 	params["protocolVersion"] = "2025-06-18";
 	params["capabilities"] = Json.emptyObject;
@@ -5107,7 +5107,7 @@ unittest  // serverInfo strips title when negotiating 2025-03-26 (pre-BaseMetada
 	Implementation info = {
 		name: "rich-srv", version_: "2.0", title: nullable("Rich Server")
 	};
-	auto s = new McpServer(info);
+	auto s = McpServer.stateless(info);
 	Json params = Json.emptyObject;
 	params["protocolVersion"] = "2025-03-26";
 	params["capabilities"] = Json.emptyObject;
@@ -5121,7 +5121,7 @@ unittest  // serverInfo strips title when negotiating 2025-03-26 (pre-BaseMetada
 
 unittest  // the (name, version) constructor emits a minimal serverInfo
 {
-	auto s = new McpServer("plain-srv", "1.0");
+	auto s = McpServer.stateless("plain-srv", "1.0");
 	Json params = Json.emptyObject;
 	params["protocolVersion"] = "2025-11-25";
 	params["capabilities"] = Json.emptyObject;
@@ -5144,7 +5144,7 @@ unittest  // server/discover (2026-07-28) emits the full stored serverInfo
 				Icon("https://example.com/i.png")
 		]
 	};
-	auto s = new McpServer(info);
+	auto s = McpServer.stateless(info);
 	// server/discover is a modern-only RPC: dispatch it as a modern request.
 	auto resp = s.handle(modernReq(1, "server/discover")).get;
 	auto si = resp["result"]["_meta"][MetaKey.serverInfo];
@@ -5439,7 +5439,7 @@ unittest  // tools/call is -32601 when the server advertises no tools capability
 	// A server that never registered a tool advertises no `tools` capability, so a
 	// tools/call MUST be reported as -32601 (method not found), not -32602
 	// (invalid params / unknown tool), mirroring the gating of tools/list.
-	auto s = new McpServer("no-tools-srv", "0.1.0");
+	auto s = McpServer.stateless("no-tools-srv", "0.1.0");
 	Json p = Json.emptyObject;
 	p["name"] = "nope";
 	auto resp = s.handle(req(1, "tools/call", p)).get;
@@ -5448,7 +5448,7 @@ unittest  // tools/call is -32601 when the server advertises no tools capability
 
 unittest  // resources/read is -32601 when the server advertises no resources capability
 {
-	auto s = new McpServer("no-res-srv", "0.1.0");
+	auto s = McpServer.stateless("no-res-srv", "0.1.0");
 	Json p = Json.emptyObject;
 	p["uri"] = "file:///nope";
 	auto resp = s.handle(req(1, "resources/read", p)).get;
@@ -5457,7 +5457,7 @@ unittest  // resources/read is -32601 when the server advertises no resources ca
 
 unittest  // prompts/get is -32601 when the server advertises no prompts capability
 {
-	auto s = new McpServer("no-prompt-srv", "0.1.0");
+	auto s = McpServer.stateless("no-prompt-srv", "0.1.0");
 	Json p = Json.emptyObject;
 	p["name"] = "nope";
 	auto resp = s.handle(req(1, "prompts/get", p)).get;
@@ -5466,7 +5466,7 @@ unittest  // prompts/get is -32601 when the server advertises no prompts capabil
 
 unittest  // tools/list emits a tool descriptor's _meta
 {
-	auto s = new McpServer("meta-srv", "0.1.0");
+	auto s = McpServer.stateless("meta-srv", "0.1.0");
 	Tool t = {name: "tagged"};
 	Json m = Json.emptyObject;
 	m["x.example/group"] = "demo";
@@ -5483,7 +5483,7 @@ unittest  // tools/list emits a tool descriptor's _meta
 
 unittest  // tools/call propagates a handler's result-level _meta to the wire
 {
-	auto s = new McpServer("meta-srv", "0.1.0");
+	auto s = McpServer.stateless("meta-srv", "0.1.0");
 	Tool t = {name: "withmeta"};
 	s.registerTool(t, (Json args) @safe {
 		Json m = Json.emptyObject;
@@ -5510,7 +5510,7 @@ unittest  // output-schema validation: conforming structuredContent passes
 {
 	import mcp.api.binding : jsonSchemaOf, SchemaUse;
 
-	auto s = new McpServer("vsrv", "0.1.0");
+	auto s = McpServer.stateless("vsrv", "0.1.0");
 	struct AddResult
 	{
 		int result;
@@ -5539,7 +5539,7 @@ unittest  // output-schema validation: non-conforming structuredContent errors
 {
 	import mcp.api.binding : jsonSchemaOf, SchemaUse;
 
-	auto s = new McpServer("vsrv", "0.1.0");
+	auto s = McpServer.stateless("vsrv", "0.1.0");
 	struct AddResult
 	{
 		int result;
@@ -5568,7 +5568,7 @@ unittest  // output-schema validation is off by default: bad output still ships
 {
 	import mcp.api.binding : jsonSchemaOf, SchemaUse;
 
-	auto s = new McpServer("vsrv", "0.1.0");
+	auto s = McpServer.stateless("vsrv", "0.1.0");
 	struct AddResult
 	{
 		int result;
@@ -5596,7 +5596,7 @@ unittest  // output-schema validation: missing structuredContent is a violation
 {
 	import mcp.api.binding : jsonSchemaOf, SchemaUse;
 
-	auto s = new McpServer("vsrv", "0.1.0");
+	auto s = McpServer.stateless("vsrv", "0.1.0");
 	struct AddResult
 	{
 		int result;
@@ -5627,7 +5627,7 @@ unittest  // output-schema validation: an isError result is exempt from the stru
 {
 	import mcp.api.binding : jsonSchemaOf, SchemaUse;
 
-	auto s = new McpServer("vsrv", "0.1.0");
+	auto s = McpServer.stateless("vsrv", "0.1.0");
 	struct AddResult
 	{
 		int result;
@@ -5660,7 +5660,7 @@ unittest  // output-schema validation off: missing structuredContent still ships
 {
 	import mcp.api.binding : jsonSchemaOf, SchemaUse;
 
-	auto s = new McpServer("vsrv", "0.1.0");
+	auto s = McpServer.stateless("vsrv", "0.1.0");
 	struct AddResult
 	{
 		int result;
@@ -5687,7 +5687,7 @@ unittest  // input-schema validation: a missing required argument yields an isEr
 {
 	import mcp.api.binding : jsonSchemaOf;
 
-	auto s = new McpServer("vsrv", "0.1.0");
+	auto s = McpServer.stateless("vsrv", "0.1.0");
 	struct AddArgs
 	{
 		int a;
@@ -5720,7 +5720,7 @@ unittest  // input-schema validation: a wrong-typed argument yields an isError r
 {
 	import mcp.api.binding : jsonSchemaOf;
 
-	auto s = new McpServer("vsrv", "0.1.0");
+	auto s = McpServer.stateless("vsrv", "0.1.0");
 	struct AddArgs
 	{
 		int a;
@@ -5751,7 +5751,7 @@ unittest  // input-schema validation: conforming arguments dispatch normally
 {
 	import mcp.api.binding : jsonSchemaOf;
 
-	auto s = new McpServer("vsrv", "0.1.0");
+	auto s = McpServer.stateless("vsrv", "0.1.0");
 	struct AddArgs
 	{
 		int a;
@@ -5783,7 +5783,7 @@ unittest  // input-schema validation is ON by default: a missing required argume
 	// Spec: server/tools § Security Considerations — "Servers MUST: Validate all
 	// tool inputs". The SDK validates tool arguments against the declared
 	// inputSchema by default; no explicit opt-in is required.
-	auto s = new McpServer("vsrv", "0.1.0");
+	auto s = McpServer.stateless("vsrv", "0.1.0");
 	struct AddArgs
 	{
 		int a;
@@ -5812,7 +5812,7 @@ unittest  // input-schema validation default can be turned off via disableInputS
 {
 	import mcp.api.binding : jsonSchemaOf;
 
-	auto s = new McpServer("vsrv", "0.1.0");
+	auto s = McpServer.stateless("vsrv", "0.1.0");
 	struct AddArgs
 	{
 		int a;
@@ -5844,7 +5844,7 @@ unittest  // a genuinely malformed CallToolRequest (non-string name) is still -3
 	// The spec reserves protocol errors for requests that fail the
 	// CallToolRequest schema itself (name/arguments), so a non-string `name`
 	// must remain a JSON-RPC -32602 error even with input-schema validation on.
-	auto s = new McpServer("vsrv", "0.1.0");
+	auto s = McpServer.stateless("vsrv", "0.1.0");
 	struct AddArgs
 	{
 		int a;
@@ -5868,7 +5868,7 @@ unittest  // a genuinely malformed CallToolRequest (non-string name) is still -3
 
 unittest  // a tool handler that throws becomes an isError result, not a protocol error
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	Tool boom = {name: "boom"};
 	CallToolResult delegate(Json) @safe handler = (Json) {
 		throw new Exception("kaboom");
@@ -5886,7 +5886,7 @@ unittest  // a throwing tool handler's message stays server-side by default
 {
 	import std.algorithm.searching : canFind;
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	Tool boom = {name: "boom"};
 	CallToolResult delegate(Json) @safe handler = (Json) {
 		throw new Exception("open /srv/secret.db failed");
@@ -5899,7 +5899,7 @@ unittest  // a throwing tool handler's message stays server-side by default
 
 unittest  // exposeInternalErrors sends a throwing tool handler's message as isError content
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	s.exposeInternalErrors();
 	Tool boom = {name: "boom"};
 	CallToolResult delegate(Json) @safe handler = (Json) {
@@ -5913,7 +5913,7 @@ unittest  // exposeInternalErrors sends a throwing tool handler's message as isE
 
 unittest  // a ToolError's message always reaches the client as isError content
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	Tool boom = {name: "boom"};
 	CallToolResult delegate(Json) @safe handler = (Json) {
 		throw new ToolError("no such city");
@@ -5929,7 +5929,7 @@ unittest  // a PromptError's message always reaches the client as a JSON-RPC err
 {
 	import mcp.server.responses : PromptError;
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	GetPromptResult delegate(Json) @safe handler = (Json) {
 		throw new PromptError("no such template");
 	};
@@ -5941,7 +5941,7 @@ unittest  // a PromptError's message always reaches the client as a JSON-RPC err
 
 unittest  // any other prompt handler exception is masked as Internal error
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	GetPromptResult delegate(Json) @safe handler = (Json) {
 		throw new Exception("open /srv/prompts.db failed");
 	};
@@ -5962,7 +5962,7 @@ unittest  // notifications/cancelled mid-handler: ctx.isCancelled flips and the 
 	// A handler that, while running, simulates a concurrent cancellation arriving
 	// for its own request, then observes ctx.isCancelled and returns. The server
 	// MUST NOT send a response for the cancelled request.
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	bool sawCancelled;
 	Tool slow = {name: "slow"};
 	s.registerTool(slow, (Json args, RequestContext ctx) @safe {
@@ -6012,7 +6012,7 @@ unittest  // an uncancelled request still receives its normal response
 
 unittest  // cancellation matches string-id requests too
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	bool sawCancelled;
 	Tool slow = {name: "slow"};
 	s.registerTool(slow, (Json args, RequestContext ctx) @safe {
@@ -6066,7 +6066,7 @@ unittest  // a cancellation on connection B must not suppress connection A's sam
 	// in-flight request with the IDENTICAL JSON-RPC id 42. A cancellation that
 	// arrives on connection B's channel must only match B's in-flight key, never
 	// A's: the registry is keyed by (connectionToken, id), not the bare id.
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	auto ctxA = new ConnCtx("conn-A");
 	auto ctxB = new ConnCtx("conn-B");
 
@@ -6127,7 +6127,7 @@ unittest  // a handler reads its own session's version and capabilities from ctx
 
 unittest  // a modern handler reads the request's own _meta capabilities from ctx
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	bool seenSampling;
 	ProtocolVersion seenVersion;
 	Tool probe = {name: "probe"};
@@ -6149,7 +6149,7 @@ unittest  // a modern handler reads the request's own _meta capabilities from ct
 
 unittest  // a cancellation on the SAME connection still cancels
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	auto ctxA = new ConnCtx("conn-A");
 	bool sawCancelled;
 
@@ -6174,7 +6174,7 @@ unittest  // a cancellation on the SAME connection still cancels
 
 unittest  // notifications/roots/list_changed fires the dedicated server hook
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	bool sawRootsChanged;
 	s.setRootsListChangedHandler((RequestContext ctx) @safe {
 		sawRootsChanged = true;
@@ -6187,7 +6187,7 @@ unittest  // notifications/roots/list_changed fires the dedicated server hook
 
 unittest  // notifications/roots/list_changed also reaches the generic client-notification observer
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	string seenMethod;
 	s.setClientNotificationHandler((string method, Json params, RequestContext ctx) @safe {
 		seenMethod = method;
@@ -6199,7 +6199,7 @@ unittest  // notifications/roots/list_changed also reaches the generic client-no
 
 unittest  // unrecognised client notifications are surfaced to the generic observer
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	string seenMethod;
 	s.setClientNotificationHandler((string method, Json params, RequestContext ctx) @safe {
 		seenMethod = method;
@@ -6212,7 +6212,7 @@ unittest  // unrecognised client notifications are surfaced to the generic obser
 
 unittest  // client-notification observers see which connection a notification came from
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	string[] rootsFrom, notesFrom;
 	s.setRootsListChangedHandler((RequestContext ctx) @safe {
 		rootsFrom ~= connectionTokenOf(ctx);
@@ -6229,7 +6229,7 @@ unittest  // client-notification observers see which connection a notification c
 
 unittest  // a throwing client-notification observer does not escape handle()
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	s.setRootsListChangedHandler((RequestContext ctx) @safe {
 		throw new Exception("roots boom");
 	});
@@ -6269,7 +6269,7 @@ unittest  // server-consumed notifications do NOT reach the generic client obser
 {
 	// notifications/initialized and notifications/cancelled are handled by the
 	// server itself and must not be forwarded to the application observer.
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	bool observed;
 	s.setClientNotificationHandler((string method, Json params, RequestContext ctx) @safe {
 		observed = true;
@@ -6377,7 +6377,7 @@ unittest  // handleRaw(text, conn, token, auth) registers in-flight requests und
 {
 	// A notifications/cancelled arriving on another POST of the same session is
 	// matched by (token, id), so the batch path must register under that token.
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	auto conn = new ConnectionState;
 	conn.negotiated = ProtocolVersion.v2025_03_26;
 	string[] keys;
@@ -6518,7 +6518,7 @@ unittest  // handleRaw answers valid members of a mixed batch and errors malform
 
 unittest  // registering a tool whose name already exists throws
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	Tool a = {name: "dup"};
 	s.registerTool(a, (Json) @safe => CallToolResult.init);
 	bool threw;
@@ -6531,7 +6531,7 @@ unittest  // registering a tool whose name already exists throws
 
 unittest  // registering a resource whose uri already exists throws
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	Resource r = {uri: "test://x", name: "x"};
 	s.registerResource(r, () @safe => ResourceContents.makeText("test://x", "text/plain", "hi"));
 	bool threw;
@@ -6544,7 +6544,7 @@ unittest  // registering a resource whose uri already exists throws
 
 unittest  // removeResource drops a registered resource and reports success
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	// A server that removes resources at runtime advertises listChanged, which
 	// keeps resources/list valid even once the set is empty.
 	s.enableResourcesListChanged();
@@ -6560,14 +6560,14 @@ unittest  // removeResource drops a registered resource and reports success
 
 unittest  // removeResource reports false for a uri that was never registered
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	assert(!s.removeResource("test://missing"),
 			"removeResource should report false for an unknown uri");
 }
 
 unittest  // a uri can be re-registered after removeResource
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	Resource r = {uri: "test://x", name: "x"};
 	s.registerResource(r, () @safe => ResourceContents.makeText("test://x", "text/plain", "one"));
 	s.removeResource("test://x");
@@ -6583,7 +6583,7 @@ unittest  // a uri can be re-registered after removeResource
 
 unittest  // registering a prompt whose name already exists throws
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	Prompt p = {name: "dup"};
 	s.registerPrompt(p, (Json) @safe => GetPromptResult.init);
 	bool threw;
@@ -6596,7 +6596,7 @@ unittest  // registering a prompt whose name already exists throws
 
 unittest  // resources/list and resources/read for a direct resource
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	Resource r = {uri: "test://x", name: "x", mimeType: nullable("text/plain")};
 	s.registerResource(r, () @safe => ResourceContents.makeText("test://x", "text/plain", "hi"));
 
@@ -6611,7 +6611,7 @@ unittest  // resources/list and resources/read for a direct resource
 
 unittest  // a direct resource reader may return several contents
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	s.registerResource(Resource("test://x", "x"), () @safe => [
 		ResourceContents.makeText("test://x", "text/plain", "one"),
 		ResourceContents.makeText("test://x#2", "text/plain", "two")
@@ -6634,7 +6634,7 @@ unittest  // a direct resource reader may return several contents
 
 unittest  // a resource template reader may return several contents
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	ResourceTemplate t = {uriTemplate: "test://dir/{name}", name: "dir"};
 	s.registerResourceTemplate(t, (string uri,
 			string[string] params) @safe => [
@@ -6652,7 +6652,7 @@ unittest  // a resource template reader may return several contents
 
 unittest  // resources/read strips per-content _meta for a 2024-11-05 client
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	Resource r = {uri: "test://x", name: "x", mimeType: nullable("text/plain")};
 	s.registerResource(r, () @safe {
 		auto c = ResourceContents.makeText("test://x", "text/plain", "hi");
@@ -6676,7 +6676,7 @@ unittest  // resources/read strips per-content _meta for a 2024-11-05 client
 
 unittest  // resources/read keeps per-content _meta for a 2025-06-18 client
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	Resource r = {uri: "test://x", name: "x", mimeType: nullable("text/plain")};
 	s.registerResource(r, () @safe {
 		auto c = ResourceContents.makeText("test://x", "text/plain", "hi");
@@ -6698,7 +6698,7 @@ unittest  // resources/read keeps per-content _meta for a 2025-06-18 client
 
 unittest  // resources/read for an unknown uri is resourceNotFound
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	Resource r = {uri: "test://x", name: "x"};
 	s.registerResource(r, () @safe => ResourceContents.makeText("test://x", "text/plain", "hi"));
 	Json p = Json.emptyObject;
@@ -6709,7 +6709,7 @@ unittest  // resources/read for an unknown uri is resourceNotFound
 
 unittest  // resources/read not-found carries structured data.uri (spec example shape)
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	Resource r = {uri: "test://x", name: "x"};
 	s.registerResource(r, () @safe => ResourceContents.makeText("test://x", "text/plain", "hi"));
 	Json p = Json.emptyObject;
@@ -6720,7 +6720,7 @@ unittest  // resources/read not-found carries structured data.uri (spec example 
 
 unittest  // resource templates resolve and read with captured params
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	ResourceTemplate t = {uriTemplate: "test://tpl/{id}/data", name: "tpl"};
 	s.registerResourceTemplate(t, (string uri, string[string] params) @safe {
 		return ResourceContents.makeText(uri, "application/json", "id=" ~ params["id"]);
@@ -6737,7 +6737,7 @@ unittest  // resource templates resolve and read with captured params
 
 unittest  // prompts/list and prompts/get with arguments
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	Prompt pr = {name: "greet", description: nullable("greets")};
 	pr.arguments = [PromptArgument("who", nullable("name"), true)];
 	s.registerPrompt(pr, (Json args) @safe {
@@ -6759,7 +6759,7 @@ unittest  // prompts/list and prompts/get with arguments
 
 unittest  // prompts/get returns -32602 when a required argument is missing
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	Prompt pr = {name: "greet", description: nullable("greets")};
 	pr.arguments = [PromptArgument("who", nullable("name"), true)];
 	s.registerPrompt(pr, (Json args) @safe {
@@ -6787,7 +6787,7 @@ unittest  // prompts/get returns -32602 when a required argument is missing
 
 unittest  // prompts/get allows a missing optional argument
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	Prompt pr = {name: "greet", description: nullable("greets")};
 	pr.arguments = [PromptArgument("who", nullable("name"), false)];
 	s.registerPrompt(pr, (Json args) @safe {
@@ -6812,7 +6812,7 @@ version (unittest) private void registerCompletablePrompt(McpServer s, string na
 
 unittest  // completion/complete returns -32601 when no completions capability is declared
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	// No completion handler registered => completions capability not advertised.
 	auto resp = s.handle(req(1, "completion/complete", Json.emptyObject)).get;
 	assert("error" in resp);
@@ -6822,7 +6822,7 @@ unittest  // completion/complete returns -32601 when no completions capability i
 
 unittest  // completion/complete uses the registered typed handler
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	registerCompletablePrompt(s, "greet");
 	s.setCompletionRequestHandler((CompleteRequest) @safe {
 		CompleteResult r;
@@ -6838,7 +6838,7 @@ unittest  // completion/complete uses the registered typed handler
 
 unittest  // completion/complete rejects params missing a valid ref or argument with -32602
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	bool called;
 	s.setCompletionRequestHandler((CompleteRequest) @safe {
 		called = true;
@@ -6869,7 +6869,7 @@ unittest  // completion/complete rejects params missing a valid ref or argument 
 
 unittest  // typed completion handler receives a parsed CompleteRequest
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	registerCompletablePrompt(s, "greet");
 	string seenName;
 	string seenArg;
@@ -6897,7 +6897,7 @@ unittest  // typed completion handler receives a parsed CompleteRequest
 
 unittest  // typed completion handler receives the resolved context.arguments
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	registerCompletablePrompt(s, "greet");
 	string[string] seenContext;
 	s.setCompletionRequestHandler((CompleteRequest r) @safe {
@@ -6926,7 +6926,7 @@ unittest  // typed completion handler receives the resolved context.arguments
 
 unittest  // a per-argument completer is dispatched on its (reference, argument) pair
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	registerCompletablePrompt(s, "code_review");
 	immutable langs = ["c", "cpp", "d", "go", "java", "javascript"];
 	s.setArgumentCompleter(CompletionReference.forPrompt("code_review"), "language",
@@ -6947,7 +6947,7 @@ unittest  // a per-argument completer is dispatched on its (reference, argument)
 
 unittest  // an empty global completion result falls back to a per-argument completer
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	registerCompletablePrompt(s, "code_review");
 	s.setCompletionRequestHandler((CompleteRequest r) @safe {
 		CompleteResult result;
@@ -6977,7 +6977,7 @@ unittest  // an empty global completion result falls back to a per-argument comp
 
 unittest  // a per-argument completer surface answers a non-matching request with empty
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	registerCompletablePrompt(s, "code_review");
 	s.setArgumentCompleter(CompletionReference.forPrompt("code_review"),
 			"language", (CompleteRequest r) @safe => CompleteResult(["d"]));
@@ -6996,7 +6996,7 @@ unittest  // a per-argument completer surface answers a non-matching request wit
 
 unittest  // registering a per-argument completer advertises the completions capability
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	s.setArgumentCompleter(CompletionReference.forPrompt("p"), "a",
 			(CompleteRequest r) @safe => CompleteResult.init);
 	auto caps = s.capabilities();
@@ -7005,7 +7005,7 @@ unittest  // registering a per-argument completer advertises the completions cap
 
 unittest  // typed completion handler advertises the completions capability
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	s.setCompletionRequestHandler((CompleteRequest) @safe {
 		CompleteResult res;
 		return res;
@@ -7020,7 +7020,7 @@ unittest  // initialize requires a non-empty string protocolVersion
 {
 	import mcp.protocol.errors : ErrorCode;
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	// Omitted protocolVersion -> invalidParams (not a silent downgrade).
 	auto missing = s.handle(req(1, "initialize", Json.emptyObject)).get;
 	assert(missing["error"]["code"].get!int == ErrorCode.invalidParams);
@@ -7040,7 +7040,7 @@ unittest  // registerResourceTemplate rejects adjacent variables that can never 
 {
 	import std.exception : assertThrown;
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	ResourceTemplate t = {uriTemplate: "test://{a}{b}", name: "adjacent"};
 	assertThrown!Exception(s.registerResourceTemplate(t, (string uri, string[string] params) @safe {
 			return ResourceContents.makeText(uri, "text/plain", "x");
@@ -7054,7 +7054,7 @@ unittest  // logging/setLevel is refused on a stateless server (no session-scope
 	// -32601 on every transport (matching resources/subscribe) rather than being a
 	// silent no-op; log emission still works per-request. Statefulness, not the
 	// transport, governs this — the stdio transport follows the same rule.
-	auto s = new McpServer("t", "1"); // default mode is stateless
+	auto s = McpServer.stateless("t", "1"); // default mode is stateless
 	s.enableLogging();
 	Json p = Json.emptyObject;
 	p["level"] = "debug";
@@ -7180,7 +7180,7 @@ version (unittest) private final class ModernLogCtx : BaseRequestContext
 
 version (unittest) private McpServer makeNoisyLogServer() @safe
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	s.enableLogging();
 	Tool t = {name: "noisy"};
 	s.registerTool(t, (Json args, RequestContext ctx) @safe {
@@ -7271,7 +7271,7 @@ version (unittest) private McpServer makeNoisyLogServerNoLogging() @safe
 {
 	// Same noisy tool as makeNoisyLogServer, but enableLogging() is NEVER called,
 	// so the server advertises no `logging` capability in initialize.
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	Tool t = {name: "noisy"};
 	s.registerTool(t, (Json args, RequestContext ctx) @safe {
 		ctx.log("debug", Json("d"));
@@ -7320,7 +7320,7 @@ unittest  // modern: no notifications/message when the logging capability was ne
 
 unittest  // capabilities reflect registered features
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	Resource r = {uri: "u", name: "u"};
 	s.registerResource(r, () @safe => ResourceContents.makeText("u", "text/plain", "x"));
 	s.enableLogging();
@@ -7332,7 +7332,7 @@ unittest  // capabilities reflect registered features
 
 unittest  // advertised extensions appear in server/discover capabilities under the modern protocol
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	Json settings = Json.emptyObject;
 	settings["maxConcurrent"] = 4;
 	s.advertiseExtension("io.modelcontextprotocol/tasks", settings);
@@ -7347,7 +7347,7 @@ unittest  // advertised extensions appear in server/discover capabilities under 
 
 unittest  // the Tasks extension is NOT advertised for legacy negotiated versions
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	s.advertiseExtension("io.modelcontextprotocol/tasks", Json.emptyObject);
 
 	foreach (ver; ["2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25"])
@@ -7362,7 +7362,7 @@ unittest  // the Tasks extension is NOT advertised for legacy negotiated version
 
 unittest  // Apps/Skills extensions are advertised when negotiating 2025-11-25
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	s.advertiseExtension("io.modelcontextprotocol/ui", Json.emptyObject);
 	s.advertiseExtension("io.modelcontextprotocol/skills", Json.emptyObject);
 
@@ -7377,7 +7377,7 @@ unittest  // Apps/Skills extensions are advertised when negotiating 2025-11-25
 
 unittest  // a mixed extension set negotiated at 2025-11-25 advertises Apps/Skills but not Tasks
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	s.advertiseExtension("io.modelcontextprotocol/tasks", Json.emptyObject);
 	s.advertiseExtension("io.modelcontextprotocol/skills", Json.emptyObject);
 
@@ -7391,7 +7391,7 @@ unittest  // a mixed extension set negotiated at 2025-11-25 advertises Apps/Skil
 
 unittest  // completions are NOT advertised when negotiating 2024-11-05
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	s.setCompletionRequestHandler((CompleteRequest r) @safe => CompleteResult([]));
 
 	Json params = Json.emptyObject;
@@ -7402,7 +7402,7 @@ unittest  // completions are NOT advertised when negotiating 2024-11-05
 
 unittest  // completions ARE advertised from 2025-03-26 onward
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	s.setCompletionRequestHandler((CompleteRequest r) @safe => CompleteResult([]));
 
 	foreach (ver; ["2025-03-26", "2025-06-18", "2025-11-25"])
@@ -7421,7 +7421,7 @@ unittest  // prompts/get downgrades audio content to a text placeholder for a 20
 	// carrying audio content, retrieved by a peer negotiated at 2024-11-05 (where
 	// audio is out-of-schema), must come back as a text placeholder rather than
 	// leaking an `audio` block.
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	Prompt descr = {name: "p"};
 	s.registerPrompt(descr, (Json) @safe {
 		GetPromptResult r;
@@ -7445,7 +7445,7 @@ unittest  // prompts/get downgrades resource_link content for a 2025-03-26 peer
 	// resource_link is in-schema only from 2025-06-18; a 2025-03-26 peer must see a
 	// text placeholder, exercised through the server dispatch path (not just the
 	// type method).
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	Prompt descr = {name: "p"};
 	s.registerPrompt(descr, (Json) @safe {
 		GetPromptResult r;
@@ -7468,7 +7468,7 @@ unittest  // prompts/get keeps resource_link content intact for a 2025-06-18 pee
 {
 	// The projection must NOT over-strip: from 2025-06-18 resource_link is valid,
 	// so it survives the dispatch path unchanged.
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	Prompt descr = {name: "p"};
 	s.registerPrompt(descr, (Json) @safe {
 		GetPromptResult r;
@@ -7489,7 +7489,7 @@ unittest  // prompts/get keeps resource_link content intact for a 2025-06-18 pee
 
 unittest  // server reads the extensions a client advertises at initialize
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	Json caps = Json.emptyObject;
 	Json ext = Json.emptyObject;
 	ext["io.modelcontextprotocol/ui"] = Json.emptyObject;
@@ -7631,7 +7631,7 @@ unittest  // resources/subscribe is rejected with -32601 when capability not adv
 	// The `subscribe` resources capability is optional and only advertised when
 	// enableResourceSubscriptions() was called. A server that never advertised it
 	// MUST reject resources/subscribe with -32601 rather than silently accepting.
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	Json p = Json.emptyObject;
 	p["uri"] = "test://w";
 	auto resp = s.handle(req(1, "resources/subscribe", p)).get;
@@ -7648,7 +7648,7 @@ unittest  // modern: resources/subscribe is method-not-found (subscriptions/list
 	// modern (stateless) the method does not exist, so it MUST be answered with
 	// -32601 and MUST NOT record the URI. (A stateless server cannot even opt into
 	// subscriptions — enableResourceSubscriptions() throws — so none is enabled.)
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	Json p = Json.emptyObject;
 	p["uri"] = "test://w";
 	auto resp = s.handle(modernReq(1, "resources/subscribe", p)).get;
@@ -7658,7 +7658,7 @@ unittest  // modern: resources/subscribe is method-not-found (subscriptions/list
 
 unittest  // resources/unsubscribe is rejected with -32601 when capability not advertised
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	Json p = Json.emptyObject;
 	p["uri"] = "test://w";
 	auto resp = s.handle(req(1, "resources/unsubscribe", p)).get;
@@ -7668,7 +7668,7 @@ unittest  // resources/unsubscribe is rejected with -32601 when capability not a
 
 unittest  // modern: resources/unsubscribe is method-not-found (removed for subscriptions/listen)
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	Json p = Json.emptyObject;
 	p["uri"] = "test://w";
 	auto resp = s.handle(modernReq(2, "resources/unsubscribe", p)).get;
@@ -7680,7 +7680,7 @@ unittest  // server/discover is modern-only: a legacy session gets -32601
 	// `server/discover` is a modern RPC (stable peers handshake via `initialize`).
 	// A request whose effective version is the default stable negotiated version
 	// MUST be answered with -32601 rather than being served the discover result.
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	auto resp = s.handle(req(1, "server/discover")).get;
 	assert("error" in resp);
 	assert(resp["error"]["code"].get!int == ErrorCode.methodNotFound);
@@ -7688,7 +7688,7 @@ unittest  // server/discover is modern-only: a legacy session gets -32601
 
 unittest  // server/discover under the modern protocol still serves the discover result
 {
-	auto s = new McpServer("disc-srv", "1.0");
+	auto s = McpServer.stateless("disc-srv", "1.0");
 	auto resp = s.handle(modernReq(1, "server/discover")).get;
 	assert("error" !in resp);
 	assert(resp["result"]["_meta"][MetaKey.serverInfo]["name"].get!string == "disc-srv");
@@ -7729,7 +7729,7 @@ unittest  // enableTasks throws rather than replace a runtime that holds tasks
 {
 	import std.exception : assertThrown;
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	auto rt = s.enableTasks();
 	const id = rt.create().taskId;
 	assertThrown(s.enableTasks());
@@ -7739,7 +7739,7 @@ unittest  // enableTasks throws rather than replace a runtime that holds tasks
 
 unittest  // enableTasks may replace a runtime that holds no tasks
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	auto first = s.enableTasks();
 	auto second = s.enableTasks();
 	assert(second !is first);
@@ -7776,7 +7776,7 @@ unittest  // removing the last tool, resource or prompt keeps its capability and
 
 unittest  // notify() on stdio honours the listen stream's filter
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	s.enableToolsListChanged();
 	string[] sink;
 	assert(s.tryServeStdioListen(stdioListenReq(1), (string line) @safe {
@@ -7798,7 +7798,7 @@ unittest  // a second stdio subscriptions/listen closes the first with its resul
 
 	import std.algorithm : canFind;
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	s.enableToolsListChanged();
 	string[] frames;
 	void sink(string line) @safe
@@ -7828,7 +7828,7 @@ unittest  // no stdio listen notification follows the stream's closing result
 {
 	import vibe.data.json : parseJsonString;
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	s.enableToolsListChanged();
 	string[] frames;
 	void sink(string line) @safe
@@ -7853,7 +7853,7 @@ unittest  // an invalid replacement stdio listen leaves the open stream untouche
 	import std.conv : to;
 	import vibe.data.json : parseJsonString;
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	registerStubResources(s, "test://stub");
 	s.enableToolsListChanged();
 	string[] frames;
@@ -7882,7 +7882,7 @@ unittest  // a stdio subscriptions/listen missing _meta clientCapabilities is -3
 {
 	import vibe.data.json : parseJsonString;
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	s.enableToolsListChanged();
 	string[] frames;
 	Json meta = Json.emptyObject;
@@ -7900,7 +7900,7 @@ unittest  // a stdio events/stream missing _meta clientCapabilities is -32602
 {
 	import vibe.data.json : parseJsonString;
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	string[] frames;
 	Json meta = Json.emptyObject;
 	meta[MetaKey.protocolVersion] = "2026-07-28";
@@ -7917,7 +7917,7 @@ unittest  // a stdio events/stream on a server without events is -32601 naming e
 {
 	import vibe.data.json : parseJsonString;
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	string[] frames;
 	assert(s.tryServeStdioEventsStream(modernReq(1, "events/stream",
 			Json(["name": Json("x")])), (string l) @safe { frames ~= l; }));
@@ -7932,7 +7932,7 @@ unittest  // stdio subscriptions/listen is cancellable via notifications/cancell
 	import std.algorithm : canFind;
 
 	// Open a stdio modern `subscriptions/listen` stream opting into toolsListChanged.
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	s.enableToolsListChanged();
 	string[] frames;
 	void sink(string line) @safe
@@ -7974,7 +7974,7 @@ unittest  // stdio subscriptions/listen cancellation does not match a string req
 {
 	// JSON-RPC ids are typed: the string "42" names a different request than the
 	// number 42, so it leaves the listen stream open.
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	s.enableToolsListChanged();
 	string[] frames;
 	void sink(string line) @safe
@@ -8003,7 +8003,7 @@ unittest  // stdio subscriptions/listen cancellation ignores a fractional reques
 {
 	import std.exception : assertNotThrown;
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	s.enableToolsListChanged();
 	void sink(string line) @safe
 	{
@@ -8031,7 +8031,7 @@ unittest  // stdio subscriptions/listen does not wipe negotiated session clientC
 	// must NOT clobber the shared negotiated clientCaps a concurrent/subsequent
 	// stateful request would observe. The modern per-request gate already reads the
 	// listen request's own _meta, so dropping the overwrite is free.
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	s.enableToolsListChanged();
 
 	Json initParams = Json.emptyObject;
@@ -8136,7 +8136,7 @@ version (unittest)
 
 unittest  // enableTasks advertises the tasks extension under 2026-07-28 server/discover
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	s.enableTasks();
 	auto resp = s.handle(modernReq(1, "server/discover")).get;
 	auto caps = resp["result"]["capabilities"];
@@ -8146,7 +8146,7 @@ unittest  // enableTasks advertises the tasks extension under 2026-07-28 server/
 
 unittest  // tasks/* are -32601 when the server never enabled tasks
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	foreach (m; ["tasks/get", "tasks/update", "tasks/cancel"])
 	{
 		Json p = Json(["taskId": Json("x")]);
@@ -8159,7 +8159,7 @@ unittest  // tasks/* are -32601 when the server never enabled tasks
 
 unittest  // tasks/* are -32601 on a legacy session even when enabled (extension is modern-only)
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	s.enableTasks();
 	foreach (m; ["tasks/get", "tasks/update", "tasks/cancel"])
 	{
@@ -8173,7 +8173,7 @@ unittest  // tasks/* are -32601 on a legacy session even when enabled (extension
 
 unittest  // tasks/list and tasks/result do not exist in the extension (always -32601)
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	s.enableTasks();
 	foreach (m; ["tasks/list", "tasks/result"])
 	{
@@ -8184,7 +8184,7 @@ unittest  // tasks/list and tasks/result do not exist in the extension (always -
 
 unittest  // tasks/get for an unknown taskId is -32602 with the taskId echoed
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	s.enableTasks();
 	auto resp = s.handle(modernReq(1, "tasks/get", Json(["taskId": Json("nope")]))).get;
 	assert(resp["error"]["code"].get!int == ErrorCode.invalidParams);
@@ -8209,7 +8209,7 @@ version (unittest)
 
 unittest  // enableEvents advertises the events extension under the modern protocol discover
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	s.enableEvents();
 	auto resp = s.handle(modernReq(1, "server/discover")).get;
 	auto caps = resp["result"]["capabilities"];
@@ -8218,7 +8218,7 @@ unittest  // enableEvents advertises the events extension under the modern proto
 
 unittest  // the events extension does not advertise listChanged, which no listen filter can carry
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	s.enableEvents();
 	auto resp = s.handle(modernReq(1, "server/discover")).get;
 	auto settings = resp["result"]["capabilities"]["extensions"]["io.modelcontextprotocol/events"];
@@ -8227,7 +8227,7 @@ unittest  // the events extension does not advertise listChanged, which no liste
 
 unittest  // events/* are -32601 when the server never enabled events
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	foreach (m; [
 		"events/list", "events/poll", "events/subscribe", "events/unsubscribe"
 	])
@@ -8241,7 +8241,7 @@ unittest  // events/* are -32601 when the server never enabled events
 
 unittest  // events/* are -32601 on a legacy session even when enabled (modern-only)
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	s.enableEvents();
 	foreach (m; [
 		"events/list", "events/poll", "events/subscribe", "events/unsubscribe"
@@ -8256,7 +8256,7 @@ unittest  // events/* are -32601 on a legacy session even when enabled (modern-o
 
 unittest  // events/list returns registered event types with computed delivery modes
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	s.enableEvents();
 	registerDemoEvent(s);
 	auto resp = s.handle(modernReq(1, "events/list")).get;
@@ -8268,7 +8268,7 @@ unittest  // events/list returns registered event types with computed delivery m
 
 unittest  // events/poll bootstraps then drains an emitted event
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	auto rt = s.enableEvents();
 	registerDemoEvent(s);
 
@@ -8292,7 +8292,7 @@ unittest  // events/poll bootstraps then drains an emitted event
 
 unittest  // events/poll on an unknown event type is -32011 NotFound
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	s.enableEvents();
 	auto resp = s.handle(modernReq(1, "events/poll", Json(["name": Json("nope")]))).get;
 	assert(resp["error"]["code"].get!int == ErrorCode.notFound);
@@ -8300,7 +8300,7 @@ unittest  // events/poll on an unknown event type is -32011 NotFound
 
 unittest  // events/subscribe without an authenticated principal is -32012 Forbidden
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	s.enableEvents();
 	registerDemoEvent(s);
 	Json p = Json.emptyObject;
@@ -8319,7 +8319,7 @@ unittest  // stdio events/stream opens with an active frame, then delivers emitt
 	import mcp.protocol.events : EventOccurrence;
 	import vibe.data.json : parseJsonString;
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	auto rt = s.enableEvents();
 	registerDemoEvent(s);
 
@@ -8353,7 +8353,7 @@ unittest  // stdio events/stream rejects a request id that already names an open
 	import mcp.protocol.events : EventOccurrence;
 	import vibe.data.json : parseJsonString;
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	auto rt = s.enableEvents();
 	registerDemoEvent(s);
 	string[] lines;
@@ -8382,7 +8382,7 @@ unittest  // stdio events/stream answers a negative maxAgeMs with InvalidParams
 {
 	import vibe.data.json : parseJsonString;
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	s.enableEvents();
 	registerDemoEvent(s);
 	string[] lines;
@@ -8406,7 +8406,7 @@ unittest  // stdio events/stream answers InternalError when on_subscribe throws 
 	import mcp.server.event_context : EventContext;
 	import mcp.server.events_runtime : EventRegistration;
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	s.enableEvents();
 	EventRegistration reg;
 	reg.descriptor.name = "n";
@@ -8434,7 +8434,7 @@ unittest  // a cancelled stdio events/stream stops receiving events
 {
 	import mcp.protocol.events : EventOccurrence;
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	auto rt = s.enableEvents();
 	registerDemoEvent(s);
 	string[] lines;
@@ -8459,7 +8459,7 @@ unittest  // cancelling string request id "9" leaves the stdio events/stream wit
 {
 	import mcp.protocol.events : EventOccurrence;
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	auto rt = s.enableEvents();
 	registerDemoEvent(s);
 	string[] lines;
@@ -8484,7 +8484,7 @@ unittest  // an HTTP connection's cancel leaves the stdio events/stream with the
 	import mcp.protocol.events : EventOccurrence;
 	import mcp.server.connection : ConnectionState;
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	auto rt = s.enableEvents();
 	registerDemoEvent(s);
 	string[] lines;
@@ -8507,7 +8507,7 @@ unittest  // an HTTP connection's cancel leaves the stdio subscriptions/listen w
 {
 	import mcp.server.connection : ConnectionState;
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	s.enableToolsListChanged();
 	string[] frames;
 	void sink(string line) @safe
@@ -8535,7 +8535,7 @@ unittest  // events/poll answers -32602 InvalidParams on the wire when arguments
 	import vibe.data.json : parseJsonString;
 	import mcp.server.events_runtime : EventRegistration;
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	s.enableEvents();
 	EventRegistration reg = {descriptor: EventType("n"), emitOnly: true};
 	reg.descriptor.inputSchema = parseJsonString(
@@ -8556,7 +8556,7 @@ unittest  // a server-terminated stdio stream gets the terminated frame, then th
 	import mcp.protocol.errors : forbidden, toErrorJson;
 	import mcp.server.events_runtime : EventRegistration;
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	auto rt = s.enableEvents();
 	EventRegistration reg = {descriptor: EventType("n"), emitOnly: true};
 	s.registerEventType(reg);
@@ -8586,7 +8586,7 @@ unittest  // hasStdioEventStreams reports open stdio push streams, not merely en
 	import mcp.server.event_context : EventContext, EventResult;
 	import mcp.server.events_runtime : EventRegistration;
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	s.enableEvents();
 	assert(!s.hasStdioEventStreams());
 
@@ -8607,7 +8607,7 @@ unittest  // tickStdioEventStreams iterates a snapshot, so a mid-tick cancel can
 	import mcp.server.event_context : EventContext, EventResult;
 	import mcp.server.events_runtime : EventRegistration;
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	s.enableEvents();
 
 	// A check-backed type whose check() cancels stream id 1 while the tick is mid-loop
@@ -8647,7 +8647,7 @@ unittest  // a stdio events/stream cancelled mid-tick gets no heartbeat from tha
 	import mcp.server.event_context : EventContext, EventResult;
 	import mcp.server.events_runtime : EventRegistration;
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	s.enableEvents();
 
 	// A check-backed type whose check() cancels both streams during the tick, so
@@ -8692,7 +8692,7 @@ unittest  // tickStdioEventStreams polls a check-backed stream and heartbeats on
 	import mcp.server.event_context : EventContext, EventResult;
 	import mcp.server.events_runtime : EventRegistration;
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	s.enableEvents();
 
 	// A check-backed type that yields one fresh event on each non-bootstrap poll.
@@ -8755,7 +8755,7 @@ unittest  // tickStdioEventStreams polls a check-backed stream and heartbeats on
 
 unittest  // a created task is served via tasks/get, progressing working -> completed
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	auto rt = s.enableTasks();
 	auto t = rt.create();
 
@@ -8778,7 +8778,7 @@ unittest  // a created task is served via tasks/get, progressing working -> comp
 
 unittest  // input_required surfaces inputRequests and tasks/update is acknowledged
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	auto rt = s.enableTasks();
 	auto t = rt.create();
 	rt.requireInput(t.taskId, Json([
@@ -8805,7 +8805,7 @@ version (unittest) private McpServer twoQuestionTaskServer(out int* runs) @safe
 {
 	import mcp.protocol.mrtr : InputRequest;
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	s.enableTasks(syncTasks());
 	Tool desc;
 	desc.name = "ask2";
@@ -8951,7 +8951,7 @@ unittest  // tasks/update with no or empty inputResponses is -32602 and re-runs 
 
 unittest  // tasks/cancel acknowledges and cancels a task
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	auto rt = s.enableTasks();
 	auto t = rt.create();
 	auto ack = s.handle(modernReq(1, "tasks/cancel", Json([
@@ -8967,7 +8967,7 @@ unittest  // tasks/cancel acknowledges and cancels a task
 
 unittest  // tasks/update for an unknown taskId is -32602
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	s.enableTasks();
 	Json up = Json(["taskId": Json("nope"), "inputResponses": Json.emptyObject]);
 	auto resp = s.handle(modernReq(1, "tasks/update", up)).get;
@@ -8976,7 +8976,7 @@ unittest  // tasks/update for an unknown taskId is -32602
 
 unittest  // registerTaskTool: tools/call returns a task handle the executor completes
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	s.enableTasks(syncTasks());
 	Tool desc;
 	desc.name = "dbl";
@@ -9030,7 +9030,7 @@ version (unittest)
 	{
 		import mcp.protocol.mrtr : InputRequest;
 
-		auto s = new McpServer("t", "1");
+		auto s = McpServer.stateless("t", "1");
 		s.enableTasks(syncTasks());
 		Tool desc;
 		desc.name = "gate";
@@ -9064,7 +9064,7 @@ unittest  // a manual task a handler creates from its request is bound to that r
 {
 	import mcp.protocol.tasks : makeCreateTaskResult;
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	auto rt = s.enableTasks();
 	Tool desc = {name: "manual"};
 	s.registerTool(desc, (Json args,
@@ -9149,7 +9149,7 @@ unittest  // a task created without an authenticated principal is not principal-
 
 unittest  // tasks/get, tasks/update, tasks/cancel are -32021 for a client without the extension
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	s.enableTasks();
 	foreach (m; ["tasks/get", "tasks/update", "tasks/cancel"])
 	{
@@ -9162,7 +9162,7 @@ unittest  // tasks/get, tasks/update, tasks/cancel are -32021 for a client witho
 
 unittest  // a task tool called without the extension runs synchronously and returns a plain result
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	s.enableTasks(syncTasks());
 	Tool desc;
 	desc.name = "dbl";
@@ -9190,7 +9190,7 @@ unittest  // a task tool run inline for a client without the extension emits no 
 {
 	import std.algorithm : canFind;
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	s.enableTasks(syncTasks());
 	Tool desc;
 	desc.name = "slow";
@@ -9222,7 +9222,7 @@ unittest  // a task tool run inline for a client without the extension emits no 
 
 unittest  // a synchronous task-tool call validates arguments before running the executor
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	s.enableTasks(syncTasks());
 	Tool desc;
 	desc.name = "dbl";
@@ -9244,7 +9244,7 @@ unittest  // a synchronous task-tool call validates arguments before running the
 
 unittest  // a synchronous task-tool result is checked against the outputSchema
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	s.enableOutputSchemaValidation();
 	s.enableTasks(syncTasks());
 	Tool desc;
@@ -9268,7 +9268,7 @@ unittest  // a synchronous task-tool call leaves no task record behind
 {
 	TaskOptions o;
 	o.idGenerator = () @safe => "inline-1";
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	o.dispatcher = new SyncTaskDispatcher();
 	s.enableTasks(o);
 	Tool desc;
@@ -9314,7 +9314,7 @@ unittest  // a synchronous task-tool call is not refused by the unsettled-task c
 
 unittest  // a task tool that requires the extension rejects a client without it with -32021
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	s.enableTasks(syncTasks());
 	Tool desc;
 	desc.name = "must-task";
@@ -9338,7 +9338,7 @@ unittest  // a task tool that requires the extension rejects a client without it
 
 unittest  // an inline task tool observes its request's cancellation through tc.cancelRequested
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	s.enableTasks(syncTasks());
 	Tool desc;
 	desc.name = "slow";
@@ -9364,7 +9364,7 @@ unittest  // an inline task tool that ends cancelled answers with requestCancell
 {
 	import std.algorithm : canFind;
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	auto rt = s.enableTasks(syncTasks());
 	Tool desc;
 	desc.name = "abort";
@@ -9383,7 +9383,7 @@ unittest  // an inline task tool that ends cancelled answers with requestCancell
 
 unittest  // an inline task tool cannot detach: the client gets -32021 naming the extension
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	s.enableTasks(syncTasks());
 	Tool desc;
 	desc.name = "handoff";
@@ -9397,7 +9397,7 @@ unittest  // an inline task tool cannot detach: the client gets -32021 naming th
 
 unittest  // a handler-built task result is rejected with -32021 for a client without the extension
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	Tool desc;
 	desc.name = "handmade-task";
 	desc.inputSchema = Json(["type": Json("object")]);
@@ -9419,7 +9419,7 @@ unittest  // a handler-built task result is rejected with -32021 for a client wi
 
 unittest  // a synchronous fall-through surfaces a failed task as its JSON-RPC error
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	s.enableTasks(syncTasks());
 	Tool desc;
 	desc.name = "boom";
@@ -9438,7 +9438,7 @@ unittest  // startTask lets an MRTR tool gather input and then escalate to a tas
 {
 	import mcp.protocol.mrtr : InputRequest;
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	s.enableTasks(syncTasks());
 	s.registerTaskExecutor("escalate", (TaskContext tc) @safe {
 		const name = tc.inputJson()["user_name"].get!string;
@@ -9493,7 +9493,7 @@ unittest  // startTask with an unregistered executor fails as a masked tool erro
 {
 	import std.algorithm.searching : canFind;
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	s.enableTasks(syncTasks());
 	Tool desc = {name: "go"};
 	s.registerTool(desc, (Json args, RequestContext ctx) @safe {
@@ -9507,7 +9507,7 @@ unittest  // startTask with an unregistered executor fails as a masked tool erro
 
 unittest  // startTask before enableTasks fails as a masked tool error, not a protocol error
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	Tool desc = {name: "go"};
 	s.registerTool(desc, (Json args, RequestContext ctx) @safe {
 		return s.startTask("x", Json.emptyObject, ctx);
@@ -9521,7 +9521,7 @@ version (unittest) private McpServer makeEscalatingServer(TaskSupport support) @
 {
 	import mcp.protocol.mrtr : InputRequest;
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	s.enableTasks(syncTasks());
 	s.registerTaskExecutor("greet", (TaskContext tc) @safe {
 		const name = tc.inputJson()["user_name"].get!string;
@@ -9606,7 +9606,7 @@ version (unittest) private Message legacyInitDeclaringTasks() @safe
 
 unittest  // a 2025-era request never exposes MRTR inputResponses or requestState
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	size_t seenResponses = size_t.max;
 	string seenState = "unset";
 	Tool desc;
@@ -9657,7 +9657,7 @@ unittest  // registerTaskTool with a clashing name leaves the existing executor 
 {
 	import std.exception : assertThrown;
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	s.enableTasks(syncTasks());
 	Tool desc;
 	desc.name = "dup";
@@ -9682,7 +9682,7 @@ unittest  // registerTaskTool: a mid-task input_required resumes on tasks/update
 {
 	import mcp.protocol.mrtr : InputRequest;
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	s.enableTasks(syncTasks());
 	Tool desc;
 	desc.name = "gate";
@@ -9793,7 +9793,7 @@ unittest  // stateful (2025-era) tools/call gates on negotiated session capabili
 
 unittest  // modern prompts/get rejects with -32021 when a required client cap is undeclared
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	Prompt pr = {name: "greet"};
 	s.registerPrompt(pr, (Json) @safe { GetPromptResult r; return r; });
 	ClientCapabilities reqCap;
@@ -9809,7 +9809,7 @@ unittest  // modern prompts/get rejects with -32021 when a required client cap i
 
 unittest  // modern prompts/get proceeds when the required cap is declared
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	Prompt pr = {name: "greet"};
 	s.registerPrompt(pr, (Json) @safe { GetPromptResult r; return r; });
 	ClientCapabilities reqCap;
@@ -9828,7 +9828,7 @@ unittest  // modern prompts/get proceeds when the required cap is declared
 
 unittest  // setPromptRequiredClientCapabilities returns false for an unknown prompt
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	ClientCapabilities reqCap;
 	reqCap.sampling = true;
 	assert(!s.setPromptRequiredClientCapabilities("nope", reqCap));
@@ -9836,7 +9836,7 @@ unittest  // setPromptRequiredClientCapabilities returns false for an unknown pr
 
 unittest  // stateful (2025-era) prompts/get gates on negotiated session capabilities
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	Prompt pr = {name: "greet"};
 	s.registerPrompt(pr, (Json) @safe { GetPromptResult r; return r; });
 	ClientCapabilities reqCap;
@@ -9857,7 +9857,7 @@ unittest  // duplicate resource, template and prompt registrations name their re
 {
 	import std.algorithm : canFind;
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	registerStubResources(s, "test://r");
 	ResourceTemplate t = {uriTemplate: "test://{x}", name: "t"};
 	s.registerResourceTemplate(t, (string uri, string[string] p) @safe => ResourceContents.init);
@@ -9902,7 +9902,7 @@ unittest  // prompts/get rejects non-object arguments with -32602 before the han
 {
 	import std.algorithm : canFind;
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	bool ran;
 	Prompt pr = {name: "greet"};
 	s.registerPrompt(pr, (Json) @safe { ran = true; return GetPromptResult(); });
@@ -9922,7 +9922,7 @@ unittest  // an unexpected handler exception reaches the client as a generic int
 {
 	import std.algorithm : canFind;
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	Resource r = {uri: "test://boom", name: "boom"};
 	s.registerResource(r, () @safe {
 		throw new Exception("open /srv/secret.db failed");
@@ -9938,7 +9938,7 @@ unittest  // an unexpected handler exception reaches the client as a generic int
 
 unittest  // exposeInternalErrors sends an unexpected exception's message to the client
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	s.exposeInternalErrors();
 	Resource r = {uri: "test://boom", name: "boom"};
 	s.registerResource(r, () @safe {
@@ -9953,7 +9953,7 @@ unittest  // exposeInternalErrors sends an unexpected exception's message to the
 
 unittest  // modern resources/read rejects with -32021 when a required client cap is undeclared
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	s.registerResource(Resource("res://x", "x"), () @safe {
 		ResourceContents c;
 		return c;
@@ -9971,7 +9971,7 @@ unittest  // modern resources/read rejects with -32021 when a required client ca
 
 unittest  // modern resources/read proceeds when the required cap is declared
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	s.registerResource(Resource("res://x", "x"), () @safe {
 		ResourceContents c;
 		return c;
@@ -9991,7 +9991,7 @@ unittest  // modern resources/read proceeds when the required cap is declared
 
 unittest  // setResourceRequiredClientCapabilities returns false for an unknown resource
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	ClientCapabilities reqCap;
 	reqCap.sampling = true;
 	assert(!s.setResourceRequiredClientCapabilities("res://nope", reqCap));
@@ -9999,7 +9999,7 @@ unittest  // setResourceRequiredClientCapabilities returns false for an unknown 
 
 unittest  // stateful (2025-era) resources/read gates on negotiated session capabilities
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	s.registerResource(Resource("res://x", "x"), () @safe {
 		ResourceContents c;
 		return c;
@@ -10019,7 +10019,7 @@ unittest  // stateful (2025-era) resources/read gates on negotiated session capa
 
 unittest  // modern resources/read via template rejects with -32021 when cap undeclared
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	ResourceTemplate tmpl = {uriTemplate: "res://{id}", name: "item"};
 	s.registerResourceTemplate(tmpl, (string uri, string[string] params) @safe {
 		ResourceContents c;
@@ -10036,7 +10036,7 @@ unittest  // modern resources/read via template rejects with -32021 when cap und
 
 unittest  // setResourceTemplateRequiredClientCapabilities returns false for unknown template
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	ClientCapabilities reqCap;
 	reqCap.sampling = true;
 	assert(!s.setResourceTemplateRequiredClientCapabilities("res://{nope}", reqCap));
@@ -10116,7 +10116,7 @@ unittest  // server/discover with no configured hint emits the mandatory ttlMs:0
 
 unittest  // per-resource registerResource hint emits ttlMs/cacheScope on a modern resources/read
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	Resource r = {uri: "test://r", name: "r", mimeType: nullable("text/plain")};
 	s.registerResource(r, () @safe => ResourceContents.makeText("test://r",
 			"text/plain", "x"), nullable(CacheHint(9.seconds, CacheScope.private_)));
@@ -10129,7 +10129,7 @@ unittest  // per-resource registerResource hint emits ttlMs/cacheScope on a mode
 
 unittest  // per-resource hint is NOT emitted on a legacy (2025-11-25) resources/read
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	Resource r = {uri: "test://r", name: "r", mimeType: nullable("text/plain")};
 	s.registerResource(r, () @safe => ResourceContents.makeText("test://r",
 			"text/plain", "x"), nullable(CacheHint(9.seconds, CacheScope.private_)));
@@ -10141,7 +10141,7 @@ unittest  // per-resource hint is NOT emitted on a legacy (2025-11-25) resources
 
 unittest  // per-template registerResourceTemplate hint emits on a matching modern resources/read
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	ResourceTemplate t = {uriTemplate: "test://{id}", name: "tmpl"};
 	s.registerResourceTemplate(t, (string uri, string[string] params) @safe {
 		return ResourceContents.makeText(uri, "text/plain", "y");
@@ -10184,7 +10184,7 @@ unittest  // modern resources/list, templates/list, prompts/list default to ttlM
 
 unittest  // modern resources/read defaults to ttlMs:0 when the resource has no hint
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	Resource r = {uri: "test://r", name: "r", mimeType: nullable("text/plain")};
 	s.registerResource(r, () @safe => ResourceContents.makeText("test://r", "text/plain", "x")); // no explicit CacheHint
 	Json p = Json.emptyObject;
@@ -10211,7 +10211,7 @@ unittest  // legacy list/read never emit the default cache hint
 // resultType.
 unittest
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	Json innerResp = Json.undefined;
 	Tool yielder = {name: "yielder", description: nullable("reentrant")};
 	s.registerTool(yielder, (Json args, RequestContext ctx) @safe {
@@ -10311,7 +10311,7 @@ unittest  // initialize is an unknown method on a modern request (removed by 202
 
 unittest  // removeTool unregisters a tool and reports whether one was removed
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	Tool keep = {name: "keep"};
 	Tool temp = {name: "temp"};
 	s.registerTool(keep, (Json) @safe => CallToolResult());
@@ -10325,7 +10325,7 @@ unittest  // removeTool unregisters a tool and reports whether one was removed
 
 unittest  // removePrompt unregisters a prompt and reports whether one was removed
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	Prompt keep = {name: "keep"};
 	Prompt temp = {name: "temp"};
 	s.registerPrompt(keep, (Json) @safe => GetPromptResult());
@@ -10405,7 +10405,7 @@ unittest  // legacy results never emit resultType
 
 unittest  // modern InputRequiredResult is stamped resultType:"input_required", not "complete"
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	registerBookTool(s);
 	auto resp = s.handle(modernCall(1, "book", [])).get;
 	assert("error" !in resp);
@@ -10420,7 +10420,7 @@ unittest  // modern: a raw CallToolResult carrying inputRequests is stamped "inp
 	// `inputRequests` field DIRECTLY (not via ToolResponse.inputRequired). This
 	// is the non-idiomatic-but-reachable path: the result serialises to an
 	// InputRequiredResult shape but reaches stampResultType without a resultType.
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	Tool t = {name: "raw"};
 	s.registerTool(t, (Json args) @safe {
 		CallToolResult r;
@@ -10442,7 +10442,7 @@ unittest  // modern: a raw CallToolResult's inputRequests are filtered against t
 {
 	import mcp.protocol.mrtr : InputRequest;
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	Tool t = {name: "raw"};
 	s.registerTool(t, (Json args) @safe {
 		CallToolResult r;
@@ -10472,7 +10472,7 @@ unittest  // modern: an MRTR sampling request with includeContext needs sampling
 {
 	import mcp.protocol.mrtr : InputRequest;
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	Tool t = {name: "raw"};
 	s.registerTool(t, (Json args) @safe {
 		CallToolResult r;
@@ -10501,7 +10501,7 @@ unittest  // modern: a dropped form elicitation reports form elicitation as requ
 {
 	import mcp.protocol.mrtr : InputRequest;
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	Tool t = {name: "raw"};
 	s.registerTool(t, (Json args) @safe {
 		CallToolResult r;
@@ -10523,7 +10523,7 @@ unittest  // modern: a raw CallToolResult carrying a task handle bypasses output
 {
 	import mcp.protocol.tasks : Task;
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	s.enableOutputSchemaValidation();
 	Tool t = {name: "raw"};
 	t.outputSchema = Json(["type": Json("object")]);
@@ -10543,7 +10543,7 @@ unittest  // modern: a raw CallToolResult carrying a task handle bypasses output
 
 unittest  // modern: a requestState-only input-required result bypasses output-schema validation
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	s.enableOutputSchemaValidation();
 	Tool t = {name: "raw"};
 	t.outputSchema = Json(["type": Json("object")]);
@@ -10561,7 +10561,7 @@ unittest  // modern: a requestState-only input-required result bypasses output-s
 
 unittest  // a direct resource reader can receive the per-request RequestContext
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	Resource r = {uri: "s://ctx", name: "ctx"};
 	s.registerResource(r, (RequestContext ctx) @safe => ResourceContents.makeText("s://ctx",
 			"text/plain", ctx.usesInputRequired ? "stateless" : "session"));
@@ -10573,7 +10573,7 @@ unittest  // a direct resource reader can receive the per-request RequestContext
 
 unittest  // a prompt handler returning a final result can receive the per-request RequestContext
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	Prompt p = {name: "greet"};
 	s.registerPrompt(p, (Json args, RequestContext ctx) @safe {
 		GetPromptResult g;
@@ -10588,7 +10588,7 @@ unittest  // a prompt handler returning a final result can receive the per-reque
 
 unittest  // resources/directory/read reports a URI that is both a file and a subdirectory once
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	s.enableDirectoryRead();
 	foreach (u; ["s://d/a", "s://d/a/b", "s://d/c"])
 	{
@@ -10604,7 +10604,7 @@ unittest  // resources/directory/read reports a URI that is both a file and a su
 
 unittest  // setListCacheHint configures the modern resources/directory/read freshness hint
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	s.enableDirectoryRead();
 	Resource r = {uri: "s://d/a", name: "a"};
 	s.registerResource(r, () @safe => ResourceContents.makeText("s://d/a", "text/plain", "x"));
@@ -10617,7 +10617,7 @@ unittest  // setListCacheHint configures the modern resources/directory/read fre
 
 unittest  // modern resources/read unknown uri uses invalidParams (-32602)
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	Resource r = {uri: "test://x", name: "x"};
 	s.registerResource(r, () @safe => ResourceContents.makeText("test://x", "text/plain", "hi"));
 	Json p = Json.emptyObject;
@@ -10800,7 +10800,7 @@ unittest  // stdio subscriptions/listen over the URI cap answers an error instea
 	import std.algorithm : canFind;
 	import std.conv : to;
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	registerStubResources(s, "test://stub");
 	Json uris = Json.emptyArray;
 	foreach (i; 0 .. maxResourceSubscriptions + 1)
@@ -10931,7 +10931,7 @@ unittest  // subscriptions/listen ack omits a list-changed type the server does 
 	// basic/utilities/subscriptions Acknowledgment ("notification types the
 	// server does not support are omitted") a toolsListChanged opt-in must be
 	// dropped from both the recorded filter and the acknowledged subset.
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	Json filter = Json.emptyObject;
 	filter["toolsListChanged"] = true;
 	Json p = Json.emptyObject;
@@ -10943,7 +10943,7 @@ unittest  // subscriptions/listen ack omits a list-changed type the server does 
 
 unittest  // subscriptions/listen ack keeps a list-changed type once the server enables it
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	s.enableToolsListChanged();
 	Json filter = Json.emptyObject;
 	filter["toolsListChanged"] = true;
@@ -10956,7 +10956,7 @@ unittest  // subscriptions/listen ack keeps a list-changed type once the server 
 
 unittest  // subscriptions/listen ack omits promptsListChanged when unsupported
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	s.enableToolsListChanged(); // a different cap is on; prompts stays off
 	Json filter = Json.emptyObject;
 	filter["promptsListChanged"] = true;
@@ -10969,7 +10969,7 @@ unittest  // subscriptions/listen ack omits promptsListChanged when unsupported
 
 unittest  // subscriptions/listen ack omits resourcesListChanged when unsupported
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	Json filter = Json.emptyObject;
 	filter["resourcesListChanged"] = true;
 	Json p = Json.emptyObject;
@@ -11200,7 +11200,7 @@ version (unittest)
 
 unittest  // modern (stateless) first round: handler returns an InputRequiredResult
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	registerBookTool(s);
 	auto resp = s.handle(modernCall(1, "book", [])).get;
 	assert("error" !in resp);
@@ -11212,7 +11212,7 @@ unittest  // modern (stateless) first round: handler returns an InputRequiredRes
 
 unittest  // modern (stateless) retry with input responses: handler completes
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	registerBookTool(s);
 	auto answer = InputResponse("date", Json([
 			"content": Json(["day": Json("monday")])
@@ -11224,7 +11224,7 @@ unittest  // modern (stateless) retry with input responses: handler completes
 
 unittest  // SEP-2322: a stateless server emits requestState and reads it back on retry
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	// A tool that stashes its progress entirely in the opaque requestState: on
 	// the first round it asks for a date and attaches state "awaiting-date";
 	// on retry it reads ctx.requestState() to know how to finish.
@@ -11278,13 +11278,13 @@ unittest  // secureRequestState rejects a ttl under one second
 	RequestStateSecurity sec;
 	sec.key = new ubyte[32];
 	sec.ttl = Duration.zero;
-	assertThrown(new McpServer("t", "1").secureRequestState(sec));
+	assertThrown(McpServer.stateless("t", "1").secureRequestState(sec));
 	sec.ttl = -(1.seconds);
-	assertThrown(new McpServer("t", "1").secureRequestState(sec));
+	assertThrown(McpServer.stateless("t", "1").secureRequestState(sec));
 	sec.ttl = 500.msecs;
-	assertThrown(new McpServer("t", "1").secureRequestState(sec));
+	assertThrown(McpServer.stateless("t", "1").secureRequestState(sec));
 	sec.ttl = 1.seconds;
-	assertNotThrown(new McpServer("t", "1").secureRequestState(sec));
+	assertNotThrown(McpServer.stateless("t", "1").secureRequestState(sec));
 }
 
 unittest  // secureRequestState throws on a stateful server, which never issues MRTR requestState
@@ -11310,7 +11310,7 @@ version (unittest) private McpServer secureStatebookServer() @safe
 	// requestState, used to prove the secure codec is transparent: the handler
 	// stores/reads the plaintext "awaiting-date" exactly as in the unsecured
 	// test, while the wire carries an integrity-protected blob.
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	RequestStateSecurity sec;
 	sec.key = new ubyte[32];
 	foreach (i; 0 .. 32)
@@ -11412,7 +11412,7 @@ unittest  // secureRequestState: a tampered echoed blob re-elicits instead of re
 
 unittest  // secureRequestState: a rejected echoed blob also drops the round's inputResponses
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	RequestStateSecurity sec;
 	sec.key = new ubyte[32];
 	sec.bindTo = RequestStateBinding.none;
@@ -11444,7 +11444,7 @@ unittest  // secureRequestState: a rejected echoed blob also drops the round's i
 
 unittest  // no codec configured: outgoing requestState stays plaintext (wire unchanged)
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	Tool book = {name: "statebook"};
 	s.registerTool(book, (Json args, RequestContext ctx) @safe {
 		Json ep = Json.emptyObject;
@@ -11464,7 +11464,7 @@ unittest  // a modern InputRequiredResult drops an elicitation request the clien
 	// emit an inputRequest whose kind the client never declared. With no other
 	// request left, the result is a -32021 error rather than an
 	// InputRequiredResult that the client could never fulfil.
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	Tool ask = {name: "ask"};
 	s.registerTool(ask, (Json args, RequestContext ctx) @safe {
 		Json ep = Json.emptyObject;
@@ -11485,7 +11485,7 @@ unittest  // a modern InputRequiredResult drops an elicitation request the clien
 
 unittest  // the same elicitation request IS emitted when the client declared elicitation
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	Tool ask = {name: "ask"};
 	s.registerTool(ask, (Json args, RequestContext ctx) @safe {
 		Json ep = Json.emptyObject;
@@ -11511,7 +11511,7 @@ unittest  // a mixed InputRequiredResult drops only the unsupported kinds
 {
 	// elicitation is declared, roots is not: only the roots request is dropped,
 	// the elicitation request survives so the round trip can still proceed.
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	Tool ask = {name: "ask"};
 	s.registerTool(ask, (Json args, RequestContext ctx) @safe {
 		Json ep = Json.emptyObject;
@@ -11537,7 +11537,7 @@ unittest  // a mixed InputRequiredResult drops only the unsupported kinds
 
 unittest  // dropping every inputRequest with requestState set yields -32021, not an empty round trip
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	Tool ask = {name: "ask"};
 	s.registerTool(ask, (Json args, RequestContext ctx) @safe {
 		return ToolResponse.inputRequired([InputRequest.roots("r1")], "state-1");
@@ -11551,7 +11551,7 @@ unittest  // dropping every inputRequest with requestState set yields -32021, no
 
 unittest  // dropping every inputRequest without requestState yields -32021 naming the kinds
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	Tool ask = {name: "ask"};
 	s.registerTool(ask, (Json args, RequestContext ctx) @safe {
 		return ToolResponse.inputRequired([
@@ -11569,7 +11569,7 @@ unittest  // dropping every inputRequest without requestState yields -32021 nami
 
 unittest  // prompts/get: dropping every inputRequest with requestState set yields -32021
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	Prompt descriptor = {name: "p"};
 	s.registerPrompt(descriptor, (Json args, RequestContext ctx) @safe {
 		return PromptResponse.inputRequired([InputRequest.roots("r1")], "state-1");
@@ -11581,7 +11581,7 @@ unittest  // prompts/get: dropping every inputRequest with requestState set yiel
 
 unittest  // elicit() is rejected on a modern (2026-07-28) request
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	Tool bad = {name: "bad"};
 	s.registerTool(bad, (Json args, RequestContext ctx) @safe {
 		ctx.elicit("x", Json.emptyObject); // illegal under MRTR
@@ -11665,7 +11665,7 @@ version (unittest)
 
 unittest  // modern prompts/get: handler can return an InputRequiredResult
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	registerTopicPrompt(s);
 	auto resp = s.handle(modernGetPrompt(1, "mrtrprompt", [])).get;
 	assert("error" !in resp);
@@ -11680,7 +11680,7 @@ unittest  // modern prompts/get: handler can return an InputRequiredResult
 
 unittest  // modern prompts/get retry with input responses: handler completes
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	registerTopicPrompt(s);
 	auto answer = InputResponse("topic", Json([
 			"content": Json(["t": Json("birds")])
@@ -11695,7 +11695,7 @@ unittest  // modern prompts/get retry with input responses: handler completes
 
 unittest  // modern prompts/get reads back the echoed opaque requestState (SEP-2322)
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	Prompt descriptor = {name: "stateprompt"};
 	s.registerPrompt(descriptor, (Json args, RequestContext ctx) @safe {
 		if (ctx.requestState() == "awaiting-topic")
@@ -11728,7 +11728,7 @@ unittest  // modern prompts/get reads back the echoed opaque requestState (SEP-2
 
 unittest  // legacy prompts/get is unaffected: no resultType, plain GetPromptResult
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	Prompt descriptor = {name: "plainprompt"};
 	s.registerPrompt(descriptor, (Json args, RequestContext ctx) @safe {
 		GetPromptResult r;
@@ -11758,14 +11758,14 @@ version (unittest)
 
 unittest  // notify is a no-op (returns 0) before a push channel exists
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	assert(s.serverPushChannel() is null);
 	assert(s.notify("notifications/message") == 0);
 }
 
 unittest  // notify delivers unsolicited notifications to GET-stream listeners
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	auto coord = new StreamCoordinator;
 	auto ch = ensurePushChannel(s, coord);
 	assert(s.serverPushChannel() is ch); // same instance returned thereafter
@@ -11863,7 +11863,7 @@ unittest  // notifyResourceUpdated emits params that are exactly { uri } (no non
 
 unittest  // notifyResourceUpdated has no title overload (title is not a spec param)
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	// The single-argument (uri only) form must exist.
 	static assert(__traits(compiles, s.notifyResourceUpdated("test://w")));
 	// A `title` argument is NOT part of any spec version, so the two-argument
@@ -11875,7 +11875,7 @@ unittest  // notifyResourceUpdated reaches every listen stream subscribed to the
 {
 	import std.algorithm : canFind;
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	registerStubResources(s, "test://stub");
 	auto ch = ensurePushChannel(s, new StreamCoordinator);
 	string a, b, other;
@@ -11934,7 +11934,7 @@ unittest  // notifyResourceUpdated is a no-op before a push channel exists
 
 unittest  // notifyElicitationComplete emits notifications/elicitation/complete with the id
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	auto coord = new StreamCoordinator;
 	auto ch = ensurePushChannel(s, coord);
 	string[] received;
@@ -11952,7 +11952,7 @@ unittest  // notifyElicitationComplete emits notifications/elicitation/complete 
 
 unittest  // notifyElicitationComplete is a no-op before a push channel exists
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	assert(s.notifyElicitationComplete("", "elic-1") == 0);
 }
 
@@ -11960,7 +11960,7 @@ unittest  // notifyElicitationComplete never reaches a modern subscriptions/list
 {
 	// 2026-07-28 removed `notifications/elicitation/complete`; a modern listen
 	// stream (an active filter) must not receive it.
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	auto coord = new StreamCoordinator;
 	auto ch = ensurePushChannel(s, coord);
 	string[] received;
@@ -11975,7 +11975,7 @@ unittest  // notifyElicitationComplete never reaches a modern subscriptions/list
 
 unittest  // notifyElicitationComplete never reaches a stdio subscriptions/listen stream
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	s.enableToolsListChanged();
 	string[] frames;
 	void sink(string line) @safe
@@ -12001,7 +12001,7 @@ unittest  // notifyElicitationComplete rejects an empty elicitationId as API mis
 {
 	import std.exception : collectException;
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	auto e = collectException(s.notifyElicitationComplete("", ""));
 	assert(e !is null);
 	assert(cast(McpException) e is null);
@@ -12024,7 +12024,7 @@ unittest  // notifyElicitationComplete reaches only the session that received th
 {
 	import std.algorithm : canFind;
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	auto ch = ensurePushChannel(s, new StreamCoordinator);
 	string a, b;
 	ch.addListener((string f) @safe { a = f; }, Json(""), ListenFilter.init, "", null, "sess-A");
@@ -12039,7 +12039,7 @@ unittest  // notifications/tasks reaches only the task owner's streams
 {
 	import std.algorithm : canFind;
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	auto rt = s.enableTasks();
 	auto ch = ensurePushChannel(s, new StreamCoordinator);
 	string alice, bob;
@@ -12060,7 +12060,7 @@ unittest  // notifications/tasks reaches only the task owner's streams
 
 unittest  // notifications/tasks for an ownerless task reaches no anonymous HTTP stream
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	auto rt = s.enableTasks();
 	auto ch = ensurePushChannel(s, new StreamCoordinator);
 	string anon;
@@ -12078,7 +12078,7 @@ unittest  // notifications/tasks for an ownerless task reaches the stdio listen 
 {
 	import std.algorithm : canFind;
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	auto rt = s.enableTasks();
 	string[] frames;
 	void sink(string f) @safe
@@ -12111,7 +12111,7 @@ unittest  // a listen stream receives only the notification types its filter req
 {
 	import std.algorithm : canFind;
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	s.enableToolsListChanged();
 	string[] frames;
 	void sink(string f) @safe
@@ -12146,7 +12146,7 @@ unittest  // a listen stream receives only the notification types its filter req
 
 unittest  // tools listChanged is not advertised by default
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	Tool add = {name: "add"};
 	s.registerTool(add, (Json) @safe { return CallToolResult(); });
 	auto caps = s.capabilities();
@@ -12156,7 +12156,7 @@ unittest  // tools listChanged is not advertised by default
 
 unittest  // enableToolsListChanged advertises listChanged:true for tools
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	Tool add = {name: "add"};
 	s.registerTool(add, (Json) @safe { return CallToolResult(); });
 	s.enableToolsListChanged();
@@ -12172,7 +12172,7 @@ unittest  // enableToolsListChanged advertises tools capability with zero tools 
 	// before any tool is registered. Per 2025-11-25 tools §Capabilities, it MUST
 	// still advertise the tools capability so clients call tools/list and expect
 	// notifications/tools/list_changed.
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	s.enableToolsListChanged();
 	auto caps = s.capabilities();
 	assert(!caps.tools.isNull);
@@ -12182,7 +12182,7 @@ unittest  // enableToolsListChanged advertises tools capability with zero tools 
 
 unittest  // removeTool unregisters a previously registered tool
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	s.enableToolsListChanged();
 	Tool add = {name: "add"};
 	s.registerTool(add, (Json) @safe { return CallToolResult(); });
@@ -12194,7 +12194,7 @@ unittest  // removeTool unregisters a previously registered tool
 
 unittest  // notifyToolsListChanged broadcasts notifications/tools/list_changed
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	s.enableToolsListChanged();
 	auto coord = new StreamCoordinator;
 	auto ch = ensurePushChannel(s, coord);
@@ -12222,7 +12222,7 @@ unittest  // a plain GET stream gets no list_changed whose listChanged capabilit
 
 unittest  // notifyToolsListChanged is a no-op before a push channel exists
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	assert(s.notifyToolsListChanged() == 0);
 }
 
@@ -12234,7 +12234,7 @@ unittest  // notifyToolsListChanged fans out to EVERY connected session, not jus
 	// notifyToolsListChanged.
 	import std.algorithm : canFind;
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	s.enableToolsListChanged();
 	auto coord = new StreamCoordinator;
 	auto ch = ensurePushChannel(s, coord);
@@ -12254,7 +12254,7 @@ unittest  // a list_changed broadcast still delivers only ONE stream within a si
 {
 	// Multiple Connections rule: within ONE session two open GET streams must not
 	// both receive the same broadcast — only one of the session's streams does.
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	s.enableToolsListChanged();
 	auto coord = new StreamCoordinator;
 	auto ch = ensurePushChannel(s, coord);
@@ -12269,7 +12269,7 @@ unittest  // a list_changed broadcast still delivers only ONE stream within a si
 
 unittest  // resources listChanged is not advertised by default
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	Resource r = {uri: "test://r", name: "r"};
 	s.registerResource(r, () @safe => ResourceContents.makeText("test://r", "text/plain", "x"));
 	auto caps = s.capabilities();
@@ -12279,7 +12279,7 @@ unittest  // resources listChanged is not advertised by default
 
 unittest  // enableResourcesListChanged advertises listChanged:true for resources
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	Resource r = {uri: "test://r", name: "r"};
 	s.registerResource(r, () @safe => ResourceContents.makeText("test://r", "text/plain", "x"));
 	s.enableResourcesListChanged();
@@ -12295,7 +12295,7 @@ unittest  // enableResourcesListChanged advertises resources capability with zer
 	// before any resource is registered. Per 2025-11-25 resources §Capabilities, it
 	// MUST still advertise the resources capability so clients call resources/list and
 	// expect notifications/resources/list_changed.
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	s.enableResourcesListChanged();
 	auto caps = s.capabilities();
 	assert(!caps.resources.isNull);
@@ -12319,7 +12319,7 @@ unittest  // enableResourceSubscriptions advertises resources capability with ze
 
 unittest  // notifyResourcesListChanged broadcasts notifications/resources/list_changed
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	s.enableResourcesListChanged();
 	auto coord = new StreamCoordinator;
 	auto ch = ensurePushChannel(s, coord);
@@ -12335,13 +12335,13 @@ unittest  // notifyResourcesListChanged broadcasts notifications/resources/list_
 
 unittest  // notifyResourcesListChanged is a no-op before a push channel exists
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	assert(s.notifyResourcesListChanged() == 0);
 }
 
 unittest  // prompts listChanged is not advertised by default
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	Prompt pr = {name: "greet"};
 	s.registerPrompt(pr, (Json) @safe { return GetPromptResult(); });
 	auto caps = s.capabilities();
@@ -12355,7 +12355,7 @@ unittest  // enablePromptsListChanged advertises prompts capability with zero pr
 	// before any prompt is registered. Per 2025-11-25 prompts §Capabilities, it
 	// MUST still advertise the prompts capability so clients call prompts/list and
 	// expect notifications/prompts/list_changed.
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	s.enablePromptsListChanged();
 	auto caps = s.capabilities();
 	assert(!caps.prompts.isNull);
@@ -12365,7 +12365,7 @@ unittest  // enablePromptsListChanged advertises prompts capability with zero pr
 
 unittest  // enablePromptsListChanged advertises listChanged:true for prompts
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	Prompt pr = {name: "greet"};
 	s.registerPrompt(pr, (Json) @safe { return GetPromptResult(); });
 	s.enablePromptsListChanged();
@@ -12377,7 +12377,7 @@ unittest  // enablePromptsListChanged advertises listChanged:true for prompts
 
 unittest  // notifyPromptsListChanged broadcasts notifications/prompts/list_changed
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	s.enablePromptsListChanged();
 	auto coord = new StreamCoordinator;
 	auto ch = ensurePushChannel(s, coord);
@@ -12393,7 +12393,7 @@ unittest  // notifyPromptsListChanged broadcasts notifications/prompts/list_chan
 
 unittest  // notifyPromptsListChanged is a no-op before a push channel exists
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	assert(s.notifyPromptsListChanged() == 0);
 }
 
@@ -12402,7 +12402,7 @@ unittest  // enablePromptsListChanged is the consistent name and advertises list
 	// The pluralised enablePromptsListChanged matches the `prompts` capability
 	// key and the other enable*ListChanged toggles. Per 2025-11-25 prompts
 	// §Capabilities it advertises prompts: { listChanged: true }.
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	s.enablePromptsListChanged();
 	auto caps = s.capabilities();
 	assert(!caps.prompts.isNull);
@@ -12412,7 +12412,7 @@ unittest  // enablePromptsListChanged is the consistent name and advertises list
 
 unittest  // enableToolsListChanged is the consistent name and advertises listChanged:true
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	s.enableToolsListChanged();
 	auto caps = s.capabilities();
 	assert(!caps.tools.isNull);
@@ -12551,7 +12551,7 @@ unittest  // stdio listen sink is per-URI filtered (subscribed delivered, other 
 
 	// Delivery is driven by the stdio listen stream's own recorded filter, not by
 	// enableResourceSubscriptions() (which a stateless server cannot call).
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	registerStubResources(s, "test://stub");
 
 	string[] sink;
@@ -12587,7 +12587,7 @@ unittest  // modern subscriptions/listen: a stream gets list_changed only if its
 	// `notifications/prompts/list_changed` only when its OWN per-stream
 	// `ListenFilter` opted into promptsListChanged — no connection-level
 	// version is consulted, since a modern connection never has a plain GET stream.
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	s.enablePromptsListChanged();
 	auto coord = new StreamCoordinator;
 	auto ch = ensurePushChannel(s, coord);
@@ -12628,7 +12628,7 @@ unittest  // setPageSize paginates tools/list across cursor-following pages
 {
 	import std.conv : to;
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	foreach (i; 0 .. 5)
 	{
 		Tool tool = {name: "tool" ~ i.to!string};
@@ -12664,7 +12664,7 @@ unittest  // setPageSize paginates tools/list across cursor-following pages
 
 unittest  // a tools/list cursor resumes after the last-seen tool when earlier tools are removed
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	foreach (name; ["a", "b", "c", "d", "e"])
 	{
 		Tool tool = {name: name};
@@ -12684,7 +12684,7 @@ unittest  // a tools/list cursor resumes after the last-seen tool when earlier t
 
 unittest  // a resources/templates/list cursor survives removal of an earlier template
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	foreach (name; ["test://c/{id}", "test://a/{id}", "test://b/{id}"])
 	{
 		ResourceTemplate t = {uriTemplate: name, name: "t"};
@@ -12707,7 +12707,7 @@ unittest  // without setPageSize, tools/list returns everything in one page (no 
 {
 	import std.conv : to;
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	foreach (i; 0 .. 5)
 	{
 		Tool tool = {name: "tool" ~ i.to!string};
@@ -12726,7 +12726,7 @@ unittest  // setPageSize paginates resources/list
 {
 	import std.conv : to;
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	foreach (i; 0 .. 3)
 	{
 		Resource r = {uri: "test://r" ~ i.to!string, name: "r"};
@@ -12749,7 +12749,7 @@ unittest  // setPageSize paginates prompts/list
 {
 	import std.conv : to;
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	foreach (i; 0 .. 3)
 	{
 		Prompt pr = {name: "p" ~ i.to!string};
@@ -12772,7 +12772,7 @@ unittest  // setPageSize paginates resources/templates/list
 {
 	import std.conv : to;
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	foreach (i; 0 .. 3)
 	{
 		ResourceTemplate t = {
@@ -12797,7 +12797,7 @@ unittest  // setPageSize paginates resources/templates/list
 
 unittest  // an invalid pagination cursor yields invalidParams (-32602)
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	Tool tool = {name: "only"};
 	s.registerTool(tool, (Json) @safe {
 		CallToolResult r;
@@ -12816,7 +12816,7 @@ unittest  // a well-formed cursor the server never issued yields invalidParams (
 	import std.string : representation;
 	import mcp.auth.oauth : base64UrlNoPad;
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	Tool tool = {name: "only"};
 	s.registerTool(tool, (Json) @safe {
 		CallToolResult r;
@@ -12838,7 +12838,7 @@ unittest  // a full roundtrip through cursor-following pagination yields every t
 	import std.array : array;
 	import std.conv : to;
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	foreach (i; 0 .. 7)
 	{
 		Tool tool = {name: "tool" ~ i.to!string};
@@ -12876,7 +12876,7 @@ unittest  // a full roundtrip through cursor-following pagination yields every t
 
 unittest  // the raw-Json escape hatches are named register{Tool,Prompt}
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	Tool t;
 	t.name = "x";
 	Prompt p;
@@ -12890,7 +12890,7 @@ unittest  // the raw-Json escape hatches are named register{Tool,Prompt}
 
 unittest  // the dynamic tool hatch accepts a raw-Json handler and dispatches it
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	Tool t;
 	t.name = "shout";
 	s.registerTool(t, (Json args) @safe {
@@ -12909,7 +12909,7 @@ unittest  // the dynamic tool hatch accepts a raw-Json handler and dispatches it
 
 unittest  // the dynamic prompt hatch accepts a raw-Json handler and dispatches it
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	Prompt pr;
 	pr.name = "greet";
 	s.registerPrompt(pr, (Json args) @safe {
@@ -12925,7 +12925,7 @@ unittest  // the dynamic prompt hatch accepts a raw-Json handler and dispatches 
 
 unittest  // the only completion entry point is the typed CompleteRequest one
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	static assert(__traits(compiles, s.setCompletionRequestHandler((CompleteRequest) @safe {
 				CompleteResult r;
 				return r;
@@ -12997,7 +12997,7 @@ unittest  // inputRequired(reqs, T) does not collide with the string overload
 
 unittest  // the default constructor yields a stateless server
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	assert(s.mode == ServerMode.stateless);
 }
 
@@ -13106,7 +13106,7 @@ unittest  // notifications/initialized flips only the carried state
 	import mcp.server.connection : ConnectionState;
 	import vibe.data.json : parseJsonString;
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	auto state = new ConnectionState;
 	state.initializeProcessed = true;
 	s.activeConnection.initializeProcessed = true;
@@ -13288,7 +13288,7 @@ unittest  // prompts/list on a server with no prompts capability -> -32601
 	// An empty server with prompts listChanged disabled does not advertise the
 	// prompts capability, so prompts/list must report method-not-found rather
 	// than an empty-success result.
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	assert(s.capabilities().prompts.isNull);
 	auto resp = s.handle(req(1, "prompts/list")).get;
 	assert(resp["error"]["code"].get!int == ErrorCode.methodNotFound,
@@ -13299,7 +13299,7 @@ unittest  // prompts/list still answers when promptsListChanged is advertised
 {
 	// A server with zero prompts but promptsListChanged enabled DOES advertise
 	// the prompts capability, so prompts/list must answer with an empty list.
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	s.enablePromptsListChanged();
 	assert(!s.capabilities().prompts.isNull);
 	auto resp = s.handle(req(1, "prompts/list")).get;
@@ -13309,7 +13309,7 @@ unittest  // prompts/list still answers when promptsListChanged is advertised
 
 unittest  // tools/list on a server with no tools capability -> -32601
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	assert(s.capabilities().tools.isNull);
 	auto resp = s.handle(req(1, "tools/list")).get;
 	assert(resp["error"]["code"].get!int == ErrorCode.methodNotFound,
@@ -13318,7 +13318,7 @@ unittest  // tools/list on a server with no tools capability -> -32601
 
 unittest  // resources/list and resources/templates/list -> -32601 without resources capability
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	assert(s.capabilities().resources.isNull);
 	auto rl = s.handle(req(1, "resources/list")).get;
 	assert(rl["error"]["code"].get!int == ErrorCode.methodNotFound,
@@ -13332,7 +13332,7 @@ unittest  // list endpoints answer once their capability is advertised
 {
 	// A server with a registered tool/resource/prompt advertises each capability,
 	// so the matching list endpoint must answer rather than report -32601.
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	Tool tool = {name: "t"};
 	s.registerTool(tool, (Json) @safe {
 		CallToolResult r;
@@ -13397,7 +13397,7 @@ unittest  // McpServer.exposeInternalErrors reaches the task runtime in either c
 
 unittest  // completion/complete for an unregistered prompt is -32602
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	s.setCompletionRequestHandler((CompleteRequest r) @safe => CompleteResult.init);
 	Json p = Json.emptyObject;
 	p["ref"] = Json(["type": Json("ref/prompt"), "name": Json("nope")]);
@@ -13408,7 +13408,7 @@ unittest  // completion/complete for an unregistered prompt is -32602
 
 unittest  // completion/complete for an unregistered resource or template is -32602
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	s.setCompletionRequestHandler((CompleteRequest r) @safe => CompleteResult.init);
 	ResourceTemplate t = {uriTemplate: "file:///{path}", name: "files"};
 	s.registerResourceTemplate(t, (string uri, string[string] vars, RequestContext ctx) @safe {
@@ -13435,7 +13435,7 @@ unittest  // the attached push channel is internal: its raw delivery bypasses th
 
 unittest  // a per-argument completer sees context.arguments and returns its own CompleteResult
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	registerCompletablePrompt(s, "deploy");
 	string seenEnv;
 	s.setArgumentCompleter(CompletionReference.forPrompt("deploy"), "service",
@@ -13461,7 +13461,7 @@ unittest  // shutdown stops the background timers and is idempotent
 {
 	import core.time : msecs;
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	s.shutdown();
 	auto tasks = s.enableTasks();
 	auto events = s.enableEvents();
@@ -13475,7 +13475,7 @@ unittest  // enableExtension rejects the extensions the SDK serves itself, namin
 {
 	import std.algorithm.searching : canFind;
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	foreach (key, remedy; [
 		"io.modelcontextprotocol/tasks": "enableTasks",
 		"io.modelcontextprotocol/events": "enableEvents",

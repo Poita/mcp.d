@@ -69,7 +69,7 @@ final class SkillsApi
 
 void main(string[] args) @safe
 {
-	auto server = new McpServer("skills-example", "1.0.0");
+	auto server = McpServer.stateless("skills-example", "1.0.0");
 
 	// One call registers everything: the two @skill methods and the @skillDir
 	// directory, whose nested hotfix-helper skill is published as a fourth flat

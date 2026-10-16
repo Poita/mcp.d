@@ -55,7 +55,7 @@ long add(long a, long b) @safe { return a + b; }
 
 void main()
 {
-    auto server = new McpServer("demo", "1.0.0");
+    auto server = McpServer.stateless("demo", "1.0.0");
     registerModule!demo(server);
     runStdio(server);
 }
@@ -111,7 +111,7 @@ import mcp.transport : runStreamableHttp, StreamableHttpOptions;
 
 void main()
 {
-    auto server = new McpServer("demo", "1.0.0");
+    auto server = McpServer.stateless("demo", "1.0.0");
     registerModule!demo(server);
 
     StreamableHttpOptions opts;
@@ -315,11 +315,12 @@ from that tag with `scripts/gen-docs.sh`.
 ## Statefulness
 
 A server chooses one of two statefulness models at construction. **Stateless is
-the default.** The author picks the mode via factories; the
-`new McpServer(name, version)` constructors build a stateless server.
+the default.** The author picks the mode via the `McpServer.stateless` and
+`McpServer.stateful` factories (or `ServerSettings.mode`); there is no bare
+constructor.
 
 ```d
-auto s1 = McpServer.stateless("my-server", "1.0.0"); // default; same as `new McpServer(...)`
+auto s1 = McpServer.stateless("my-server", "1.0.0"); // the default mode
 auto s2 = McpServer.stateful("my-server", "1.0.0");   // opt-in session management
 ```
 
@@ -802,7 +803,7 @@ host renders inline in the conversation. On the server side it is metadata plus 
 resource convention, and `import mcp;` brings in the helpers (`mcp.api.apps`):
 
 ```d
-auto server = new McpServer("weather", "1.0.0");
+auto server = McpServer.stateless("weather", "1.0.0");
 registerModule!(my.module)(server);     // a @tool tagged @ui("ui://weather/dashboard", "model", "app")
 
 UiResource ui = {uri: "ui://weather/dashboard", name: "weather_dashboard", html: dashboardHtml};

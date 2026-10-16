@@ -134,7 +134,7 @@ final class TasksApi
 
 void main(string[] args) @safe
 {
-	auto server = new McpServer("tasks-example", "1.0.0");
+	auto server = McpServer.stateless("tasks-example", "1.0.0");
 
 	// Enable the tasks extension. A null store uses the in-memory default and a
 	// null dispatcher uses the in-process (fiber) default — fine for a single-node

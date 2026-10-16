@@ -853,7 +853,7 @@ unittest  // registerSkillDir serves SKILL.md verbatim with authored, type-prese
 	scope (exit)
 		removeTree(root);
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	registerSkillDir(s, root);
 
 	// The authored SKILL.md is served byte-for-byte (frontmatter is NOT synthesized).
@@ -881,7 +881,7 @@ unittest  // a directory skill's manifest carries each file's byte length
 	scope (exit)
 		removeTree(root);
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	registerSkillDir(s, root);
 
 	const md = readResource(s, 1, "skill://pdf-forms/SKILL.md")["text"].get!string;
@@ -912,11 +912,11 @@ unittest  // maxFiles counts SKILL.md itself as one of the skill's resources
 
 	SkillDirOptions tight;
 	tight.maxFiles = 1;
-	assertThrown!Exception(registerSkillDir(new McpServer("t", "1"), root, tight));
+	assertThrown!Exception(registerSkillDir(McpServer.stateless("t", "1"), root, tight));
 
 	SkillDirOptions exact;
 	exact.maxFiles = 2;
-	assertNotThrown!Exception(registerSkillDir(new McpServer("t", "1"), root, exact));
+	assertNotThrown!Exception(registerSkillDir(McpServer.stateless("t", "1"), root, exact));
 }
 
 unittest  // registerSkillDir exposes supporting files as sibling resources
@@ -926,7 +926,7 @@ unittest  // registerSkillDir exposes supporting files as sibling resources
 	scope (exit)
 		removeTree(root);
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	registerSkillDir(s, root);
 
 	import std.algorithm : canFind;
@@ -942,7 +942,7 @@ unittest  // registerSkillDir auto-exposes subdirectories via resources/director
 	scope (exit)
 		removeTree(root);
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	registerSkillDir(s, root);
 
 	Json p = Json.emptyObject;
@@ -987,7 +987,7 @@ unittest  // nested files are supporting content: the enclosing manifest lists t
 	scope (exit)
 		removeTree(root);
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	registerSkillDir(s, root);
 
 	auto e = listedSkill(s, 1, 0);
@@ -1010,7 +1010,7 @@ unittest  // a nested skill is additionally published as its own flat entry
 	scope (exit)
 		removeTree(root);
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	registerSkillDir(s, root);
 
 	// Two flat entries: the enclosing skill first, then the nested one, whose
@@ -1040,7 +1040,7 @@ unittest  // skills/get answers for a nested skill's uri
 	scope (exit)
 		removeTree(root);
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	registerSkillDir(s, root);
 
 	Json p = Json.emptyObject;
@@ -1060,7 +1060,7 @@ unittest  // a nested directory whose name mismatches its frontmatter rejects th
 	writeFile(root ~ "/references/sub-skill/SKILL.md",
 			"---\nname: other-name\ndescription: d\n---\n\n# Sub\n");
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	assertThrown!Exception(registerSkillDir(s, root));
 
 	// Validation precedes registration: the server is untouched, so the skills
@@ -1078,7 +1078,7 @@ unittest  // publishNested=false serves the nested SKILL.md as a plain file only
 	scope (exit)
 		removeTree(root);
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	SkillDirOptions opts;
 	opts.publishNested = false;
 	registerSkillDir(s, root, opts);
@@ -1101,7 +1101,7 @@ unittest  // nested files are registered once and serve their authored bytes
 	scope (exit)
 		removeTree(root);
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	registerSkillDir(s, root);
 
 	const md = readResource(s, 1, "skill://outer/references/sub-skill/SKILL.md")["text"]
@@ -1129,7 +1129,7 @@ unittest  // a doubly-nested skill publishes three flat entries with subtree man
 	writeFile(root ~ "/references/sub-skill/deep-skill/SKILL.md",
 			"---\nname: deep-skill\ndescription: Doubly nested\n---\n\n# Deep\n");
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	registerSkillDir(s, root);
 
 	auto result = s.handle(Message(makeRequest(Json(1), "skills/list",
@@ -1160,7 +1160,7 @@ unittest  // registerSkillDir honours an explicit prefixed path matching the fro
 	scope (exit)
 		removeTree(root);
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	SkillDirOptions opts;
 	opts.path = "office/pdf-forms"; // final segment matches frontmatter name
 	registerSkillDir(s, root, opts);
@@ -1177,7 +1177,7 @@ unittest  // registerSkillDir rejects a path whose final segment != frontmatter 
 	scope (exit)
 		removeTree(root);
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	SkillDirOptions opts;
 	opts.path = "office/wrong-name";
 	assertThrown!Exception(registerSkillDir(s, root, opts));
@@ -1211,7 +1211,7 @@ unittest  // dot-prefixed files and directories are skipped by default
 	writeFile(root ~ "/.git/config", "[core]\n");
 	writeFile(root ~ "/references/.hidden.md", "# Hidden\n");
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	registerSkillDir(s, root);
 	assert(manifestPaths(s) == ["SKILL.md", "references/FORMS.md"], manifestPaths(s).text);
 }
@@ -1228,7 +1228,7 @@ unittest  // an include filter opts dot-prefixed paths back in
 	writeFile(root ~ "/.config/settings.json", "{}");
 	writeFile(root ~ "/.DS_Store", "junk");
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	SkillDirOptions opts;
 	opts.include = (string p) @safe => !p.canFind(".DS_Store");
 	registerSkillDir(s, root, opts);
@@ -1256,7 +1256,7 @@ version (Posix) unittest  // an include filter that excludes a directory prunes 
 	makeSymlink(root ~ "/references/FORMS.md", root ~ "/node_modules/.bin/tool");
 
 	string[] offered;
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	SkillDirOptions opts;
 	opts.include = (string p) @safe {
 		offered ~= p;
@@ -1285,7 +1285,7 @@ version (Posix) unittest  // a symlinked root SKILL.md is rejected even when the
 	}
 	makeSymlink(outside, root ~ "/SKILL.md");
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	SkillDirOptions opts;
 	opts.include = (string p) @safe => p != "SKILL.md";
 	assertThrown!Exception(registerSkillDir(s, root, opts));
@@ -1301,7 +1301,7 @@ version (Posix) unittest  // a symlink the include filter excludes is skipped ra
 		removeTree(root);
 	makeSymlink(root ~ "/references/FORMS.md", root ~ "/references/link.md");
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	SkillDirOptions opts;
 	opts.include = (string p) @safe => !p.endsWith("link.md");
 	registerSkillDir(s, root, opts);
@@ -1317,7 +1317,7 @@ unittest  // registerSkillDir rejects a directory whose name != frontmatter name
 	scope (exit)
 		removeTree(root);
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	assertThrown!Exception(registerSkillDir(s, root));
 	SkillDirOptions opts;
 	opts.path = "office/pdf-forms";
@@ -1331,8 +1331,8 @@ unittest  // registerSkillDir accepts a matching directory given with a trailing
 	scope (exit)
 		removeTree(root);
 
-	registerSkillDir(new McpServer("t", "1"), root ~ "/");
-	registerSkillDir(new McpServer("t", "1"), root ~ "/.");
+	registerSkillDir(McpServer.stateless("t", "1"), root ~ "/");
+	registerSkillDir(McpServer.stateless("t", "1"), root ~ "/.");
 }
 
 unittest  // a '---' inside a frontmatter value does not close the frontmatter early
@@ -1346,7 +1346,7 @@ unittest  // a '---' inside a frontmatter value does not close the frontmatter e
 	scope (exit)
 		removeTree(root);
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	registerSkillDir(s, root);
 
 	auto fm = listedSkill(s, 1, 0)["frontmatter"];
@@ -1360,7 +1360,7 @@ unittest  // a CRLF SKILL.md parses (fence and values carry trailing \r)
 	scope (exit)
 		removeTree(root);
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	registerSkillDir(s, root);
 
 	auto fm = listedSkill(s, 1, 0)["frontmatter"];
@@ -1377,7 +1377,7 @@ unittest  // registerSkillDir requires a string description in the frontmatter
 	scope (exit)
 		removeTree(root);
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	assertThrown!Exception(registerSkillDir(s, root));
 }
 
@@ -1400,7 +1400,7 @@ unittest  // registerSkillDir holds the frontmatter description and compatibilit
 		scope (exit)
 			removeTree(root);
 
-		auto e = collectException(registerSkillDir(new McpServer("t", "1"), root));
+		auto e = collectException(registerSkillDir(McpServer.stateless("t", "1"), root));
 		assert(e !is null && e.msg.canFind(c[1]), e is null ? c[1] : e.msg);
 	}
 }
@@ -1417,7 +1417,7 @@ unittest  // a nested skill's frontmatter description is held to the skill limit
 	writeFile(root ~ "/references/sub-skill/SKILL.md",
 			"---\nname: sub-skill\ndescription: \"\"\n---\n\n# Sub\n");
 
-	auto e = collectException(registerSkillDir(new McpServer("t", "1"), root));
+	auto e = collectException(registerSkillDir(McpServer.stateless("t", "1"), root));
 	assert(e !is null && e.msg.canFind("must not be empty"), e is null ? "" : e.msg);
 }
 
@@ -1445,7 +1445,7 @@ unittest  // registerSkillDir names the fix when YAML reads the name as a non-st
 
 	try
 	{
-		registerSkillDir(new McpServer("t", "1"), root);
+		registerSkillDir(McpServer.stateless("t", "1"), root);
 		assert(false, "expected registerSkillDir to throw");
 	}
 	catch (Exception e)
@@ -1462,7 +1462,7 @@ unittest  // an extension-less text file is served as text/plain, not an opaque 
 	scope (exit)
 		removeTree(root);
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	registerSkillDir(s, root);
 
 	auto c = readResource(s, 1, "skill://pdf-forms/LICENSE");
@@ -1479,7 +1479,7 @@ unittest  // a YAML timestamp in frontmatter is rendered as an ISO-8601 string
 	scope (exit)
 		removeTree(root);
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	registerSkillDir(s, root);
 
 	auto fm = listedSkill(s, 1, 0)["frontmatter"];
@@ -1496,7 +1496,7 @@ unittest  // registerSkillDir rejects a directory whose files exceed maxTotalByt
 	scope (exit)
 		removeTree(root);
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	SkillDirOptions opts;
 	opts.maxTotalBytes = 4; // smaller than the fixture's FORMS.md
 	assertThrown!Exception(registerSkillDir(s, root, opts));
@@ -1526,7 +1526,7 @@ unittest  // a file that grows past maxTotalBytes between its size check and its
 		removeTree(root);
 	}
 	growBeforeRead(root, "FORMS.md");
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	SkillDirOptions opts;
 	opts.maxTotalBytes = 1024;
 	string msg;
@@ -1549,7 +1549,7 @@ unittest  // a SKILL.md that grows past maxTotalBytes before its read is rejecte
 		removeTree(root);
 	}
 	growBeforeRead(root, "SKILL.md");
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	SkillDirOptions opts;
 	opts.maxTotalBytes = 1024;
 	string msg;
@@ -1696,7 +1696,7 @@ unittest  // registerSkillDir prefixes a SKILL.md frontmatter parse error with i
 	scope (exit)
 		removeTree(root);
 	write(root ~ "/SKILL.md", "---\nname: [unclosed\n---\n");
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	string msg;
 	try
 		registerSkillDir(s, root);
@@ -1768,7 +1768,7 @@ unittest  // a SKILL.md over maxTotalBytes is rejected by its size before it is 
 			cast(const(ubyte)[])("---\nname: big-skill\n".replicate(8)) ~ [
 				ubyte(0xFF)
 	]);
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	SkillDirOptions o;
 	o.maxTotalBytes = 16;
 	string msg;
@@ -1789,7 +1789,7 @@ unittest  // a SKILL.md that is not UTF-8 is rejected with a message naming its 
 	writeSkillBytes(root, cast(const(ubyte)[]) "---\nname: bin-skill\n" ~ [
 		ubyte(0xFF), ubyte(0xFE)
 	]);
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	string msg;
 	try
 		registerSkillDir(s, root);

@@ -4017,7 +4017,7 @@ unittest  // a cancellation scoped to session B must not suppress session A's sa
 	auto coord = new StreamCoordinator;
 	ClientCapabilities caps;
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	// Build the cancellation context for session B exactly as the transport does:
 	// an HttpStreamContext carrying session B's token.
 	auto ctxB = new HttpStreamContext(resB, coord, caps, Json.undefined,

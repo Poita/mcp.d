@@ -22,7 +22,7 @@ string ping() @safe
 
 void main(string[] args) @safe
 {
-	auto server = new McpServer("ci-smoke", "0.0.0");
+	auto server = McpServer.stateless("ci-smoke", "0.0.0");
 	registerModule!app(server);
 
 	StreamableHttpOptions opts;

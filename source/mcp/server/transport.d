@@ -122,3 +122,11 @@ version (unittest)
 	ServerCore core = McpServer.stateless("t", "1.0");
 	assert(core.handleRaw(`{"jsonrpc":"2.0","method":"notifications/initialized"}`) == "");
 }
+
+@safe unittest  // a server is built through a mode-naming factory, never a bare constructor
+{
+	import mcp.protocol.capabilities : Implementation;
+
+	static assert(!__traits(compiles, new McpServer("t", "1.0")));
+	static assert(!__traits(compiles, new McpServer(Implementation("t", "1.0"))));
+}

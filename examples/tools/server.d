@@ -140,7 +140,7 @@ CallToolResult describeDoc(string id) @safe
 
 void main(string[] args) @safe
 {
-	auto server = new McpServer("tools-example", "1.0.0");
+	auto server = McpServer.stateless("tools-example", "1.0.0");
 	// Register every @tool free function in this module in one call.
 	registerModule!(tools_server)(server);
 

@@ -79,7 +79,7 @@ final class EventsApi
 
 void main(string[] args) @safe
 {
-	auto server = new McpServer("events-example", "1.0.0");
+	auto server = McpServer.stateless("events-example", "1.0.0");
 
 	// Enable the Events extension. The in-memory webhook store + emit buffer are
 	// fine for a single-node demo. `allowPrivateCallbackHosts` lets a localhost

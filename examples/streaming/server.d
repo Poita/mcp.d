@@ -61,7 +61,7 @@ import examples_common : runServerFromArgs;
 
 void main(string[] args) @safe
 {
-	auto server = new McpServer("streaming-example", "1.0.0",
+	auto server = McpServer.stateless("streaming-example", "1.0.0",
 			nullable("Progress / logging / cancellation demo over stdio AND Streamable HTTP."));
 	// Advertise the `logging` capability so `ctx.log` notifications are emitted on
 	// the released (2025-*) protocols.

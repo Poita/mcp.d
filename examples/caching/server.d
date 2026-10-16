@@ -76,7 +76,7 @@ final class CachingApi
 
 void main(string[] args) @safe
 {
-	auto server = new McpServer("caching-example", "1.0.0",
+	auto server = McpServer.stateless("caching-example", "1.0.0",
 			nullable("Demonstrates modern CacheableResult freshness hints."));
 
 	// Register the @resource methods (with their @cacheable hints) in one call.

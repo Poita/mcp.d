@@ -131,7 +131,7 @@ void main(string[] args) @safe
 	// stateless server correctly forbids subscriptions/listen, so the client skips
 	// the push phase there. (For HTTP resource-update push, use a stateful server
 	// with resources/subscribe + the standalone GET SSE stream.)
-	auto server = new McpServer("resources-example", "1.0.0");
+	auto server = McpServer.stateless("resources-example", "1.0.0");
 
 	registerHandlers(server, new ResourcesApi(server));
 

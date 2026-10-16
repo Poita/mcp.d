@@ -65,7 +65,7 @@ enum dashboardHtml = `<!doctype html>
 
 void main(string[] args) @safe
 {
-	auto server = new McpServer("apps-example", "1.0.0");
+	auto server = McpServer.stateless("apps-example", "1.0.0");
 	// Register the @tool/@ui free function(s) in this module.
 	registerModule!(apps_server)(server);
 

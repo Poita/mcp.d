@@ -120,7 +120,7 @@ private immutable string[] knownLanguages = [
 /// (prompts + completion capability) is identical regardless of how it is run.
 private McpServer buildServer() @safe
 {
-	auto server = new McpServer("prompts-example-server", "1.0.0",
+	auto server = McpServer.stateless("prompts-example-server", "1.0.0",
 			nullable("Prompts + completion example (dual-transport stdio/http)."));
 
 	// Register the @prompt methods (typed dispatch + descriptors) by reflection.

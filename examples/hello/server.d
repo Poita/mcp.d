@@ -21,7 +21,7 @@ void main(string[] args)
 	getopt(args, "http", "Serve Streamable HTTP instead of stdio.", &http,
 			"port", "Streamable HTTP listen port.", &port);
 
-	auto server = new McpServer("hello", "1.0.0");
+	auto server = McpServer.stateless("hello", "1.0.0");
 	registerModule!hello_server(server);
 
 	if (http)

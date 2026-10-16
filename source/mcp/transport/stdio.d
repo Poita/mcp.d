@@ -1781,7 +1781,7 @@ version (Posix) unittest  // a runStdio whose stdio adoption fails does not use 
 		scope (exit)
 			() @trusted { setrlimit(RLIMIT_NOFILE, &lim); }();
 		try
-			runStdio(new McpServer("dup-fail", "1.0"));
+			runStdio(McpServer.stateless("dup-fail", "1.0"));
 		catch (Exception)
 			threw = true;
 	}
@@ -1800,7 +1800,7 @@ unittest  // runStdio enforces its "at most once per process" invariant via the 
 		() @trusted { _ranStdio = saved; }();
 	() @trusted { _ranStdio = true; }();
 
-	auto s = new McpServer("guard-srv", "1.0");
+	auto s = McpServer.stateless("guard-srv", "1.0");
 	bool threw;
 	try
 		runStdio(s);
@@ -1849,7 +1849,7 @@ version (Posix) unittest  // runStdio called from a task serves on that task wit
 			exitEventLoop();
 		try
 		{
-			runStdio(new McpServer("in-task", "1.0"));
+			runStdio(McpServer.stateless("in-task", "1.0"));
 			returned = true;
 			sleep(5.msecs); // needs the outer event loop to still be running
 			loopKeptRunning = true;
@@ -1952,7 +1952,7 @@ version (unittest) private void withServer(McpServer server,
 
 unittest  // serveStdio processes newline-delimited requests and writes responses
 {
-	auto s = new McpServer("stdio-srv", "1.0");
+	auto s = McpServer.stateless("stdio-srv", "1.0");
 	Tool echo = {name: "echo"};
 	s.registerTool(echo, (Json args) @safe {
 		CallToolResult r;
@@ -1990,7 +1990,7 @@ unittest  // serveStdio processes newline-delimited requests and writes response
 
 unittest  // stdio: a batch on a negotiated 2025-06-18+ session is rejected with one null-id -32600
 {
-	auto s = new McpServer("stdio-srv", "1.0");
+	auto s = McpServer.stateless("stdio-srv", "1.0");
 
 	string[] outputs;
 	withServer(s, (ServerLink link) @safe {
@@ -2026,7 +2026,7 @@ unittest  // stdio: a batch on a negotiated 2025-06-18+ session is rejected with
 
 unittest  // stdio: a batch on a pre-2025-06-18 session is answered with ONE JSON array frame
 {
-	auto s = new McpServer("stdio-srv", "1.0");
+	auto s = McpServer.stateless("stdio-srv", "1.0");
 
 	string[] outputs;
 	withServer(s, (ServerLink link) @safe {
@@ -2274,7 +2274,7 @@ unittest  // stdio: a client reply inside a batch wakes the handler awaiting it
 
 unittest  // stdio: notifications/cancelled mid-handler is observed via the in-flight token
 {
-	auto s = new McpServer("stdio-cancel", "1.0");
+	auto s = McpServer.stateless("stdio-cancel", "1.0");
 	auto entered = createManualEvent();
 	bool observedCancel;
 	Tool slow = {name: "slow"};
@@ -2321,7 +2321,7 @@ unittest  // stdio: notifications/cancelled mid-handler is observed via the in-f
 
 unittest  // serveStdio stops at end-of-input (null line) after servicing pending requests
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	size_t outCount = size_t.max;
 	withServer(s, (ServerLink link) @safe {
 		link.feed(`{"jsonrpc":"2.0","id":1,"method":"ping"}`);
@@ -2339,7 +2339,7 @@ unittest  // a request reply that fails to write is reported through StdioOption
 {
 	import std.algorithm.searching : canFind;
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	auto link = new ServerLink;
 	string[] errors;
 	StdioOptions opts;
@@ -2380,7 +2380,7 @@ unittest  // a handler still running when stdin EOFs is drained: its reply is no
 	// Reproduces the EOF/in-flight race: a tool handler blocks until after stdin
 	// reaches EOF, then computes its reply. Without a drain after the read loop the
 	// reply task is never scheduled again and the response is silently lost.
-	auto s = new McpServer("eof-drain", "1.0");
+	auto s = McpServer.stateless("eof-drain", "1.0");
 	auto release = createManualEvent();
 	auto entered = createManualEvent();
 	Tool slow = {name: "slow"};
@@ -2437,7 +2437,7 @@ unittest  // the EOF drain waits for a handler that finishes on a timer after st
 	import core.time : msecs;
 	import vibe.core.core : sleep;
 
-	auto s = new McpServer("eof-drain-timer", "1.0");
+	auto s = McpServer.stateless("eof-drain-timer", "1.0");
 	auto entered = createManualEvent();
 	Tool slow = {name: "slow"};
 	s.registerTool(slow, (Json args, RequestContext ctx) @safe {
@@ -2481,7 +2481,7 @@ unittest  // the EOF drain gives up on a stuck handler once its deadline passes
 {
 	import core.time : msecs, seconds, MonoTime;
 
-	auto s = new McpServer("eof-drain-stuck", "1.0");
+	auto s = McpServer.stateless("eof-drain-stuck", "1.0");
 	auto never = createManualEvent();
 	auto entered = createManualEvent();
 	Tool stuck = {name: "stuck"};
@@ -2534,7 +2534,7 @@ unittest  // the EOF drain gives up on a stuck handler once its deadline passes
 
 unittest  // a tool handler's ctx.log() is delivered as a notifications/message frame over stdio
 {
-	auto s = new McpServer("logsrv", "1.0");
+	auto s = McpServer.stateless("logsrv", "1.0");
 	s.enableLogging();
 	Tool logger = {name: "logit"};
 	s.registerTool(logger, (Json args, RequestContext ctx) @safe {
@@ -2596,7 +2596,7 @@ unittest  // logging below the configured minimum level is dropped over stdio
 
 unittest  // reportProgress is delivered over stdio when the request carries a progressToken
 {
-	auto s = new McpServer("progsrv", "1.0");
+	auto s = McpServer.stateless("progsrv", "1.0");
 	Tool worker = {name: "work"};
 	s.registerTool(worker, (Json args, RequestContext ctx) @safe {
 		ctx.reportProgress(0.5, nullable(1.0), "halfway");
@@ -2624,7 +2624,7 @@ unittest  // reportProgress is delivered over stdio when the request carries a p
 
 unittest  // reportProgress without a progressToken emits nothing over stdio
 {
-	auto s = new McpServer("progsrv", "1.0");
+	auto s = McpServer.stateless("progsrv", "1.0");
 	Tool worker = {name: "work"};
 	s.registerTool(worker, (Json args, RequestContext ctx) @safe {
 		ctx.reportProgress(0.5); // no token on the request -> dropped
@@ -2648,7 +2648,7 @@ unittest  // reportProgress without a progressToken emits nothing over stdio
 
 unittest  // background push: notify* with no request in flight reaches a stdio listen stream
 {
-	auto s = new McpServer("listen-srv", "1.0");
+	auto s = McpServer.stateless("listen-srv", "1.0");
 	s.enableToolsListChanged();
 
 	string[] outputs;
@@ -2772,7 +2772,7 @@ unittest  // stdio listen and events streams do not outlive serveStdio
 	import mcp.protocol.events : EventOccurrence;
 	import mcp.protocol.jsonrpc : makeRequest;
 
-	auto s = new McpServer("listen-srv", "1.0");
+	auto s = McpServer.stateless("listen-srv", "1.0");
 	s.enableToolsListChanged();
 	auto rt = s.enableEvents();
 	EventRegistration reg;
@@ -2841,7 +2841,7 @@ version (unittest)
 
 unittest  // modern subscriptions/listen over stdio sends the acknowledged notification, not a {acknowledged:true} result
 {
-	auto s = new McpServer("listen-srv", "1.0");
+	auto s = McpServer.stateless("listen-srv", "1.0");
 	s.enableToolsListChanged();
 
 	Json filter = Json.emptyObject;
@@ -2867,7 +2867,7 @@ unittest  // modern subscriptions/listen over stdio sends the acknowledged notif
 
 unittest  // the stdio acknowledged notification is stamped with the listen id as the subscriptionId
 {
-	auto s = new McpServer("listen-srv", "1.0");
+	auto s = McpServer.stateless("listen-srv", "1.0");
 	s.enableToolsListChanged();
 
 	Json filter = Json.emptyObject;
@@ -2891,7 +2891,7 @@ unittest  // the stdio acknowledged notification is stamped with the listen id a
 
 unittest  // after a stdio subscriptions/listen, notify* change notifications flow on stdout, stamped with the subscriptionId
 {
-	auto s = new McpServer("listen-srv", "1.0");
+	auto s = McpServer.stateless("listen-srv", "1.0");
 	s.enableToolsListChanged();
 
 	Json filter = Json.emptyObject;
@@ -2920,7 +2920,7 @@ unittest  // after a stdio subscriptions/listen, notify* change notifications fl
 
 unittest  // a stdio subscriptions/listen returns a SubscriptionsListenResult on graceful teardown
 {
-	auto s = new McpServer("listen-srv", "1.0");
+	auto s = McpServer.stateless("listen-srv", "1.0");
 	s.enableToolsListChanged();
 
 	Json filter = Json.emptyObject;
@@ -2955,7 +2955,7 @@ unittest  // a legacy (no protocolVersion) subscriptions/listen is method-not-fo
 	// (or a legacy) protocol version is not a modern listen, so it falls through
 	// to the normal request/reply path where the legacy negotiated session
 	// reports the method as -32601 rather than answering {acknowledged:true}.
-	auto s = new McpServer("listen-srv", "1.0");
+	auto s = McpServer.stateless("listen-srv", "1.0");
 	s.enableToolsListChanged();
 
 	string[] outputs;
@@ -2974,7 +2974,7 @@ unittest  // a legacy (no protocolVersion) subscriptions/listen is method-not-fo
 
 unittest  // two tool handlers overlap concurrently over the duplex (barrier proves they are not serialized)
 {
-	auto s = new McpServer("concurrent-srv", "1.0");
+	auto s = McpServer.stateless("concurrent-srv", "1.0");
 	auto barrier = createManualEvent();
 	shared int entered = 0;
 	Tool slow = {name: "slow"};
@@ -3063,7 +3063,7 @@ version (unittest) private final class DuplexLink
 
 unittest  // END-TO-END: McpClient over stdio drives an McpServer; two concurrent callTool get distinct results
 {
-	auto s = new McpServer("e2e-srv", "1.0");
+	auto s = McpServer.stateless("e2e-srv", "1.0");
 	Tool echo = {name: "echo"};
 	s.registerTool(echo, (Json args) @safe {
 		CallToolResult r;
@@ -3211,7 +3211,7 @@ unittest  // END-TO-END: a server tool's ctx.sample round-trips to the client's 
 
 unittest  // serveStdio runs at most maxInFlight requests, queues as many more and refuses the rest
 {
-	auto s = new McpServer("inflight-cap", "1.0");
+	auto s = McpServer.stateless("inflight-cap", "1.0");
 	bool release;
 	size_t running, peak;
 	Tool slow = {name: "slow"};
@@ -3272,7 +3272,7 @@ unittest  // serveStdio runs at most maxInFlight requests, queues as many more a
 
 unittest  // notifications/cancelled withdraws a request still waiting for an in-flight slot
 {
-	auto s = new McpServer("inflight-withdraw", "1.0");
+	auto s = McpServer.stateless("inflight-withdraw", "1.0");
 	bool release;
 	Tool slow = {name: "slow"};
 	s.registerTool(slow, (Json args, RequestContext ctx) @safe {
@@ -3352,7 +3352,7 @@ unittest  // a handler awaiting a client reply while maxInFlight handlers run st
 
 unittest  // notifications/cancelled reaches a running handler while maxInFlight handlers run
 {
-	auto s = new McpServer("stdio-cap-cancel", "1.0");
+	auto s = McpServer.stateless("stdio-cap-cancel", "1.0");
 	auto entered = createManualEvent();
 	bool observedCancel;
 	Tool slow = {name: "slow"};

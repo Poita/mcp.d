@@ -64,7 +64,7 @@ enum string demoRequestStateKey = "mrtr-demo-requeststate-key-0001!";
 
 void main(string[] args) @safe
 {
-	auto server = new McpServer("mrtr-example", "0.1.0",
+	auto server = McpServer.stateless("mrtr-example", "0.1.0",
 			nullable("MRTR (multi round-trip) demo server."));
 	// Register every @tool method of the API class in one call; the tool's input
 	// schema and argument marshalling are derived from the method signature.

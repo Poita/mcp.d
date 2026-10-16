@@ -766,7 +766,7 @@ unittest  // a supporting file with URI-reserved characters is served at its enc
 {
 	import mcp.protocol.jsonrpc : Message, makeRequest;
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	registerSkill(s, Skill("pdf", "PDF help", "# PDF", null,
 			[SkillFile("notes/a b#1.md", "text/markdown", "hello")]));
 	Json rp = Json.emptyObject;
@@ -785,7 +785,7 @@ unittest  // registerSkill rejects supporting file paths that escape or are not 
 		"", "dir/"
 	])
 	{
-		auto s = new McpServer("t", "1");
+		auto s = McpServer.stateless("t", "1");
 		assertThrown(registerSkill(s, Skill("pdf", "PDF help", "# PDF", null,
 				[SkillFile(bad, "text/plain", "x")])), bad);
 	}
@@ -908,7 +908,7 @@ unittest  // enableSkills advertises the extension (with directoryRead) and noth
 	import mcp.protocol.jsonrpc : Message, makeRequest;
 	import mcp.protocol.mrtr : MetaKey;
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	s.enableSkills();
 
 	Json params = Json.emptyObject;
@@ -939,7 +939,7 @@ unittest  // registerSkill serves SKILL.md and skills/list carries a conformant 
 {
 	import mcp.protocol.jsonrpc : Message, makeRequest;
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	registerSkill(s, Skill("git-workflow", "Follow Git conventions",
 			"# Git Workflow\n\n1. Branch from main.\n"));
 
@@ -978,7 +978,7 @@ unittest  // a skill's resources manifest lists every file exactly once with its
 	import mcp.protocol.jsonrpc : Message, makeRequest;
 	import std.base64 : Base64;
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	const raw = cast(const(ubyte)[]) "\x00binary\xff";
 	Skill sk = {
 		path: "pdf", description: "Process PDFs", instructions: "# PDF\n",
@@ -1015,7 +1015,7 @@ unittest  // every manifest entry carries the byte length of the content its dig
 	import mcp.protocol.jsonrpc : Message, makeRequest;
 	import std.base64 : Base64;
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	const raw = cast(const(ubyte)[]) "\x00binary\xff";
 	Skill sk = {
 		path: "pdf", description: "Process PDFs", instructions: "# PDF\n",
@@ -1066,13 +1066,13 @@ unittest  // a skill with more than 512 resources (SKILL.md included) is rejecte
 	Skill atLimit = {
 		path: "at-limit", description: "d", instructions: "# A\n", files: files
 	};
-	assertNotThrown!Exception(registerSkill(new McpServer("t", "1"), atLimit));
+	assertNotThrown!Exception(registerSkill(McpServer.stateless("t", "1"), atLimit));
 
 	files ~= SkillFile("one-too-many.txt", "text/plain", "x");
 	Skill over = {
 		path: "over", description: "d", instructions: "# O\n", files: files
 	};
-	assertThrown!Exception(registerSkill(new McpServer("t", "1"), over));
+	assertThrown!Exception(registerSkill(McpServer.stateless("t", "1"), over));
 }
 
 unittest  // a skill whose files total more than 16 MiB is rejected
@@ -1089,14 +1089,14 @@ unittest  // a skill whose files total more than 16 MiB is rejected
 			SkillFile("big.txt", "text/plain", "a".replicate(maxSkillTotalBytes))
 		]
 	};
-	assertThrown!Exception(registerSkill(new McpServer("t", "1"), sk));
+	assertThrown!Exception(registerSkill(McpServer.stateless("t", "1"), sk));
 }
 
 unittest  // skills/list paginates whole entries with cursor/nextCursor
 {
 	import mcp.protocol.jsonrpc : Message, makeRequest;
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	s.setPageSize(1);
 	registerSkill(s, Skill("alpha", "First", "a"));
 	registerSkill(s, Skill("beta", "Second", "b"));
@@ -1119,7 +1119,7 @@ unittest  // skills/list on a server with the extension but no skills is empty
 {
 	import mcp.protocol.jsonrpc : Message, makeRequest;
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	s.enableSkills();
 	auto result = s.handle(Message(makeRequest(Json(1), "skills/list",
 			Json.emptyObject))).get["result"];
@@ -1176,7 +1176,7 @@ unittest  // skills/list and skills/get are -32601 when skills are not enabled
 	import mcp.protocol.errors : ErrorCode;
 	import mcp.protocol.jsonrpc : Message, makeRequest;
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	foreach (method; ["skills/list", "skills/get"])
 	{
 		auto resp = s.handle(Message(makeRequest(Json(1), method, Json.emptyObject))).get;
@@ -1286,7 +1286,7 @@ unittest  // declaring the skills extension also declares the resources capabili
 	// Skill files are served through resources/read, and the base Resources spec
 	// requires a server that supports resources to declare the capability — even
 	// before the first skill (and so the first resource) is registered.
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	s.enableSkills();
 
 	Json params = Json.emptyObject;
@@ -1333,7 +1333,7 @@ unittest  // registerDynamicSkill publishes an entry whose resources is the stri
 {
 	import mcp.protocol.jsonrpc : Message, makeRequest;
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	DynamicSkill sk = {
 		path: "reports/daily", description: "Assemble today's operational report",
 		instructions: () @safe => "# Daily\n"
@@ -1361,7 +1361,7 @@ unittest  // a dynamic skill's SKILL.md is generated on each read, under fixed f
 	import std.algorithm : canFind;
 	import std.conv : to;
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	int reads;
 	DynamicSkill sk = {
 		path: "counter", description: "Counts reads", metadata: ["version": "1"],
@@ -1397,7 +1397,7 @@ unittest  // registerDynamicSkill rejects an invalid path and a duplicate uri
 {
 	import std.exception : assertThrown;
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	DynamicSkill bad = {
 		path: "Bad Name", description: "d", instructions: () @safe => "x"
 	};
@@ -1414,7 +1414,7 @@ unittest  // a prefixed skill path lists frontmatter.name as the final segment
 {
 	import mcp.protocol.jsonrpc : Message, makeRequest;
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	registerSkill(s, Skill("acme/billing/refunds", "Process refunds", "# Refunds\n"));
 
 	Json rp = Json.emptyObject;
@@ -1433,7 +1433,7 @@ unittest  // metadata round-trips into the entry frontmatter as a nested object
 {
 	import mcp.protocol.jsonrpc : Message, makeRequest;
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	Skill sk = {
 		path: "pdf", description: "Process PDFs", instructions: "# PDF\n",
 		metadata: ["version": "2.1.0"]
@@ -1449,7 +1449,7 @@ unittest  // registerSkill serves supporting files as sibling resources
 {
 	import mcp.protocol.jsonrpc : Message, makeRequest;
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	Skill sk = {
 		path: "pdf", description: "Process PDFs", instructions: "See references/FORMS.md.",
 		files: [SkillFile("references/FORMS.md", "text/markdown", "# Forms\n")]
@@ -1468,7 +1468,7 @@ unittest  // each of several supporting files serves its OWN content (no reader 
 {
 	import mcp.protocol.jsonrpc : Message, makeRequest;
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	Skill sk = {
 		path: "multi", description: "Many files", instructions: "# Multi\n",
 		files: [
@@ -1497,7 +1497,7 @@ unittest  // registerSkill rejects an invalid skill path
 {
 	import std.exception : assertThrown;
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	assertThrown!Exception(registerSkill(s, Skill("Bad Name", "d", "body")));
 }
 
@@ -1507,7 +1507,7 @@ unittest  // a duplicate supporting-file path is rejected and rolls back cleanly
 	import mcp.protocol.jsonrpc : Message, makeRequest;
 	import vibe.data.json : parseJsonString;
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	Skill bad = {
 		path: "dup", description: "d", instructions: "# D\n", files: [
 			SkillFile("a.txt", "text/plain", "one"),
@@ -1536,7 +1536,7 @@ unittest  // registering the same skill path twice is rejected, leaving one entr
 	import std.exception : assertThrown;
 	import mcp.protocol.jsonrpc : Message, makeRequest;
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	registerSkill(s, Skill("twice", "First", "a"));
 	assertThrown!Exception(registerSkill(s, Skill("twice", "Second", "b")));
 
@@ -1551,7 +1551,7 @@ unittest  // a supporting file named SKILL.md collides with the skill markdown a
 {
 	import std.exception : assertThrown;
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	Skill bad = {
 		path: "x", description: "d", instructions: "# X\n", files: [
 			SkillFile("SKILL.md", "text/markdown", "oops")
@@ -1564,7 +1564,7 @@ unittest  // multiple skills accumulate in the listing in SKILL.md URI order
 {
 	import mcp.protocol.jsonrpc : Message, makeRequest;
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	registerSkill(s, Skill("beta", "Second", "b"));
 	registerSkill(s, Skill("alpha", "First", "a"));
 
@@ -1580,7 +1580,7 @@ version (unittest) private bool probeClientSupportsSkills(Json initCaps) @safe
 	import mcp.protocol.jsonrpc : Message, makeRequest;
 	import mcp.protocol.types : Tool, CallToolResult;
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	bool seen;
 	Tool probe = {name: "probe"};
 	s.registerTool(probe, (Json args, RequestContext ctx) @safe {
@@ -1947,7 +1947,7 @@ version (unittest)
 
 	private McpServer pdfSkillServer() @safe
 	{
-		auto s = new McpServer("t", "1");
+		auto s = McpServer.stateless("t", "1");
 		Skill sk = {
 			path: "office/pdf-forms", description: "Process PDFs", instructions: "# PDF\n", files: [
 				SkillFile("references/FORMS.md", "text/markdown", "# Forms\n")
@@ -1974,7 +1974,7 @@ unittest  // skillsList entries are typed from a live in-process server from a l
 
 unittest  // skillsList entries span a paginated listing a paginated listing to completion
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	s.setPageSize(1);
 	registerSkill(s, Skill("alpha", "First", "a"));
 	registerSkill(s, Skill("beta", "Second", "b"));
@@ -2003,7 +2003,7 @@ unittest  // skillsGet's entry is the same typed entry the listing carries
 
 unittest  // skillsList surfaces a dynamic entry as isDynamic with an empty manifest
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	registerSkill(s, Skill("static-one", "Static", "# S\n"));
 	DynamicSkill dyn = {
 		path: "dynamic-one", description: "Dynamic", instructions: () @safe => "# D\n"
@@ -2086,7 +2086,7 @@ unittest  // resources/directory/read is -32601 when skills (and the method) are
 {
 	import mcp.protocol.errors : ErrorCode;
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	Json p = Json.emptyObject;
 	p["uri"] = "skill://anything";
 	auto resp = s.handle(modernRequest(1, "resources/directory/read", p)).get;
@@ -2130,7 +2130,7 @@ unittest  // a skill registration that throws registering its resource leaves th
 	import mcp.protocol.jsonrpc : Message, makeRequest;
 	import mcp.protocol.mrtr : MetaKey;
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	Resource taken;
 	taken.uri = skillUri("clash");
 	taken.name = "taken";
@@ -2180,7 +2180,7 @@ unittest  // a Skill's license, compatibility, and allowed-tools reach SKILL.md 
 	import std.algorithm.searching : canFind;
 	import mcp.api.skill_dir : parseSkillFrontmatter;
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	Skill sk = {
 		path: "pdf-forms", description: "Fill PDF forms", instructions: "# Body\n", license: "Apache-2.0",
 		compatibility: "Requires poppler", allowedTools: "Bash(pdftk:*) Read"
@@ -2197,7 +2197,7 @@ unittest  // a Skill's license, compatibility, and allowed-tools reach SKILL.md 
 
 unittest  // a Skill without the optional fields omits them from its frontmatter
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	registerSkill(s, Skill("plain", "A plain skill", "# Body\n"));
 	auto fm = listedSkill(s)["frontmatter"];
 	assert("license" !in fm && "compatibility" !in fm && "allowed-tools" !in fm, fm.toString);
@@ -2207,7 +2207,7 @@ unittest  // a DynamicSkill's license, compatibility, and allowed-tools reach it
 {
 	import std.algorithm.searching : canFind;
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	DynamicSkill dyn = {
 		path: "live", description: "Live skill", instructions: () @safe => "# Body\n",
 		license: "MIT", compatibility: "Any", allowedTools: "Read"
@@ -2222,7 +2222,7 @@ unittest  // a Skill with an empty description is rejected
 {
 	import std.exception : assertThrown;
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	assertThrown(registerSkill(s, Skill("x", "", "# Body\n")));
 }
 
@@ -2231,7 +2231,7 @@ unittest  // a Skill description over 1024 characters is rejected
 	import std.array : replicate;
 	import std.exception : assertNotThrown, assertThrown;
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	assertThrown(registerSkill(s, Skill("x", "é".replicate(1025), "# Body\n")));
 	assertNotThrown(registerSkill(s, Skill("y", "é".replicate(1024), "# Body\n")));
 }
@@ -2241,7 +2241,7 @@ unittest  // a Skill compatibility over 500 characters is rejected
 	import std.array : replicate;
 	import std.exception : assertThrown;
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	Skill sk = {
 		path: "x", description: "d", instructions: "# Body\n", compatibility: "c".replicate(501)
 	};
@@ -2252,7 +2252,7 @@ unittest  // a DynamicSkill with an empty description is rejected
 {
 	import std.exception : assertThrown;
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	DynamicSkill dyn = {
 		path: "x", description: "", instructions: () @safe => "# Body\n"
 	};
@@ -2261,6 +2261,6 @@ unittest  // a DynamicSkill with an empty description is rejected
 
 unittest  // a skill is registered only from a Skill value, not from loose parts
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	static assert(!__traits(compiles, registerSkill(s, "x", "d", "body")));
 }

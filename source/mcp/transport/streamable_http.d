@@ -3152,7 +3152,7 @@ unittest  // with auth on, every member of a 2025-03-26 batch sees the caller's 
 		info.subject = "alice";
 		return info;
 	};
-	auto server = new McpServer("t", "1");
+	auto server = McpServer.stateless("t", "1");
 	Tool whoami = {name: "whoami"};
 	server.registerTool(whoami, (Json args, RequestContext ctx) @safe {
 		CallToolResult r;
@@ -3245,7 +3245,7 @@ unittest  // a 2025-03-26 batch whose Accept excludes both reply media types is 
 	import vibe.http.server : createTestHTTPServerResponse, TestHTTPResponseMode;
 	import vibe.stream.memory : createMemoryOutputStream;
 
-	auto server = new McpServer("t", "1");
+	auto server = McpServer.stateless("t", "1");
 	auto router = new URLRouter;
 	mountMcp(router, server);
 
@@ -3263,7 +3263,7 @@ unittest  // a 2025-03-26 batch from a client accepting only text/event-stream i
 	import vibe.http.server : createTestHTTPServerResponse, TestHTTPResponseMode;
 	import vibe.stream.memory : createMemoryOutputStream;
 
-	auto server = new McpServer("t", "1");
+	auto server = McpServer.stateless("t", "1");
 	auto router = new URLRouter;
 	mountMcp(router, server);
 
@@ -3333,7 +3333,7 @@ unittest  // a client reply inside a 2025-03-26 batch resolves the waiting serve
 	import vibe.data.json : parseJsonString;
 	import mcp.transport.sse_context : StreamCoordinator, ensurePushChannel;
 
-	auto server = new McpServer("t", "1");
+	auto server = McpServer.stateless("t", "1");
 	auto coord = new StreamCoordinator;
 	ensurePushChannel(server, coord);
 	auto router = new URLRouter;
@@ -4064,7 +4064,7 @@ unittest  // legacy POST: a request is processed and its response pushed onto th
 	// produces no response frame.
 	import std.algorithm : canFind;
 
-	auto server = new McpServer("t", "1");
+	auto server = McpServer.stateless("t", "1");
 	auto ch = new LegacySseChannel("/message");
 	string[] frames;
 	const id = ch.addListener((string f) @safe { frames ~= f; });
@@ -5236,7 +5236,7 @@ unittest  // concurrent legacy stateless clients never observe each other's init
 {
 	import vibe.data.json : Json;
 
-	auto server = new McpServer("t", "1");
+	auto server = McpServer.stateless("t", "1");
 	string initialize(string ver) @safe
 	{
 		return `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"` ~ ver
@@ -6335,7 +6335,7 @@ version (unittest) private HTTPServerResponse postToMount(string body_,
 	import vibe.stream.memory : createMemoryOutputStream;
 
 	auto router = new URLRouter;
-	mountMcp(router, new McpServer("t", "1"), opts);
+	mountMcp(router, McpServer.stateless("t", "1"), opts);
 	auto sink = createMemoryOutputStream();
 	auto res = createTestHTTPServerResponse(sink, null, TestHTTPResponseMode.bodyOnly);
 	router.handleRequest(makeInitPostReq(body_, headers), res);
@@ -6422,7 +6422,7 @@ unittest  // a POST body that fails to read for a reason other than size is a 40
 	import vibe.stream.memory : createMemoryOutputStream;
 
 	auto router = new URLRouter;
-	mountMcp(router, new McpServer("t", "1"));
+	mountMcp(router, McpServer.stateless("t", "1"));
 	auto req = createTestHTTPServerRequest(URL("http://127.0.0.1/mcp"),
 			HTTPMethod.POST, new FailingBodyStream);
 	req.headers["Host"] = "127.0.0.1";
@@ -6445,7 +6445,7 @@ unittest  // a POST body read failure answers a fixed message, not the stream's 
 	import vibe.stream.memory : createMemoryOutputStream;
 
 	auto router = new URLRouter;
-	mountMcp(router, new McpServer("t", "1"));
+	mountMcp(router, McpServer.stateless("t", "1"));
 	auto req = createTestHTTPServerRequest(URL("http://127.0.0.1/mcp"),
 			HTTPMethod.POST, new FailingBodyStream);
 	req.headers["Host"] = "127.0.0.1";
@@ -6468,7 +6468,7 @@ unittest  // a chunked POST body that grows past maxRequestBytes is a 413
 	StreamableHttpOptions opts;
 	opts.maxRequestBytes = 16;
 	auto router = new URLRouter;
-	mountMcp(router, new McpServer("t", "1"), opts);
+	mountMcp(router, McpServer.stateless("t", "1"), opts);
 	auto buf = cast(ubyte[]) initializeBody().dup;
 	auto req = createTestHTTPServerRequest(URL("http://127.0.0.1/mcp"),
 			HTTPMethod.POST, createMemoryStream(buf, false));
@@ -6525,7 +6525,7 @@ unittest  // a JSON-only POST drops a handler's log/progress notifications and r
 	import mcp.protocol.types : Tool, CallToolResult, Content;
 	import mcp.server.context : RequestContext;
 
-	auto server = new McpServer("t", "1");
+	auto server = McpServer.stateless("t", "1");
 	server.enableLogging();
 	Tool noisy = {name: "noisy"};
 	server.registerTool(noisy, (Json args, RequestContext ctx) @safe {
@@ -7174,7 +7174,7 @@ unittest  // modern subscriptions/listen: ack first, then opted-in change notifi
 	import mcp.protocol.mrtr : MetaKey;
 	import std.algorithm : canFind;
 
-	auto server = new McpServer("t", "1");
+	auto server = McpServer.stateless("t", "1");
 	// The server must advertise the tools list-changed capability for the
 	// toolsListChanged opt-in to be honored (2026-07-28 basic/utilities/subscriptions).
 	server.enableToolsListChanged();
@@ -7231,7 +7231,7 @@ unittest  // a subscriptions/listen stream's events carry no SSE id: it is never
 	import mcp.transport.sse_context : StreamCoordinator;
 	import std.algorithm : canFind;
 
-	auto server = new McpServer("t", "1");
+	auto server = McpServer.stateless("t", "1");
 	server.enableToolsListChanged();
 	auto push = ensurePushChannel(server, new StreamCoordinator);
 	string[] frames;

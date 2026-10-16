@@ -117,7 +117,7 @@ void main(string[] args)
 	const audienceHost = (host == "0.0.0.0" || host == "::") ? "127.0.0.1" : host;
 	const resource = "http://" ~ audienceHost ~ ":" ~ port.to!string ~ "/mcp";
 
-	auto server = new McpServer("auth-example", "1.0.0",
+	auto server = McpServer.stateless("auth-example", "1.0.0",
 			nullable("OAuth 2.1 protected MCP server (Streamable HTTP)."));
 
 	// Register every @tool method of AuthApi (whoami, secret_note) in one call.

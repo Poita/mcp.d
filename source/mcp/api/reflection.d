@@ -1998,7 +1998,7 @@ unittest  // @tool reflection: schema derivation + typed dispatch
 {
 	import mcp.protocol.jsonrpc : Message, makeRequest;
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	registerHandlers(s, new DemoApi);
 
 	Json lp = Json.emptyObject;
@@ -2017,7 +2017,7 @@ unittest  // @tool reflection: outputSchema is inferred from the return type
 {
 	import mcp.protocol.jsonrpc : Message, makeRequest;
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	registerHandlers(s, new DemoApi);
 	auto tools = s.handle(Message(makeRequest(Json(1), "tools/list",
 			Json.emptyObject))).get["result"]["tools"];
@@ -2053,7 +2053,7 @@ unittest  // @tool reflection: struct return produces matching structuredContent
 {
 	import mcp.protocol.jsonrpc : Message, makeRequest;
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	registerHandlers(s, new DemoApi);
 	Json p = Json.emptyObject;
 	p["name"] = "stats";
@@ -2070,7 +2070,7 @@ unittest  // @tool reflection: string return becomes text content
 {
 	import mcp.protocol.jsonrpc : Message, makeRequest;
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	registerHandlers(s, new DemoApi);
 	Json p = Json.emptyObject;
 	p["name"] = "greet";
@@ -2095,7 +2095,7 @@ unittest  // @tool reflection: a void-returning tool compiles, registers, and di
 	}
 
 	auto api = new VoidApi;
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	registerHandlers(s, api);
 
 	// The void tool is registered like any other.
@@ -2124,7 +2124,7 @@ unittest  // @tool reflection: a void-returning tool advertises no outputSchema
 		}
 	}
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	registerHandlers(s, new VoidSchemaApi);
 	auto tools = s.handle(MakeListMessage()).get["result"]["tools"];
 	assert(tools.length == 1);
@@ -2133,7 +2133,7 @@ unittest  // @tool reflection: a void-returning tool advertises no outputSchema
 
 unittest  // @tool reflection: enum param schema + optional Nullable param
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	registerHandlers(s, new DemoApi);
 	auto tools = s.handle(MakeListMessage()).get["result"]["tools"];
 	// find classify
@@ -2157,7 +2157,7 @@ unittest  // @resource and @prompt reflection register and dispatch
 {
 	import mcp.protocol.jsonrpc : Message, makeRequest;
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	registerHandlers(s, new DemoApi);
 
 	Json rp = Json.emptyObject;
@@ -2186,7 +2186,7 @@ unittest  // @skill reflection: registerHandlers serves SKILL.md and lists the s
 		}
 	}
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	registerHandlers(s, new SkillApi);
 
 	// The @skill method is served as a skill:// markdown resource with synthesized
@@ -2215,7 +2215,7 @@ unittest  // @prompt enum arg given an invalid member -> InvalidParams (-32602)
 	import mcp.protocol.jsonrpc : Message, makeRequest;
 	import mcp.protocol.errors : ErrorCode;
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	registerHandlers(s, new DemoApi);
 
 	Json pp = Json.emptyObject;
@@ -2232,7 +2232,7 @@ unittest  // @prompt integer arg given a non-numeric string -> InvalidParams (-3
 	import mcp.protocol.jsonrpc : Message, makeRequest;
 	import mcp.protocol.errors : ErrorCode;
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	registerHandlers(s, new DemoApi);
 
 	Json pp = Json.emptyObject;
@@ -2248,7 +2248,7 @@ unittest  // @prompt integer arg given its wire-form string is parsed into the D
 {
 	import mcp.protocol.jsonrpc : Message, makeRequest;
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	registerHandlers(s, new DemoApi);
 
 	Json pp = Json.emptyObject;
@@ -2274,7 +2274,7 @@ unittest  // @prompt bool, floating-point, and Nullable args are parsed from the
 		}
 	}
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	registerHandlers(s, new TypedPromptApi);
 	Json pp = Json.emptyObject;
 	pp["name"] = "typed";
@@ -2304,7 +2304,7 @@ unittest  // a @prompt parameter with @schemaDefault is optional and takes that 
 		}
 	}
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	registerHandlers(s, new DefaultedPromptApi);
 	auto list = s.handle(Message(makeRequest(Json(1), "prompts/list", Json.emptyObject))).get;
 	auto args = list["result"]["prompts"][0]["arguments"];
@@ -2330,7 +2330,7 @@ unittest  // @prompt string arg given JSON null -> clean InvalidParams, not vibe
 	import mcp.protocol.errors : ErrorCode;
 	import std.algorithm : canFind;
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	registerHandlers(s, new DemoApi);
 
 	Json pp = Json.emptyObject;
@@ -2351,7 +2351,7 @@ unittest  // @prompt reflection: optional title is emitted in prompts/list
 {
 	import mcp.protocol.jsonrpc : Message, makeRequest;
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	registerHandlers(s, new DemoApi);
 
 	auto prompts = s.handle(Message(makeRequest(Json(1), "prompts/list",
@@ -2380,7 +2380,7 @@ unittest  // @audience/@priority value UDAs: annotations appear in resources/lis
 {
 	import mcp.protocol.jsonrpc : Message, makeRequest;
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	registerHandlers(s, new DemoApi);
 
 	auto res = s.handle(Message(makeRequest(Json(1), "resources/list",
@@ -2420,7 +2420,7 @@ unittest  // @audience value UDA: multiple roles round-trip into annotations
 		}
 	}
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	registerHandlers(s, new MultiAudienceApi);
 	auto res = s.handle(Message(makeRequest(Json(1), "resources/list",
 			Json.emptyObject))).get["result"]["resources"];
@@ -2443,7 +2443,7 @@ unittest  // @tool reflection: optional title is emitted in tools/list
 {
 	import mcp.protocol.jsonrpc : Message, makeRequest;
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	registerHandlers(s, new DemoApi);
 	auto tools = s.handle(Message(makeRequest(Json(1), "tools/list",
 			Json.emptyObject))).get["result"]["tools"];
@@ -2460,7 +2460,7 @@ unittest  // marker hint UDAs: hints are serialized into annotations
 {
 	import mcp.protocol.jsonrpc : Message, makeRequest;
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	registerHandlers(s, new DemoApi);
 	auto tools = s.handle(Message(makeRequest(Json(1), "tools/list",
 			Json.emptyObject))).get["result"]["tools"];
@@ -2500,7 +2500,7 @@ unittest  // marker-UDA hints: @readOnly + @hintTitle produce the wire shape
 		}
 	}
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	registerHandlers(s, new ReadOnlyApi);
 	auto tools = s.handle(Message(makeRequest(Json(1), "tools/list",
 			Json.emptyObject))).get["result"]["tools"];
@@ -2538,7 +2538,7 @@ unittest  // method-level marker UDAs coexist with a @describeParam'd parameter
 		}
 	}
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	registerHandlers(s, new MarkedParamApi);
 	auto tools = s.handle(Message(makeRequest(Json(1), "tools/list",
 			Json.emptyObject))).get["result"]["tools"];
@@ -2692,13 +2692,13 @@ unittest  // uriTemplateVars extracts variable names, stripping operators and mo
 
 unittest  // a @resourceTemplate parameter not named in the URI template is rejected at compile time
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	assert(!__traits(compiles, registerHandlers(s, new UnknownTemplateParamApi)));
 }
 
 unittest  // @resourceTemplate parameters may bind any operator-prefixed or modified template variable
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	assert(__traits(compiles, registerHandlers(s, new OperatorTemplateApi)));
 }
 
@@ -2714,31 +2714,31 @@ unittest  // the bare-UDA diagnostic shows each handler UDA's own argument list
 
 unittest  // a bare @tool (without its argument list) is rejected at compile time
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	assert(!__traits(compiles, registerHandlers(s, new BareToolApi)));
 }
 
 unittest  // a bare @prompt (without its argument list) is rejected at compile time
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	assert(!__traits(compiles, registerHandlers(s, new BarePromptApi)));
 }
 
 unittest  // a bare @resource (without its argument list) is rejected at compile time
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	assert(!__traits(compiles, registerHandlers(s, new BareResourceApi)));
 }
 
 unittest  // a @tool with an empty name is rejected at compile time
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	assert(!__traits(compiles, registerHandlers(s, new EmptyToolNameApi)));
 }
 
 unittest  // a @prompt with an empty name is rejected at compile time
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	assert(!__traits(compiles, registerHandlers(s, new EmptyPromptNameApi)));
 }
 
@@ -2769,19 +2769,19 @@ unittest  // an out or ref argument parameter is rejected at compile time
 
 unittest  // @mcpHeader: a struct-typed parameter is rejected at compile time
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	assert(!__traits(compiles, registerHandlers(s, new StructHeaderApi)));
 }
 
 unittest  // @mcpHeader: an array-typed parameter is rejected at compile time
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	assert(!__traits(compiles, registerHandlers(s, new ArrayHeaderApi)));
 }
 
 unittest  // @mcpHeader: a Nullable-of-primitive parameter is accepted at compile time
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	assert(__traits(compiles, registerHandlers(s, new NullableHeaderApi)));
 }
 
@@ -2797,7 +2797,7 @@ version (unittest) private class HeaderBesideArrayApi
 
 unittest  // @mcpHeader: a non-primitive sibling of the header parameter is accepted
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	static assert(__traits(compiles, registerHandlers(s, new HeaderBesideArrayApi)));
 }
 
@@ -2823,25 +2823,25 @@ version (unittest) private class TwoHeadersOneParamApi
 
 unittest  // @mcpHeader: two headers differing only in ASCII case are rejected at compile time
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	static assert(!__traits(compiles, registerHandlers(s, new DuplicateHeaderNameApi)));
 }
 
 unittest  // @mcpHeader: two headers on one parameter are rejected at compile time
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	static assert(!__traits(compiles, registerHandlers(s, new TwoHeadersOneParamApi)));
 }
 
 unittest  // @mcpHeader: naming a non-existent parameter is rejected at compile time
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	assert(!__traits(compiles, registerHandlers(s, new UnknownHeaderParamApi)));
 }
 
 unittest  // @mcpHeader: naming an injected context parameter is rejected at compile time
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	assert(!__traits(compiles, registerHandlers(s, new CtxHeaderParamApi)));
 }
 
@@ -2850,7 +2850,7 @@ unittest  // @mcpHeader reflection: x-mcp-header is emitted into the param schem
 	import mcp.protocol.jsonrpc : Message, makeRequest;
 	import mcp.protocol.mrtr : paramHeaders;
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	registerHandlers(s, new DemoApi);
 	auto tools = s.handle(Message(makeRequest(Json(1), "tools/list",
 			Json.emptyObject))).get["result"]["tools"];
@@ -2880,7 +2880,7 @@ unittest  // @tool dispatch: a malformed arg (validation off) yields a clean att
 	import mcp.protocol.jsonrpc : Message, makeRequest;
 	import std.algorithm.searching : canFind;
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	registerHandlers(s, new DemoApi);
 	// With schema validation off the coarse pre-dispatch check is bypassed, so the
 	// marshaller sees the malformed value and must report a clean, attributed error.
@@ -2902,7 +2902,7 @@ unittest  // @describeParam UDA: parameter descriptions appear in tool inputSche
 {
 	import mcp.protocol.jsonrpc : Message, makeRequest;
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	registerHandlers(s, new DemoApi);
 	auto tools = s.handle(Message(makeRequest(Json(1), "tools/list",
 			Json.emptyObject))).get["result"]["tools"];
@@ -2923,7 +2923,7 @@ unittest  // @describeParam UDA: prompt argument descriptions appear in prompts/
 {
 	import mcp.protocol.jsonrpc : Message, makeRequest;
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	registerHandlers(s, new DemoApi);
 	auto prompts = s.handle(Message(makeRequest(Json(1), "prompts/list",
 			Json.emptyObject))).get["result"]["prompts"];
@@ -2961,7 +2961,7 @@ unittest  // @prompt with several non-context parameters registers and dispatche
 		}
 	}
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	registerHandlers(s, new TwoArgPromptApi);
 
 	auto prompts = s.handle(Message(makeRequest(Json(1), "prompts/list",
@@ -3009,7 +3009,7 @@ unittest  // @icon UDA: tool icons appear in tools/list
 {
 	import mcp.protocol.jsonrpc : Message, makeRequest;
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	registerHandlers(s, new ExtApi);
 	auto tools = s.handle(Message(makeRequest(Json(1), "tools/list",
 			Json.emptyObject))).get["result"]["tools"];
@@ -3029,7 +3029,7 @@ unittest  // @meta UDA: tool descriptor `_meta` appears in tools/list
 {
 	import mcp.protocol.jsonrpc : Message, makeRequest;
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	registerHandlers(s, new ExtApi);
 	auto tools = s.handle(Message(makeRequest(Json(1), "tools/list",
 			Json.emptyObject))).get["result"]["tools"];
@@ -3045,7 +3045,7 @@ unittest  // @hintTitle: annotation-level title appears in annotations
 {
 	import mcp.protocol.jsonrpc : Message, makeRequest;
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	registerHandlers(s, new ExtApi);
 	auto tools = s.handle(Message(makeRequest(Json(1), "tools/list",
 			Json.emptyObject))).get["result"]["tools"];
@@ -3064,7 +3064,7 @@ unittest  // MRTR UDA tool: returning ToolResponse.inputRequired surfaces inputR
 	import mcp.protocol.jsonrpc : Message, makeRequest;
 	import mcp.protocol.mrtr : MetaKey;
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	registerHandlers(s, new ExtApi);
 
 	// Empty seed -> the tool asks for more input (MRTR InputRequiredResult). MRTR
@@ -3089,7 +3089,7 @@ unittest  // MRTR on a legacy session: an input-required result is rejected, not
 	import mcp.protocol.jsonrpc : Message, makeRequest;
 	import mcp.protocol.errors : ErrorCode;
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	registerHandlers(s, new ExtApi);
 
 	// No modern `_meta.protocolVersion` -> the session is legacy (no MRTR). A
@@ -3152,7 +3152,7 @@ unittest  // a dynamic tool's malformed arguments read via argsAs yield an isErr
 		int n;
 	}
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	Tool t;
 	t.name = "dyn";
 	t.inputSchema = parseJsonString(`{"type":"object"}`);
@@ -3182,7 +3182,7 @@ unittest  // a @prompt method may return a PromptResponse, which is sent as is
 {
 	import mcp.protocol.jsonrpc : Message, makeRequest;
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	registerHandlers(s, new PromptResponseApi);
 	Json pp = Json.emptyObject;
 	pp["name"] = "greet";
@@ -3195,7 +3195,7 @@ unittest  // MRTR UDA tool: returning ToolResponse.complete produces a normal re
 {
 	import mcp.protocol.jsonrpc : Message, makeRequest;
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	registerHandlers(s, new ExtApi);
 
 	Json p = Json.emptyObject;
@@ -3210,7 +3210,7 @@ unittest  // @icon / @meta UDA on a resource: appear in resources/list
 {
 	import mcp.protocol.jsonrpc : Message, makeRequest;
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	registerHandlers(s, new ExtApi);
 	auto res = s.handle(Message(makeRequest(Json(1), "resources/list",
 			Json.emptyObject))).get["result"]["resources"];
@@ -3228,7 +3228,7 @@ unittest  // @icon UDA on a @prompt: icons appear in prompts/list
 {
 	import mcp.protocol.jsonrpc : Message, makeRequest;
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	registerHandlers(s, new ExtApi);
 	auto prompts = s.handle(Message(makeRequest(Json(1), "prompts/list",
 			Json.emptyObject))).get["result"]["prompts"];
@@ -3248,7 +3248,7 @@ unittest  // @meta UDA on a @prompt: descriptor `_meta` appears in prompts/list
 {
 	import mcp.protocol.jsonrpc : Message, makeRequest;
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	registerHandlers(s, new ExtApi);
 	auto prompts = s.handle(Message(makeRequest(Json(1), "prompts/list",
 			Json.emptyObject))).get["result"]["prompts"];
@@ -3275,7 +3275,7 @@ unittest  // @icon UDA: theme field propagates through collectIcons to tools/lis
 {
 	import mcp.protocol.jsonrpc : Message, makeRequest;
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	registerHandlers(s, new ThemedIconApi);
 	auto tools = s.handle(Message(makeRequest(Json(1), "tools/list",
 			Json.emptyObject))).get["result"]["tools"];
@@ -3303,7 +3303,7 @@ version (unittest) private auto modernRead(string uri) @safe
 
 unittest  // @cacheable UDA on a resource: modern resources/read carries CacheableResult fields
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	registerHandlers(s, new ExtApi);
 	// A modern request (carrying the protocol-version _meta) gets cache fields.
 	auto rr = s.handle(modernRead("ext://cached")).get;
@@ -3315,7 +3315,7 @@ unittest  // @cacheable UDA: legacy resources/read has NO cache fields (no wire 
 {
 	import mcp.protocol.jsonrpc : Message, makeRequest;
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	registerHandlers(s, new ExtApi);
 	// A plain (legacy) request must NOT carry any cache fields.
 	Json rp = Json.emptyObject;
@@ -3407,7 +3407,7 @@ unittest  // enum field in a returned struct serializes by member name
 {
 	import mcp.protocol.jsonrpc : Message, makeRequest;
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	registerHandlers(s, new EnumApi);
 	Json p = Json.emptyObject;
 	p["name"] = "box";
@@ -3420,7 +3420,7 @@ unittest  // bare enum return is wrapped under `result` as its string name
 {
 	import mcp.protocol.jsonrpc : Message, makeRequest;
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	registerHandlers(s, new EnumApi);
 	Json p = Json.emptyObject;
 	p["name"] = "pick";
@@ -3433,7 +3433,7 @@ unittest  // array of enums inside a struct serializes by name
 {
 	import mcp.protocol.jsonrpc : Message, makeRequest;
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	registerHandlers(s, new EnumApi);
 	Json p = Json.emptyObject;
 	p["name"] = "palette";
@@ -3448,7 +3448,7 @@ unittest  // enum output passes the tool's own outputSchema validation
 {
 	import mcp.protocol.jsonrpc : Message, makeRequest;
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	s.enableOutputSchemaValidation();
 	registerHandlers(s, new EnumApi);
 	Json p = Json.emptyObject;
@@ -3464,7 +3464,7 @@ unittest  // enum nested in a struct param is supplied as its schema string
 {
 	import mcp.protocol.jsonrpc : Message, makeRequest;
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	registerHandlers(s, new EnumApi);
 	Json p = Json.emptyObject;
 	p["name"] = "name";
@@ -3479,7 +3479,7 @@ unittest  // a defaulted parameter is absent from inputSchema required
 {
 	import mcp.protocol.jsonrpc : Message, makeRequest;
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	registerHandlers(s, new EnumApi);
 	auto tools = s.handle(Message(makeRequest(Json(1), "tools/list",
 			Json.emptyObject))).get["result"]["tools"];
@@ -3507,7 +3507,7 @@ unittest  // omitting a defaulted arg passes the declared default, not P.init
 {
 	import mcp.protocol.jsonrpc : Message, makeRequest;
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	registerHandlers(s, new EnumApi);
 	Json p = Json.emptyObject;
 	p["name"] = "limited";
@@ -3542,7 +3542,7 @@ version (unittest)
 	{
 		import mcp.protocol.jsonrpc : Message, makeRequest;
 
-		auto s = new McpServer("t", "1");
+		auto s = McpServer.stateless("t", "1");
 		s.disableInputSchemaValidation();
 		registerHandlers(s, new PagedApi);
 		Json p = Json.emptyObject;
@@ -3604,7 +3604,7 @@ version (unittest)
 
 	private Json renamedTool(string toolName) @safe
 	{
-		auto s = new McpServer("t", "1");
+		auto s = McpServer.stateless("t", "1");
 		registerHandlers(s, new RenamedApi);
 		auto tools = s.handle(MakeListMessage()).get["result"]["tools"];
 		foreach (i; 0 .. tools.length)
@@ -3631,7 +3631,7 @@ unittest  // a struct param using vibe field UDAs is callable under input-schema
 {
 	import mcp.protocol.jsonrpc : Message, makeRequest;
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	registerHandlers(s, new RenamedApi);
 	Json p = Json.emptyObject;
 	p["name"] = "renamed";
@@ -3645,7 +3645,7 @@ unittest  // a struct return using vibe field UDAs passes its own outputSchema v
 {
 	import mcp.protocol.jsonrpc : Message, makeRequest;
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	s.enableOutputSchemaValidation();
 	registerHandlers(s, new RenamedApi);
 	Json p = Json.emptyObject;
@@ -3682,7 +3682,7 @@ version (unittest)
 
 unittest  // a Json parameter or struct field is described by the empty (any-value) schema
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	registerHandlers(s, new JsonParamApi);
 	auto tools = s.handle(MakeListMessage()).get["result"]["tools"];
 	Json raw, wrap;
@@ -3702,7 +3702,7 @@ unittest  // Json parameters and struct fields bind the argument value verbatim
 {
 	import mcp.protocol.jsonrpc : Message, makeRequest;
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	s.enableOutputSchemaValidation();
 	registerHandlers(s, new JsonParamApi);
 
@@ -3753,7 +3753,7 @@ version (unittest)
 	{
 		import mcp.protocol.jsonrpc : Message, makeRequest;
 
-		auto s = new McpServer("t", "1");
+		auto s = McpServer.stateless("t", "1");
 		registerHandlers(s, new SumTypeApi);
 		Json p = Json.emptyObject;
 		p["name"] = tool;
@@ -3766,7 +3766,7 @@ version (unittest)
 
 unittest  // a SumType parameter is described by anyOf over its members
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	registerHandlers(s, new SumTypeApi);
 	auto tools = s.handle(MakeListMessage()).get["result"]["tools"];
 	auto v = tools[0]["inputSchema"]["properties"]["v"];
@@ -3807,7 +3807,7 @@ version (unittest)
 
 unittest  // TimeOfDay/DateTime schemas describe the offset-less form they bind, not RFC 3339 formats
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	registerHandlers(s, new ClockApi);
 	auto props = s.handle(MakeListMessage()).get["result"]["tools"][0]["inputSchema"]["properties"];
 	assert("format" !in props["at"] && "pattern" in props["at"], props.toString);
@@ -3818,7 +3818,7 @@ unittest  // TimeOfDay/DateTime values round-trip under input and output schema 
 {
 	import mcp.protocol.jsonrpc : Message, makeRequest;
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	s.enableOutputSchemaValidation();
 	registerHandlers(s, new ClockApi);
 	Json p = Json.emptyObject;
@@ -3843,7 +3843,7 @@ unittest  // a required tool arg missing (schema validation disabled) is an isEr
 {
 	import mcp.protocol.jsonrpc : Message, makeRequest;
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	s.disableInputSchemaValidation();
 	registerHandlers(s, new EnumApi);
 	Json p = Json.emptyObject;
@@ -3857,7 +3857,7 @@ unittest  // resource-template int param receives the captured value, not T.init
 {
 	import mcp.protocol.jsonrpc : Message, makeRequest;
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	registerHandlers(s, new EnumApi);
 	Json rp = Json.emptyObject;
 	rp["uri"] = "widget://42";
@@ -3869,7 +3869,7 @@ unittest  // resource-template enum param is parsed by member name
 {
 	import mcp.protocol.jsonrpc : Message, makeRequest;
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	registerHandlers(s, new EnumApi);
 	Json rp = Json.emptyObject;
 	rp["uri"] = "hue://green";
@@ -3890,7 +3890,7 @@ unittest  // resource-template Nullable!string param receives the plain captured
 		}
 	}
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	registerHandlers(s, new NullableTemplateApi);
 	Json rp = Json.emptyObject;
 	rp["uri"] = "opt://hello";
@@ -3903,7 +3903,7 @@ unittest  // resource-template invalid scalar yields an InvalidParams error
 {
 	import mcp.protocol.jsonrpc : Message, makeRequest;
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	registerHandlers(s, new EnumApi);
 	Json rp = Json.emptyObject;
 	rp["uri"] = "widget://not-a-number";
@@ -4043,7 +4043,7 @@ unittest  // @prompt RequestContext parameter binds to the real request context
 {
 	import mcp.protocol.jsonrpc : Message, makeRequest;
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	registerHandlers(s, new ContextPromptApi);
 
 	auto probe = new ContextProbe;
@@ -4061,7 +4061,7 @@ unittest  // @resourceTemplate RequestContext parameter binds to the real reques
 {
 	import mcp.protocol.jsonrpc : Message, makeRequest;
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	registerHandlers(s, new ContextTemplateApi);
 
 	auto probe = new ContextProbe;
@@ -4107,7 +4107,7 @@ unittest  // @resource description and title fields are emitted in resources/lis
 {
 	import mcp.protocol.jsonrpc : Message, makeRequest;
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	registerHandlers(s, new DescribedResourceApi);
 	auto res = s.handle(Message(makeRequest(Json(1), "resources/list",
 			Json.emptyObject))).get["result"]["resources"];
@@ -4136,7 +4136,7 @@ unittest  // @resourceTemplate description and title fields are emitted in resou
 {
 	import mcp.protocol.jsonrpc : Message, makeRequest;
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	registerHandlers(s, new DescribedResourceApi);
 	auto tmpl = s.handle(Message(makeRequest(Json(1), "resources/templates/list",
 			Json.emptyObject))).get["result"]["resourceTemplates"];
@@ -4188,13 +4188,13 @@ version (unittest) private final class DescribeCtxParamApi
 
 unittest  // @describeParam naming an unknown parameter is rejected at compile time
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	assert(!__traits(compiles, registerHandlers(s, new DescribeUnknownParamApi)));
 }
 
 unittest  // @describeParam naming an injected context parameter is rejected at compile time
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	assert(!__traits(compiles, registerHandlers(s, new DescribeCtxParamApi)));
 }
 
@@ -4217,7 +4217,7 @@ unittest  // facet UDAs on bare tool parameters are emitted into inputSchema
 {
 	import mcp.protocol.jsonrpc : Message, makeRequest;
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	registerHandlers(s, new FacetParamApi);
 	auto tools = s.handle(Message(makeRequest(Json(1), "tools/list",
 			Json.emptyObject))).get["result"]["tools"];
@@ -4276,7 +4276,7 @@ version (unittest) private Json optToolSchema() @safe
 {
 	import mcp.protocol.jsonrpc : Message, makeRequest;
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	registerHandlers(s, new OptionalParamApi);
 	auto tools = s.handle(Message(makeRequest(Json(1), "tools/list",
 			Json.emptyObject))).get["result"]["tools"];
@@ -4290,7 +4290,7 @@ unittest  // a parameter facet + a method-level marker on the same tool compiles
 {
 	// Registration must compile: applyUdaFacets has to ignore the bare-type
 	// markers (@readOnly/@openWorld) mixed into the parameter's attribute set.
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	registerHandlers(s, new OptionalParamApi);
 }
 
@@ -4382,7 +4382,7 @@ unittest  // @taskTool UDA: tool is listed with an input schema derived from its
 	import mcp.protocol.jsonrpc : Message, makeRequest;
 	import mcp.server.task_context : SyncTaskDispatcher;
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	TaskOptions taskOpts;
 	taskOpts.dispatcher = new SyncTaskDispatcher();
 	s.enableTasks(taskOpts);
@@ -4406,7 +4406,7 @@ unittest  // @taskTool UDA: tools/call returns a task the executor completes
 	import mcp.protocol.jsonrpc : Message, makeRequest;
 	import mcp.server.task_context : SyncTaskDispatcher;
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	s.enableTasks(TaskOptions(null, new SyncTaskDispatcher()));
 	registerHandlers(s, new TaskUdaApi);
 
@@ -4435,7 +4435,7 @@ unittest  // @taskTool UDA: a missing required argument (schema validation off) 
 	import mcp.server.task_context : SyncTaskDispatcher;
 	import std.algorithm : canFind;
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	s.disableInputSchemaValidation();
 	s.enableTasks(TaskOptions(null, new SyncTaskDispatcher()));
 	registerHandlers(s, new TaskUdaApi);
@@ -4460,7 +4460,7 @@ unittest  // @taskTool UDA: a mid-task elicitation suspends and resumes via task
 	import mcp.protocol.jsonrpc : Message, makeRequest;
 	import mcp.server.task_context : SyncTaskDispatcher;
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	s.enableTasks(TaskOptions(null, new SyncTaskDispatcher()));
 	registerHandlers(s, new TaskUdaApi);
 
@@ -4523,7 +4523,7 @@ unittest  // @event derives input + payload schemas from its typed signature
 {
 	import mcp.protocol.jsonrpc : Message, makeRequest;
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	s.enableEvents();
 	registerHandlers(s, new EventUdaApi);
 
@@ -4545,7 +4545,7 @@ unittest  // @event carries its title through to events/list
 {
 	import mcp.protocol.jsonrpc : Message, makeRequest;
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	s.enableEvents();
 	registerHandlers(s, new EventUdaApi);
 
@@ -4564,7 +4564,7 @@ unittest  // @event fetch handler backs events/poll: bootstrap then deliver type
 {
 	import mcp.protocol.jsonrpc : Message, makeRequest;
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	s.enableEvents();
 	registerHandlers(s, new EventUdaApi);
 
@@ -4590,7 +4590,7 @@ unittest  // the typed builder defines a push type whose publish() feeds events/
 {
 	import mcp.protocol.jsonrpc : Message, makeRequest;
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	auto rt = s.enableEvents();
 	auto ev = rt.define!(EmailArgs, Email)("mail.pushed", "pushed mail");
 
@@ -4640,19 +4640,19 @@ version (unittest) private final class EventCtxTaskApi
 
 unittest  // a @tool method taking a TaskContext is rejected at compile time
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	static assert(!__traits(compiles, registerHandlers(s, new TaskCtxToolApi)));
 }
 
 unittest  // a @tool method taking an EventContext is rejected at compile time
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	static assert(!__traits(compiles, registerHandlers(s, new EventCtxToolApi)));
 }
 
 unittest  // a @taskTool method taking an EventContext is rejected at compile time
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	static assert(!__traits(compiles, registerHandlers(s, new EventCtxTaskApi)));
 }
 
@@ -4694,7 +4694,7 @@ version (unittest) private final class EventCtxTemplateApi(C)
 
 unittest  // a handler taking a FetchContext or SubContext is rejected at compile time
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	static foreach (C; AliasSeq!(FetchContext, SubContext))
 	{
 		static assert(!__traits(compiles, registerHandlers(s, new EventCtxParamsApi!C)));
@@ -4758,7 +4758,7 @@ unittest  // a non-@safe handler method is rejected with a diagnostic naming it
 {
 	static assert(!__traits(compiles, checkHandlerSafety!("t", SystemToolApi.t)()));
 	static assert(__traits(compiles, checkHandlerSafety!("echo", EchoSafeApi.echo)()));
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	static assert(!__traits(compiles, registerHandlers(s, new SystemToolApi)));
 }
 
@@ -4804,7 +4804,7 @@ unittest  // a Content[] return becomes the result's content with no structured 
 
 unittest  // @tool methods returning Content and Content[] register
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	registerHandlers(s, new ContentToolApi);
 }
 
@@ -4864,7 +4864,7 @@ version (unittest) private final class ParamResourceApi
 
 unittest  // a @resource method that takes parameters is rejected at compile time
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	static assert(!__traits(compiles, registerHandlers(s, new ParamResourceApi)));
 }
 
@@ -4910,7 +4910,7 @@ unittest  // a @resourceTemplate parameter absent from the URI binds its declare
 {
 	import mcp.protocol.jsonrpc : Message, makeRequest;
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	registerHandlers(s, new DefaultTemplateParamApi);
 
 	Json rp = Json.emptyObject;
@@ -4927,7 +4927,7 @@ unittest  // handlers with in/const/immutable parameters register and dispatch
 {
 	import mcp.protocol.jsonrpc : Message, makeRequest;
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	registerHandlers(s, new QualifiedParamApi);
 
 	Json tp = Json.emptyObject;
@@ -4979,7 +4979,7 @@ version (unittest) private final class NullInputApi
 
 unittest  // explicit null for a Nullable parameter passes input validation and binds as null
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	registerHandlers(s, new NullInputApi);
 	auto r = callToolArgs(s, "nul", `{"limit":null,"slots":[],"filter":{"q":"x"}}`);
 	assert("isError" !in r, r.toString);
@@ -4988,7 +4988,7 @@ unittest  // explicit null for a Nullable parameter passes input validation and 
 
 unittest  // a null element of a Nullable!T[] parameter passes input validation
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	registerHandlers(s, new NullInputApi);
 	auto r = callToolArgs(s, "nul", `{"slots":[1,null],"filter":{"q":"x"}}`);
 	assert("isError" !in r, r.toString);
@@ -4997,7 +4997,7 @@ unittest  // a null element of a Nullable!T[] parameter passes input validation
 
 unittest  // explicit null for a Nullable enum parameter passes input validation
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	registerHandlers(s, new NullInputApi);
 	auto r = callToolArgs(s, "nul", `{"unique":null,"slots":[],"filter":{"q":"x"}}`);
 	assert("isError" !in r, r.toString);
@@ -5005,7 +5005,7 @@ unittest  // explicit null for a Nullable enum parameter passes input validation
 
 unittest  // explicit null for a Nullable struct field passes input validation
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	registerHandlers(s, new NullInputApi);
 	auto r = callToolArgs(s, "nul", `{"slots":[],"filter":{"q":"x","limit":null}}`);
 	assert("isError" !in r, r.toString);
@@ -5015,7 +5015,7 @@ unittest  // a Nullable @mcpHeader parameter keeps the bare primitive type x-mcp
 {
 	import mcp.protocol.mrtr : paramHeaders;
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	registerHandlers(s, new NullableHeaderApi);
 	auto schema = s.handle(MakeListMessage()).get["result"]["tools"][0]["inputSchema"];
 	assert(schema["properties"]["region"]["type"].get!string == "integer", schema.toString);
@@ -5051,7 +5051,7 @@ unittest  // an unset floating-point result, as sent on the wire, conforms to th
 {
 	import mcp.protocol.schema : validateAgainstSchema;
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	registerHandlers(s, new UnsetFloatApi);
 	Json[string] schemas;
 	auto tools = s.handle(MakeListMessage()).get["result"]["tools"];
@@ -5068,7 +5068,7 @@ unittest  // an unset floating-point result, as sent on the wire, conforms to th
 
 unittest  // a floating-point output schema admits the null an unset value serializes as
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	registerHandlers(s, new UnsetFloatApi);
 	auto tools = s.handle(MakeListMessage()).get["result"]["tools"];
 	foreach (i; 0 .. tools.length)
@@ -5102,7 +5102,7 @@ version (unittest) private final class KeywordParamApi
 
 unittest  // a tool parameter's wire name drops one trailing underscore, as a struct field's does
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	registerHandlers(s, new KeywordParamApi);
 	auto schema = s.handle(MakeListMessage()).get["result"]["tools"][0]["inputSchema"];
 	assert("version" in schema["properties"] && "body" in schema["properties"], schema.toString);
@@ -5118,7 +5118,7 @@ unittest  // a prompt argument's wire name drops one trailing underscore
 {
 	import mcp.protocol.jsonrpc : Message, makeRequest;
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	registerHandlers(s, new KeywordParamApi);
 	auto prompts = s.handle(Message(makeRequest(Json(1), "prompts/list",
 			Json.emptyObject))).get["result"]["prompts"];
@@ -5134,7 +5134,7 @@ unittest  // a resource template parameter matches its URI variable without the 
 {
 	import mcp.protocol.jsonrpc : Message, makeRequest;
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	registerHandlers(s, new KeywordParamApi);
 	Json rp = Json.emptyObject;
 	rp["uri"] = "pkg://3";
@@ -5164,7 +5164,7 @@ unittest  // a @resource method may take the per-request RequestContext
 {
 	import mcp.protocol.jsonrpc : Message, makeRequest;
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	registerHandlers(s, new ContextResourceApi);
 	Json rp = Json.emptyObject;
 	rp["uri"] = "ctx://doc";
@@ -5174,7 +5174,7 @@ unittest  // a @resource method may take the per-request RequestContext
 
 unittest  // a @resource method taking a non-context parameter is rejected at compile time
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	static assert(!__traits(compiles, registerHandlers(s, new ArgResourceApi)));
 }
 
@@ -5207,19 +5207,19 @@ version (unittest) private final class UnnamedContextParamApi
 
 unittest  // a tool with an unnamed schema parameter is rejected at compile time
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	static assert(!__traits(compiles, registerHandlers(s, new UnnamedToolParamApi)));
 }
 
 unittest  // a prompt with an unnamed argument parameter is rejected at compile time
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	static assert(!__traits(compiles, registerHandlers(s, new UnnamedPromptParamApi)));
 }
 
 unittest  // an unnamed injected context parameter needs no name
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	registerHandlers(s, new UnnamedContextParamApi);
 }
 
@@ -5240,7 +5240,7 @@ version (unittest) private final class StrictArgsApi
 
 version (unittest) private Json strictToolSchema(string name) @safe
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	registerHandlers(s, new StrictArgsApi);
 	auto tools = s.handle(MakeListMessage()).get["result"]["tools"];
 	foreach (i; 0 .. tools.length)
@@ -5259,7 +5259,7 @@ unittest  // a @strictArgs tool's input schema closes its properties
 
 unittest  // a @strictArgs tool rejects an unknown argument
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	registerHandlers(s, new StrictArgsApi);
 	auto r = callToolArgs(s, "strict", `{"q":"x","limt":5}`);
 	assert(r["isError"].get!bool, r.toString);
@@ -5269,7 +5269,7 @@ unittest  // a @strictArgs tool rejects an unknown argument with input validatio
 {
 	import std.algorithm.searching : canFind;
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	s.disableInputSchemaValidation();
 	registerHandlers(s, new StrictArgsApi);
 	auto r = callToolArgs(s, "strict", `{"q":"x","limt":5}`);
@@ -5280,7 +5280,7 @@ unittest  // a @strictArgs tool rejects an unknown argument with input validatio
 
 unittest  // a tool without @strictArgs ignores an unknown argument
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	registerHandlers(s, new StrictArgsApi);
 	auto r = callToolArgs(s, "lenient", `{"q":"x","extra":true}`);
 	assert("isError" !in r, r.toString);
@@ -5299,14 +5299,14 @@ version (unittest) private struct CounterApi
 
 unittest  // registerHandlers rejects a struct value, whose handlers would mutate a copy
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	CounterApi api;
 	static assert(!__traits(compiles, registerHandlers(s, api)));
 }
 
 unittest  // registerHandlers with a pointer to a struct dispatches to that struct
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	auto api = new CounterApi;
 	registerHandlers(s, api);
 	callToolArgs(s, "bump", `{}`);
@@ -5325,7 +5325,7 @@ version (unittest) private final class SharedWireNameApi
 
 unittest  // parameters whose names differ only by a trailing underscore are rejected at compile time
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	static assert(!__traits(compiles, registerHandlers(s, new SharedWireNameApi)));
 }
 
@@ -5348,7 +5348,7 @@ version (unittest) private final class StringEnumApi
 
 unittest  // a string-based enum parameter is advertised and bound by member name
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	registerHandlers(s, new StringEnumApi);
 	auto tools = s.handle(MakeListMessage()).get["result"]["tools"];
 	auto props = tools[0]["inputSchema"]["properties"];
@@ -5404,7 +5404,7 @@ unittest  // a @schemaDefault parameter is optional in the input schema
 
 unittest  // an omitted @schemaDefault argument binds to the advertised default
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	registerHandlers(s, new SchemaDefaultParamApi);
 	auto r = callToolArgs(s, "sum", `{"n":1}`);
 	assert(r["structuredContent"]["result"].get!int == 13, r.toString);
@@ -5443,7 +5443,7 @@ unittest  // @ui on a @taskTool attaches _meta.ui to its descriptor
 {
 	import mcp.server.task_context : SyncTaskDispatcher;
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	s.enableTasks(TaskOptions(null, new SyncTaskDispatcher()));
 	registerHandlers(s, new UiTaskApi);
 	auto t = s.handle(MakeListMessage()).get["result"]["tools"][0];
@@ -5471,19 +5471,19 @@ version (unittest) private final class UiBadVisibilityApi
 
 unittest  // a @ui resourceUri outside the ui:// scheme is rejected at compile time
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	static assert(!__traits(compiles, registerHandlers(s, new UiBadSchemeApi)));
 }
 
 unittest  // a @ui visibility other than "model" or "app" is rejected at compile time
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	static assert(!__traits(compiles, registerHandlers(s, new UiBadVisibilityApi)));
 }
 
 unittest  // a JSON Schema facet on a handler method is rejected at compile time
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	static assert(!__traits(compiles, registerHandlers(s, new MethodTitleApi)));
 }
 
@@ -5525,7 +5525,7 @@ version (unittest) private final class SumTypeResultApi
 
 unittest  // a SumType tool result serializes as the value it holds
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	registerHandlers(s, new SumTypeResultApi);
 	auto n = callToolResult(s, "pick", Json(["word": Json(false)]));
 	assert(n["structuredContent"]["result"] == Json(7), n.toString);
@@ -5535,7 +5535,7 @@ unittest  // a SumType tool result serializes as the value it holds
 
 unittest  // a SumType field of a struct tool result serializes as the value it holds
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	registerHandlers(s, new SumTypeResultApi);
 	auto r = callToolResult(s, "tagged", Json.emptyObject);
 	assert(r["structuredContent"]["value"] == Json("held"), r.toString);
@@ -5593,25 +5593,25 @@ version (unittest) private final class FractionalIntDefaultApi
 
 unittest  // a real parameter is rejected at compile time
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	static assert(!__traits(compiles, registerHandlers(s, new RealParamApi)));
 }
 
 unittest  // a Tuple return is rejected at compile time
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	static assert(!__traits(compiles, registerHandlers(s, new TupleReturnApi)));
 }
 
 unittest  // a class parameter is rejected at compile time
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	static assert(!__traits(compiles, registerHandlers(s, new ClassParamApi)));
 }
 
 unittest  // a @schemaDefault whose value does not convert to the parameter type is rejected
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	static assert(!__traits(compiles, registerHandlers(s, new MismatchedDefaultApi)));
 	static assert(!__traits(compiles, registerHandlers(s, new FractionalIntDefaultApi)));
 }
@@ -5646,7 +5646,7 @@ version (unittest) private final class NonMemberEnumDefaultApi
 
 unittest  // a lossy or non-member @schemaDefault on a parameter is rejected at compile time
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	assert(!__traits(compiles, registerHandlers(s, new OutOfRangeDefaultApi)));
 	assert(!__traits(compiles, registerHandlers(s, new NonMemberEnumDefaultApi)));
 }
@@ -5702,7 +5702,7 @@ version (unittest) private final class PunctuatedToolNameApi
 
 unittest  // a @tool or @taskTool name outside 1..128 of [A-Za-z0-9_.-] is rejected at compile time
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	assert(!__traits(compiles, registerHandlers(s, new SpacedToolNameApi)));
 	assert(!__traits(compiles, registerHandlers(s, new LongToolNameApi)));
 	assert(!__traits(compiles, registerHandlers(s, new SlashedTaskToolNameApi)));
@@ -5838,7 +5838,7 @@ version (unittest) private final class FittingUdasApi
 
 unittest  // @taskTtl on a plain @tool is rejected at compile time
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	static assert(!__traits(compiles, registerHandlers(s, new TaskTtlOnToolApi)));
 }
 
@@ -5860,7 +5860,7 @@ unittest  // a method-level MCP UDA on a method with no handler UDA is rejected 
 {
 	import core.time : seconds;
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	static assert(__traits(compiles, registerHandlers(s, new MethodUdaWithoutHandlerApi!())));
 	static assert(!__traits(compiles, registerHandlers(s,
 			new MethodUdaWithoutHandlerApi!readOnly)));
@@ -5880,19 +5880,19 @@ unittest  // a method-level MCP UDA on a method with no handler UDA is rejected 
 
 unittest  // @cacheable on a @tool is rejected at compile time
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	static assert(!__traits(compiles, registerHandlers(s, new CacheableOnToolApi)));
 }
 
 unittest  // @ui on a @resource is rejected at compile time
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	static assert(!__traits(compiles, registerHandlers(s, new UiOnResourceApi)));
 }
 
 unittest  // tool-only UDAs on a @prompt are rejected at compile time
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	static assert(!__traits(compiles, registerHandlers(s, new ReadOnlyOnPromptApi)));
 	static assert(!__traits(compiles, registerHandlers(s, new StrictArgsOnPromptApi)));
 	static assert(!__traits(compiles, registerHandlers(s, new McpHeaderOnPromptApi)));
@@ -5900,13 +5900,13 @@ unittest  // tool-only UDAs on a @prompt are rejected at compile time
 
 unittest  // @describeParam on a @resourceTemplate is rejected at compile time
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	static assert(!__traits(compiles, registerHandlers(s, new DescribeParamOnTemplateApi)));
 }
 
 unittest  // a facet that does not fit its parameter or field type is rejected at compile time
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	static assert(!__traits(compiles, registerHandlers(s, new MinLengthOnIntApi)));
 	static assert(!__traits(compiles, registerHandlers(s, new MinimumOnStringApi)));
 	static assert(!__traits(compiles, registerHandlers(s, new MinItemsOnFieldApi)));
@@ -5914,13 +5914,13 @@ unittest  // a facet that does not fit its parameter or field type is rejected a
 
 unittest  // a TaskContext parameter on a @prompt is rejected at compile time
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	static assert(!__traits(compiles, registerHandlers(s, new TaskContextPromptApi)));
 }
 
 unittest  // @eventPollInterval on a @tool is rejected at compile time
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	static assert(!__traits(compiles, registerHandlers(s, new EventPollOnToolApi)));
 }
 
@@ -5969,7 +5969,7 @@ version (unittest)
 
 unittest  // a value UDA attached bare (without its argument list) is rejected at compile time
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	static assert(!__traits(compiles, registerHandlers(s, new ToolWithUdas!ui)));
 	static assert(!__traits(compiles, registerHandlers(s, new ToolWithUdas!hintTitle)));
 	static assert(!__traits(compiles, registerHandlers(s, new ToolWithUdas!icon)));
@@ -5989,7 +5989,7 @@ unittest  // marker UDAs and applied value UDAs still register beside a handler
 {
 	import core.time : seconds;
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	static assert(__traits(compiles, registerHandlers(s, new ToolWithUdas!(readOnly,
 			hintTitle("h"), icon("https://example.com/i.png"), describeParam("a", "d")))));
 	static assert(__traits(compiles, registerHandlers(s, new TaskWithUdas!(taskTtl(1.seconds)))));
@@ -5999,7 +5999,7 @@ unittest  // marker UDAs and applied value UDAs still register beside a handler
 
 unittest  // a handler UDA with an empty required field is rejected at compile time
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	static assert(!__traits(compiles, registerHandlers(s, new ResourceUriApi!("", "r"))));
 	static assert(!__traits(compiles, registerHandlers(s, new ResourceUriApi!("test://r", ""))));
 	static assert(__traits(compiles, registerHandlers(s, new ResourceUriApi!("test://r", "r"))));
@@ -6007,7 +6007,7 @@ unittest  // a handler UDA with an empty required field is rejected at compile t
 
 unittest  // @audience accepts only the roles "user" and "assistant"
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	static assert(!__traits(compiles, registerHandlers(s,
 			new ResourceWithUdas!(audience("user", "admin")))));
 	static assert(__traits(compiles, registerHandlers(s,
@@ -6016,7 +6016,7 @@ unittest  // @audience accepts only the roles "user" and "assistant"
 
 unittest  // @icon needs a src and a theme of "light" or "dark"
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	static assert(!__traits(compiles, registerHandlers(s, new ToolWithUdas!(icon("")))));
 	static assert(!__traits(compiles, registerHandlers(s,
 			new ToolWithUdas!(icon("https://example.com/i.png", "", null, "sepia")))));
@@ -6026,7 +6026,7 @@ unittest  // @icon needs a src and a theme of "light" or "dark"
 
 unittest  // a @resourceTemplate with adjacent variables is rejected at compile time
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	static assert(!__traits(compiles, registerHandlers(s, new TemplateWithUdas!("test://{a}{b}"))));
 	static assert(__traits(compiles, registerHandlers(s, new TemplateWithUdas!("test://{a}{?b}"))));
 }
@@ -6036,7 +6036,7 @@ unittest  // a single-valued UDA repeated on one handler is rejected at compile 
 	import core.time : seconds;
 	import vibe.data.json : parseJsonString;
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	static assert(!__traits(compiles, registerHandlers(s,
 			new ToolWithUdas!(hintTitle("a"), hintTitle("b")))));
 	static assert(!__traits(compiles, registerHandlers(s,
@@ -6092,7 +6092,7 @@ unittest  // an alias of an annotated method does not register the handler twice
 {
 	import mcp.protocol.jsonrpc : Message, makeRequest;
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	registerHandlers(s, new AliasedToolApi);
 	auto tools = s.handle(Message(makeRequest(Json(1), "tools/list",
 			Json.emptyObject))).get["result"]["tools"];
@@ -6103,7 +6103,7 @@ unittest  // registerHandlers rejects a null object, interface, or struct pointe
 {
 	import std.exception : assertThrown;
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	assertThrown!Exception(registerHandlers(s, cast(ToolWithUdas!()) null));
 	assertThrown!Exception(registerHandlers(s, cast(NullTargetIface) null));
 	assertThrown!Exception(registerHandlers(s, cast(NullTargetStruct*) null));
@@ -6111,7 +6111,7 @@ unittest  // registerHandlers rejects a null object, interface, or struct pointe
 
 unittest  // UDAs that fit their handler kind and parameter types still register
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	registerHandlers(s, new FittingUdasApi);
 }
 
@@ -6140,13 +6140,13 @@ version (unittest) private final class TemplatedHelperApi
 
 unittest  // a templated method carrying a handler UDA is rejected at compile time
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	static assert(!__traits(compiles, registerHandlers(s, new TemplatedToolApi)));
 }
 
 unittest  // a templated method without a handler UDA is skipped
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	registerHandlers(s, new TemplatedHelperApi);
 }
 
@@ -6181,7 +6181,7 @@ unittest  // a tool, prompt, or resource returning a non-immutable or wide strin
 {
 	import mcp.protocol.jsonrpc : Message, makeRequest;
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	registerHandlers(s, new MutableStringApi);
 	auto t = callToolResult(s, "chars", Json.emptyObject);
 	assert(t["content"][0]["text"] == Json("abc"), t.toString);
@@ -6219,7 +6219,7 @@ version (unittest) private final class OutOfRangePriorityApi
 
 unittest  // an out-of-range @priority is rejected at registration even without contracts
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	static assert(!__traits(compiles, registerHandlers(s, new OutOfRangePriorityApi)));
 }
 
@@ -6252,7 +6252,7 @@ version (unittest) private final class NullableDefaultApi
 
 unittest  // an explicit null for a defaulted Nullable parameter binds as unset
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	registerHandlers(s, new NullableDefaultApi);
 	Json nullArg = Json(["n": Json(null)]);
 	assert(callToolResult(s, "viaUda", nullArg)["content"][0]["text"] == Json("unset"));
@@ -6265,7 +6265,7 @@ unittest  // an explicit null for a defaulted Nullable prompt argument binds as 
 {
 	import mcp.protocol.jsonrpc : Message, makeRequest;
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	registerHandlers(s, new NullableDefaultApi);
 	Json pp = Json.emptyObject;
 	pp["name"] = "p";
@@ -6294,13 +6294,13 @@ version (unittest) private final class InvalidSkillDirPathApi
 
 unittest  // an invalid @skill path is rejected at compile time
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	static assert(!__traits(compiles, registerHandlers(s, new InvalidSkillPathApi)));
 }
 
 unittest  // an invalid non-empty @skillDir path is rejected at compile time
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	static assert(!__traits(compiles, registerHandlers(s, new InvalidSkillDirPathApi)));
 }
 
@@ -6331,7 +6331,7 @@ version (unittest) private class FurtherOverridingApi : OverridingApi
 
 unittest  // an override of an annotated base method registers with the base UDAs and dispatches virtually
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	registerHandlers(s, new OverridingApi);
 	auto r = callToolArgs(s, "who", `{}`);
 	assert(r["content"][0]["text"].get!string == "derived", r.toString);
@@ -6339,7 +6339,7 @@ unittest  // an override of an annotated base method registers with the base UDA
 
 unittest  // an override two levels below the annotated declaration is still registered
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	registerHandlers(s, new FurtherOverridingApi);
 	auto r = callToolArgs(s, "who", `{}`);
 	assert(r["content"][0]["text"].get!string == "further", r.toString);
@@ -6361,7 +6361,7 @@ version (unittest) private final class InterfaceImplApi : AnnotatedInterfaceApi
 
 unittest  // a class implementing an annotated interface method registers that tool
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	registerHandlers(s, new InterfaceImplApi);
 	auto r = callToolArgs(s, "ping", `{"from":"a"}`);
 	assert(r["content"][0]["text"].get!string == "pong a", r.toString);
@@ -6391,7 +6391,7 @@ unittest  // an empty string for an optional non-string prompt argument binds as
 {
 	import mcp.protocol.jsonrpc : Message, makeRequest;
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	registerHandlers(s, new EmptyPromptArgApi);
 	Json pp = Json.emptyObject;
 	pp["name"] = "page";
@@ -6412,7 +6412,7 @@ unittest  // an empty string for a required non-string prompt argument is a miss
 	import mcp.protocol.errors : ErrorCode;
 	import mcp.protocol.jsonrpc : Message, makeRequest;
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	registerHandlers(s, new EmptyPromptArgApi);
 	Json pp = Json.emptyObject;
 	pp["name"] = "need";
@@ -6437,7 +6437,7 @@ unittest  // @fieldDescription and @title on a prompt parameter fill its PromptA
 		}
 	}
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	registerHandlers(s, new DescribedPromptParamApi);
 	auto list = s.handle(Message(makeRequest(Json(1), "prompts/list", Json.emptyObject))).get;
 	auto arg = list["result"]["prompts"][0]["arguments"][0];
@@ -6459,7 +6459,7 @@ unittest  // @describeParam takes precedence over a prompt parameter's @fieldDes
 		}
 	}
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	registerHandlers(s, new BothDescribedPromptApi);
 	auto list = s.handle(Message(makeRequest(Json(1), "prompts/list", Json.emptyObject))).get;
 	auto arg = list["result"]["prompts"][0]["arguments"][0];
@@ -6495,19 +6495,19 @@ version (unittest) private final class TemplateDescriptionApi
 
 unittest  // a validation facet on a prompt parameter is rejected at compile time
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	static assert(!__traits(compiles, registerHandlers(s, new PromptFacetApi)));
 }
 
 unittest  // a validation facet on a resource-template parameter is rejected at compile time
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	static assert(!__traits(compiles, registerHandlers(s, new TemplateFacetApi)));
 }
 
 unittest  // @fieldDescription on a resource-template parameter is rejected at compile time
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	static assert(!__traits(compiles, registerHandlers(s, new TemplateDescriptionApi)));
 }
 
@@ -6531,19 +6531,19 @@ version (unittest) private final class ProtectedHandlerApi
 
 unittest  // a private handler method is rejected at compile time
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	static assert(!__traits(compiles, registerHandlers(s, new PrivateHandlerApi)));
 }
 
 unittest  // a protected handler method is rejected at compile time
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	static assert(!__traits(compiles, registerHandlers(s, new ProtectedHandlerApi)));
 }
 
 unittest  // registering a @taskTool enables the Tasks extension when it is not yet enabled
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	registerHandlers(s, new TaskUdaApi);
 	assert(s.tasks() !is null);
 }
@@ -6553,7 +6553,7 @@ unittest  // enableTasks with custom options after registering a @taskTool keeps
 	import mcp.protocol.jsonrpc : Message, makeRequest;
 	import mcp.server.task_context : SyncTaskDispatcher;
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	registerHandlers(s, new TaskUdaApi);
 	s.enableTasks(TaskOptions(null, new SyncTaskDispatcher()));
 
@@ -6585,7 +6585,7 @@ unittest  // a @taskTool on a stateful server fails naming the tool and the reas
 
 unittest  // registering an @event enables the Events extension when it is not yet enabled
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	registerHandlers(s, new EventUdaApi);
 	assert(s.events() !is null);
 	assert(s.events().has("email.received"));
@@ -6595,7 +6595,7 @@ unittest  // enableEvents after an event type is registered throws rather than d
 {
 	import std.exception : assertThrown;
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	registerHandlers(s, new EventUdaApi);
 	assertThrown(s.enableEvents());
 	assert(s.events().has("email.received"));
@@ -6612,7 +6612,7 @@ version (unittest) private final class NullJsonParamApi
 
 unittest  // a Json parameter binds an explicit null rather than reporting it missing
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	registerHandlers(s, new NullJsonParamApi);
 	auto r = callToolArgs(s, "kind", `{"value":null}`);
 	assert(!("isError" in r && r["isError"].get!bool), r.toString);
@@ -6621,7 +6621,7 @@ unittest  // a Json parameter binds an explicit null rather than reporting it mi
 
 unittest  // a Json parameter left out is still a missing required argument
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	s.disableInputSchemaValidation();
 	registerHandlers(s, new NullJsonParamApi);
 	auto r = callToolArgs(s, "kind", `{}`);
@@ -6662,19 +6662,19 @@ version (unittest) private final class UiMetaMergeApi
 
 unittest  // a @meta whose value is not a JSON object is rejected at compile time
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	static assert(!__traits(compiles, registerHandlers(s, new NonObjectMetaApi)));
 }
 
 unittest  // a @meta setting the "ui" key alongside @ui is rejected at compile time
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	static assert(!__traits(compiles, registerHandlers(s, new UiMetaClashApi)));
 }
 
 unittest  // @meta and @ui merge into one _meta object
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	registerHandlers(s, new UiMetaMergeApi);
 	auto t = s.handle(MakeListMessage()).get["result"]["tools"][0];
 	assert(t["_meta"]["category"].get!string == "art", t.toString);
@@ -6703,13 +6703,13 @@ version (unittest) private final class LongSkillDescriptionApi
 
 unittest  // an @skill with an empty description is rejected at compile time
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	static assert(!__traits(compiles, registerHandlers(s, new EmptySkillDescriptionApi)));
 }
 
 unittest  // an @skill description over 1024 characters is rejected at compile time
 {
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	static assert(!__traits(compiles, registerHandlers(s, new LongSkillDescriptionApi)));
 }
 
@@ -6726,7 +6726,7 @@ unittest  // @skill carries license, compatibility, and allowed-tools into the f
 		}
 	}
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	registerHandlers(s, new LicensedSkillApi);
 	auto fm = s.handle(Message(makeRequest(Json(1), "skills/list",
 			Json.emptyObject))).get["result"]["skills"][0]["frontmatter"];
@@ -6773,7 +6773,7 @@ unittest  // a registerHandlers that throws part-way leaves none of its handlers
 	import std.exception : assertThrown;
 	import mcp.protocol.jsonrpc : Message, makeRequest;
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	Tool existing;
 	existing.name = "taken";
 	existing.inputSchema = parseJsonString(`{"type":"object"}`);
@@ -6813,7 +6813,7 @@ unittest  // a missing @skillDir directory leaves the earlier handlers unregiste
 {
 	import std.exception : assertThrown;
 
-	auto s = new McpServer("t", "1");
+	auto s = McpServer.stateless("t", "1");
 	assertThrown(registerHandlers(s, new MissingSkillDirApi));
 	auto tools = s.handle(MakeListMessage()).get["result"]["tools"];
 	assert(tools.length == 0, tools.toString);
