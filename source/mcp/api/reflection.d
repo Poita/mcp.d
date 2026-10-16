@@ -1650,6 +1650,78 @@ private string[] uriTemplateVars(string tmpl) @safe pure
 	return vars;
 }
 
+/// The separator between the elements of URI template variable `name`'s value
+/// in `tmpl`: an exploded `{/var*}` or `{.var*}` repeats its operator between
+/// elements, and every other list value is comma-separated (RFC 6570 §3.2.1).
+private char uriTemplateListSeparator(string tmpl, string name) @safe pure
+{
+	import std.algorithm.iteration : splitter;
+	import std.string : indexOf;
+
+	while (true)
+	{
+		immutable open = tmpl.indexOf('{');
+		if (open < 0)
+			return ',';
+		immutable close = tmpl[open .. $].indexOf('}');
+		if (close < 0)
+			return ',';
+		auto expr = tmpl[open + 1 .. open + close];
+		tmpl = tmpl[open + close + 1 .. $];
+		char op;
+		if (expr.length && "+#./;?&".indexOf(expr[0]) >= 0)
+		{
+			op = expr[0];
+			expr = expr[1 .. $];
+		}
+		foreach (spec; expr.splitter(','))
+		{
+			immutable colon = spec.indexOf(':');
+			if (colon >= 0)
+				spec = spec[0 .. colon];
+			immutable explode = spec.length && spec[$ - 1] == '*';
+			if (explode)
+				spec = spec[0 .. $ - 1];
+			if (spec == name)
+				return explode && (op == '/' || op == '.') ? op : ',';
+		}
+	}
+}
+
+/// Bind the captured value `raw` of a URI template variable to `P`. An array
+/// reads its elements from the RFC 6570 list form, split on `sep`, each bound
+/// like a scalar variable; any other type binds as `bindString` reads it.
+private P bindTemplateVar(P)(string raw, char sep) @safe
+{
+	static if (isArray!P && !isSomeString!P)
+	{
+		import std.algorithm.iteration : splitter;
+		import std.conv : to;
+		import mcp.api.binding : BindException;
+
+		alias E = typeof(P.init[0]);
+		E[] elems;
+		if (raw.length)
+			foreach (part; raw.splitter(sep))
+				elems ~= bindString!E(part);
+		static if (isStaticArray!P)
+		{
+			if (elems.length != P.length)
+				throw new BindException(
+						"expected " ~ P.length.to!string ~ " elements, got "
+						~ elems.length.to!string);
+			P result;
+			foreach (i, ref e; result)
+				setBound(e, elems[i]);
+			return result;
+		}
+		else
+			return elems;
+	}
+	else
+		return bindString!P(raw);
+}
+
 private void registerTemplateMethod(string memberName, alias overload,
 		alias parent, resourceTemplate attr)(McpServer server) @safe
 {
@@ -1712,7 +1784,8 @@ private void registerTemplateMethod(string memberName, alias overload,
 				if (auto pv = names[i] in params)
 				{
 					try
-						setBound(argv[i], bindString!P(*pv));
+						setBound(argv[i], bindTemplateVar!P(*pv,
+							uriTemplateListSeparator(attr.uriTemplate, names[i])));
 					catch (Exception e)
 						throw invalidParams("resource template parameter '" ~ names[i]
 							~ "' could not be parsed as " ~ P.stringof ~ ": " ~ e.msg);
@@ -3821,6 +3894,79 @@ unittest  // resource-template invalid scalar yields an InvalidParams error
 	auto rr = s.handle(Message(makeRequest(Json(3), "resources/read", rp))).get;
 	assert("error" in rr);
 	assert(rr["error"]["code"].get!int == -32602);
+}
+
+version (unittest) private final class ListTemplateApi
+{
+	@resourceTemplate("files://root{/segs*}", "Files", "text/plain")
+	string files(string[] segs) @safe
+	{
+		import std.array : join;
+
+		return segs.join("|");
+	}
+
+	@resourceTemplate("tagged://{id}{?tags}", "Tagged", "text/plain")
+	string tagged(string id, int[] tags) @safe
+	{
+		import std.conv : to;
+
+		return id ~ tags.to!string;
+	}
+
+	@resourceTemplate("pair://{xy}", "Pair", "text/plain")
+	string pair(int[2] xy) @safe
+	{
+		import std.conv : to;
+
+		return xy.to!string;
+	}
+}
+
+version (unittest) private Json readUri(McpServer s, string uri) @safe
+{
+	import mcp.protocol.jsonrpc : Message, makeRequest;
+
+	Json rp = Json.emptyObject;
+	rp["uri"] = uri;
+	return s.handle(Message(makeRequest(Json(1), "resources/read", rp))).get;
+}
+
+unittest  // a resource-template array param binds an exploded path variable segment by segment
+{
+	auto s = new McpServer("t", "1");
+	registerHandlers(s, new ListTemplateApi);
+	auto rr = readUri(s, "files://root/a/b/c");
+	assert("error" !in rr, rr.toString);
+	assert(rr["result"]["contents"][0]["text"].get!string == "a|b|c");
+}
+
+unittest  // a resource-template array param binds a comma-separated list value element by element
+{
+	auto s = new McpServer("t", "1");
+	registerHandlers(s, new ListTemplateApi);
+	auto rr = readUri(s, "tagged://x?tags=1,2,3");
+	assert("error" !in rr, rr.toString);
+	assert(rr["result"]["contents"][0]["text"].get!string == "x[1, 2, 3]");
+}
+
+unittest  // a resource-template array element that does not parse is an InvalidParams error
+{
+	auto s = new McpServer("t", "1");
+	registerHandlers(s, new ListTemplateApi);
+	auto rr = readUri(s, "tagged://x?tags=1,zz");
+	assert(rr["error"]["code"].get!int == -32602, rr.toString);
+}
+
+unittest  // a resource-template static array param requires exactly its length of elements
+{
+	auto s = new McpServer("t", "1");
+	registerHandlers(s, new ListTemplateApi);
+	auto ok = readUri(s, "pair://3,4");
+	assert("error" !in ok, ok.toString);
+	assert(ok["result"]["contents"][0]["text"].get!string == "[3, 4]");
+	auto bad = readUri(s, "pair://3,4,5");
+	assert(bad["error"]["code"].get!int == -32602, bad.toString);
 }
 
 version (unittest)
