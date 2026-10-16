@@ -12,8 +12,8 @@ import jsonschema : Validator;
 /// Derived schemas describe enums as `{type:"string", enum:[names…]}`, so both
 /// directions of marshalling must agree: struct params/returns and bare-enum
 /// values are (de)serialized by-name. The policy only defines
-/// `toRepresentation`/`fromRepresentation` for enums and `SumType`s (see the
-/// `SumType` arm below), so vibe's `isPolicySerializable` is false for every
+/// `toRepresentation`/`fromRepresentation` for enums, `SumType`s and `SysTime`
+/// (see the arms below), so vibe's `isPolicySerializable` is false for every
 /// other type and the default behaviour is preserved (it still recurses into
 /// nested struct/array fields, applying this rule at any depth).
 template EnumByNamePolicy(T) if (is(T == enum))
@@ -94,6 +94,23 @@ template EnumByNamePolicy(T) if (isSumType!T)
 			}
 		}
 		throw new Exception("JSON value matches none of the types in " ~ T.stringof);
+	}
+}
+
+/// The `SysTime` arm of `EnumByNamePolicy`: a `SysTime` is written in UTC, so
+/// the value always carries the offset an RFC 3339 `date-time` requires. vibe
+/// would otherwise write a local-time `SysTime` (such as `Clock.currTime()`)
+/// with no offset at all.
+template EnumByNamePolicy(T) if (is(T == imported!"std.datetime.systime".SysTime))
+{
+	static string toRepresentation(T v) @safe
+	{
+		return v.toUTC().toISOExtString();
+	}
+
+	static T fromRepresentation(string s) @safe
+	{
+		return T.fromISOExtString(s);
 	}
 }
 
@@ -358,4 +375,46 @@ unittest  // a precompiled validator validates repeatedly with independent resul
 	assert(validationError(v, Json(["n": Json(1)])) == "");
 	assert(validationError(v, Json(["n": Json("bad")])).length > 0);
 	assert(validationError(v, Json(["n": Json(2)])) == "");
+}
+
+unittest  // a SysTime is written in UTC, so it always carries an offset
+{
+	import core.time : hours;
+	import std.datetime.date : DateTime;
+	import std.datetime.systime : SysTime;
+	import std.datetime.timezone : LocalTime, SimpleTimeZone;
+	import vibe.data.json : JsonSerializer;
+	import vibe.data.serialization : serializeWithPolicy;
+
+	static struct S
+	{
+		SysTime when;
+	}
+
+	const plus2 = new immutable SimpleTimeZone(2.hours);
+	auto j = serializeWithPolicy!(JsonSerializer, EnumByNamePolicy)(
+			S(SysTime(DateTime(2024, 1, 1, 10, 0, 0), plus2)));
+	assert(j["when"] == Json("2024-01-01T08:00:00Z"), j.toString);
+
+	auto local = serializeWithPolicy!(JsonSerializer, EnumByNamePolicy)(
+			SysTime(DateTime(2024, 1, 1, 10, 0, 0), LocalTime()));
+	assert(local.get!string[$ - 1] == 'Z', local.toString);
+}
+
+unittest  // a structured tool result carries a SysTime as a UTC date-time
+{
+	import mcp.protocol.types : CallToolResult;
+	import std.datetime.date : DateTime;
+	import std.datetime.systime : SysTime;
+	import std.datetime.timezone : LocalTime;
+
+	static struct R
+	{
+		SysTime at;
+	}
+
+	auto r = CallToolResult.structured(R(SysTime(DateTime(2024, 6, 1, 12, 30, 0), LocalTime())));
+	const s = r.structuredContent["at"].get!string;
+	assert(s[$ - 1] == 'Z', s);
+	assert(SysTime.fromISOExtString(s) == SysTime(DateTime(2024, 6, 1, 12, 30, 0), LocalTime()));
 }
