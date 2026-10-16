@@ -601,10 +601,18 @@ private void checkParamTypes(alias func)()
 	import mcp.api.binding : facetMismatch, isDefaultFor, unsupportedTypeReason;
 
 	alias ids = ParameterIdentifierTuple!func;
+	alias storage = ParameterStorageClassTuple!func;
 	static foreach (i, P; BoundParameters!func)
 	{
 		static if (!isInjected!P)
 		{
+			// An argument is bound into a local and passed by value, so an out,
+			// ref, or lazy parameter would neither return nor share anything.
+			static assert(!(storage[i] & (ParameterStorageClass.out_ | ParameterStorageClass.ref_
+					| ParameterStorageClass.lazy_)),
+					"parameter '" ~ ids[i] ~ "' of '" ~ __traits(identifier, func)
+					~ "' is out, ref, or lazy; an argument is bound from JSON and passed "
+					~ "by value, so declare it as a plain parameter");
 			static assert(unsupportedTypeReason!(P, SchemaUse.input)() is null,
 					"parameter '" ~ ids[i] ~ "' of '" ~ __traits(identifier,
 						func) ~ "' has type " ~ P.stringof ~ ", which cannot be bound from JSON ("
@@ -2749,6 +2757,31 @@ unittest  // a @prompt with an empty name is rejected at compile time
 {
 	auto s = new McpServer("t", "1");
 	assert(!__traits(compiles, registerHandlers(s, new EmptyPromptNameApi)));
+}
+
+version (unittest) private class OutParamApi
+{
+	@tool("out_param", "Declares an out parameter")
+	string f(out int x) @safe
+	{
+		return "";
+	}
+}
+
+version (unittest) private class RefParamApi
+{
+	@tool("ref_param", "Declares a ref parameter")
+	string f(ref int x) @safe
+	{
+		return "";
+	}
+}
+
+unittest  // an out or ref argument parameter is rejected at compile time
+{
+	auto s = new McpServer("t", "1");
+	assert(!__traits(compiles, registerHandlers(s, new OutParamApi)));
+	assert(!__traits(compiles, registerHandlers(s, new RefParamApi)));
 }
 
 unittest  // @mcpHeader: a struct-typed parameter is rejected at compile time

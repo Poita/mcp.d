@@ -345,10 +345,20 @@ package(mcp) string unsupportedTypeReason(T, SchemaUse use, Ancestors...)()
 	{
 		import jsonschema.attributes : SchemaDefault;
 
+		// Binding builds the value in a default-constructed slot and assigns
+		// each field, so an input type must allow both.
+		static if (use == SchemaUse.input && !is(typeof({ T t; })))
+			return T.stringof ~ ": its default construction is disabled, so it cannot be "
+				~ "bound from JSON";
 		static foreach (field; FieldNameTuple!T)
 		{
 			static if (isBoundField!(T, field))
 			{
+				static if (use == SchemaUse.input && (is(typeof(__traits(getMember,
+						T, field)) == const) || is(typeof(__traits(getMember, T,
+						field)) == immutable)))
+					return T.stringof ~ "." ~ field
+						~ ": a const or immutable field cannot be bound from JSON; make it mutable";
 				static foreach (d; getUDAs!(__traits(getMember, T, field), SchemaDefault))
 					static if (!isDefaultFor!(typeof(__traits(getMember, T, field)), d))
 						return T.stringof ~ "." ~ field
@@ -1786,4 +1796,36 @@ unittest  // a struct field default holding a NaN is not advertised
 	auto props = jsonSchemaOf!Shape()["properties"];
 	assert("default" !in props["origin"], props.toString);
 	assert(props["corner"]["default"]["x"].get!double == 2, props.toString);
+}
+
+unittest  // a const or immutable struct field cannot be bound from JSON, but can be written
+{
+	static struct Frozen
+	{
+		immutable int a;
+	}
+
+	static struct Fixed
+	{
+		const string name;
+	}
+
+	static assert(unsupportedTypeReason!(Frozen, SchemaUse.input)().length);
+	static assert(unsupportedTypeReason!(Fixed[], SchemaUse.input)().length);
+	static assert(unsupportedTypeReason!(Frozen, SchemaUse.output)() is null);
+}
+
+unittest  // a struct whose default construction is disabled cannot be bound from JSON
+{
+	static struct NoDefault
+	{
+		int a;
+		@disable this();
+		this(int a) @safe
+		{
+			this.a = a;
+		}
+	}
+
+	static assert(unsupportedTypeReason!(NoDefault, SchemaUse.input)().length);
 }
