@@ -522,40 +522,66 @@ string validateInputSchemaHeaders(Json inputSchema) @safe
 	string err;
 	bool[string] seen; // ASCII-lowercased header values already encountered
 
-	// True when `node`, or anything nested within it through any keyword, carries
-	// an `x-mcp-header`. Used to reject annotations that hang off a non-`properties`
-	// keyword and are therefore not statically reachable.
-	bool containsAnnotation(Json node) @safe
-	{
-		bool found;
-		if (node.type == Json.Type.object)
-		{
-			if ("x-mcp-header" in node)
-				return true;
-			foreach (_, v; node.byKeyValue)
-				if (containsAnnotation(v))
-				{
-					found = true;
-					break;
-				}
-		}
-		else if (node.type == Json.Type.array)
-		{
-			foreach (elem; node.byValue)
-				if (containsAnnotation(elem))
-				{
-					found = true;
-					break;
-				}
-		}
-		return found;
-	}
-
 	// Keywords whose values are JSON data rather than subschemas: an
 	// `x-mcp-header` key inside them is not an annotation.
 	static immutable string[] valueKeys = [
 		"const", "enum", "default", "examples"
 	];
+	// Keywords whose values map names to subschemas, so their keys are names
+	// rather than keywords.
+	static immutable string[] schemaMapKeys = [
+		"properties", "patternProperties", "dependentSchemas", "$defs",
+		"definitions"
+	];
+
+	// True when the schema `node` (an object or an array of schemas), or any
+	// subschema nested within it, carries an `x-mcp-header`. Data under value
+	// keywords is skipped. Used to reject annotations that hang off a
+	// non-`properties` keyword and are therefore not statically reachable.
+	bool containsAnnotation(Json node) @safe
+	{
+		import std.algorithm.searching : canFind;
+
+		if (node.type == Json.Type.array)
+		{
+			foreach (elem; node.byValue)
+				if (containsAnnotation(elem))
+					return true;
+			return false;
+		}
+		if (node.type != Json.Type.object)
+			return false;
+		if ("x-mcp-header" in node)
+			return true;
+		foreach (key, v; node.byKeyValue)
+		{
+			if (valueKeys.canFind(key))
+				continue;
+			if (!schemaMapKeys.canFind(key) || v.type != Json.Type.object)
+			{
+				if (containsAnnotation(v))
+					return true;
+				continue;
+			}
+			foreach (_, sub; v.byKeyValue)
+				if (containsAnnotation(sub))
+					return true;
+		}
+		return false;
+	}
+
+	// Whether the value `v` of schema keyword `key` contains an annotation.
+	bool keywordContainsAnnotation(string key, Json v) @safe
+	{
+		import std.algorithm.searching : canFind;
+
+		if (!schemaMapKeys.canFind(key) || v.type != Json.Type.object)
+			return containsAnnotation(v);
+		foreach (_, sub; v.byKeyValue)
+			if (containsAnnotation(sub))
+				return true;
+		return false;
+	}
 
 	// `isProperty` is true when `node` is a `properties` member, whose own
 	// `x-mcp-header` the caller has already validated.
@@ -619,7 +645,7 @@ string validateInputSchemaHeaders(Json inputSchema) @safe
 		{
 			if (key == "properties" || valueKeys.canFind(key) || (isProperty && key == "x-mcp-header"))
 				continue;
-			if (key == "x-mcp-header" || containsAnnotation(v))
+			if (key == "x-mcp-header" || keywordContainsAnnotation(key, v))
 			{
 				err = "x-mcp-header MUST only be applied to statically reachable properties"
 					~ " (a chain of `properties` keys); an annotation under `" ~ key
@@ -1669,6 +1695,25 @@ unittest  // validateInputSchemaHeaders ignores annotation-shaped data under val
 			~ `"default":{"x-mcp-header":"x"},"examples":[{"x-mcp-header":"y"}]},`
 			~ `"r":{"type":"string","x-mcp-header":"Region"}}}`);
 	assert(validateInputSchemaHeaders(schema) is null);
+}
+
+unittest  // validateInputSchemaHeaders ignores annotation-shaped data under value keywords of nested subschemas
+{
+	import vibe.data.json : parseJsonString;
+
+	auto schema = parseJsonString(`{"type":"object","properties":{"tags":{"type":"array",`
+			~ `"items":{"type":"object","default":{"x-mcp-header":"x"},`
+			~ `"enum":[{"x-mcp-header":"y"}]}}}}`);
+	assert(validateInputSchemaHeaders(schema) is null);
+}
+
+unittest  // validateInputSchemaHeaders rejects an annotated subschema named like a value keyword
+{
+	import vibe.data.json : parseJsonString;
+
+	auto schema = parseJsonString(
+			`{"type":"object","$defs":{"default":` ~ `{"type":"string","x-mcp-header":"Region"}}}`);
+	assert(validateInputSchemaHeaders(schema) !is null);
 }
 
 unittest  // validateInputSchemaHeaders: number-typed annotation is rejected (number NOT permitted)
