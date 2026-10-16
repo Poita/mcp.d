@@ -5166,8 +5166,9 @@ struct PromptMessage
 		requireObject(j, "PromptMessage");
 		PromptMessage m;
 		m.role = j.getOr("role", "");
-		if ("content" in j)
-			m.content = Content.fromJson(j["content"]);
+		if ("content" !in j)
+			throw invalidParams("a prompt message requires 'content'");
+		m.content = Content.fromJson(j["content"]);
 		return m;
 	}
 
@@ -6572,6 +6573,24 @@ unittest  // Resource/ResourceContents/Prompt/GetPrompt fromJson round-trips
 	ReadResourceResult rr;
 	rr.contents = [ResourceContents.makeText("u", "text/plain", "hi")];
 	assert(ReadResourceResult.fromJson(rr.toJson()).contents[0].text == "hi");
+}
+
+unittest  // PromptMessage.fromJson rejects a message without content with -32602
+{
+	import std.exception : collectException;
+
+	auto e = collectException!McpException(
+			PromptMessage.fromJson(parseJsonString(`{"role":"user"}`)));
+	assert(e !is null && e.code == ErrorCode.invalidParams);
+}
+
+unittest  // GetPromptResult.fromJson rejects a message without content with -32602
+{
+	import std.exception : collectException;
+
+	auto e = collectException!McpException(
+			GetPromptResult.fromJson(parseJsonString(`{"messages":[{"role":"user"}]}`)));
+	assert(e !is null && e.code == ErrorCode.invalidParams);
 }
 
 unittest  // Prompt + GetPromptResult fromJson round-trips
