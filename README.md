@@ -775,6 +775,21 @@ error, as is a method-level UDA on a handler kind that does not read it (such as
 all; any other placement is a compile error. An argument a tool does not declare is ignored; mark the
 method `@strictArgs` to advertise `"additionalProperties": false` and reject one.
 
+A struct field initialized to its type's own `.init` stays **required**, unlike a
+parameter: D cannot tell `int offset = 0;` or `bool verbose = false;` from a
+field with no initializer, so both are listed in `required`. To make such a field
+optional, give it `@schemaDefault(0)` (which also advertises the default), mark
+it vibe's `@optional`, declare it `Nullable`, or put `@allOptional` on the struct:
+
+```d
+struct Page
+{
+    @schemaDefault(0) int offset;   // optional, defaults to 0
+    int limit = 10;                 // optional: differs from int.init
+    @optional bool verbose;         // optional, keeps false when omitted
+}
+```
+
 ## MCP Apps (interactive UI)
 
 The [MCP Apps extension](https://modelcontextprotocol.io/extensions/apps/overview)
