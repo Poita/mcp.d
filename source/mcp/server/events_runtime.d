@@ -394,7 +394,7 @@ struct EventsOptions
 	/// with the defaults the effective lease is 500 seconds.
 	Duration deliveryLease = 1.minutes;
 	size_t deliveryLeaseBatch = 100; /// most jobs one drain claims from the queue, leaving the rest to other nodes and later passes (0 = unlimited)
-	size_t webhookMaxConcurrency = 64; /// most outbound webhook tasks (terminated-envelope posts) one node runs at once (0 = unlimited)
+	size_t webhookMaxConcurrency = 64; /// most outbound webhook tasks (delivery runs and terminated-envelope posts) one node runs at once (0 = unlimited)
 	Duration webhookHttpTimeout = 10.seconds; /// per-attempt HTTP bound (default transport); also the worst-case-retry budget input
 	WebhookTransport webhookTransport; /// outbound HTTP (default SSRF-hardened); tests inject a fake
 	void delegate(void delegate() @safe job) @safe deliveryExecutor; /// runs a delivery (default: a fiber)
@@ -2445,7 +2445,22 @@ final class EventsRuntime
 	{
 		drainKicked_ = false;
 		const leaseMs = opts_.deliveryLease.total!"msecs";
-		const batch = opts_.deliveryLeaseBatch;
+		// Each claimed job may start a run, so no more are claimed than the
+		// concurrency bound leaves room for.
+		size_t batch = opts_.deliveryLeaseBatch;
+		const cap = opts_.webhookMaxConcurrency;
+		if (cap > 0)
+		{
+			const busy = outboundTasks();
+			const room = busy >= cap ? 0 : cap - busy;
+			if (room == 0)
+			{
+				backlogged_ = true; // a finishing run kicks the next drain
+				return;
+			}
+			if (batch == 0 || batch > room)
+				batch = room;
+		}
 		auto jobs = deliveryQueue_.lease(opts_.nowMs(), leaseMs, batch);
 		// A full batch may have left jobs behind: claim more once a run drains.
 		backlogged_ = batch > 0 && jobs.length >= batch;
@@ -3163,7 +3178,12 @@ final class EventsRuntime
 				terminatePosters_--;
 			opts_.deliveryExecutor(() @safe {
 				scope (exit)
+				{
 					terminatePosters_--;
+					// A drain held back by the concurrency bound may proceed now.
+					if (backlogged_)
+						kickDrain();
+				}
 				while (terminatePosts_.length)
 				{
 					auto post = terminatePosts_[0];
@@ -3177,11 +3197,11 @@ final class EventsRuntime
 		}
 	}
 
-	// Outbound webhook tasks this node is running, counted against
-	// `webhookMaxConcurrency`.
+	// Outbound webhook tasks this node is running — delivery runs and
+	// terminated-envelope posters — counted against `webhookMaxConcurrency`.
 	private size_t outboundTasks() @safe
 	{
-		return terminatePosters_;
+		return runningSubscriptions_.length + terminatePosters_;
 	}
 
 	/// Atomically apply `mutate` to the stored subscription `id`: read it, let
@@ -9678,4 +9698,29 @@ unittest  // terminating many webhook subscriptions posts their envelopes from a
 		tasks[i]();
 	assert(tasks.length == 2);
 	assert(controlPostsOf(ft, "terminated").length == 5);
+}
+
+unittest  // a drain starts no more delivery runs than the node's concurrency bound
+{
+	auto ft = new FakeWebhookTransport();
+	auto queue = new InMemoryDeliveryQueue();
+	EventsOptions o;
+	o.nowMs = () @safe => 1_000_000L;
+	o.nowIso = () @safe => "t";
+	o.allowPrivateCallbackHosts = true;
+	o.webhookTransport = ft;
+	o.deliveryQueue = queue;
+	o.webhookMaxConcurrency = 2;
+	o.deliveryExecutor = (void delegate() @safe job) @safe {}; // runs never finish
+	auto rt = new EventsRuntime(null, o);
+	EventRegistration reg = {descriptor: EventType("n"), emitOnly: true};
+	rt.register(reg);
+	foreach (i; 0 .. 3)
+		rt.subscribeWebhook(webhookSub("n", "https://proxy/h" ~ i.to!string), "user-1");
+	rt.emit(EventOccurrence("evt_1", "n", "t"));
+	rt.drainDeliveries();
+	rt.drainDeliveries();
+	assert(rt.runningSubscriptions_.length == 2);
+	// The third job stays in the queue for a later drain or another node.
+	assert(queue.lease(1_000_000L, 1000, 0).length == 1);
 }
