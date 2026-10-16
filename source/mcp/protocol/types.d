@@ -3971,15 +3971,20 @@ struct ElicitResult
 	/// callers should branch on `action` first. Fields are read by the rules
 	/// `elicitationSchemaOf!T` advertises: keyed by wire name, enums by member
 	/// name, and an omitted optional field keeps its default. The content comes
-	/// from the peer, so a value that does not fit `T` throws
-	/// `McpException(invalidParams)`.
+	/// from the peer, so an `accept` with no content object, or a value that does
+	/// not fit `T`, throws `McpException(invalidParams)` rather than passing
+	/// defaults off as the user's input.
 	T contentAs(T)() const @safe
 	{
 		import mcp.api.binding : bindJson;
 		import mcp.protocol.errors : invalidParams;
 
 		if (content.type != Json.Type.object)
+		{
+			if (action == ElicitAction.accept)
+				throw invalidParams("elicitation content: an accept carries no content object");
 			return T.init;
+		}
 		try
 			return bindJson!T(content);
 		catch (McpException e)
@@ -4375,6 +4380,31 @@ unittest  // ElicitResult.contentAs!T maps malformed peer content to invalidPara
 	}
 	catch (McpException e)
 		assert(e.code == ErrorCode.invalidParams);
+}
+
+unittest  // ElicitResult.contentAs!T rejects an accept that carries no content with -32602
+{
+	import std.exception : collectException;
+
+	static struct Pref
+	{
+		int count;
+	}
+
+	auto r = ElicitResult.fromJson(`{"action":"accept"}`.parseJsonString);
+	auto e = collectException!McpException(r.contentAs!Pref);
+	assert(e !is null && e.code == ErrorCode.invalidParams);
+}
+
+unittest  // ElicitResult.contentAs!T returns T.init for a decline or cancel
+{
+	static struct Pref
+	{
+		int count = 3;
+	}
+
+	assert(ElicitResult.decline().contentAs!Pref.count == 3);
+	assert(ElicitResult.cancel().contentAs!Pref.count == 3);
 }
 
 unittest  // CallToolResult.structuredContentAs!T decodes structuredContent into a struct
