@@ -370,6 +370,12 @@ struct ClientSettings
 	/// server requests), which otherwise default to a 30-second bound.
 	Duration requestTimeout = 60.seconds;
 
+	/// How long opening a `subscriptions/listen` or `events/stream` stream waits
+	/// for the server's leading frame before the stream is cancelled and the open
+	/// fails with `RequestTimeoutException`. Applied by `http`, `stdio` and
+	/// `spawn`; a transport passed to the constructor keeps its own bound.
+	Duration listenTimeout = 10.seconds;
+
 	/// Whether each `notifications/progress` for a request restarts its
 	/// `requestTimeout`, so a long-running request that keeps reporting progress
 	/// is not cut off (basic/utilities/progress).
@@ -912,6 +918,7 @@ final class McpClient : ClientProtocol
 		transport.setConnectTimeout(settings.connectTimeout);
 		transport.setMaxMessageBytes(settings.maxMessageBytes);
 		transport.setTlsTrust(settings.tls);
+		transport.listenTimeout_ = settings.listenTimeout;
 		if (!settings.cacheServer.length)
 			settings.cacheServer = url;
 		return new McpClient(transport, settings);
@@ -928,7 +935,9 @@ final class McpClient : ClientProtocol
 	static McpClient stdio(string delegate() @safe readLine,
 			void delegate(string) @safe writeLine, ClientSettings settings = ClientSettings.init) @safe
 	{
-		return new McpClient(new StdioClientTransport(readLine, writeLine), settings);
+		auto transport = new StdioClientTransport(readLine, writeLine);
+		transport.listenTimeout_ = settings.listenTimeout;
+		return new McpClient(transport, settings);
 	}
 
 	/// Launch an MCP server as a subprocess and build a client over its
@@ -945,7 +954,9 @@ final class McpClient : ClientProtocol
 
 		if (!settings.cacheServer.length)
 			settings.cacheServer = "stdio:" ~ command.join(" ");
-		return new McpClient(spawnStdioTransport(command, settings.maxMessageBytes), settings);
+		auto transport = spawnStdioTransport(command, settings.maxMessageBytes);
+		transport.listenTimeout_ = settings.listenTimeout;
+		return new McpClient(transport, settings);
 	}
 
 	/// Launch an MCP server binary that ships *next to this executable* and build a
@@ -10616,6 +10627,24 @@ unittest  // the default preferredModes cannot be modified in place through one 
 	assert(fresh.preferredModes == [
 		DeliveryMode.webhook, DeliveryMode.push, DeliveryMode.poll
 	]);
+}
+
+unittest  // ClientSettings.listenTimeout configures the stdio transport's listen-open bound
+{
+	ClientSettings s;
+	s.listenTimeout = 123.msecs;
+	auto c = McpClient.stdio(() @safe => cast(string) null, (string) @safe {}, s);
+	auto t = cast(StdioClientTransport) c.transport;
+	assert(t !is null && t.listenTimeout_ == 123.msecs);
+}
+
+unittest  // ClientSettings.listenTimeout configures the HTTP transport's listen-open bound
+{
+	ClientSettings s;
+	s.listenTimeout = 456.msecs;
+	auto c = McpClient.http("http://localhost", s);
+	auto t = cast(HttpClientTransport) c.transport;
+	assert(t !is null && t.listenTimeout_ == 456.msecs);
 }
 
 unittest  // a mode the client removed from preferredModes is never selected

@@ -172,8 +172,8 @@ final class StdioClientTransport : ClientTransport
 	/// request id, per the modern stdio cancellation rule. The server answers the
 	/// listen request only when the stream ends: an error reply before the leading
 	/// frame is thrown from here, and a later reply ends the handle (`ended`,
-	/// `error`). When no leading frame arrives within the listen timeout (ten
-	/// seconds) the stream is cancelled and this throws `RequestTimeoutException`.
+	/// `error`). When no leading frame arrives within the listen timeout
+	/// (`ClientSettings.listenTimeout`, ten seconds by default) the stream is cancelled and this throws `RequestTimeoutException`.
 	SubscriptionStream openListen(Json message) @safe
 	{
 		import vibe.core.core : runTask;
