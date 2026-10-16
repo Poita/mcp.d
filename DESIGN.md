@@ -20,8 +20,9 @@ adding a typed request surface.
   never known to the host at compile time, so a statically-typed argument struct
   only ever serves *tests*, not the production call path it purports to ergonomize.
 - A typed overload silently **mis-serializes enum fields**. vibe's
-  default serialization writes an enum numerically (by ordinal), while the
-  server's reflected input schemas declare string enums by member *name*. A typed
+  default serialization writes an enum by its value (the number for an `int`
+  enum, the string for a `string` enum), while the server's reflected input
+  schemas declare string enums by member *name*. A typed
   `callTool("calc", CalcArgs(Op.add, …))` would send `"op": 0` against a
   schema that requires `"op": "add"` — a class of bug the typed surface actively
   invites and hides. Building the `arguments` JSON explicitly makes the wire shape
