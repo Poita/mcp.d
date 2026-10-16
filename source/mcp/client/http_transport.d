@@ -376,6 +376,9 @@ final class HttpClientTransport : ClientTransport
 	// but rejected" from "endpoint not yet received", so `startLegacyFallback` can
 	// break its wait loop immediately instead of stalling until the 10s deadline.
 	private bool legacyEndpointRejected;
+	// Set when `startLegacyFallback` fails, so the GET reader it started stops
+	// and closes its socket instead of reading on for a transport not in legacy mode.
+	private bool legacyStopRequested;
 	// Per-request waiters for responses arriving on the legacy GET SSE stream,
 	// keyed by request id. Each in-flight `legacyRpc` registers a waiter and polls
 	// its own slot, so overlapping or reentrant legacy requests never clobber one
@@ -2278,6 +2281,7 @@ final class HttpClientTransport : ClientTransport
 		import core.time : msecs, MonoTime;
 
 		legacyMode = true;
+		legacyStopRequested = false;
 		legacyEndpoint = null;
 		legacyEndpointRejected = false;
 		legacyStreamEnded = false;
@@ -2313,12 +2317,12 @@ final class HttpClientTransport : ClientTransport
 		}
 		if (legacyEndpointRejected)
 		{
-			legacyMode = false;
+			abandonLegacyStream();
 			throw internalError("legacy HTTP+SSE server sent a cross-origin `endpoint` event (SSRF guard rejected it)");
 		}
 		if (legacyEndpoint.length == 0)
 		{
-			legacyMode = false;
+			abandonLegacyStream();
 			if (legacyStreamFailure !is null)
 				throw legacyStreamFailure;
 			if (legacyStreamEnded)
@@ -2327,6 +2331,16 @@ final class HttpClientTransport : ClientTransport
 			throw internalError(
 					"legacy HTTP+SSE server did not send an `endpoint` event on the GET stream");
 		}
+	}
+
+	/// Leave legacy mode after a failed `startLegacyFallback`, stopping the GET
+	/// reader it started and closing that reader's socket.
+	private void abandonLegacyStream() @safe
+	{
+		legacyMode = false;
+		legacyStopRequested = true;
+		if (legacyStreamSlot !is null)
+			legacyStreamSlot.abort();
 	}
 
 	/// Send a JSON-RPC request over the legacy transport: POST it to the
@@ -2439,7 +2453,7 @@ final class HttpClientTransport : ClientTransport
 			}
 			// A first stream that never announced an endpoint is reported by
 			// `startLegacyFallback` instead.
-			if (closing || !everEstablished)
+			if (closing || legacyStopRequested || !everEstablished)
 				return;
 			legacyReconnecting = true;
 			const until = MonoTime.currTime + backoff;
@@ -2485,13 +2499,13 @@ final class HttpClientTransport : ClientTransport
 		() {
 			try
 			{
-				if (closing)
+				if (closing || legacyStopRequested)
 					return;
 				auto sock = connectTimed(pinnedHost, ep.port);
 				// `attach` closes `sock` immediately if a `close()` already ran during
 				// the `connectTCP` yield, so the socket is never leaked or left parked.
 				slot.attach(sock);
-				if (closing)
+				if (closing || legacyStopRequested)
 					return;
 				// Wrap in TLS for https; plaintext is returned unwrapped.
 				auto conn = openClientStream(sock, ep.tls ? tlsContext() : null, ep.host);
@@ -2512,8 +2526,8 @@ final class HttpClientTransport : ClientTransport
 				}
 
 				SseCursor cursor;
-				readSseBody(conn, head.chunked, cursor, () @safe => closing,
-						(string eventType, string data) @safe {
+				readSseBody(conn, head.chunked, cursor, () @safe => closing
+						|| legacyStopRequested, (string eventType, string data) @safe {
 					if (eventType == "endpoint")
 					{
 						const resolved = resolveEndpointUri(url, data.strip);
@@ -4549,6 +4563,47 @@ unittest  // ClientSettings.reinitializeOnSessionExpiry starts a new session and
 	assert(tools == 0, "the request must succeed on the new session");
 	assert(srv.initializeSessionHeaders == ["", ""],
 			"the expiry must trigger one fresh initialize without a session id");
+}
+
+unittest  // a failed legacy fallback closes the GET stream it opened
+{
+	import core.time : msecs, MonoTime;
+	import vibe.core.core : sleep;
+
+	bool gone;
+	auto router = new URLRouter;
+	router.get("/mcp", (HTTPServerRequest req, HTTPServerResponse res) @safe {
+		res.headers["Content-Type"] = "text/event-stream";
+		try
+		{
+			res.bodyWriter.write("event: endpoint\ndata: http://elsewhere.example/message\n\n");
+			res.bodyWriter.flush();
+			const deadline = MonoTime.currTime + 3.seconds;
+			while (MonoTime.currTime < deadline)
+			{
+				sleep(50.msecs);
+				res.bodyWriter.write(": ping\n\n");
+				res.bodyWriter.flush();
+			}
+		}
+		catch (Exception)
+			gone = true;
+	});
+
+	bool threw;
+	const failure = runAgainstFakeServer(router, (string url) @safe {
+		auto t = new HttpClientTransport(url);
+		try
+			t.startLegacyFallback();
+		catch (Exception)
+			threw = true;
+		const deadline = MonoTime.currTime + 1.seconds;
+		while (!gone && MonoTime.currTime < deadline)
+			sleep(20.msecs);
+	});
+	assert(failure.length == 0, "scenario failed: " ~ failure);
+	assert(threw, "a cross-origin endpoint must fail the fallback");
+	assert(gone, "the failed fallback must close its GET stream");
 }
 
 unittest  // with maxInFlight = 1 a notification callback on a request's stream can issue a request
