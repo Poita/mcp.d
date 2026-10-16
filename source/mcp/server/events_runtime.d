@@ -1271,9 +1271,13 @@ final class EventsRuntime
 				foreach (ev; page.events)
 					s.deliver(eventsEventNotification,
 							withSubscriptionId(ev.toJson(), s.subscriptionId));
+				// A page the subscription's filter empties still moves the cursor,
+				// so paging continues while the position advances.
+				const advanced = !page.cursor.isNull && (s.cursor.isNull
+						|| page.cursor.get != s.cursor.get);
 				if (!page.cursor.isNull)
 					s.cursor = page.cursor;
-				hasMore = page.hasMore && page.events.length > 0;
+				hasMore = page.hasMore && advanced;
 			}
 			hasMore = false;
 		}
@@ -9487,4 +9491,27 @@ unittest  // a typed event's arguments are read by their serialized names
 	rt.poll("wire", Json(["version": Json("v2")]), "", nullable("c0"),
 			Nullable!long.init, Nullable!long.init);
 	assert(seen == "v2");
+}
+
+unittest  // a push backlog page the stream's filter empties does not end the backlog
+{
+	auto rt = testRuntime();
+	EventRegistration reg = {descriptor: EventType("n"), emitOnly: true};
+	reg.match = (EventContext ctx, EventOccurrence ev) @safe => ev.data["k"].get!string != "drop";
+	rt.register(reg);
+	const start = rt.buffer_.headCursor();
+	foreach (i; 0 .. 250)
+	{
+		auto o = EventOccurrence("e" ~ i.to!string, "n", "t");
+		o.data = Json(["k": Json(i >= 100 && i < 200 ? "drop" : "keep")]);
+		rt.emit(o);
+	}
+	string[] ids;
+	auto h = rt.openPushStream("n", Json.emptyObject, "u", Json(1), (string m, Json p) @safe {
+		if (m == eventsEventNotification)
+			ids ~= p["eventId"].get!string;
+	});
+	rt.startPushStream(h.stream, nullable(start), Nullable!long.init);
+	assert(ids.length == 150);
+	assert(ids[100] == "e200" && ids[$ - 1] == "e249");
 }
