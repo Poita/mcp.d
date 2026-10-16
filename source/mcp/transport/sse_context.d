@@ -2667,8 +2667,9 @@ package(mcp) void closeRawConnection(HTTPServerResponse res) @safe nothrow
 /// closed as connected (the close is only observed by a read), so the socket is
 /// polled with a non-blocking read instead: bytes it picks up stay buffered on
 /// the connection for the next reader, and an end-of-stream means the client
-/// is gone. A response without a TCP connection (a test response) reports
-/// `res.connected`.
+/// is gone. A response with no raw connection (a test response, or one already
+/// finalized) reports disconnected; a vibe.d build whose response has no raw
+/// connection field falls back to `res.connected`.
 package(mcp) bool clientConnected(HTTPServerResponse res) @safe nothrow
 {
 	import vibe.core.net : TCPConnection, WaitForDataStatus;
