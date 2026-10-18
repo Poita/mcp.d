@@ -589,8 +589,10 @@ class FileTokenStore : TokenStore
 	/// `O_CREAT|O_EXCL` with mode `0600`, then atomically `rename`d over the
 	/// target; because the secret bytes only ever live in the private temp file
 	/// (and rename preserves its `0600` mode), a pre-existing loose-permission
-	/// target is never written to before being tightened. Falls back to a plain
-	/// write on platforms without POSIX permissions.
+	/// target is never written to before being tightened. When the temp file
+	/// cannot be written or renamed the save throws, leaving the existing file
+	/// untouched. Falls back to a plain write on platforms without POSIX
+	/// permissions.
 	private void writeSecretFile(const(ubyte)[] bytes) @safe
 	{
 		import std.file : write;
@@ -598,7 +600,7 @@ class FileTokenStore : TokenStore
 		version (Posix)
 		{
 			import core.sys.posix.fcntl : open, O_CREAT, O_EXCL, O_WRONLY;
-			import core.sys.posix.unistd : close, getpid;
+			import core.sys.posix.unistd : close, fsync, getpid;
 			import core.sys.posix.sys.stat : S_IRUSR, S_IWUSR;
 			import core.stdc.stdio : rename;
 			import std.digest : toHexString;
@@ -636,7 +638,9 @@ class FileTokenStore : TokenStore
 						return false;
 					off += cast(size_t) n;
 				}
-				return true;
+				// Flush the bytes before the rename publishes them, so a crash
+				// never leaves an empty or partial file in the token file's place.
+				return fsync(fd) == 0;
 			}();
 
 			void discardTmp() @safe nothrow
@@ -653,16 +657,11 @@ class FileTokenStore : TokenStore
 				}())
 				return;
 
-			// The atomic path failed (could not create/write the temp file, or the
-			// rename failed). Clean up any temp and fall back to an in-place write.
-			// Tighten any pre-existing file to owner-only BEFORE writing secrets so
-			// they are not exposed through a loose-permission file, and reassert
-			// afterwards in case the file had to be created by `write`.
+			// An in-place write that fails part-way (e.g. a full disk) would
+			// truncate every resource's tokens, so the save fails instead and the
+			// existing file stays intact.
 			discardTmp();
-			restrictPermissions();
-			write(path, bytes);
-			restrictPermissions();
-			return;
+			throw internalError("FileTokenStore: could not write the token file " ~ path);
 		}
 		else
 		{
@@ -4054,6 +4053,34 @@ version (Posix) @system unittest  // a token file that cannot be read fails the 
 	assertThrown(new FileTokenStore(file).save("https://b.example.com", t));
 	assert(!exists(file ~ "~"));
 	setAttributes(file, octal!600);
+	assert(readText(file) == `{"https://a.example.com":{"access_token":"keep"}}`);
+}
+
+version (Posix) @system unittest  // a save whose temp file cannot be created fails and leaves the token file intact
+{
+	import core.sys.posix.unistd : geteuid;
+	import std.exception : assertThrown;
+	import std.file : tempDir, mkdirRecurse, rmdirRecurse, write, readText, setAttributes;
+	import std.path : buildPath;
+	import std.conv : octal, to;
+	import std.datetime.systime : Clock;
+
+	if (geteuid() == 0)
+		return; // root creates files in a read-only directory
+	auto root = buildPath(tempDir, "mcp-login-notemp-" ~ Clock.currTime().stdTime.to!string);
+	mkdirRecurse(root);
+	scope (exit)
+		rmdirRecurse(root);
+	auto file = buildPath(root, "tokens.json");
+	write(file, `{"https://a.example.com":{"access_token":"keep"}}`);
+	write(file ~ ".lock", "");
+	setAttributes(root, octal!500);
+	scope (exit)
+		setAttributes(root, octal!700);
+
+	StoredToken t;
+	t.accessToken = "new";
+	assertThrown(new FileTokenStore(file).save("https://b.example.com", t));
 	assert(readText(file) == `{"https://a.example.com":{"access_token":"keep"}}`);
 }
 
