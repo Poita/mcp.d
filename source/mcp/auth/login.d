@@ -4027,7 +4027,7 @@ version (Posix) @system unittest  // waiting for another process's token-file lo
 	assert(() @trusted { return flock(fd, LOCK_EX); }() == 0);
 	auto releaser = new Thread(() {
 		Thread.sleep(300.msecs);
-		flock(fd, LOCK_UN);
+		cast(void) flock(fd, LOCK_UN);
 		close(fd);
 	});
 	releaser.start();

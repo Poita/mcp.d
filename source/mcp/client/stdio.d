@@ -1823,7 +1823,7 @@ version (Posix) unittest  // spawning a missing executable fails with an McpExce
 		{
 			before = before ? before : openDescriptors();
 			try
-				spawnStdioTransport(cmd);
+				cast(void) spawnStdioTransport(cmd);
 			catch (McpException e)
 				errors ~= e;
 		}
@@ -1852,7 +1852,7 @@ version (Posix) unittest  // spawning a file that is not executable fails with a
 	string msg;
 	inLoop(() @safe {
 		try
-			spawnStdioTransport([path]);
+			cast(void) spawnStdioTransport([path]);
 		catch (McpException e)
 			msg = e.msg;
 	});
@@ -1868,7 +1868,7 @@ version (Posix) unittest  // spawning into a missing working directory fails wit
 	string msg;
 	inLoop(() @safe {
 		try
-			spawnStdioTransport(["sh", "-c", "cat"], defaultMaxLineBytes, s);
+			cast(void) spawnStdioTransport(["sh", "-c", "cat"], defaultMaxLineBytes, s);
 		catch (McpException e)
 			msg = e.msg;
 	});

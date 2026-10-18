@@ -1589,7 +1589,7 @@ version (Posix) unittest  // an exception thrown by the onInbound notification h
 	runEventLoop();
 
 	// Flush stderr (now pointing at the pipe) and read what was written to the pipe.
-	stderrLog.flush(5.seconds);
+	assert(stderrLog.flush(5.seconds));
 	() @trusted { stderr.flush(); }();
 	// Make the read end non-blocking so we don't hang if nothing was written.
 	() @trusted { fcntl(errPipe[0], F_SETFL, O_NONBLOCK); }();

@@ -5937,7 +5937,7 @@ version (unittest)
 unittest  // events/poll applies match and transform to an onFetch type's events
 {
 	auto rt = testRuntime();
-	shapedFetchType(rt);
+	cast(void) shapedFetchType(rt);
 	auto r = rt.poll("incident.created", Json(["severity": Json("P1")]), "",
 			nullable("c0"), Nullable!long.init, Nullable!long.init);
 	assert(r.events.length == 1);
@@ -5949,7 +5949,7 @@ unittest  // events/poll applies match and transform to an onFetch type's events
 unittest  // a push stream applies match and transform to an onFetch type's events
 {
 	auto rt = testRuntime();
-	shapedFetchType(rt);
+	cast(void) shapedFetchType(rt);
 	Json[] events;
 	auto h = rt.openPushStream("incident.created", Json(["severity": Json("P1")]),
 			"user-1", Json(1), (string method, Json params) @safe {
@@ -7192,7 +7192,7 @@ unittest  // webhook delivery applies match and transform to an onFetch type's e
 {
 	auto ft = new FakeWebhookTransport();
 	auto rt = engineRuntime(ft);
-	shapedFetchType(rt);
+	cast(void) shapedFetchType(rt);
 	auto p = webhookSub("incident.created", "https://proxy/hooks", Json([
 		"severity": Json("P1")
 	]));

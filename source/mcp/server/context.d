@@ -1467,7 +1467,7 @@ unittest  // removing an onCancel registration twice, or an empty one, is harmle
 	auto token = new CancellationToken;
 	int runs;
 	auto a = token.onCancel(() @safe nothrow{ runs++; });
-	auto b = token.onCancel(() @safe nothrow{ runs += 10; });
+	cast(void) token.onCancel(() @safe nothrow{ runs += 10; });
 	a.remove();
 	a.remove();
 	CancelRegistration none;

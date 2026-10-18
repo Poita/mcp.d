@@ -1681,7 +1681,7 @@ unittest  // FrameWriter throws on a short or failed write
 
 	auto w = new FrameWriter;
 	assert(collectException(w.write((const(ubyte)[] b) @safe => IoResult(IOStatus.ok,
-			b.length - 1), "abc")) !is null);
+			b.length / 2), "abc")) !is null);
 	assert(collectException(w.write((const(ubyte)[] b) @safe => IoResult(IOStatus.error,
 			0), "abc")) !is null);
 }
