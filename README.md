@@ -519,7 +519,9 @@ auto c = McpClient.http(url, s);
 A `CacheStore` is a small `get`/`put`/`invalidate`/`invalidatePartition`/`clear`
 interface; supply your own to pre-seed entries and
 skip round-trips, or share one across clients. The default `InMemoryCacheStore`
-is per-client and bounded by an LRU-style size cap. `client.setCache`,
+is per-client and bounded by a least-recently-used size cap (256 entries by
+default; `new InMemoryCacheStore(n)` sets another, `0` none). Expired entries are
+not swept on their own; one nobody reads again is reclaimed by that cap. `client.setCache`,
 `setDefaultCacheTtl`, and `clearCache` adjust this at runtime; `cache()` exposes
 the live store for pre-seeding.
 

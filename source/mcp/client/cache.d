@@ -83,21 +83,23 @@ interface CacheStore
 	void clear() @safe;
 }
 
-/// Default in-memory store: an associative array bounded by an
-/// insertion-ordered size cap so an unbounded stream of distinct
-/// `resources/read` URIs cannot grow it without limit. Single-fiber vibe.d
-/// access means no locking is needed.
+/// Default in-memory store: an associative array bounded by a least-recently-used
+/// size cap (a `get` or `put` counts as a use) so an unbounded stream of distinct
+/// `resources/read` URIs cannot grow it without limit. Expired entries are not
+/// purged on their own: the store holds no clock, and the client still reads an
+/// expired `tools/list` entry for schema lookups; an entry nobody reads again is
+/// reclaimed by the size cap. Single-fiber vibe.d access means no locking is needed.
 final class InMemoryCacheStore : CacheStore
 {
-	// Each live entry with the insertion stamp of its current incarnation.
+	// Each live entry with the stamp of its most recent use.
 	private struct Slot
 	{
 		CacheEntry entry;
 		ulong stamp;
 	}
 
-	// One insertion in `order_`: the key and the stamp it was inserted with. It
-	// is stale once the key is removed or re-inserted under a newer stamp.
+	// One use in `order_`: the key and the stamp it was used with. It is stale
+	// once the key is removed or used again under a newer stamp.
 	private struct Insertion
 	{
 		CacheKey key;
@@ -105,7 +107,8 @@ final class InMemoryCacheStore : CacheStore
 	}
 
 	private Slot[CacheKey] entries_;
-	// Insertion order used to evict the oldest live entry when at capacity. Only
+	// Use order, oldest first, used to evict the least recently used live entry
+	// when at capacity. Only
 	// kept when the store is bounded; stale insertions are skipped on eviction and
 	// reclaimed once they outnumber the live entries.
 	private Insertion[] order_;
@@ -123,7 +126,10 @@ final class InMemoryCacheStore : CacheStore
 	override Nullable!CacheEntry get(CacheKey key) @safe
 	{
 		if (auto e = key in entries_)
+		{
+			touch(key, *e);
 			return nullable(e.entry);
+		}
 		return Nullable!CacheEntry.init;
 	}
 
@@ -132,6 +138,7 @@ final class InMemoryCacheStore : CacheStore
 		if (auto e = key in entries_)
 		{
 			e.entry = entry;
+			touch(key, *e);
 			return;
 		}
 		evictIfNeeded();
@@ -139,6 +146,17 @@ final class InMemoryCacheStore : CacheStore
 		if (cap_ != 0)
 			order_ ~= Insertion(key, stamp);
 		entries_[key] = Slot(entry, stamp);
+		compactOrder();
+	}
+
+	/// Mark `key` most recently used: re-stamp it and queue a fresh insertion,
+	/// leaving its earlier one stale.
+	private void touch(CacheKey key, ref Slot slot) @safe
+	{
+		if (cap_ == 0)
+			return;
+		slot.stamp = ++nextStamp_;
+		order_ ~= Insertion(key, slot.stamp);
 		compactOrder();
 	}
 
@@ -168,7 +186,7 @@ final class InMemoryCacheStore : CacheStore
 		return e !is null && e.stamp == i.stamp;
 	}
 
-	/// Evict the oldest live entry when adding a new key would exceed the cap,
+	/// Evict the least recently used live entry when adding a new key would exceed the cap,
 	/// discarding stale insertions on the way.
 	private void evictIfNeeded() @safe
 	{
@@ -280,7 +298,39 @@ CacheStore noCache() @safe nothrow
 	assert(!s.get(CacheKey("resources/read", "b")).isNull);
 }
 
-@safe unittest  // the size cap evicts the oldest entry first (FIFO)
+@safe unittest  // the size cap evicts the least recently read entry, not the oldest written
+{
+	auto s = new InMemoryCacheStore(2);
+	s.put(CacheKey("resources/read", "a"), CacheEntry(Json("a")));
+	s.put(CacheKey("resources/read", "b"), CacheEntry(Json("b")));
+	s.get(CacheKey("resources/read", "a")); // 'a' is now the most recently used
+	s.put(CacheKey("resources/read", "c"), CacheEntry(Json("c")));
+	assert(!s.get(CacheKey("resources/read", "a")).isNull, "a recently read entry survives");
+	assert(s.get(CacheKey("resources/read", "b")).isNull, "the least recently used is evicted");
+	assert(!s.get(CacheKey("resources/read", "c")).isNull);
+}
+
+@safe unittest  // re-putting an existing key marks it most recently used
+{
+	auto s = new InMemoryCacheStore(2);
+	s.put(CacheKey("resources/read", "a"), CacheEntry(Json("a1")));
+	s.put(CacheKey("resources/read", "b"), CacheEntry(Json("b")));
+	s.put(CacheKey("resources/read", "a"), CacheEntry(Json("a2")));
+	s.put(CacheKey("resources/read", "c"), CacheEntry(Json("c")));
+	assert(s.get(CacheKey("resources/read", "a")).get.value == Json("a2"));
+	assert(s.get(CacheKey("resources/read", "b")).isNull);
+}
+
+@safe unittest  // repeated reads do not grow the eviction bookkeeping without bound
+{
+	auto s = new InMemoryCacheStore(4);
+	s.put(CacheKey("resources/read", "x"), CacheEntry(Json(1)));
+	foreach (i; 0 .. 1000)
+		s.get(CacheKey("resources/read", "x"));
+	assert(s.order_.length <= 64);
+}
+
+@safe unittest  // with no reads, the size cap evicts the oldest entry first
 {
 	auto s = new InMemoryCacheStore(2);
 	s.put(CacheKey("resources/read", "a"), CacheEntry(Json("a")));
