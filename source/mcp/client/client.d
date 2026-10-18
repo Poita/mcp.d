@@ -24,7 +24,8 @@ import mcp.client.stdio : StdioClientTransport, spawnStdioTransport;
 import mcp.client.subscription : SubscriptionStream, SubscriptionFilter;
 import mcp.client.cache : CacheStore, InMemoryCacheStore, CacheKey, CacheEntry, noCache;
 import mcp.client.event_subscription : EventSubscription;
-import mcp.client.events : WebhookReceiver, NoCompatibleDeliveryMode, generateWhsecSecret;
+import mcp.client.events : WebhookReceiver, NoCompatibleDeliveryMode,
+	generateWhsecSecret, isWhsecSecret;
 import mcp.protocol.events;
 import mcp.protocol.ssrf : TlsTrust;
 
@@ -3527,7 +3528,18 @@ final class McpClient : ClientProtocol
 			void delegate(EventOccurrence) @safe onEvent,
 			void delegate(EventControl) @safe onControl = null) @safe
 	{
+		import std.algorithm : startsWith;
+
 		ensureOpen();
+		if (rx is null)
+			throw new McpException(ErrorCode.invalidParams,
+					"subscribeWebhook needs a WebhookReceiver to route deliveries");
+		const url = p.delivery.url;
+		if (!url.startsWith("https://") && !url.startsWith("http://"))
+			throw new McpException(ErrorCode.invalidParams, "delivery.url must be an http(s) URL");
+		if (!isWhsecSecret(p.delivery.secret))
+			throw new McpException(ErrorCode.invalidParams,
+					"delivery.secret must be a whsec_ secret (see generateWhsecSecret)");
 		auto sub = new EventSubscription();
 		sub.setMode(DeliveryMode.webhook);
 		sub.dedupCapacity(eventSettings_.dedupWindow);
@@ -12444,4 +12456,38 @@ unittest  // a webhook refresh surfaces a gap and the server's deliveryStatus
 	assert(ctrls[0].cursor.get == "w2");
 	assert(!sub.deliveryStatus.get.active);
 	assert(sub.deliveryStatus.get.lastError.get == DeliveryErrorCategory.http5xx);
+}
+
+unittest  // subscribeWebhook refuses a null receiver, a bad url, or a bad secret before subscribing
+{
+	auto c = new McpClient(new RecordingClientTransport());
+	c.enableModern();
+	int subs;
+	c.onRpcForTest = (string method, Json params) @safe {
+		subs++;
+		SubscribeResult r;
+		r.id = "sub_x";
+		return r.toJson();
+	};
+	void expectRefused(WebhookReceiver rx, string url, string secret) @safe
+	{
+		SubscribeParams sp;
+		sp.name = "incident.created";
+		sp.delivery = WebhookDelivery(url, secret);
+		bool refused;
+		try
+			c.subscribeWebhook(rx, sp, (EventOccurrence o) @safe {});
+		catch (McpException e)
+			refused = e.code == ErrorCode.invalidParams;
+		assert(refused);
+	}
+
+	auto rx = new WebhookReceiver();
+	expectRefused(null, "https://hook/x", managedTestWhsec);
+	expectRefused(rx, "", managedTestWhsec);
+	expectRefused(rx, "ftp://hook/x", managedTestWhsec);
+	expectRefused(rx, "https://hook/x", "");
+	expectRefused(rx, "https://hook/x", "not-a-secret");
+	expectRefused(rx, "https://hook/x", "whsec_AAAA"); // decodes to too few bytes
+	assert(subs == 0, "nothing reaches the server");
 }

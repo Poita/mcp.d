@@ -26,6 +26,23 @@ string generateWhsecSecret() @safe
 	return ("whsec_" ~ Base64.encode(cryptoRandomBytes(32))).idup;
 }
 
+/// Whether `secret` has the shape the Events extension requires of a webhook
+/// signing secret: `whsec_` + base64 of 24..64 bytes.
+bool isWhsecSecret(string secret) @safe
+{
+	import std.algorithm : startsWith;
+
+	if (!secret.startsWith("whsec_"))
+		return false;
+	try
+	{
+		const n = Base64.decode(secret["whsec_".length .. $]).length;
+		return n >= 24 && n <= 64;
+	}
+	catch (Exception)
+		return false;
+}
+
 /// Thrown by `McpClient.subscribeEvents` when none of the delivery modes an
 /// event type advertises is usable by this client (or the forced mode is not
 /// offered).
@@ -319,6 +336,16 @@ unittest  // generateWhsecSecret produces a decodable whsec_ secret of 32 bytes
 	auto raw = Base64.decode(s["whsec_".length .. $]);
 	assert(raw.length == 32);
 	assert(generateWhsecSecret() != generateWhsecSecret()); // random
+}
+
+unittest  // isWhsecSecret accepts a minted secret and rejects malformed ones
+{
+	assert(isWhsecSecret(generateWhsecSecret()));
+	assert(isWhsecSecret(testSecret));
+	assert(!isWhsecSecret(""));
+	assert(!isWhsecSecret("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="));
+	assert(!isWhsecSecret("whsec_AAAA")); // 3 bytes
+	assert(!isWhsecSecret("whsec_!!!!"));
 }
 
 unittest  // the receiver verifies a signed event delivery and routes the occurrence
