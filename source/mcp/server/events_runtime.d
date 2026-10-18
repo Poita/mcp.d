@@ -564,7 +564,7 @@ final class PushStream
 	private string name_;
 	private Json arguments_;
 	private string principal_;
-	private Json subscriptionId_;
+	private Json requestId_;
 	private Nullable!string cursor_;
 	private void delegate(string method, Json taggedParams) @safe deliver_;
 	private bool terminated_;
@@ -587,10 +587,12 @@ final class PushStream
 		return principal_;
 	}
 
-	/// The events/stream request's JSON-RPC id.
-	Json subscriptionId() @safe nothrow
+	/// The events/stream request's JSON-RPC id, which tags the stream's
+	/// notifications as their `_meta` subscription id. Distinct from the
+	/// lifecycle id (`SubContext.subscriptionId`) the hooks receive.
+	Json requestId() @safe nothrow
 	{
-		return subscriptionId_;
+		return requestId_;
 	}
 
 	/// The last position delivered on this stream.
@@ -1244,7 +1246,7 @@ final class EventsRuntime
 	/// having sent its response headers, calls `startPushStream`. The transport
 	/// supplies `deliver` and drives the heartbeat/poll loop.
 	PushHandle openPushStream(string name, Json arguments, string principal,
-			Json subscriptionId, void delegate(string method, Json taggedParams) @safe deliver) @safe
+			Json requestId, void delegate(string method, Json taggedParams) @safe deliver) @safe
 	{
 		principal = resolvePrincipal(principal);
 		auto p = name in types_;
@@ -1263,7 +1265,7 @@ final class EventsRuntime
 		s.name_ = name;
 		s.arguments_ = (arguments.type == Json.Type.object) ? arguments : Json.emptyObject;
 		s.principal_ = principal;
-		s.subscriptionId_ = subscriptionId;
+		s.requestId_ = requestId;
 		s.deliver_ = deliver;
 		if (regIsEmitOnly(p))
 			s.openHead_ = buffer_.headCursor();
@@ -1305,7 +1307,7 @@ final class EventsRuntime
 		catch (Exception e)
 			readError = e;
 		s.deliver(eventsActiveNotification, withSubscriptionId(activeParams(read
-				? first.cursor : cursor, read && first.truncated), s.subscriptionId));
+				? first.cursor : cursor, read && first.truncated), s.requestId));
 		if (readError !is null)
 		{
 			logEventsError("push stream backlog check threw", readError);
@@ -1313,8 +1315,7 @@ final class EventsRuntime
 		}
 		if (read)
 			foreach (ev; first.events)
-				s.deliver(eventsEventNotification,
-						withSubscriptionId(ev.toJson(), s.subscriptionId));
+				s.deliver(eventsEventNotification, withSubscriptionId(ev.toJson(), s.requestId));
 		s.cursor_ = read && !first.cursor.isNull ? first.cursor : cursor;
 		bool hasMore = read && first.hasMore;
 		if (regIsEmitOnly(reg))
@@ -1327,10 +1328,10 @@ final class EventsRuntime
 						s.cursor, maxAgeMs, cap);
 				if (page.truncated)
 					s.deliver(eventsActiveNotification,
-							withSubscriptionId(activeParams(page.cursor, true), s.subscriptionId));
+							withSubscriptionId(activeParams(page.cursor, true), s.requestId));
 				foreach (ev; page.events)
 					s.deliver(eventsEventNotification,
-							withSubscriptionId(ev.toJson(), s.subscriptionId));
+							withSubscriptionId(ev.toJson(), s.requestId));
 				// A page the subscription's filter empties still moves the cursor,
 				// so paging continues while the position advances.
 				const advanced = !page.cursor.isNull && (s.cursor.isNull
@@ -1437,9 +1438,9 @@ final class EventsRuntime
 		}
 		if (r.truncated)
 			s.deliver(eventsActiveNotification,
-					withSubscriptionId(activeParams(r.cursor, true), s.subscriptionId));
+					withSubscriptionId(activeParams(r.cursor, true), s.requestId));
 		foreach (ev; r.events)
-			s.deliver(eventsEventNotification, withSubscriptionId(ev.toJson(), s.subscriptionId));
+			s.deliver(eventsEventNotification, withSubscriptionId(ev.toJson(), s.requestId));
 		if (!r.cursor.isNull)
 			s.cursor_ = r.cursor;
 		return r.hasMore;
@@ -1452,8 +1453,7 @@ final class EventsRuntime
 		auto mcp = cast(McpException) e;
 		Json err = mcp !is null ? toErrorJson(mcp) : toErrorJson(
 				internalError(exposeInternalErrors ? e.msg : "Internal error"));
-		s.deliver(eventsErrorNotification,
-				withSubscriptionId(eventErrorParams(err), s.subscriptionId));
+		s.deliver(eventsErrorNotification, withSubscriptionId(eventErrorParams(err), s.requestId));
 	}
 
 	/// End a push stream from the server side: deliver `notifications/events/
@@ -1467,7 +1467,7 @@ final class EventsRuntime
 		s.terminated_ = true;
 		try
 			s.deliver(eventsTerminatedNotification,
-					withSubscriptionId(terminatedParams(error), s.subscriptionId));
+					withSubscriptionId(terminatedParams(error), s.requestId));
 		catch (Exception)
 		{
 			// The client is already gone; the stream is released regardless.
@@ -2418,9 +2418,9 @@ final class EventsRuntime
 		catch (Exception e)
 		{
 			logEventsError("match/transform threw", e);
-			s.deliver(eventsErrorNotification, withSubscriptionId(eventErrorParams(
-					toErrorJson(internalError("Event could not be shaped for this subscription"))),
-					s.subscriptionId));
+			s.deliver(eventsErrorNotification,
+					withSubscriptionId(eventErrorParams(toErrorJson(internalError(
+						"Event could not be shaped for this subscription"))), s.requestId));
 			return;
 		}
 		// Only advance the stream cursor for buffer-backed types. For a check-backed
@@ -2429,7 +2429,7 @@ final class EventsRuntime
 		// ticker's poll() to advance from check results.
 		if (regIsEmitOnly(reg) && !shaped.cursor.isNull)
 			s.cursor_ = shaped.cursor;
-		auto params = withSubscriptionId(shaped.toJson(), s.subscriptionId);
+		auto params = withSubscriptionId(shaped.toJson(), s.requestId);
 		s.deliver(eventsEventNotification, params);
 	}
 
@@ -4034,9 +4034,9 @@ version (unittest)
 	// Open a push stream already started (no leading frames), so a test sees
 	// only the frames its own emits produce.
 	private PushHandle openLive(EventsRuntime rt, string name, Json arguments, string principal,
-			Json subscriptionId, void delegate(string method, Json taggedParams) @safe deliver) @safe
+			Json requestId, void delegate(string method, Json taggedParams) @safe deliver) @safe
 	{
-		auto h = rt.openPushStream(name, arguments, principal, subscriptionId, deliver);
+		auto h = rt.openPushStream(name, arguments, principal, requestId, deliver);
 		h.stream.started_ = true;
 		return h;
 	}
@@ -4511,6 +4511,17 @@ unittest  // emit fans out to a matching push stream
 	assert(deliveredParams["eventId"].get!string == "evt1");
 	// the subscription id is carried in _meta
 	assert(deliveredParams["_meta"][MetaKey.subscriptionId].get!int == 1);
+	handle.close();
+}
+
+unittest  // a push stream exposes the events/stream request id it was opened with
+{
+	auto rt = testRuntime();
+	EventRegistration reg = {descriptor: EventType("n"), emitOnly: true};
+	rt.register(reg);
+	auto handle = rt.openPushStream("n", Json.emptyObject, "user-1",
+			Json("req-7"), (string method, Json params) @safe {});
+	assert(handle.stream.requestId.get!string == "req-7");
 	handle.close();
 }
 

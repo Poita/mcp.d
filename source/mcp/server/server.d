@@ -2072,7 +2072,7 @@ final class McpServer : ServerCore
 			{
 				s.lastHeartbeatMs = nowMs;
 				s.deliver(eventsHeartbeatNotification,
-						withSubscriptionId(heartbeatParams(s.cursor), s.subscriptionId));
+						withSubscriptionId(heartbeatParams(s.cursor), s.requestId));
 			}
 		}
 	}
