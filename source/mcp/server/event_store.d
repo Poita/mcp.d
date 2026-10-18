@@ -290,6 +290,10 @@ final class EmitBuffer
 struct WebhookSubscription
 {
 	string id; /// derived routing handle (hash of the subscription key)
+	/// Random per creation. `id` is derived from the key, so a subscription
+	/// removed and created again reuses it: jobs carry the incarnation they were
+	/// queued for, and one queued for an earlier subscription is dropped unsent.
+	string incarnation;
 	string principal; /// authenticated subject that owns the subscription
 	string name; /// event type
 	Json arguments = Json.emptyObject; /// subscription arguments (part of the key)
@@ -329,6 +333,8 @@ struct WebhookSubscription
 	{
 		Json j = Json.emptyObject;
 		j["id"] = id;
+		if (incarnation.length)
+			j["incarnation"] = incarnation;
 		j["principal"] = principal;
 		j["name"] = name;
 		j["arguments"] = arguments.type == Json.Type.object ? arguments : Json.emptyObject;
@@ -373,6 +379,7 @@ struct WebhookSubscription
 	{
 		WebhookSubscription s;
 		s.id = j.getOr("id", "");
+		s.incarnation = j.getOr("incarnation", "");
 		s.principal = j.getOr("principal", "");
 		s.name = j.getOr("name", "");
 		if ("arguments" in j && j["arguments"].type == Json.Type.object)
@@ -569,7 +576,7 @@ final class InMemoryWebhookSubscriptionStore : WebhookSubscriptionStore
 /// node's leased-but-unacked jobs are re-leased by another.
 struct Delivery
 {
-	string jobId; /// unique (subscription id + event id)
+	string jobId; /// unique (subscription id + incarnation + event id)
 	string subscriptionId;
 	EventOccurrence occ; /// the event to deliver (carries its watermark cursor)
 	int attempt; /// attempts already made
@@ -579,6 +586,7 @@ struct Delivery
 	/// A gap owed for positions dropped undelivered, which settled when they
 	/// were dropped: it is sent no earlier than the subscription's watermark.
 	bool owed;
+	string incarnation; /// the `WebhookSubscription.incarnation` the job was queued for
 
 	Json toJson() const @safe
 	{
@@ -591,6 +599,8 @@ struct Delivery
 			j["gap"] = true;
 		if (owed)
 			j["owed"] = true;
+		if (incarnation.length)
+			j["incarnation"] = incarnation;
 		return j;
 	}
 
@@ -604,6 +614,7 @@ struct Delivery
 		d.attempt = j.getOr("attempt", 0);
 		d.gap = j.getOr("gap", false);
 		d.owed = j.getOr("owed", false);
+		d.incarnation = j.getOr("incarnation", "");
 		return d;
 	}
 }
@@ -1320,6 +1331,17 @@ unittest  // WebhookSubscription round-trips an owed gap through JSON
 	s.missedCursor = "c7";
 	back = WebhookSubscription.fromJson(s.toJson());
 	assert(back.owesGap && back.missedCursor.get == "c7");
+}
+
+unittest  // a subscription's and a job's incarnation round-trip through JSON
+{
+	WebhookSubscription s;
+	s.id = "s";
+	s.incarnation = "inc1";
+	assert(WebhookSubscription.fromJson(s.toJson()).incarnation == "inc1");
+	auto d = Delivery("s/inc1/e", "s", EventOccurrence("e", "n", "t"), 0);
+	d.incarnation = "inc1";
+	assert(Delivery.fromJson(d.toJson()).incarnation == "inc1");
 }
 
 unittest  // WebhookSubscription.isExpired honours noExpiry

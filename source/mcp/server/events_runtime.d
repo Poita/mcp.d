@@ -1635,6 +1635,7 @@ final class EventsRuntime
 		// deliveries), so it is a no-op rather than a regression.
 		if (isNew)
 		{
+			sub.incarnation = randomNonce()[0 .. 16];
 			sub.cursor = p.cursor;
 			sub.fetchCursor = p.cursor;
 		}
@@ -2102,7 +2103,16 @@ final class EventsRuntime
 			noteMissed(sub.id, shaped.cursor);
 			return false;
 		}
-		return enqueueTracked(Delivery(sub.id ~ "/" ~ shaped.eventId, sub.id, shaped, 0));
+		auto job = Delivery(jobPrefix(sub) ~ shaped.eventId, sub.id, shaped, 0);
+		job.incarnation = sub.incarnation;
+		return enqueueTracked(job);
+	}
+
+	// The start of every job id queued for `sub`: its id and incarnation, so a
+	// later subscription under the same id never shares a job id with it.
+	private static string jobPrefix(const WebhookSubscription sub) @safe pure
+	{
+		return sub.id ~ "/" ~ sub.incarnation ~ "/";
 	}
 
 	// Enqueue `job`, tracking it for the watermark and the pending bound first (a
@@ -2768,9 +2778,9 @@ final class EventsRuntime
 		const occ = job.occ;
 		const leaseMs = opts_.deliveryLease.total!"msecs";
 		auto s0 = webhookStore_.get(subId);
-		if (s0.isNull)
+		if (s0.isNull || s0.get.incarnation != job.incarnation)
 		{
-			ackJob(job.jobId); // subscription gone; nothing to deliver
+			ackJob(job.jobId); // subscription gone (or created afresh); nothing to deliver
 			return false;
 		}
 		if (dropIfLapsed(job, s0.get))
@@ -2835,7 +2845,7 @@ final class EventsRuntime
 			deliveryQueue_.touch(job.jobId, attempt, opts_.nowMs() + leaseMs);
 			persistedAttempt = attempt;
 			auto sn = webhookStore_.get(subId);
-			if (sn.isNull)
+			if (sn.isNull || sn.get.incarnation != job.incarnation)
 			{
 				ackJob(job.jobId);
 				return false;
@@ -3083,7 +3093,8 @@ final class EventsRuntime
 		occ.name = sub.name;
 		occ.cursor = cursor;
 		const key = cursor.isNull ? occ.eventId : cursor.get;
-		Delivery job = Delivery(sub.id ~ "/gap/" ~ key, sub.id, occ, 0);
+		Delivery job = Delivery(jobPrefix(sub) ~ "gap/" ~ key, sub.id, occ, 0);
+		job.incarnation = sub.incarnation;
 		job.gap = true;
 		job.owed = owed;
 		return enqueueTracked(job);
@@ -9096,6 +9107,43 @@ unittest  // an emit landing while a bootstrapping subscription is stored is not
 	assert(postedEventIds(ft) == ["evt_2"]);
 }
 
+unittest  // a removed subscription's queued jobs are not delivered to its resubscription
+{
+	auto ft = new FakeWebhookTransport();
+	auto queue = new InMemoryDeliveryQueue();
+	EventsOptions o;
+	o.nowMs = () @safe => 1_000_000L;
+	o.nowIso = () @safe => "t";
+	o.allowPrivateCallbackHosts = true;
+	o.webhookTransport = ft;
+	o.deliveryQueue = queue;
+	o.deliverySleep = (Duration d) @safe {};
+	void delegate() @safe[] deferred;
+	o.deliveryExecutor = (void delegate() @safe job) @safe { deferred ~= job; };
+	auto rt = new EventsRuntime(null, o);
+	EventRegistration reg = {descriptor: EventType("n"), emitOnly: true};
+	rt.register(reg);
+	rt.subscribeWebhook(webhookSub("n", "https://proxy/hooks"), "user-1");
+	rt.emit(EventOccurrence("evt_1", "n", "t"));
+	UnsubscribeParams u;
+	u.name = "n";
+	u.url = "https://proxy/hooks";
+	rt.unsubscribeWebhook(u, "user-1");
+	// The client subscribes again starting from now, before the old job ran.
+	auto r = rt.subscribeWebhook(webhookSub("n", "https://proxy/hooks"), "user-1");
+	for (size_t i = 0; i < deferred.length; i++)
+		deferred[i]();
+	rt.drainDeliveries();
+	for (size_t i = 0; i < deferred.length; i++)
+		deferred[i]();
+	assert(ft.eventPosts().length == 0);
+	assert(!queue.hasPendingFor(r.id));
+	rt.emit(EventOccurrence("evt_2", "n", "t"));
+	for (size_t i = 0; i < deferred.length; i++)
+		deferred[i]();
+	assert(postedEventIds(ft) == ["evt_2"]);
+}
+
 unittest  // a job for a subscription that lapsed before delivery is acked without a POST
 {
 	long now = 1_000_000;
@@ -9328,7 +9376,9 @@ unittest  // attempt persistence: a job re-leased mid-retry does not restart att
 	// Enqueue a job one attempt short of the cap on a prior (crashed) lease.
 	auto occ = EventOccurrence("evt_1", "n", "t");
 	occ.cursor = "5";
-	queue.enqueue(Delivery(r.id ~ "/evt_1", r.id, occ, o.webhookMaxAttempts - 1));
+	auto job = Delivery(r.id ~ "/evt_1", r.id, occ, o.webhookMaxAttempts - 1);
+	job.incarnation = rt.webhookStore().get(r.id).get.incarnation;
+	queue.enqueue(job);
 	rt.drainDeliveries();
 	// Resuming from the persisted count, only one more attempt is made before the cap.
 	assert(ft.eventPosts().length == 1);
