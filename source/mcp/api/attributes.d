@@ -4,6 +4,11 @@ import vibe.data.json : Json;
 import core.time : Duration;
 import mcp.protocol.modern : CacheScope;
 
+/// vibe's field attributes, which derived schemas and argument binding honour:
+/// `@optional` makes a field optional, `@name` sets its wire name, and
+/// `@ignore` leaves it out.
+public import vibe.data.serialization : ignore, name, optional;
+
 @safe:
 
 /// UDA marking a method as an MCP tool. Apply to a member function; the input

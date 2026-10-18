@@ -436,3 +436,27 @@ unittest
 			Nullable!bool b = nullable(true);
 		}));
 }
+
+// The vibe field attributes the schema binding honours come with `import mcp;`,
+// so a struct can mark a field optional, renamed, or skipped without an extra
+// import.
+unittest
+{
+	static assert(visibleFromMcp!"optional");
+	static assert(visibleFromMcp!"name");
+	static assert(visibleFromMcp!"ignore");
+	static assert(__traits(compiles, {
+			import mcp;
+
+			struct Page
+			{
+				@schemaDefault(0) int offset;
+				int limit = 10;
+				@optional bool verbose;
+				@name("page_size") int size = 20;
+				@ignore int scratch;
+			}
+
+			auto s = jsonSchemaOf!Page;
+		}));
+}

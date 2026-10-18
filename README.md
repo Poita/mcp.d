@@ -784,7 +784,9 @@ A struct field initialized to its type's own `.init` stays **required**, unlike 
 parameter: D cannot tell `int offset = 0;` or `bool verbose = false;` from a
 field with no initializer, so both are listed in `required`. To make such a field
 optional, give it `@schemaDefault(0)` (which also advertises the default), mark
-it vibe's `@optional`, declare it `Nullable`, or put `@allOptional` on the struct:
+it vibe's `@optional`, declare it `Nullable`, or put `@allOptional` on the struct.
+`import mcp;` re-exports vibe's `@optional`, `@name` (wire name) and `@ignore`
+(left out) field attributes:
 
 ```d
 struct Page
