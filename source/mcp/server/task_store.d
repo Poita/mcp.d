@@ -172,9 +172,11 @@ interface TaskStore
 	/// Drop the record identified by `taskId`. A no-op if unknown.
 	void remove(string taskId) @safe;
 
-	/// Drop every record for which `pred` returns true, returning how many were
-	/// removed. The runtime's TTL sweep uses it to expire settled tasks; a store
-	/// with native key expiry may apply the same rule itself.
+	/// Call `pred` once for every stored record and drop each one for which it
+	/// returns true, returning how many were removed. The runtime's sweep uses it
+	/// both to expire settled tasks and to find unsettled ones idle past
+	/// `TaskOptions.maxUnsettledIdle`, which it then settles, so a store must
+	/// evaluate `pred` on every record even when it also expires keys natively.
 	size_t removeIf(scope bool delegate(const TaskRecord) @safe pred) @safe;
 
 	/// How many records owned by `owner` ("" for unbound tasks) are not yet
