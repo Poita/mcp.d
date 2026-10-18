@@ -151,6 +151,16 @@ final class WebhookReceiver
 		if (!vr.ok)
 			return ReceiverResponse(400, "");
 
+		Json j;
+		try
+			j = parseUntrustedJson(body);
+		catch (Exception)
+			return ReceiverResponse(400, "");
+		// A verification challenge is answered on every attempt and never
+		// recorded: a retry still needs the echo to prove intent to receive.
+		if (isControlEnvelope(j) && j["type"].get!string == "verification")
+			return challengeEcho(j);
+
 		// Deduplicate retries per subscription: the same eventId fans out to every
 		// subscription as deliveries sharing one webhook-id, so a bare webhook-id
 		// key would let the first subscription's copy swallow the rest. Only a true
@@ -175,12 +185,18 @@ final class WebhookReceiver
 				inProgress_.remove(key);
 			// Recorded only once the delivery is handled: a callback that throws
 			// (the adapter answers 5xx) leaves the server's retry to be processed.
-			auto resp = route(body, *reg);
+			auto resp = route(j, *reg);
 			if (resp.status == 200)
 				recordSeen(key, ts);
 			return resp;
 		}
-		return route(body, *reg);
+		return route(j, *reg);
+	}
+
+	// The 2xx reply that proves intent to receive: the challenge echoed back.
+	private static ReceiverResponse challengeEcho(Json envelope) @safe
+	{
+		return ReceiverResponse(200, Json(["challenge": envelope["challenge"]]).toString());
 	}
 
 	// Answer a verification challenge for a subscription id not registered yet
@@ -207,26 +223,18 @@ final class WebhookReceiver
 			catch (Exception)
 				break;
 			if (isControlEnvelope(j) && j["type"].get!string == "verification")
-				return ReceiverResponse(200, Json(["challenge": j["challenge"]]).toString());
+				return challengeEcho(j);
 			break;
 		}
 		return ReceiverResponse(503, "");
 	}
 
-	// Parse a verified delivery and hand it to the subscription's callbacks.
-	private ReceiverResponse route(string body, ref Reg reg) @safe
+	// Hand a verified, parsed, non-verification delivery to the subscription's
+	// callbacks.
+	private ReceiverResponse route(Json j, ref Reg reg) @safe
 	{
-		Json j;
-		try
-			j = parseUntrustedJson(body);
-		catch (Exception)
-			return ReceiverResponse(400, "");
-
 		if (isControlEnvelope(j))
 		{
-			const type = j["type"].get!string;
-			if (type == "verification") // Prove intent to receive: echo the challenge in a 2xx body.
-				return ReceiverResponse(200, Json(["challenge": j["challenge"]]).toString());
 			EventControl ctrl;
 			if (reg.onControl !is null && controlFromWebhookEnvelope(j, ctrl))
 				reg.onControl(ctrl);
@@ -352,6 +360,25 @@ unittest  // the receiver answers a verification challenge by echoing the nonce
 	auto headers = signDeliveryHeaders(signing, body);
 	auto resp = rx.processDelivery(body, headers);
 	assert(resp.status == 200);
+	assert(parseJsonString(resp.body)["challenge"].get!string == "nonce-123");
+}
+
+unittest  // a retried verification challenge (same webhook-id) is echoed again
+{
+	auto rx = new WebhookReceiver();
+	rx.verifyTimestamp = false;
+	rx.register("sub_1", testSecret, (EventOccurrence occ) @safe {});
+
+	const 
+	body = verificationEnvelope("nonce-123").toString();
+	DeliverySigning signing = {
+		secret: testSecret, messageId: "msg_verif", timestamp: 1700, subscriptionId: "sub_1"
+	};
+	auto headers = signDeliveryHeaders(signing, body);
+	assert(rx.processDelivery(body, headers).status == 200);
+	auto resp = rx.processDelivery(body, headers);
+	assert(resp.status == 200);
+	assert(resp.body.length, "a retried challenge must still carry the echo");
 	assert(parseJsonString(resp.body)["challenge"].get!string == "nonce-123");
 }
 
