@@ -274,7 +274,8 @@ alias TaskExecutor = Json delegate(TaskContext tc) @safe;
 /// has suspended or detached, the dispatch ends there whatever it does
 /// afterwards. A task whose record was removed during the run is left gone.
 /// A task already cancelled or removed when the dispatch starts is settled
-/// without invoking the executor.
+/// without invoking the executor, and one that is not `working` (already
+/// settled or awaiting input) or was detached is left as it is.
 /// Pure over the store, so it is correct whether invoked in-process or by a
 /// remote worker. Throws only when the outcome cannot be recorded (e.g. the
 /// store is unreachable).
@@ -310,6 +311,8 @@ package(mcp) McpException tasksExtensionRequired(string message) @safe
 
 private void drive(ref TaskContext tc, TaskExecutor executor) @safe
 {
+	import mcp.protocol.tasks : TaskStatus;
+
 	auto rt = tc.rt_;
 	const taskId = tc.taskId_;
 	// A task removed while its executor ran has no record left to settle.
@@ -326,6 +329,16 @@ private void drive(ref TaskContext tc, TaskExecutor executor) @safe
 		settleCancelled();
 		return;
 	}
+	// Only a working task with no detached hand-off awaits this dispatch; a
+	// redelivered one for a task that settled, suspended or detached would
+	// repeat the executor's side effects.
+	auto rec = rt.recordOf(taskId);
+	if (rec.isNull || rec.get.meta.status != TaskStatus.working || rec.get.detached)
+		return;
+	tc.outcome_.executorInput = rec.get.executorInput;
+	tc.outcome_.inputs = rec.get.inputResponses;
+	tc.outcome_.checkpoints = rec.get.checkpoints;
+	tc.outcome_.loaded = true;
 
 	try
 	{
@@ -668,6 +681,57 @@ unittest  // a task whose record is gone before its dispatch runs never invokes 
 	assert(!ran);
 }
 
+unittest  // a redelivered dispatch of a settled task never invokes the executor
+{
+	import mcp.server.task_runtime : TaskOptions;
+
+	auto rt = new TaskRuntime(TaskOptions.init);
+	auto t = rt.createFor("once", Json.undefined);
+	int runs;
+	TaskExecutor exec = (TaskContext tc) @safe {
+		runs++;
+		return Json(["structuredContent": Json(["run": Json(runs)])]);
+	};
+	runTaskExecutor(rt, t.taskId, exec);
+	runTaskExecutor(rt, t.taskId, exec);
+	assert(runs == 1);
+	assert(rt.getDetailed(t.taskId)["result"]["structuredContent"]["run"].get!int == 1);
+}
+
+unittest  // a redelivered dispatch of a task awaiting input never invokes the executor
+{
+	import mcp.server.task_runtime : TaskOptions;
+
+	auto rt = new TaskRuntime(TaskOptions.init);
+	auto t = rt.createFor("gate", Json.undefined);
+	int runs;
+	TaskExecutor exec = (TaskContext tc) @safe {
+		runs++;
+		return tc.requireInput([InputRequest.elicitation("ok", "Proceed?")]);
+	};
+	runTaskExecutor(rt, t.taskId, exec);
+	runTaskExecutor(rt, t.taskId, exec);
+	assert(runs == 1);
+	assert(rt.getDetailed(t.taskId)["status"].get!string == "input_required");
+}
+
+unittest  // a redelivered dispatch of a detached task never invokes the executor
+{
+	import mcp.server.task_runtime : TaskOptions;
+
+	auto rt = new TaskRuntime(TaskOptions.init);
+	auto t = rt.createFor("deploy", Json.undefined);
+	int runs;
+	TaskExecutor exec = delegate Json(TaskContext tc) @safe {
+		runs++;
+		return tc.detach();
+	};
+	runTaskExecutor(rt, t.taskId, exec);
+	runTaskExecutor(rt, t.taskId, exec);
+	assert(runs == 1);
+	assert(rt.getDetailed(t.taskId)["status"].get!string == "working");
+}
+
 unittest  // an executor that throws after a cancel was requested ends the task cancelled
 {
 	import mcp.server.task_store : InMemoryTaskStore;
@@ -891,7 +955,7 @@ unittest  // checkpoint state survives a suspension and is restored on re-run
 	assert(d["result"]["structuredContent"]["state"].get!string == "carried");
 }
 
-unittest  // an executor's input and checkpoint reads share one store read per dispatch
+unittest  // an executor's input and checkpoint reads come from the dispatch's one store read
 {
 	import mcp.server.task_store : TaskStore, InMemoryTaskStore, TaskRecord;
 	import mcp.server.task_runtime : TaskOptions;
@@ -954,7 +1018,7 @@ unittest  // an executor's input and checkpoint reads share one store read per d
 			assert(tc.hasCheckpoint("seen"));
 			assert(tc.restore!bool("seen"));
 		}
-		assert(store.gets - before == 1, "reads after the first must come from the snapshot");
+		assert(store.gets == before, "reads must come from the dispatch's snapshot");
 		tc.checkpoint("later", 2);
 		assert(tc.restore!int("later") == 2);
 		return Json(["content": Json.emptyArray]);
