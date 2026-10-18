@@ -2687,6 +2687,29 @@ package(mcp) void closeRawConnection(HTTPServerResponse res) @safe nothrow
 	}
 }
 
+/// The `notifications/cancelled` reason for a server->client request abandoned
+/// because the inbound request it serves was cancelled.
+package(mcp) enum cancelledOnBehalfReason = "the request it serves was cancelled";
+
+/// Fail the pending server->client request `(sessionToken, id)` with a
+/// `requestCancelled` error once `cancellation` fires (at once if it already
+/// has), so its awaiter wakes rather than waiting out the reply timeout. A
+/// request already settled is left alone. A null `cancellation` does nothing.
+package(mcp) void releaseOnCancel(StreamCoordinator coord, long id,
+		string sessionToken, CancellationToken cancellation) @safe nothrow
+{
+	if (cancellation is null)
+		return;
+	cancellation.onCancel(() @safe nothrow{
+		try
+			coord.failPending(id, new McpException(ErrorCode.requestCancelled,
+				"request cancelled"), sessionToken);
+		catch (Exception)
+		{
+		}
+	});
+}
+
 /// Whether the client behind `res` still holds its connection open.
 /// `HTTPServerResponse.connected` keeps reporting a connection the peer has
 /// closed as connected (the close is only observed by a read), so the socket is
@@ -2833,6 +2856,8 @@ final class HttpStreamContext : RequestContext, ConnectionScoped
 	private bool resumedElsewhere_;
 	private TaskMutex writeMtx_;
 	private Duration stallTimeout_ = defaultSseStallTimeout;
+	// The id of the inbound request this context serves; undefined when unknown.
+	private Json requestId_;
 
 	this(HTTPServerResponse res, StreamCoordinator coord, ClientCapabilities caps, Json progressToken,
 			TokenInfo auth = TokenInfo.invalid(),
@@ -2899,6 +2924,23 @@ final class HttpStreamContext : RequestContext, ConnectionScoped
 	void setStallTimeout(Duration timeout) @safe
 	{
 		stallTimeout_ = timeout;
+	}
+
+	/// The id of the inbound request this context serves. A server->client
+	/// request made on its behalf ends as soon as that request is cancelled.
+	void setRequestId(Json id) @safe
+	{
+		requestId_ = id;
+	}
+
+	/// The cancellation token the server registered for the inbound request,
+	/// or null when there is none.
+	private CancellationToken inboundCancellation() @safe
+	{
+		if (connState_ is null || requestId_.type == Json.Type.undefined)
+			return null;
+		auto token = McpServer.inFlightKey(token_, requestId_) in connState_.inFlight;
+		return token is null ? null : *token;
 	}
 
 	/// The globally-unique id this stream will assign to its next SSE event.
@@ -3155,6 +3197,8 @@ final class HttpStreamContext : RequestContext, ConnectionScoped
 			coord.cancel(id, token_);
 			throw internalError("client disconnected before the request could be sent");
 		}
+		auto cancellation = inboundCancellation();
+		releaseOnCancel(coord, id, token_, cancellation);
 		// Bind the awaiting fiber to the stream's liveness. The response to this
 		// server->client request arrives on a SEPARATE POST, so a dead stream would
 		// otherwise leave this fiber parked for the full timeout. A resumable stream
@@ -3180,6 +3224,18 @@ final class HttpStreamContext : RequestContext, ConnectionScoped
 				writeEvent(cancelledNotification(id, "request timed out"));
 			catch (Exception)
 			{
+			}
+			throw e;
+		}
+		catch (McpException e)
+		{
+			if (cancellation !is null && cancellation.cancelled)
+			{
+				try
+					writeEvent(cancelledNotification(id, cancelledOnBehalfReason));
+				catch (Exception)
+				{
+				}
 			}
 			throw e;
 		}
@@ -4823,6 +4879,57 @@ unittest  // a POST stream's server->client request times out after the mount's 
 	catch (RequestTimeoutException)
 		timedOut = true;
 	assert(timedOut);
+	const body_ = cast(string) sink.data.idup;
+	assert(body_.canFind(`"method":"notifications/cancelled"`), body_);
+	assert(body_.canFind(`"requestId":1`), body_);
+}
+
+unittest  // cancelling the inbound request releases its POST stream's server->client request
+{
+	import core.time : MonoTime;
+	import std.algorithm : canFind;
+	import vibe.core.core : runTask, runEventLoop, exitEventLoop, sleep;
+	import vibe.http.server : createTestHTTPServerResponse, TestHTTPResponseMode;
+	import vibe.stream.memory : createMemoryOutputStream;
+
+	auto sink = createMemoryOutputStream();
+	auto res = createTestHTTPServerResponse(sink, null, TestHTTPResponseMode.bodyOnly);
+	auto coord = new StreamCoordinator;
+	auto conn = new ConnectionState;
+	auto token = new CancellationToken;
+	conn.inFlight[McpServer.inFlightKey("sess-A", Json(7))] = token;
+	ClientCapabilities caps;
+	auto ctx = new HttpStreamContext(res, coord, caps, Json.undefined,
+			TokenInfo.invalid(), false, latestLegacy, "sess-A", conn);
+	ctx.setConnectionProbe(() @safe => true);
+	ctx.setRequestId(Json(7));
+
+	int code;
+	Duration took;
+	runTask(() nothrow{
+		scope (exit)
+			exitEventLoop();
+		const t0 = MonoTime.currTime;
+		try
+			ctx.elicitRaw(Json.emptyObject);
+		catch (McpException e)
+			code = e.code;
+		catch (Exception)
+		{
+		}
+		took = MonoTime.currTime - t0;
+	});
+	runTask(() nothrow{
+		try
+			sleep(50.msecs);
+		catch (Exception)
+		{
+		}
+		token.cancel();
+	});
+	runEventLoop();
+	assert(code == ErrorCode.requestCancelled, "the wait must end with requestCancelled");
+	assert(took < 2.seconds);
 	const body_ = cast(string) sink.data.idup;
 	assert(body_.canFind(`"method":"notifications/cancelled"`), body_);
 	assert(body_.canFind(`"requestId":1`), body_);

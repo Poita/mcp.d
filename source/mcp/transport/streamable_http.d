@@ -1201,7 +1201,9 @@ private void handleLegacyInput(McpServer server, LegacySseChannel channel,
 		channel.deliverTo(sessionId, frame);
 	}
 
-	Json serverRequest(string method, Json params) @safe
+	// Issue a server->client request on behalf of inbound request `inboundId`,
+	// which ends as soon as that request is cancelled.
+	Json serverRequest(Json inboundId, string method, Json params) @safe
 	{
 		import core.time : seconds, msecs;
 
@@ -1214,6 +1216,17 @@ private void handleLegacyInput(McpServer server, LegacySseChannel channel,
 			channel.coord.cancel(id, sessionId);
 			throw e;
 		}
+		auto token = McpServer.inFlightKey(sessionId, inboundId) in conn.inFlight;
+		auto cancellation = token is null ? null : *token;
+		releaseOnCancel(channel.coord, id, sessionId, cancellation);
+		void notifyCancelled(string reason) @safe
+		{
+			try
+				channel.deliverTo(sessionId, cancelledNotification(id, reason).toString());
+			catch (Exception)
+			{
+			}
+		}
 		// Closing the GET stream leaves nowhere for the reply to come from, so the
 		// waiter fails as soon as the stream is gone rather than at the timeout.
 		try
@@ -1222,12 +1235,13 @@ private void handleLegacyInput(McpServer server, LegacySseChannel channel,
 					channel.coord.requestTimeout, 250.msecs, sessionId);
 		catch (RequestTimeoutException e)
 		{
-			try
-				channel.deliverTo(sessionId, cancelledNotification(id,
-						"request timed out").toString());
-			catch (Exception)
-			{
-			}
+			notifyCancelled("request timed out");
+			throw e;
+		}
+		catch (McpException e)
+		{
+			if (cancellation !is null && cancellation.cancelled)
+				notifyCancelled(cancelledOnBehalfReason);
 			throw e;
 		}
 	}
@@ -1241,9 +1255,11 @@ private void handleLegacyInput(McpServer server, LegacySseChannel channel,
 			channel.coord.resolve(msg.id, msg.result, msg.error, sessionId);
 			return Nullable!Json.init;
 		}
-		auto inner = new StdioContext(&sink, StdioContextOptions(&serverRequest, conn.clientCaps,
-				extractProgressToken(msg.params), conn.negotiated,
-				server.mode == ServerMode.stateless));
+		const inboundId = msg.id;
+		auto inner = new StdioContext(&sink, StdioContextOptions((string method,
+				Json params) @safe => serverRequest(inboundId,
+				method, params), conn.clientCaps, extractProgressToken(msg.params),
+				conn.negotiated, server.mode == ServerMode.stateless));
 		return server.handle(msg, new LegacySseContext(inner, sessionId, conn, token));
 	}
 
@@ -3043,6 +3059,7 @@ private void handlePost(McpServer server, ServerPushChannel push,
 				token, isModernReq, effVersion, requestScope(cancelScope, mintedSessionId),
 				reqState, server.mode == ServerMode.stateless, reqAcceptsSse);
 		ctx.setStallTimeout(opts.streamLimits.stallTimeout);
+		ctx.setRequestId(msg.id);
 		// A session-bound 2025-11-25 stream advertises resumability with its
 		// priming event, so record its events for a GET Last-Event-ID resume.
 		if (sessions !is null && sendsPrimingEvent(effVersion))
@@ -6493,6 +6510,89 @@ unittest  // an initialize that fails header validation mints no surviving sessi
 			"a failed initialize MUST NOT stamp Mcp-Session-Id on the error response");
 }
 
+unittest  // a notifications/cancelled POST releases the elicitation its request awaits
+{
+	import core.time : MonoTime, msecs;
+	import std.algorithm : canFind;
+	import vibe.core.core : runTask, runEventLoop, exitEventLoop, sleep;
+	import vibe.http.server : createTestHTTPServerResponse, TestHTTPResponseMode;
+	import vibe.http.router : URLRouter;
+	import vibe.stream.memory : createMemoryOutputStream;
+	import mcp.protocol.types : Tool, CallToolResult;
+	import mcp.server.responses : ToolResponse;
+
+	auto server = McpServer.stateful("t", "1");
+	int code;
+	bool asked, done;
+	Tool descriptor;
+	descriptor.name = "ask";
+	server.registerTool(descriptor, (Json args, RequestContext ctx) @safe {
+		asked = true;
+		try
+			ctx.elicitRaw(Json.emptyObject);
+		catch (McpException e)
+			code = e.code;
+		done = true;
+		CallToolResult r;
+		return ToolResponse.complete(r);
+	});
+	auto router = new URLRouter;
+	mountMcp(router, server);
+
+	auto initRes = createTestHTTPServerResponse(createMemoryOutputStream(),
+			null, TestHTTPResponseMode.bodyOnly);
+	router.handleRequest(makeInitPostReq(initializeBody(),
+			["Accept": "application/json, text/event-stream"]), initRes);
+	const sid = initRes.headers.get(SessionHeader, "");
+	assert(sid.length);
+	string[string] headers = [
+		"Accept": "application/json, text/event-stream", SessionHeader: sid,
+		HttpHeader.protocolVersion: "2025-11-25"
+	];
+
+	auto sink = createMemoryOutputStream();
+	Duration took = Duration.max;
+	() @trusted {
+		runTask(() nothrow{
+			try
+			{
+				auto res = createTestHTTPServerResponse(sink, null, TestHTTPResponseMode.bodyOnly);
+				router.handleRequest(makeInitPostReq(
+					`{"jsonrpc":"2.0","id":9,"method":"tools/call",`
+					~ `"params":{"name":"ask","arguments":{}}}`, headers), res);
+			}
+			catch (Exception)
+			{
+			}
+		});
+		runTask(() nothrow{
+			scope (exit)
+				exitEventLoop();
+			try
+			{
+				const opened = MonoTime.currTime;
+				while (!asked && MonoTime.currTime - opened < 5.seconds)
+					sleep(5.msecs);
+				const t0 = MonoTime.currTime;
+				auto res = createTestHTTPServerResponse(createMemoryOutputStream(),
+					null, TestHTTPResponseMode.bodyOnly);
+				router.handleRequest(makeInitPostReq(`{"jsonrpc":"2.0","method":`
+					~ `"notifications/cancelled","params":{"requestId":9}}`, headers), res);
+				while (!done && MonoTime.currTime - t0 < 5.seconds)
+					sleep(5.msecs);
+				took = MonoTime.currTime - t0;
+			}
+			catch (Exception)
+			{
+			}
+		});
+		runEventLoop();
+	}();
+	assert(done && took < 2.seconds, "the cancellation must release the elicitation");
+	assert(code == ErrorCode.requestCancelled);
+	assert((cast(string) sink.data).canFind(`"method":"notifications/cancelled"`));
+}
+
 unittest  // an `initialize` notification without a session id is held to the session check
 {
 	import vibe.http.server : createTestHTTPServerResponse, TestHTTPResponseMode;
@@ -7643,6 +7743,48 @@ unittest  // legacy notifications/cancelled is accepted while the stream's in-fl
 		yield();
 	}
 	assert(cancelled);
+}
+
+unittest  // legacy notifications/cancelled releases the server->client request its request awaits
+{
+	import std.algorithm : canFind, any;
+	import vibe.core.core : yield;
+	import mcp.protocol.types : Tool, CallToolResult;
+	import mcp.server.responses : ToolResponse;
+
+	auto server = McpServer.stateful("t", "1");
+	int code;
+	bool done;
+	Tool descriptor;
+	descriptor.name = "ask";
+	server.registerTool(descriptor, (Json args, RequestContext ctx) @safe {
+		try
+			ctx.elicitRaw(Json.emptyObject);
+		catch (McpException e)
+			code = e.code;
+		done = true;
+		CallToolResult r;
+		return ToolResponse.complete(r);
+	});
+	auto ch = new LegacySseChannel("/message");
+	string[] frames;
+	const sid = ch.sessionIdFor(ch.addListener((string f) @safe { frames ~= f; }));
+
+	assert(dispatchLegacyPost(server, ch, sid, `{"jsonrpc":"2.0","id":3,"method":"tools/call",`
+			~ `"params":{"name":"ask","arguments":{}}}`) == LegacyPostOutcome.accepted);
+	yieldUntil(() => frames.any!(f => f.canFind("elicitation/create")));
+	assert(dispatchLegacyPost(server, ch, sid,
+			`{"jsonrpc":"2.0","method":"notifications/cancelled",` ~ `"params":{"requestId":3}}`)
+			== LegacyPostOutcome.accepted);
+	foreach (_; 0 .. 4096)
+	{
+		if (done)
+			break;
+		yield();
+	}
+	assert(done, "cancelling the request must release its elicitation");
+	assert(code == ErrorCode.requestCancelled);
+	assert(frames.any!(f => f.canFind(`"method":"notifications/cancelled"`)));
 }
 
 unittest  // legacy notification POSTs wait for a slot rather than each parking a task
