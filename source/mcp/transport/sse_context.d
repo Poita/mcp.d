@@ -2981,7 +2981,11 @@ final class HttpStreamContext : RequestContext, ConnectionScoped
 				resumedElsewhere_ = resumedElsewhere_ || ev.forwarded;
 			}
 			else
-				frame = formatSseEvent(nextEventId(), msg);
+			{
+				// Without a replay channel the stream cannot be resumed, so its
+				// events carry no ids to resume from.
+				frame = formatSseEvent("", msg);
+			}
 			eventSeq++;
 			if (!resumedElsewhere_)
 				writeFrame(frame);
@@ -3350,6 +3354,22 @@ unittest  // formatSseEvent omits the id: line when id is empty
 	import std.string : startsWith;
 
 	assert(frame.startsWith("data: "));
+}
+
+unittest  // a POST stream without a replay channel frames its events without an id: line
+{
+	import std.algorithm : canFind;
+	import vibe.http.server : createTestHTTPServerResponse, TestHTTPResponseMode;
+	import vibe.stream.memory : createMemoryOutputStream;
+
+	auto sink = createMemoryOutputStream();
+	auto res = createTestHTTPServerResponse(sink, null, TestHTTPResponseMode.bodyOnly);
+	ClientCapabilities caps;
+	auto ctx = new HttpStreamContext(res, new StreamCoordinator, caps, Json.undefined);
+	ctx.log("info", Json("hello"));
+	const body_ = cast(string) sink.data.idup;
+	assert(body_.canFind("data: "), body_);
+	assert(!body_.canFind("id: "), body_);
 }
 
 unittest  // each stream gets a distinct ordinal, so event ids are globally unique
@@ -4432,7 +4452,7 @@ unittest  // concurrent writes on one POST stream never interleave their frames
 	{
 		import std.algorithm : startsWith, count;
 
-		assert(f.startsWith("id: "), f);
+		assert(f.startsWith("data: "), f);
 		assert(f.count("data: ") == 1, f);
 	}
 }
