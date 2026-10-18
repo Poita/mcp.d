@@ -404,9 +404,11 @@ struct EventsOptions
 	Duration deliveryLease = 1.minutes;
 	size_t deliveryLeaseBatch = 100; /// most jobs one drain claims from the queue, leaving the rest to other nodes and later passes (0 = unlimited)
 	size_t webhookMaxConcurrency = 64; /// most outbound webhook tasks (delivery runs and terminated-envelope posts) one node runs at once (0 = unlimited)
+	size_t webhookMaxConcurrentFetches = 16; /// most poll-driven webhook fetch tasks (check functions run for subscriptions) one node runs at once (0 = unlimited)
 	Duration webhookHttpTimeout = 10.seconds; /// per-attempt HTTP bound (default transport); also sets the `deliveryLease` floor
 	WebhookTransport webhookTransport; /// outbound HTTP (default SSRF-hardened); tests inject a fake
 	void delegate(void delegate() @safe job) @safe deliveryExecutor; /// runs a delivery (default: a fiber)
+	void delegate(void delegate() @safe job) @safe fetchExecutor; /// runs a poll-driven webhook fetch task (default: a fiber; inline outside any task)
 	void delegate(void delegate() @safe job) @safe pushExecutor; /// runs a push stream's writer (default: a fiber)
 	size_t pushMaxQueuedEvents = 1000; /// events a push stream may fall behind before it is terminated as a slow consumer (0 = unlimited)
 	V1aSigner v1aSigner; /// optional asymmetric (`v1a,`) signer; auto-wired from `webhookSigningKey`
@@ -706,6 +708,7 @@ final class EventsRuntime
 	private TerminatePost[] terminatePosts_; // terminated envelopes waiting for a poster
 	private string[string] coalescedMisses_; // subscription id -> furthest position missed while suspended, not yet in the store
 	private size_t terminatePosters_; // tasks posting terminated envelopes
+	private bool[string] fetching_; // subscription ids with a poll-driven fetch task in progress
 
 	this(WebhookSubscriptionStore webhookStore = null, EventsOptions opts = EventsOptions.init) @safe
 	{
@@ -735,6 +738,24 @@ final class EventsRuntime
 					job();
 				catch (Exception e)
 					logEventsError("delivery task threw", e);
+			});
+		};
+		if (opts_.fetchExecutor is null)
+			opts_.fetchExecutor = (void delegate() @safe job) @safe {
+			import vibe.core.core : runTask;
+			import vibe.core.task : Task;
+
+			// Outside any task there is no scheduler to hand the fetch to.
+			if (Task.getThis() == Task.init)
+			{
+				job();
+				return;
+			}
+			runTask(() nothrow @safe {
+				try
+					job();
+				catch (Exception e)
+					logEventsError("webhook fetch task threw", e);
 			});
 		};
 		if (opts_.pushExecutor is null)
@@ -1902,18 +1923,22 @@ final class EventsRuntime
 	}
 
 	/// The poll-driven webhook pass: for every live subscription to a check-backed
-	/// type whose cadence has come round, run the check function from the
-	/// subscription's fetch position and enqueue what it returns, fetching again
-	/// while the check reports more. A quiet fetch with nothing in flight advances
-	/// the watermark (so the client's cursor moves during quiet periods); a fetch
-	/// that reports `truncated` queues a `gap` envelope. Emit-only types are not
-	/// polled — `emit` routes them live.
+	/// type whose cadence has come round, start a task on `fetchExecutor` that runs the check function from the subscription's fetch position and
+	/// enqueues what it returns, fetching again while the check reports more. At
+	/// most `webhookMaxConcurrentFetches` such tasks run at once, one per
+	/// subscription; a subscription left over is fetched by a later pass. A slow
+	/// upstream thus holds up only its own subscriptions, never the pass. A quiet
+	/// fetch with nothing in flight advances the watermark (so the client's cursor
+	/// moves during quiet periods); a fetch that reports `truncated` queues a
+	/// `gap` envelope. Emit-only types are not polled — `emit` routes them live.
 	void pollWebhookSubscriptions() @safe
 	{
 		if (!opts_.webhookEnabled)
 			return;
 		const now = opts_.nowMs();
-		bool any = pageEmitBackfills(now);
+		if (pageEmitBackfills(now))
+			kickDrain();
+		const cap = opts_.webhookMaxConcurrentFetches;
 		string[] checkBacked;
 		foreach (name; types_.byKey)
 			if (!regIsEmitOnly(name in types_) && offersWebhook(name))
@@ -1921,7 +1946,9 @@ final class EventsRuntime
 		foreach (name; checkBacked)
 			foreach (sub; webhookStore_.byName(name))
 			{
-				if (sub.isExpired(now) || !sub.active)
+				if (cap > 0 && fetching_.length >= cap)
+					return;
+				if (sub.isExpired(now) || !sub.active || (sub.id in fetching_) !is null)
 					continue;
 				auto reg = sub.name in types_;
 				if (regIsEmitOnly(reg))
@@ -1930,16 +1957,37 @@ final class EventsRuntime
 					if (now < *next)
 						continue;
 				nextFetchAt_[sub.id] = now + nextPollMsFor(*reg);
+				fetching_[sub.id] = true;
+				scope (failure)
+					fetching_.remove(sub.id);
+				opts_.fetchExecutor(fetchTask(sub));
+			}
+	}
+
+	// A delegate fetching `sub`'s due batches (see `pollWebhookSubscriptions`).
+	// Built by a call so each task closes over its own subscription.
+	private void delegate() @safe fetchTask(WebhookSubscription sub) @safe
+	{
+		return () @safe {
+			bool any;
+			{
+				scope (exit)
+					fetching_.remove(sub.id);
 				foreach (_; 0 .. maxWebhookFetchesPerPass)
 				{
+					// Each fetch can yield, so the registration is looked up afresh.
+					auto reg = sub.name in types_;
+					if (regIsEmitOnly(reg) || !offersWebhook(sub.name))
+						break;
 					bool more;
 					any |= fetchForWebhook(sub, reg, more);
 					if (!more)
 						break;
 				}
 			}
-		if (any)
-			kickDrain();
+			if (any)
+				kickDrain();
+		};
 	}
 
 	// Page the emit-only backfills still catching up: read each from the ring
@@ -6685,6 +6733,90 @@ unittest  // jobs queued behind slow successful deliveries keep their lease
 	}
 	assert(posts >= 2);
 	assert(stolen == 0, "a queued job's lease lapsed while it waited");
+}
+
+unittest  // a worker pass hands poll-driven fetches to tasks, so a slow check holds up neither it nor other fetches
+{
+	import core.time : MonoTime;
+	import vibe.core.core : runTask, exitEventLoop, runEventLoop, sleep;
+
+	EventsOptions o;
+	o.nowMs = () @safe => 1_000_000L;
+	o.nowIso = () @safe => "t";
+	o.allowPrivateCallbackHosts = true;
+	o.webhookTransport = new FakeWebhookTransport();
+	auto rt = new EventsRuntime(null, o);
+	int inCheck, maxInCheck;
+	EventRegistration reg;
+	reg.descriptor.name = "m";
+	reg.check = (EventContext ctx) @safe {
+		if (ctx.cursor.isNull)
+			return EventResult.empty("c0");
+		inCheck++;
+		maxInCheck = max(maxInCheck, inCheck);
+		scope (exit)
+			inCheck--;
+		sleep(50.msecs); // a slow upstream
+		return EventResult.empty("c0");
+	};
+	rt.register(reg);
+	rt.subscribeWebhook(webhookSub("m", "https://proxy/a"), "user-1");
+	rt.subscribeWebhook(webhookSub("m", "https://proxy/b"), "user-1");
+	Duration passTook;
+	runTask(() nothrow @safe {
+		try
+		{
+			const start = MonoTime.currTime;
+			rt.tick();
+			passTook = MonoTime.currTime - start;
+			sleep(200.msecs);
+		}
+		catch (Exception)
+		{
+		}
+		exitEventLoop();
+	});
+	runEventLoop();
+	assert(passTook < 40.msecs, "the worker pass waited on a check");
+	assert(maxInCheck == 2, "the two subscriptions' checks did not overlap");
+}
+
+unittest  // poll-driven fetches run at most webhookMaxConcurrentFetches at a time
+{
+	auto ft = new FakeWebhookTransport();
+	void delegate() @safe[] tasks;
+	EventsOptions o;
+	o.nowMs = () @safe => 1_000_000L;
+	o.nowIso = () @safe => "t";
+	o.allowPrivateCallbackHosts = true;
+	o.webhookTransport = ft;
+	o.webhookMaxConcurrentFetches = 2;
+	o.deliveryExecutor = (void delegate() @safe job) @safe { job(); };
+	o.fetchExecutor = (void delegate() @safe job) @safe { tasks ~= job; };
+	auto rt = new EventsRuntime(null, o);
+	int checks;
+	EventRegistration reg;
+	reg.descriptor.name = "m";
+	reg.check = (EventContext ctx) @safe {
+		if (!ctx.cursor.isNull)
+			checks++;
+		return EventResult.empty("c0");
+	};
+	rt.register(reg);
+	foreach (i; 0 .. 3)
+		rt.subscribeWebhook(webhookSub("m", "https://proxy/h" ~ i.to!string), "user-1");
+	rt.pollWebhookSubscriptions();
+	assert(tasks.length == 2);
+	rt.pollWebhookSubscriptions(); // the third waits for a free task
+	assert(tasks.length == 2);
+	foreach (t; tasks)
+		t();
+	assert(checks == 2);
+	tasks = null;
+	rt.pollWebhookSubscriptions();
+	assert(tasks.length == 1);
+	tasks[0]();
+	assert(checks == 3);
 }
 
 unittest  // restarting the delivery worker stops the loop it replaces
