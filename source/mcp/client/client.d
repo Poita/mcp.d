@@ -2949,6 +2949,8 @@ final class McpClient : ClientProtocol
 	/// `io.modelcontextprotocol/events` in the `extensions` map.
 	bool eventsSupported() @safe
 	{
+		if (!useModern)
+			return false;
 		auto ext = serverCapabilities_.extensions;
 		return ext.type == Json.Type.object && (eventsExtensionKey in ext) !is null;
 	}
@@ -10845,6 +10847,17 @@ unittest  // the poll loop delivers a redelivered eventId only once
 		got++;
 	}, null);
 	assert(polls == 2 && got == 1);
+}
+
+unittest  // eventsSupported is false on a legacy session even when the extension is advertised
+{
+	auto c = new McpClient(new RecordingClientTransport());
+	Json ext = Json.emptyObject;
+	ext[eventsExtensionKey] = Json.emptyObject;
+	c.serverCapabilities_.extensions = ext;
+	assert(!c.eventsSupported(), "events are modern-only");
+	c.enableModern();
+	assert(c.eventsSupported());
 }
 
 unittest  // selectDeliveryMode prefers webhook, then push, then poll among advertised modes
