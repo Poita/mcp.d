@@ -1905,11 +1905,15 @@ final class HttpClientTransport : ClientTransport
 	/// Open the standalone server->client SSE stream (`GET /mcp`) in a background
 	/// task, so the server can deliver sampling / elicitation / roots requests
 	/// and notifications outside of any POST response. A server that does not
-	/// offer this stream (e.g. responds 405) is tolerated as a no-op.
+	/// offer this stream (e.g. responds 405) is tolerated as a no-op. On the
+	/// legacy HTTP+SSE transport the session's GET stream already carries these
+	/// messages, and a second GET would open a second session, so this is a no-op.
 	void startServerStream() @safe
 	{
 		import vibe.core.core : runTask;
 
+		if (legacyMode)
+			return;
 		// Idempotent: a reader task is already live, so a second start would spawn a
 		// duplicate standalone stream and orphan the first reader. Set the flag here,
 		// before `runTask` yields, so a re-entrant call observes it.
@@ -3742,6 +3746,14 @@ unittest  // startServerStream() is idempotent: a second call while a reader is 
 	const before = t.serverStreamSlots.length;
 	t.startServerStream();
 	assert(t.serverStreamSlots.length == before);
+}
+
+unittest  // startServerStream() is a no-op on the legacy HTTP+SSE transport, whose GET stream is already open
+{
+	auto t = new HttpClientTransport("http://host:8080/mcp");
+	t.legacyMode = true;
+	t.startServerStream();
+	assert(!t.serverStreamAlive, "a legacy session must not open a second GET stream");
 }
 
 unittest  // close() force-closes every registered server-stream socket slot
