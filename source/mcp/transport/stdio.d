@@ -37,7 +37,8 @@ private __gshared bool _ranStdio;
 ///     emits (`notifications/message`, `notifications/progress`) and the request's
 ///     reply are written through `channel.send` (serialized against other
 ///     writers). At most `opts.maxInFlight` requests and batches run at once;
-///     further ones wait for a slot, and the read loop keeps reading meanwhile;
+///     further ones wait for a slot, and the read loop keeps reading meanwhile.
+///     `ping` and `initialize` are answered without waiting for a slot;
 ///   - a *notification* (e.g. `notifications/cancelled`, `notifications/initialized`)
 ///     is handled inline; an inbound `notifications/cancelled` flips the matching
 ///     in-flight request's `CancellationToken` concurrently with its running
@@ -206,6 +207,29 @@ void serveStdio(McpServer server, string delegate() @safe readLine,
 		return false;
 	}
 
+	// `ping` and `initialize` are answered at once without blocking, so they do
+	// not wait behind long-running handlers: a host's keep-alive ping is answered
+	// however busy the server is. They have a budget of their own, `maxInFlight`
+	// at once, past which they are admitted like any other request.
+	size_t controlRunning;
+
+	bool runAsControl(Message m) @safe
+	{
+		if (m.method != "ping" && m.method != "initialize")
+			return false;
+		if (opts.maxInFlight != 0 && controlRunning >= opts.maxInFlight)
+			return false;
+		++controlRunning;
+		inflight.start();
+		scope (exit)
+		{
+			--controlRunning;
+			inflight.finish();
+		}
+		runAdmitted(Admitted(m));
+		return true;
+	}
+
 	// Run `first`, then whatever the backlog holds, on the current task. The
 	// caller holds one slot (see `admit`), released on return.
 	void runSlot(Admitted first) @safe nothrow
@@ -268,6 +292,8 @@ void serveStdio(McpServer server, string delegate() @safe readLine,
 			// long-running handler (server->client request, cancellation poll loop)
 			// does not stall the read loop. The handler's notifications + reply ride
 			// `channel.send`.
+			if (runAsControl(m))
+				return;
 			if (admit(Admitted(m)))
 				runSlot(Admitted(m));
 			break;
@@ -501,6 +527,8 @@ struct StdioOptions
 	/// so a client cannot spawn handler tasks without bound. Up to this many more
 	/// wait, in arrival order, for a running one to finish; a request arriving
 	/// while that queue is full is answered with a -32603 "server busy" error.
+	/// `ping` and `initialize` do not take a slot: up to this many of them are
+	/// answered at once whatever else is running.
 	/// stdin is always read, so replies to server->client requests,
 	/// `notifications/cancelled` (which also withdraws a queued request) and
 	/// end-of-input are seen however many handlers run. Notifications are not
@@ -3412,6 +3440,43 @@ unittest  // serveStdio runs at most maxInFlight requests, queues as many more a
 	assert(link.outbound.length == 5, "every queued request is answered once slots free");
 }
 
+unittest  // ping and initialize are answered while maxInFlight handlers run
+{
+	auto s = McpServer.stateful("inflight-ping", "1.0");
+	bool release;
+	Tool slow = {name: "slow"};
+	s.registerTool(slow, (Json args, RequestContext ctx) @safe {
+		while (!release)
+			yield();
+		return CallToolResult.init;
+	});
+
+	StdioOptions opts;
+	opts.maxInFlight = 1;
+	string[] repliedWhileBlocked;
+	withServer(s, (ServerLink link) @safe {
+		link.feed(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"slow"}}`);
+		link.feed(`{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"slow"}}`);
+		link.feed(`{"jsonrpc":"2.0","id":3,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"t","version":"1"}}}`);
+		link.feed(`{"jsonrpc":"2.0","id":4,"method":"ping"}`);
+		foreach (_; 0 .. 32)
+			yield();
+		repliedWhileBlocked = link.outbound.dup;
+		release = true;
+		foreach (_; 0 .. 32)
+			yield();
+	}, opts);
+	Json[] ids;
+	foreach (o; repliedWhileBlocked)
+	{
+		auto j = parseJsonString(o);
+		assert("result" in j, o);
+		ids ~= j["id"];
+	}
+	assert(ids == [Json(3), Json(4)],
+			"initialize and ping neither wait for a slot nor are refused as busy");
+}
+
 unittest  // notifications/cancelled withdraws a request still waiting for an in-flight slot
 {
 	auto s = McpServer.stateless("inflight-withdraw", "1.0");
@@ -3428,7 +3493,7 @@ unittest  // notifications/cancelled withdraws a request still waiting for an in
 	string[] outputs;
 	withServer(s, (ServerLink link) @safe {
 		link.feed(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"slow"}}`);
-		link.feed(`{"jsonrpc":"2.0","id":2,"method":"ping"}`);
+		link.feed(`{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"slow"}}`);
 		link.feed(`{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":2}}`);
 		foreach (_; 0 .. 32)
 			yield();
