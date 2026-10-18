@@ -26,7 +26,8 @@ import mcp.protocol.jsonhelpers : asciiEqualsIgnoreCase;
 // `SsrfPolicy.blockInternal` rejects loopback/private/link-local hosts and is
 // used for every URL an untrusted party names. `SsrfPolicy.allowLoopback` adds
 // a plain-http allowance for explicit loopback hosts, for URLs the operator or
-// user configured (local development). `SsrfPolicy.allowUserConfigured`
+// user configured (local development), and `SsrfPolicy.allowLoopbackTls` also
+// permits them over https. `SsrfPolicy.allowUserConfigured`
 // resolves and pins the address for stability but permits internal/loopback
 // targets, for the user-chosen client transport endpoint.
 // ===========================================================================
@@ -60,6 +61,11 @@ enum SsrfPolicy
 	/// or user configured (JWKS, introspection, upstream OAuth endpoints) or that
 	/// a user-configured loopback MCP endpoint names.
 	allowLoopback,
+	/// As `allowLoopback`, and an explicit loopback host is also permitted over
+	/// `https`. Used for URLs that a user-configured `https` loopback MCP
+	/// endpoint names: that endpoint is itself a local TLS service, so loopback
+	/// over TLS opens nothing the user did not already point the client at.
+	allowLoopbackTls,
 	/// Resolve and pin the address (TOCTOU-stable) but do NOT reject internal or
 	/// loopback targets. Used for the user-chosen MCP client transport endpoint.
 	allowUserConfigured,
@@ -889,7 +895,8 @@ struct PinnedConnect
 /// the dev-loopback allowance; loopback over TLS and a registered name that
 /// DNS-resolves to loopback are rejected (`classifyHost` demotes resolved
 /// loopback to private). A caller that must reach a loopback TLS service uses
-/// `allowUserConfigured`.
+/// `allowLoopbackTls` or `allowUserConfigured`.
+/// `allowLoopbackTls`: as `allowLoopback`, with explicit loopback also over TLS.
 /// `allowUserConfigured`: every classifiable host passes (loopback and private
 /// included); only a fail-closed classification (unresolvable / malformed)
 /// is rejected.
@@ -921,6 +928,11 @@ PinnedConnect pinnedConnectAddress(string host, bool tls, SsrfPolicy policy) @sa
 		if (cls == AddressClass.loopback && !tls)
 			break;
 		return r; // loopback over TLS, private/link-local -> reject
+	case SsrfPolicy.allowLoopbackTls:
+		if (cls == AddressClass.public_
+				|| cls == AddressClass.loopback)
+			break;
+		return r; // private/link-local -> reject
 	case SsrfPolicy.allowUserConfigured:
 		break; // any classifiable host is permitted
 	}
@@ -1139,7 +1151,7 @@ private void fetchPinned(string url, SsrfPolicy policy,
 	if (policy == SsrfPolicy.blockInternal && !isHttps)
 		throw invalidRequest(
 				"Refusing to fetch insecure URL (must be https to a public host): " ~ redactUrl(url));
-	if (policy == SsrfPolicy.allowLoopback)
+	if (policy == SsrfPolicy.allowLoopback || policy == SsrfPolicy.allowLoopbackTls)
 	{
 		// The lexical class (no DNS) decides the scheme; the resolved-address
 		// verdict comes from pinnedConnectAddress below.
@@ -1746,6 +1758,16 @@ unittest  // allowLoopback still rejects loopback over https and private/link-lo
 	assert(!pinnedConnectAddress("10.0.0.5", false, SsrfPolicy.allowLoopback).ok);
 	assert(!pinnedConnectAddress("169.254.169.254", true, SsrfPolicy.allowLoopback).ok);
 	assert(pinnedConnectAddress("8.8.8.8", true, SsrfPolicy.allowLoopback).ok);
+}
+
+unittest  // allowLoopbackTls permits loopback over https and http but rejects private/link-local hosts
+{
+	assert(pinnedConnectAddress("127.0.0.1", true, SsrfPolicy.allowLoopbackTls).ok);
+	assert(pinnedConnectAddress("localhost:8443", true, SsrfPolicy.allowLoopbackTls).ok);
+	assert(pinnedConnectAddress("[::1]", false, SsrfPolicy.allowLoopbackTls).ok);
+	assert(!pinnedConnectAddress("10.0.0.5", true, SsrfPolicy.allowLoopbackTls).ok);
+	assert(!pinnedConnectAddress("169.254.169.254", false, SsrfPolicy.allowLoopbackTls).ok);
+	assert(pinnedConnectAddress("8.8.8.8", true, SsrfPolicy.allowLoopbackTls).ok);
 }
 
 unittest  // allowLoopback refuses plain http to anything but an explicit loopback host

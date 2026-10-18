@@ -1038,7 +1038,8 @@ private bool isScheme(string scheme, string want) @safe pure nothrow @nogc
 
 /// The lexical (no DNS) scheme/host gate of `policy`: `https` to a host that is
 /// not a private/link-local literal (`blockInternal` also rejects loopback),
-/// plus plain `http` to an explicit loopback host under `allowLoopback`, and
+/// plus plain `http` to an explicit loopback host under `allowLoopback` and
+/// `allowLoopbackTls`, and
 /// either scheme to any host under `allowUserConfigured`.
 private bool passesLexicalGate(string scheme, string host, SsrfPolicy policy) @safe
 {
@@ -1052,6 +1053,7 @@ private bool passesLexicalGate(string scheme, string host, SsrfPolicy policy) @s
 	case SsrfPolicy.blockInternal:
 		return https && cls == AddressClass.public_;
 	case SsrfPolicy.allowLoopback:
+	case SsrfPolicy.allowLoopbackTls:
 		if (cls == AddressClass.privateOrLinkLocal)
 			return false;
 		return https || (http && cls == AddressClass.loopback);

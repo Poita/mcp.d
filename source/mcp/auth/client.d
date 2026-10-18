@@ -142,16 +142,17 @@ final class OAuthClient
 	/// The SSRF policy for every URL this client fetches or validates during
 	/// discovery, registration and the token flows. When null, the policy is
 	/// anchored at the MCP endpoint: `allowLoopback` when that endpoint is on
-	/// an explicit loopback host, else `blockInternal`. Set it to reach an
+	/// an explicit loopback host (`allowLoopbackTls` when it is also `https`),
+	/// else `blockInternal`. Set it to reach an
 	/// authorization server on a private network (`allowUserConfigured`), or to
 	/// forbid loopback even for a loopback endpoint (`blockInternal`).
 	Nullable!SsrfPolicy ssrfPolicy;
 
 	/// The SSRF policy for a URL the MCP server or its authorization server
 	/// names (discovered metadata, token, registration and authorization
-	/// endpoints). Unless `ssrfPolicy` is set, plain-http loopback is permitted
-	/// only when the MCP endpoint the user configured (`resource`) is itself on
-	/// loopback, so a remote server can never steer the client — and its codes,
+	/// endpoints). Unless `ssrfPolicy` is set, loopback is permitted only when
+	/// the MCP endpoint the user configured (`resource`) is itself on loopback
+	/// (over TLS only when that endpoint is `https`), so a remote server can never steer the client — and its codes,
 	/// tokens and secrets — to a local service.
 	private SsrfPolicy namedUrlPolicy() const @safe
 	{
@@ -159,8 +160,8 @@ final class OAuthClient
 	}
 
 	/// `ssrfPolicy` when set; otherwise `allowLoopback` when `userUrl` (a URL
-	/// the user configured) targets an explicit loopback host, else
-	/// `blockInternal`.
+	/// the user configured) targets an explicit loopback host over `http`,
+	/// `allowLoopbackTls` when over `https`, else `blockInternal`.
 	private SsrfPolicy policyAnchoredAt(string userUrl) const @safe
 	{
 		import mcp.protocol.ssrf : AddressClass, classifyHostLexical;
@@ -170,8 +171,10 @@ final class OAuthClient
 			return ssrfPolicy.get;
 		try
 		{
-			if (classifyHostLexical(URL(userUrl).host) == AddressClass.loopback)
-				return SsrfPolicy.allowLoopback;
+			const url = URL(userUrl);
+			if (classifyHostLexical(url.host) == AddressClass.loopback)
+				return url.schema == "https" ? SsrfPolicy.allowLoopbackTls
+					: SsrfPolicy.allowLoopback;
 		}
 		catch (Exception)
 		{
@@ -1833,6 +1836,28 @@ unittest  // prmResourceMatches accepts the endpoint itself or a path prefix of 
 	assert(prmResourceMatches("https://mcp.example.com/", "https://mcp.example.com/mcp"));
 	assert(prmResourceMatches("https://mcp.example.com/tenant",
 			"https://mcp.example.com/tenant/mcp"));
+}
+
+unittest  // an https loopback MCP endpoint may reach loopback over TLS, but still not private hosts
+{
+	import mcp.protocol.ssrf : pinnedConnectAddress;
+
+	auto c = new OAuthClient();
+	c.resource = "https://localhost:8443/mcp";
+	const policy = c.namedUrlPolicy();
+	assert(pinnedConnectAddress("localhost:8443", true, policy).ok);
+	assert(pinnedConnectAddress("127.0.0.1:9000", true, policy).ok);
+	assert(pinnedConnectAddress("127.0.0.1:9000", false, policy).ok);
+	assert(!pinnedConnectAddress("10.0.0.5", true, policy).ok);
+}
+
+unittest  // a plain-http loopback MCP endpoint does not open loopback TLS services
+{
+	import mcp.protocol.ssrf : pinnedConnectAddress;
+
+	auto c = new OAuthClient();
+	c.resource = "http://localhost:8080/mcp";
+	assert(!pinnedConnectAddress("127.0.0.1:9000", true, c.namedUrlPolicy()).ok);
 }
 
 unittest  // prmResourceMatches matches an endpoint carrying a query by its path
