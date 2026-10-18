@@ -966,7 +966,9 @@ incidents.publish(Incident("INC-1", "P1"));   // fans out to streams/poll + the 
 registries (stream/poll are always node-local; webhook is as wide as the
 `WebhookSubscriptionStore`). Poll sees published events only on a type without a
 fetch handler: once `onFetch` is set, poll reads from the handler, so `publish`
-reaches live streams and webhook subscribers but never a poller. The handle also carries typed `onSubscribe`/`onUnsubscribe`
+reaches live streams and webhook subscribers but never a poller. A type's `match`
+and `transform` shape every event a subscription receives, published or fetched,
+on every delivery mode. The handle also carries typed `onSubscribe`/`onUnsubscribe`
 lifecycle hooks (start an author-owned live source task in `onSubscribe` that
 `publish`es, and stop it in `onUnsubscribe`) and `pollInterval`. A poller's lease
 lasts `EventsOptions.pollLeaseTtl` or two poll intervals, whichever is longer, so

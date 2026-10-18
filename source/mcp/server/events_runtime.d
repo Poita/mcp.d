@@ -42,12 +42,14 @@ private enum long secretRotationGraceMs = 5 * 60 * 1000;
 /// function backing poll (and poll-driven push) for an event type.
 alias EventCheck = EventResult delegate(EventContext ctx) @safe;
 
-/// Broadcast-emit filter: whether a subscription (its arguments carried by `ctx`)
-/// receives `ev`. Absent => every subscription for the event name receives it.
+/// Per-subscription filter: whether a subscription (its arguments carried by
+/// `ctx`) receives `ev`, applied to emitted and fetched events alike on every
+/// delivery mode. Absent => every subscription for the event name receives it.
 alias EventMatch = bool delegate(EventContext ctx, EventOccurrence ev) @safe;
 
-/// Broadcast-emit transform: shape `ev` for a subscription (e.g. redact per its
-/// arguments). Absent => the event is delivered as emitted.
+/// Per-subscription transform: shape `ev` for a subscription (e.g. redact per
+/// its arguments), applied wherever `EventMatch` is. Absent => the event is
+/// delivered as emitted or fetched.
 alias EventTransform = EventOccurrence delegate(EventContext ctx, EventOccurrence ev) @safe;
 
 /// Subscription lifecycle hook (subscribe/unsubscribe), invoked across all
@@ -55,14 +57,14 @@ alias EventTransform = EventOccurrence delegate(EventContext ctx, EventOccurrenc
 alias EventLifecycle = void delegate(EventContext ctx, string subscriptionId) @safe;
 
 /// One registered event type: its declared descriptor plus the author's check
-/// function, optional broadcast `match`/`transform` shaping, and lifecycle hooks.
+/// function, optional per-subscription `match`/`transform` shaping, and lifecycle hooks.
 /// `emitOnly` types have no check function — poll is served from the ring buffer.
 struct EventRegistration
 {
 	EventType descriptor; /// name/description/inputSchema/payloadSchema/_meta (delivery is computed)
 	EventCheck check; /// null for emit-only
-	EventMatch match; /// optional broadcast filter
-	EventTransform transform; /// optional broadcast payload shaper
+	EventMatch match; /// optional per-subscription filter
+	EventTransform transform; /// optional per-subscription payload shaper
 	EventLifecycle onSubscribe; /// optional upstream setup
 	EventLifecycle onUnsubscribe; /// optional upstream teardown
 	bool emitOnly; /// true => no check function; poll reads the ring buffer
@@ -1175,7 +1177,7 @@ final class EventsRuntime
 		{
 			auto er = runCheck(p, ctx);
 			capBatch(er, maxEvents);
-			out_.events = er.events;
+			out_.events = applyShaping(p, ctx, er.events);
 			out_.cursor = er.cursor;
 			out_.truncated = er.truncated;
 			out_.hasMore = er.hasMore;
@@ -1885,7 +1887,7 @@ final class EventsRuntime
 		sub = committed;
 		bool any;
 		foreach (occ; er.events)
-			any |= enqueueForWebhook(sub, reg, occ, regIsEmitOnly(reg));
+			any |= enqueueForWebhook(sub, reg, occ);
 		if (any)
 			kickDrain();
 		return er.truncated;
@@ -1966,7 +1968,7 @@ final class EventsRuntime
 				else
 					emitBackfill_.remove(id);
 				foreach (occ; er.events)
-					any |= enqueueForWebhook(sub, reg, occ, true);
+					any |= enqueueForWebhook(sub, reg, occ);
 				if (er.truncated)
 					any |= enqueueGap(sub, er.cursor);
 				if (!er.hasMore)
@@ -2024,7 +2026,7 @@ final class EventsRuntime
 			return false;
 		bool any;
 		foreach (occ; er.events)
-			any |= enqueueForWebhook(cur, reg, occ, false);
+			any |= enqueueForWebhook(cur, reg, occ);
 		// The gap is queued behind the batch, so the watermark reaches its
 		// position only after the batch settles and the endpoint is verified.
 		if (gap)
@@ -2052,27 +2054,23 @@ final class EventsRuntime
 	}
 
 	// Enqueue one delivery of `occ` for `sub`, applying the type's `match`/
-	// `transform` when `shape` is set (broadcast emits; a check function has
-	// already applied the subscription's arguments), and tracking the position for
-	// the watermark. Returns false when the filter dropped the event.
+	// `transform` for the subscription, and tracking the position for the
+	// watermark. Returns false when the filter dropped the event.
 	private bool enqueueForWebhook(WebhookSubscription sub,
-			EventRegistration* reg, EventOccurrence occ, bool shape) @safe
+			EventRegistration* reg, EventOccurrence occ) @safe
 	{
 		EventOccurrence shaped = occ;
-		if (shape)
+		// A throwing author callback costs only this subscription this event.
+		auto ctx = new EventContext(sub.cursor, sub.arguments, sub.principal);
+		try
 		{
-			// A throwing author callback costs only this subscription this event.
-			auto ctx = new EventContext(sub.cursor, sub.arguments, sub.principal);
-			try
-			{
-				if (!shapeFor(reg, ctx, shaped))
-					return false;
-			}
-			catch (Exception e)
-			{
-				logEventsError("match/transform threw", e);
+			if (!shapeFor(reg, ctx, shaped))
 				return false;
-			}
+		}
+		catch (Exception e)
+		{
+			logEventsError("match/transform threw", e);
+			return false;
 		}
 		// Past the per-subscription bound the event is dropped rather than queued
 		// behind a backlog the endpoint is not draining; a gap covers it later.
@@ -2488,7 +2486,7 @@ final class EventsRuntime
 			// A backfill still paging reaches this event in the ring buffer.
 			if ((sub.id in emitBackfill_) !is null)
 				continue;
-			any |= enqueueForWebhook(sub, reg, occ, true);
+			any |= enqueueForWebhook(sub, reg, occ);
 		}
 		// Kick a drain on this node so the just-enqueued jobs deliver promptly
 		// (workers on other nodes also lease from a shared queue independently).
@@ -5840,6 +5838,63 @@ unittest  // typed onFetch backs events/poll with strongly-typed events
 	assert(next.events[0].eventId.length > 0); // stamped
 }
 
+version (unittest)
+{
+	// An onFetch-backed type that returns one P1 and one P2 incident after its
+	// bootstrap, with a `match` keeping the subscription's severity and a
+	// `transform` redacting the id.
+	private EventHandle!(DemoArgs, DemoPayload) shapedFetchType(EventsRuntime rt) @safe
+	{
+		return rt.define!(DemoArgs, DemoPayload)("incident.created")
+			.onFetch(delegate(DemoArgs args, scope FetchContext ctx) @safe {
+				if (ctx.isBootstrap)
+					return EventBatch!DemoPayload.empty("c0");
+				if (ctx.cursor.get != "c0")
+					return EventBatch!DemoPayload.empty("c2");
+				return EventBatch!DemoPayload.of([
+					Event!DemoPayload(DemoPayload("INC-1", "P1"), "c1"),
+					Event!DemoPayload(DemoPayload("INC-2", "P2"), "c2")
+				], "c2");
+			}).match(delegate(DemoArgs a, DemoPayload p) @safe => p.severity == a.severity)
+			.transform(delegate(DemoArgs a, DemoPayload p) @safe {
+				EventOccurrence o;
+				o.data = Json([
+					"id": Json("redacted"),
+					"severity": Json(p.severity)
+				]);
+				return o;
+			});
+	}
+}
+
+unittest  // events/poll applies match and transform to an onFetch type's events
+{
+	auto rt = testRuntime();
+	shapedFetchType(rt);
+	auto r = rt.poll("incident.created", Json(["severity": Json("P1")]), "",
+			nullable("c0"), Nullable!long.init, Nullable!long.init);
+	assert(r.events.length == 1);
+	assert(r.events[0].data["id"].get!string == "redacted");
+	assert(r.events[0].data["severity"].get!string == "P1");
+	assert(r.cursor.get == "c2");
+}
+
+unittest  // a push stream applies match and transform to an onFetch type's events
+{
+	auto rt = testRuntime();
+	shapedFetchType(rt);
+	Json[] events;
+	auto h = rt.openPushStream("incident.created", Json(["severity": Json("P1")]),
+			"user-1", Json(1), (string method, Json params) @safe {
+		if (method == eventsEventNotification)
+			events ~= params;
+	});
+	rt.startPushStream(h.stream, nullable("c0"), Nullable!long.init);
+	assert(events.length == 1);
+	assert(events[0]["data"]["id"].get!string == "redacted");
+	h.close();
+}
+
 unittest  // typed onFetch receives the poll's maxEvents cap
 {
 	auto rt = testRuntime();
@@ -6928,6 +6983,23 @@ version (unittest)
 		rt.register(reg);
 		return rt;
 	}
+}
+
+unittest  // webhook delivery applies match and transform to an onFetch type's events
+{
+	auto ft = new FakeWebhookTransport();
+	auto rt = engineRuntime(ft);
+	shapedFetchType(rt);
+	auto p = webhookSub("incident.created", "https://proxy/hooks", Json([
+			"severity": Json("P1")
+	]));
+	p.cursor = "c0";
+	rt.subscribeWebhook(p, "user-1");
+	auto posts = ft.eventPosts();
+	assert(posts.length == 1);
+	auto body = parseJsonString(posts[0].body);
+	assert(body["data"]["id"].get!string == "redacted");
+	assert(body["data"]["severity"].get!string == "P1");
 }
 
 unittest  // a rotated previous secret is cleared once its grace window has elapsed
