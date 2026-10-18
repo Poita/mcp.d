@@ -78,7 +78,8 @@ package void pageBounds(Json params, const(string)[] keys, size_t pageSize,
 		begin = keys.length - keys.assumeSorted.upperBound(lastKey).length;
 	}
 
-	if (pageSize == 0 || begin + pageSize >= keys.length)
+	// Compared as `pageSize >= remaining` so a huge page size cannot overflow.
+	if (pageSize == 0 || pageSize >= keys.length - begin)
 	{
 		end = keys.length;
 	}
@@ -120,6 +121,14 @@ unittest  // a cursor resumes after its key even when that key is gone
 	pageBounds(Json.emptyObject, ["a", "b", "c", "d"], 2, b, e, next);
 	assert(b == 0 && e == 2);
 	pageBounds(Json(["cursor": Json(next.get)]), ["a", "c", "d"], 2, b, e, next);
+	assert(b == 1 && e == 3 && next.isNull);
+}
+
+unittest  // a page size of size_t.max after a cursor returns the rest of the list
+{
+	size_t b, e;
+	Nullable!string next;
+	pageBounds(Json(["cursor": Json(encodeCursor("a"))]), ["a", "b", "c"], size_t.max, b, e, next);
 	assert(b == 1 && e == 3 && next.isNull);
 }
 
