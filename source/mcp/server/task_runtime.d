@@ -33,7 +33,7 @@ enum Duration unlimitedTaskTtl = Duration.max;
 /// it forever); a task that is still working or awaiting input does not expire
 /// by TTL. `maxUnsettledIdle` bounds that instead: a task still unsettled that
 /// long after its last status change (`lastUpdatedAt`: creation, a progress
-/// message, an input round) is taken to be abandoned — its executor hung or its
+/// message, an input round or a `tasks/update` answer) is taken to be abandoned — its executor hung or its
 /// node vanished — and is failed, or cancelled when a cancel was requested, then
 /// expires by its TTL like any settled task. An executor that runs longer keeps
 /// its task alive by reporting progress; zero disables the bound.
@@ -449,6 +449,7 @@ final class TaskRuntime
 	{
 		none, /// nothing: leave the record as is
 		state, /// internal state only: store it
+		activity, /// progress with no status change: also stamp `lastUpdatedAt`
 		status /// wire-visible state: also stamp `lastUpdatedAt` and notify
 	}
 
@@ -466,7 +467,7 @@ final class TaskRuntime
 			const change = mutate(r);
 			if (change == Change.none)
 				return false;
-			if (change == Change.status)
+			if (change >= Change.activity)
 				r.meta.lastUpdatedAt = stamp();
 			if (!store_.compareAndSwap(r, expected))
 				continue;
@@ -686,7 +687,8 @@ final class TaskRuntime
 	/// outstanding `inputRequests`, it moves back to `working` in the same atomic
 	/// update and `deliverInput` returns true: the caller re-dispatches the
 	/// executor, and of concurrent updates exactly one sees true. A partial answer
-	/// is recorded but leaves the task `input_required`. Throws `-32602` when
+	/// is recorded and stamps `lastUpdatedAt` but leaves the task
+	/// `input_required`, with no status notification. Throws `-32602` when
 	/// `inputResponses` is not a non-empty object, when the task is unknown, when
 	/// it is already terminal (no executor will ever read the answers), or when
 	/// any key is not among the task's current `inputRequests`, or when an
@@ -745,11 +747,13 @@ final class TaskRuntime
 			}
 			foreach (k, v; inputResponses.byKeyValue)
 				r.inputResponses[k] = v;
+			// An answer that leaves the task waiting still shows the client is
+			// engaged, so it restarts the `maxUnsettledIdle` clock.
 			if (r.toolName.length == 0 || r.meta.status != TaskStatus.inputRequired)
-				return Change.state;
+				return Change.activity;
 			foreach (k, v; r.inputRequests.byKeyValue)
 				if (k !in r.inputResponses)
-					return Change.state;
+					return Change.activity;
 			transition(r, TaskStatus.working);
 			r.inputRequests = Json.emptyObject;
 			r.detached = false;
@@ -1366,6 +1370,30 @@ unittest  // a task whose status keeps changing is not settled as overdue
 	assert(rt.getDetailed(t.taskId)["status"].get!string == "working");
 	now = "2026-06-07T11:50:00Z";
 	assert(rt.getDetailed(t.taskId)["status"].get!string == "failed");
+}
+
+unittest  // a partial tasks/update answer keeps an input_required task from going idle
+{
+	string now = "2026-06-07T10:00:00Z";
+	TaskOptions o;
+	o.nowIso = () @safe => now;
+	o.maxUnsettledIdle = 1.hours;
+	auto rt = new TaskRuntime(o);
+	int notified;
+	rt.onStatusChange((Json d, string owner) @safe { notified++; });
+	auto t = rt.createFor("slow", Json.undefined);
+	rt.requireInput(t.taskId, Json([
+			"a": Json(["method": Json("elicitation/create")]),
+			"b": Json(["method": Json("elicitation/create")])
+	]));
+	const before = notified;
+	now = "2026-06-07T10:50:00Z";
+	assert(!rt.deliverInput(t.taskId, Json(["a": Json("first")])));
+	assert(notified == before, "a partial answer changes no status");
+	now = "2026-06-07T11:30:00Z";
+	auto d = rt.getDetailed(t.taskId);
+	assert(d["status"].get!string == "input_required");
+	assert(d["lastUpdatedAt"].get!string == "2026-06-07T10:50:00Z");
 }
 
 unittest  // the sweep fails a task unsettled past maxUnsettledIdle
