@@ -541,11 +541,20 @@ final class HttpClientTransport : ClientTransport
 	}
 
 	/// The bearer to attach to the request being built: the provider's current
-	/// token when one is installed, else the static token.
+	/// token when one is installed, else the static token. Throws an
+	/// `McpException` for a token with a byte outside visible ASCII (a space, CR,
+	/// LF or other control character), which no valid bearer token (RFC 6750
+	/// §2.1) carries and which could split the raw `Authorization` header.
 	private string currentBearer() @safe
 	{
+		import std.algorithm.searching : all;
+		import std.string : representation;
+
 		if (bearerProvider.token !is null)
 			bearerToken = bearerProvider.token();
+		if (!bearerToken.representation.all!(b => b >= 0x21 && b <= 0x7E))
+			throw internalError(
+					"bearer token contains a character not allowed in an Authorization header");
 		return bearerToken;
 	}
 
@@ -4291,6 +4300,52 @@ unittest  // buildHttpRequest sends Authorization only for a non-empty bearer
 	const without = t.buildHttpRequest("GET", "/mcp", "host:8080",
 			"text/event-stream", "keep-alive", null, (string[string]).init, null, null);
 	assert(!without.canFind("Authorization"));
+}
+
+unittest  // a bearer token carrying CR, LF or another control character is refused before it reaches a header
+{
+	import std.exception : collectException;
+
+	foreach (bad; [
+			"tok\r\nX-Injected: 1", "tok\nen", "to\x00k", "to k", "tok\x7F"
+		])
+	{
+		auto t = new HttpClientTransport("http://127.0.0.1:8080/mcp");
+		t.setBearerToken(bad);
+		assert(cast(McpException) collectException(t.currentBearer()) !is null,
+				"a bearer with a non-token character must be refused");
+		auto p = new HttpClientTransport("http://127.0.0.1:8080/mcp");
+		p.setBearerProvider(BearerProvider(() @safe => bad));
+		assert(cast(McpException) collectException(p.currentBearer()) !is null,
+				"a provider's bearer with a non-token character must be refused");
+	}
+}
+
+unittest  // a request whose bearer carries CR/LF fails without being sent
+{
+	import mcp.client.client : McpClient;
+
+	int posts;
+	auto router = new URLRouter;
+	router.post("/mcp", (HTTPServerRequest req, HTTPServerResponse res) @safe {
+		posts++;
+		res.statusCode = 500;
+		res.writeBody("");
+	});
+	Exception thrown;
+	const failure = runAgainstFakeServer(router, (string url) @safe {
+		auto t = new HttpClientTransport(url);
+		scope (exit)
+			t.close();
+		t.setBearerToken("tok\r\nX-Injected: 1");
+		try
+			t.deliver(makeRequest(Json(1), "ping", Json.emptyObject), 1);
+		catch (Exception e)
+			thrown = e;
+	});
+	assert(failure.length == 0, "scenario failed: " ~ failure);
+	assert(cast(McpException) thrown !is null);
+	assert(posts == 0, "the request must not be sent");
 }
 
 unittest  // a bearer provider is consulted on every read, so a refreshed token is sent
