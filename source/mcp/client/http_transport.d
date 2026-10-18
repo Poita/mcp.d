@@ -1333,34 +1333,34 @@ final class HttpClientTransport : ClientTransport
 	/// Read one chunked-transfer-encoding frame from `conn`: the hex size line,
 	/// then `size` payload bytes, then the trailing per-chunk CRLF. Sets `data` to
 	/// the payload and returns true to continue; returns false on the terminating
-	/// zero-size chunk, a malformed/unparseable size line, or end-of-stream. The
-	/// single chunk-framing primitive shared by `readRemaining` and `readSseBody`,
-	/// so size parsing and trailing-CRLF consumption live in exactly one place.
-	/// A chunk declaring more than `maxBytes` fails before anything is allocated.
+	/// zero-size chunk. A connection that ends or fails mid-frame throws the read
+	/// error, and a size line that is not hexadecimal throws an `McpException`, so
+	/// a truncated body never reads as a complete one. The single chunk-framing
+	/// primitive shared by `readRemaining` and `readSseBody`. A chunk declaring
+	/// more than `maxBytes` fails before anything is allocated.
 	private static bool readChunk(Conn)(Conn conn, size_t maxBytes, out string data) @safe
 	{
 		import vibe.stream.operations : readLine;
 		import vibe.core.stream : IOMode;
+		import std.ascii : isHexDigit;
 		import std.string : strip;
 		import std.conv : parse;
 
 		for (;;)
 		{
-			string sizeLine;
-			try
-				sizeLine = (cast(string) readLine(conn, maxHeaderLineBytes).idup).strip;
-			catch (Exception)
-				return false;
+			const sizeLine = (cast(string) readLine(conn, maxHeaderLineBytes).idup).strip;
 			if (sizeLine.length == 0)
 				continue; // tolerate a stray blank line before the size
+			if (!isHexDigit(sizeLine[0]))
+				throw internalError("HTTP response has a malformed chunk size line");
 			ulong sz;
 			try
 			{
-				auto sl = sizeLine;
+				string sl = sizeLine;
 				sz = parse!ulong(sl, 16);
 			}
 			catch (Exception)
-				return false;
+				throw internalError("HTTP response has a malformed chunk size line");
 			if (sz == 0)
 				return false; // last chunk
 			if (sz > maxBytes)
@@ -1368,11 +1368,7 @@ final class HttpClientTransport : ClientTransport
 			auto chunk = new ubyte[cast(size_t) sz];
 			conn.read(chunk, IOMode.all);
 			data = cast(string) chunk.idup;
-			try
-				readLine(conn, maxHeaderLineBytes); // trailing CRLF after the chunk data
-			catch (Exception)
-			{
-			}
+			readLine(conn, maxHeaderLineBytes); // trailing CRLF after the chunk data
 			return true;
 		}
 	}
@@ -3981,6 +3977,28 @@ unittest  // readChunk consumes the per-chunk trailing CRLF so framing stays ali
 			body.dup, false);
 	auto got = HttpClientTransport.readRemaining(stream, true, defaultMaxMessageBytes);
 	assert(got == "abcdef");
+}
+
+unittest  // readRemaining fails a chunked body that ends before its terminating chunk
+{
+	import std.exception : collectException;
+	import vibe.stream.memory : createMemoryStream;
+
+	auto stream = createMemoryStream(cast(ubyte[]) "5\r\nhello\r\n".dup, false);
+	assert(collectException(HttpClientTransport.readRemaining(stream, true,
+			defaultMaxMessageBytes)) !is null, "a truncated chunked body must not read as complete");
+}
+
+unittest  // readRemaining fails a chunked body whose size line is not hexadecimal
+{
+	import std.exception : collectException;
+	import vibe.stream.memory : createMemoryStream;
+
+	auto stream = createMemoryStream(
+			cast(ubyte[]) "5\r\nhello\r\nzz\r\nmore\r\n0\r\n\r\n".dup, false);
+	auto e = collectException(HttpClientTransport.readRemaining(stream, true,
+			defaultMaxMessageBytes));
+	assert(cast(McpException) e !is null, "a malformed chunk size must fail the read");
 }
 
 unittest  // readRemaining rejects a chunk whose declared size exceeds the message limit before allocating it
