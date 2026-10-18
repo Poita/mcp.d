@@ -2605,6 +2605,7 @@ private void handlePost(McpServer server, ServerPushChannel push,
 	if (sessions !is null)
 	{
 		const isInit = !input.isBatch && input.messages.length == 1
+			&& input.messages[0].kind == MessageKind.request
 			&& input.messages[0].method == "initialize";
 		if (!isInit)
 		{
@@ -6304,6 +6305,24 @@ unittest  // an initialize that fails header validation mints no surviving sessi
 	assert(res.statusCode == HTTPStatus.badRequest);
 	assert(SessionHeader !in res.headers,
 			"a failed initialize MUST NOT stamp Mcp-Session-Id on the error response");
+}
+
+unittest  // an `initialize` notification without a session id is held to the session check
+{
+	import vibe.http.server : createTestHTTPServerResponse, TestHTTPResponseMode;
+	import vibe.http.router : URLRouter;
+	import vibe.stream.memory : createMemoryOutputStream;
+
+	auto server = McpServer.stateful("t", "1");
+	auto router = new URLRouter;
+	mountMcp(router, server);
+
+	auto sink = createMemoryOutputStream();
+	auto res = createTestHTTPServerResponse(sink, null, TestHTTPResponseMode.bodyOnly);
+	router.handleRequest(makeInitPostReq(`{"jsonrpc":"2.0","method":"initialize","params":{}}`,
+			["Accept": "application/json, text/event-stream"]), res);
+
+	assert(res.statusCode == HTTPStatus.badRequest);
 }
 
 unittest  // a POST request whose Accept excludes both media types is rejected with 406
