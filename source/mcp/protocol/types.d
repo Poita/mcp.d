@@ -1501,6 +1501,23 @@ unittest  // CallToolResult.structured!T writes a ulong above long.max non-negat
 	assert(r.structuredContentAs!Counter.n == ulong.max);
 }
 
+unittest  // structuredContentAs!T reads an unset (NaN) double back as NaN, in process and over the wire
+{
+	import std.math : isNaN;
+
+	struct Reading
+	{
+		double value;
+	}
+
+	auto r = CallToolResult.structured(Reading.init);
+	assert(r.structuredContentAs!Reading.value.isNaN);
+	CallToolResult wire;
+	wire.structuredContent = parseJsonString(r.structuredContent.toString);
+	assert(wire.structuredContent["value"].type == Json.Type.null_, wire.structuredContent.toString);
+	assert(wire.structuredContentAs!Reading.value.isNaN);
+}
+
 version (unittest)
 {
 	private enum StructuredLevel

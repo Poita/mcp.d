@@ -852,13 +852,14 @@ package(mcp) void setBound(X)(ref X dst, X value)
 }
 
 /// Whether a struct member's JSON value `p` counts as supplied. JSON `null`
-/// means not supplied except for a `Json` field, which binds `null` verbatim; a
+/// means not supplied except for a `Json` field, which binds `null` verbatim, and
+/// a floating-point field, which binds `null` as the NaN vibe writes that way; a
 /// `Nullable` field given `null` binds as unset rather than taking its default.
 private bool isPresent(FT)(const(Json)* p)
 {
 	if (p is null || p.type == Json.Type.undefined)
 		return false;
-	static if (is(FT == Json))
+	static if (is(FT == Json) || isFloatingPoint!FT)
 		return true;
 	else
 		return p.type != Json.Type.null_;
@@ -950,8 +951,12 @@ private T bindLeaf(T)(Json v, string path)
 	}
 	else static if (isFloatingPoint!T)
 	{
-		import std.math : isFinite;
+		import std.math : isFinite, isNaN;
 
+		// vibe writes a NaN, such as an unset field's `.init`, as `null`, and a
+		// floating-point output schema admits it, so both read back as NaN.
+		if (v.type == Json.Type.null_ || (v.type == Json.Type.float_ && v.get!double.isNaN))
+			return T.nan;
 		if (v.type != Json.Type.int_ && v.type != Json.Type.bigInt && v.type != Json.Type.float_)
 			throw new BindException(located(path, "expected a number, got " ~ jsonTypeName(v)));
 		// A finite JSON number beyond `T`'s range would otherwise bind as infinity.
