@@ -1218,7 +1218,9 @@ private void handleLegacyInput(McpServer server, LegacySseChannel channel,
 		}
 		auto token = McpServer.inFlightKey(sessionId, inboundId) in conn.inFlight;
 		auto cancellation = token is null ? null : *token;
-		releaseOnCancel(channel.coord, id, sessionId, cancellation);
+		auto cancelRelease = releaseOnCancel(channel.coord, id, sessionId, cancellation);
+		scope (exit)
+			cancelRelease.remove();
 		void notifyCancelled(string reason) @safe
 		{
 			try

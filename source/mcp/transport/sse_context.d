@@ -2695,12 +2695,13 @@ package(mcp) enum cancelledOnBehalfReason = "the request it serves was cancelled
 /// `requestCancelled` error once `cancellation` fires (at once if it already
 /// has), so its awaiter wakes rather than waiting out the reply timeout. A
 /// request already settled is left alone. A null `cancellation` does nothing.
-package(mcp) void releaseOnCancel(StreamCoordinator coord, long id,
+/// The caller removes the returned registration once the request settles.
+package(mcp) CancelRegistration releaseOnCancel(StreamCoordinator coord, long id,
 		string sessionToken, CancellationToken cancellation) @safe nothrow
 {
 	if (cancellation is null)
-		return;
-	cancellation.onCancel(() @safe nothrow{
+		return CancelRegistration.init;
+	return cancellation.onCancel(() @safe nothrow{
 		try
 			coord.failPending(id, new McpException(ErrorCode.requestCancelled,
 				"request cancelled"), sessionToken);
@@ -3198,7 +3199,9 @@ final class HttpStreamContext : RequestContext, ConnectionScoped
 			throw internalError("client disconnected before the request could be sent");
 		}
 		auto cancellation = inboundCancellation();
-		releaseOnCancel(coord, id, token_, cancellation);
+		auto cancelRelease = releaseOnCancel(coord, id, token_, cancellation);
+		scope (exit)
+			cancelRelease.remove();
 		// Bind the awaiting fiber to the stream's liveness. The response to this
 		// server->client request arrives on a SEPARATE POST, so a dead stream would
 		// otherwise leave this fiber parked for the full timeout. A resumable stream
@@ -4933,6 +4936,52 @@ unittest  // cancelling the inbound request releases its POST stream's server->c
 	const body_ = cast(string) sink.data.idup;
 	assert(body_.canFind(`"method":"notifications/cancelled"`), body_);
 	assert(body_.canFind(`"requestId":1`), body_);
+}
+
+unittest  // an answered server->client request leaves no cancel callback on its inbound request
+{
+	import vibe.core.core : runTask, runEventLoop, exitEventLoop, sleep;
+	import vibe.http.server : createTestHTTPServerResponse, TestHTTPResponseMode;
+	import vibe.stream.memory : createMemoryOutputStream;
+
+	auto sink = createMemoryOutputStream();
+	auto res = createTestHTTPServerResponse(sink, null, TestHTTPResponseMode.bodyOnly);
+	auto coord = new StreamCoordinator;
+	auto conn = new ConnectionState;
+	auto token = new CancellationToken;
+	conn.inFlight[McpServer.inFlightKey("sess-A", Json(7))] = token;
+	ClientCapabilities caps;
+	auto ctx = new HttpStreamContext(res, coord, caps, Json.undefined,
+			TokenInfo.invalid(), false, latestLegacy, "sess-A", conn);
+	ctx.setConnectionProbe(() @safe => true);
+	ctx.setRequestId(Json(7));
+
+	bool answered;
+	runTask(() nothrow{
+		scope (exit)
+			exitEventLoop();
+		try
+		{
+			ctx.elicitRaw(Json.emptyObject);
+			answered = true;
+		}
+		catch (Exception)
+		{
+		}
+	});
+	runTask(() nothrow{
+		try
+		{
+			sleep(50.msecs);
+			coord.resolve(Json(1), Json(["action": Json("decline")]), Json.undefined, "sess-A");
+		}
+		catch (Exception)
+		{
+		}
+	});
+	runEventLoop();
+	assert(answered);
+	assert(token.registeredCallbacks == 0);
 }
 
 unittest  // a timed-out push-channel request is cancelled on the session's stream

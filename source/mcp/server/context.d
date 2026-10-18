@@ -72,6 +72,12 @@ final class CancellationToken
 		return CancelRegistration(this, id);
 	}
 
+	/// How many `onCancel` callbacks are still registered.
+	package(mcp) size_t registeredCallbacks() const @safe nothrow @nogc
+	{
+		return onCancel_.length;
+	}
+
 	private void unregister(ulong id) @safe nothrow
 	{
 		foreach (i, c; onCancel_)
