@@ -462,6 +462,9 @@ final class HttpClientTransport : ClientTransport
 	private Duration connectTimeout = 30.seconds;
 	/// How long `openListen` waits for the stream's leading frame.
 	package Duration listenTimeout_ = 10.seconds;
+	/// Bound on the whole session `DELETE` that `close()` sends, short because
+	/// the DELETE is a best-effort courtesy that must not hold up `close()`.
+	package Duration endSessionTimeout_ = 5.seconds;
 	/// A resumed POST response stream that closes this soon without a new event
 	/// id counts as an idle resume; a few in a row end the request.
 	package Duration idleResumeWindow_ = 1.seconds;
@@ -655,7 +658,9 @@ final class HttpClientTransport : ClientTransport
 	/// Tell a stateful Streamable HTTP server the session is over: `DELETE` the
 	/// endpoint with its `Mcp-Session-Id` (basic/transports §Session Management:
 	/// clients that no longer need a session SHOULD). Best-effort — a server may
-	/// answer 405 (it does not let clients end sessions) and any failure is ignored.
+	/// answer 405 (it does not let clients end sessions) and any failure is
+	/// ignored, as is a DELETE still unanswered after `endSessionTimeout_` (or
+	/// the connect timeout, when shorter).
 	private void endSession() @safe nothrow
 	{
 		import mcp.protocol.ssrf : secureRequestHTTP, SsrfPolicy;
@@ -677,7 +682,8 @@ final class HttpClientTransport : ClientTransport
 					if (!isHeaderValueUnsafe(v))
 						req.headers[k] = v;
 			}, (scope HTTPClientResponse res) { res.dropBody(); },
-					FetchOptions(connectTimeout, tlsTrust));
+					FetchOptions(connectTimeout < endSessionTimeout_
+						? connectTimeout : endSessionTimeout_, tlsTrust));
 		}
 		catch (Exception)
 		{
@@ -6492,6 +6498,39 @@ unittest  // close() ends a stateful session with DELETE carrying its Mcp-Sessio
 	});
 	assert(failure.length == 0, "scenario failed: " ~ failure);
 	assert(deleted == ["s1"], "close() must DELETE the live session");
+}
+
+unittest  // close() gives up on a session DELETE the server does not answer within its own short bound
+{
+	import core.time : msecs, MonoTime;
+	import vibe.core.core : sleep;
+	import mcp.client.client : McpClient, ClientSettings;
+
+	auto srv = new SessionFakeServer;
+	auto router = srv.router();
+	router.delete_("/mcp", (HTTPServerRequest req, HTTPServerResponse res) @safe {
+		sleep(2.seconds);
+		res.statusCode = 204;
+		res.writeVoidBody();
+	});
+	Duration took;
+	const failure = runAgainstFakeServer(router, (string url) @safe {
+		auto t = new HttpClientTransport(url);
+		t.endSessionTimeout_ = 200.msecs;
+		auto client = new McpClient(t, ClientSettings.init);
+		client.initialize("2025-11-25");
+		const started = MonoTime.currTime;
+		client.close();
+		took = MonoTime.currTime - started;
+	});
+	assert(failure.length == 0, "scenario failed: " ~ failure);
+	assert(took < 1.seconds, "close() must not wait out the connect timeout for the DELETE");
+}
+
+unittest  // the session DELETE close() sends is bounded well below the connect timeout
+{
+	auto t = new HttpClientTransport("http://host:8080/mcp");
+	assert(t.endSessionTimeout_ <= 5.seconds);
 }
 
 unittest  // close() tolerates a server that answers the session DELETE with 405
