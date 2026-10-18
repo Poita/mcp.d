@@ -853,11 +853,9 @@ final class McpClient : ClientProtocol
 
 			return "client:" ~ randomUUID().toString();
 		}();
-		cacheServer_ = settings.cacheServer.length ? settings.cacheServer : () {
-			import std.conv : to;
-
-			return "client:" ~ (cast(size_t) cast(void*) this).to!string;
-		}();
+		// The random id, not the object's address, which the GC can hand to a
+		// later client still sharing the store.
+		cacheServer_ = settings.cacheServer.length ? settings.cacheServer : clientPartition_;
 		now_ = () @safe => Clock.currTime();
 		eventSettings_ = settings.events;
 		resetTimeoutOnProgress_ = settings.resetTimeoutOnProgress;
@@ -9485,6 +9483,15 @@ unittest  // clients over custom transports sharing a store are isolated unless 
 	make().listTools();
 	make().listTools();
 	assert(calls == 2, "an unidentifiable transport must not share another client's entries");
+}
+
+unittest  // a client with no cacheServer is keyed by a random id, not its reusable address
+{
+	import std.conv : to;
+
+	auto c = new McpClient(new RecordingClientTransport());
+	assert(c.cacheServer_ != "client:" ~ (cast(size_t) cast(void*) c).to!string);
+	assert(c.cacheServer_ == c.clientPartition_);
 }
 
 unittest  // an explicit cacheServer lets clients of one server share entries across URLs
