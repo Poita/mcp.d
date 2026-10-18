@@ -349,6 +349,8 @@ void serveStdio(McpServer server, string delegate() @safe readLine,
 	channel = new DuplexChannel(readLine, writeLine, &onInbound, &onInboundBatch);
 	channel.onError = opts.onError;
 	channel.answersMalformed = true;
+	// Requests are admitted above, under `opts.maxInFlight`.
+	channel.maxRequestTasks = 0;
 	// Change notifications for a 2025-era client ride the same serialized writer.
 	server.attachStdioSink(&sink);
 	scope (exit)

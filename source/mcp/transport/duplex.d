@@ -72,6 +72,10 @@ final class DuplexChannel
 	// for one (see `maxNotificationTasks`).
 	private size_t notificationTasks_;
 	private Message[] notificationBacklog_;
+	// Tasks running inbound request handlers, and the requests waiting for one
+	// (see `maxRequestTasks`).
+	private size_t requestTasks_;
+	private Message[] requestBacklog_;
 	private PostQueue posts_;
 
 	/// Receives a description of each failure the read loop survives or ends on
@@ -94,6 +98,15 @@ final class DuplexChannel
 	/// one arriving while the wait list is full is dropped and reported to
 	/// `onError`. `notifications/cancelled` is never held back.
 	size_t maxNotificationTasks = 64;
+
+	/// The most inbound requests handled at once (`0`: unbounded), so a peer
+	/// cannot spawn handler tasks without bound (a server flooding a client with
+	/// elicitation or sampling requests, say). Up to this many more wait, in
+	/// arrival order, for a running one to finish, and a `notifications/cancelled`
+	/// naming one withdraws it unanswered; one arriving while the wait list is
+	/// full is answered with a -32603 error. A transport that admits requests
+	/// itself (the stdio server, under `StdioOptions.maxInFlight`) sets `0`.
+	size_t maxRequestTasks = 64;
 
 	/// The most posted lines (error replies to malformed input, teardown
 	/// `notifications/cancelled`) held waiting for the peer to read at once
@@ -356,12 +369,72 @@ final class DuplexChannel
 	/// `notifications/initialized` is handled before the request that follows it).
 	private void dispatchInbound(Message m) @safe
 	{
-		if (m.kind == MessageKind.notification && m.method != "notifications/cancelled")
+		if (m.kind == MessageKind.request)
+		{
+			dispatchRequest(m);
+			return;
+		}
+		if (m.method != "notifications/cancelled")
 		{
 			dispatchNotification(m);
 			return;
 		}
+		withdrawRequest(m.params);
 		runTask((Message msg) nothrow{ runInbound(msg); }, m);
+	}
+
+	/// Run request `m` on a task of its own when fewer than `maxRequestTasks`
+	/// are running, else queue it, or refuse it when the queue is full.
+	private void dispatchRequest(Message m) @safe
+	{
+		if (maxRequestTasks == 0 || requestTasks_ < maxRequestTasks)
+		{
+			++requestTasks_;
+			runTask((Message first) nothrow{ runRequests(first); }, m);
+			return;
+		}
+		if (requestBacklog_.length < maxRequestTasks)
+		{
+			requestBacklog_ ~= m;
+			return;
+		}
+		// Posted: this runs on the read loop, which must not wait on a peer that
+		// is not reading.
+		post(makeErrorResponse(m.id, internalError("busy: " ~ intToString(
+				requestTasks_) ~ " requests are in progress and " ~ intToString(
+				requestBacklog_.length) ~ " are queued")));
+	}
+
+	/// Handle request `first`, then whatever requests are waiting, on the
+	/// current task, which holds one request slot until it returns.
+	private void runRequests(Message first) @safe nothrow
+	{
+		scope (exit)
+			--requestTasks_;
+		for (auto m = first;;)
+		{
+			runInbound(m);
+			if (requestBacklog_.length == 0)
+				break;
+			m = requestBacklog_[0];
+			requestBacklog_ = requestBacklog_[1 .. $];
+		}
+	}
+
+	/// Drop the queued request a `notifications/cancelled` with `params` names:
+	/// it has not started, so it is never run and, per the cancellation rules,
+	/// gets no reply.
+	private void withdrawRequest(Json params) @safe
+	{
+		if (requestBacklog_.length == 0 || params.type != Json.Type.object || "requestId" !in params)
+			return;
+		const id = params["requestId"];
+		foreach (i, q; requestBacklog_)
+			if (q.id == id)
+			{
+				requestBacklog_ = requestBacklog_[0 .. i] ~ requestBacklog_[i + 1 .. $];
+				return;
+			}
 	}
 
 	private void runInbound(Message m) @safe nothrow
@@ -938,6 +1011,65 @@ unittest  // inbound notifications run on at most maxNotificationTasks tasks, ca
 	});
 	runEventLoop();
 	assert(handled == 6, "queued notifications run once a slot frees up");
+}
+
+unittest  // inbound requests run on at most maxRequestTasks tasks, queue as many more and refuse the rest
+{
+	import std.conv : to;
+
+	auto inbound = new LineLink;
+	auto release = createManualEvent();
+	size_t running, peak;
+	long[] handled;
+	string[] written;
+	runTask(() nothrow{
+		scope (exit)
+			exitEventLoop();
+		try
+		{
+			auto channel = new DuplexChannel(() @safe { return inbound.take(); }, (string s) @safe {
+				written ~= s;
+			}, (Message m) @safe {
+				if (m.kind != MessageKind.request)
+					return;
+				++running;
+				if (running > peak)
+					peak = running;
+				release.wait(release.emitCount);
+				--running;
+				handled ~= m.id.get!long;
+			});
+			channel.maxRequestTasks = 2;
+			channel.onError = (string) @safe nothrow{};
+			channel.start();
+			foreach (i; 1 .. 7)
+				inbound.put(
+					`{"jsonrpc":"2.0","id":` ~ i.to!string ~ `,"method":"elicitation/create"}`);
+			inbound.put(
+				`{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":3}}`);
+			foreach (_; 0 .. 32)
+				yield();
+			assert(peak == 2, "no more than maxRequestTasks requests run at once");
+			assert(written.length == 2, "only the requests beyond the queue are answered early");
+			foreach (k, w; written)
+			{
+				auto j = parseJsonString(w);
+				assert(j["id"] == Json(5 + cast(long) k) && j["error"]["code"].get!int == -32603);
+			}
+			foreach (_; 0 .. 4)
+			{
+				release.emit();
+				foreach (__; 0 .. 8)
+					yield();
+			}
+			inbound.closeEnd();
+		}
+		catch (Exception)
+		{
+		}
+	});
+	runEventLoop();
+	assert(handled == [1, 2, 4], "queued requests run once a slot frees up; a cancelled one never");
 }
 
 unittest  // queued list_changed notifications of one kind are coalesced
