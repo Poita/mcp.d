@@ -1003,7 +1003,8 @@ final class HttpClientTransport : ClientTransport
 
 		// A 404 under a session means the session is gone: drop the id and mark it
 		// so later requests fail until an `initialize` starts a new session.
-		if (status == 404 && sentSession.length && !got && err is null)
+		if (status == 404 && sentSession.length && !got && (err is null
+				|| cast(HttpStatusException) err !is null))
 		{
 			// A session started since this request was sent is left alone.
 			if (sessionId == sentSession)
@@ -1014,12 +1015,6 @@ final class HttpClientTransport : ClientTransport
 			throw new SessionExpiredException(status,
 					"MCP session expired (server answered HTTP 404 for the session)");
 		}
-		// Any other 400/404/405 without a recognised modern error is the signal
-		// `McpClient.connect` uses to fall back to an older transport.
-		if (isLegacyFallbackStatus(status) && !got && err is null)
-			throw new HttpStatusException(status,
-					"HTTP " ~ idStr(status) ~ " from the MCP endpoint with no JSON-RPC response");
-
 		if (err !is null)
 			throw err;
 		if (got)
@@ -1218,14 +1213,15 @@ final class HttpClientTransport : ClientTransport
 						return;
 				}
 
-				// A 400/404/405 is the legacy-fallback signal: read the (small) body
-				// and surface a recognised modern JSON-RPC error if present.
+				// A 400/404/405 is the legacy-fallback signal unless its body is a
+				// recognised modern JSON-RPC error; either way the body's error
+				// reaches the caller, with the HTTP status kept for the fallback.
 				if (isLegacyFallbackStatus(status))
 				{
 					const b = readRemaining(conn, chunked, maxMessageBytes, head.contentLength);
 					McpException modernErr;
-					if (modernErrorFromBody(b, modernErr))
-						err = modernErr;
+					err = modernErrorFromBody(b, modernErr) ? modernErr : httpStatusError(status,
+							b, wwwAuthenticate);
 					return;
 				}
 
@@ -5630,6 +5626,20 @@ unittest  // a JSON-RPC error body on a 5xx keeps its code alongside the HTTP st
 	auto h = cast(HttpStatusException) e;
 	assert(h !is null);
 	assert(h.status == 503 && h.code == -32001 && h.msg == "busy");
+}
+
+unittest  // a JSON-RPC error body on a 400 keeps its code and message alongside the HTTP status
+{
+	auto e = listToolsFailure((Json req, HTTPServerResponse res) @safe {
+		auto resp = parseJsonString(
+			`{"jsonrpc":"2.0","error":{"code":-32602,"message":"bad cursor"}}`);
+		resp["id"] = req["id"];
+		res.statusCode = 400;
+		res.writeBody(resp.toString(), "application/json");
+	});
+	auto h = cast(HttpStatusException) e;
+	assert(h !is null, "a 400 must raise HttpStatusException");
+	assert(h.status == 400 && h.code == -32_602 && h.msg == "bad cursor");
 }
 
 unittest  // a null-id JSON-RPC error on a request's SSE response stream fails that request with the error
