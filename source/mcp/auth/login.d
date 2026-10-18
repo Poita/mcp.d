@@ -795,6 +795,11 @@ class FileTokenStore : TokenStore
 /// token that expires mid-flight.
 enum long defaultExpirySkewSeconds = 30;
 
+/// How long (seconds) after a rejection-driven refresh a rejection of the
+/// replacement token is surfaced instead of refreshed again (see
+/// `OAuthSession.invalidate`).
+enum long rejectionRefreshWindowSeconds = 60;
+
 /// Whether the stored access token must be refreshed before use at time `now`
 /// (Unix seconds). A token with `expiresAt == 0` (unknown expiry) is never
 /// considered expired here. A record with no access token always needs
@@ -1078,8 +1083,10 @@ final class OAuthSession
 	private TaskMutex refreshLock_;
 	// `invalidate` discarded a rejected token, so the next refresh replaces it.
 	private bool rejectionPending_;
-	// The current token came from a refresh that replaced a rejected one.
+	// The current token came from a refresh that replaced a rejected one, at
+	// `refreshedOnRejectionAt_` (Unix seconds).
 	private bool refreshedOnRejection_;
+	private long refreshedOnRejectionAt_;
 
 	/// `oauth` must already carry the canonical `resource`. `token` is the
 	/// initial (possibly empty) stored token for `resource`.
@@ -1124,9 +1131,12 @@ final class OAuthSession
 	///
 	/// Returns whether a replacement token can be obtained: false when no
 	/// refresh token is held, or when the rejected token is itself the
-	/// replacement for a rejected one (the server would reject any refresh the
-	/// same way, until the token is replaced on expiry), so the rejection (and its `WWW-Authenticate`
-	/// challenge, which a re-authenticating `useOAuth` needs) reaches the caller.
+	/// replacement for a rejected one, obtained less than
+	/// `rejectionRefreshWindowSeconds` earlier (the server would most likely
+	/// reject another refresh the same way), so the rejection (and its
+	/// `WWW-Authenticate` challenge, which a re-authenticating `useOAuth` needs)
+	/// reaches the caller. Once that window has passed, a rejection of the
+	/// replacement is treated like any other and refreshed again.
 	///
 	/// Naming the rejected token keeps concurrent rejections idempotent: a
 	/// request that failed with a token another request has already replaced
@@ -1137,14 +1147,22 @@ final class OAuthSession
 	/// retries that request once when it returns true.
 	bool invalidate(string rejectedAccessToken) @safe
 	{
+		import std.datetime.systime : Clock;
+
+		return invalidateAt(rejectedAccessToken, Clock.currTime().toUnixTime());
+	}
+
+	/// `invalidate` for a rejection observed at `now` (Unix seconds).
+	bool invalidateAt(string rejectedAccessToken, long now) @safe
+	{
 		refreshLock_.lock();
 		scope (exit)
 			refreshLock_.unlock();
 		if (store_ is null)
-			return invalidateHoldingLocks(rejectedAccessToken);
+			return invalidateHoldingLocks(rejectedAccessToken, now);
 		bool result;
 		store_.withLock(resource_, () @safe {
-			result = invalidateHoldingLocks(rejectedAccessToken);
+			result = invalidateHoldingLocks(rejectedAccessToken, now);
 		});
 		return result;
 	}
@@ -1153,7 +1171,7 @@ final class OAuthSession
 	/// store's lock. A record another session has stored since this one last
 	/// read it is adopted first, so a rejection never overwrites a rotated
 	/// refresh token with the one it replaced.
-	private bool invalidateHoldingLocks(string rejectedAccessToken) @safe
+	private bool invalidateHoldingLocks(string rejectedAccessToken, long now) @safe
 	{
 		import mcp.auth.oauth : constantTimeEquals;
 
@@ -1169,7 +1187,7 @@ final class OAuthSession
 		const replaceable = token_.refreshToken.length > 0;
 		if (!token_.hasToken || !constantTimeEquals(token_.accessToken, rejectedAccessToken))
 			return token_.hasToken || replaceable;
-		if (refreshedOnRejection_)
+		if (refreshedOnRejection_ && now - refreshedOnRejectionAt_ < rejectionRefreshWindowSeconds)
 		{
 			// The token a rejection-driven refresh produced is rejected too
 			// (e.g. an audience mismatch), so another refresh would only be
@@ -1274,6 +1292,7 @@ final class OAuthSession
 		auto issuer = prev.issuer.length ? prev.issuer : as_.issuer;
 		token_ = StoredToken.fromTokenSet(ts, resource_, now, prev.refreshToken);
 		refreshedOnRejection_ = rejectionPending_;
+		refreshedOnRejectionAt_ = now;
 		rejectionPending_ = false;
 		if (token_.scope_.length == 0)
 			token_.scope_ = prev.scope_;
@@ -2020,6 +2039,44 @@ unittest  // a rejected token with no refresh token demands re-authentication an
 	assert(refreshes == 0);
 	// A later useOAuth must not reuse the rejected token from the store.
 	assert(!store.load("https://mcp.example.com").hasToken);
+}
+
+version (unittest) private OAuthSession countingRefreshSession(
+		MemoryTokenStore store, int* refreshes) @safe
+{
+	import std.conv : to;
+
+	StoredToken t;
+	t.accessToken = "A0";
+	t.refreshToken = "R0";
+	return new OAuthSession("https://mcp.example.com", t, store, (string rt) @safe {
+		TokenSet ts;
+		ts.accessToken = "A" ~ (++*refreshes).to!string;
+		ts.refreshToken = "R" ~ ts.accessToken;
+		return ts;
+	});
+}
+
+unittest  // a token a rejection-driven refresh produced that is rejected right away is not refreshed again
+{
+	auto refreshes = new int;
+	auto sess = countingRefreshSession(new MemoryTokenStore(), refreshes);
+	assert(sess.invalidateAt("A0", 1000));
+	assert(sess.bearerForRequest(1000) == "A1");
+	assert(!sess.invalidateAt("A1", 1001));
+	assert(sess.bearerForRequest(1001) == "A1");
+	assert(*refreshes == 1);
+}
+
+unittest  // a token a rejection-driven refresh produced is refreshed again when rejected long after
+{
+	auto refreshes = new int;
+	auto sess = countingRefreshSession(new MemoryTokenStore(), refreshes);
+	assert(sess.invalidateAt("A0", 1000));
+	assert(sess.bearerForRequest(1000) == "A1");
+	assert(sess.invalidateAt("A1", 900_000));
+	assert(sess.bearerForRequest(900_000) == "A2");
+	assert(*refreshes == 2);
 }
 
 unittest  // invalidating a token that has already been replaced keeps the current one

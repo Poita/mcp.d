@@ -643,7 +643,7 @@ It discovers the protected-resource and authorization-server metadata, then:
   refresh token, so later requests fail fast until `useOAuth` signs in again. A
   request the server rejects with `401 invalid_token` is
   refreshed and retried once; with no refresh token, or when the refreshed token
-  is rejected too, the 401 (an `HttpStatusException` carrying the
+  is rejected too within a minute of that refresh, the 401 (an `HttpStatusException` carrying the
   `WWW-Authenticate` challenge) reaches the caller, who can pass the challenge
   to `useOAuth` as `OAuthLogin.wwwAuthenticate` to sign in again.
 
