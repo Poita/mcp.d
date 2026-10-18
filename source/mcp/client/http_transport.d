@@ -2349,6 +2349,11 @@ final class HttpClientTransport : ClientTransport
 						{
 						}
 					});
+					// A listen stream ends only with the answer to its request, so a
+					// server close before that answer is a failure, not a clean end.
+					if (!answered && !isCancelled())
+						failure = internalError(
+								"subscription stream closed before the server answered the request");
 					return;
 				}
 			}
@@ -6509,6 +6514,29 @@ unittest  // a listen stream the server fails after acknowledging records the er
 	assert(e is null, "an acknowledged listen must open");
 	assert(ended, "the server's error must end the stream");
 	assert(streamError !is null && streamError.code == -32603);
+}
+
+unittest  // a listen stream the server closes without answering the request ends with an error
+{
+	import core.time : msecs, MonoTime;
+	import vibe.core.core : sleep;
+
+	McpException streamError;
+	bool ended;
+	auto e = listenFailure((Json req, HTTPServerResponse res) @safe {
+		writeSse(res,
+			`data: {"jsonrpc":"2.0","method":"notifications/subscriptions/acknowledged",`
+			~ `"params":{"notifications":{}}}` ~ "\n\n");
+	}, (SubscriptionStream stream) @safe {
+		const until = MonoTime.currTime + 3.seconds;
+		while (!stream.ended && MonoTime.currTime < until)
+			sleep(20.msecs);
+		ended = stream.ended;
+		streamError = stream.error;
+	});
+	assert(e is null, "an acknowledged listen must open");
+	assert(ended, "the server's close must end the stream");
+	assert(streamError !is null, "a close before the listen answer must be reported as a failure");
 }
 
 unittest  // aborting a listen slot interrupts its parked reader, but not inside a handler
