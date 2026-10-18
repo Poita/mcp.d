@@ -1787,9 +1787,11 @@ final class HttpClientTransport : ClientTransport
 	///
 	/// Frames the body (chunked transfer-encoding when `chunked`, else raw reads to
 	/// EOF via `leastSize`) and runs the SSE line tokenizer over it (lines end in
-	/// CRLF, LF or CR), accumulating `data:` (joined with `\n`, one leading space
-	/// stripped) and `event:` and flushing a complete event to
-	/// `onEvent(eventType, data)` on each blank line. `id:`/`retry:` fields are
+	/// CRLF, LF or CR, after any byte-order mark opening the stream), accumulating
+	/// `data:` (joined with `\n`, one leading space stripped) and `event:` and
+	/// flushing an event that has a `data` line to `onEvent(eventType, data)` on
+	/// each blank line. A field line without a colon is that field with an empty
+	/// value. `id:`/`retry:` fields are
 	/// handled uniformly here — updating the caller-owned `cursor` resumption
 	/// state, with an `id:` taking effect when its event is dispatched — so every
 	/// caller gets `event:`/`id:`/`retry:`
@@ -1802,10 +1804,14 @@ final class HttpClientTransport : ClientTransport
 			scope void delegate(string eventType, string data) @safe onEvent) @safe
 	{
 		import vibe.core.stream : IOMode;
-		import std.string : indexOfAny, startsWith, strip;
+		import std.string : indexOfAny, representation, startsWith, strip;
 		import std.conv : to;
 
 		string acc, data, eventType;
+		// Whether the event being read has a `data` line, which may be empty.
+		bool hasData;
+		// Whether a byte-order mark opening the stream has been looked for.
+		bool bomChecked;
 		// The `id:` of the event being read; it becomes the resume cursor only when
 		// that event is dispatched, so a stream cut mid-event resumes before it.
 		string idBuffer = cursor.lastEventId;
@@ -1817,6 +1823,18 @@ final class HttpClientTransport : ClientTransport
 		size_t scanned;
 		void tokenize()
 		{
+			if (!bomChecked)
+			{
+				// A UTF-8 byte-order mark opening the stream is not part of its
+				// first line; wait until enough bytes arrived to tell.
+				static immutable ubyte[] bom = [0xEF, 0xBB, 0xBF];
+				const head = acc.representation;
+				if (head.length < bom.length && bom.startsWith(head))
+					return;
+				if (head.startsWith(bom))
+					acc = acc[bom.length .. $];
+				bomChecked = true;
+			}
 			for (;;)
 			{
 				if (pendingCr && acc.length)
@@ -1852,38 +1870,49 @@ final class HttpClientTransport : ClientTransport
 				if (line.length == 0)
 				{
 					cursor.lastEventId = idBuffer;
-					if (data.length)
+					if (hasData)
 						onEvent(eventType, data);
 					data = null;
+					hasData = false;
 					eventType = null;
 				}
-				else if (line.startsWith("event:"))
+				else if (line[0] != ':')
 				{
-					auto v = line["event:".length .. $];
-					if (v.startsWith(" "))
-						v = v[1 .. $];
-					eventType = v;
-				}
-				else if (line.startsWith("data:"))
-				{
-					auto d = line["data:".length .. $];
-					if (d.startsWith(" "))
-						d = d[1 .. $];
-					if (data.length + d.length + 1 > maxMessageBytes)
-						throw messageTooLarge(maxMessageBytes);
-					data ~= (data.length ? "\n" : "") ~ d;
-				}
-				else if (line.startsWith("id:"))
-					idBuffer = line["id:".length .. $].strip;
-				else if (line.startsWith("retry:"))
-				{
-					try
+					// `field: value`, one space after the colon dropped; a line with
+					// no colon is a field with an empty value.
+					size_t colon;
+					while (colon < line.length && line[colon] != ':')
+						++colon;
+					const field = line[0 .. colon];
+					auto value = colon < line.length ? line[colon + 1 .. $] : "";
+					if (value.length && value[0] == ' ')
+						value = value[1 .. $];
+					switch (field)
 					{
-						const ms = line["retry:".length .. $].strip.to!long;
-						cursor.retryMs = ms > maxRetryMs ? maxRetryMs : ms;
-					}
-					catch (Exception)
-					{
+					case "event":
+						eventType = value;
+						break;
+					case "data":
+						if (data.length + value.length + 1 > maxMessageBytes)
+							throw messageTooLarge(maxMessageBytes);
+						data ~= (hasData ? "\n" : "") ~ value;
+						hasData = true;
+						break;
+					case "id":
+						idBuffer = value.strip;
+						break;
+					case "retry":
+						try
+						{
+							const ms = value.strip.to!long;
+							cursor.retryMs = ms > maxRetryMs ? maxRetryMs : ms;
+						}
+						catch (Exception)
+						{
+						}
+						break;
+					default:
+						break;
 					}
 				}
 				if (shouldStop())
@@ -4042,6 +4071,48 @@ unittest  // readSseBody records id:/retry: into the caller-owned cursor
 	assert(events == ["{}"]);
 }
 
+unittest  // readSseBody treats a field line without a colon as that field with an empty value
+{
+	import vibe.stream.memory : createMemoryStream;
+
+	auto t = new HttpClientTransport("http://host:8080/mcp");
+	auto stream = createMemoryStream(cast(ubyte[])(
+			"data:a\ndata\ndata:b\n\nevent: endpoint\nevent\ndata: x\n\nid: 7\nid\ndata\n\n").dup,
+			false);
+	SseCursor cursor;
+	string[] events, types;
+	t.readSseBody(stream, false, cursor, () @safe => false, (string e, string d) @safe {
+		types ~= e;
+		events ~= d;
+	});
+	assert(events == ["a\n\nb", "x", ""], "a bare `data` line is an empty data line");
+	assert(types == ["", "", ""], "a bare `event` line resets the event type");
+	assert(cursor.lastEventId == "", "a bare `id` line resets the event id");
+}
+
+unittest  // readSseBody ignores a byte-order mark opening the stream, even when split across reads
+{
+	import vibe.stream.memory : createMemoryStream;
+
+	auto t = new HttpClientTransport("http://host:8080/mcp");
+	auto whole = createMemoryStream(cast(ubyte[]) "\xEF\xBB\xBFdata: {}\n\n".dup, false);
+	SseCursor cursor;
+	string[] events;
+	t.readSseBody(whole, false, cursor, () @safe => false, (string e, string d) @safe {
+		events ~= d;
+	});
+	assert(events == ["{}"]);
+
+	// A chunked body delivering the mark one byte per chunk.
+	auto split = createMemoryStream(cast(ubyte[])(
+			"1\r\n\xEF\r\n1\r\n\xBB\r\n1\r\n\xBF\r\nA\r\ndata: {}\n\n\r\n0\r\n\r\n").dup, false);
+	events = null;
+	t.readSseBody(split, true, cursor, () @safe => false, (string e, string d) @safe {
+		events ~= d;
+	});
+	assert(events == ["{}"]);
+}
+
 unittest  // each readSseBody caller's cursor is independent (no shared resumption state)
 {
 	import vibe.stream.memory : createMemoryStream;
@@ -4307,8 +4378,8 @@ unittest  // a bearer token carrying CR, LF or another control character is refu
 	import std.exception : collectException;
 
 	foreach (bad; [
-			"tok\r\nX-Injected: 1", "tok\nen", "to\x00k", "to k", "tok\x7F"
-		])
+		"tok\r\nX-Injected: 1", "tok\nen", "to\x00k", "to k", "tok\x7F"
+	])
 	{
 		auto t = new HttpClientTransport("http://127.0.0.1:8080/mcp");
 		t.setBearerToken(bad);
