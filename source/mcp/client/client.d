@@ -3159,12 +3159,19 @@ final class McpClient : ClientProtocol
 						eventSettings_.pollFloor.total!"msecs" << (failures < 6 ? failures : 6));
 				continue;
 			}
+			bool delivered; // at least one occurrence not already seen
 			foreach (occ; res.events)
 			{
 				if (sub.isCancelled())
 					return;
-				if (!deliverManagedEvent(sub, occ, onEvent))
+				final switch (deliverManagedEvent(sub, occ, onEvent))
 				{
+				case Delivery.handled:
+					delivered = true;
+					break;
+				case Delivery.duplicate:
+					break;
+				case Delivery.failed:
 					sub.markTerminated();
 					reportEventError(onControl, handlerFailure(occ));
 					return;
@@ -3177,7 +3184,10 @@ final class McpClient : ClientProtocol
 				c.cursor = res.cursor;
 				onControl(c);
 			}
-			const progressed = res.events.length > 0 || res.cursor != cur.cursor;
+			// Progress is a newly delivered occurrence or a cursor naming a new
+			// position; a null cursor or a batch of redeliveries is neither.
+			const progressed = delivered || (!res.cursor.isNull
+					&& res.cursor.get.length && res.cursor != cur.cursor);
 			sub.advanceCursor(res.cursor);
 			if (sub.isCancelled())
 				return;
@@ -3269,7 +3279,7 @@ final class McpClient : ClientProtocol
 			ms.lastFrameMs = eventNowMs();
 			if (!sub.active)
 				return;
-			if (!deliverManagedEvent(sub, o, ms.onEvent))
+			if (deliverManagedEvent(sub, o, ms.onEvent) == Delivery.failed)
 				endManagedStream(sub, ms, handlerFailure(o));
 		}, (EventControl c) @safe {
 			ms.lastFrameMs = eventNowMs();
@@ -3359,16 +3369,23 @@ final class McpClient : ClientProtocol
 		}
 	}
 
+	/// The outcome of handing one occurrence to a managed subscription.
+	private enum Delivery
+	{
+		handled, /// `onEvent` returned
+		duplicate, /// skipped: the dedup window already holds its id
+		failed, /// `onEvent` threw
+	}
+
 	/// Hand `occ` to a managed subscription's `onEvent`, recording it as delivered
 	/// and moving the watermark past it only once the handler returns, so the
-	/// cursor never passes an occurrence that was not handled. Returns false when
-	/// the handler threw, which the caller answers by ending the subscription;
-	/// true when the occurrence was handled or skipped as a duplicate.
-	private bool deliverManagedEvent(EventSubscription sub, EventOccurrence occ,
-			void delegate(EventOccurrence) @safe onEvent) @safe
+	/// cursor never passes an occurrence that was not handled. On `failed` the
+	/// caller ends the subscription.
+	private Delivery deliverManagedEvent(EventSubscription sub,
+			EventOccurrence occ, void delegate(EventOccurrence) @safe onEvent) @safe
 	{
 		if (sub.isSeen(occ.eventId))
-			return true;
+			return Delivery.duplicate;
 		if (onEvent !is null)
 		{
 			try
@@ -3378,12 +3395,12 @@ final class McpClient : ClientProtocol
 				import vibe.core.log : logWarn;
 
 				logWarn("[mcp.client] event handler for %s threw: %s", occ.name, e.msg);
-				return false;
+				return Delivery.failed;
 			}
 		}
 		sub.markSeen(occ.eventId);
 		sub.advanceCursor(occ.cursor);
-		return true;
+		return Delivery.handled;
 	}
 
 	/// The error a managed subscription reports when its `onEvent` threw on `occ`.
@@ -10536,6 +10553,65 @@ unittest  // the poll loop sleeps on a hasMore poll that made no progress
 	c.runPollLoop(sub, PollParams("incident.created"), null, null);
 	assert(polls == 2, "a hasMore poll with no events and the same cursor must not re-poll at once");
 	assert(sleeps == 2);
+}
+
+unittest  // the poll loop sleeps on a hasMore poll that returns no cursor and no events
+{
+	auto c = new McpClient(new RecordingClientTransport());
+	c.enableModern();
+	int polls;
+	auto sub = new EventSubscription();
+	c.onRpcForTest = (string method, Json params) @safe {
+		polls++;
+		if (polls > 5)
+			sub.cancel();
+		PollResult r;
+		r.hasMore = true;
+		return r.toJson();
+	};
+	int sleeps;
+	sub.advanceCursor(Nullable!string("c"));
+	c.onEventPollSleepForTest = (Duration d) @safe {
+		sleeps++;
+		if (sleeps == 2)
+			sub.cancel();
+	};
+	c.runPollLoop(sub, PollParams("incident.created"), null, null);
+	assert(polls == 2, "a null cursor is not progress");
+	assert(sleeps == 2);
+}
+
+unittest  // the poll loop sleeps on a hasMore poll whose events are all duplicates
+{
+	auto c = new McpClient(new RecordingClientTransport());
+	c.enableModern();
+	int polls;
+	auto sub = new EventSubscription();
+	sub.dedupCapacity(10);
+	c.onRpcForTest = (string method, Json params) @safe {
+		polls++;
+		if (polls > 5)
+			sub.cancel();
+		PollResult r;
+		r.events ~= EventOccurrence("e1", "incident.created", "t");
+		r.cursor = "c";
+		r.hasMore = true;
+		return r.toJson();
+	};
+	int sleeps, delivered;
+	sub.advanceCursor(Nullable!string("c"));
+	c.onEventPollSleepForTest = (Duration d) @safe {
+		sleeps++;
+		if (sleeps == 2)
+			sub.cancel();
+	};
+	c.runPollLoop(sub, PollParams("incident.created"), (EventOccurrence o) @safe {
+		delivered++;
+	}, null);
+	// The first poll delivers e1 (progress, so the drain continues); the second
+	// returns only the duplicate at the same cursor, which must sleep.
+	assert(polls == 3, "an all-duplicate batch at the same cursor is not progress");
+	assert(delivered == 1);
 }
 
 unittest  // the poll loop clamps a tiny nextPollMs up to the default 1000 ms floor
