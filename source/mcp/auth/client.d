@@ -343,7 +343,11 @@ final class OAuthClient
 	/// than being synthesized, keeping the recorded issuer the AS's authenticated
 	/// self-assertion that RFC 9207 mix-up detection anchors on. On the lenient
 	/// 2025-03-26 backcompat path a missing `issuer` is synthesized from the
-	/// request and a sub-path document's own assertion is accepted as-is.
+	/// request, and a document's own assertion is accepted when it is on the
+	/// requested issuer's origin (the document was served from there); one naming
+	/// another origin is refused, since the session would then reuse that
+	/// issuer's cached refresh token and client secret at this document's token
+	/// endpoint.
 	private static AuthorizationServerMetadata bindDiscoveredIssuer(
 			AuthorizationServerMetadata m, string issuer, bool enforceIssuerMatch) @safe
 	{
@@ -355,6 +359,12 @@ final class OAuthClient
 		else if (m.issuer.length == 0)
 		{
 			m.issuer = issuer;
+		}
+		else if (urlOrigin(canonicalResourceUri(m.issuer)) != urlOrigin(
+				canonicalResourceUri(issuer)))
+		{
+			throw internalError("Authorization server metadata names issuer '" ~ m.issuer
+					~ "', which is not on the origin it was discovered from (" ~ issuer ~ ")");
 		}
 		return m;
 	}
@@ -1191,6 +1201,30 @@ unittest  // 2025-03-26 backcompat path: a sub-path issuer mismatch is tolerated
 	auto m = OAuthClient.bindDiscoveredIssuer(AuthorizationServerMetadata.fromJson(j),
 			"https://mcp.example.com", false);
 	assert(m.issuer == "https://mcp.example.com/oauth");
+}
+
+unittest  // 2025-03-26 backcompat path: an issuer on another origin is refused
+{
+	import std.exception : assertThrown;
+	import vibe.data.json : parseJsonString;
+
+	// The MCP origin's document cannot claim another AS's identity, which would
+	// let it collect the refresh token and client secret that AS issued.
+	auto j = parseJsonString(
+			`{"issuer":"https://as.example.com",`
+			~ `"token_endpoint":"https://mcp.example.com/token"}`);
+	assertThrown(OAuthClient.bindDiscoveredIssuer(AuthorizationServerMetadata.fromJson(j),
+			"https://mcp.example.com", false));
+}
+
+unittest  // 2025-03-26 backcompat path: an issuer on the requested origin matches regardless of case and default port
+{
+	import vibe.data.json : parseJsonString;
+
+	auto j = parseJsonString(`{"issuer":"https://MCP.example.com:443/oauth"}`);
+	auto m = OAuthClient.bindDiscoveredIssuer(AuthorizationServerMetadata.fromJson(j),
+			"https://mcp.example.com", false);
+	assert(m.issuer == "https://MCP.example.com:443/oauth");
 }
 
 unittest  // 2025-03-26 backcompat path: a missing issuer is synthesized from the request
