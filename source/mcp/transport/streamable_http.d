@@ -929,6 +929,10 @@ private final class SseWriter
 	/// closed.
 	private Duration queueStallTimeout;
 
+	/// Called on the writer task once the stream has failed, so the loop holding
+	/// the stream open wakes then rather than at its next heartbeat.
+	void delegate() @safe nothrow onFailure;
+
 	this(HTTPServerResponse res, size_t maxQueued, Duration stallTimeout) @safe
 	{
 		this.res = res;
@@ -980,10 +984,19 @@ private final class SseWriter
 		wake.emit();
 	}
 
+	/// Whether the stream has failed; every later write throws.
+	bool failed() const @safe nothrow
+	{
+		return dead;
+	}
+
 	private void run() nothrow @safe
 	{
 		scope (exit)
 			finished.emit();
+		scope (exit)
+			if (dead && onFailure !is null)
+				onFailure();
 		try
 		{
 			while (true)
@@ -1063,31 +1076,23 @@ private SseWriter sseFrameWriter(HTTPServerResponse res, StreamLimits limits = S
 	return new SseWriter(res, limits.maxQueuedStreamBytes, limits.stallTimeout);
 }
 
-/// Hold an SSE connection open, emitting a comment heartbeat every 15s so a write
-/// failure (client disconnect) is observed and the loop terminates.
-private void runSseHeartbeat(void delegate(string) @safe writeFrame) @safe
-{
-	import vibe.core.core : sleep;
-	import core.time : seconds;
-
-	while (true)
-	{
-		sleep(15.seconds);
-		try
-			writeFrame(": ping\n\n");
-		catch (Exception)
-			break;
-	}
-}
-
-/// Hold a standalone GET SSE stream open until its listener is closed (the
-/// session was terminated), its session has expired or been evicted, or the
-/// client disconnects. Every `interval` it writes a comment heartbeat, which
-/// detects a disconnect, and refreshes the session's idle timer, so a client that
-/// only listens keeps its session alive.
-private void holdSessionStream(void delegate(string) @safe writeFrame, ServerPushChannel push,
+/// Hold an SSE stream fed by push-channel listener `listenerId` open until the
+/// listener is closed (for a GET stream, its session was terminated), the
+/// session `sid` has expired or been evicted, or the client disconnects. Every
+/// `interval` it writes a comment heartbeat, which detects a disconnect and
+/// refreshes the session's idle timer, so a client that only listens keeps its
+/// session alive. A failed write ends it at once. With no `sessions` the stream
+/// has no session to watch.
+private void holdSessionStream(SseWriter writeFrame, ServerPushChannel push,
 		long listenerId, SessionManager sessions, string sid, Duration interval) @safe
 {
+	writeFrame.onFailure = () @safe nothrow{
+		try
+			push.removeListener(listenerId);
+		catch (Exception)
+		{
+		}
+	};
 	while (!push.awaitClosed(listenerId, interval))
 	{
 		if (sessions !is null && sessions.stateFor(sid) is null)
@@ -1130,7 +1135,7 @@ private void handleLegacyGet(McpServer server, LegacySseChannel channel,
 	scope (exit)
 		push.removeListener(pushId);
 
-	holdSessionStream(&writeFrame.opCall, push, pushId, null, sessionId, 15.seconds);
+	holdSessionStream(writeFrame, push, pushId, null, sessionId, 15.seconds);
 }
 
 /// Parse a legacy POST body. A malformed one is answered with a JSON-RPC error
@@ -2048,7 +2053,7 @@ private void handleGet(McpServer server, ServerPushChannel push,
 		}
 	}
 
-	holdSessionStream(&writeFrame.opCall, push, listenerId, sessions, ownerToken, 15.seconds);
+	holdSessionStream(writeFrame, push, listenerId, sessions, ownerToken, 15.seconds);
 }
 
 /// Serve a modern `subscriptions/listen` request as a long-lived SSE notification
@@ -2124,7 +2129,7 @@ private void handleListenStream(McpServer server, ServerPushChannel push, Messag
 	push.emitTo(listenerId,
 			subscriptionsAcknowledgedNotification(server.acknowledgedSubsetFor(streamFilter)));
 
-	runSseHeartbeat(&writeFrame.opCall);
+	holdSessionStream(writeFrame, push, listenerId, null, "", 15.seconds);
 }
 
 /// Register a `subscriptions/listen` stream on `push`: its notifications are
@@ -2281,6 +2286,7 @@ private void handleEventsStream(McpServer server, Message msg,
 		}
 		terminatedEvt.emit();
 	};
+	writeFrame.onFailure = () @safe nothrow{ terminatedEvt.emit(); };
 
 	const emitOnly = rt.isEmitOnly(p.name);
 	long pollMs = 15_000;
@@ -2326,6 +2332,8 @@ private void handleEventsStream(McpServer server, Message msg,
 		catch (Exception)
 			break;
 		more = false;
+		if (writeFrame.failed)
+			break; // client disconnected
 		if (handle.stream.terminated)
 			break; // the server ended the stream; its final frame is already written
 		const sinceHeartbeatMs = (MonoTime.currTime - lastHeartbeat).total!"msecs";
@@ -4302,7 +4310,7 @@ unittest  // a session GET stream keeps its session alive and ends when the sess
 	bool ended, aliveAfterIdle;
 	runTask(() @safe nothrow{
 		try
-			holdSessionStream((string) @safe {}, push, lid, sessions, sid, 10.msecs);
+			holdSessionStream(discardingSseWriter(), push, lid, sessions, sid, 10.msecs);
 		catch (Exception)
 		{
 		}
@@ -4343,7 +4351,7 @@ unittest  // a session GET stream ends once its session has been evicted
 	bool ended;
 	runTask(() @safe nothrow{
 		try
-			holdSessionStream((string) @safe {}, push, lid, sessions, sid, 10.msecs);
+			holdSessionStream(discardingSseWriter(), push, lid, sessions, sid, 10.msecs);
 		catch (Exception)
 		{
 		}
@@ -4829,6 +4837,34 @@ unittest  // a write waiting on a full SSE queue fails as soon as the writer die
 	runEventLoop();
 	assert(failed, "a write to a dead stream must throw");
 	assert(took < 1.seconds, "a waiting write must wake when the writer dies");
+}
+
+unittest  // a held SSE stream ends as soon as its writer fails, not at the next heartbeat
+{
+	import core.time : MonoTime;
+	import vibe.core.core : runTask, exitEventLoop, runEventLoop;
+	import vibe.http.server : createTestHTTPServerResponse, TestHTTPResponseMode;
+
+	auto writer = sseFrameWriter(createTestHTTPServerResponse(new FailingSink,
+			null, TestHTTPResponseMode.bodyOnly));
+	auto push = new ServerPushChannel(new StreamCoordinator);
+	const lid = push.addListener((string f) @safe { writer(f); });
+	Duration took;
+	runTask(() @safe nothrow{
+		const started = MonoTime.currTime;
+		try
+		{
+			writer("data: {}\n\n");
+			holdSessionStream(writer, push, lid, null, "", 5.seconds);
+		}
+		catch (Exception)
+		{
+		}
+		took = MonoTime.currTime - started;
+		exitEventLoop();
+	});
+	runEventLoop();
+	assert(took < 2.seconds, "the hold loop must wake when the writer fails");
 }
 
 unittest  // several stalled SSE readers hold up a fan-out for one stall timeout, not one each
@@ -5565,6 +5601,15 @@ unittest  // eventStreamTick: poll only for non-emit-only; heartbeat only once t
 	assert(!eventStreamTick(false, eventStreamHeartbeatIntervalMs - 1).heartbeat);
 	assert(eventStreamTick(false, eventStreamHeartbeatIntervalMs).heartbeat);
 	assert(eventStreamTick(false, eventStreamHeartbeatIntervalMs * 2).heartbeat);
+}
+
+version (unittest) private SseWriter discardingSseWriter() @safe
+{
+	import vibe.http.server : createTestHTTPServerResponse, TestHTTPResponseMode;
+	import vibe.stream.memory : createMemoryOutputStream;
+
+	return sseFrameWriter(createTestHTTPServerResponse(createMemoryOutputStream(),
+			null, TestHTTPResponseMode.bodyOnly));
 }
 
 version (unittest) private HTTPServerRequest makeInitPostReq(string body_,
@@ -6972,6 +7017,51 @@ unittest  // a server-terminated emit-only events/stream ends promptly, not afte
 	}();
 	assert(ended, "the stream handler must return after a server-side termination");
 	assert(afterTerminate < 2.seconds, "the hold loop must wake on termination");
+}
+
+unittest  // an emit-only events/stream ends as soon as its client is gone, not at its heartbeat
+{
+	import core.time : MonoTime, seconds;
+	import vibe.core.core : runTask, exitEventLoop, runEventLoop;
+	import vibe.http.server : createTestHTTPServerResponse, TestHTTPResponseMode;
+	import vibe.http.router : URLRouter;
+	import mcp.server.events_runtime : EventRegistration;
+
+	auto server = McpServer.stateless("t", "1");
+	server.enableEvents();
+	EventRegistration reg;
+	reg.descriptor.name = "n";
+	reg.emitOnly = true;
+	server.registerEventType(reg);
+	auto router = new URLRouter;
+	mountMcp(router, server);
+
+	auto res = createTestHTTPServerResponse(new FailingSink, null, TestHTTPResponseMode.bodyOnly);
+	const body_ = `{"jsonrpc":"2.0","id":1,"method":"events/stream","params":{`
+		~ `"name":"n","_meta":{"protocolVersion":"2026-07-28",`
+		~ `"io.modelcontextprotocol/clientCapabilities":{}}}}`;
+	auto req = makeInitPostReq(body_, [
+		"Accept": "application/json, text/event-stream",
+		"MCP-Protocol-Version": "2026-07-28",
+		"Mcp-Method": "events/stream"
+	]);
+
+	Duration took = Duration.max;
+	() @trusted {
+		runTask(() nothrow{
+			scope (exit)
+				exitEventLoop();
+			const t0 = MonoTime.currTime;
+			try
+				router.handleRequest(req, res);
+			catch (Exception)
+			{
+			}
+			took = MonoTime.currTime - t0;
+		});
+		runEventLoop();
+	}();
+	assert(took < 2.seconds, "the hold loop must wake when the stream's writer fails");
 }
 
 /// Build the leading event the transport sends when it opens a
