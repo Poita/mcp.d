@@ -2695,14 +2695,16 @@ final class McpClient : ClientProtocol
 	/// client cannot answer is returned unfinished (`isInputRequired`).
 	ReadResourceResult readResource(string uri, RequestOptions opts = RequestOptions.init) @safe
 	{
-		return cachedFetch!ReadResourceResult(CacheKey("resources/read", uri),
-				opts.cacheMode, (out bool uncacheable) @safe {
-			auto token = effectiveToken(opts);
-			bool fromMrtr;
-			auto result = withPerCallProgress!ReadResourceResult(opts,
+		return withCancellation!ReadResourceResult(opts.cancellation, () @safe {
+			return cachedFetch!ReadResourceResult(CacheKey("resources/read",
+				uri), opts.cacheMode, (out bool uncacheable) @safe {
+				auto token = effectiveToken(opts);
+				bool fromMrtr;
+				auto result = withPerCallProgress!ReadResourceResult(opts,
 				() @safe => readResourceLoop(uri, token, fromMrtr, opts.logLevel));
-			uncacheable = fromMrtr;
-			return result;
+				uncacheable = fromMrtr;
+				return result;
+			});
 		});
 	}
 
@@ -12397,6 +12399,25 @@ unittest  // a resources/updated arriving while that resource's read is in fligh
 	c.readResource("a"); // the second one was
 	assert(calls == 2);
 	assert(c.cacheGenerations_.length == 0);
+}
+
+unittest  // readResource refuses an already-cancelled token even when the result is cached
+{
+	import std.exception : collectException;
+
+	auto c = McpClient.http("http://localhost");
+	c.onRpcForTest = (string m, Json p) @safe {
+		Json arr = Json.emptyArray;
+		arr ~= ResourceContents.makeText("a", "text/plain", "hi").toJson();
+		return Json(["contents": arr, "ttlMs": Json(5000)]);
+	};
+	c.readResource("a"); // now cached
+	auto token = new CancellationToken;
+	token.cancel("stop");
+	RequestOptions opts;
+	opts.cancellation = token;
+	auto e = cast(McpException) collectException(c.readResource("a", opts));
+	assert(e !is null && e.code == ErrorCode.requestCancelled);
 }
 
 unittest  // a truncated webhook subscribe result reaches onControl as a gap
