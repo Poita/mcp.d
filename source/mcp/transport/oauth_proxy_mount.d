@@ -1237,9 +1237,10 @@ package void mountOAuthCallback(URLRouter router, OAuthProxy proxy,
 		}
 		// RFC 9207: a response naming an issuer other than the configured upstream
 		// one came from a different authorization server (a mix-up attack), so its
-		// code is never relayed.
+		// code is never relayed. An upstream that sends `iss` sends it on every
+		// response, so one without it is refused too (§2.4).
 		const responseIssuer = req.query.get("iss", "");
-		if (upstreamIssuer.length && responseIssuer.length && responseIssuer != upstreamIssuer)
+		if (upstreamIssuer.length && responseIssuer != upstreamIssuer)
 		{
 			res.redirect(buildClientCallbackError(st.clientRedirectUri, "server_error",
 				"the authorization response came from an unexpected issuer",
@@ -4293,9 +4294,8 @@ unittest  // PASSTHROUGH: a refresh token the upstream rejects is forgotten, so 
 	import std.algorithm : canFind;
 
 	foreach (rejection; [
-			`400:{"error":"invalid_grant"}`,
-			`200:{"error":"bad_verification_code"}`
-		])
+		`400:{"error":"invalid_grant"}`, `200:{"error":"bad_verification_code"}`
+	])
 	{
 		auto proxy = mountSampleProxy();
 		auto router = new URLRouter;
@@ -4547,14 +4547,29 @@ unittest  // RFC 9207: a relayed upstream error carries the proxy's iss
 unittest  // RFC 9207: a callback whose iss is not the configured upstream issuer relays no code
 {
 	auto cfg = consentMountConfig();
-	cfg.upstreamIssuer = "https://github.com";
+	cfg.upstreamIssuer = "https://idp.example.com";
 	const bad = completeCallback(cfg, "&code=C1&iss=https%3A%2F%2Fevil.example");
 	assert(!bad.location.canFind("code=C1"));
 	assert(bad.status == 302 && bad.location.canFind("error="));
-	const good = completeCallback(cfg, "&code=C1&iss=https%3A%2F%2Fgithub.com");
+	const good = completeCallback(cfg, "&code=C1&iss=https%3A%2F%2Fidp.example.com");
 	assert(good.location.canFind("code=C1"));
+}
+
+unittest  // RFC 9207: with an upstream issuer configured, a callback carrying no iss relays no code
+{
+	auto cfg = consentMountConfig();
+	cfg.upstreamIssuer = "https://idp.example.com";
 	const absent = completeCallback(cfg, "&code=C1");
-	assert(absent.location.canFind("code=C1"));
+	assert(!absent.location.canFind("code=C1"));
+	assert(absent.status == 302 && absent.location.canFind("error=server_error"));
+	const absentError = completeCallback(cfg, "&error=access_denied");
+	assert(absentError.location.canFind("error=server_error"));
+}
+
+unittest  // RFC 9207: with no upstream issuer configured, a callback carrying no iss relays its code
+{
+	const cb = completeCallback(consentMountConfig(), "&code=C1");
+	assert(cb.location.canFind("code=C1"));
 }
 
 unittest  // RFC 9207: an /authorize error redirected to the client carries the proxy's iss

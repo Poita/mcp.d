@@ -91,9 +91,12 @@ struct OAuthProxyConfig
 	/// with the IdP. Handed to every MCP client at DCR time.
 	string upstreamClientId;
 
-	/// The upstream IdP's issuer identifier. When set, an upstream authorization
-	/// response carrying an RFC 9207 `iss` parameter is relayed only when `iss`
-	/// equals it, defending against mix-up attacks; empty skips the check.
+	/// The upstream IdP's issuer identifier, for an upstream that sends the
+	/// RFC 9207 `iss` authorization response parameter (its metadata advertises
+	/// `authorization_response_iss_parameter_supported`). When set, an upstream
+	/// authorization response is relayed only when its `iss` equals this value,
+	/// and one without `iss` is refused, defending against mix-up attacks. Leave
+	/// empty for an upstream that does not send `iss`.
 	string upstreamIssuer;
 
 	/// The fixed upstream `client_secret`. May be empty for public PKCE clients.
