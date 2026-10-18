@@ -206,10 +206,20 @@ struct UiResourceMeta
 }
 
 /// Attach a UI link to a tool's `_meta` under the `ui` key, preserving any
-/// other `_meta` entries already present. Use this on a `Tool` descriptor built
-/// for `McpServer.registerTool`; the `@ui` UDA does the same for the
+/// other `_meta` entries already present, and enable the Apps extension on
+/// `server` (see `enableApps`) when it is not yet enabled. Use this on a `Tool`
+/// descriptor built for `server.registerTool`, as
+/// `server.setUiToolMeta(tool, ui)`; the `@ui` UDA does the same for the
 /// FastMCP-style `@tool` API.
-void setUiToolMeta(ref Tool tool, UiToolMeta ui) @safe
+void setUiToolMeta(McpServer server, ref Tool tool, UiToolMeta ui) @safe
+{
+	attachUiToolMeta(tool, ui);
+	ensureApps(server);
+}
+
+/// Attach a UI link to a tool's `_meta` under the `ui` key, preserving any
+/// other `_meta` entries already present.
+package(mcp) void attachUiToolMeta(ref Tool tool, UiToolMeta ui) @safe
 {
 	// A Json object is a reference, so copy it rather than add `ui` to an
 	// object the caller may share with other descriptors.
@@ -589,35 +599,44 @@ unittest  // registerUiResource rejects a uri that is not in the ui:// scheme
 	assertThrown!Exception(registerUiResource(s, UiResource("https://demo/widget", "w", "<x/>")));
 }
 
-unittest  // setUiToolMeta attaches the ui link under a tool's _meta.ui
+unittest  // attachUiToolMeta attaches the ui link under a tool's _meta.ui
 {
 	Tool t;
 	t.name = "render";
 	UiToolMeta ui = {resourceUri: "ui://demo/widget", visibility: ["model"]};
-	setUiToolMeta(t, ui);
+	attachUiToolMeta(t, ui);
 	auto j = t.toJson();
 	assert(j["_meta"]["ui"]["resourceUri"].get!string == "ui://demo/widget");
 	assert(j["_meta"]["ui"]["visibility"][0].get!string == "model");
 }
 
-unittest  // setUiToolMeta preserves other _meta keys already on the tool
+unittest  // attachUiToolMeta preserves other _meta keys already on the tool
 {
 	Tool t;
 	t.name = "render";
 	t.meta = Json(["category": Json("demo")]);
-	setUiToolMeta(t, UiToolMeta("ui://demo/widget"));
+	attachUiToolMeta(t, UiToolMeta("ui://demo/widget"));
 	auto j = t.toJson();
 	assert(j["_meta"]["category"].get!string == "demo");
 	assert(j["_meta"]["ui"]["resourceUri"].get!string == "ui://demo/widget");
 }
 
-unittest  // setUiToolMeta leaves a _meta object shared with another tool untouched
+unittest  // setUiToolMeta enables the Apps extension on the server the tool is for
+{
+	auto s = McpServer.stateless("t", "1");
+	Tool t;
+	t.name = "render";
+	s.setUiToolMeta(t, UiToolMeta("ui://demo/widget"));
+	assert(s.extensionEnabled(appsExtensionKey));
+}
+
+unittest  // attachUiToolMeta leaves a _meta object shared with another tool untouched
 {
 	auto shared_ = Json(["category": Json("demo")]);
 	Tool a, b;
 	a.meta = shared_;
 	b.meta = shared_;
-	setUiToolMeta(a, UiToolMeta("ui://demo/widget"));
+	attachUiToolMeta(a, UiToolMeta("ui://demo/widget"));
 	assert("ui" in a.meta);
 	assert("ui" !in b.meta);
 	assert("ui" !in shared_);

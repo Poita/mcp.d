@@ -19,7 +19,7 @@ import mcp.server.event_context : EventContext, EventResult, Event, EventBatch,
 	FetchContext, SubContext;
 import mcp.server.events_runtime : EventRegistration, EventCheck;
 import mcp.api.attributes;
-import mcp.api.apps : UiToolMeta, setUiToolMeta, ensureApps;
+import mcp.api.apps : UiToolMeta, attachUiToolMeta, ensureApps;
 import mcp.api.skills : Skill, isValidSkillPath, registerSkill,
 	skillFieldProblem, skillPathRule, unregisterSkill;
 import mcp.api.binding : bindJson, bindString, defaultAs, isAdvertisableDefault,
@@ -1211,7 +1211,7 @@ private Tool toolDescriptor(alias overload, A)(A attr) @safe
 			static foreach (v; a.visibility)
 				static assert(v == "model" || v == "app",
 						"@ui visibility must be \"model\" or \"app\", got: \"" ~ v ~ "\"");
-			setUiToolMeta(descriptor, UiToolMeta(a.resourceUri, a.visibility));
+			attachUiToolMeta(descriptor, UiToolMeta(a.resourceUri, a.visibility));
 		}
 	}
 	return descriptor;

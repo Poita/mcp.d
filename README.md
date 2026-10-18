@@ -818,8 +818,9 @@ Set `UiResource.htmlProvider` instead of `html` to generate the document on each
 read.
 
 A `@tool` carries its UI link via `@ui(resourceUri, visibility…)` (folded into the
-tool's `_meta.ui`); the dynamic path uses `setUiToolMeta(tool, UiToolMeta(...))`.
-Registering a `@ui` tool or a UI resource advertises the extension; call
+tool's `_meta.ui`); the dynamic path uses `server.setUiToolMeta(tool, UiToolMeta(...))`.
+Registering a `@ui` tool or a UI resource, or calling `setUiToolMeta`, advertises
+the extension; call
 `server.enableApps(mimeTypes)` only to declare content types in addition to
 `text/html;profile=mcp-app`, which is always advertised (before or after
 registering).
