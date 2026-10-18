@@ -338,11 +338,15 @@ package Nullable!string verifyIncomingRequestState(RequestStateCodec codec,
 /// the incoming seam will verify against. A result carrying `inputRequests`
 /// but no `requestState` gets a blob of the empty state, so the retry that
 /// answers it can prove it answers this round. Tool and prompt input-required results
-/// share this single top-level field, so one seam covers both.
+/// share this single top-level field, so one seam covers both. Results of any
+/// other method (e.g. a `tasks/get` DetailedTask that carries `inputRequests`)
+/// are returned unchanged: they have no `requestState` field.
 package Json secureOutgoingRequestState(RequestStateCodec codec, Json result,
 		string method, Json params, RequestContext ctx) @safe
 {
 	if (codec is null || result.type != Json.Type.object)
+		return result;
+	if (method != "tools/call" && method != "prompts/get")
 		return result;
 	string plain;
 	if (auto p = "requestState" in result)
@@ -802,5 +806,18 @@ unittest  // a complete result without requestState is left unchanged
 	Json result = Json(["content": Json.emptyArray]);
 	auto out_ = secureOutgoingRequestState(codec, result, "tools/call",
 			Json.emptyObject, new AnonymousCtx());
+	assert("requestState" !in out_);
+}
+
+unittest  // a tasks/get result carrying inputRequests gets no requestState
+{
+	auto codec = signedCodec();
+	Json params = Json(["taskId": Json("t1")]);
+	Json result = Json([
+		"taskId": Json("t1"),
+		"status": Json("input_required"),
+		"inputRequests": Json(["a": Json(["method": Json("roots/list")])])
+	]);
+	auto out_ = secureOutgoingRequestState(codec, result, "tasks/get", params, new AnonymousCtx());
 	assert("requestState" !in out_);
 }
