@@ -9,7 +9,7 @@ import vibe.data.json : Json, parseJsonString;
 
 import mcp.protocol.jsonrpc;
 import mcp.protocol.errors;
-import mcp.server.context : CancellationToken;
+import mcp.server.context : CancellationToken, CancelRegistration;
 import mcp.transport.coordinator : DuplexCoordinator, cancelledNotification;
 
 @safe:
@@ -511,10 +511,14 @@ final class DuplexChannel
 		coord.register(id);
 		auto write = startWrite(makeRequest(Json(id), method, params), id);
 		bool settled;
+		CancelRegistration onCancelled;
 		scope (exit)
+		{
 			settled = true;
+			onCancelled.remove();
+		}
 		if (cancellation !is null)
-			cancellation.onCancel(() @safe nothrow{
+			onCancelled = cancellation.onCancel(() @safe nothrow{
 				if (settled)
 					return;
 				abandon(id, write, "the request it serves was cancelled");

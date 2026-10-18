@@ -26,8 +26,15 @@ import mcp.server.connection : ConnectionState;
 /// cancelled request, Free associated resources, Not send a response".
 final class CancellationToken
 {
+	private static struct Callback
+	{
+		ulong id;
+		void delegate() @safe nothrow dg;
+	}
+
 	private bool cancelled_;
-	private void delegate() @safe nothrow[] onCancel_;
+	private Callback[] onCancel_;
+	private ulong nextId_;
 
 	/// Whether a cancellation has been requested for this token's request.
 	bool cancelled() const @safe nothrow @nogc
@@ -35,8 +42,8 @@ final class CancellationToken
 		return cancelled_;
 	}
 
-	/// Mark the request cancelled and run the callbacks given to `onCancel`.
-	/// Idempotent.
+	/// Mark the request cancelled and run the callbacks given to `onCancel`
+	/// that are still registered. Idempotent.
 	void cancel() @safe nothrow
 	{
 		if (cancelled_)
@@ -44,19 +51,54 @@ final class CancellationToken
 		cancelled_ = true;
 		auto callbacks = onCancel_;
 		onCancel_ = null;
-		foreach (dg; callbacks)
-			dg();
+		foreach (c; callbacks)
+			c.dg();
 	}
 
 	/// Run `dg` when the request is cancelled, or now if it already is, so work
 	/// parked on the request's behalf (a server->client request awaiting the
-	/// client's reply) is released at once.
-	void onCancel(void delegate() @safe nothrow dg) @safe nothrow
+	/// client's reply) is released at once. The returned registration's
+	/// `remove` drops `dg` once that work ends, so a long-lived request making
+	/// many such calls does not accumulate callbacks.
+	CancelRegistration onCancel(void delegate() @safe nothrow dg) @safe nothrow
 	{
 		if (cancelled_)
+		{
 			dg();
-		else
-			onCancel_ ~= dg;
+			return CancelRegistration.init;
+		}
+		const id = nextId_++;
+		onCancel_ ~= Callback(id, dg);
+		return CancelRegistration(this, id);
+	}
+
+	private void unregister(ulong id) @safe nothrow
+	{
+		foreach (i, c; onCancel_)
+			if (c.id == id)
+			{
+				onCancel_[i] = onCancel_[$ - 1];
+				onCancel_ = onCancel_[0 .. $ - 1];
+				return;
+			}
+	}
+}
+
+/// A callback registered with `CancellationToken.onCancel`. `remove` drops it
+/// so it never runs; removing it again, or removing an empty registration, does
+/// nothing.
+struct CancelRegistration
+{
+	private CancellationToken token_;
+	private ulong id_;
+
+	/// Drop the callback from its token.
+	void remove() @safe nothrow
+	{
+		if (token_ is null)
+			return;
+		token_.unregister(id_);
+		token_ = null;
 	}
 }
 
@@ -1399,6 +1441,43 @@ unittest  // a CancellationToken starts uncancelled and cancel() is idempotent
 	assert(token.cancelled);
 	token.cancel();
 	assert(token.cancelled);
+}
+
+unittest  // a removed onCancel callback is released and never runs
+{
+	auto token = new CancellationToken;
+	int runs;
+	foreach (_; 0 .. 100)
+		token.onCancel(() @safe nothrow{ runs++; }).remove();
+	auto kept = token.onCancel(() @safe nothrow{ runs += 1000; });
+	assert(token.onCancel_.length == 1);
+	token.cancel();
+	assert(runs == 1000);
+	kept.remove();
+}
+
+unittest  // removing an onCancel registration twice, or an empty one, is harmless
+{
+	auto token = new CancellationToken;
+	int runs;
+	auto a = token.onCancel(() @safe nothrow{ runs++; });
+	auto b = token.onCancel(() @safe nothrow{ runs += 10; });
+	a.remove();
+	a.remove();
+	CancelRegistration none;
+	none.remove();
+	token.cancel();
+	assert(runs == 10);
+}
+
+unittest  // onCancel on a cancelled token runs the callback at once and registers nothing
+{
+	auto token = new CancellationToken;
+	token.cancel();
+	int runs;
+	token.onCancel(() @safe nothrow{ runs++; }).remove();
+	assert(runs == 1);
+	assert(token.onCancel_.length == 0);
 }
 
 unittest  // NullContext reports never-cancelled (no out-of-band channel)
