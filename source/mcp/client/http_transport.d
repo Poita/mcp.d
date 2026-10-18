@@ -442,6 +442,8 @@ final class HttpClientTransport : ClientTransport
 	// no-op, so a second standalone stream is never spawned and the live socket
 	// slots are never orphaned.
 	private bool serverStreamAlive;
+	/// How many times the standalone stream has resolved the endpoint host.
+	version (unittest) package size_t serverStreamResolutions;
 	// Set when a session expiry ended the standalone stream `startServerStream`
 	// opened, so the `notifications/initialized` of the next session reopens it.
 	private bool reopenServerStream;
@@ -1972,9 +1974,6 @@ final class HttpClientTransport : ClientTransport
 
 		// The URL the stream is opened at: the endpoint, or where it redirected.
 		string target = url;
-		HttpEndpoint ep;
-		string pinnedHost;
-		string pinnedTarget;
 		size_t redirects;
 
 		// `id:`/`retry:` resumption state is tracked in this reconnect loop's own
@@ -1994,13 +1993,6 @@ final class HttpClientTransport : ClientTransport
 			{
 				reopenServerStream = true;
 				break;
-			}
-			if (pinnedTarget != target)
-			{
-				// Resolve + pin the endpoint host to a numeric address.
-				ep = parseHttpEndpoint(target);
-				pinnedHost = pinnedEndpointHost(ep);
-				pinnedTarget = target;
 			}
 			bool refused;
 			bool sawData;
@@ -2025,6 +2017,13 @@ final class HttpClientTransport : ClientTransport
 			() {
 				try
 				{
+					// Resolve + pin the endpoint host to a numeric address on every
+					// attempt, so a reconnect follows the host to a new address and a
+					// failed lookup is retried like a failed connect.
+					const ep = parseHttpEndpoint(target);
+					const pinnedHost = pinnedEndpointHost(ep);
+					version (unittest)
+						serverStreamResolutions++;
 					auto sock = connectTimed(pinnedHost, ep.port);
 					// `attach` closes `sock` immediately if a `close()` already ran during
 					// the `connectTCP` yield, so the socket is never leaked or left parked.
@@ -6178,6 +6177,33 @@ unittest  // the standalone server stream keeps reconnecting after repeated clos
 	assert(failure.length == 0, "scenario failed: " ~ failure);
 	assert(getIds.length >= 4, "the standalone stream must keep reconnecting");
 	assert(getIds[0 .. 4] == ["", "s1", "s2", "s3"]);
+}
+
+unittest  // each reconnect of the standalone stream resolves the endpoint host afresh
+{
+	import core.time : msecs, MonoTime;
+	import vibe.core.core : sleep;
+
+	int gets;
+	size_t resolutions;
+	auto router = new URLRouter;
+	router.get("/mcp", (HTTPServerRequest req, HTTPServerResponse res) @safe {
+		gets++;
+		writeSse(res, "retry: 20\n: tick\n\n");
+	});
+	const failure = runAgainstFakeServer(router, (string url) @safe {
+		auto t = new HttpClientTransport(url);
+		scope (exit)
+			t.close();
+		t.startServerStream();
+		const until = MonoTime.currTime + 3.seconds;
+		while (gets < 3 && MonoTime.currTime < until)
+			sleep(20.msecs);
+		resolutions = t.serverStreamResolutions;
+	});
+	assert(failure.length == 0, "scenario failed: " ~ failure);
+	assert(gets >= 3, "the standalone stream must keep reconnecting");
+	assert(resolutions >= 3, "every reconnect must resolve the host, not reuse the first address");
 }
 
 unittest  // each reconnect of the standalone stream sends the current protocol-version header
