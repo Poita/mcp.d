@@ -1597,11 +1597,31 @@ struct TokenSet
 				if (d > 0 && d < 9.0e18)
 					t.expiresIn = cast(long) d;
 			}
+			else if (e.type == Json.Type.string)
+				t.expiresIn = parseDecimalSeconds(e.get!string);
 		}
 		t.refreshToken = strField(j, "refresh_token");
 		t.scope_ = strField(j, "scope");
 		return t;
 	}
+}
+
+/// A positive decimal-digit `expires_in` string that some authorization servers
+/// send in place of a JSON number, or 0 (no known expiry) for anything else.
+private long parseDecimalSeconds(string s) @safe pure nothrow
+{
+	import std.ascii : isDigit;
+
+	if (s.length == 0 || s.length > 18)
+		return 0;
+	long v;
+	foreach (c; s)
+	{
+		if (!isDigit(c))
+			return 0;
+		v = v * 10 + (c - '0');
+	}
+	return v;
 }
 
 private string enc(string s) @safe
@@ -1935,6 +1955,24 @@ unittest  // TokenSet.fromJson ignores a float expires_in outside the range of a
 	assert(ts.expiresIn == 0);
 	ts = TokenSet.fromJson(parseJson(`{"access_token":"tok","expires_in":-5.0}`));
 	assert(ts.expiresIn == 0);
+}
+
+unittest  // TokenSet.fromJson parses expires_in when AS returns it as a decimal string
+{
+	auto ts = TokenSet.fromJson(parseJson(`{"access_token":"tok","expires_in":"3600"}`));
+	assert(ts.expiresIn == 3600);
+}
+
+unittest  // TokenSet.fromJson ignores a string expires_in that is not a positive decimal a long holds
+{
+	foreach (v; [
+			`""`, `"abc"`, `"-5"`, `"+5"`, `"36.5"`, `" 3600"`, `"0"`,
+			`"99999999999999999999"`
+		])
+	{
+		auto ts = TokenSet.fromJson(parseJson(`{"access_token":"tok","expires_in":` ~ v ~ `}`));
+		assert(ts.expiresIn == 0, v);
+	}
 }
 
 unittest  // TokenSet.fromJson parses expires_in when AS returns it as a JSON float
