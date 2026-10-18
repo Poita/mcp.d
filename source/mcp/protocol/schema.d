@@ -188,7 +188,7 @@ unittest  // a ulong above long.max is written and read back as its exact value
 	}
 
 	auto j = serializeWithPolicy!(JsonSerializer, EnumByNamePolicy)(S(ulong.max, [
-			1, 1UL << 63
+		1, 1UL << 63
 	]));
 	assert(j["n"].toString == "18446744073709551615", j.toString);
 	assert(j["ns"].toString == "[1,9223372036854775808]", j.toString);

@@ -1211,9 +1211,9 @@ unittest  // SubscribeParams rejects a delivery whose mode is not webhook
 	import mcp.protocol.errors : McpException, ErrorCode;
 
 	foreach (d; [
-			`{"mode":"push","url":"https://h/x"}`, `{"url":"https://h/x"}`,
-			`{"mode":1}`
-		])
+		`{"mode":"push","url":"https://h/x"}`, `{"url":"https://h/x"}`,
+		`{"mode":1}`
+	])
 	{
 		auto e = collectException!McpException(SubscribeParams.fromJson(
 				parseJsonString(`{"name":"n","delivery":` ~ d ~ `}`)));

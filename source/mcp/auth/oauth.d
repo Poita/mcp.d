@@ -1966,9 +1966,9 @@ unittest  // TokenSet.fromJson parses expires_in when AS returns it as a decimal
 unittest  // TokenSet.fromJson ignores a string expires_in that is not a positive decimal a long holds
 {
 	foreach (v; [
-			`""`, `"abc"`, `"-5"`, `"+5"`, `"36.5"`, `" 3600"`, `"0"`,
-			`"99999999999999999999"`
-		])
+		`""`, `"abc"`, `"-5"`, `"+5"`, `"36.5"`, `" 3600"`, `"0"`,
+		`"99999999999999999999"`
+	])
 	{
 		auto ts = TokenSet.fromJson(parseJson(`{"access_token":"tok","expires_in":` ~ v ~ `}`));
 		assert(ts.expiresIn == 0, v);
