@@ -1331,15 +1331,18 @@ final class McpServer : ServerCore
 	void registerTaskTool(Tool descriptor, TaskExecutor executor,
 			TaskToolOptions opts = TaskToolOptions.init) @safe
 	{
-		ensureTasks("task tool '" ~ descriptor.name ~ "'");
 		const toolName = descriptor.name;
 		const create = opts.create;
-		// The tool is registered first so a name clash throws before the
-		// executor map changes.
-		registerTool(descriptor, (Json args, RequestContext ctx) @safe {
-			return startTask(toolName, args, ctx, create);
-		});
-		registerTaskExecutor(descriptor.name, executor);
+		// The tool is validated and built first so a bad name or schema throws
+		// before the Tasks extension is enabled or the executor map changes.
+		requireToolNameAvailable(toolName);
+		auto entry = withCompiledValidators(RegisteredTool(descriptor,
+				(Json args, RequestContext ctx) @safe {
+				return startTask(toolName, args, ctx, create);
+			}));
+		ensureTasks("task tool '" ~ toolName ~ "'");
+		tools[toolName] = entry;
+		registerTaskExecutor(toolName, executor);
 		setToolTaskSupport(descriptor.name, opts.support == TaskSupport.none
 				? TaskSupport.optional : opts.support);
 	}
@@ -8961,6 +8964,22 @@ version (unittest) private McpServer twoQuestionTaskServer(out int* runs) @safe
 		return Json(["content": Json.emptyArray]);
 	});
 	return s;
+}
+
+unittest  // registerTaskTool with an invalid or taken name leaves Tasks disabled
+{
+	import std.exception : assertThrown;
+
+	auto s = McpServer.stateless("t", "1");
+	Tool bad = {name: "bad name"};
+	assertThrown(s.registerTaskTool(bad, (TaskContext tc) @safe => Json.emptyObject));
+	assert(s.taskRuntime_ is null);
+	assert("extensions" !in s.capabilities().toJson());
+
+	Tool plain = {name: "taken"};
+	s.registerTool(plain, (Json) @safe => CallToolResult());
+	assertThrown(s.registerTaskTool(plain, (TaskContext tc) @safe => Json.emptyObject));
+	assert(s.taskRuntime_ is null);
 }
 
 version (unittest) private Json taskUpdate(string id, Json responses) @safe
