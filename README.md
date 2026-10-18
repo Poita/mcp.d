@@ -227,7 +227,7 @@ the one remaining check is the harness's own wire-schema validator rejecting any
   document — with confused-deputy consent keyed on the stable `client_id` URL. The consent
   screen surfaces the `client_name`, the `client_id` host, the redirect-URI hostname and the
   requested scopes; consent is recorded per scope set, so a request for broader access re-prompts,
-  and only scopes listed in `OAuthProxyConfig.scopesSupported` (when set) are forwarded upstream.
+  and only scopes listed in `OAuthProxyConfig.scopesSupported` are forwarded upstream (none when it is empty).
   DCR remains as the deprecated fallback.
 
 - ✅ **Interactive client login** — `useOAuth` runs the full browser authorization-code flow

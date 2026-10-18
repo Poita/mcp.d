@@ -126,9 +126,11 @@ struct OAuthProxyConfig
 	/// user approves it here. Defaults to `/consent`.
 	string consentPath = "/consent";
 
-	/// The scopes advertised in the metadata documents the proxy publishes. When
-	/// set, these are also the only scopes `/authorize` forwards upstream; any
-	/// other requested scope is dropped (`forwardedScopes`).
+	/// The scopes advertised in the metadata documents the proxy publishes, and
+	/// the only scopes `/authorize` forwards upstream; any other requested scope
+	/// is dropped (`forwardedScopes`). Empty forwards no scope, leaving the
+	/// upstream to grant its default, so a client cannot reach arbitrary upstream
+	/// scopes under the proxy's own `client_id`.
 	string[] scopesSupported;
 
 	/// The `grant_types_supported` advertised in the published RFC 8414 AS
@@ -407,10 +409,10 @@ class InvalidScopeException : Exception
 }
 
 /// The scopes from the space-delimited `scopeStr` that the proxy forwards
-/// upstream: each distinct requested scope, restricted to `cfg.scopesSupported`
-/// when that is set, so a client cannot reach upstream scopes the proxy does not
-/// advertise under the proxy's own upstream `client_id`. Dropping the rest is a
-/// partial grant RFC 6749 §3.3 permits. Throws `InvalidScopeException` when
+/// upstream: each distinct requested scope listed in `cfg.scopesSupported` (none
+/// when that is empty), so a client cannot reach upstream scopes the proxy does
+/// not advertise under the proxy's own upstream `client_id`. Dropping the rest
+/// is a partial grant RFC 6749 §3.3 permits. Throws `InvalidScopeException` when
 /// `scopeStr` names more than `maxScopesPerRequest` distinct scopes, supported
 /// or not.
 string[] forwardedScopes(const OAuthProxyConfig cfg, string scopeStr) @safe
@@ -429,7 +431,7 @@ string[] forwardedScopes(const OAuthProxyConfig cfg, string scopeStr) @safe
 		if (seen.length == maxScopesPerRequest)
 			throw new InvalidScopeException("too many scopes requested");
 		seen[sc] = true;
-		if (supported.length && sc !in supported)
+		if (sc !in supported)
 			continue;
 		scopes ~= sc;
 	}
@@ -2610,14 +2612,16 @@ unittest  // proxied /authorize forwards only the scopes listed in scopesSupport
 	assert(!url.canFind("admin"), url);
 }
 
-unittest  // with no scopesSupported configured, the requested scopes are forwarded as-is
+unittest  // with no scopesSupported configured, no requested scope is forwarded upstream
 {
 	import std.algorithm : canFind;
 
 	auto cfg = sampleConfig();
 	cfg.scopesSupported = null;
+	assert(forwardedScopes(cfg, "read:user admin:org").length == 0);
 	auto url = proxyAuthorizeUrl(cfg, "CHALLENGE", "read:user admin:org", "S");
-	assert(url.canFind("admin%3Aorg"), url);
+	assert(!url.canFind("admin"), url);
+	assert(!url.canFind("read%3Auser"), url);
 }
 
 unittest  // proxied /token exchanges the code upstream with fixed creds (client_secret_post)
@@ -3342,15 +3346,15 @@ unittest  // CONSENT STORE: an approval evicted and granted again is not evicted
 
 unittest  // SCOPE CAP: a request naming more than maxScopesPerRequest distinct scopes is refused
 {
-	import std.array : join;
+	import std.array : array, join;
 	import std.conv : to;
 	import std.exception : assertNotThrown, assertThrown;
 	import std.range : iota;
 	import std.algorithm : map;
 
 	auto cfg = sampleConfig();
-	cfg.scopesSupported = null;
-	const atCap = iota(maxScopesPerRequest).map!(i => "s" ~ i.to!string).join(" ");
+	cfg.scopesSupported = iota(maxScopesPerRequest).map!(i => "s" ~ i.to!string).array;
+	const atCap = cfg.scopesSupported.join(" ");
 	assert(assertNotThrown(forwardedScopes(cfg, atCap ~ " s0")).length == maxScopesPerRequest);
 	assertThrown!InvalidScopeException(forwardedScopes(cfg, atCap ~ " extra"));
 	// Unsupported scopes count too: the cap bounds the work, not just the result.

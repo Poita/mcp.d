@@ -2389,6 +2389,7 @@ version (unittest)
 		cfg.upstreamClientId = "Iv1.upstream";
 		cfg.baseUrl = "https://mcp.example.com";
 		cfg.resource = "https://mcp.example.com/mcp";
+		cfg.scopesSupported = ["read", "write", "admin"];
 		return cfg;
 	}
 
@@ -2799,6 +2800,7 @@ version (unittest)
 		cfg.upstreamClientId = "Iv1.upstream";
 		cfg.baseUrl = "https://mcp.example.com";
 		cfg.resource = "https://mcp.example.com/mcp";
+		cfg.scopesSupported = ["read"];
 		cfg.clientIdMetadataDocumentSupported = true;
 		return cfg;
 	}

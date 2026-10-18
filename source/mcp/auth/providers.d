@@ -335,8 +335,9 @@ in (store !is null)
 
 /// GitHub OAuth app. Fills in GitHub's fixed authorize/token endpoints; the IdP
 /// has no DCR and issues opaque tokens, so the proxy fronts it. The author still
-/// supplies a `baseUrl`/`resource` for the proxy surface. Defaults to
-/// passthrough; a server that calls GitHub's API with the issued token should
+/// supplies a `baseUrl`/`resource` for the proxy surface. `scopes` are the only
+/// scopes the proxy forwards to GitHub; with none, GitHub grants its default
+/// (public, read-only) access. Defaults to passthrough; a server that calls GitHub's API with the issued token should
 /// chain `.brokered(...)` to switch to issue-own-token mode.
 ///
 /// GitHub tokens carry no audience, so the preset sets
@@ -362,6 +363,8 @@ OAuthProxyConfig github(string clientId, string clientSecret, string[] scopes = 
 
 /// Google. Fills in Google's fixed authorize/token endpoints; Google has no DCR,
 /// so the proxy fronts it. The author supplies the proxy `baseUrl`/`resource`.
+/// `scopes` are the only scopes the proxy forwards to Google, which refuses an
+/// authorization request naming none, so they default to `openid`.
 /// Defaults to passthrough; a server that calls Google's API with the issued
 /// token should chain `.brokered(...)` to switch to issue-own-token mode.
 ///
@@ -371,6 +374,7 @@ OAuthProxyConfig github(string clientId, string clientSecret, string[] scopes = 
 /// which confirms the token was issued to `clientId`. A replacement verifier
 /// must do the same, not merely check that it is a live Google token.
 OAuthProxyConfig google(string clientId, string clientSecret, string[] scopes = [
+	"openid"
 ]) @safe
 {
 	OAuthProxyConfig cfg;
@@ -731,6 +735,12 @@ unittest  // Google fills in its fixed authorize/token endpoints + credentials
 	assert(cfg.upstreamClientId == "client.apps.googleusercontent.com");
 	assert(cfg.upstreamClientSecret == "gsecret");
 	assert(cfg.scopesSupported == ["openid", "email"]);
+}
+
+unittest  // Google forwards the openid scope by default, since Google refuses an authorization request without one
+{
+	auto cfg = google("client.apps.googleusercontent.com", "gsecret");
+	assert(cfg.scopesSupported == ["openid"]);
 }
 
 unittest  // Google pins its RFC 9207 issuer so a mixed-up authorization response is refused
