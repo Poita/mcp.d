@@ -2364,8 +2364,9 @@ final class McpClient : ClientProtocol
 	/// Poll `tasks/get` until the task reaches a terminal status, honoring the
 	/// server's `pollIntervalMs` (`ClientSettings.taskPollInterval` when it gives
 	/// none). Returns the final `CallToolResult` on `completed`; throws on
-	/// `failed`/`cancelled`, and `RequestTimeoutException` once
-	/// `ClientSettings.taskTimeout` (when set) elapses. While the task is
+	/// `failed`/`cancelled`, `RequestTimeoutException` once
+	/// `ClientSettings.taskTimeout` (when set) elapses, and
+	/// `TransportClosedException` once the client is closed. While the task is
 	/// `input_required`, `onInputRequired` is invoked with the `inputRequests`
 	/// entries it has not yet been given in that phase (each key is delivered once,
 	/// even while it stays pending across polls) so the caller can answer via
@@ -2425,6 +2426,9 @@ final class McpClient : ClientProtocol
 		for (;;)
 		{
 			checkCancelled();
+			// A closed client's poll sleep returns at once, so polling stops here
+			// rather than spinning until the transport is released.
+			ensureOpen();
 			Json state;
 			try
 				state = getTaskState(taskId);
@@ -5225,6 +5229,30 @@ unittest  // getTask parses the Task metadata from a tasks/get reply
 	auto t = c.getTask("t1");
 	assert(t.taskId == "t1" && t.status == TaskStatus.working);
 	assert(t.ttlMs.get == 60_000);
+}
+
+unittest  // awaitTask stops polling with TransportClosedException once the client is closing
+{
+	import std.exception : assertThrown;
+
+	auto c = McpClient.http("http://localhost");
+	int polls;
+	// close() marks the client closed before releasing the transport; the
+	// teardown grace between the two must not leave the poll loop spinning.
+	c.onTaskSleepForTest = (Duration d) @safe { c.closed_ = true; };
+	c.onRpcForTest = (string method, Json params) @safe {
+		polls++;
+		if (polls > 5)
+			throw new McpException(ErrorCode.internalError, "still polling");
+		return Json([
+			"resultType": Json("complete"),
+			"taskId": Json("t1"),
+			"status": Json("working"),
+			"pollIntervalMs": Json(5_000)
+		]);
+	};
+	assertThrown!TransportClosedException(c.awaitTask("t1"));
+	assert(polls == 1);
 }
 
 unittest  // awaitTask polls to completion and returns the final CallToolResult
