@@ -8,7 +8,7 @@ import mcp.protocol.versions : ProtocolVersion;
 import mcp.server.server;
 import mcp.server.settings : ServerSettings;
 import mcp.transport.coordinator : defaultServerRequestTimeout;
-import mcp.transport.duplex : DuplexChannel, PostQueue, defaultMaxLineBytes;
+import mcp.transport.duplex : DuplexChannel, PostQueue, defaultMaxLineBytes, stderrLog;
 import mcp.transport.lines : FrameHead, LineReader;
 
 @safe:
@@ -553,7 +553,10 @@ struct StdioOptions
 
 	/// Receives a description of each failure the transport survives: a request
 	/// whose handling or reply write threw, an unreadable input. stdout carries
-	/// only MCP messages, so this defaults to stderr when null.
+	/// only MCP messages, so this defaults to stderr when null, written on a
+	/// thread of its own so a host not reading stderr cannot stall the server
+	/// (past 256 waiting lines, further ones are dropped and counted). It is
+	/// called on the event loop, so a delegate set here must not block.
 	void delegate(string) @safe nothrow onError;
 }
 
@@ -739,20 +742,12 @@ void runStdio(McpServer server, StdioOptions opts = StdioOptions.init)
 /// MCP messages.
 private void reportStdioError(void delegate(string) @safe nothrow onError, string msg) @safe nothrow
 {
-	import std.stdio : stderr;
-
 	if (onError !is null)
 	{
 		onError(msg);
 		return;
 	}
-	() @trusted nothrow{
-		try
-			stderr.writeln("[mcp.transport.stdio] ", msg);
-		catch (Exception)
-		{
-		}
-	}();
+	stderrLog.put("[mcp.transport.stdio] " ~ msg);
 }
 
 /// Result of one `StdioEnd` read/write: the eventcore status and byte count,

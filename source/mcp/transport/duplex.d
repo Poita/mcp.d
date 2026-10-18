@@ -80,7 +80,10 @@ final class DuplexChannel
 
 	/// Receives a description of each failure the read loop survives or ends on
 	/// (an unreadable input, a line whose handling threw). Defaults to stderr, the
-	/// stdio transport's logging channel, when null.
+	/// stdio transport's logging channel, when null; stderr is written on a thread
+	/// of its own, so a host not reading it cannot stall the event loop (past 256
+	/// waiting lines, further ones are dropped and counted). It is called on the
+	/// event loop, so a delegate set here must not block.
 	void delegate(string) @safe nothrow onError;
 
 	/// Whether an inbound line that is not a valid JSON-RPC message, and carries
@@ -127,20 +130,12 @@ final class DuplexChannel
 	/// Report `msg` to `onError`, or to stderr when it is null.
 	void reportError(string msg) @safe nothrow
 	{
-		import std.stdio : stderr;
-
 		if (onError !is null)
 		{
 			onError(msg);
 			return;
 		}
-		() @trusted nothrow{
-			try
-				stderr.writeln("[mcp.transport.duplex] ", msg);
-			catch (Exception)
-			{
-			}
-		}();
+		stderrLog.put("[mcp.transport.duplex] " ~ msg);
 	}
 
 	/// `readLine` returns the next inbound line (without terminator) or `null` at
@@ -823,6 +818,182 @@ package(mcp) final class PostQueue
 	}
 }
 
+/// Writes log lines on a thread of its own, so reporting a failure never waits
+/// on the destination: a host that does not drain the process's stderr pipe
+/// cannot stall the event loop through it. At most `cap` lines wait to be
+/// written; past that a line is counted and dropped, and the count is written
+/// once the writer catches up.
+package(mcp) final class BackgroundLog
+{
+	import core.sync.condition : Condition;
+	import core.sync.mutex : Mutex;
+	import core.thread : Thread;
+
+	private void delegate(string) @safe nothrow write;
+	private size_t cap;
+	private Mutex mtx;
+	private Condition wake;
+	private string[] queue;
+	private size_t dropped;
+	private bool busy; // the writer thread holds lines it has not written yet
+	private Thread thread;
+
+	this(void delegate(string) @safe nothrow write, size_t cap) @trusted nothrow
+	{
+		this.write = write;
+		this.cap = cap;
+		mtx = new Mutex;
+		wake = new Condition(mtx);
+	}
+
+	/// Queue `line` for writing, or count it as dropped when `cap` lines are
+	/// already waiting. Never waits for a write.
+	void put(string line) @trusted nothrow
+	{
+		mtx.lock_nothrow();
+		scope (exit)
+			mtx.unlock_nothrow();
+		if (queue.length >= cap)
+		{
+			++dropped;
+			return;
+		}
+		queue ~= line;
+		try
+		{
+			if (thread is null)
+			{
+				thread = new Thread(&run);
+				thread.isDaemon = true;
+				thread.start();
+			}
+			wake.notifyAll();
+		}
+		catch (Exception)
+		{
+		}
+	}
+
+	/// Wait up to `timeout` for every queued line to be written. Returns whether
+	/// they were.
+	bool flush(Duration timeout) @trusted nothrow
+	{
+		import core.time : MonoTime;
+
+		const deadline = MonoTime.currTime + timeout;
+		mtx.lock_nothrow();
+		scope (exit)
+			mtx.unlock_nothrow();
+		while (queue.length || dropped || busy)
+		{
+			const now = MonoTime.currTime;
+			if (now >= deadline)
+				return false;
+			try
+				wake.wait(deadline - now);
+			catch (Exception)
+				return false;
+		}
+		return true;
+	}
+
+	private void run() @trusted nothrow
+	{
+		for (;;)
+		{
+			string[] lines;
+			size_t lost;
+			{
+				mtx.lock_nothrow();
+				scope (exit)
+					mtx.unlock_nothrow();
+				busy = false;
+				try
+				{
+					wake.notifyAll();
+					while (queue.length == 0 && dropped == 0)
+						wake.wait();
+				}
+				catch (Exception)
+				{
+					return;
+				}
+				lines = queue;
+				queue = null;
+				lost = dropped;
+				dropped = 0;
+				busy = true;
+			}
+			foreach (l; lines)
+				write(l);
+			if (lost)
+				write("[mcp] " ~ intToString(lost) ~ " log lines dropped: stderr is not being read");
+		}
+	}
+}
+
+/// The process-wide stderr log behind the stdio transports' default error
+/// reporting.
+package(mcp) BackgroundLog stderrLog() @trusted nothrow
+{
+	__gshared BackgroundLog log;
+
+	synchronized
+	{
+		if (log is null)
+			log = new BackgroundLog((string line) @trusted nothrow{
+				import std.stdio : stderr;
+
+				try
+					stderr.writeln(line);
+				catch (Exception)
+				{
+				}
+			}, 256);
+	}
+	return log;
+}
+
+unittest  // BackgroundLog never runs its writer on the reporting thread and drops past its cap
+{
+	import core.sync.semaphore : Semaphore;
+	import core.thread : Thread;
+
+	auto caller = () @trusted { return Thread.getThis(); }();
+	auto gate = () @trusted { return new Semaphore(0); }();
+	auto entered = () @trusted { return new Semaphore(0); }();
+	shared bool onCaller;
+	string[] got;
+	auto log = new BackgroundLog((string line) @trusted nothrow{
+		if (Thread.getThis() is caller)
+		{
+			onCaller = true;
+			return;
+		}
+		try
+		{
+			entered.notify();
+			gate.wait();
+		}
+		catch (Exception)
+		{
+		}
+		got ~= line;
+	}, 2);
+	log.put("first");
+	assert(!onCaller, "a report must not wait for its write");
+	if (!onCaller)
+		() @trusted { entered.wait(); }();
+	foreach (_; 0 .. 5)
+		log.put("queued");
+	foreach (_; 0 .. 8)
+		() @trusted { gate.notify(); }();
+	assert(log.flush(5.seconds));
+	assert(got.length == 4 && got[0] == "first" && got[1] == "queued"
+			&& got[2] == "queued", "the first line is written, then the queued ones");
+	assert(got[3] == "[mcp] 3 log lines dropped: stderr is not being read", got[3]);
+}
+
 private string intToString(size_t n) @safe nothrow
 {
 	import std.conv : to;
@@ -1418,6 +1589,7 @@ version (Posix) unittest  // an exception thrown by the onInbound notification h
 	runEventLoop();
 
 	// Flush stderr (now pointing at the pipe) and read what was written to the pipe.
+	stderrLog.flush(5.seconds);
 	() @trusted { stderr.flush(); }();
 	// Make the read end non-blocking so we don't hang if nothing was written.
 	() @trusted { fcntl(errPipe[0], F_SETFL, O_NONBLOCK); }();
