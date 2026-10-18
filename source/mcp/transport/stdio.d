@@ -51,13 +51,15 @@ private __gshared bool _ranStdio;
 ///
 /// Requires a running vibe event loop; `serveStdio` runs the read loop on the
 /// CURRENT task and blocks until end-of-input, then waits up to
-/// `opts.drainTimeout` for request handlers still running to write their replies.
+/// `opts.drainTimeout` for request handlers still running to write their replies
+/// and for queued error replies to be written.
 ///
 /// `readLine` owns line framing, so `opts.maxLineBytes` is not applied here: a
 /// caller reading an untrusted stream bounds its own lines (`runStdio` does).
 void serveStdio(McpServer server, string delegate() @safe readLine,
 		void delegate(string) @safe writeLine, StdioOptions opts = StdioOptions.init)
 {
+	import core.time : MonoTime;
 	import vibe.core.core : runTask;
 	import vibe.data.json : Json;
 	import mcp.protocol.jsonrpc : Message, MessageKind;
@@ -364,7 +366,12 @@ void serveStdio(McpServer server, string delegate() @safe readLine,
 	// has computed its reply still needs to be scheduled so its sendRaw runs. Wait
 	// until every dispatched handler task has finished, bounded by
 	// `opts.drainTimeout` so a stuck handler cannot hold the process open forever.
+	// Posted lines (error replies, refusals) are waited for too, within the
+	// same deadline.
+	const drainStart = MonoTime.currTime;
 	inflight.awaitIdle(opts.drainTimeout);
+	const spent = MonoTime.currTime - drainStart;
+	channel.awaitPosted(spent < opts.drainTimeout ? opts.drainTimeout - spent : Duration.zero);
 }
 
 /// Call `tick` every `period` until `done` reports true. A tick that throws is
@@ -522,7 +529,8 @@ struct StdioOptions
 	size_t maxLineBytes = defaultMaxLineBytes;
 
 	/// How long the transport waits, once stdin reaches end-of-input, for request
-	/// handlers still running to finish and write their replies before it returns.
+	/// handlers still running to finish and write their replies, and for error
+	/// replies already queued to be written, before it returns.
 	Duration drainTimeout = 5.seconds;
 
 	/// The most inbound requests and batches handled at once (`0`: unbounded),
@@ -611,6 +619,7 @@ void runStdio(McpServer server, ServerSettings settings)
 void runStdio(McpServer server, StdioOptions opts = StdioOptions.init)
 {
 	const maxLineBytes = opts.maxLineBytes;
+	import core.time : MonoTime;
 	import vibe.core.core : runTask, runEventLoop, exitEventLoop;
 	import vibe.core.sync : TaskMutex;
 	import vibe.core.task : Task;
@@ -667,11 +676,16 @@ void runStdio(McpServer server, StdioOptions opts = StdioOptions.init)
 		reportStdioError(opts.onError, "dropped the reply to an over-long line: 64 writes are already waiting for the peer to read");
 	});
 
+	// When stdin reached end-of-input, which starts the `drainTimeout` drain.
+	MonoTime eofAt;
+
 	string readLine() @safe
 	{
 		for (;;)
 		{
 			auto line = reader.next(&readStdin);
+			if (line is null)
+				eofAt = MonoTime.currTime;
 			FrameHead head;
 			if (!reader.takeOversized(head))
 				return line;
@@ -683,9 +697,19 @@ void runStdio(McpServer server, StdioOptions opts = StdioOptions.init)
 		}
 	}
 
+	// Serve, then give the replies to over-long lines still being written what
+	// is left of the drain, so stdout is not released under them.
+	void serve() @safe
+	{
+		scope (exit)
+			oversizedPosts.awaitIdle((eofAt == MonoTime.init ? MonoTime.currTime
+					: eofAt) + opts.drainTimeout);
+		serveStdio(server, &readLine, &writeLine, opts);
+	}
+
 	if (Task.getThis() != Task.init)
 	{
-		serveStdio(server, &readLine, &writeLine, opts);
+		serve();
 		return;
 	}
 	() @trusted {
@@ -693,7 +717,7 @@ void runStdio(McpServer server, StdioOptions opts = StdioOptions.init)
 			scope (exit)
 				exitEventLoop();
 			try
-				serveStdio(server, &readLine, &writeLine, opts);
+				serve();
 			catch (Exception e)
 			{
 				// stdout carries only MCP messages, so a failure that ends the
@@ -2035,6 +2059,94 @@ version (Posix) unittest  // runStdio called from a task serves on that task wit
 	assert(loopKeptRunning, "runStdio does not stop the event loop it was called within");
 }
 
+version (Posix) unittest  // runStdio writes the reply to an over-long line that ends stdin before it returns
+{
+	import core.sys.posix.unistd : close, dup, dup2, pipe, read, write;
+	import core.sys.posix.fcntl : fcntl, F_GETFL, F_SETFL, O_NONBLOCK;
+	import core.thread : Thread;
+	import core.time : msecs;
+	import std.algorithm : canFind;
+	import vibe.core.core : runTask, runEventLoop, exitEventLoop;
+
+	const saved = () @trusted { return _ranStdio; }();
+	scope (exit)
+		() @trusted { _ranStdio = saved; }();
+	() @trusted { _ranStdio = false; }();
+
+	int[2] inPipe, outPipe;
+	const savedIn = () @trusted { return dup(0); }();
+	const savedOut = () @trusted { return dup(1); }();
+	enum line = `{"jsonrpc":"2.0","id":7,"method":"tools/list","params":{"pad":"aaaaaaaaaaaaaaaaaaaa"}}` ~ "\n";
+	() @trusted {
+		pipe(inPipe);
+		pipe(outPipe);
+		write(inPipe[1], line.ptr, line.length);
+		close(inPipe[1]);
+		// Fill stdout's pipe so the reply cannot be written until it is drained.
+		const flags = fcntl(outPipe[1], F_GETFL);
+		fcntl(outPipe[1], F_SETFL, flags | O_NONBLOCK);
+		ubyte[4096] junk;
+		while (write(outPipe[1], junk.ptr, junk.length) > 0)
+		{
+		}
+		fcntl(outPipe[1], F_SETFL, flags);
+		dup2(inPipe[0], 0);
+		dup2(outPipe[1], 1);
+		close(inPipe[0]);
+		close(outPipe[1]);
+	}();
+	scope (exit)
+		() @trusted {
+		dup2(savedIn, 0);
+		dup2(savedOut, 1);
+		close(savedIn);
+		close(savedOut);
+	}();
+
+	// Drain stdout's pipe a little after runStdio has seen end-of-input.
+	char[] drained;
+	auto drainer = () @trusted {
+		return new Thread({
+			import core.time : MonoTime, seconds;
+
+			Thread.sleep(300.msecs);
+			fcntl(outPipe[0], F_SETFL, fcntl(outPipe[0], F_GETFL) | O_NONBLOCK);
+			const deadline = MonoTime.currTime + 3.seconds;
+			char[4096] buf;
+			while (MonoTime.currTime < deadline && !drained.canFind(`-32600`))
+			{
+				const n = read(outPipe[0], buf.ptr, buf.length);
+				if (n > 0)
+					drained ~= buf[0 .. n];
+				else if (n == 0)
+					break;
+				else
+					Thread.sleep(10.msecs);
+			}
+			close(outPipe[0]);
+		}).start();
+	}();
+
+	runTask(() nothrow{
+		scope (exit)
+			exitEventLoop();
+		try
+		{
+			StdioOptions opts;
+			opts.maxLineBytes = 32;
+			opts.drainTimeout = 2.seconds;
+			runStdio(McpServer.stateless("oversized-eof", "1.0"), opts);
+		}
+		catch (Exception)
+		{
+		}
+	});
+	runEventLoop();
+	() @trusted { drainer.join(); }();
+	assert(drained.canFind(`"id":7`) && drained.canFind(`-32600`),
+			"the over-long line's error reply must be written before runStdio returns");
+}
+
 version (unittest)
 {
 	import std.typecons : nullable;
@@ -2647,6 +2759,37 @@ unittest  // the EOF drain waits for a handler that finishes on a timer after st
 	outputs = link.outbound.dup;
 
 	assert(outputs.length == 1, "a handler finishing shortly after EOF must still reply");
+}
+
+unittest  // the EOF drain waits for posted replies still being written
+{
+	import core.time : msecs;
+	import vibe.core.core : sleep;
+
+	auto s = McpServer.stateless("eof-drain-posted", "1.0");
+	auto link = new ServerLink;
+	string[] written;
+	void slowWrite(string line) @safe
+	{
+		sleep(100.msecs);
+		written ~= line;
+	}
+
+	runTask(() nothrow{
+		scope (exit)
+			exitEventLoop();
+		try
+			serveStdio(s, &link.readLine, &slowWrite);
+		catch (Exception)
+		{
+		}
+	});
+	link.feed(`not json`);
+	link.closeInput();
+	runEventLoop();
+	assert(written.length == 1,
+			"a posted parse-error reply must be written before serveStdio returns");
+	assert(parseJsonString(written[0])["error"]["code"].get!int == -32700);
 }
 
 unittest  // the EOF drain gives up on a stuck handler once its deadline passes

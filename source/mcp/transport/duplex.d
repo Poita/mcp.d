@@ -661,6 +661,15 @@ final class DuplexChannel
 		posts_.post(text);
 	}
 
+	/// Wait until every line handed to `post` has been written (or its write has
+	/// failed), or `timeout` elapses.
+	void awaitPosted(Duration timeout) @safe nothrow
+	{
+		import core.time : MonoTime;
+
+		posts_.awaitIdle(MonoTime.currTime + timeout);
+	}
+
 	/// Whether a line is being written right now. A write the peer does not
 	/// drain stays in progress until the peer reads or goes away.
 	bool writing() const @safe nothrow
@@ -748,17 +757,38 @@ final class DuplexChannel
 /// ignored: a posted line carries nothing its sender waits on.
 package(mcp) final class PostQueue
 {
+	import core.time : MonoTime;
+	import vibe.core.sync : LocalManualEvent, createManualEvent;
+
 	/// The most writes outstanding at once.
 	size_t cap;
 	private void delegate(string) @safe write;
 	private void delegate(string) @safe nothrow onDrop;
 	private size_t pending_;
+	private LocalManualEvent finished_;
 
 	this(void delegate(string) @safe write, size_t cap, void delegate(string) @safe nothrow onDrop) @safe nothrow
 	{
 		this.write = write;
 		this.cap = cap;
 		this.onDrop = onDrop;
+		finished_ = createManualEvent();
+	}
+
+	/// Wait until no posted write is outstanding or `deadline` passes.
+	void awaitIdle(MonoTime deadline) @safe nothrow
+	{
+		while (pending_ > 0)
+		{
+			const now = MonoTime.currTime;
+			if (now >= deadline)
+				return;
+			const ec = finished_.emitCount;
+			try
+				finished_.wait(deadline - now, ec);
+			catch (Exception)
+				return;
+		}
 	}
 
 	/// Write `line` on a task of its own, or drop it when `cap` writes are
@@ -774,7 +804,10 @@ package(mcp) final class PostQueue
 		++pending_;
 		runTask((string l) nothrow{
 			scope (exit)
+			{
 				--pending_;
+				finished_.emit();
+			}
 			try
 				write(l);
 			catch (Exception)
