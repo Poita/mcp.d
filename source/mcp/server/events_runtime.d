@@ -700,6 +700,7 @@ final class EventsRuntime
 	private bool[string] enqueuing_; // job ids tracked whose enqueue call has not yet returned
 	private WebhookRef[string] heldWebhookRefs_; // subscription id -> lifecycle key acquired on this node
 	private Nullable!string[string] emitBackfill_; // emit-only subscription id -> ring-buffer position its paged backfill has reached
+	private bool[string] awaitingReplay_; // new emit-only subscription ids being stored, whose replay is not yet read
 	private BackgroundLoop worker_; // the periodic worker `startDeliveryWorker` runs
 	private bool backlogged_; // the last drain claimed a full batch, so more may be ready
 	private TerminatePost[] terminatePosts_; // terminated envelopes waiting for a poster
@@ -1679,6 +1680,14 @@ final class EventsRuntime
 				releaseLifecycle(p.name, p.arguments, principal);
 				throw e;
 			}
+			// Until a new emit-only subscription's replay is read, live emits
+			// leave it to that replay: one routed live while the write is in
+			// flight would be queued ahead of the replayed events and carry the
+			// watermark past them.
+			if (regIsEmitOnly(reg))
+				awaitingReplay_[id] = true;
+			scope (failure)
+				awaitingReplay_.remove(id);
 			webhookStore_.put(sub);
 		}
 		else if (!webhookStore_.compareAndSwap(sub, existing.get.revision))
@@ -1817,6 +1826,7 @@ final class EventsRuntime
 			if (job.subscriptionId == subId)
 				trackedJobs_.remove(jobId);
 		emitBackfill_.remove(subId);
+		awaitingReplay_.remove(subId);
 		nextFetchAt_.remove(subId);
 		coalescedMisses_.remove(subId);
 		if (auto held = subId in heldWebhookRefs_)
@@ -1838,16 +1848,19 @@ final class EventsRuntime
 			EventRegistration* reg, Nullable!long maxAgeMs) @safe
 	{
 		EventResult er;
-		if (regIsEmitOnly(reg))
+		const emitOnly = regIsEmitOnly(reg);
+		if (emitOnly)
 		{
-			// Replay one batch the subscription's pending bound can take; the
-			// rest is paged from the ring buffer by the poll-driven pass, and
-			// live emits wait in the buffer behind it until it catches up.
+			// Replay one batch the subscription's pending bound can take. The
+			// subscription then pages on from the batch's end: what was emitted
+			// since the read is caught up below, and a remainder the bound holds
+			// back by the poll-driven pass, while live emits wait in the buffer.
+			scope (exit)
+				awaitingReplay_.remove(sub.id);
 			Nullable!long cap;
 			webhookFetchCap(sub.id, cap);
 			er = buffer_.readSince(sub.name, sub.cursor, maxAgeMs, cap);
-			if (er.hasMore)
-				emitBackfill_[sub.id] = er.cursor;
+			emitBackfill_[sub.id] = er.cursor;
 		}
 		else
 		{
@@ -1888,6 +1901,8 @@ final class EventsRuntime
 		bool any;
 		foreach (occ; er.events)
 			any |= enqueueForWebhook(sub, reg, occ);
+		if (emitOnly && !er.hasMore)
+			any |= pageEmitBackfill(sub.id, opts_.nowMs());
 		if (any)
 			kickDrain();
 		return er.truncated;
@@ -1942,38 +1957,45 @@ final class EventsRuntime
 	{
 		bool any;
 		foreach (id; emitBackfill_.keys)
+			any |= pageEmitBackfill(id, now);
+		return any;
+	}
+
+	// Page one emit-only backfill (see `pageEmitBackfills`). Returns whether a
+	// delivery was queued.
+	private bool pageEmitBackfill(string id, long now) @safe
+	{
+		auto sn = webhookStore_.get(id);
+		auto reg = sn.isNull ? null : sn.get.name in types_;
+		if (sn.isNull || sn.get.isExpired(now) || !regIsEmitOnly(reg)
+				|| !offersWebhook(sn.get.name))
 		{
-			auto sn = webhookStore_.get(id);
-			auto reg = sn.isNull ? null : sn.get.name in types_;
-			if (sn.isNull || sn.get.isExpired(now) || !regIsEmitOnly(reg)
-					|| !offersWebhook(sn.get.name))
-			{
+			emitBackfill_.remove(id);
+			return false;
+		}
+		auto sub = sn.get;
+		if (!sub.active)
+			return false;
+		bool any;
+		foreach (_; 0 .. maxWebhookFetchesPerPass)
+		{
+			auto pos = id in emitBackfill_;
+			Nullable!long cap;
+			if (pos is null || !webhookFetchCap(id, cap))
+				break;
+			auto er = buffer_.readSince(sub.name, *pos, Nullable!long.init, cap);
+			// Reaching the head hands the subscription to live routing before
+			// anything below can yield, so no emit falls between the two.
+			if (er.hasMore)
+				*pos = er.cursor;
+			else
 				emitBackfill_.remove(id);
-				continue;
-			}
-			auto sub = sn.get;
-			if (!sub.active)
-				continue;
-			foreach (_; 0 .. maxWebhookFetchesPerPass)
-			{
-				auto pos = id in emitBackfill_;
-				Nullable!long cap;
-				if (pos is null || !webhookFetchCap(id, cap))
-					break;
-				auto er = buffer_.readSince(sub.name, *pos, Nullable!long.init, cap);
-				// Reaching the head hands the subscription to live routing before
-				// anything below can yield, so no emit falls between the two.
-				if (er.hasMore)
-					*pos = er.cursor;
-				else
-					emitBackfill_.remove(id);
-				foreach (occ; er.events)
-					any |= enqueueForWebhook(sub, reg, occ);
-				if (er.truncated)
-					any |= enqueueGap(sub, er.cursor);
-				if (!er.hasMore)
-					break;
-			}
+			foreach (occ; er.events)
+				any |= enqueueForWebhook(sub, reg, occ);
+			if (er.truncated)
+				any |= enqueueGap(sub, er.cursor);
+			if (!er.hasMore)
+				break;
 		}
 		return any;
 	}
@@ -2483,8 +2505,9 @@ final class EventsRuntime
 				}
 				continue;
 			}
-			// A backfill still paging reaches this event in the ring buffer.
-			if ((sub.id in emitBackfill_) !is null)
+			// A backfill still paging, or a replay not yet read, reaches this
+			// event in the ring buffer.
+			if ((sub.id in emitBackfill_) !is null || (sub.id in awaitingReplay_) !is null)
 				continue;
 			any |= enqueueForWebhook(sub, reg, occ);
 		}
@@ -6991,7 +7014,7 @@ unittest  // webhook delivery applies match and transform to an onFetch type's e
 	auto rt = engineRuntime(ft);
 	shapedFetchType(rt);
 	auto p = webhookSub("incident.created", "https://proxy/hooks", Json([
-			"severity": Json("P1")
+		"severity": Json("P1")
 	]));
 	p.cursor = "c0";
 	rt.subscribeWebhook(p, "user-1");
@@ -8959,6 +8982,118 @@ unittest  // a reconcile pass while a new webhook subscription is stored does no
 	assert(subs == 1 && unsubs == 0);
 	rt.reconcileDeliveries();
 	assert(unsubs == 0);
+}
+
+version (unittest)
+{
+	// A store whose `put` lands the write and then runs `afterPut` before
+	// returning, as a shared store's round-trip lets other fibers run once the
+	// record is visible.
+	private final class LandThenYieldStore : ForwardingStore
+	{
+		void delegate() @safe afterPut;
+
+		override void put(WebhookSubscription sub) @safe
+		{
+			inner.put(sub);
+			if (afterPut !is null)
+			{
+				auto hook = afterPut;
+				afterPut = null;
+				hook();
+			}
+		}
+	}
+
+	private EventsRuntime yieldingStoreRuntime(LandThenYieldStore store, FakeWebhookTransport ft) @safe
+	{
+		EventsOptions o;
+		o.nowMs = () @safe => 1_000_000L;
+		o.nowIso = () @safe => "t";
+		o.allowPrivateCallbackHosts = true;
+		o.webhookTransport = ft;
+		o.deliverySleep = (Duration d) @safe {};
+		o.deliveryExecutor = (void delegate() @safe job) @safe { job(); };
+		auto rt = new EventsRuntime(store, o);
+		EventRegistration reg = {descriptor: EventType("n"), emitOnly: true};
+		rt.register(reg);
+		return rt;
+	}
+
+	private string[] postedEventIds(FakeWebhookTransport ft) @safe
+	{
+		string[] ids;
+		foreach (p; ft.eventPosts())
+			ids ~= parseJsonString(p.body)["eventId"].get!string;
+		return ids;
+	}
+}
+
+unittest  // an emit landing while a new subscription is stored is delivered after its replay
+{
+	auto store = new LandThenYieldStore();
+	auto ft = new FakeWebhookTransport();
+	auto rt = yieldingStoreRuntime(store, ft);
+	rt.emit(EventOccurrence("evt_0", "n", "t"));
+	const from = rt.buffer_.headCursor();
+	rt.emit(EventOccurrence("evt_1", "n", "t"));
+	rt.emit(EventOccurrence("evt_2", "n", "t"));
+	store.afterPut = () @safe { rt.emit(EventOccurrence("evt_3", "n", "t")); };
+	auto p = webhookSub("n", "https://proxy/hooks");
+	p.cursor = from;
+	auto r = rt.subscribeWebhook(p, "user-1");
+	assert(postedEventIds(ft) == ["evt_1", "evt_2", "evt_3"]);
+	assert(store.get(r.id).get.cursor == rt.buffer_.headCursor());
+}
+
+unittest  // an emit landing while a new subscription's replay is settled is delivered after it
+{
+	static final class YieldingCasStore : ForwardingStore
+	{
+		void delegate() @safe duringCas;
+
+		override bool compareAndSwap(WebhookSubscription sub, ulong expectedRevision) @safe
+		{
+			if (duringCas !is null)
+			{
+				auto hook = duringCas;
+				duringCas = null;
+				hook();
+			}
+			return inner.compareAndSwap(sub, expectedRevision);
+		}
+	}
+
+	auto store = new YieldingCasStore();
+	auto ft = new FakeWebhookTransport();
+	EventsOptions o;
+	o.nowMs = () @safe => 1_000_000L;
+	o.nowIso = () @safe => "t";
+	o.allowPrivateCallbackHosts = true;
+	o.webhookTransport = ft;
+	o.deliverySleep = (Duration d) @safe {};
+	o.deliveryExecutor = (void delegate() @safe job) @safe { job(); };
+	auto rt = new EventsRuntime(store, o);
+	EventRegistration reg = {descriptor: EventType("n"), emitOnly: true};
+	rt.register(reg);
+	rt.emit(EventOccurrence("evt_0", "n", "t"));
+	auto p = webhookSub("n", "https://proxy/hooks");
+	p.cursor = rt.buffer_.headCursor();
+	rt.emit(EventOccurrence("evt_1", "n", "t"));
+	store.duringCas = () @safe { rt.emit(EventOccurrence("evt_2", "n", "t")); };
+	rt.subscribeWebhook(p, "user-1");
+	assert(postedEventIds(ft) == ["evt_1", "evt_2"]);
+}
+
+unittest  // an emit landing while a bootstrapping subscription is stored is not replayed
+{
+	auto store = new LandThenYieldStore();
+	auto ft = new FakeWebhookTransport();
+	auto rt = yieldingStoreRuntime(store, ft);
+	store.afterPut = () @safe { rt.emit(EventOccurrence("evt_1", "n", "t")); };
+	rt.subscribeWebhook(webhookSub("n", "https://proxy/hooks"), "user-1");
+	rt.emit(EventOccurrence("evt_2", "n", "t"));
+	assert(postedEventIds(ft) == ["evt_2"]);
 }
 
 unittest  // a job for a subscription that lapsed before delivery is acked without a POST
