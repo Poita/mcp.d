@@ -3974,7 +3974,7 @@ unittest  // BROKER MOUNT: the upstream token is retrievable server-side from th
 	auto validate = referenceTokenValidator(store, "https://mcp.example.com/mcp");
 	auto info = validate(issuedToken);
 	assert(info.valid);
-	assert(info.claims["upstream_access_token"].get!string == "gho_upstream_secret");
+	assert(info.upstream.accessToken == "gho_upstream_secret");
 }
 
 unittest  // BROKER MOUNT: a 200 upstream response carrying an OAuth error mints no token

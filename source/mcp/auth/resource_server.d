@@ -8,6 +8,21 @@ import mcp.auth.oauth : ProtectedResourceMetadata;
 
 @safe:
 
+/// Upstream IdP tokens held server-side for a principal (an `OAuthProxy` in
+/// broker mode), so a handler can call the upstream API on the user's behalf.
+/// Kept apart from `TokenInfo.claims` so code that echoes or logs the claim set
+/// never exposes them, and redacted when formatted.
+struct UpstreamTokens
+{
+	string accessToken; /// the upstream access token; empty when none is held
+	string refreshToken; /// the upstream refresh token; empty when none was issued
+
+	void toString(scope void delegate(const(char)[]) @safe sink) const @safe
+	{
+		sink(accessToken.length ? "UpstreamTokens(<redacted>)" : "UpstreamTokens()");
+	}
+}
+
 /// The result of validating a bearer access token. A token validator returns
 /// this to the transport: `valid` gates the request, `scopes`/`subject`/`claims`
 /// describe the principal and are surfaced to tool handlers via
@@ -20,6 +35,7 @@ struct TokenInfo
 	string[] scopes; /// the scopes the token grants
 	string[] audience; /// the audiences the token was issued for (RFC 8707)
 	Json claims = Json.undefined; /// the full claim set, for handler inspection
+	UpstreamTokens upstream; /// upstream IdP tokens held for the principal, if any
 
 	/// true when the validator could not judge the token because its verifier
 	/// is temporarily out of reach (an IdP outage, a rate limit, a JWKS that

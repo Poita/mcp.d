@@ -319,7 +319,7 @@ ResourceServerConfig scalekit(string envUrl, JwtPresetOptions opts) @safe
 
 /// Switch a proxy preset into ISSUE-OWN-TOKEN (broker) mode: the proxy mints the
 /// MCP server's OWN opaque token for the client and keeps the upstream token
-/// server-side in `store` (reachable from the validated `TokenInfo.claims`),
+/// server-side in `store` (reachable from the validated `TokenInfo.upstream`),
 /// instead of relaying the upstream token to the client (passthrough). A
 /// self-brokering server — one that calls a downstream API with the issued token
 /// — should chain this onto a preset, e.g. `github(...).brokered(hook, store)`.

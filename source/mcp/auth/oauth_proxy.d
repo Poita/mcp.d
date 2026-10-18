@@ -43,7 +43,7 @@ import mcp.auth.oauth : AuthorizationServerMetadata, ClientIdMetadataDocument,
 import mcp.auth.reference_token : IssuedToken, ReferenceTokenStore, referenceTokenValidator;
 import mcp.protocol.ssrf : SsrfPolicy;
 import mcp.auth.resource_server : ResourceServerConfig, TokenInfo,
-	TokenValidator, bindResourceAudience;
+	TokenValidator, UpstreamTokens, bindResourceAudience;
 import mcp.internal.expiring_map : BoundedExpiringMap;
 
 @safe:
@@ -75,7 +75,7 @@ alias IssueTokenHook = IssuedToken delegate(TokenSet upstream) @safe;
 /// downstream API with the issued token — should instead set `issueToken` +
 /// `tokenStore` to switch to ISSUE-OWN-TOKEN (broker) mode, where the proxy mints
 /// its own opaque MCP token for the client and keeps the upstream token
-/// server-side (reachable from the validated `TokenInfo.claims`).
+/// server-side (reachable from the validated `TokenInfo.upstream`).
 struct OAuthProxyConfig
 {
 	/// The upstream IdP's authorization endpoint (e.g.
@@ -511,15 +511,6 @@ struct BrokeredToken
 	/// (`expiresAt == long.max`) or is already dead.
 	long expiresIn;
 }
-
-/// The `TokenInfo.claims` key under which the proxy stashes the upstream access
-/// token in broker mode, so a server handler can read it back from the validated
-/// token to call the upstream API on the user's behalf.
-enum string upstreamAccessTokenClaim = "upstream_access_token";
-
-/// The `TokenInfo.claims` key under which the proxy stashes the upstream refresh
-/// token in broker mode (present only when the upstream returned one).
-enum string upstreamRefreshTokenClaim = "upstream_refresh_token";
 
 // ===========================================================================
 // Redirect-URI registration + validation (RFC 6749 §3.1.2.2 / §10.6, RFC 8252)
@@ -1940,8 +1931,8 @@ final class OAuthProxy
 
 	/// Mint the MCP server's OWN token for the client from the `upstream` token
 	/// response, stash the upstream access (and refresh, when present) token in the
-	/// issued token's claims so the server can call the upstream API on the user's
-	/// behalf, store it, and return the opaque token to hand the client. The
+	/// issued token's `upstream` (surfaced as `TokenInfo.upstream`, never in its
+	/// claims) so the server can call the upstream API on the user's behalf, store it, and return the opaque token to hand the client. The
 	/// audience is bound to the proxy's `resource` so the issued token validates
 	/// against this server. Only valid in broker mode (`brokerEnabled`). Throws
 	/// when `upstream` carries no access token, so a failed upstream exchange can
@@ -1957,11 +1948,7 @@ final class OAuthProxy
 		auto issued = cfg.issueToken(upstream);
 		if (cfg.resource.length && !issued.audience.canFind(cfg.resource))
 			issued.audience ~= cfg.resource;
-		Json claims = issued.claims.type == Json.Type.object ? issued.claims : Json.emptyObject;
-		claims[upstreamAccessTokenClaim] = upstream.accessToken;
-		if (upstream.refreshToken.length)
-			claims[upstreamRefreshTokenClaim] = upstream.refreshToken;
-		issued.claims = claims;
+		issued.upstream = UpstreamTokens(upstream.accessToken, upstream.refreshToken);
 		const token = cfg.tokenStore.issue(issued);
 		const now = cfg.tokenStore.now();
 		const expiresIn = issued.expiresAt == long.max || issued.expiresAt <= now
@@ -3666,18 +3653,25 @@ unittest  // BROKER: the resource server accepts the issued token, rejects the r
 	assert(!validate("gho_upstream_secret").valid);
 }
 
-unittest  // BROKER: the stashed upstream token is retrievable from the validated TokenInfo claims
+unittest  // BROKER: the stashed upstream tokens are retrievable from the validated TokenInfo, outside its claims
 {
+	import std.algorithm : canFind;
+	import std.format : format;
+
 	auto cfg = brokerConfig();
 	auto proxy = new OAuthProxy(cfg);
 	TokenSet upstream;
 	upstream.accessToken = "gho_upstream_secret";
+	upstream.refreshToken = "ghr_upstream_secret";
 	const issued = proxy.issueClientToken(upstream);
 
 	auto validate = referenceTokenValidator(cfg.tokenStore, cfg.resource);
 	auto info = validate(issued.token);
 	assert(info.valid);
-	assert(info.claims["upstream_access_token"].get!string == "gho_upstream_secret");
+	assert(info.upstream.accessToken == "gho_upstream_secret");
+	assert(info.upstream.refreshToken == "ghr_upstream_secret");
+	assert(!info.claims.toString().canFind("upstream_secret"), info.claims.toString());
+	assert(!format("%s", info).canFind("upstream_secret"));
 }
 
 unittest  // BROKER: the issued token is audience-bound to the proxy's own resource

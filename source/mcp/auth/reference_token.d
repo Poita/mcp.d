@@ -3,7 +3,7 @@ module mcp.auth.reference_token;
 import std.typecons : Nullable, nullable;
 import vibe.data.json : Json;
 
-import mcp.auth.resource_server : TokenInfo, TokenValidator;
+import mcp.auth.resource_server : TokenInfo, TokenValidator, UpstreamTokens;
 
 @safe:
 
@@ -18,6 +18,7 @@ struct IssuedToken
 	string[] scopes; /// the scopes the token grants
 	string[] audience; /// the resources the token was issued for (RFC 8707)
 	Json claims = Json.undefined; /// arbitrary claims surfaced to handlers
+	UpstreamTokens upstream; /// upstream IdP tokens surfaced as `TokenInfo.upstream`
 	/// Absolute Unix-time expiry in seconds. The zero-value default (0) is
 	/// already in the past, so an `IssueTokenHook` that leaves this unset mints
 	/// an instantly-dead token — always set it (use `long.max` for a
@@ -199,6 +200,7 @@ in (store !is null)
 		info.scopes = t.scopes.dup;
 		// Copies, so a handler editing its TokenInfo cannot rewrite the stored token.
 		info.claims = t.claims.clone();
+		info.upstream = t.upstream;
 		info.audience = t.audience.length ? t.audience.dup : [resource];
 		return info;
 	};
