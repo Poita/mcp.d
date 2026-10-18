@@ -46,7 +46,7 @@ version (unittest) import mcp.transport.sse_context : StreamCoordinator, ensureP
 /// A registered tool: its descriptor plus the handler that executes it. The
 /// handler always returns a `ToolResponse`; the `CallToolResult`-returning
 /// registration overloads are adapted to one that always `complete`s.
-struct RegisteredTool
+private struct RegisteredTool
 {
 	Tool descriptor;
 	MrtrToolHandler handler;
@@ -85,7 +85,7 @@ struct TaskToolOptions
 }
 
 /// A registered direct resource: descriptor + reader producing its contents.
-struct RegisteredResource
+private struct RegisteredResource
 {
 	Resource descriptor;
 	ResourceReader reader;
@@ -103,7 +103,7 @@ struct RegisteredResource
 
 /// A registered resource template: descriptor + reader receiving the concrete
 /// URI, the captured `{var}` parameters, and the per-request context.
-struct RegisteredTemplate
+private struct RegisteredTemplate
 {
 	ResourceTemplate descriptor;
 	TemplateReader reader;
@@ -122,7 +122,7 @@ struct RegisteredTemplate
 /// A registered prompt: descriptor + handler producing its messages. The handler
 /// always returns a `PromptResponse`; the `GetPromptResult`-returning
 /// registration overload is adapted to one that always `complete`s.
-struct RegisteredPrompt
+private struct RegisteredPrompt
 {
 	Prompt descriptor;
 	MrtrPromptHandler handler;
@@ -4201,7 +4201,7 @@ final class McpServer : ServerCore
 /// Comma-separated variable lists are supported. A prefix modifier (`:n`) caps
 /// its variable's decoded value at `n` code points. An explode modifier (`*`) on
 /// the last variable of a `/` or `.` expression takes the remaining segments.
-bool matchUriTemplate(string tmpl, string uri, out string[string] params) @safe
+private bool matchUriTemplate(string tmpl, string uri, out string[string] params) @safe
 {
 	auto m = UriTemplateMatcher(tmpl, uri);
 	return m.match(0, 0, params);
@@ -4321,7 +4321,7 @@ private enum uriTemplatePrefixOps = "#./;?&";
 /// can never be reverse-matched against a concrete URI, as there is no boundary
 /// between them. An expression whose operator emits its own prefix ("{id}{?q}")
 /// is bounded.
-bool hasAdjacentUriVariables(string tmpl) @safe pure nothrow @nogc
+package(mcp) bool hasAdjacentUriVariables(string tmpl) @safe pure nothrow @nogc
 {
 	foreach (i; 2 .. tmpl.length)
 	{

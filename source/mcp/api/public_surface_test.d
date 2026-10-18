@@ -409,6 +409,16 @@ unittest
 		static assert(!reachableHere!("mcp.transport.oauth_proxy_mount." ~ sym), sym);
 }
 
+// The server's registry entries and URI-template matching are internal to it.
+unittest
+{
+	static foreach (sym; [
+		"RegisteredTool", "RegisteredResource", "RegisteredTemplate",
+		"RegisteredPrompt", "matchUriTemplate"
+	])
+		static assert(!reachableHere!("mcp.server.server." ~ sym), sym);
+}
+
 // A route mounted on its own takes its rate limit explicitly, so leaving one
 // out cannot silently disable it.
 unittest
