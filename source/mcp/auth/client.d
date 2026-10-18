@@ -15,7 +15,7 @@ import mcp.auth.oauth;
 
 /// Thrown when protected-resource-metadata discovery establishes the document is
 /// genuinely ABSENT — every candidate location was reachable but reported no
-/// document (a 404 / empty body). This is the only outcome that licenses the
+/// document (a 404, 410 or empty 2xx body). This is the only outcome that licenses the
 /// lenient 2025-03-26 origin-issuer fallback. A fetch FAILURE (SSRF block, TLS,
 /// DNS, network error, or a malformed body) is a different, non-absent outcome
 /// and must not be downgraded onto that lenient path.
@@ -28,9 +28,9 @@ class PrmAbsentException : Exception
 }
 
 /// The outcome of a discovery fetch: `ok` (2xx with a parseable JSON body),
-/// `notFound` (reachable but no usable document — a non-2xx or empty 2xx), or
-/// `error` (the fetch itself failed: SSRF block, TLS/DNS/network error, or a
-/// malformed body). The `error`/`notFound` split is what keeps a fetch failure
+/// `notFound` (reachable but no document — a 404, 410 or empty 2xx), or
+/// `error` (any other status, or the fetch itself failed: SSRF block,
+/// TLS/DNS/network error, or a malformed body). The `error`/`notFound` split is what keeps a fetch failure
 /// from masquerading as a genuinely-absent document.
 enum FetchResult
 {
@@ -846,10 +846,10 @@ final class OAuthClient
 		// address — including a hostname that resolves to one (DNS-rebinding SSRF
 		// mitigation, pinned at connect time).
 		Json parsed;
-		// A reachable response that is not a usable 2xx-with-body means "no document
-		// here"; an exception (SSRF block, TLS/DNS/network failure, or a malformed
-		// 2xx body) is a fetch error, tracked distinctly so it cannot be mistaken
-		// for a genuinely-absent document.
+		// A 404, 410 or empty 2xx means "no document here"; any other status, or an
+		// exception (SSRF block, TLS/DNS/network failure, or a malformed 2xx body),
+		// is a fetch error, tracked distinctly so it cannot be mistaken for a
+		// genuinely-absent document (a 401 or 503 says nothing about absence).
 		auto outcome = FetchResult.notFound;
 		try
 		{
@@ -863,6 +863,8 @@ final class OAuthClient
 					parsed = parseUntrustedJson(body); // a throw here is a fetch error, caught below
 					outcome = FetchResult.ok;
 				}
+				else if (res.statusCode / 100 != 2 && res.statusCode != 404 && res.statusCode != 410)
+					outcome = FetchResult.error;
 			});
 		}
 		catch (Exception e)
@@ -1768,6 +1770,53 @@ unittest  // discoverProtectedResource rejects a PRM document whose resource nam
 	assertThrown(c.discoverProtectedResource(srv.base ~ "/mcp"));
 	bool fromPrm;
 	assertThrown(c.resolveIssuer(srv.base ~ "/mcp", fromPrm));
+}
+
+unittest  // protected-resource metadata answered with a status other than 404/410 is a discovery failure, not absence
+{
+	import std.exception : assertThrown;
+
+	foreach (status; [401, 403, 500, 503])
+	{
+		auto srv = startLoopback((scope HTTPServerRequest req, scope HTTPServerResponse res) @safe {
+			res.statusCode = status;
+			res.writeBody("", "text/plain");
+		});
+		scope (exit)
+			srv.stop();
+
+		auto c = new OAuthClient();
+		try
+		{
+			c.discoverProtectedResource(srv.base ~ "/mcp");
+			assert(false, "discovery must fail");
+		}
+		catch (PrmAbsentException)
+			assert(false, "a non-404/410 status is not an absent document");
+		catch (Exception)
+		{
+		}
+		bool fromPrm;
+		assertThrown(c.resolveIssuer(srv.base ~ "/mcp", fromPrm));
+	}
+}
+
+unittest  // protected-resource metadata answered 404 or 410 is absent
+{
+	import std.exception : assertThrown;
+
+	foreach (status; [404, 410])
+	{
+		auto srv = startLoopback((scope HTTPServerRequest req, scope HTTPServerResponse res) @safe {
+			res.statusCode = status;
+			res.writeBody("", "text/plain");
+		});
+		scope (exit)
+			srv.stop();
+
+		auto c = new OAuthClient();
+		assertThrown!PrmAbsentException(c.discoverProtectedResource(srv.base ~ "/mcp"));
+	}
 }
 
 unittest  // discoverProtectedResource fetches a cross-origin resource_metadata URL from the challenge
