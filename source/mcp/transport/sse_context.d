@@ -2757,21 +2757,16 @@ package(mcp) bool clientConnected(HTTPServerResponse res) @safe nothrow
 
 /// Whether the peer of socket `fd` has closed its side and every byte it sent
 /// has been read off the socket. eventcore's sockets are non-blocking, so the
-/// peek never waits.
+/// peek never waits. Only POSIX sockets are peeked; on other platforms this
+/// reports the peer as still there.
 private bool socketAtEnd(int fd) @trusted nothrow
 {
-	ubyte b;
 	version (Posix)
 	{
 		import core.sys.posix.sys.socket : recv, MSG_PEEK;
 
+		ubyte b;
 		return recv(fd, &b, 1, MSG_PEEK) == 0;
-	}
-	else version (Windows)
-	{
-		import core.sys.windows.winsock2 : recv, MSG_PEEK, SOCKET;
-
-		return recv(cast(SOCKET) fd, &b, 1, MSG_PEEK) == 0;
 	}
 	else
 		return false;

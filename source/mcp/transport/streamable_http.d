@@ -3631,7 +3631,7 @@ unittest  // modern: a client closing its TCP connection mid-request cancels the
 	assert(cancelled, "a client disconnect must cancel a modern request");
 }
 
-unittest  // modern: a client that sends unread bytes before closing still cancels the request
+version (Posix) unittest  // modern: a client that sends unread bytes before closing still cancels the request
 {
 	import core.time : MonoTime, msecs;
 	import std.conv : to;
