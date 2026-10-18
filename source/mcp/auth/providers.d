@@ -91,7 +91,8 @@ ResourceServerConfig jwtResourceServer(string issuer, string jwksUri, JwtPresetO
 /// `vc.allowAnyAudience` is set), so a token that passes is also bound to
 /// `resource` (see `bindResourceAudience`); this lets an IdP whose `aud` is an
 /// API identifier rather than the MCP URL pass `authorize`'s RFC 8707 resource
-/// check. Under `vc.allowAnyAudience`, tokens must name `resource` itself.
+/// check. Under `vc.allowAnyAudience` the verifier checks no audience, so
+/// tokens must name `resource` itself, whether or not `vc.audience` is set.
 ResourceServerConfig resourceServer(JwtVerifierConfig vc, string resource) @safe
 {
 	import mcp.auth.resource_server : bindResourceAudience;
@@ -104,8 +105,8 @@ ResourceServerConfig resourceServer(JwtVerifierConfig vc, string resource) @safe
 	cfg.requiredScopes = vc.requiredScopes.dup;
 	cfg.scopesSupported = vc.requiredScopes.dup;
 	vc.requiredScopes = null;
-	cfg.validator = vc.audience.length ? bindResourceAudience(jwtVerifier(vc),
-			resource) : jwtVerifier(vc);
+	cfg.validator = vc.allowAnyAudience
+		? jwtVerifier(vc) : bindResourceAudience(jwtVerifier(vc), resource);
 	cfg.resource = resource;
 	if (vc.issuer.length)
 		cfg.authorizationServers = [vc.issuer];
@@ -747,7 +748,7 @@ unittest  // entraId and entraIdTenants require an explicit audience instead of 
 			JwtPresetOptions(mcpUrl)));
 	assert(one.canFind("audience"), one);
 	const many = collectExceptionMsg(entraIdTenants([
-			"11111111-1111-1111-1111-111111111111"
+		"11111111-1111-1111-1111-111111111111"
 	], JwtPresetOptions(mcpUrl)));
 	assert(many.canFind("audience"), many);
 }
@@ -848,7 +849,7 @@ unittest  // entraIdTenants rejects an empty allowlist and pseudo-tenants
 
 	assertThrown(entraIdTenants([], JwtPresetOptions(mcpUrl)));
 	assertThrown(entraIdTenants([
-			"11111111-1111-1111-1111-111111111111", "common"
+		"11111111-1111-1111-1111-111111111111", "common"
 	], JwtPresetOptions(mcpUrl, "api://my-app")));
 }
 
@@ -1033,6 +1034,22 @@ unittest  // a preset with a distinct audience still rejects a token minted for 
 	TokenInfo info;
 	assert(authorize(entraStyleConfig(),
 			"Bearer " ~ presetToken("api://other-api"), info) == AuthFailure.invalidToken);
+}
+
+unittest  // resourceServer under allowAnyAudience accepts only tokens naming the resource, even with an audience set
+{
+	import mcp.auth.resource_server : AuthFailure, TokenInfo, authorize;
+
+	JwtVerifierConfig vc;
+	vc.issuer = entraIssuer;
+	vc.staticPublicKeysPem = [presetEcPubPem];
+	vc.audience = "api://my-mcp-server";
+	vc.allowAnyAudience = true;
+	auto cfg = resourceServer(vc, mcpUrl);
+	TokenInfo info;
+	assert(authorize(cfg, "Bearer " ~ presetToken("https://other-service.example"),
+			info) == AuthFailure.invalidToken);
+	assert(authorize(cfg, "Bearer " ~ presetToken(mcpUrl), info) == AuthFailure.none);
 }
 
 unittest  // a preset answers a token missing a required scope with insufficient_scope (step-up)
