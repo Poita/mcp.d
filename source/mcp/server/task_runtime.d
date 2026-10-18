@@ -499,28 +499,42 @@ final class TaskRuntime
 	}
 
 	/// Move a task to `completed`, storing the final result for `tasks/get`. A
-	/// no-op if the task is already terminal (e.g. a cancel landed first).
+	/// task whose cancellation was requested is settled `cancelled` instead, so
+	/// a cancel landing between an executor's last check and its result still
+	/// wins. A no-op if the task is already terminal (e.g. a cancel landed first).
 	void complete(string id, Json result) @safe
 	{
-		modify(id, (ref TaskRecord r) @safe {
-			if (isTerminal(r.meta.status))
-				return Change.none;
-			transition(r, TaskStatus.completed);
+		settle(id, TaskStatus.completed, (ref TaskRecord r) @safe {
 			r.result = nullable(result);
-			r.inputRequests = Json.emptyObject;
-			return Change.status;
 		});
 	}
 
-	/// Move a task to `failed`, storing the JSON-RPC error for `tasks/get`. A
-	/// no-op if the task is already terminal.
+	/// Move a task to `failed`, storing the JSON-RPC error for `tasks/get`. As
+	/// with `complete`, a requested cancellation settles it `cancelled` instead.
+	/// A no-op if the task is already terminal.
 	void fail(string id, Json error) @safe
+	{
+		settle(id, TaskStatus.failed, (ref TaskRecord r) @safe {
+			r.error = nullable(error);
+		});
+	}
+
+	/// Settle task `id` as `status`, letting `payload` attach the result or
+	/// error, or as `cancelled` when a cancel was requested. The cancel flag is
+	/// read inside the compare-and-swap, so no concurrent request is missed.
+	private void settle(string id, TaskStatus status,
+			scope void delegate(ref TaskRecord) @safe payload) @safe
 	{
 		modify(id, (ref TaskRecord r) @safe {
 			if (isTerminal(r.meta.status))
 				return Change.none;
-			transition(r, TaskStatus.failed);
-			r.error = nullable(error);
+			if (r.cancelRequested)
+				transition(r, TaskStatus.cancelled);
+			else
+			{
+				transition(r, status);
+				payload(r);
+			}
 			r.inputRequests = Json.emptyObject;
 			return Change.status;
 		});
@@ -608,8 +622,7 @@ final class TaskRuntime
 	/// detached — transitions to `cancelled` immediately; for a running executor
 	/// the status is left untouched so it can observe the flag and stop at a safe
 	/// point, and a repeated request for it stores nothing. Once requested, the
-	/// cancel wins: when that executor returns or throws, its dispatcher records
-	/// the task `cancelled` rather than `completed` or `failed`.
+	/// cancel wins: a later `complete` or `fail` records the task `cancelled`.
 	void cancel(string id) @safe
 	{
 		modify(id, (ref TaskRecord r) @safe {
@@ -1524,6 +1537,30 @@ unittest  // a cancel racing a completion does not overwrite the stored result
 	auto d = rt.getDetailed(t.taskId);
 	assert(d["status"].get!string == "completed");
 	assert(d["result"]["structuredContent"]["ok"].get!bool);
+}
+
+unittest  // a completion racing a cancel request settles the task cancelled
+{
+	auto store = new RacingTaskStore();
+	auto rt = new TaskRuntime(TaskOptions(store));
+	auto t = rt.createFor("slow", Json.undefined);
+	store.beforeNextSwap = () @safe { rt.cancel(t.taskId); };
+	rt.complete(t.taskId, Json(["structuredContent": Json.emptyObject]));
+	auto d = rt.getDetailed(t.taskId);
+	assert(d["status"].get!string == "cancelled");
+	assert("result" !in d);
+}
+
+unittest  // a failure racing a cancel request settles the task cancelled
+{
+	auto store = new RacingTaskStore();
+	auto rt = new TaskRuntime(TaskOptions(store));
+	auto t = rt.createFor("slow", Json.undefined);
+	store.beforeNextSwap = () @safe { rt.cancel(t.taskId); };
+	rt.fail(t.taskId, internalError("boom"));
+	auto d = rt.getDetailed(t.taskId);
+	assert(d["status"].get!string == "cancelled");
+	assert("error" !in d);
 }
 
 unittest  // each status notification carries the state its own transition committed
