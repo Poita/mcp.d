@@ -277,7 +277,8 @@ package TokenInfo verifyToken(JwtVerifierConfig cfg, string token, KeySource key
 		return reject("typ header is absent or not an accepted token type");
 
 	// Gather candidate keys: the JWKS keys for this kid (every JWKS key when it
-	// names none or an unknown one), then the pinned keys.
+	// names none, the kid-less ones when it names an unknown one), then the
+	// pinned keys.
 	PublicKey[] candidates = keys.keysFor(kid, alg) ~ pinned;
 	Duration retryAfter;
 	const keysUnavailable = keys.unavailable(retryAfter);
@@ -790,7 +791,8 @@ private string pkeyToPem(EVP_PKEY* pkey) @trusted
 }
 
 /// A TTL cache for a JWKS document, refetched on demand. Selects keys by `kid`;
-/// when a token's `kid` is unknown, every JWKS key is offered as a candidate.
+/// when a token's `kid` is unknown, only the JWKS keys without a `kid` are
+/// offered, and a token without a `kid` is offered every key.
 ///
 /// Once the TTL lapses the cached keys keep verifying tokens while a background
 /// task refetches the document (stale-while-revalidate), so an IdP outage never
@@ -831,6 +833,7 @@ package final class JwksCache : KeySource
 	// RFC 7517 4.5 lets keys of different types share a kid, so each kid maps
 	// to every key carrying it.
 	private Key[][string] keysByKid;
+	private Key[] kidlessKeys;
 	private Key[] allKeys;
 	private long fetchedAt = -1;
 	private long lastAttemptAt = -1; // when the last fetch attempt finished
@@ -881,6 +884,7 @@ package final class JwksCache : KeySource
 			logWarn("JWKS from %s has not been refreshed within %s; dropping the cached keys",
 					redactUrl(uri), maxStaleness);
 			keysByKid = null;
+			kidlessKeys = null;
 			allKeys = null;
 			loaded = false;
 		}
@@ -913,14 +917,20 @@ package final class JwksCache : KeySource
 		return lastAttemptAt >= 0 && now() - lastAttemptAt < minRefetchInterval.total!"seconds";
 	}
 
-	/// The keys under `kid` (every key when `kid` is absent or unknown) whose
-	/// type `alg` verifies with.
+	/// The keys whose type `alg` verifies with from those under `kid`: every key
+	/// when `kid` is absent, and only the keys carrying no kid when it names none
+	/// the JWKS holds (a key published under another kid is not the signer, and
+	/// trying every key would let a forged kid multiply the verification work).
 	private PublicKey[] kidKeys(string kid, string alg) @safe
 	{
 		Key[] pool = allKeys;
 		if (kid.length)
+		{
 			if (auto p = kid in keysByKid)
 				pool = *p;
+			else
+				pool = kidlessKeys;
+		}
 		const kty = alg == "RS256" ? "RSA" : alg == "ES256" ? "EC" : null;
 		PublicKey[] keys;
 		foreach (k; pool)
@@ -993,6 +1003,7 @@ package final class JwksCache : KeySource
 		// JSON or invalid base64url in a JWK field) leaves the existing cache
 		// state untouched rather than clearing it and marking it stale.
 		Key[][string] newKeysByKid;
+		Key[] newKidlessKeys;
 		Key[] newAllKeys;
 		foreach (jwk; parseJwks(jwksJson))
 		{
@@ -1008,6 +1019,8 @@ package final class JwksCache : KeySource
 			newAllKeys ~= key;
 			if (jwk.kid.length)
 				newKeysByKid[jwk.kid] ~= key;
+			else
+				newKidlessKeys ~= key;
 		}
 		// A document with no usable key is treated like a failed fetch: the
 		// previous keys stay and the cache stays stale, so the next fetch is
@@ -1023,6 +1036,7 @@ package final class JwksCache : KeySource
 		}
 		// Swap atomically into the cache fields only after all parsing succeeds.
 		keysByKid = newKeysByKid;
+		kidlessKeys = newKidlessKeys;
 		allKeys = newAllKeys;
 		loaded = true;
 		fetchedAt = now();
@@ -1895,18 +1909,30 @@ unittest  // a token naming a JWKS kid verifies against that key ahead of pinned
 	assert(verifyToken(cfg, testRs256Jwt, cache, 1_700_001_000).valid);
 }
 
+unittest  // JwksCache offers a token naming an unknown kid only the keys that carry no kid
+{
+	auto cache = new JwksCache("", 300.seconds);
+	cache.load(`{"keys":[{"kty":"RSA","kid":"rsa-1","n":"` ~ testRsaN ~ `","e":"AQAB"},`
+			~ `{"kty":"EC","crv":"P-256","x":"` ~ testEcX ~ `","y":"` ~ testEcY ~ `"}]}`);
+	auto unknown = cache.keysFor("nope");
+	assert(unknown.length == 1);
+	assert(unknown[0].kty == "EC");
+	assert(cache.keysFor("").length == 2);
+	assert(cache.keysFor("rsa-1").length == 1);
+}
+
 unittest  // JwksCache.keysFor selects by kid, then refreshes from a new document
 {
 	auto cache = new JwksCache("", 300.seconds);
 	// First load: only kid "rsa-1".
 	cache.load(`{"keys":[{"kty":"RSA","kid":"rsa-1","n":"` ~ testRsaN ~ `","e":"AQAB"}]}`);
 	assert(cache.keysFor("rsa-1").length == 1);
-	assert(cache.keysFor("nope").length == 1); // unknown kid: all keys offered
+	assert(cache.keysFor("nope").length == 0); // unknown kid: only kid-less keys offered
 
 	// Refresh with a different document; the old kid is gone.
 	cache.load(`{"keys":[{"kty":"EC","kid":"ec-9","crv":"P-256","x":"`
 			~ testEcX ~ `","y":"` ~ testEcY ~ `"}]}`);
-	assert(cache.keysFor("rsa-1").length == 1); // falls back to all keys
+	assert(cache.keysFor("rsa-1").length == 0);
 	assert(cache.keysFor("ec-9").length == 1);
 }
 
