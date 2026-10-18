@@ -1017,25 +1017,33 @@ string defaultTokenStorePath() @safe
 /// The token-store path for an environment read through `getEnv`:
 /// `%APPDATA%\dlang-mcp\tokens.json` (else `%LOCALAPPDATA%`) on Windows, and
 /// `$XDG_CONFIG_HOME/dlang-mcp/tokens.json` (else `~/.config/...`) elsewhere.
-/// Tokens are secrets, so when no per-user directory is known this throws
-/// `McpException` rather than writing them into the working directory.
+/// A variable holding a relative path is ignored, since it would resolve
+/// against the working directory. Tokens are secrets, so when no per-user
+/// directory is known this throws `McpException` rather than writing them into
+/// the working directory.
 string tokenStorePathFor(scope string delegate(string name) @safe getEnv, bool windows) @safe
 {
 	import std.path : buildPath;
 
+	string absoluteDir(string name)
+	{
+		const dir = getEnv(name);
+		return isAbsoluteDir(dir, windows) ? dir : null;
+	}
+
 	string base;
 	if (windows)
 	{
-		base = getEnv("APPDATA");
+		base = absoluteDir("APPDATA");
 		if (base.length == 0)
-			base = getEnv("LOCALAPPDATA");
+			base = absoluteDir("LOCALAPPDATA");
 	}
 	else
 	{
-		base = getEnv("XDG_CONFIG_HOME");
+		base = absoluteDir("XDG_CONFIG_HOME");
 		if (base.length == 0)
 		{
-			const home = getEnv("HOME");
+			const home = absoluteDir("HOME");
 			if (home.length)
 				base = buildPath(home, ".config");
 		}
@@ -1043,6 +1051,20 @@ string tokenStorePathFor(scope string delegate(string name) @safe getEnv, bool w
 	if (base.length == 0)
 		throw internalError(windows ? "no per-user directory for the OAuth token store: neither APPDATA nor LOCALAPPDATA is set; supply OAuthLogin.store" : "no per-user directory for the OAuth token store: neither XDG_CONFIG_HOME nor HOME is set; supply OAuthLogin.store");
 	return buildPath(base, "dlang-mcp", "tokens.json");
+}
+
+/// Whether `dir` is an absolute path: rooted at `/` on POSIX; a drive letter
+/// followed by a separator, or a UNC `\\server` prefix, on Windows.
+private bool isAbsoluteDir(string dir, bool windows) @safe pure nothrow
+{
+	import std.ascii : isAlpha;
+
+	if (!windows)
+		return dir.length > 0 && dir[0] == '/';
+	bool sep(char c) => c == '\\' || c == '/';
+	if (dir.length >= 3 && isAlpha(dir[0]) && dir[1] == ':' && sep(dir[2]))
+		return true;
+	return dir.length > 2 && sep(dir[0]) && sep(dir[1]) && !sep(dir[2]);
 }
 
 /// Generate a random `state` value (base64url, 16 bytes of randomness) for the
@@ -2170,6 +2192,43 @@ unittest  // the Windows token store falls back to %LOCALAPPDATA%
 	assert(tokenStorePathFor(fakeEnv([
 		"LOCALAPPDATA": `C:\Users\u\AppData\Local`
 	]), true) == buildPath(`C:\Users\u\AppData\Local`, "dlang-mcp", "tokens.json"));
+}
+
+unittest  // the POSIX token store ignores a relative XDG_CONFIG_HOME
+{
+	import std.path : buildPath;
+
+	assert(tokenStorePathFor(fakeEnv([
+		"XDG_CONFIG_HOME": "rel/xdg",
+		"HOME": "/home/u"
+	]), false) == buildPath("/home/u", ".config", "dlang-mcp", "tokens.json"));
+}
+
+unittest  // the POSIX token store refuses a relative HOME rather than use the working directory
+{
+	import std.exception : assertThrown;
+
+	assertThrown!McpException(tokenStorePathFor(fakeEnv(["HOME": "home/u"]), false));
+}
+
+unittest  // the Windows token store ignores a relative APPDATA
+{
+	import std.path : buildPath;
+
+	assert(tokenStorePathFor(fakeEnv([
+		"APPDATA": `AppData\Roaming`,
+		"LOCALAPPDATA": `C:\Users\u\AppData\Local`
+	]), true) == buildPath(`C:\Users\u\AppData\Local`, "dlang-mcp", "tokens.json"));
+}
+
+unittest  // the Windows token store accepts drive-letter and UNC per-user directories only
+{
+	import std.exception : assertThrown;
+
+	assertThrown!McpException(tokenStorePathFor(fakeEnv(["APPDATA": `C:AppData`]), true));
+	assertThrown!McpException(tokenStorePathFor(fakeEnv(["APPDATA": `\AppData`]), true));
+	tokenStorePathFor(fakeEnv(["APPDATA": `\\server\share\u`]), true);
+	tokenStorePathFor(fakeEnv(["APPDATA": `D:/u/AppData`]), true);
 }
 
 unittest  // the Windows token store ignores HOME-style variables and never uses the working directory

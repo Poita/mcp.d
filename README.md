@@ -631,8 +631,9 @@ It discovers the protected-resource and authorization-server metadata, then:
 - **Persists tokens** through `OAuthLogin.store`. The default is a `FileTokenStore`
   at `$XDG_CONFIG_HOME/dlang-mcp/tokens.json` (or `~/.config/dlang-mcp/tokens.json`;
   `%APPDATA%\dlang-mcp\tokens.json`, else `%LOCALAPPDATA%`, on Windows),
-  written owner-only. With no per-user directory `useOAuth` throws rather than
-  writing tokens to the working directory. Subclass it and override `serialize`/`deserialize` to encrypt
+  written owner-only. A variable holding a relative path is ignored, and with no
+  per-user directory `useOAuth` throws rather than writing tokens to the working
+  directory. Subclass it and override `serialize`/`deserialize` to encrypt
   at rest, or supply `MemoryTokenStore` or your own `TokenStore`.
 - **Refreshes transparently**: every request asks the returned `OAuthSession` for
   its bearer, which runs the refresh-token grant when the access token is within
