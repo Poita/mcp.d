@@ -1176,13 +1176,19 @@ final class McpClient : ClientProtocol
 	/// capabilities, and identity. `DiscoverResult` is a `CacheableResult`, so a
 	/// still-fresh response is served from the cache without a round-trip;
 	/// `opts.cacheMode` overrides. On a modern session the result also becomes
-	/// what `serverCapabilities`/`serverInfo`/`serverInstructions` report.
+	/// what `serverCapabilities`/`serverInfo`/`serverInstructions` report. On any
+	/// other session the request alone is framed as 2026-07-28 (as `connect`'s
+	/// probe is), since a stateless server serves `server/discover` only to a
+	/// modern-framed request; the session's own framing is left unchanged.
 	DiscoverResult discover(RequestOptions opts = RequestOptions.init) @safe
 	{
+		const framing = useModern ? Nullable!ProtocolVersion.init
+			: nullable(ProtocolVersion.v2026_07_28);
 		auto result = withCancellation!DiscoverResult(opts.cancellation,
 				() @safe => cachedFetch!DiscoverResult(CacheKey("server/discover",
-					""), opts.cacheMode, () @safe => DiscoverResult.fromJson(
-					rpcWith("server/discover", Json.emptyObject, opts))));
+					""), opts.cacheMode,
+					() @safe => DiscoverResult.fromJson(rpcWith("server/discover",
+					Json.emptyObject, opts, framing))));
 		discoverResult_ = result;
 		// A modern session has no initialize handshake, so discovery is where the
 		// server's capabilities and identity come from.
@@ -1521,11 +1527,12 @@ final class McpClient : ClientProtocol
 	/// progress, and its cancellation token aborts the call. A token minted for
 	/// `opts.onProgress` is kept in `opts`, so a caller issuing several requests
 	/// (a paginated listing) correlates them all under one token.
-	private Json rpcWith(string method, Json params, ref RequestOptions opts) @safe
+	private Json rpcWith(string method, Json params, ref RequestOptions opts,
+			Nullable!ProtocolVersion framing = Nullable!ProtocolVersion.init) @safe
 	{
 		auto token = effectiveToken(opts);
 		auto p = withSessionLogLevel(withProgressToken(params, token), opts.logLevel);
-		return withPerCallProgress!Json(opts, () @safe => rpc(method, p));
+		return withPerCallProgress!Json(opts, () @safe => rpc(method, p, framing));
 	}
 
 	/// `withRequestLogLevel` on a modern session; `params` unchanged on a released
@@ -10196,6 +10203,26 @@ unittest  // connect()'s discover probe frames only itself as modern
 	assert(probeHeaders.get(HttpHeader.protocolVersion, "") == ProtocolVersion.v2026_07_28.toWire);
 	assert(HttpHeader.method !in otherHeaders,
 			"a concurrent request must not pick up the probe's modern framing");
+}
+
+unittest  // discover() before any version is negotiated frames its request as modern
+{
+	auto transport = new RecordingClientTransport();
+	auto c = new McpClient(transport);
+	string[string] headers;
+	Json meta;
+	transport.responder = (Json message, long expectId) @safe {
+		headers = c.headersFor(message);
+		meta = message["params"]["_meta"];
+		DiscoverResult d;
+		d.supportedVersions = [ProtocolVersion.v2026_07_28.toWire];
+		return d.toJson();
+	};
+	c.discover();
+	assert(headers.get(HttpHeader.protocolVersion, "") == ProtocolVersion.v2026_07_28.toWire,
+			"a stateless server only serves server/discover to a modern-framed request");
+	assert(meta[MetaKey.protocolVersion].get!string == ProtocolVersion.v2026_07_28.toWire);
+	assert(!c.useModern, "framing the request alone leaves the session's protocol untouched");
 }
 
 unittest  // discover() on a modern session adopts the server's capabilities, identity and instructions
