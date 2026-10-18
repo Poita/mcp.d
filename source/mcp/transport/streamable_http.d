@@ -3604,6 +3604,75 @@ unittest  // modern: a client closing its TCP connection mid-request cancels the
 	assert(cancelled, "a client disconnect must cancel a modern request");
 }
 
+unittest  // modern: a client that sends unread bytes before closing still cancels the request
+{
+	import core.time : MonoTime, msecs;
+	import std.conv : to;
+	import vibe.core.core : runTask, runEventLoop, exitEventLoop, sleep;
+	import vibe.core.net : connectTCP;
+	import vibe.http.server : HTTPServerSettings, listenHTTP;
+	import mcp.protocol.types : Tool, CallToolResult;
+
+	auto server = McpServer.stateless("t", "1");
+	bool started, finished, cancelled;
+	Tool wait = {name: "wait"};
+	server.registerTool(wait, (Json args, RequestContext ctx) @safe {
+		started = true;
+		const deadline = MonoTime.currTime + 5.seconds;
+		while (!ctx.isCancelled && MonoTime.currTime < deadline)
+			sleep(10.msecs);
+		cancelled = ctx.isCancelled;
+		finished = true;
+		CallToolResult r;
+		return r;
+	});
+	auto router = new URLRouter;
+	mountMcp(router, server);
+	auto settings = new HTTPServerSettings;
+	settings.port = 0;
+	settings.bindAddresses = ["127.0.0.1"];
+
+	string failure;
+	runTask(() nothrow{
+		scope (exit)
+			exitEventLoop();
+		try
+		{
+			auto listener = listenHTTP(settings, router);
+			scope (exit)
+				listener.stopListening();
+			auto conn = connectTCP("127.0.0.1", listener.bindAddresses[0].port);
+			const body_ = `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"wait",`
+				~ `"arguments":{},"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28",`
+				~ `"io.modelcontextprotocol/clientCapabilities":{}}}}`;
+			conn.write(
+				"POST /mcp HTTP/1.1\r\nHost: 127.0.0.1\r\n" ~ "Content-Type: application/json\r\n"
+				~ "Accept: application/json, text/event-stream\r\n"
+				~ "MCP-Protocol-Version: 2026-07-28\r\nMcp-Method: tools/call\r\n"
+				~ "Mcp-Name: wait\r\nContent-Length: " ~ body_.length.to!string ~ "\r\n\r\n" ~ body_);
+			conn.flush();
+			const startBy = MonoTime.currTime + 2.seconds;
+			while (!started && MonoTime.currTime < startBy)
+				sleep(10.msecs);
+			// Bytes the server never reads, as a TLS close_notify alert is to the
+			// TCP layer, land in the connection's read buffer ahead of the close.
+			conn.write("\x15\x03\x03\x00\x02\x01\x00");
+			conn.flush();
+			sleep(100.msecs);
+			conn.close();
+			const finishBy = MonoTime.currTime + 6.seconds;
+			while (!finished && MonoTime.currTime < finishBy)
+				sleep(10.msecs);
+		}
+		catch (Exception e)
+			failure = e.msg;
+	});
+	runEventLoop();
+	assert(failure.length == 0, failure);
+	assert(started, "the tool handler never ran");
+	assert(cancelled, "a client disconnect must cancel a modern request despite unread bytes");
+}
+
 unittest  // a POST stream whose client stops reading does not pin its handler
 {
 	import core.time : MonoTime, msecs;

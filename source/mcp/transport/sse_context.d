@@ -2692,9 +2692,11 @@ package(mcp) void closeRawConnection(HTTPServerResponse res) @safe nothrow
 /// closed as connected (the close is only observed by a read), so the socket is
 /// polled with a non-blocking read instead: bytes it picks up stay buffered on
 /// the connection for the next reader, and an end-of-stream means the client
-/// is gone. A response with no raw connection (a test response, or one already
-/// finalized) reports disconnected; a vibe.d build whose response has no raw
-/// connection field falls back to `res.connected`.
+/// is gone. A client that shuts down only its sending side also reads as gone:
+/// without a write, a half-close cannot be told from a full close. A response
+/// with no raw connection (a test response, or one already finalized) reports
+/// disconnected; a vibe.d build whose response has no raw connection field
+/// falls back to `res.connected`.
 package(mcp) bool clientConnected(HTTPServerResponse res) @safe nothrow
 {
 	import vibe.core.net : TCPConnection, WaitForDataStatus;
@@ -2708,8 +2710,16 @@ package(mcp) bool clientConnected(HTTPServerResponse res) @safe nothrow
 			try
 			{
 				auto tcp = field.extract!TCPConnection;
-				return tcp.connected
-					&& tcp.waitForDataEx(Duration.zero) != WaitForDataStatus.noMoreData;
+				if (!tcp.connected)
+					return false;
+				const buffered = tcp.peek().length > 0;
+				if (tcp.waitForDataEx(Duration.zero) == WaitForDataStatus.noMoreData)
+					return false;
+				// Bytes vibe.d already buffered make `waitForDataEx` report data
+				// without consulting the socket, so a close queued behind them
+				// (a TLS close_notify alert, or pipelined bytes) is only visible
+				// to the kernel.
+				return !buffered || !socketAtEnd(tcp.fd);
 			}
 			catch (Exception)
 				return false;
@@ -2718,6 +2728,28 @@ package(mcp) bool clientConnected(HTTPServerResponse res) @safe nothrow
 	try
 		return res.connected;
 	catch (Exception)
+		return false;
+}
+
+/// Whether the peer of socket `fd` has closed its side and every byte it sent
+/// has been read off the socket. eventcore's sockets are non-blocking, so the
+/// peek never waits.
+private bool socketAtEnd(int fd) @trusted nothrow
+{
+	ubyte b;
+	version (Posix)
+	{
+		import core.sys.posix.sys.socket : recv, MSG_PEEK;
+
+		return recv(fd, &b, 1, MSG_PEEK) == 0;
+	}
+	else version (Windows)
+	{
+		import core.sys.windows.winsock2 : recv, MSG_PEEK, SOCKET;
+
+		return recv(cast(SOCKET) fd, &b, 1, MSG_PEEK) == 0;
+	}
+	else
 		return false;
 }
 
