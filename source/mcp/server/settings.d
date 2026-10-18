@@ -111,11 +111,15 @@ struct ServerSettings
 	/// Construct a fresh `McpServer` from this settings' identity and mode, then
 	/// apply the capability/validation flags via the matching `enable*`/`disable*`
 	/// methods. Tools, resources, and prompts are registered on the returned server
-	/// before serving. Throws when `resourceSubscriptions` or `requireInitialized`
-	/// is set on a `stateless` mode, or `requestStateSecurity` on a `stateful` one.
+	/// before serving. Throws when `serverInfo.name` is empty, when
+	/// `resourceSubscriptions` or `requireInitialized` is set on a `stateless`
+	/// mode, or `requestStateSecurity` on a `stateful` one.
 	McpServer newServer() @safe
 	{
 		import mcp.api.apps : enableApps;
+
+		if (serverInfo.name.length == 0)
+			throw new Exception("ServerSettings.serverInfo.name must be set");
 
 		McpServer server;
 		final switch (mode)
@@ -165,6 +169,17 @@ struct ServerSettings
 	s.serverInfo = Implementation("settings-srv", "1.0");
 	auto server = s.newServer();
 	assert(server.mode == ServerMode.stateless);
+}
+
+@safe unittest
+{
+	// newServer refuses a server with no name.
+	import std.exception : assertThrown;
+
+	ServerSettings s;
+	assertThrown(s.newServer());
+	s.serverInfo = Implementation("", "1.0");
+	assertThrown(s.newServer());
 }
 
 @safe unittest
