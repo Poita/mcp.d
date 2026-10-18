@@ -612,24 +612,22 @@ void runStdio(McpServer server, StdioOptions opts = StdioOptions.init)
 	// Serializes whole-frame writes: the channel's writer and the read loop's
 	// over-long-line error reply both write stdout.
 	auto writeMtx = new TaskMutex;
+	auto frames = new FrameWriter;
 
 	void writeLine(string s) @safe
 	{
 		writeMtx.lock();
 		scope (exit)
 			writeMtx.unlock();
-		auto bytes = cast(const(ubyte)[])(s ~ "\n");
-		// Write the whole frame (IOMode.all loops internally until done). Inspect
-		// the result symmetrically with readLine: a status that is neither ok nor
-		// wouldBlock, or a short write, means the peer closed its read end (EPIPE /
-		// IOStatus.error) and the channel is broken. Throw so DuplexChannel.send
-		// observes the failure instead of producing replies that are silently lost.
-		// On POSIX the SIGPIPE such a write raises is caught by the handler vibe-core
-		// installs on the first `runEventLoop`, so the failure surfaces here as
-		// IOStatus.error rather than terminating the process.
-		auto res = outFD.writeAll(bytes);
-		if (writeFailed(res.status, res.nbytes, bytes.length))
-			throw new Exception("runStdio: write to stdout failed (peer closed its read end?)");
+		// Write the whole frame (IOMode.all loops internally until done). A status
+		// that is neither ok nor wouldBlock, or a short write, means the peer closed
+		// its read end (EPIPE / IOStatus.error) and the channel is broken, so the
+		// write throws and DuplexChannel.send observes the failure instead of
+		// producing replies that are silently lost. On POSIX the SIGPIPE such a
+		// write raises is caught by the handler vibe-core installs on the first
+		// `runEventLoop`, so the failure surfaces as IOStatus.error rather than
+		// terminating the process.
+		frames.write(&outFD.writeAll, s);
 	}
 
 	// The error replies to over-long lines are posted, so the read loop never
@@ -1395,6 +1393,43 @@ private bool writeFailed(ECStatus)(ECStatus status, size_t nbytes, size_t expect
 	return nbytes < expected;
 }
 
+/// Writes newline-terminated frames without allocating per frame: a frame of up
+/// to `smallFrame` bytes is copied with its newline into a reused buffer and
+/// written at once, and a larger one is written as is, then its newline. Callers
+/// serialize `write`, since the buffer is shared between frames.
+private final class FrameWriter
+{
+	private enum size_t smallFrame = 64 * 1024;
+	private ubyte[] scratch;
+
+	/// Write `s` and its newline through `writeAll`. A failed or short write
+	/// throws: the peer closed its read end.
+	void write(scope IoResult delegate(const(ubyte)[]) @safe writeAll, string s) @safe
+	{
+		static immutable ubyte[1] newline = ['\n'];
+
+		if (s.length <= smallFrame)
+		{
+			if (scratch is null)
+				scratch = new ubyte[smallFrame + 1];
+			scratch[0 .. s.length] = cast(const(ubyte)[]) s;
+			scratch[s.length] = '\n';
+			writeChecked(writeAll, scratch[0 .. s.length + 1]);
+			return;
+		}
+		writeChecked(writeAll, cast(const(ubyte)[]) s);
+		writeChecked(writeAll, newline[]);
+	}
+
+	private static void writeChecked(
+			scope IoResult delegate(const(ubyte)[]) @safe writeAll, const(ubyte)[] bytes) @safe
+	{
+		auto res = writeAll(bytes);
+		if (writeFailed(res.status, res.nbytes, bytes.length))
+			throw new Exception("runStdio: write to stdout failed (peer closed its read end?)");
+	}
+}
+
 unittest  // writeFailed flags a non-ok status and a short write, accepts a full ok write
 {
 	import eventcore.driver : IOStatus;
@@ -1404,6 +1439,67 @@ unittest  // writeFailed flags a non-ok status and a short write, accepts a full
 	assert(writeFailed(IOStatus.error, 10, 10));
 	assert(writeFailed(IOStatus.disconnected, 0, 10));
 	assert(writeFailed(IOStatus.ok, 4, 10));
+}
+
+// Bytes the GC has allocated on this thread so far.
+version (unittest) private ulong gcAllocated() @trusted nothrow
+{
+	import core.memory : GC;
+
+	return GC.allocatedInCurrentThread;
+}
+
+unittest  // FrameWriter writes a large frame and its newline without copying the frame
+{
+	import eventcore.driver : IOStatus;
+
+	auto frame = new char[1024 * 1024];
+	frame[] = 'x';
+	const(ubyte)[][] writes;
+	auto w = new FrameWriter;
+	const before = gcAllocated();
+	w.write((const(ubyte)[] b) @safe {
+		writes ~= b;
+		return IoResult(IOStatus.ok, b.length);
+	}, (() @trusted => cast(string) frame)());
+	const allocated = gcAllocated() - before;
+	assert(allocated < frame.length / 2, "the frame must not be copied to append its newline");
+	assert(writes.length == 2 && &writes[0][0] is cast(const(ubyte)*)&frame[0]
+			&& writes[0].length == frame.length && writes[1] == cast(const(ubyte)[]) "\n");
+}
+
+unittest  // FrameWriter writes a small frame with its newline in one write, reusing its buffer
+{
+	import eventcore.driver : IOStatus;
+
+	char[64] last;
+	size_t lastLen, calls;
+	auto w = new FrameWriter;
+	scope sink = (const(ubyte)[] b) @safe {
+		++calls;
+		last[0 .. b.length] = cast(const(char)[]) b;
+		lastLen = b.length;
+		return IoResult(IOStatus.ok, b.length);
+	};
+	w.write(sink, `{"a":1}`);
+	assert(calls == 1 && last[0 .. lastLen] == "{\"a\":1}\n");
+	const before = gcAllocated();
+	w.write(sink, `{"b":2}`);
+	const allocated = gcAllocated() - before;
+	assert(allocated == 0, "a small frame reuses the writer's buffer");
+	assert(calls == 2 && last[0 .. lastLen] == "{\"b\":2}\n");
+}
+
+unittest  // FrameWriter throws on a short or failed write
+{
+	import eventcore.driver : IOStatus;
+	import std.exception : collectException;
+
+	auto w = new FrameWriter;
+	assert(collectException(w.write((const(ubyte)[] b) @safe => IoResult(IOStatus.ok,
+			b.length - 1), "abc")) !is null);
+	assert(collectException(w.write((const(ubyte)[] b) @safe => IoResult(IOStatus.error,
+			0), "abc")) !is null);
 }
 
 version (unittest) private size_t readScripted(IoResult[] script, out size_t calls) @safe
