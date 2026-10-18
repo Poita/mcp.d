@@ -377,6 +377,41 @@ unittest  // a disabled (no-validator) config is never rejected, even with no AS
 	assertNotThrown!Exception(validateAuthConfig(cfg));
 }
 
+/// Validate `opts.auth` and, when auth is enabled, mount the Protected Resource
+/// Metadata document that every 401 challenge on this mount points to.
+private void mountProtectedResourceMetadata(URLRouter router, StreamableHttpOptions opts) @safe
+{
+	// basic/authorization §Authorization Server Location (RFC 9728): refuse to start
+	// serving a Protected Resource Metadata document that would violate the MUST to
+	// list at least one authorization server. Fail loudly rather than publish an empty
+	// authorization_servers array.
+	validateAuthConfig(opts.auth);
+
+	// basic/authorization (RFC 9728 §3): publish the Protected Resource Metadata
+	// document so clients can discover the authorization server(s). Served
+	// unauthenticated (it is the discovery hook the 401 points clients to). The
+	// document is public, so any origin may read it: a browser-based client must
+	// fetch it before it holds a token.
+	if (opts.auth.enabled)
+	{
+		const prmPath = protectedResourceMetadataPath(opts.auth.resource, opts.path);
+		router.get(prmPath, (HTTPServerRequest req, HTTPServerResponse res) @safe {
+			res.headers["Access-Control-Allow-Origin"] = "*";
+			res.statusCode = HTTPStatus.ok;
+			res.writeJsonBody(opts.auth.metadata().toJson());
+		});
+		router.match(HTTPMethod.OPTIONS, prmPath, (HTTPServerRequest req,
+				HTTPServerResponse res) @safe {
+			res.headers["Access-Control-Allow-Origin"] = "*";
+			res.headers["Access-Control-Allow-Methods"] = "GET";
+			res.headers["Access-Control-Allow-Headers"] = "MCP-Protocol-Version";
+			res.headers["Access-Control-Max-Age"] = "600";
+			res.statusCode = HTTPStatus.noContent;
+			res.writeVoidBody();
+		});
+	}
+}
+
 /// Mount an `McpServer` onto a vibe.d `URLRouter` at the configured path,
 /// implementing the modern Streamable HTTP transport (single endpoint):
 ///   - POST: a JSON-RPC message/batch; `202 Accepted` with no body when the
@@ -430,35 +465,7 @@ void mountMcp(URLRouter router, McpServer server,
 	// resolve their own per-`Mcp-Session-Id` state.
 	server.bindConnection(new ConnectionState);
 
-	// basic/authorization §Authorization Server Location (RFC 9728): refuse to start
-	// serving a Protected Resource Metadata document that would violate the MUST to
-	// list at least one authorization server. Fail loudly rather than publish an empty
-	// authorization_servers array.
-	validateAuthConfig(opts.auth);
-
-	// basic/authorization (RFC 9728 §3): publish the Protected Resource Metadata
-	// document so clients can discover the authorization server(s). Served
-	// unauthenticated (it is the discovery hook the 401 points clients to). The
-	// document is public, so any origin may read it: a browser-based client must
-	// fetch it before it holds a token.
-	if (opts.auth.enabled)
-	{
-		const prmPath = protectedResourceMetadataPath(opts.auth.resource, opts.path);
-		router.get(prmPath, (HTTPServerRequest req, HTTPServerResponse res) @safe {
-			res.headers["Access-Control-Allow-Origin"] = "*";
-			res.statusCode = HTTPStatus.ok;
-			res.writeJsonBody(opts.auth.metadata().toJson());
-		});
-		router.match(HTTPMethod.OPTIONS, prmPath, (HTTPServerRequest req,
-				HTTPServerResponse res) @safe {
-			res.headers["Access-Control-Allow-Origin"] = "*";
-			res.headers["Access-Control-Allow-Methods"] = "GET";
-			res.headers["Access-Control-Allow-Headers"] = "MCP-Protocol-Version";
-			res.headers["Access-Control-Max-Age"] = "600";
-			res.statusCode = HTTPStatus.noContent;
-			res.writeVoidBody();
-		});
-	}
+	mountProtectedResourceMetadata(router, opts);
 
 	mountCorsPreflight(router, opts.path, sessions !is null ? "POST, GET, DELETE" : "POST", opts);
 	router.post(opts.path, (HTTPServerRequest req, HTTPServerResponse res) @safe {
@@ -543,14 +550,16 @@ void mountMcp(URLRouter router, McpServer server,
 	// HTTP+SSE two-endpoint transport alongside the modern MCP endpoint
 	// (basic/transports §Backwards Compatibility — a SHOULD, hence opt-in).
 	if (opts.legacyHttpSse)
-		mountLegacyHttpSse(router, server, opts);
+		mountLegacyRoutes(router, server, opts);
 }
 
 /// Mount the deprecated 2024-11-05 HTTP+SSE two-endpoint transport
 /// (basic/transports §HTTP with SSE) onto `router`, so a legacy-only client can
-/// still negotiate it against a D MCP server. Called by `mountMcp` when
-/// `opts.legacyHttpSse` is set, but also usable directly to host ONLY the legacy
-/// transport. It mounts:
+/// still negotiate it against a D MCP server. `mountMcp` mounts the same
+/// endpoints when `opts.legacyHttpSse` is set; calling this directly hosts ONLY
+/// the legacy transport, plus the Protected Resource Metadata document when
+/// `opts.auth` is enabled (its config is validated as `mountMcp` validates it).
+/// It mounts:
 ///   - GET `opts.legacySsePath`: opens a `text/event-stream`; the FIRST event is
 ///     the `endpoint` event whose data is `opts.legacyMessagePath` ("When a
 ///     client connects, the server MUST send an `endpoint` event containing a URI
@@ -563,6 +572,14 @@ void mountMcp(URLRouter router, McpServer server,
 ///     data"). Origin/auth guards mirror the modern endpoint.
 void mountLegacyHttpSse(URLRouter router, McpServer server,
 		StreamableHttpOptions opts = StreamableHttpOptions.init) @safe
+{
+	mountProtectedResourceMetadata(router, opts);
+	mountLegacyRoutes(router, server, opts);
+}
+
+/// Mount the legacy HTTP+SSE stream and message endpoints without the metadata
+/// document, which the caller has already mounted.
+private void mountLegacyRoutes(URLRouter router, McpServer server, StreamableHttpOptions opts) @safe
 {
 	// Each legacy stream also listens on the server's push channel, so `notify*`
 	// and server pings reach legacy clients; sharing its coordinator lets the
@@ -7947,6 +7964,29 @@ unittest  // the Protected Resource Metadata is served at the RFC 9728 path-inse
 	const www = challenge.headers.get("WWW-Authenticate", "");
 	assert(www.canFind(`resource_metadata="https://mcp.example.com/.well-known/oauth-protected-resource/tenant-a/mcp"`),
 			www);
+}
+
+unittest  // a legacy-only mount publishes the metadata document its challenge points to
+{
+	StreamableHttpOptions opts;
+	opts.auth.validator = (string t) @safe => TokenInfo.invalid();
+	opts.auth.authorizationServers = ["https://auth.example.com"];
+	opts.allowedHosts = ["mcp.example.com"];
+	auto router = new URLRouter;
+	mountLegacyHttpSse(router, McpServer.stateless("t", "1"), opts);
+
+	auto doc = corsRequest(router, HTTPMethod.GET, ["Host": "mcp.example.com"],
+			"", protectedResourceMetadataPath("", opts.path));
+	assert(doc.statusCode == 200);
+}
+
+unittest  // a legacy-only mount refuses an auth config with no authorization servers
+{
+	import std.exception : assertThrown;
+
+	StreamableHttpOptions opts;
+	opts.auth.validator = (string t) @safe => TokenInfo.invalid();
+	assertThrown!Exception(mountLegacyHttpSse(new URLRouter, McpServer.stateless("t", "1"), opts));
 }
 
 version (unittest) private string challengeWith(bool trustProxyHeaders, string forwardedProto) @safe
