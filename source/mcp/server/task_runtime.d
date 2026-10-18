@@ -307,9 +307,17 @@ final class TaskRuntime
 			return false;
 		// An unparseable `lastUpdatedAt` cannot be aged, so it counts as overdue.
 		try
-			return now >= SysTime.fromISOExtString(r.meta.lastUpdatedAt) + opts_.maxUnsettledIdle;
+			return idleSince(r, now) >= opts_.maxUnsettledIdle;
 		catch (Exception)
 			return true;
+	}
+
+	/// How long ago `r` last changed status. Measured as `now - lastUpdatedAt`
+	/// rather than by adding a limit to `lastUpdatedAt`, which overflows for
+	/// limits near `Duration.max`. Throws when `lastUpdatedAt` does not parse.
+	private static Duration idleSince(const TaskRecord r, SysTime now) @safe
+	{
+		return now - SysTime.fromISOExtString(r.meta.lastUpdatedAt);
 	}
 
 	/// Settle an overdue task: `cancelled` when a cancel was requested (its
@@ -368,10 +376,12 @@ final class TaskRuntime
 	/// so it counts as expired.
 	private static bool isExpired(const TaskRecord r, SysTime now) @safe
 	{
-		if (r.meta.ttlMs.isNull || !isTerminal(r.meta.status))
+		// A TTL longer than any `Duration` outlasts every clock reading.
+		enum maxTtlMs = Duration.max.total!"msecs";
+		if (r.meta.ttlMs.isNull || r.meta.ttlMs.get > maxTtlMs || !isTerminal(r.meta.status))
 			return false;
 		try
-			return now >= SysTime.fromISOExtString(r.meta.lastUpdatedAt) + r.meta.ttlMs.get.msecs;
+			return idleSince(r, now) >= r.meta.ttlMs.get.msecs;
 		catch (Exception)
 			return true;
 	}
@@ -1262,6 +1272,46 @@ unittest  // a task created with unlimitedTaskTtl has a null ttl and is kept for
 	now = "2100-01-01T00:00:00Z";
 	assert(rt.sweepExpired() == 0);
 	assert(rt.getDetailed(t.taskId)["status"].get!string == "completed");
+}
+
+unittest  // a ttl just short of unlimited keeps a settled task rather than expiring it at once
+{
+	string now = "2026-06-07T10:00:00Z";
+	TaskOptions o;
+	o.nowIso = () @safe => now;
+	auto rt = new TaskRuntime(o);
+	auto t = rt.create(TaskCreateOptions(nullable(Duration.max - 1.seconds)));
+	rt.complete(t.taskId, Json.emptyObject);
+	now = "2026-06-07T10:00:01Z";
+	assert(rt.sweepExpired() == 0);
+	assert(rt.getDetailed(t.taskId)["status"].get!string == "completed");
+}
+
+unittest  // a stored ttl too large for a Duration never expires
+{
+	string now = "2026-06-07T10:00:00Z";
+	TaskOptions o;
+	o.nowIso = () @safe => now;
+	auto rt = new TaskRuntime(o);
+	auto t = rt.create();
+	rt.complete(t.taskId, Json.emptyObject);
+	auto r = rt.store.get(t.taskId).get;
+	r.meta.ttlMs = nullable(long.max);
+	assert(rt.store.compareAndSwap(r, r.revision));
+	now = "2100-01-01T00:00:00Z";
+	assert(rt.getDetailed(t.taskId)["status"].get!string == "completed");
+}
+
+unittest  // a maxUnsettledIdle near Duration.max does not settle a fresh task
+{
+	string now = "2026-06-07T10:00:00Z";
+	TaskOptions o;
+	o.nowIso = () @safe => now;
+	o.maxUnsettledIdle = Duration.max;
+	auto rt = new TaskRuntime(o);
+	auto t = rt.createFor("slow", Json.undefined);
+	now = "2026-06-07T10:00:01Z";
+	assert(rt.getDetailed(t.taskId)["status"].get!string == "working");
 }
 
 unittest  // a defaultTtl of unlimitedTaskTtl makes tasks unlimited unless a ttl is given
