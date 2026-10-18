@@ -4160,6 +4160,16 @@ bool matchUriTemplate(string tmpl, string uri, out string[string] params) @safe
 	return m.match(0, 0, params);
 }
 
+/// Like `matchUriTemplate`, applying the same checks, but filling `params` with
+/// each variable's captured value still percent-encoded, so a list value can be
+/// split on its literal separators before its elements are decoded.
+package(mcp) bool matchUriTemplateRaw(string tmpl, string uri, out string[string] params) @safe
+{
+	auto m = UriTemplateMatcher(tmpl, uri);
+	m.keepRaw = true;
+	return m.match(0, 0, params);
+}
+
 /// Backtracking matcher behind `matchUriTemplate`. An expression's extent is
 /// ambiguous when its trailing literal (or the next expression's operator
 /// prefix) recurs in the URI, so each candidate end is tried shortest first,
@@ -4174,6 +4184,8 @@ private struct UriTemplateMatcher
 
 	string tmpl;
 	string uri;
+	/// Capture values still percent-encoded rather than decoded.
+	bool keepRaw;
 	bool[ulong] failed;
 	size_t attempts;
 
@@ -4214,7 +4226,8 @@ private struct UriTemplateMatcher
 			if (++attempts > maxAttempts)
 				return false;
 			auto attempt = params.dup;
-			if (bindUriExpression(expr, uri[ui .. end], attempt) && match(next, end, attempt))
+			if (bindUriExpression(expr, uri[ui .. end], keepRaw, attempt)
+					&& match(next, end, attempt))
 			{
 				params = attempt;
 				return true;
@@ -4277,8 +4290,9 @@ bool hasAdjacentUriVariables(string tmpl) @safe pure nothrow @nogc
 }
 
 /// Bind one template expression (`expr`, the text between the braces) against
-/// the URI substring `s` it spans; see `matchUriTemplate` for the rules.
-private bool bindUriExpression(string expr, string s, ref string[string] params) @safe
+/// the URI substring `s` it spans; see `matchUriTemplate` for the rules. With
+/// `keepRaw`, a value is checked as usual but captured still percent-encoded.
+private bool bindUriExpression(string expr, string s, bool keepRaw, ref string[string] params) @safe
 {
 	import std.algorithm : countUntil;
 	import std.array : join, split;
@@ -4354,7 +4368,7 @@ private bool bindUriExpression(string expr, string s, ref string[string] params)
 				return false;
 			if (!withinPrefix(i, v))
 				return false;
-			params[names[i]] = v;
+			params[names[i]] = keepRaw ? raw : v;
 		}
 		return true;
 	}
@@ -4391,14 +4405,15 @@ private bool bindUriExpression(string expr, string s, ref string[string] params)
 			const idx = names.countUntil(name);
 			if (idx < 0)
 				return false;
+			const raw = eq < 0 ? "" : pair[eq + 1 .. $];
 			string v;
-			if (!decodeUriValue(eq < 0 ? "" : pair[eq + 1 .. $], true, v))
+			if (!decodeUriValue(raw, true, v))
 				return false;
 			if (hasDotSegment(v))
 				return false;
 			if (!withinPrefix(idx, v))
 				return false;
-			params[name] = v;
+			params[name] = keepRaw ? raw : v;
 		}
 		return true;
 	}
