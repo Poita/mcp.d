@@ -15,13 +15,12 @@ alias TaskIdGenerator = string delegate() @safe;
 /// The complete durable state of a task — the single source of truth.
 ///
 /// `meta` is the SEP-2663 wire `Task` (status, timestamps, ttl). The remaining
-/// fields are the execution state that earlier lived only in process memory and
-/// therefore broke multi-node deployments: `result`/`error` (terminal payloads),
+/// fields are the execution state: `result`/`error` (terminal payloads),
 /// `inputRequests` (outstanding server-to-client requests while `input_required`),
 /// `inputResponses` (answers delivered via `tasks/update`), `cancelRequested`
 /// (cooperative cancel flag), plus the executor's durable `executorInput` and
-/// `checkpoints`. Persisting all of it means any node can serve `tasks/get` and
-/// re-dispatch the executor purely from the store.
+/// `checkpoints`. Because all of it is persisted, any node can serve `tasks/get`
+/// and re-dispatch the executor purely from the store.
 struct TaskRecord
 {
 	Task meta; /// wire metadata (taskId, status, timestamps, ttl, pollInterval)
