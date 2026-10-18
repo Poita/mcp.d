@@ -1488,6 +1488,19 @@ unittest  // CallToolResult.structured!T round-trips via structuredContentAs!T
 	assert(back.tempC == 18);
 }
 
+unittest  // CallToolResult.structured!T writes a ulong above long.max non-negative and reads it back
+{
+	struct Counter
+	{
+		ulong n;
+	}
+
+	auto r = CallToolResult.structured(Counter(ulong.max));
+	assert(r.structuredContent["n"].toString == "18446744073709551615",
+			r.structuredContent.toString);
+	assert(r.structuredContentAs!Counter.n == ulong.max);
+}
+
 version (unittest)
 {
 	private enum StructuredLevel

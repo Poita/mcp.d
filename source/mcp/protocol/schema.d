@@ -12,7 +12,7 @@ import jsonschema : Validator;
 /// Derived schemas describe enums as `{type:"string", enum:[names…]}`, so both
 /// directions of marshalling must agree: struct params/returns and bare-enum
 /// values are (de)serialized by-name. The policy only defines
-/// `toRepresentation`/`fromRepresentation` for enums, `SumType`s and `SysTime`
+/// `toRepresentation`/`fromRepresentation` for enums, `SumType`s, `SysTime` and `ulong`
 /// (see the arms below), so vibe's `isPolicySerializable` is false for every
 /// other type and the default behaviour is preserved (it still recurses into
 /// nested struct/array fields, applying this rule at any depth).
@@ -114,6 +114,36 @@ template EnumByNamePolicy(T) if (is(T == imported!"std.datetime.systime".SysTime
 	}
 }
 
+/// The `ulong` arm of `EnumByNamePolicy`: vibe stores integers as `long`, so a
+/// `ulong` above `long.max` would be written negative. Such a value is written
+/// and read as a JSON big integer instead; smaller ones stay plain integers.
+template EnumByNamePolicy(T) if (is(immutable T == immutable ulong))
+{
+	static Json toRepresentation(T v) @safe
+	{
+		import std.bigint : BigInt;
+
+		return v > long.max ? Json(BigInt(v)) : Json(cast(long) v);
+	}
+
+	static T fromRepresentation(Json j) @safe
+	{
+		import std.bigint : BigInt;
+		import std.conv : ConvOverflowException;
+
+		if (j.type == Json.Type.bigInt)
+		{
+			const b = j.get!BigInt;
+			if (b < 0 || b > ulong.max)
+				throw new ConvOverflowException("integer out of range for ulong: " ~ j.toString);
+			return cast(T) b;
+		}
+		if (j.type == Json.Type.int_ && j.get!long < 0)
+			throw new ConvOverflowException("integer out of range for ulong: " ~ j.toString);
+		return cast(T) j.to!long;
+	}
+}
+
 /// How many of object `a`'s keys object `b` also has.
 private size_t sharedKeyCount(Json a, Json b) @safe
 {
@@ -144,6 +174,27 @@ unittest  // a SumType is written as the value it holds, at any depth
 	]));
 	assert(j["u"] == Json("a"), j.toString);
 	assert(j["us"] == Json([Json(1), Json("b")]), j.toString);
+}
+
+unittest  // a ulong above long.max is written and read back as its exact value
+{
+	import vibe.data.json : JsonSerializer;
+	import vibe.data.serialization : deserializeWithPolicy, serializeWithPolicy;
+
+	static struct S
+	{
+		ulong n;
+		ulong[] ns;
+	}
+
+	auto j = serializeWithPolicy!(JsonSerializer, EnumByNamePolicy)(S(ulong.max, [
+			1, 1UL << 63
+	]));
+	assert(j["n"].toString == "18446744073709551615", j.toString);
+	assert(j["ns"].toString == "[1,9223372036854775808]", j.toString);
+	auto back = deserializeWithPolicy!(JsonSerializer, EnumByNamePolicy, S)(j);
+	assert(back.n == ulong.max && back.ns == [1, 1UL << 63]);
+	assert(serializeWithPolicy!(JsonSerializer, EnumByNamePolicy)(ulong(7)).type == Json.Type.int_);
 }
 
 unittest  // a SumType reads back as the member matching the JSON value's own type
