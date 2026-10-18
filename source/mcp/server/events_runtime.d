@@ -2620,6 +2620,9 @@ final class EventsRuntime
 				// Marked idle first, so the drain starts a fresh run for this
 				// subscription's next jobs rather than queueing them behind this one.
 				runningSubscriptions_.remove(subId);
+				// The freed slot goes to terminated envelopes the bound held back
+				// first: nothing else would start their poster.
+				pumpTerminatePosts();
 				if (backlogged_ || ran)
 				{
 					backlogged_ = false;
@@ -2701,7 +2704,7 @@ final class EventsRuntime
 	/// Run the periodic worker until `stopDeliveryWorker` is called: every
 	/// `interval` it evicts aged emit-buffer events, expires poll leases, sweeps lapsed webhook subscriptions,
 	/// records the positions suspended subscriptions missed, reconciles delivery bookkeeping with the shared store and queue, runs the
-	/// poll-driven webhook pass, and drains the delivery queue.
+	/// poll-driven webhook pass, posts waiting terminated envelopes, and drains the delivery queue.
 	/// `enableEvents` starts one per server at `workerInterval`; starting again
 	/// replaces (and stops) a worker already running. A multi-node deployment
 	/// shares a durable `DeliveryQueue` so any node's worker delivers (and
@@ -2747,6 +2750,7 @@ final class EventsRuntime
 		guarded("missed-position flush", &flushCoalescedMisses);
 		guarded("delivery reconciliation", &reconcileDeliveries);
 		guarded("poll-driven webhook pass", &pollWebhookSubscriptions);
+		guarded("terminated-envelope posting", &pumpTerminatePosts);
 		guarded("delivery drain", &drainDeliveries);
 	}
 
@@ -10084,6 +10088,48 @@ unittest  // terminating many webhook subscriptions posts their envelopes from a
 		tasks[i]();
 	assert(tasks.length == 2);
 	assert(controlPostsOf(ft, "terminated").length == 5);
+}
+
+unittest  // a terminated envelope queued while delivery runs fill the bound is posted when one ends
+{
+	auto ft = new FakeWebhookTransport();
+	void delegate() @safe[] tasks;
+	EventsOptions o;
+	o.nowMs = () @safe => 1_000_000L;
+	o.nowIso = () @safe => "t";
+	o.allowPrivateCallbackHosts = true;
+	o.webhookTransport = ft;
+	o.callbackAllowlist = ["https://proxy/"];
+	o.webhookMaxConcurrency = 1;
+	o.deliveryExecutor = (void delegate() @safe job) @safe { tasks ~= job; };
+	auto rt = new EventsRuntime(null, o);
+	EventRegistration reg = {descriptor: EventType("n"), emitOnly: true};
+	rt.register(reg);
+	rt.subscribeWebhook(webhookSub("n", "https://proxy/a"), "user-1");
+	auto b = rt.subscribeWebhook(webhookSub("n", "https://proxy/b"), "user-1");
+	rt.emit(EventOccurrence("evt_1", "n", "t"));
+	tasks[0](); // the drain starts the one run the bound allows
+	assert(rt.outboundTasks() == 1);
+	rt.terminateWebhook(b.id, Json(["code": Json(-32012)]));
+	for (size_t i = 1; i < tasks.length; i++)
+		tasks[i]();
+	assert(controlPostsOf(ft, "terminated").length == 1);
+}
+
+unittest  // the worker pass posts terminated envelopes still waiting for a poster
+{
+	auto ft = new FakeWebhookTransport();
+	EventsOptions o;
+	o.nowMs = () @safe => 1_000_000L;
+	o.nowIso = () @safe => "t";
+	o.allowPrivateCallbackHosts = true;
+	o.webhookTransport = ft;
+	o.deliveryExecutor = (void delegate() @safe job) @safe { job(); };
+	auto rt = new EventsRuntime(null, o);
+	rt.terminatePosts_ ~= TerminatePost("https://proxy/a", null,
+			terminatedEnvelope(Json(["code": Json(-32012)])).toString());
+	rt.tick();
+	assert(controlPostsOf(ft, "terminated").length == 1);
 }
 
 unittest  // a drain starts no more delivery runs than the node's concurrency bound
