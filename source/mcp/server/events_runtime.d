@@ -397,16 +397,16 @@ struct EventsOptions
 	DeliveryQueue deliveryQueue; /// webhook outbox (default in-memory); shared/durable for multi-node
 	Duration workerInterval = 5.seconds; /// cadence of the periodic worker `enableEvents` starts (0 = the author runs it)
 	/// How long a worker claims a leased delivery job. Raised at construction to at
-	/// least twice the longest stretch between lease renewals (one
-	/// `webhookHttpTimeout` plus the backoff after the second-to-last attempt), so
-	/// with the defaults the effective lease is 500 seconds.
+	/// least twice the longest stretch between lease renewals (three
+	/// `webhookHttpTimeout`s: a receiver-document GET, a verification challenge and
+	/// the delivery itself), so the defaults keep 1 minute. A retry's backoff is
+	/// not part of it: the job waits that out in the queue, unclaimed by any run.
 	Duration deliveryLease = 1.minutes;
 	size_t deliveryLeaseBatch = 100; /// most jobs one drain claims from the queue, leaving the rest to other nodes and later passes (0 = unlimited)
 	size_t webhookMaxConcurrency = 64; /// most outbound webhook tasks (delivery runs and terminated-envelope posts) one node runs at once (0 = unlimited)
-	Duration webhookHttpTimeout = 10.seconds; /// per-attempt HTTP bound (default transport); also the worst-case-retry budget input
+	Duration webhookHttpTimeout = 10.seconds; /// per-attempt HTTP bound (default transport); also sets the `deliveryLease` floor
 	WebhookTransport webhookTransport; /// outbound HTTP (default SSRF-hardened); tests inject a fake
 	void delegate(void delegate() @safe job) @safe deliveryExecutor; /// runs a delivery (default: a fiber)
-	void delegate(Duration d) @safe deliverySleep; /// inter-attempt sleep (default: vibe sleep)
 	void delegate(void delegate() @safe job) @safe pushExecutor; /// runs a push stream's writer (default: a fiber)
 	size_t pushMaxQueuedEvents = 1000; /// events a push stream may fall behind before it is terminated as a slow consumer (0 = unlimited)
 	V1aSigner v1aSigner; /// optional asymmetric (`v1a,`) signer; auto-wired from `webhookSigningKey`
@@ -756,31 +756,23 @@ final class EventsRuntime
 					logEventsError("push stream writer threw", e);
 			});
 		};
-		if (opts_.deliverySleep is null)
-			opts_.deliverySleep = (Duration d) @safe {
-			import vibe.core.core : sleep;
-
-			sleep(d);
-		};
 		wireV1aSigner();
 		buffer_ = new EmitBuffer(opts_.emitBuffer);
 		buffer_.nowMs = opts_.nowMs;
 	}
 
-	// A delivery worker holds one lease across a job's whole bounded retry loop,
-	// renewing it before each attempt and after each inter-attempt sleep. The
-	// lease must comfortably exceed the longest stretch between renewals — one
-	// HTTP timeout plus the longest sleep, which follows the second-to-last
-	// attempt — or a concurrent drain could re-lease the job mid-attempt and
+	// A delivery run renews a job's lease as it starts and again before its POST,
+	// and the jobs waiting behind it after each one it finishes. The lease must
+	// comfortably exceed the longest stretch between renewals — one job's worth
+	// of HTTP: a receiver-document GET, a verification challenge and the delivery
+	// POST — or a concurrent drain could re-lease a job mid-attempt and
 	// double-deliver. Clamp the lease up to that worst case (with headroom) rather
 	// than trusting a too-short configured value.
 	private void clampDeliveryLease() @safe
 	{
-		const longestSleepMs = opts_.webhookMaxAttempts > 1
-			? backoffFor(opts_.webhookMaxAttempts - 1).total!"msecs" : 0;
-		const worstAttemptMs = longestSleepMs + opts_.webhookHttpTimeout.total!"msecs";
-		// Two attempts' worth of headroom so a renewal that lands late still holds.
-		const floorMs = worstAttemptMs * 2;
+		const worstJobMs = 3 * opts_.webhookHttpTimeout.total!"msecs";
+		// Twice that, so a renewal that lands late still holds.
+		const floorMs = worstJobMs * 2;
 		if (opts_.deliveryLease.total!"msecs" < floorMs)
 			opts_.deliveryLease = floorMs.msecs;
 	}
@@ -2665,7 +2657,7 @@ final class EventsRuntime
 		}
 	}
 
-	// Run one job's bounded retry loop, settling it even when `deliverWithRetry`
+	// Run one delivery attempt of a job, settling it even when `deliverAttempt`
 	// throws unexpectedly (e.g. a custom store/queue raising). Without this a thrown
 	// job would stay leased and silently re-lease forever. On an unexpected throw the
 	// attempt count is advanced and the job is dead-lettered (acked) once the bound is
@@ -2673,12 +2665,12 @@ final class EventsRuntime
 	// whether the job was deferred to a later retry rather than settled.
 	private bool deliverGuarded(Delivery job) @safe
 	{
-		// The highest attempt count deliverWithRetry persisted before it threw;
+		// The highest attempt count deliverAttempt persisted before it threw;
 		// counting on from the leased job's count would roll it back and let the
 		// job exceed webhookMaxAttempts across re-leases.
 		int persisted = job.attempt;
 		try
-			return deliverWithRetry(job, persisted);
+			return deliverAttempt(job, persisted);
 		catch (Exception e)
 			logEventsError("webhook delivery threw", e);
 		const attempt = max(persisted, job.attempt) + 1;
@@ -2709,8 +2701,8 @@ final class EventsRuntime
 	/// replaces (and stops) a worker already running. A multi-node deployment
 	/// shares a durable `DeliveryQueue` so any node's worker delivers (and
 	/// re-leases a dead node's jobs). The worker runs in its own fiber on the
-	/// event loop, independent of `deliveryExecutor` / `deliverySleep`, so those
-	/// per-delivery hooks may be synchronous without blocking or spinning it.
+	/// event loop, independent of `deliveryExecutor`, so that per-delivery hook
+	/// may be synchronous without blocking or spinning it.
 	void startDeliveryWorker(Duration interval) @safe
 	{
 		import vibe.core.core : runTask;
@@ -2762,21 +2754,22 @@ final class EventsRuntime
 			logEventsError(what ~ " threw", e);
 	}
 
-	/// Deliver one queued job to its subscription, verifying the endpoint first (if
-	/// not already verified) and retrying with exponential backoff up to the bounded
-	/// attempt count. The attempt count is persisted on the queued job, so a job
-	/// re-leased after a crash resumes from where it left off and total attempts stay
-	/// bounded across leases/nodes. The lease is renewed around each attempt. On
-	/// success the subscription's watermark cursor advances; on exhaustion the lost
-	/// position is recorded as missed, and a signed `gap` envelope is queued for it
-	/// once the endpoint takes deliveries again. The job is acked (removed) only
-	/// once its position is settled — success, a 410 (which ends the subscription)
-	/// or 413, or exhaustion — never on a mere transient failure (so it survives to
-	/// be re-leased). `persistedAttempt` tracks the attempt count last persisted,
-	/// for a caller that recovers from a throw part-way through. Returns whether
-	/// the job was deferred to a later retry (its endpoint not yet verified)
-	/// rather than settled.
-	private bool deliverWithRetry(Delivery job, ref int persistedAttempt) @safe
+	/// Make one delivery attempt of a queued job, verifying the endpoint first (if
+	/// not already verified). A failed attempt short of the bounded attempt count
+	/// is retried after an exponential backoff, which the job waits out in the
+	/// queue, leased until it ends: no delivery slot is held meanwhile, and the
+	/// subscription's later jobs stay behind it. The attempt count is persisted on
+	/// the queued job, so a job re-leased after a crash resumes from where it left
+	/// off and total attempts stay bounded across leases/nodes. On success the
+	/// subscription's watermark cursor advances; on exhaustion the lost position is
+	/// recorded as missed, and a signed `gap` envelope is queued for it once the
+	/// endpoint takes deliveries again. The job is acked (removed) only once its
+	/// position is settled — success, a 410 (which ends the subscription) or 413,
+	/// or exhaustion — never on a mere transient failure (so it survives to be
+	/// re-leased). `persistedAttempt` tracks the attempt count last persisted, for
+	/// a caller that recovers from a throw part-way through. Returns whether the
+	/// job was deferred to a later retry rather than settled.
+	private bool deliverAttempt(Delivery job, ref int persistedAttempt) @safe
 	{
 		const subId = job.subscriptionId;
 		const occ = job.occ;
@@ -2842,72 +2835,60 @@ final class EventsRuntime
 			flushMissed(s0.get);
 			return false;
 		}
-		int attempt = job.attempt;
-		for (;;)
+		const attempt = job.attempt + 1;
+		deliveryQueue_.touch(job.jobId, attempt, opts_.nowMs() + leaseMs);
+		persistedAttempt = attempt;
+		auto sn = webhookStore_.get(subId);
+		if (sn.isNull || sn.get.incarnation != job.incarnation)
 		{
-			attempt++;
-			deliveryQueue_.touch(job.jobId, attempt, opts_.nowMs() + leaseMs);
-			persistedAttempt = attempt;
-			auto sn = webhookStore_.get(subId);
-			if (sn.isNull || sn.get.incarnation != job.incarnation)
-			{
-				ackJob(job.jobId);
-				return false;
-			}
-			if (dropIfLapsed(job, sn.get))
-				return false;
-			Delivery sending = job;
-			if (job.gap)
-			{
-				sending.occ.cursor = gapCursorAtSend(sn.get, job.occ.cursor, job.owed);
-				retrackCursor(job.jobId, sending.occ.cursor);
-			}
-			auto res = attemptDelivery(sn.get, sending);
-			if (res.ok)
-			{
-				recordSuccess(subId, job.jobId, sending.occ.cursor);
-				ackJob(job.jobId);
-				// The endpoint is taking deliveries again: send any gap it is owed.
-				flushMissed(sn.get);
-				return false;
-			}
-			// 410 Gone: the receiver no longer wants this subscription, so it ends.
-			if (res.statusCode == 410)
-			{
-				ackJob(job.jobId);
-				removeWebhookState(sn.get);
-				return false;
-			}
-			// 413 too large: retrying cannot succeed, so the event is skipped and
-			// the client is owed a gap. It is no evidence the endpoint is healthy.
-			if (res.statusCode == 413)
-			{
-				abandonUndelivered(job);
-				return false;
-			}
-			// Each failed attempt is one sample for the suspension policy, so an
-			// endpoint that never answers reaches the threshold within the window.
-			const cat = res.error.isNull ? DeliveryErrorCategory.http5xx : res.error.get;
-			if (!recordFailure(subId, cat))
-			{
-				abandonUndelivered(job);
-				return false;
-			}
-			if (attempt >= opts_.webhookMaxAttempts)
-			{
-				abandonUndelivered(job);
-				return false;
-			}
-			opts_.deliverySleep(backoffFor(attempt));
-			// Renew the lease after the inter-attempt sleep so a long retry loop never
-			// lets its claim lapse (which would let a concurrent drain re-lease it).
-			// The jobs queued behind this one are renewed too: they wait out the
-			// whole retry loop, and a lapsed claim would let another node deliver
-			// them out of order and again when their turn comes here.
-			const until = opts_.nowMs() + leaseMs;
-			deliveryQueue_.renew(job.jobId, until);
-			renewWaiting(subId, until);
+			ackJob(job.jobId);
+			return false;
 		}
+		if (dropIfLapsed(job, sn.get))
+			return false;
+		Delivery sending = job;
+		if (job.gap)
+		{
+			sending.occ.cursor = gapCursorAtSend(sn.get, job.occ.cursor, job.owed);
+			retrackCursor(job.jobId, sending.occ.cursor);
+		}
+		auto res = attemptDelivery(sn.get, sending);
+		if (res.ok)
+		{
+			recordSuccess(subId, job.jobId, sending.occ.cursor);
+			ackJob(job.jobId);
+			// The endpoint is taking deliveries again: send any gap it is owed.
+			flushMissed(sn.get);
+			return false;
+		}
+		// 410 Gone: the receiver no longer wants this subscription, so it ends.
+		if (res.statusCode == 410)
+		{
+			ackJob(job.jobId);
+			removeWebhookState(sn.get);
+			return false;
+		}
+		// 413 too large: retrying cannot succeed, so the event is skipped and
+		// the client is owed a gap. It is no evidence the endpoint is healthy.
+		if (res.statusCode == 413)
+		{
+			abandonUndelivered(job);
+			return false;
+		}
+		// Each failed attempt is one sample for the suspension policy, so an
+		// endpoint that never answers reaches the threshold within the window.
+		const cat = res.error.isNull ? DeliveryErrorCategory.http5xx : res.error.get;
+		if (!recordFailure(subId, cat) || attempt >= opts_.webhookMaxAttempts)
+		{
+			abandonUndelivered(job);
+			return false;
+		}
+		// The retry waits out its backoff in the queue, not in this run: the job
+		// stays leased until then, which holds the subscription's later jobs
+		// behind it, and any node's drain delivers it once the backoff ends.
+		deliveryQueue_.touch(job.jobId, attempt,
+				opts_.nowMs() + backoffFor(attempt).total!"msecs");
+		return true;
 	}
 
 	// A subscription whose grant lapsed (but that no sweep has removed yet) takes
@@ -3631,7 +3612,7 @@ final class EventsRuntime
 	}
 
 	// Exponential: base * 2^(attempt-1), capped at `maxRetryBackoff` (or the base,
-	// if larger) so a large attempt bound neither overflows nor sleeps for days.
+	// if larger) so a large attempt bound neither overflows nor defers a retry for days.
 	private Duration backoffFor(int attempt) @safe
 	{
 		import std.algorithm : max;
@@ -4150,16 +4131,16 @@ unittest  // the delivery lease is clamped to twice the longest wait between ren
 	EventsOptions o;
 	o.nowMs = () @safe => 1_000_000L;
 	o.nowIso = () @safe => "t";
-	// Defaults: 5 attempts, 30 s base, 10 s HTTP timeout. The longest sleep before
-	// a renewal follows attempt 4 (30 s * 2^3 = 240 s), so the floor is 2 * 250 s.
+	// Defaults: a 10 s HTTP timeout, and a job makes up to three requests
+	// between renewals, so the floor is 2 * 30 s. Retry backoff is spent in
+	// the queue, so the attempt count and retry base play no part.
 	auto rt = new EventsRuntime(null, o);
-	assert(rt.opts_.deliveryLease == 500.seconds);
-
-	o.webhookMaxAttempts = 1; // no retry, so no sleep: only the HTTP bound counts
-	rt = new EventsRuntime(null, o);
 	assert(rt.opts_.deliveryLease == 1.minutes);
 
-	o.webhookMaxAttempts = 5;
+	o.webhookHttpTimeout = 30.seconds;
+	rt = new EventsRuntime(null, o);
+	assert(rt.opts_.deliveryLease == 180.seconds);
+
 	o.deliveryLease = 60.minutes; // a longer configured lease is kept
 	rt = new EventsRuntime(null, o);
 	assert(rt.opts_.deliveryLease == 60.minutes);
@@ -4197,7 +4178,7 @@ unittest  // a node that claimed a full batch claims the next once its runs fini
 	o.allowPrivateCallbackHosts = true;
 	o.webhookTransport = ft;
 	o.deliveryLeaseBatch = 2;
-	o.deliverySleep = (Duration d) @safe {};
+	o.webhookRetryBase = Duration.zero;
 	bool running;
 	void delegate() @safe[] tasks;
 	o.deliveryExecutor = (void delegate() @safe job) @safe {
@@ -5591,7 +5572,7 @@ unittest  // a webhook subscribe admitted while another's on_subscribe runs cann
 	o.allowPrivateCallbackHosts = true;
 	o.webhookTransport = ft;
 	o.deliveryExecutor = (void delegate() @safe job) @safe { job(); };
-	o.deliverySleep = (Duration d) @safe {};
+	o.webhookRetryBase = Duration.zero;
 	o.webhookMaxSubscriptionsPerPrincipal = 1;
 	auto rt = new EventsRuntime(null, o);
 	bool nested;
@@ -6568,10 +6549,21 @@ unittest  // the delivery worker keeps running when a pass throws
 	assert(passes - constructed >= 4, "the worker kept running past failing passes");
 }
 
-unittest  // jobs queued behind a retrying job keep their lease, so another node cannot take them
+version (unittest)
 {
-	import mcp.server.event_store : InMemoryDeliveryQueue;
+	// The event ids POSTed to callback `url`, in order.
+	private string[] eventIdsPostedTo(FakeWebhookTransport ft, string url) @safe
+	{
+		string[] ids;
+		foreach (p; ft.eventPosts())
+			if (p.url == url)
+				ids ~= parseJsonString(p.body)["eventId"].get!string;
+		return ids;
+	}
+}
 
+unittest  // a delivery waiting out its retry backoff holds no delivery slot
+{
 	long now = 1_000_000;
 	auto ft = new FakeWebhookTransport();
 	auto q = new InMemoryDeliveryQueue();
@@ -6579,35 +6571,74 @@ unittest  // jobs queued behind a retrying job keep their lease, so another node
 	o.nowMs = () @safe => now;
 	o.nowIso = () @safe => "t";
 	o.allowPrivateCallbackHosts = true;
+	o.callbackAllowlist = ["https://proxy/"];
 	o.webhookTransport = ft;
 	o.deliveryQueue = q;
-	o.webhookRetryBase = 1.msecs;
-	o.webhookHttpTimeout = 1.msecs;
-	o.deliveryLease = 1000.msecs;
+	o.webhookMaxConcurrency = 1;
 	void delegate() @safe[] deferred;
 	o.deliveryExecutor = (void delegate() @safe job) @safe { deferred ~= job; };
-	int sleeps;
-	size_t stolen;
-	o.deliverySleep = (Duration d) @safe {
-		now += 600; // each backoff outlasts half the lease
-		if (++sleeps == 3)
-			stolen = q.lease(now, 1000, 0).length; // another node's drain
-	};
+	void runAll() @safe
+	{
+		while (deferred.length)
+		{
+			auto job = deferred[0];
+			deferred = deferred[1 .. $];
+			job();
+		}
+	}
+
+	auto rt = new EventsRuntime(null, o);
+	EventRegistration reg = {descriptor: EventType("n"), emitOnly: true};
+	rt.register(reg);
+	auto a = rt.subscribeWebhook(webhookSub("n", "https://proxy/a"), "user-1");
+	rt.emit(EventOccurrence("evt_1", "n", "t"));
+	ft.eventStatuses = [503];
+	runAll();
+	// The failed attempt left the job queued for its retry and freed its slot.
+	assert(eventIdsPostedTo(ft, "https://proxy/a") == ["evt_1"]);
+	assert(q.hasPendingFor(a.id) && rt.outboundTasks() == 0);
+	// Another subscription delivers through the slot meanwhile.
+	rt.subscribeWebhook(webhookSub("n", "https://proxy/b"), "user-1");
+	rt.emit(EventOccurrence("evt_2", "n", "t"));
+	runAll();
+	assert(eventIdsPostedTo(ft, "https://proxy/b") == ["evt_2"]);
+	// The retrying job still goes out ahead of the one queued behind it, once
+	// its backoff ends.
+	rt.drainDeliveries();
+	runAll();
+	assert(eventIdsPostedTo(ft, "https://proxy/a") == ["evt_1"]);
+	now += rt.backoffFor(1).total!"msecs";
+	rt.drainDeliveries();
+	runAll();
+	assert(eventIdsPostedTo(ft, "https://proxy/a") == [
+		"evt_1", "evt_1", "evt_2"
+	]);
+	assert(!q.hasPendingFor(a.id));
+}
+
+unittest  // jobs queued behind a job waiting out its backoff are not leased by another node
+{
+	long now = 1_000_000;
+	auto ft = new FakeWebhookTransport();
+	auto q = new InMemoryDeliveryQueue();
+	EventsOptions o;
+	o.nowMs = () @safe => now;
+	o.nowIso = () @safe => "t";
+	o.allowPrivateCallbackHosts = true;
+	o.callbackAllowlist = ["https://proxy/"];
+	o.webhookTransport = ft;
+	o.deliveryQueue = q;
+	o.deliveryExecutor = (void delegate() @safe job) @safe { job(); };
 	auto rt = new EventsRuntime(null, o);
 	EventRegistration reg = {descriptor: EventType("n"), emitOnly: true};
 	rt.register(reg);
 	rt.subscribeWebhook(webhookSub("n", "https://proxy/hooks"), "user-1");
-	ft.eventStatuses = [500, 500, 500, 500, 500];
+	ft.eventStatuses = [503];
 	rt.emit(EventOccurrence("evt_1", "n", "t"));
 	rt.emit(EventOccurrence("evt_2", "n", "t"));
-	while (deferred.length)
-	{
-		auto job = deferred[0];
-		deferred = deferred[1 .. $];
-		job();
-	}
-	assert(sleeps >= 3);
-	assert(stolen == 0, "a queued job's lease lapsed while it waited");
+	assert(q.lease(now + rt.backoffFor(1).total!"msecs" - 1, 1000, 0).length == 0);
+	auto ready = q.lease(now + rt.backoffFor(1).total!"msecs", 1000, 0);
+	assert(ready.length == 2 && ready[0].occ.eventId == "evt_1" && ready[0].attempt == 1);
 }
 
 unittest  // jobs queued behind slow successful deliveries keep their lease
@@ -6629,7 +6660,6 @@ unittest  // jobs queued behind slow successful deliveries keep their lease
 	o.deliveryLease = 1000.msecs;
 	void delegate() @safe[] deferred;
 	o.deliveryExecutor = (void delegate() @safe job) @safe { deferred ~= job; };
-	o.deliverySleep = (Duration d) @safe {};
 	auto rt = new EventsRuntime(null, o);
 	EventRegistration reg = {descriptor: EventType("n"), emitOnly: true};
 	rt.register(reg);
@@ -6694,16 +6724,16 @@ unittest  // the worker does not run on the delivery hooks: a synchronous execut
 	EventsOptions o;
 	o.nowMs = () @safe => 1_000_000L;
 	o.nowIso = () @safe => "t";
-	o.deliveryExecutor = (void delegate() @safe job) @safe { job(); };
-	int sleeps;
-	o.deliverySleep = (Duration d) @safe {
-		if (++sleeps > 3)
+	int runs;
+	o.deliveryExecutor = (void delegate() @safe job) @safe {
+		if (++runs > 3)
 			throw new Exception("the worker looped inline on the delivery hooks");
+		job();
 	};
 	auto rt = new EventsRuntime(null, o);
 	rt.startDeliveryWorker(1.seconds);
 	rt.stopDeliveryWorker();
-	assert(sleeps == 0);
+	assert(runs == 0);
 }
 
 unittest  // unsubscribeWebhook throws NotFound for an unknown subscription
@@ -7007,6 +7037,9 @@ version (unittest)
 		}
 	}
 
+	// A webhook engine on a fixed clock whose deliveries run inline. Retries
+	// have no backoff, so a failing delivery is retried (and exhausted) within
+	// the call that queued it.
 	private EventsRuntime engineRuntime(FakeWebhookTransport ft, bool allowPrivate = true) @safe
 	{
 		EventsOptions o;
@@ -7014,8 +7047,8 @@ version (unittest)
 		o.nowIso = () @safe => "t";
 		o.allowPrivateCallbackHosts = allowPrivate;
 		o.webhookTransport = ft;
+		o.webhookRetryBase = Duration.zero;
 		o.deliveryExecutor = (void delegate() @safe job) @safe { job(); };
-		o.deliverySleep = (Duration d) @safe {};
 		auto rt = new EventsRuntime(null, o);
 		EventRegistration reg = {descriptor: EventType("n"), emitOnly: true};
 		rt.register(reg);
@@ -7052,7 +7085,7 @@ unittest  // a rotated previous secret is cleared once its grace window has elap
 	o.allowPrivateCallbackHosts = true;
 	o.webhookTransport = ft;
 	o.deliveryExecutor = (void delegate() @safe job) @safe { job(); };
-	o.deliverySleep = (Duration d) @safe {};
+	o.webhookRetryBase = Duration.zero;
 	auto rt = new EventsRuntime(null, o);
 	EventRegistration reg = {descriptor: EventType("n"), emitOnly: true};
 	rt.register(reg);
@@ -7091,7 +7124,7 @@ unittest  // end-to-end secret rotation: deliveries dual-sign within grace, sing
 	o.allowPrivateCallbackHosts = true;
 	o.webhookTransport = ft;
 	o.deliveryExecutor = (void delegate() @safe job) @safe { job(); };
-	o.deliverySleep = (Duration d) @safe {};
+	o.webhookRetryBase = Duration.zero;
 	auto rt = new EventsRuntime(null, o);
 	EventRegistration reg = {descriptor: EventType("n"), emitOnly: true};
 	rt.register(reg);
@@ -7203,7 +7236,7 @@ unittest  // deliveries skipped by the verification backoff are not counted towa
 	o.allowPrivateCallbackHosts = true;
 	o.webhookTransport = ft;
 	o.deliveryExecutor = (void delegate() @safe job) @safe { job(); };
-	o.deliverySleep = (Duration d) @safe {};
+	o.webhookRetryBase = Duration.zero;
 	o.webhookSuspension.minAttempts = 3;
 	auto rt = new EventsRuntime(null, o);
 	EventRegistration reg = {descriptor: EventType("n"), emitOnly: true};
@@ -7272,7 +7305,7 @@ unittest  // a check-backed type is served over webhook by replaying from the cu
 	o.allowPrivateCallbackHosts = true;
 	o.webhookTransport = ft;
 	o.deliveryExecutor = (void delegate() @safe job) @safe { job(); };
-	o.deliverySleep = (Duration d) @safe {};
+	o.webhookRetryBase = Duration.zero;
 	auto rt = new EventsRuntime(null, o);
 	Nullable!string[] seen;
 	EventRegistration reg;
@@ -7390,7 +7423,7 @@ unittest  // an unsubscribe while the poll-driven check runs is not undone by th
 	o.allowPrivateCallbackHosts = true;
 	o.webhookTransport = ft;
 	o.deliveryExecutor = (void delegate() @safe job) @safe { job(); };
-	o.deliverySleep = (Duration d) @safe {};
+	o.webhookRetryBase = Duration.zero;
 	auto rt = new EventsRuntime(null, o);
 	void delegate() @safe duringCheck;
 	EventRegistration reg;
@@ -7504,7 +7537,7 @@ unittest  // a delivery yielding mid-POST does not let a sibling job of the subs
 	o.nowIso = () @safe => "t";
 	o.allowPrivateCallbackHosts = true;
 	o.webhookTransport = ft;
-	o.deliverySleep = (Duration d) @safe {};
+	o.webhookRetryBase = Duration.zero;
 	void delegate() @safe[] deferred;
 	o.deliveryExecutor = (void delegate() @safe job) @safe { deferred ~= job; };
 	void runPending() @safe
@@ -7545,7 +7578,7 @@ unittest  // concurrent deliveries to one unverified endpoint send a single chal
 	o.nowIso = () @safe => "t";
 	o.allowPrivateCallbackHosts = true;
 	o.webhookTransport = ft;
-	o.deliverySleep = (Duration d) @safe {};
+	o.webhookRetryBase = Duration.zero;
 	void delegate() @safe[] deferred;
 	o.deliveryExecutor = (void delegate() @safe job) @safe { deferred ~= job; };
 	void runPending() @safe
@@ -7601,7 +7634,7 @@ unittest  // a lapsed subscription is recreated from the client's cursor, with l
 	o.allowPrivateCallbackHosts = true;
 	o.webhookTransport = ft;
 	o.deliveryExecutor = (void delegate() @safe job) @safe { job(); };
-	o.deliverySleep = (Duration d) @safe {};
+	o.webhookRetryBase = Duration.zero;
 	o.webhookTtlCap = 1.minutes;
 	auto rt = new EventsRuntime(null, o);
 	int subs, unsubs;
@@ -7682,7 +7715,7 @@ unittest  // an emit-only webhook backfill larger than the pending bound pages i
 	o.allowPrivateCallbackHosts = true;
 	o.webhookTransport = ft;
 	o.deliveryExecutor = (void delegate() @safe job) @safe { job(); };
-	o.deliverySleep = (Duration d) @safe {};
+	o.webhookRetryBase = Duration.zero;
 	o.webhookMaxPendingPerSubscription = 3;
 	auto rt = new EventsRuntime(null, o);
 	EventRegistration reg = {descriptor: EventType("n"), emitOnly: true};
@@ -7788,7 +7821,7 @@ unittest  // a deferred drain delivers every leased job
 	o.nowIso = () @safe => "t";
 	o.allowPrivateCallbackHosts = true;
 	o.webhookTransport = ft;
-	o.deliverySleep = (Duration d) @safe {};
+	o.webhookRetryBase = Duration.zero;
 	void delegate() @safe[] deferred;
 	o.deliveryExecutor = (void delegate() @safe job) @safe { deferred ~= job; };
 	auto rt = new EventsRuntime(null, o);
@@ -7890,7 +7923,7 @@ unittest  // well-known verification can be disabled, falling back to the challe
 	o.allowPrivateCallbackHosts = true;
 	o.webhookTransport = ft;
 	o.deliveryExecutor = (void delegate() @safe job) @safe { job(); };
-	o.deliverySleep = (Duration d) @safe {};
+	o.webhookRetryBase = Duration.zero;
 	o.wellKnownReceiverVerification = false;
 	auto rt = new EventsRuntime(null, o);
 	EventRegistration reg = {descriptor: EventType("n"), emitOnly: true};
@@ -7912,7 +7945,7 @@ unittest  // an unverified endpoint is not re-probed on every emit (verification
 	o.allowPrivateCallbackHosts = true;
 	o.webhookTransport = ft;
 	o.deliveryExecutor = (void delegate() @safe job) @safe { job(); };
-	o.deliverySleep = (Duration d) @safe {};
+	o.webhookRetryBase = Duration.zero;
 	auto rt = new EventsRuntime(null, o);
 	EventRegistration reg = {descriptor: EventType("n"), emitOnly: true};
 	rt.register(reg);
@@ -8088,7 +8121,7 @@ unittest  // a sustained failure rate over the minimum sample suspends the subsc
 	o.allowPrivateCallbackHosts = true;
 	o.webhookTransport = ft;
 	o.deliveryExecutor = (void delegate() @safe job) @safe { job(); };
-	o.deliverySleep = (Duration d) @safe {};
+	o.webhookRetryBase = Duration.zero;
 	o.webhookMaxAttempts = 1; // one attempt per event => one outcome per emit
 	o.webhookSuspension.minAttempts = 2;
 	auto rt = new EventsRuntime(null, o);
@@ -8114,7 +8147,7 @@ unittest  // the refresh that reactivates a suspended subscription reports the s
 	o.allowPrivateCallbackHosts = true;
 	o.webhookTransport = ft;
 	o.deliveryExecutor = (void delegate() @safe job) @safe { job(); };
-	o.deliverySleep = (Duration d) @safe {};
+	o.webhookRetryBase = Duration.zero;
 	o.webhookMaxAttempts = 1;
 	o.webhookSuspension.minAttempts = 2;
 	auto rt = new EventsRuntime(null, o);
@@ -8142,7 +8175,7 @@ unittest  // a refresh that reactivates a suspended subscription starts a fresh 
 	o.allowPrivateCallbackHosts = true;
 	o.webhookTransport = ft;
 	o.deliveryExecutor = (void delegate() @safe job) @safe { job(); };
-	o.deliverySleep = (Duration d) @safe {};
+	o.webhookRetryBase = Duration.zero;
 	o.webhookMaxAttempts = 1;
 	o.webhookSuspension.minAttempts = 2;
 	o.webhookSuspension.failureRatePercent = 60;
@@ -8171,7 +8204,7 @@ unittest  // every failed retry attempt counts toward suspension, so a dead endp
 	o.allowPrivateCallbackHosts = true;
 	o.webhookTransport = ft;
 	o.deliveryExecutor = (void delegate() @safe job) @safe { job(); };
-	o.deliverySleep = (Duration d) @safe {};
+	o.webhookRetryBase = Duration.zero;
 	o.webhookMaxAttempts = 5;
 	o.webhookSuspension.minAttempts = 3;
 	auto rt = new EventsRuntime(null, o);
@@ -8195,20 +8228,15 @@ unittest  // the first failed attempt records lastError and failedSince before a
 	o.allowPrivateCallbackHosts = true;
 	o.webhookTransport = ft;
 	o.deliveryExecutor = (void delegate() @safe job) @safe { job(); };
-	EventsRuntime rt;
-	string subId;
-	bool sawError;
-	o.deliverySleep = (Duration d) @safe {
-		auto s = rt.webhookStore().get(subId).get;
-		sawError = s.lastErrorCat == cast(int) DeliveryErrorCategory.http5xx && s.failedSinceMs != 0;
-	};
-	rt = new EventsRuntime(null, o);
+	auto rt = new EventsRuntime(null, o);
 	EventRegistration reg = {descriptor: EventType("n"), emitOnly: true};
 	rt.register(reg);
-	subId = rt.subscribeWebhook(webhookSub("n", "https://proxy/hooks"), "user-1").id;
+	const subId = rt.subscribeWebhook(webhookSub("n", "https://proxy/hooks"), "user-1").id;
 	ft.eventStatuses = [503, 200];
 	rt.emit(EventOccurrence("evt_1", "n", "t"));
-	assert(sawError);
+	assert(ft.eventPosts().length == 1); // the retry waits out its backoff
+	auto s = rt.webhookStore().get(subId).get;
+	assert(s.lastErrorCat == cast(int) DeliveryErrorCategory.http5xx && s.failedSinceMs != 0);
 }
 
 unittest  // the default suspension policy suspends a dead endpoint within one window
@@ -8224,8 +8252,6 @@ unittest  // the default suspension policy suspends a dead endpoint within one w
 	o.allowPrivateCallbackHosts = true;
 	o.webhookTransport = ft;
 	o.deliveryExecutor = (void delegate() @safe job) @safe { job(); };
-	// Retry backoff advances the clock exactly as the real sleeps would.
-	o.deliverySleep = (Duration d) @safe { clock += d.total!"msecs"; };
 	auto rt = new EventsRuntime(null, o);
 	EventRegistration reg = {descriptor: EventType("n"), emitOnly: true};
 	rt.register(reg);
@@ -8245,6 +8271,9 @@ unittest  // the default suspension policy suspends a dead endpoint within one w
 			refreshedAt = clock;
 		}
 		rt.emit(EventOccurrence("evt_" ~ (i++).to!string, "n", "t"));
+		// Each pass of the worker delivers the jobs whose backoff has ended.
+		clock += 30_000;
+		rt.drainDeliveries();
 	}
 	assert(!rt.webhookStore().get(r.id).get.active,
 			"a dead endpoint must be suspended within one suspension window");
@@ -8270,7 +8299,7 @@ unittest  // a failure rate under the threshold never suspends, however large th
 	o.allowPrivateCallbackHosts = true;
 	o.webhookTransport = ft;
 	o.deliveryExecutor = (void delegate() @safe job) @safe { job(); };
-	o.deliverySleep = (Duration d) @safe {};
+	o.webhookRetryBase = Duration.zero;
 	o.webhookMaxAttempts = 1;
 	o.webhookSuspension.minAttempts = 4;
 	auto rt = new EventsRuntime(null, o);
@@ -8295,7 +8324,7 @@ unittest  // the sample window tumbles: an old streak does not count against a n
 	o.allowPrivateCallbackHosts = true;
 	o.webhookTransport = ft;
 	o.deliveryExecutor = (void delegate() @safe job) @safe { job(); };
-	o.deliverySleep = (Duration d) @safe {};
+	o.webhookRetryBase = Duration.zero;
 	o.webhookMaxAttempts = 1;
 	o.webhookSuspension.minAttempts = 2;
 	o.webhookSuspension.window = 1.minutes;
@@ -8322,7 +8351,7 @@ unittest  // events missed while suspended are signalled with a gap once a refre
 	o.webhookTransport = ft;
 	o.deliveryQueue = queue;
 	o.deliveryExecutor = (void delegate() @safe job) @safe { job(); };
-	o.deliverySleep = (Duration d) @safe {};
+	o.webhookRetryBase = Duration.zero;
 	o.webhookMaxAttempts = 1;
 	o.webhookSuspension.minAttempts = 2;
 	auto rt = new EventsRuntime(null, o);
@@ -8362,7 +8391,7 @@ unittest  // a job queued before its subscription was suspended is not re-leased
 	o.allowPrivateCallbackHosts = true;
 	o.webhookTransport = ft;
 	o.deliveryQueue = queue;
-	o.deliverySleep = (Duration d) @safe {};
+	o.webhookRetryBase = Duration.zero;
 	void delegate() @safe[] deferred;
 	o.deliveryExecutor = (void delegate() @safe job) @safe { deferred ~= job; };
 	auto rt = new EventsRuntime(null, o);
@@ -8393,7 +8422,7 @@ unittest  // deliveries to an endpoint that never verifies are dead-lettered aft
 	o.deliveryQueue = queue;
 	o.webhookMaxAttempts = 2;
 	o.deliveryExecutor = (void delegate() @safe job) @safe { job(); };
-	o.deliverySleep = (Duration d) @safe {};
+	o.webhookRetryBase = Duration.zero;
 	auto rt = new EventsRuntime(null, o);
 	EventRegistration reg = {descriptor: EventType("n"), emitOnly: true};
 	rt.register(reg);
@@ -8420,7 +8449,7 @@ unittest  // a subscription's queued deliveries are bounded; the overflow is sig
 	o.webhookTransport = ft;
 	o.deliveryQueue = queue;
 	o.webhookMaxPendingPerSubscription = 2;
-	o.deliverySleep = (Duration d) @safe {};
+	o.webhookRetryBase = Duration.zero;
 	void delegate() @safe[] deferred;
 	o.deliveryExecutor = (void delegate() @safe job) @safe { deferred ~= job; };
 	auto rt = new EventsRuntime(null, o);
@@ -8451,7 +8480,7 @@ unittest  // the pending bound also holds for deliveries that carry no cursor
 	o.webhookTransport = ft;
 	o.deliveryQueue = queue;
 	o.webhookMaxPendingPerSubscription = 2;
-	o.deliverySleep = (Duration d) @safe {};
+	o.webhookRetryBase = Duration.zero;
 	void delegate() @safe[] deferred;
 	o.deliveryExecutor = (void delegate() @safe job) @safe { deferred ~= job; };
 	auto rt = new EventsRuntime(null, o);
@@ -8484,7 +8513,7 @@ unittest  // a delivered cursor-less job frees its slot under the pending bound
 	o.allowPrivateCallbackHosts = true;
 	o.webhookTransport = ft;
 	o.webhookMaxPendingPerSubscription = 1;
-	o.deliverySleep = (Duration d) @safe {};
+	o.webhookRetryBase = Duration.zero;
 	o.deliveryExecutor = (void delegate() @safe job) @safe { job(); };
 	auto rt = new EventsRuntime(null, o);
 	int n;
@@ -8572,7 +8601,7 @@ unittest  // a webhook subscription at its pending bound is not fetched past, so
 	o.allowPrivateCallbackHosts = true;
 	o.webhookTransport = ft;
 	o.webhookMaxPendingPerSubscription = 2;
-	o.deliverySleep = (Duration d) @safe {};
+	o.webhookRetryBase = Duration.zero;
 	void delegate() @safe[] deferred;
 	o.deliveryExecutor = (void delegate() @safe job) @safe { deferred ~= job; };
 	void runAll() @safe
@@ -8608,7 +8637,7 @@ unittest  // a webhook poll pass keeps fetching while the check reports more
 	o.allowPrivateCallbackHosts = true;
 	o.webhookTransport = ft;
 	o.pollDefaultMaxEvents = 2;
-	o.deliverySleep = (Duration d) @safe {};
+	o.webhookRetryBase = Duration.zero;
 	o.deliveryExecutor = (void delegate() @safe job) @safe { job(); };
 	auto rt = new EventsRuntime(null, o);
 	rt.register(pagedCheckType("paged", 5));
@@ -8629,7 +8658,7 @@ unittest  // a no-replay check's truncation is reported to a webhook subscriber 
 	o.nowIso = () @safe => "t";
 	o.allowPrivateCallbackHosts = true;
 	o.webhookTransport = ft;
-	o.deliverySleep = (Duration d) @safe {};
+	o.webhookRetryBase = Duration.zero;
 	o.deliveryExecutor = (void delegate() @safe job) @safe { job(); };
 	auto rt = new EventsRuntime(null, o);
 	EventRegistration reg;
@@ -8661,7 +8690,7 @@ unittest  // a quiet fetch does not advance the watermark past a position still 
 	o.allowPrivateCallbackHosts = true;
 	o.webhookTransport = ft;
 	o.webhookMaxAttempts = 1;
-	o.deliverySleep = (Duration d) @safe {};
+	o.webhookRetryBase = Duration.zero;
 	o.deliveryExecutor = (void delegate() @safe job) @safe { job(); };
 	auto rt = new EventsRuntime(null, o);
 	EventRegistration reg;
@@ -8689,7 +8718,7 @@ unittest  // emits arriving before a drain runs share one drain kick
 	o.nowIso = () @safe => "t";
 	o.allowPrivateCallbackHosts = true;
 	o.webhookTransport = ft;
-	o.deliverySleep = (Duration d) @safe {};
+	o.webhookRetryBase = Duration.zero;
 	void delegate() @safe[] deferred;
 	o.deliveryExecutor = (void delegate() @safe job) @safe { deferred ~= job; };
 	auto rt = new EventsRuntime(null, o);
@@ -8716,7 +8745,7 @@ unittest  // endpoint verification and well-known caches are evicted once stale
 	o.allowPrivateCallbackHosts = true;
 	o.webhookTransport = ft;
 	o.deliveryExecutor = (void delegate() @safe job) @safe { job(); };
-	o.deliverySleep = (Duration d) @safe {};
+	o.webhookRetryBase = Duration.zero;
 	auto rt = new EventsRuntime(null, o);
 	EventRegistration reg = {descriptor: EventType("n"), emitOnly: true};
 	rt.register(reg);
@@ -8743,7 +8772,7 @@ unittest  // emitted webhook deliveries respect the type's match filter
 	o.allowPrivateCallbackHosts = true;
 	o.webhookTransport = ft;
 	o.deliveryExecutor = (void delegate() @safe job) @safe { job(); };
-	o.deliverySleep = (Duration d) @safe {};
+	o.webhookRetryBase = Duration.zero;
 	auto rt = new EventsRuntime(null, o);
 	EventRegistration reg;
 	reg.descriptor.name = "incident.created";
@@ -8776,7 +8805,7 @@ unittest  // a match throwing for one webhook subscription neither escapes emit 
 	o.allowPrivateCallbackHosts = true;
 	o.webhookTransport = ft;
 	o.deliveryExecutor = (void delegate() @safe job) @safe { job(); };
-	o.deliverySleep = (Duration d) @safe {};
+	o.webhookRetryBase = Duration.zero;
 	auto rt = new EventsRuntime(null, o);
 	EventRegistration reg;
 	reg.descriptor.name = "n";
@@ -8808,7 +8837,7 @@ unittest  // publish enqueues a webhook delivery; delivery happens on a queue dr
 	o.nowIso = () @safe => "t";
 	o.allowPrivateCallbackHosts = true;
 	o.webhookTransport = ft;
-	o.deliverySleep = (Duration d) @safe {};
+	o.webhookRetryBase = Duration.zero;
 	// A deferring executor captures the per-publish kick without running it, so we
 	// can observe that publish only ENQUEUES — delivery waits for a drain.
 	void delegate() @safe[] deferred;
@@ -8848,7 +8877,7 @@ unittest  // subscribe and publish read only the subscriptions they concern, nev
 	o.nowIso = () @safe => "t";
 	o.allowPrivateCallbackHosts = true;
 	o.webhookTransport = ft;
-	o.deliverySleep = (Duration d) @safe {};
+	o.webhookRetryBase = Duration.zero;
 	o.deliveryExecutor = (void delegate() @safe job) @safe { job(); };
 	auto rt = new EventsRuntime(store, o);
 	EventRegistration n = {descriptor: EventType("n"), emitOnly: true};
@@ -8901,7 +8930,7 @@ version (unittest)
 		o.nowIso = () @safe => "t";
 		o.allowPrivateCallbackHosts = true;
 		o.webhookTransport = new FakeWebhookTransport();
-		o.deliverySleep = (Duration d) @safe {};
+		o.webhookRetryBase = Duration.zero;
 		o.deliveryExecutor = (void delegate() @safe job) @safe { job(); };
 		auto rt = new EventsRuntime(store, o);
 		EventRegistration reg = {descriptor: EventType("n"), emitOnly: true};
@@ -8982,7 +9011,7 @@ unittest  // a reconcile pass while a new webhook subscription is stored does no
 	o.nowIso = () @safe => "t";
 	o.allowPrivateCallbackHosts = true;
 	o.webhookTransport = new FakeWebhookTransport();
-	o.deliverySleep = (Duration d) @safe {};
+	o.webhookRetryBase = Duration.zero;
 	o.deliveryExecutor = (void delegate() @safe job) @safe { job(); };
 	auto rt = new EventsRuntime(store, o);
 	int subs, unsubs;
@@ -9027,7 +9056,7 @@ version (unittest)
 		o.nowIso = () @safe => "t";
 		o.allowPrivateCallbackHosts = true;
 		o.webhookTransport = ft;
-		o.deliverySleep = (Duration d) @safe {};
+		o.webhookRetryBase = Duration.zero;
 		o.deliveryExecutor = (void delegate() @safe job) @safe { job(); };
 		auto rt = new EventsRuntime(store, o);
 		EventRegistration reg = {descriptor: EventType("n"), emitOnly: true};
@@ -9086,7 +9115,7 @@ unittest  // an emit landing while a new subscription's replay is settled is del
 	o.nowIso = () @safe => "t";
 	o.allowPrivateCallbackHosts = true;
 	o.webhookTransport = ft;
-	o.deliverySleep = (Duration d) @safe {};
+	o.webhookRetryBase = Duration.zero;
 	o.deliveryExecutor = (void delegate() @safe job) @safe { job(); };
 	auto rt = new EventsRuntime(store, o);
 	EventRegistration reg = {descriptor: EventType("n"), emitOnly: true};
@@ -9121,7 +9150,7 @@ unittest  // a removed subscription's queued jobs are not delivered to its resub
 	o.allowPrivateCallbackHosts = true;
 	o.webhookTransport = ft;
 	o.deliveryQueue = queue;
-	o.deliverySleep = (Duration d) @safe {};
+	o.webhookRetryBase = Duration.zero;
 	void delegate() @safe[] deferred;
 	o.deliveryExecutor = (void delegate() @safe job) @safe { deferred ~= job; };
 	auto rt = new EventsRuntime(null, o);
@@ -9159,7 +9188,7 @@ unittest  // a job for a subscription that lapsed before delivery is acked witho
 	o.allowPrivateCallbackHosts = true;
 	o.webhookTransport = ft;
 	o.deliveryQueue = queue;
-	o.deliverySleep = (Duration d) @safe {};
+	o.webhookRetryBase = Duration.zero;
 	void delegate() @safe[] deferred;
 	o.deliveryExecutor = (void delegate() @safe job) @safe { deferred ~= job; };
 	auto rt = new EventsRuntime(null, o);
@@ -9187,7 +9216,7 @@ unittest  // multi-node: node B's worker delivers a job node A enqueued (shared 
 	oa.nowIso = () @safe => "t";
 	oa.allowPrivateCallbackHosts = true;
 	oa.webhookTransport = ftA;
-	oa.deliverySleep = (Duration d) @safe {};
+	oa.webhookRetryBase = Duration.zero;
 	oa.deliveryQueue = queue;
 	oa.deliveryExecutor = (void delegate() @safe job) @safe {}; // drop the kick
 	auto rtA = new EventsRuntime(store, oa);
@@ -9204,7 +9233,7 @@ unittest  // multi-node: node B's worker delivers a job node A enqueued (shared 
 	ob.nowIso = () @safe => "t";
 	ob.allowPrivateCallbackHosts = true;
 	ob.webhookTransport = ftB;
-	ob.deliverySleep = (Duration d) @safe {};
+	ob.webhookRetryBase = Duration.zero;
 	ob.deliveryQueue = queue;
 	ob.deliveryExecutor = (void delegate() @safe job) @safe { job(); };
 	auto rtB = new EventsRuntime(store, ob);
@@ -9260,7 +9289,7 @@ version (unittest)
 			o.webhookTransport = ft;
 			o.deliveryQueue = t.queue;
 			o.webhookMaxPendingPerSubscription = maxPending;
-			o.deliverySleep = (Duration d) @safe {};
+			o.webhookRetryBase = Duration.zero;
 			o.deliveryExecutor = delivers ? (void delegate() @safe job) @safe {
 				job();
 			} : (void delegate() @safe job) @safe {};
@@ -9369,7 +9398,7 @@ unittest  // attempt persistence: a job re-leased mid-retry does not restart att
 	o.allowPrivateCallbackHosts = true;
 	o.webhookTransport = ft;
 	o.deliveryQueue = queue;
-	o.deliverySleep = (Duration d) @safe {};
+	o.webhookRetryBase = Duration.zero;
 	// Don't auto-run the kick; drive drains manually so we can simulate a crash.
 	o.deliveryExecutor = (void delegate() @safe job) @safe { job(); };
 	auto rt = new EventsRuntime(null, o);
@@ -9394,9 +9423,8 @@ unittest  // attempt persistence: a job re-leased mid-retry does not restart att
 
 unittest  // the default retry schedule is 3-5 attempts spread over at most 15 minutes
 {
-	auto ft = new FakeWebhookTransport();
-	auto rt = engineRuntime(ft);
 	EventsOptions defaults;
+	auto rt = testRuntime();
 	assert(defaults.webhookMaxAttempts >= 3 && defaults.webhookMaxAttempts <= 5);
 	Duration total;
 	foreach (attempt; 1 .. defaults.webhookMaxAttempts)
@@ -9479,7 +9507,7 @@ unittest  // an owed gap survives a restart over the same subscription store
 		o.allowPrivateCallbackHosts = true;
 		o.webhookTransport = ft;
 		o.deliveryExecutor = (void delegate() @safe job) @safe { job(); };
-		o.deliverySleep = (Duration d) @safe {};
+		o.webhookRetryBase = Duration.zero;
 		auto rt = new EventsRuntime(store, o);
 		EventRegistration reg = {descriptor: EventType("n"), emitOnly: true};
 		rt.register(reg);
@@ -9556,7 +9584,7 @@ unittest  // a transient failure leaves the job leased (not acked) for re-lease
 	o.allowPrivateCallbackHosts = true;
 	o.webhookTransport = ft;
 	o.deliveryQueue = queue;
-	o.deliverySleep = (Duration d) @safe {};
+	o.webhookRetryBase = Duration.zero;
 	o.deliveryExecutor = (void delegate() @safe job) @safe { job(); };
 	auto rt = new EventsRuntime(null, o);
 	EventRegistration reg = {descriptor: EventType("n"), emitOnly: true};
@@ -9580,7 +9608,7 @@ unittest  // a delivery whose store throws is dead-lettered, not looped invisibl
 	import mcp.server.event_store : InMemoryDeliveryQueue, InMemoryWebhookSubscriptionStore;
 
 	// A store that throws on get() once a subscription has been written, so the
-	// delivery worker's deliverWithRetry throws after the job is enqueued.
+	// delivery worker's deliverAttempt throws after the job is enqueued.
 	static final class ThrowingStore : ForwardingStore
 	{
 		bool throwOnGet;
@@ -9604,7 +9632,7 @@ unittest  // a delivery whose store throws is dead-lettered, not looped invisibl
 	o.webhookTransport = ft;
 	o.deliveryQueue = queue;
 	o.webhookMaxAttempts = 1; // a single failed attempt dead-letters
-	o.deliverySleep = (Duration d) @safe {};
+	o.webhookRetryBase = Duration.zero;
 	o.deliveryExecutor = (void delegate() @safe job) @safe { job(); };
 	auto rt = new EventsRuntime(store, o);
 	EventRegistration reg = {descriptor: EventType("n"), emitOnly: true};
@@ -9626,7 +9654,6 @@ unittest  // a delivery that throws mid-retry keeps its attempt count, so attemp
 	auto ft = new FakeWebhookTransport();
 	ft.eventStatuses = [500, 500, 500, 500, 500, 500, 500, 500, 500, 500];
 	long now = 1_000_000;
-	int sleeps;
 	EventsOptions o;
 	o.nowMs = () @safe => now;
 	o.nowIso = () @safe => "t";
@@ -9634,22 +9661,20 @@ unittest  // a delivery that throws mid-retry keeps its attempt count, so attemp
 	o.webhookTransport = ft;
 	o.webhookMaxAttempts = 5;
 	o.deliveryExecutor = (void delegate() @safe job) @safe { job(); };
-	// The backoff after the third failed attempt throws, as a store or clock
-	// fault part-way through the retry loop would.
-	o.deliverySleep = (Duration d) @safe {
-		if (++sleeps == 3)
-			throw new Exception("interrupted");
-	};
 	auto rt = new EventsRuntime(null, o);
 	EventRegistration reg = {descriptor: EventType("n"), emitOnly: true};
 	rt.register(reg);
 	rt.subscribeWebhook(webhookSub("n", "https://proxy/hooks"), "user-1");
 	rt.emit(EventOccurrence("evt_1", "n", "t"));
-	assert(ft.eventPosts().length == 3);
-	// Re-drain past each lease, staying inside the subscription's grant.
-	foreach (i; 0 .. 3)
+	now += 60_000;
+	rt.drainDeliveries();
+	assert(ft.eventPosts().length == 2);
+	// The third attempt throws, as a store or transport fault would.
+	ft.throwEvents = 1;
+	// Re-drain past each backoff and lease, staying inside the subscription's grant.
+	foreach (i; 0 .. 4)
 	{
-		now += 9 * 60 * 1000;
+		now += 5 * 60 * 1000;
 		rt.drainDeliveries();
 	}
 	assert(ft.eventPosts().length > 3); // the job was retried
@@ -9667,7 +9692,7 @@ unittest  // a dead-lettered delivery settles its position so the watermark keep
 	o.webhookTransport = ft;
 	o.webhookMaxAttempts = 1;
 	o.deliveryExecutor = (void delegate() @safe job) @safe { job(); };
-	o.deliverySleep = (Duration d) @safe {};
+	o.webhookRetryBase = Duration.zero;
 	auto rt = new EventsRuntime(null, o);
 	EventRegistration reg = {descriptor: EventType("n"), emitOnly: true};
 	rt.register(reg);
@@ -9685,7 +9710,7 @@ unittest  // re-publishing an event id already queued does not wedge the waterma
 	o.nowIso = () @safe => "t";
 	o.allowPrivateCallbackHosts = true;
 	o.webhookTransport = ft;
-	o.deliverySleep = (Duration d) @safe {};
+	o.webhookRetryBase = Duration.zero;
 	void delegate() @safe[] deferred;
 	o.deliveryExecutor = (void delegate() @safe job) @safe { deferred ~= job; };
 	auto rt = new EventsRuntime(null, o);
@@ -9804,7 +9829,7 @@ unittest  // a dead-lettered delivery is logged and owed a gap
 	o.webhookTransport = ft;
 	o.webhookMaxAttempts = 1;
 	o.deliveryExecutor = (void delegate() @safe job) @safe { job(); };
-	o.deliverySleep = (Duration d) @safe {};
+	o.webhookRetryBase = Duration.zero;
 	auto rt = new EventsRuntime(null, o);
 	EventRegistration reg = {descriptor: EventType("n"), emitOnly: true};
 	rt.register(reg);
@@ -9847,7 +9872,7 @@ unittest  // a deferred delivery is not overtaken by its subscription's later ev
 	o.webhookTransport = ft;
 	o.webhookRetryBase = 1.seconds;
 	o.webhookHttpTimeout = 1.seconds;
-	o.deliverySleep = (Duration d) @safe {};
+	o.webhookRetryBase = Duration.zero;
 	void delegate() @safe[] deferred;
 	o.deliveryExecutor = (void delegate() @safe job) @safe { deferred ~= job; };
 	void runAll() @safe
@@ -10044,7 +10069,7 @@ unittest  // a delivery waiting out the verification backoff is held, not droppe
 	o.deliveryQueue = queue;
 	o.webhookTtlCap = 120.minutes;
 	o.deliveryExecutor = (void delegate() @safe job) @safe { job(); };
-	o.deliverySleep = (Duration d) @safe {};
+	o.webhookRetryBase = Duration.zero;
 	auto rt = new EventsRuntime(null, o);
 	EventRegistration reg = {descriptor: EventType("n"), emitOnly: true};
 	rt.register(reg);
@@ -10178,7 +10203,7 @@ unittest  // events missed while suspended cost no store write per emit, and the
 	o.allowPrivateCallbackHosts = true;
 	o.webhookTransport = ft;
 	o.deliveryExecutor = (void delegate() @safe job) @safe { job(); };
-	o.deliverySleep = (Duration d) @safe {};
+	o.webhookRetryBase = Duration.zero;
 	o.webhookMaxAttempts = 1;
 	o.webhookSuspension.minAttempts = 2;
 	auto rt = new EventsRuntime(store, o);

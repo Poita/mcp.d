@@ -641,13 +641,15 @@ interface DeliveryQueue
 	/// flight, or deferred to a retry) is never overtaken by a later one.
 	Delivery[] lease(long nowMs, long leaseMs, size_t maxJobs) @safe;
 
-	/// Persist a job's `attempt` count and extend its lease to `leasedUntilMs`, so
-	/// the retry count survives a re-lease (crash recovery bounds total attempts)
-	/// and a long retry loop keeps renewing its claim. A no-op for an acked job.
+	/// Persist a job's `attempt` count and move its lease to `leasedUntilMs`, so
+	/// the retry count survives a re-lease (crash recovery bounds total attempts).
+	/// A failed attempt leases its job until its retry backoff ends, so it is not
+	/// retried, nor overtaken by its subscription's later jobs, before then. A
+	/// no-op for an acked job.
 	void touch(string jobId, int attempt, long leasedUntilMs) @safe;
 
 	/// Extend a leased job's claim to `leasedUntilMs` without changing its attempt
-	/// count — called around each in-loop attempt so a slow job never lets its lease
+	/// count — called around each attempt so a slow job never lets its lease
 	/// expire (which would let a concurrent drain re-lease and double-deliver it).
 	void renew(string jobId, long leasedUntilMs) @safe;
 
