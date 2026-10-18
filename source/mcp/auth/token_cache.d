@@ -44,6 +44,8 @@ final class TokenCache
 	{
 		TaskMutex done;
 		TokenInfo result;
+		// What `verify` threw, rethrown to every caller sharing the flight.
+		Exception failure;
 	}
 
 	private ExpiringCache positive; // null when positive caching is off
@@ -63,8 +65,9 @@ final class TokenCache
 	}
 
 	/// The result for `token`: a live cached one, else `verify`'s. Concurrent
-	/// lookups of the same token share one `verify` call. Every caller gets its
-	/// own deep copy, so mutating it affects neither the cache nor other callers.
+	/// lookups of the same token share one `verify` call, and what it throws is
+	/// rethrown to each of them. Every caller gets its own deep copy, so
+	/// mutating it affects neither the cache nor other callers.
 	TokenInfo lookup(string token, scope TokenInfo delegate() @safe verify) @safe
 	{
 		const key = cacheKey(token);
@@ -80,6 +83,8 @@ final class TokenCache
 			auto flight = *pending;
 			flight.done.lock();
 			flight.done.unlock();
+			if (flight.failure !is null)
+				throw flight.failure;
 			return flight.result.dup;
 		}
 
@@ -92,7 +97,13 @@ final class TokenCache
 			inFlight.remove(key);
 			flight.done.unlock();
 		}
-		flight.result = verify();
+		try
+			flight.result = verify();
+		catch (Exception e)
+		{
+			flight.failure = e;
+			throw e;
+		}
 		store(key, flight.result);
 		return flight.result.dup;
 	}
@@ -408,6 +419,40 @@ unittest  // TokenCache coalesces concurrent lookups of one token into a single 
 	tb.join();
 	assert(calls == 1);
 	assert(subjects[0] == "u1" && subjects[1] == "u1");
+}
+
+unittest  // a waiter coalesced onto a throwing verifier call gets the failure, not a rejection
+{
+	import core.time : msecs;
+	import vibe.core.core : runTask, sleep;
+
+	auto cache = new TokenCache(TokenCacheOptions.init);
+	int calls;
+	TokenInfo failingVerify() @safe
+	{
+		++calls;
+		sleep(30.msecs);
+		throw new Exception("upstream exploded");
+	}
+
+	string[2] outcomes;
+	auto ta = runTask(() nothrow{
+		try
+			outcomes[0] = cache.lookup("tok", &failingVerify).valid ? "valid" : "invalid";
+		catch (Exception e)
+			outcomes[0] = e.msg;
+	});
+	auto tb = runTask(() nothrow{
+		try
+			outcomes[1] = cache.lookup("tok", &failingVerify).valid ? "valid" : "invalid";
+		catch (Exception e)
+			outcomes[1] = e.msg;
+	});
+	ta.join();
+	tb.join();
+	assert(calls == 1);
+	assert(outcomes[0] == "upstream exploded"
+			&& outcomes[1] == "upstream exploded", outcomes[0] ~ " / " ~ outcomes[1]);
 }
 
 unittest  // ExpiringCache returns a hit before expiry and a miss after
