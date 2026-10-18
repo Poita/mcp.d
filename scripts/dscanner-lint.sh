@@ -43,8 +43,22 @@ cd "${REPO_ROOT}"
 # Raise the file-descriptor limit; the D toolchain opens many files at once.
 ulimit -n 65536 2>/dev/null || true
 
+# Build D-Scanner with LDC when it is installed (CI builds it with LDC too).
+compiler=()
+if command -v ldc2 >/dev/null 2>&1; then
+  compiler=(--compiler=ldc2)
+fi
+
+# D-Scanner exits non-zero both when it reports findings and when it cannot be
+# built, so build it first: a toolchain failure must fail the gate rather than
+# leave an empty, "clean" result.
+if ! dub build --quiet ${compiler[@]+"${compiler[@]}"} dscanner >/dev/null; then
+  echo "D-Scanner could not be built; no lint was run." >&2
+  exit 2
+fi
+
 # Collect only the diagnostic lines (D-Scanner prints them to stdout).
-raw="$(dub run --quiet dscanner -- --styleCheck source/ 2>/dev/null || true)"
+raw="$(dub run --quiet ${compiler[@]+"${compiler[@]}"} dscanner -- --styleCheck source/ 2>/dev/null || true)"
 
 # Keep only [warn]/[error] diagnostics, then drop the documented false positives.
 findings="$(printf '%s\n' "${raw}" \
