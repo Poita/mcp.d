@@ -1568,6 +1568,8 @@ OAuthSession useOAuth(McpClient client, string mcpEndpoint, OAuthLogin opts) @sa
 				logWarn("OAuth refresh for %s failed (%s); starting an interactive login",
 						oauth.resource, e.msg);
 		}
+		// The interactive login registers its own client, with the configured method.
+		oauth.authMethod = opts.authMethod;
 		return null;
 	}
 
@@ -3210,6 +3212,8 @@ version (unittest)
 		string prmResource;
 		/// The PRM `scopes_supported`; empty omits it.
 		string[] prmScopes;
+		/// The `token_endpoint_auth_method` of the last registration request.
+		string lastRegisterAuthMethod;
 
 		void stop() @safe
 		{
@@ -3252,9 +3256,12 @@ version (unittest)
 					~ b ~ `/register","code_challenge_methods_supported":["S256"]}`,
 					"application/json");
 			else if (req.path == "/register")
+			{
+				srv.lastRegisterAuthMethod = req.json["token_endpoint_auth_method"].opt!string;
 				res.writeBody(
 					`{"client_id":"fresh-id","redirect_uris":["http://localhost:8765/callback"]}`,
 					"application/json");
+			}
 			else if (req.path == "/token")
 			{
 				if (req.form.get("grant_type", "") == "refresh_token")
@@ -3482,6 +3489,40 @@ unittest  // useOAuth refreshes a cached DCR token with the auth method the AS a
 	assert(sess.token.accessToken == "new-access");
 	assert(srv.lastRefreshFormSecret == "dcr-secret");
 	assert(store.load(resource).tokenEndpointAuthMethod == "client_secret_post");
+}
+
+unittest  // a cached client's auth method is not used to register a new client when the cache is not reused
+{
+	import core.time : msecs;
+	import std.exception : assertThrown;
+	import mcp.auth.oauth : canonicalResourceUri;
+
+	auto srv = startIssuerTestAuthServer();
+	scope (exit)
+		srv.stop();
+	srv.failRefresh = true;
+	const endpoint = srv.base ~ "/mcp";
+	const resource = canonicalResourceUri(endpoint);
+
+	auto store = new MemoryTokenStore();
+	StoredToken t;
+	t.accessToken = "old";
+	t.refreshToken = "rt";
+	t.setClient(RegisteredClient("abc123", "dcr-secret"));
+	t.tokenEndpointAuthMethod = "client_secret_post";
+	t.expiresAt = 1;
+	t.resource = resource;
+	t.issuer = srv.base;
+	store.save(resource, t);
+
+	OAuthLogin opts;
+	opts.store = store;
+	opts.callbackTimeout = 50.msecs;
+	opts.openBrowser = (string url) @safe {};
+
+	assertThrown(useOAuth(McpClient.http(endpoint), endpoint, opts));
+	assert(srv.refreshCalls == 1);
+	assert(srv.lastRegisterAuthMethod == "none", srv.lastRegisterAuthMethod);
 }
 
 unittest  // a failed cached refresh is logged before useOAuth falls back to the browser
