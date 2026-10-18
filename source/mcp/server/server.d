@@ -7838,7 +7838,7 @@ unittest  // enableTasks throws rather than replace a runtime that holds tasks
 
 	auto s = McpServer.stateless("t", "1");
 	auto rt = s.enableTasks();
-	const id = rt.create().taskId;
+	const id = rt.createUnbound().taskId;
 	assertThrown(s.enableTasks());
 	assert(s.tasks() is rt);
 	assert(!rt.statusOf(id).isNull);
@@ -8899,7 +8899,7 @@ unittest  // a created task is served via tasks/get, progressing working -> comp
 {
 	auto s = McpServer.stateless("t", "1");
 	auto rt = s.enableTasks();
-	auto t = rt.create();
+	auto t = rt.createUnbound();
 
 	auto working = s.handle(modernReq(1, "tasks/get", Json([
 		"taskId": Json(t.taskId)
@@ -8922,7 +8922,7 @@ unittest  // input_required surfaces inputRequests and tasks/update is acknowled
 {
 	auto s = McpServer.stateless("t", "1");
 	auto rt = s.enableTasks();
-	auto t = rt.create();
+	auto t = rt.createUnbound();
 	rt.requireInput(t.taskId, Json([
 			"k1": Json(["method": Json("elicitation/create")])
 	]));
@@ -9111,7 +9111,7 @@ unittest  // tasks/cancel acknowledges and cancels a task
 {
 	auto s = McpServer.stateless("t", "1");
 	auto rt = s.enableTasks();
-	auto t = rt.create();
+	auto t = rt.createUnbound();
 	auto ack = s.handle(modernReq(1, "tasks/cancel", Json([
 		"taskId": Json(t.taskId)
 	]))).get;
@@ -9457,7 +9457,7 @@ unittest  // a synchronous task-tool call is not refused by the unsettled-task c
 	o.maxUnsettledAnonymous = 1;
 	auto s = new McpServer("t", "1");
 	s.enableTasks(o);
-	s.tasks.create();
+	s.tasks.createUnbound();
 	Tool desc;
 	desc.name = "noop";
 	desc.inputSchema = Json(["type": Json("object")]);

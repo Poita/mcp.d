@@ -59,7 +59,7 @@ struct TaskOptions
 	string delegate() @safe nowIso;
 }
 
-/// Per-task settings for `TaskRuntime.create` / `createFor`.
+/// Per-task settings for `TaskRuntime.create`, `createUnbound` and `createFor`.
 struct TaskCreateOptions
 {
 	/// How long the record is kept once the task settles; null inherits
@@ -80,7 +80,7 @@ struct TaskCreateOptions
 /// node reconstructs a task purely from its ID. There is no in-process task state,
 /// which is what makes a shared store yield a correct multi-node deployment.
 ///
-/// `create`/`createFor` mint a `working` task; the transition helpers (`progress`,
+/// `create`/`createUnbound`/`createFor` mint a `working` task; the transition helpers (`progress`,
 /// `complete`, `fail`, `requireInput`, `resumeWorking`, `cancel`) read-modify-write
 /// the stored `TaskRecord` and stamp `lastUpdatedAt`. `getDetailed` builds the
 /// `tasks/get` response from the record, and `deliverInput` records `tasks/update`
@@ -157,13 +157,19 @@ final class TaskRuntime
 			if (info.valid)
 				opts.owner = info.subject;
 		}
-		return create(opts);
+		return createFor("", Json.undefined, opts);
 	}
 
-	/// Create a fresh `working` task with no associated executor, bound to
-	/// `opts.owner` (if any).
-	Task create(TaskCreateOptions opts = TaskCreateOptions.init) @safe
+	/// Create a fresh `working` task with no associated executor and no owning
+	/// principal: its id alone authorizes every tasks/* request, and it counts
+	/// against `TaskOptions.maxUnsettledAnonymous`. A request handler uses
+	/// `create(ctx)` instead. Throws when `opts.owner` is set; `createFor` binds
+	/// a task to an explicit owner.
+	Task createUnbound(TaskCreateOptions opts = TaskCreateOptions.init) @safe
 	{
+		import std.exception : enforce;
+
+		enforce(opts.owner.length == 0, "createUnbound: an unbound task has no owner");
 		return createFor("", Json.undefined, opts);
 	}
 
@@ -878,7 +884,7 @@ unittest  // create yields a working task with seeded ttl/poll and timestamps
 	TaskOptions o;
 	o.nowIso = () @safe => "2026-06-07T10:30:00Z";
 	auto rt = new TaskRuntime(o);
-	auto t = rt.create();
+	auto t = rt.createUnbound();
 	assert(t.status == TaskStatus.working);
 	assert(t.taskId.length > 0);
 	assert(t.createdAt == "2026-06-07T10:30:00Z");
@@ -886,10 +892,24 @@ unittest  // create yields a working task with seeded ttl/poll and timestamps
 	assert(rt.getDetailed(t.taskId)["status"].get!string == "working");
 }
 
+unittest  // a manual task is unbound only when created through createUnbound
+{
+	import std.exception : assertThrown;
+
+	auto rt = new TaskRuntime(TaskOptions.init);
+	static assert(!__traits(compiles, rt.create()));
+	static assert(!__traits(compiles, rt.create(TaskCreateOptions.init)));
+	auto t = rt.createUnbound();
+	assert(rt.store.get(t.taskId).get.owner == "");
+	TaskCreateOptions owned;
+	owned.owner = "alice";
+	assertThrown(rt.createUnbound(owned));
+}
+
 unittest  // create honors explicit ttl/poll overrides
 {
 	auto rt = new TaskRuntime(TaskOptions.init);
-	auto t = rt.create(TaskCreateOptions(nullable(1_000.msecs), nullable(250.msecs)));
+	auto t = rt.createUnbound(TaskCreateOptions(nullable(1_000.msecs), nullable(250.msecs)));
 	assert(t.ttlMs.get == 1_000 && t.pollIntervalMs.get == 250);
 }
 
@@ -904,7 +924,7 @@ unittest  // createFor records the executor toolName and durable input
 unittest  // complete stores the result and getDetailed inlines it
 {
 	auto rt = new TaskRuntime(TaskOptions.init);
-	auto t = rt.create();
+	auto t = rt.createUnbound();
 	Json result = Json([
 		"content": Json([Json(["type": Json("text"), "text": Json("done")])])
 	]);
@@ -917,7 +937,7 @@ unittest  // complete stores the result and getDetailed inlines it
 unittest  // fail stores the JSON-RPC error and getDetailed inlines it
 {
 	auto rt = new TaskRuntime(TaskOptions.init);
-	auto t = rt.create();
+	auto t = rt.createUnbound();
 	rt.fail(t.taskId, Json(["code": Json(-32000), "message": Json("boom")]));
 	auto d = rt.getDetailed(t.taskId);
 	assert(d["status"].get!string == "failed");
@@ -927,7 +947,7 @@ unittest  // fail stores the JSON-RPC error and getDetailed inlines it
 unittest  // fail from an McpException records its code, message, and data
 {
 	auto rt = new TaskRuntime(TaskOptions.init);
-	auto t = rt.create();
+	auto t = rt.createUnbound();
 	rt.fail(t.taskId, internalError("deploy failed", Json(["ref": Json("abc")])));
 	auto d = rt.getDetailed(t.taskId);
 	assert(d["status"].get!string == "failed");
@@ -939,7 +959,7 @@ unittest  // fail from an McpException records its code, message, and data
 unittest  // requireInput surfaces inputRequests and deliverInput records responses
 {
 	auto rt = new TaskRuntime(TaskOptions.init);
-	auto t = rt.create();
+	auto t = rt.createUnbound();
 	Json reqs = Json(["k1": Json(["method": Json("elicitation/create")])]);
 	rt.requireInput(t.taskId, reqs);
 	auto d = rt.getDetailed(t.taskId);
@@ -953,7 +973,7 @@ unittest  // requireInput surfaces inputRequests and deliverInput records respon
 unittest  // a manual (executor-less) task cancels immediately
 {
 	auto rt = new TaskRuntime(TaskOptions.init);
-	auto t = rt.create();
+	auto t = rt.createUnbound();
 	rt.cancel(t.taskId);
 	assert(rt.cancelRequested(t.taskId));
 	assert(rt.getDetailed(t.taskId)["status"].get!string == "cancelled");
@@ -974,7 +994,7 @@ unittest  // an executor-backed task cancels cooperatively (flag set, status unc
 unittest  // complete does not override an already-cancelled task
 {
 	auto rt = new TaskRuntime(TaskOptions.init);
-	auto t = rt.create();
+	auto t = rt.createUnbound();
 	rt.cancel(t.taskId);
 	rt.complete(t.taskId, Json.emptyObject);
 	assert(rt.getDetailed(t.taskId)["status"].get!string == "cancelled");
@@ -1019,7 +1039,7 @@ unittest  // onStatusChange fires with the DetailedTask on each transition
 		calls++;
 		lastStatus = d["status"].get!string;
 	});
-	auto t = rt.create();
+	auto t = rt.createUnbound();
 	rt.complete(t.taskId, Json.emptyObject);
 	assert(calls >= 1);
 	assert(lastStatus == "completed");
@@ -1087,9 +1107,9 @@ unittest  // a unique-id collision from a bad generator is retried, then errors
 	TaskOptions o;
 	o.idGenerator = () @safe => "dup"; // always the same id
 	auto rt = new TaskRuntime(o);
-	auto first = rt.create();
+	auto first = rt.createUnbound();
 	assert(first.taskId == "dup");
-	auto ex = cast(McpException) collectException(rt.create());
+	auto ex = cast(McpException) collectException(rt.createUnbound());
 	assert(ex !is null && ex.code == ErrorCode.internalError);
 }
 
@@ -1136,7 +1156,7 @@ unittest  // a terminal task expires ttl after it settled: tasks/get then report
 	auto store = new InMemoryTaskStore();
 	o.store = store;
 	auto rt = new TaskRuntime(o);
-	auto t = rt.create(TaskCreateOptions(nullable(10_000.msecs)));
+	auto t = rt.createUnbound(TaskCreateOptions(nullable(10_000.msecs)));
 	now = "2026-06-07T10:00:05Z";
 	rt.complete(t.taskId, Json.emptyObject);
 	now = "2026-06-07T10:00:14.5Z"; // past createdAt + ttl, within settledAt + ttl
@@ -1155,7 +1175,7 @@ unittest  // a non-terminal task never expires; its ttl starts once it settles
 	auto store = new InMemoryTaskStore();
 	o.store = store;
 	auto rt = new TaskRuntime(o);
-	auto t = rt.create(TaskCreateOptions(nullable(1_000.msecs)));
+	auto t = rt.createUnbound(TaskCreateOptions(nullable(1_000.msecs)));
 	now = "2026-06-07T12:00:00Z";
 	assert(rt.sweepExpired() == 0);
 	assert(rt.getDetailed(t.taskId)["status"].get!string == "working");
@@ -1185,9 +1205,9 @@ unittest  // sweepExpired removes settled records past their ttl and keeps the r
 	auto store = new InMemoryTaskStore();
 	o.store = store;
 	auto rt = new TaskRuntime(o);
-	auto done = rt.create(TaskCreateOptions(nullable(1_000.msecs)));
-	auto fresh = rt.create(TaskCreateOptions(nullable(60_000.msecs)));
-	auto running = rt.create(TaskCreateOptions(nullable(1_000.msecs)));
+	auto done = rt.createUnbound(TaskCreateOptions(nullable(1_000.msecs)));
+	auto fresh = rt.createUnbound(TaskCreateOptions(nullable(60_000.msecs)));
+	auto running = rt.createUnbound(TaskCreateOptions(nullable(1_000.msecs)));
 	rt.complete(done.taskId, Json.emptyObject);
 	rt.complete(fresh.taskId, Json.emptyObject);
 	now = "2026-06-07T10:00:02Z";
@@ -1252,7 +1272,7 @@ unittest  // a task with an unlimited ttl never expires
 	auto store = new InMemoryTaskStore();
 	o.store = store;
 	auto rt = new TaskRuntime(o);
-	auto t = rt.create();
+	auto t = rt.createUnbound();
 	TaskRecord r = store.get(t.taskId).get;
 	r.meta.ttlMs = Nullable!long.init;
 	r.meta.status = TaskStatus.completed;
@@ -1270,7 +1290,7 @@ unittest  // a task created with unlimitedTaskTtl has a null ttl and is kept for
 	auto store = new InMemoryTaskStore();
 	o.store = store;
 	auto rt = new TaskRuntime(o);
-	auto t = rt.create(TaskCreateOptions(nullable(unlimitedTaskTtl)));
+	auto t = rt.createUnbound(TaskCreateOptions(nullable(unlimitedTaskTtl)));
 	assert(t.ttlMs.isNull);
 	rt.complete(t.taskId, Json.emptyObject);
 	now = "2100-01-01T00:00:00Z";
@@ -1284,7 +1304,7 @@ unittest  // a ttl just short of unlimited keeps a settled task rather than expi
 	TaskOptions o;
 	o.nowIso = () @safe => now;
 	auto rt = new TaskRuntime(o);
-	auto t = rt.create(TaskCreateOptions(nullable(Duration.max - 1.seconds)));
+	auto t = rt.createUnbound(TaskCreateOptions(nullable(Duration.max - 1.seconds)));
 	rt.complete(t.taskId, Json.emptyObject);
 	now = "2026-06-07T10:00:01Z";
 	assert(rt.sweepExpired() == 0);
@@ -1297,7 +1317,7 @@ unittest  // a stored ttl too large for a Duration never expires
 	TaskOptions o;
 	o.nowIso = () @safe => now;
 	auto rt = new TaskRuntime(o);
-	auto t = rt.create();
+	auto t = rt.createUnbound();
 	rt.complete(t.taskId, Json.emptyObject);
 	auto r = rt.store.get(t.taskId).get;
 	r.meta.ttlMs = nullable(long.max);
@@ -1323,8 +1343,8 @@ unittest  // a defaultTtl of unlimitedTaskTtl makes tasks unlimited unless a ttl
 	TaskOptions o;
 	o.defaultTtl = unlimitedTaskTtl;
 	auto rt = new TaskRuntime(o);
-	assert(rt.create().ttlMs.isNull);
-	assert(rt.create(TaskCreateOptions(nullable(1_000.msecs))).ttlMs.get == 1_000);
+	assert(rt.createUnbound().ttlMs.isNull);
+	assert(rt.createUnbound(TaskCreateOptions(nullable(1_000.msecs))).ttlMs.get == 1_000);
 }
 
 unittest  // a task unsettled past maxUnsettledIdle fails, stops its executor, then expires by ttl
@@ -1531,7 +1551,7 @@ unittest  // progress, requireInput, and resumeWorking leave a terminal task unt
 	TaskOptions o;
 	o.nowIso = () @safe => now;
 	auto rt = new TaskRuntime(o);
-	auto t = rt.create();
+	auto t = rt.createUnbound();
 	rt.cancel(t.taskId);
 	int notified;
 	rt.onStatusChange((Json d, string owner) @safe { notified++; });
@@ -1716,7 +1736,7 @@ unittest  // deliverInput rejects answers for a terminal task with -32602
 	import std.exception : collectException;
 
 	auto rt = new TaskRuntime(TaskOptions.init);
-	auto t = rt.create();
+	auto t = rt.createUnbound();
 	rt.complete(t.taskId, Json.emptyObject);
 	auto ex = cast(McpException) collectException(rt.deliverInput(t.taskId,
 			Json(["a": Json("late")])));
@@ -1800,7 +1820,7 @@ unittest  // createFor rejects a zero ttl, which would expire the task as it set
 	import std.exception : assertThrown;
 
 	auto rt = new TaskRuntime(TaskOptions.init);
-	assertThrown(rt.create(TaskCreateOptions(nullable(Duration.zero))));
+	assertThrown(rt.createUnbound(TaskCreateOptions(nullable(Duration.zero))));
 }
 
 unittest  // createFor rejects a negative ttl
@@ -1808,7 +1828,7 @@ unittest  // createFor rejects a negative ttl
 	import std.exception : assertThrown;
 
 	auto rt = new TaskRuntime(TaskOptions.init);
-	assertThrown(rt.create(TaskCreateOptions(nullable(-1.seconds))));
+	assertThrown(rt.createUnbound(TaskCreateOptions(nullable(-1.seconds))));
 }
 
 unittest  // createFor rejects a negative poll interval
@@ -1816,13 +1836,14 @@ unittest  // createFor rejects a negative poll interval
 	import std.exception : assertThrown;
 
 	auto rt = new TaskRuntime(TaskOptions.init);
-	assertThrown(rt.create(TaskCreateOptions(Nullable!Duration.init, nullable(-1.seconds))));
+	assertThrown(rt.createUnbound(TaskCreateOptions(Nullable!Duration.init,
+			nullable(-1.seconds))));
 }
 
 unittest  // createFor accepts a zero poll interval
 {
 	auto rt = new TaskRuntime(TaskOptions.init);
-	auto t = rt.create(TaskCreateOptions(Nullable!Duration.init, nullable(Duration.zero)));
+	auto t = rt.createUnbound(TaskCreateOptions(Nullable!Duration.init, nullable(Duration.zero)));
 	assert(t.pollIntervalMs.get == 0);
 }
 
@@ -1853,17 +1874,17 @@ unittest  // createFor refuses a principal past its unsettled-task cap
 	auto rt = new TaskRuntime(o);
 	TaskCreateOptions alice;
 	alice.owner = "alice";
-	auto first = rt.create(alice);
-	rt.create(alice);
-	auto e = collectException!McpException(rt.create(alice));
+	auto first = rt.createFor("", Json.undefined, alice);
+	rt.createFor("", Json.undefined, alice);
+	auto e = collectException!McpException(rt.createFor("", Json.undefined, alice));
 	assert(e !is null && e.code == ErrorCode.resourceExhausted);
 
 	TaskCreateOptions bob;
 	bob.owner = "bob";
-	rt.create(bob);
+	rt.createFor("", Json.undefined, bob);
 
 	rt.complete(first.taskId, Json.emptyObject);
-	rt.create(alice);
+	rt.createFor("", Json.undefined, alice);
 }
 
 unittest  // a task idle past maxUnsettledIdle frees its unsettled slot without a sweep
@@ -1937,12 +1958,12 @@ unittest  // repeated creates at the unsettled-task cap sweep the store at most 
 	auto rt = new TaskRuntime(o);
 	TaskCreateOptions alice;
 	alice.owner = "alice";
-	rt.create(alice);
+	rt.createFor("", Json.undefined, alice);
 	foreach (_; 0 .. 50)
-		assert(collectException!McpException(rt.create(alice)) !is null);
+		assert(collectException!McpException(rt.createFor("", Json.undefined, alice)) !is null);
 	assert(store.sweeps == 1);
 	now = "2026-06-07T10:00:01Z";
-	assert(collectException!McpException(rt.create(alice)) !is null);
+	assert(collectException!McpException(rt.createFor("", Json.undefined, alice)) !is null);
 	assert(store.sweeps == 2);
 }
 
@@ -1953,8 +1974,8 @@ unittest  // unauthenticated tasks share the anonymous unsettled-task cap
 	TaskOptions o;
 	o.maxUnsettledAnonymous = 1;
 	auto rt = new TaskRuntime(o);
-	rt.create();
-	auto e = collectException!McpException(rt.create());
+	rt.createUnbound();
+	auto e = collectException!McpException(rt.createUnbound());
 	assert(e !is null && e.code == ErrorCode.resourceExhausted);
 }
 
@@ -1968,8 +1989,8 @@ unittest  // a zero unsettled-task cap is unlimited
 	alice.owner = "alice";
 	foreach (_; 0 .. 2000)
 	{
-		rt.create(alice);
-		rt.create();
+		rt.createFor("", Json.undefined, alice);
+		rt.createUnbound();
 	}
 }
 
@@ -1991,7 +2012,7 @@ unittest  // a clock that stops yielding ISO-8601 timestamps fails task creation
 	o.nowIso = () @safe => now;
 	auto rt = new TaskRuntime(o);
 	now = "junk";
-	assertThrown(rt.create());
+	assertThrown(rt.createUnbound());
 }
 
 unittest  // a settled record with an unparseable timestamp expires
@@ -2000,7 +2021,7 @@ unittest  // a settled record with an unparseable timestamp expires
 	TaskOptions o;
 	o.nowIso = () @safe => now;
 	auto rt = new TaskRuntime(o);
-	auto t = rt.create();
+	auto t = rt.createUnbound();
 	rt.complete(t.taskId, Json.emptyObject);
 	auto r = rt.store.get(t.taskId).get;
 	r.meta.lastUpdatedAt = "junk";
