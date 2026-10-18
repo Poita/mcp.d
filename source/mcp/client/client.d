@@ -1576,9 +1576,27 @@ final class McpClient : ClientProtocol
 		while (!cursor.isNull);
 	}
 
+	/// The freshness hint for a result assembled from pages carrying `a` and `b`:
+	/// the shorter TTL, and private when either page is. A page without a hint
+	/// counts as private with the default TTL, as a single hint-less result is
+	/// cached. Null only when neither page carries a hint.
+	private Nullable!CacheHint combineCacheHints(Nullable!CacheHint a, Nullable!CacheHint b) @safe
+	{
+		if (a.isNull && b.isNull)
+			return a;
+		const fallback = CacheHint(defaultCacheTtl_, CacheScope.private_);
+		const x = a.isNull ? fallback : a.get;
+		const y = b.isNull ? fallback : b.get;
+		CacheHint h;
+		h.ttl = x.ttl < y.ttl ? x.ttl : y.ttl;
+		h.cacheScope = x.cacheScope == CacheScope.private_
+			|| y.cacheScope == CacheScope.private_ ? CacheScope.private_ : CacheScope.public_;
+		return nullable(h);
+	}
+
 	/// Drain a paginated `<method>` list into a single accumulated result `R`.
-	/// Owns the cursor-param building, the first-page `cache` capture (for a
-	/// result that carries one), and the `nextCursor` reset shared by every
+	/// Owns the cursor-param building, the combined `cache` hint across pages
+	/// (for a result that carries one), and the `nextCursor` reset shared by every
 	/// paginated verb. Each page sends `params` plus its cursor; `append`
 	/// concatenates one page's items onto the accumulator.
 	private R drainList(R)(string method, Json params, scope void delegate(ref R acc,
@@ -1593,8 +1611,7 @@ final class McpClient : ClientProtocol
 			auto res = R.fromJson(rpcWith(method, p, opts));
 			append(acc, res);
 			static if (is(typeof(acc.cache)))
-				if (first)
-					acc.cache = res.cache;
+				acc.cache = first ? res.cache : combineCacheHints(acc.cache, res.cache);
 			first = false;
 			return res.nextCursor;
 		});
@@ -1604,7 +1621,7 @@ final class McpClient : ClientProtocol
 
 	/// `tools/list`, following pagination cursors to completion. Returns the
 	/// drained `ListToolsResult`: `tools` aggregates every page's items,
-	/// `nextCursor` is null, and `cache` carries the first page's parsed modern
+	/// `nextCursor` is null, and `cache` carries the pages' combined modern
 	/// `CacheableResult` freshness hint (if any). A still-fresh result is served
 	/// from the response cache without a round-trip; `opts.cacheMode` overrides.
 	ListToolsResult listTools(RequestOptions opts = RequestOptions.init) @safe
@@ -2618,7 +2635,7 @@ final class McpClient : ClientProtocol
 
 	/// `resources/list`, auto-paginated. Returns the drained
 	/// `ListResourcesResult`: `resources` aggregates every page, `nextCursor` is
-	/// null, and `cache` carries the first page's parsed freshness hint. A
+	/// null, and `cache` carries the pages' combined freshness hint. A
 	/// still-fresh result is served from the cache; `opts.cacheMode` overrides.
 	ListResourcesResult listResources(RequestOptions opts = RequestOptions.init) @safe
 	{
@@ -2640,7 +2657,7 @@ final class McpClient : ClientProtocol
 	/// `resources/templates/list`, auto-paginated. Returns the drained
 	/// `ListResourceTemplatesResult` (URI templates clients can expand and
 	/// `resources/read`). `resourceTemplates` aggregates every page, `nextCursor`
-	/// is null, and `cache` carries the first page's parsed freshness hint. A
+	/// is null, and `cache` carries the pages' combined freshness hint. A
 	/// still-fresh result is served from the cache; `opts.cacheMode` overrides.
 	ListResourceTemplatesResult listResourceTemplates(RequestOptions opts = RequestOptions.init) @safe
 	{
@@ -2720,7 +2737,7 @@ final class McpClient : ClientProtocol
 	/// a server that declared the `io.modelcontextprotocol/skills` extension;
 	/// otherwise the server answers -32601 (method not found). The result MAY be
 	/// empty or partial — per the extension that is not proof the server has no
-	/// skills. `cache` carries the first page's `ttlMs`/`cacheScope` (a modern
+	/// skills. `cache` carries the pages' combined `ttlMs`/`cacheScope` (a modern
 	/// server always sends them); the listing is not served from the response
 	/// cache, since the per-entry digests are the signal hosts act on.
 	ListSkillsResult skillsList(RequestOptions opts = RequestOptions.init) @safe
@@ -2747,7 +2764,7 @@ final class McpClient : ClientProtocol
 
 	/// `prompts/list`, auto-paginated. Returns the drained `ListPromptsResult`:
 	/// `prompts` aggregates every page, `nextCursor` is null, and `cache` carries
-	/// the first page's parsed freshness hint. A still-fresh result is served from
+	/// the pages' combined freshness hint. A still-fresh result is served from
 	/// the cache; `opts.cacheMode` overrides.
 	ListPromptsResult listPrompts(RequestOptions opts = RequestOptions.init) @safe
 	{
@@ -8724,7 +8741,7 @@ unittest  // skillsList drains pagination into a single result
 	assert(res.nextCursor.isNull);
 }
 
-unittest  // skillsList carries the first page's ttlMs/cacheScope on the drained result
+unittest  // skillsList combines every page's ttlMs/cacheScope on the drained result
 {
 	import mcp.protocol.modern : CacheScope;
 
@@ -8733,7 +8750,6 @@ unittest  // skillsList carries the first page's ttlMs/cacheScope on the drained
 	c.onRpcForTest = (string method, Json params) @safe {
 		Json r = Json.emptyObject;
 		r["skills"] = Json.emptyArray;
-		// Only the first page's hint is kept; a later page's differing hint is ignored.
 		r["ttlMs"] = call == 0 ? 300_000 : 1;
 		r["cacheScope"] = call == 0 ? "private" : "public";
 		if (call == 0)
@@ -8744,8 +8760,32 @@ unittest  // skillsList carries the first page's ttlMs/cacheScope on the drained
 
 	auto res = c.skillsList();
 	assert(!res.cache.isNull);
-	assert(res.cache.get.ttl.total!"msecs" == 300_000);
+	assert(res.cache.get.ttl.total!"msecs" == 1); // the shortest page TTL
+	assert(res.cache.get.cacheScope == CacheScope.private_); // private if any page is
+}
+
+unittest  // a multi-page list with one private page is cached privately for the shortest TTL
+{
+	import core.time : seconds;
+
+	auto c = McpClient.http("http://localhost");
+	int call;
+	c.onRpcForTest = (string method, Json params) @safe {
+		Json r = Json.emptyObject;
+		r["tools"] = Json.emptyArray;
+		r["ttlMs"] = call == 0 ? 60_000 : 5000;
+		r["cacheScope"] = call == 0 ? "public" : "private";
+		if (call == 0)
+			r["nextCursor"] = "p2";
+		call++;
+		return r;
+	};
+	auto res = c.listTools();
+	assert(res.cache.get.ttl == 5.seconds);
 	assert(res.cache.get.cacheScope == CacheScope.private_);
+	auto entry = c.cacheStore_.get(c.scopedKey(CacheKey("tools/list", ""), CacheScope.private_));
+	assert(!entry.isNull, "the drained list must be stored in the private partition");
+	assert(c.cacheStore_.get(c.scopedKey(CacheKey("tools/list", ""), CacheScope.public_)).isNull);
 }
 
 unittest  // skillsGet sends the uri and returns the entry with its caching attributes
@@ -8945,7 +8985,7 @@ unittest  // readResource exposes the parsed CacheableResult freshness hint as .
 	assert(res.cache.get.cacheScope == CacheScope.private_);
 }
 
-unittest  // a list result exposes .cache from the first page's freshness hint
+unittest  // a list result exposes .cache from its freshness hint
 {
 	import core.time : seconds;
 

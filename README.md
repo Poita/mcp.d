@@ -494,7 +494,9 @@ never cached (the spec excludes them).
 when a result carries a positive `ttlMs` hint, so against legacy servers (or a
 modern server sending `ttlMs:0`) behaviour matches the uncached client exactly.
 The stored entry's lifetime is the server's `ttlMs`; its `cacheScope`
-(`public`/`private`) is recorded for shared backends.
+(`public`/`private`) is recorded for shared backends. A paginated list is cached
+as one entry under the shortest `ttlMs` of its pages, and as `private` if any
+page is.
 
 ```d
 auto c = McpClient.http("https://server.example/mcp");
