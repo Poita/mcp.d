@@ -148,6 +148,10 @@ private Exception alreadyRegistered(string what, string remover) @safe
 /// per-session state a client can make the server keep.
 private enum maxResourceSubscriptions = 1024;
 
+/// The most per-URI resource removal stamps the server keeps; older stamps are
+/// folded into a single removal floor.
+private enum maxTrackedResourceRemovals = 4096;
+
 /// How a server manages per-connection state. The author chooses;
 /// `stateless` is the default. See the README "Statefulness" section for the
 /// full feature-gating matrix.
@@ -244,8 +248,11 @@ final class McpServer : ServerCore
 	// Monotonic stamp for `resources/subscribe` entries and resource removals:
 	// a session's subscription to a URI is live only while it is newer than that
 	// URI's removal, which drops it from sessions the server cannot enumerate.
+	// At most `maxTrackedResourceRemovals` URIs keep their own removal stamp;
+	// `resourceRemovalFloor_` is the newest stamp forgotten to stay in bound.
 	private ulong subscriptionEpoch_;
 	private ulong[string] resourceRemovedAt_;
+	private ulong resourceRemovalFloor_;
 	private bool promptsDeclared_;
 	private CompleteResult delegate(CompleteRequest request) @safe typedCompletionHandler;
 	/// Per-argument completers keyed by "<ref-key>\0<argumentName>", so a consumer
@@ -642,9 +649,30 @@ final class McpServer : ServerCore
 			return false;
 		resources.remove(uri);
 		resourcesDeclared_ = true;
-		resourceRemovedAt_[uri] = ++subscriptionEpoch_;
+		recordResourceRemoval(uri);
 		activeConnection.subscriptions.remove(uri);
 		return true;
+	}
+
+	/// Stamp `uri`'s removal. Past `maxTrackedResourceRemovals` stamps, the
+	/// older half is forgotten and folded into `resourceRemovalFloor_`.
+	private void recordResourceRemoval(string uri) @safe
+	{
+		import std.algorithm : sort;
+
+		resourceRemovedAt_[uri] = ++subscriptionEpoch_;
+		if (resourceRemovedAt_.length <= maxTrackedResourceRemovals)
+			return;
+		auto stamps = resourceRemovedAt_.values;
+		stamps.sort();
+		const cutoff = stamps[$ / 2];
+		string[] forgotten;
+		foreach (u, at; resourceRemovedAt_)
+			if (at < cutoff)
+				forgotten ~= u;
+		foreach (u; forgotten)
+			resourceRemovedAt_.remove(u);
+		resourceRemovalFloor_ = stamps[$ / 2 - 1];
 	}
 
 	/// Unregister a previously registered prompt by name. Returns `true` if a
@@ -3616,14 +3644,17 @@ final class McpServer : ServerCore
 	}
 
 	/// Whether `conn` holds a `resources/subscribe` entry for `uri` made after
-	/// the resource was last removed.
+	/// the resource was last removed. A subscription no newer than
+	/// `resourceRemovalFloor_` whose URI has no stamp of its own may predate a
+	/// forgotten removal, so it counts as live only while the URI still resolves.
 	private bool hasLiveSubscription(ConnectionState conn, string uri) const @safe
 	{
 		auto at = uri in conn.subscriptions;
 		if (at is null)
 			return false;
-		auto removed = uri in resourceRemovedAt_;
-		return removed is null || *at > *removed;
+		if (auto removed = uri in resourceRemovedAt_)
+			return *at > *removed;
+		return *at > resourceRemovalFloor_ || resourceExists(uri);
 	}
 
 	/// Drop `conn`'s subscriptions to resources removed since they were made.
@@ -3638,7 +3669,7 @@ final class McpServer : ServerCore
 	}
 
 	/// Whether `uri` names a registered resource or matches a resource template.
-	private bool resourceExists(string uri) @safe
+	private bool resourceExists(string uri) const @safe
 	{
 		if (uri in resources)
 			return true;
@@ -7596,6 +7627,48 @@ unittest  // removeResource drops resources/subscribe entries for that URI on ev
 	assert("error" !in s.handle(req(2, "resources/subscribe", p), new ConnCtx("A", a)).get);
 	assert(s.plainGetEligibleFor(a, m, "res://gone"));
 	assert(!s.plainGetEligibleFor(b, m, "res://gone"));
+}
+
+unittest  // resource removal bookkeeping stays bounded under URI churn
+{
+	import std.conv : to;
+
+	auto s = McpServer.stateful("t", "1");
+	s.enableResourceSubscriptions();
+	foreach (i; 0 .. maxTrackedResourceRemovals * 2)
+	{
+		const uri = "res://churn/" ~ i.to!string;
+		registerStubResources(s, uri);
+		assert(s.removeResource(uri));
+	}
+	assert(s.resourceRemovedAt_.length <= maxTrackedResourceRemovals);
+}
+
+unittest  // a subscription survives or dies correctly once its removal stamp is forgotten
+{
+	import std.conv : to;
+	import mcp.server.connection : ConnectionState;
+
+	auto s = McpServer.stateful("t", "1");
+	s.enableResourceSubscriptions();
+	registerStubResources(s, "res://kept", "res://dropped");
+	auto a = new ConnectionState;
+	Json p = Json.emptyObject;
+	p["uri"] = "res://kept";
+	assert("error" !in s.handle(req(1, "resources/subscribe", p), new ConnCtx("A", a)).get);
+	p["uri"] = "res://dropped";
+	assert("error" !in s.handle(req(2, "resources/subscribe", p), new ConnCtx("A", a)).get);
+	assert(s.removeResource("res://dropped"));
+	foreach (i; 0 .. maxTrackedResourceRemovals * 2)
+	{
+		const uri = "res://churn/" ~ i.to!string;
+		registerStubResources(s, uri);
+		assert(s.removeResource(uri));
+	}
+	assert("res://dropped" !in s.resourceRemovedAt_);
+	enum m = "notifications/resources/updated";
+	assert(s.plainGetEligibleFor(a, m, "res://kept"));
+	assert(!s.plainGetEligibleFor(a, m, "res://dropped"));
 }
 
 unittest  // a subscription to a removed resource does not count toward the per-connection cap
