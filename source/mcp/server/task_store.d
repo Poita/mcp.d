@@ -178,8 +178,9 @@ interface TaskStore
 	size_t removeIf(scope bool delegate(const TaskRecord) @safe pred) @safe;
 
 	/// How many records owned by `owner` ("" for unbound tasks) are not yet
-	/// terminal. The runtime enforces its per-principal task caps with it; a
-	/// shared store answers from an index on `(owner, status)`.
+	/// terminal. The runtime enforces its per-principal task caps with it on
+	/// every task creation, so it must not scan the store: a shared store answers
+	/// from an index on `(owner, status)` or a per-owner counter.
 	size_t countUnsettled(string owner) @safe;
 }
 
@@ -190,13 +191,35 @@ interface TaskStore
 /// makes the in-memory store a faithful single-process stand-in for a shared one.
 final class InMemoryTaskStore : TaskStore
 {
+	import mcp.protocol.tasks : isTerminal;
+
 	private TaskRecord[string] records;
+	// Unsettled records per owner, kept in step with every write so
+	// `countUnsettled` never scans the store.
+	private size_t[string] unsettled_;
+
+	private void track(const ref TaskRecord r, bool add) @safe
+	{
+		if (isTerminal(r.meta.status))
+			return;
+		if (add)
+		{
+			unsettled_.require(r.owner, 0)++;
+			return;
+		}
+		auto p = r.owner in unsettled_;
+		if (p is null)
+			return;
+		if (--*p == 0)
+			unsettled_.remove(r.owner);
+	}
 
 	bool put(TaskRecord record) @safe
 	{
 		if (record.meta.taskId in records)
 			return false;
 		records[record.meta.taskId] = record.dup;
+		track(record, true);
 		return true;
 	}
 
@@ -212,14 +235,20 @@ final class InMemoryTaskStore : TaskStore
 		auto p = record.meta.taskId in records;
 		if (p is null || p.revision != expectedRevision)
 			return false;
+		track(*p, false);
 		*p = record.dup;
 		p.revision = expectedRevision + 1;
+		track(*p, true);
 		return true;
 	}
 
 	void remove(string taskId) @safe
 	{
-		records.remove(taskId);
+		if (auto p = taskId in records)
+		{
+			track(*p, false);
+			records.remove(taskId);
+		}
 	}
 
 	size_t removeIf(scope bool delegate(const TaskRecord) @safe pred) @safe
@@ -229,19 +258,15 @@ final class InMemoryTaskStore : TaskStore
 			if (pred(r))
 				doomed ~= id;
 		foreach (id; doomed)
-			records.remove(id);
+			remove(id);
 		return doomed.length;
 	}
 
 	size_t countUnsettled(string owner) @safe
 	{
-		import mcp.protocol.tasks : isTerminal;
-
-		size_t n;
-		foreach (ref r; records)
-			if (r.owner == owner && !isTerminal(r.meta.status))
-				n++;
-		return n;
+		if (auto p = owner in unsettled_)
+			return *p;
+		return 0;
 	}
 }
 
@@ -431,6 +456,46 @@ unittest  // defaultTaskIdGenerator yields distinct 32-char hex ids
 	assert(a != b, "two generated task ids must differ");
 	foreach (c; a)
 		assert((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'), "id must be lowercase hex");
+}
+
+unittest  // countUnsettled tracks each owner's unsettled records through every write
+{
+	import mcp.protocol.tasks : TaskStatus;
+
+	auto s = new InMemoryTaskStore();
+	TaskRecord mk(string id, string owner, TaskStatus st) @safe
+	{
+		TaskRecord r;
+		r.meta.taskId = id;
+		r.meta.status = st;
+		r.owner = owner;
+		return r;
+	}
+
+	assert(s.put(mk("a1", "alice", TaskStatus.working)));
+	assert(s.put(mk("a2", "alice", TaskStatus.inputRequired)));
+	assert(s.put(mk("a3", "alice", TaskStatus.completed)));
+	assert(s.put(mk("b1", "bob", TaskStatus.working)));
+	assert(s.put(mk("n1", "", TaskStatus.working)));
+	assert(!s.put(mk("a1", "alice", TaskStatus.working)));
+	assert(s.countUnsettled("alice") == 2);
+	assert(s.countUnsettled("bob") == 1);
+	assert(s.countUnsettled("") == 1);
+	assert(s.countUnsettled("carol") == 0);
+
+	assert(s.compareAndSwap(mk("a1", "alice", TaskStatus.completed), 0));
+	assert(s.countUnsettled("alice") == 1);
+	assert(!s.compareAndSwap(mk("a2", "alice", TaskStatus.failed), 7));
+	assert(s.countUnsettled("alice") == 1);
+	assert(s.compareAndSwap(mk("a3", "alice", TaskStatus.working), 0));
+	assert(s.countUnsettled("alice") == 2);
+
+	s.remove("a2");
+	s.remove("missing");
+	assert(s.countUnsettled("alice") == 1);
+	assert(s.removeIf((const TaskRecord r) @safe => r.owner == "bob") == 1);
+	assert(s.countUnsettled("bob") == 0);
+	assert(s.countUnsettled("alice") == 1);
 }
 
 unittest  // removeIf drops exactly the records matching the predicate

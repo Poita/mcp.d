@@ -95,6 +95,8 @@ final class TaskRuntime
 	// Tasks whose status changes are not pushed: ephemeral records whose id no
 	// client ever learns.
 	private bool[string] silenced_;
+	// When a create refused at its cap last swept the store.
+	private SysTime lastCapSweep_;
 
 	/// Whether a task executor's unexpected (non-`McpException`) exception message
 	/// is recorded as the failed task's error, rather than a generic "Internal
@@ -232,10 +234,17 @@ final class TaskRuntime
 			return;
 		// Tasks idle past `maxUnsettledIdle` are settled only when accessed or
 		// swept, so settle them now rather than let abandoned tasks hold the
-		// principal's slots (the sweeper may be disabled).
-		sweepExpired();
-		if (store_.countUnsettled(owner) < cap)
-			return;
+		// principal's slots (the sweeper may be disabled). The sweep scans the
+		// whole store, so creates hammering a cap trigger it at most once a
+		// second; an overdue task has been idle far longer than that.
+		const now = currentTime();
+		if (now >= lastCapSweep_ + 1.seconds)
+		{
+			lastCapSweep_ = now;
+			sweepExpired();
+			if (store_.countUnsettled(owner) < cap)
+				return;
+		}
 		throw resourceExhausted("too many unsettled tasks", owner.length
 				? "maxUnsettledPerPrincipal" : "maxUnsettledAnonymous", cast(long) cap);
 	}
@@ -1793,6 +1802,70 @@ unittest  // a task idle past maxUnsettledIdle frees its unsettled slot without 
 	now = "2026-06-07T11:00:00Z";
 	rt.createFor("slow", Json.undefined, alice);
 	assert(rt.store.get(hung.taskId).get.meta.status == TaskStatus.failed);
+}
+
+unittest  // repeated creates at the unsettled-task cap sweep the store at most once a second
+{
+	import std.exception : collectException;
+
+	static final class SweepCountingStore : TaskStore
+	{
+		InMemoryTaskStore inner;
+		size_t sweeps;
+
+		this() @safe
+		{
+			inner = new InMemoryTaskStore();
+		}
+
+		bool put(TaskRecord r) @safe
+		{
+			return inner.put(r);
+		}
+
+		Nullable!TaskRecord get(string id) @safe
+		{
+			return inner.get(id);
+		}
+
+		bool compareAndSwap(TaskRecord r, ulong expected) @safe
+		{
+			return inner.compareAndSwap(r, expected);
+		}
+
+		void remove(string id) @safe
+		{
+			inner.remove(id);
+		}
+
+		size_t removeIf(scope bool delegate(const TaskRecord) @safe pred) @safe
+		{
+			sweeps++;
+			return inner.removeIf(pred);
+		}
+
+		size_t countUnsettled(string owner) @safe
+		{
+			return inner.countUnsettled(owner);
+		}
+	}
+
+	string now = "2026-06-07T10:00:00Z";
+	auto store = new SweepCountingStore();
+	TaskOptions o;
+	o.store = store;
+	o.nowIso = () @safe => now;
+	o.maxUnsettledPerPrincipal = 1;
+	auto rt = new TaskRuntime(o);
+	TaskCreateOptions alice;
+	alice.owner = "alice";
+	rt.create(alice);
+	foreach (_; 0 .. 50)
+		assert(collectException!McpException(rt.create(alice)) !is null);
+	assert(store.sweeps == 1);
+	now = "2026-06-07T10:00:01Z";
+	assert(collectException!McpException(rt.create(alice)) !is null);
+	assert(store.sweeps == 2);
 }
 
 unittest  // unauthenticated tasks share the anonymous unsettled-task cap
