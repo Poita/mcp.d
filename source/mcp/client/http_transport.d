@@ -1905,9 +1905,12 @@ final class HttpClientTransport : ClientTransport
 	/// Open the standalone server->client SSE stream (`GET /mcp`) in a background
 	/// task, so the server can deliver sampling / elicitation / roots requests
 	/// and notifications outside of any POST response. A server that does not
-	/// offer this stream (e.g. responds 405) is tolerated as a no-op. On the
-	/// legacy HTTP+SSE transport the session's GET stream already carries these
-	/// messages, and a second GET would open a second session, so this is a no-op.
+	/// offer this stream (e.g. responds 405) is tolerated as a no-op. Returns
+	/// once the server has answered the stream's first GET, or the first attempt
+	/// failed, or after `listenTimeout_`, so a message the server sends right
+	/// after this returns reaches an open stream. On the legacy HTTP+SSE
+	/// transport the session's GET stream already carries these messages, and a
+	/// second GET would open a second session, so this is a no-op.
 	void startServerStream() @safe
 	{
 		import vibe.core.core : runTask;
@@ -1920,13 +1923,15 @@ final class HttpClientTransport : ClientTransport
 		if (serverStreamAlive)
 			return;
 		serverStreamAlive = true;
+		auto gate = new ListenGate;
 		runTask(() nothrow{
 			try
-				runServerStream();
+				runServerStream(&gate.signal);
 			catch (Exception)
 			{
 			}
 		});
+		gate.wait(listenTimeout_);
 	}
 
 	/// Open the standalone server->client SSE stream over a raw TCP connection
@@ -1942,17 +1947,28 @@ final class HttpClientTransport : ClientTransport
 	/// server offers no standalone stream; a 404: no stream at the endpoint, or
 	/// the session is gone), so it ends the reader too, as does a 501. A
 	/// same-origin redirect is followed at once, a bounded number of times in a
-	/// row; any other redirect ends the reader.
-	private void runServerStream() @safe
+	/// row; any other redirect ends the reader. `onOpened(true)` fires once the
+	/// server answers a GET with 200, `onOpened(false)` once an attempt ends
+	/// otherwise; only the first call counts.
+	private void runServerStream(void delegate(bool) @safe nothrow onOpened = null) @safe
 	{
 		import core.time : msecs;
 		import vibe.core.core : sleep;
 		import vibe.core.task : Task;
 
+		void opened(bool ok) @safe nothrow
+		{
+			if (onOpened !is null)
+				onOpened(ok);
+		}
+
 		// Clear the liveness flag when the reader task exits, so a later
 		// `startServerStream()` can re-open the stream instead of being suppressed.
 		scope (exit)
+		{
 			serverStreamAlive = false;
+			opened(false);
+		}
 
 		// The URL the stream is opened at: the endpoint, or where it redirected.
 		string target = url;
@@ -2046,6 +2062,7 @@ final class HttpClientTransport : ClientTransport
 						return;
 					}
 					redirects = 0;
+					opened(true);
 
 					readSseBody(conn, head.chunked, cursor, () @safe => closing,
 							(string eventType, string data) @safe {
@@ -2074,6 +2091,8 @@ final class HttpClientTransport : ClientTransport
 				{
 				}
 			}();
+			if (redirect.length == 0 || refused)
+				opened(false);
 
 			if (closing)
 				break;
@@ -3754,6 +3773,54 @@ unittest  // startServerStream() is a no-op on the legacy HTTP+SSE transport, wh
 	t.legacyMode = true;
 	t.startServerStream();
 	assert(!t.serverStreamAlive, "a legacy session must not open a second GET stream");
+}
+
+unittest  // startServerStream() returns once the server has answered the stream's GET
+{
+	import core.time : msecs;
+	import vibe.core.core : sleep;
+
+	bool opened;
+	bool openedOnReturn;
+	auto router = new URLRouter;
+	router.get("/mcp", (HTTPServerRequest req, HTTPServerResponse res) @safe {
+		opened = true;
+		res.headers["Content-Type"] = "text/event-stream";
+		res.bodyWriter.write(": open\n\n");
+		res.bodyWriter.flush();
+		sleep(300.msecs);
+	});
+	const failure = runAgainstFakeServer(router, (string url) @safe {
+		auto t = new HttpClientTransport(url);
+		scope (exit)
+			t.close();
+		t.startServerStream();
+		openedOnReturn = opened;
+	});
+	assert(failure.length == 0, "scenario failed: " ~ failure);
+	assert(openedOnReturn, "the stream must be open when startServerStream returns");
+}
+
+unittest  // startServerStream() returns promptly when the server refuses the stream
+{
+	import core.time : MonoTime;
+
+	auto router = new URLRouter;
+	router.get("/mcp", (HTTPServerRequest req, HTTPServerResponse res) @safe {
+		res.statusCode = 405;
+		res.writeBody("");
+	});
+	Duration took;
+	const failure = runAgainstFakeServer(router, (string url) @safe {
+		auto t = new HttpClientTransport(url);
+		scope (exit)
+			t.close();
+		const started = MonoTime.currTime;
+		t.startServerStream();
+		took = MonoTime.currTime - started;
+	});
+	assert(failure.length == 0, "scenario failed: " ~ failure);
+	assert(took < 2.seconds, "a refused stream must not hold startServerStream");
 }
 
 unittest  // close() force-closes every registered server-stream socket slot
