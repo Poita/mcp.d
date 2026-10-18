@@ -44,10 +44,11 @@ enum FetchResult
 /// resource must equal the endpoint or be a same-origin path prefix of it ending
 /// on a `/` boundary — the latter covers a document served at the root
 /// well-known URL that names the whole origin (or a parent path) as the
-/// resource. A missing `resource` never matches.
+/// resource. An endpoint's query string is ignored unless the resource names
+/// that same query. A missing `resource` never matches.
 package bool prmResourceMatches(string prmResource, string mcpEndpoint) @safe
 {
-	import std.string : startsWith;
+	import std.string : indexOf, startsWith;
 
 	if (prmResource.length == 0)
 		return false;
@@ -55,7 +56,11 @@ package bool prmResourceMatches(string prmResource, string mcpEndpoint) @safe
 	const have = canonicalResourceUri(prmResource);
 	if (have == want)
 		return true;
-	return want.length > have.length && want.startsWith(have) && want[have.length] == '/';
+	const query = want.indexOf('?');
+	const wantPath = query < 0 ? want : canonicalResourceUri(want[0 .. query]);
+	if (have == wantPath)
+		return true;
+	return wantPath.length > have.length && wantPath.startsWith(have) && wantPath[have.length] == '/';
 }
 
 /// Where an MCP endpoint's authorization server was found
@@ -1828,6 +1833,15 @@ unittest  // prmResourceMatches accepts the endpoint itself or a path prefix of 
 	assert(prmResourceMatches("https://mcp.example.com/", "https://mcp.example.com/mcp"));
 	assert(prmResourceMatches("https://mcp.example.com/tenant",
 			"https://mcp.example.com/tenant/mcp"));
+}
+
+unittest  // prmResourceMatches matches an endpoint carrying a query by its path
+{
+	assert(prmResourceMatches("https://h.example/mcp", "https://h.example/mcp?tenant=x"));
+	assert(prmResourceMatches("https://h.example", "https://h.example/mcp?tenant=x"));
+	assert(prmResourceMatches("https://h.example/mcp?tenant=x", "https://h.example/mcp?tenant=x"));
+	assert(!prmResourceMatches("https://h.example/mcp?tenant=y", "https://h.example/mcp?tenant=x"));
+	assert(!prmResourceMatches("https://h.example/mc", "https://h.example/mcp?tenant=x"));
 }
 
 unittest  // prmResourceMatches rejects another origin, a sibling path, and a missing resource
