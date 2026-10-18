@@ -162,7 +162,8 @@ struct OAuthProxyConfig
 	/// In ISSUE-OWN-TOKEN (broker) mode, mints the MCP server's own token for the
 	/// client from the upstream token response. Set together with `tokenStore` to
 	/// switch the proxy out of passthrough: the proxy then NEVER hands the client
-	/// the upstream token. Null (the default) leaves the proxy in passthrough.
+	/// the upstream token. Null (the default) leaves the proxy in passthrough;
+	/// setting only one of the pair is refused.
 	IssueTokenHook issueToken;
 
 	/// In ISSUE-OWN-TOKEN (broker) mode, stores the minted client token and the
@@ -232,6 +233,7 @@ struct OAuthProxyConfig
 	/// `resource`/`scopesSupported` are mirrored.
 	ResourceServerConfig toResourceServer() @safe
 	{
+		requireBrokerPair();
 		ResourceServerConfig rs;
 		if (issueToken !is null && tokenStore !is null)
 			rs.validator = referenceTokenValidator(tokenStore, resource);
@@ -246,6 +248,16 @@ struct OAuthProxyConfig
 			rs.authorizationServers = [stripTrailingSlash(baseUrl)];
 		rs.scopesSupported = scopesSupported.dup;
 		return rs;
+	}
+
+	/// Refuses a config that sets only one of `issueToken` and `tokenStore`:
+	/// broker mode needs both, and staying in passthrough would hand clients
+	/// the upstream token the author meant to keep server-side.
+	package void requireBrokerPair() const @safe
+	{
+		import std.exception : enforce;
+
+		enforce((issueToken is null) == (tokenStore is null), "OAuthProxyConfig: set both issueToken and tokenStore for broker mode, or neither for passthrough.");
 	}
 }
 
@@ -1477,6 +1489,7 @@ final class OAuthProxy
 		enforce(cfg.resource.length > 0,
 				"OAuthProxy: resource (the canonical MCP server URL) must be set; "
 				~ "every token would otherwise fail the audience check.");
+		cfg.requireBrokerPair();
 		requireSecureUrl(cfg.upstreamAuthorizationEndpoint, cfg.upstreamSsrfPolicy);
 		requireSecureUrl(cfg.upstreamTokenEndpoint, cfg.upstreamSsrfPolicy);
 		requireSecureUrl(cfg.callbackUrl(), SsrfPolicy.allowLoopback);
@@ -3586,6 +3599,21 @@ unittest  // BROKER: a config with both issueToken and tokenStore is in broker m
 {
 	auto proxy = new OAuthProxy(brokerConfig());
 	assert(proxy.brokerEnabled());
+}
+
+unittest  // BROKER: a config setting only one of issueToken and tokenStore is refused
+{
+	import std.exception : assertThrown;
+
+	auto hookOnly = brokerConfig();
+	hookOnly.tokenStore = null;
+	assertThrown(new OAuthProxy(hookOnly));
+	assertThrown(hookOnly.toResourceServer());
+
+	auto storeOnly = brokerConfig();
+	storeOnly.issueToken = null;
+	assertThrown(new OAuthProxy(storeOnly));
+	assertThrown(storeOnly.toResourceServer());
 }
 
 unittest  // BROKER: passthrough remains the default (no issueToken, no tokenStore)
