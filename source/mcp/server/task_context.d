@@ -21,9 +21,11 @@ import mcp.server.task_runtime : TaskRuntime;
 /// re-dispatch, so from then on the context's writes (`progress`,
 /// `checkpoint`, `requireInput`, `detach`) change nothing. It derives from `Exception` rather than
 /// `Throwable` so `finally` / `scope(exit)` cleanup in the executor always runs.
+/// Only the context raises it: one thrown any other way records no suspension,
+/// so it fails the task.
 final class TaskSuspended : Exception
 {
-	this(string taskId) @safe nothrow
+	package(mcp) this(string taskId) @safe nothrow
 	{
 		super("task suspended for input: " ~ taskId);
 	}
@@ -34,10 +36,11 @@ final class TaskSuspended : Exception
 /// `working` (no `inputRequests`): the dispatcher catches this and stops the
 /// current dispatch, and an external signal later calls `rt.complete` / `rt.fail`.
 /// Do not catch this in executor code; as with `TaskSuspended`, a swallowed
-/// detach still ends the dispatch with the task left `working`.
+/// detach still ends the dispatch with the task left `working`. As with
+/// `TaskSuspended`, only the context raises it.
 final class TaskDetached : Exception
 {
-	this(string taskId) @safe nothrow
+	package(mcp) this(string taskId) @safe nothrow
 	{
 		super("task detached: " ~ taskId);
 	}
@@ -350,14 +353,10 @@ private void drive(ref TaskContext tc, TaskExecutor executor) @safe
 		else
 			rt.complete(taskId, result);
 	}
-	catch (TaskSuspended)
-	{
-		// Already persisted as input_required; nothing further this dispatch.
-	}
-	catch (TaskDetached)
-	{
-		// Left `working`; an external signal completes it via rt.complete/rt.fail.
-	}
+	// A `TaskSuspended` or `TaskDetached` raised by the context has already
+	// recorded its outcome and marked the dispatch unwound, so it ends the
+	// dispatch below; one raised any other way recorded nothing and fails the
+	// task like any other exception.
 	catch (McpException e)
 	{
 		if (tc.outcome_.unwound)
@@ -679,6 +678,24 @@ unittest  // a task whose record is gone before its dispatch runs never invokes 
 		return Json.emptyObject;
 	});
 	assert(!ran);
+}
+
+unittest  // a TaskSuspended or TaskDetached not raised by the context fails the task
+{
+	import mcp.server.task_runtime : TaskOptions;
+
+	auto rt = new TaskRuntime(TaskOptions.init);
+	auto s = rt.createFor("rogue", Json.undefined);
+	runTaskExecutor(rt, s.taskId, delegate Json(TaskContext tc) @safe {
+		throw new TaskSuspended(tc.taskId);
+	});
+	assert(rt.getDetailed(s.taskId)["status"].get!string == "failed");
+
+	auto d = rt.createFor("rogue", Json.undefined);
+	runTaskExecutor(rt, d.taskId, delegate Json(TaskContext tc) @safe {
+		throw new TaskDetached(tc.taskId);
+	});
+	assert(rt.getDetailed(d.taskId)["status"].get!string == "failed");
 }
 
 unittest  // a redelivered dispatch of a settled task never invokes the executor
