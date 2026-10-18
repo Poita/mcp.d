@@ -51,8 +51,9 @@ struct JwtVerifierConfig
 	string jwksUri;
 
 	/// PEM-encoded public keys (`-----BEGIN PUBLIC KEY-----`) pinned directly,
-	/// tried in order. An alternative to `jwksUri` for static deployments. RSA
-	/// keys shorter than 2048 bits never verify a token.
+	/// tried in order. An alternative to `jwksUri` for static deployments. Each
+	/// must be an RSA key of at least 2048 bits or a P-256 EC key; `jwtVerifier`
+	/// refuses any other, since it could never verify a token.
 	string[] staticPublicKeysPem;
 
 	/// The required token issuer (`iss`). A token whose `iss` differs is
@@ -143,6 +144,7 @@ struct JwtVerifierConfig
 TokenValidator jwtVerifier(JwtVerifierConfig cfg) @safe
 {
 	import std.exception : enforce;
+	import std.format : format;
 
 	enforce(cfg.issuer.length || cfg.allowAnyIssuer,
 			"jwtVerifier: set JwtVerifierConfig.issuer (or allowAnyIssuer to skip the iss check)");
@@ -154,6 +156,10 @@ TokenValidator jwtVerifier(JwtVerifierConfig cfg) @safe
 	auto cache = new JwksCache(cfg.jwksUri, cfg.jwksCacheTtl, cfg.ssrfPolicy);
 	cache.maxStaleness = cfg.jwksMaxStaleness;
 	auto pinned = parsePinnedKeys(cfg.staticPublicKeysPem);
+	foreach (i, key; pinned)
+		enforce(key !is null && key.canVerify(),
+				format!("jwtVerifier: JwtVerifierConfig.staticPublicKeysPem[%s] is not an RSA "
+					~ "(2048+ bit) or P-256 EC public key, so it could never verify a token")(i));
 	return (string token) @safe {
 		return verifyOrInvalid(() @safe => verifyToken(cfg, token, cache,
 				currentUnixTime(), pinned));
@@ -233,7 +239,11 @@ private TokenInfo keysOutage(Duration retryAfter) @safe
 /// call; `jwtVerifier` parses them once and passes them as `pinned`.
 package TokenInfo verifyToken(JwtVerifierConfig cfg, string token, KeySource keys, long now) @safe
 {
-	return verifyToken(cfg, token, keys, now, parsePinnedKeys(cfg.staticPublicKeysPem));
+	import std.algorithm : filter;
+	import std.array : array;
+
+	return verifyToken(cfg, token, keys, now,
+			parsePinnedKeys(cfg.staticPublicKeysPem).filter!(k => k !is null).array);
 }
 
 /// As above, with the pinned keys already parsed.
@@ -424,6 +434,13 @@ package final class PublicKey
 		return new PublicKey(pkey, baseId == EVP_PKEY_RSA ? "RSA" : "EC");
 	}
 
+	/// Whether the key meets the floor some algorithm verifies with: an RSA key
+	/// of at least `minRsaKeyBits`, or an EC key on P-256.
+	bool canVerify() @trusted
+	{
+		return kty == "RSA" ? EVP_PKEY_bits(pkey) >= minRsaKeyBits : isP256Key(pkey);
+	}
+
 	/// Verify a JWS signature over `signingInput` for `alg` (see `verifyJws`).
 	bool verify(string alg, const(ubyte)[] signingInput, const(ubyte)[] sig) @safe
 	{
@@ -431,14 +448,13 @@ package final class PublicKey
 	}
 }
 
-/// Parse each pinned PEM key, skipping any that do not parse (they can never
-/// verify a token).
+/// Parse each pinned PEM key, one entry per PEM: null for a PEM that does not
+/// parse as an RSA or EC public key.
 package PublicKey[] parsePinnedKeys(const string[] pems) @safe
 {
 	PublicKey[] keys;
 	foreach (pem; pems)
-		if (auto k = PublicKey.fromPem(pem))
-			keys ~= k;
+		keys ~= PublicKey.fromPem(pem);
 	return keys;
 }
 
@@ -1306,7 +1322,7 @@ unittest  // jwtVerifier refuses a config that pins no issuer
 
 	JwtVerifierConfig cfg;
 	cfg.allowAnyAudience = true;
-	cfg.staticPublicKeysPem = ["unused"];
+	cfg.staticPublicKeysPem = [testEcPubPem];
 	assertThrown(jwtVerifier(cfg));
 }
 
@@ -1316,7 +1332,7 @@ unittest  // jwtVerifier refuses a config that pins no audience
 
 	JwtVerifierConfig cfg;
 	cfg.issuer = "https://as.example.com";
-	cfg.staticPublicKeysPem = ["unused"];
+	cfg.staticPublicKeysPem = [testEcPubPem];
 	assertThrown(jwtVerifier(cfg));
 	cfg.allowAnyAudience = true;
 	cast(void) jwtVerifier(cfg);
@@ -1642,6 +1658,30 @@ unittest  // a pinned RSA public key shorter than 2048 bits is not used to verif
 	cfg.allowAnyIssuer = true;
 	cfg.staticPublicKeysPem = [weakPem];
 	assert(!verifyToken(cfg, weakToken, new NoKeys, 1_700_001_000).valid);
+}
+
+unittest  // jwtVerifier refuses a pinned PEM that cannot verify any token
+{
+	import std.exception : assertThrown;
+
+	enum weakPem = "-----BEGIN PUBLIC KEY-----\n"
+		~ "MIGfMA0GCSqGSIb3DQEBAQUAA4GNADCBiQKBgQC677t17xuMpPQagrUx7LYzqLJh\n"
+		~ "EM/uXXIIPC5rlQh8rZFHNl1Nozt6XWq3Bvd+Gesl3eZ/PVd0B+IYU/V8+Fex/fst\n"
+		~ "W8pqucd+wGhFUUa7Q24u1momdVAhYOW2M+na8V3TBcr7snfNd+L7L8pkmZiGRos3\n"
+		~ "EKi8uzdJlHOeNGMmmQIDAQAB\n" ~ "-----END PUBLIC KEY-----\n";
+	JwtVerifierConfig cfg;
+	cfg.issuer = "https://as.example.com";
+	cfg.audience = "https://mcp.example.com/mcp";
+	cfg.staticPublicKeysPem = ["not a pem"];
+	assertThrown(jwtVerifier(cfg));
+	cfg.staticPublicKeysPem = [weakPem];
+	assertThrown(jwtVerifier(cfg));
+	cfg.staticPublicKeysPem = [testEcPubPem, "not a pem"];
+	assertThrown(jwtVerifier(cfg));
+	cfg.jwksUri = "https://as.example.com/jwks";
+	assertThrown(jwtVerifier(cfg));
+	cfg.staticPublicKeysPem = [testEcPubPem];
+	cast(void) jwtVerifier(cfg);
 }
 
 unittest  // a malformed signature segment is invalid without raising (no per-request warning)
