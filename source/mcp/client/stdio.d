@@ -813,6 +813,48 @@ struct SpawnSettings
 /// The longest stderr line `StderrMode.capture` delivers in one piece.
 enum size_t maxStderrLineBytes = 64 * 1024;
 
+/// Throw a descriptive `McpException` when `args` cannot start a process in
+/// `workingDir`: an empty command line, a missing working directory, or an
+/// executable that is missing or not executable. A bare name is looked up on
+/// `PATH` and a relative path against `workingDir`, as the spawn does.
+version (Posix) private void checkSpawnable(string[] args, string workingDir) @safe
+{
+	import core.sys.posix.unistd : access, X_OK;
+	import std.algorithm.iteration : splitter;
+	import std.algorithm.searching : canFind;
+	import std.file : exists, isDir;
+	import std.path : buildPath, isAbsolute;
+	import std.process : environment;
+	import std.string : toStringz;
+
+	static bool executable(string path) @trusted
+	{
+		return access(path.toStringz, X_OK) == 0 && !isDir(path);
+	}
+
+	if (args.length == 0 || args[0].length == 0)
+		throw internalError("cannot start an MCP server: the command line is empty");
+	const name = args[0];
+	if (workingDir.length && !(exists(workingDir) && isDir(workingDir)))
+		throw internalError("cannot start MCP server `" ~ name ~ "`: working directory `"
+				~ workingDir ~ "` does not exist or is not a directory");
+	if (!name.canFind('/'))
+	{
+		foreach (dir; environment.get("PATH", "").splitter(':'))
+		{
+			const candidate = buildPath(dir.length ? dir : ".", name);
+			if (exists(candidate) && executable(candidate))
+				return;
+		}
+		throw internalError("cannot start MCP server: executable `" ~ name ~ "` not found on PATH");
+	}
+	const path = isAbsolute(name) || workingDir.length == 0 ? name : buildPath(workingDir, name);
+	if (!exists(path))
+		throw internalError("cannot start MCP server: executable `" ~ path ~ "` not found");
+	if (!executable(path))
+		throw internalError("cannot start MCP server: `" ~ path ~ "` is not executable");
+}
+
 /// Launch an MCP server as a subprocess and wire a `StdioClientTransport` to its
 /// stdin/stdout via vibe's async process pipes. `args` is the command line
 /// (`args[0]` is the executable); newline-delimited JSON-RPC requests are written
@@ -835,9 +877,16 @@ version (Posix) StdioClientTransport spawnStdioTransport(string[] args,
 	// Heap-box the pipes so the read/write closures capture a stable, long-lived
 	// handle past this function's return (`attachProcess` keeps the same pointer
 	// for the shutdown sequence).
+	// The event driver reports a failed spawn without its cause and keeps the
+	// pipes it opened for it, so the usual causes are ruled out first.
+	checkSpawnable(args, spawn.workingDir);
 	auto pipes = new ProcessPipes;
-	*pipes = pipeProcess(args, redirect, spawn.env, spawn.replaceEnv ? Config.newEnv
-			: Config.none, spawn.workingDir.length ? NativePath(spawn.workingDir) : NativePath.init);
+	try
+		*pipes = pipeProcess(args, redirect, spawn.env, spawn.replaceEnv ? Config.newEnv
+				: Config.none, spawn.workingDir.length
+				? NativePath(spawn.workingDir) : NativePath.init);
+	catch (Exception e)
+		throw internalError("cannot start MCP server `" ~ args[0] ~ "`: " ~ e.msg);
 	StdioClientTransport transport;
 
 	// Async, cooperative line read over the child's stdout, in chunks through a
@@ -1081,9 +1130,13 @@ version (Windows) StdioClientTransport spawnStdioTransport(string[] args,
 		auto toChild = pipe();
 		auto fromChild = pipe();
 		auto errFile = spawn.stderr == StderrMode.discard ? File("NUL", "w") : std.stdio.stderr;
-		child.pid = spawnProcess(args, toChild.readEnd, fromChild.writeEnd,
-				errFile, spawn.env, spawn.replaceEnv ? Config.newEnv
-				: Config.none, spawn.workingDir);
+		try
+			child.pid = spawnProcess(args, toChild.readEnd, fromChild.writeEnd,
+					errFile, spawn.env, spawn.replaceEnv ? Config.newEnv
+					: Config.none, spawn.workingDir);
+		catch (Exception e)
+			throw internalError("cannot start MCP server `" ~ (args.length
+					? args[0] : "") ~ "`: " ~ e.msg);
 		auto proc = GetCurrentProcess();
 		DuplicateHandle(proc, fromChild.readEnd.windowsHandle, proc,
 				&readHandle, 0, FALSE, DUPLICATE_SAME_ACCESS);
@@ -1746,6 +1799,80 @@ version (Posix) unittest  // StderrMode.capture hands each line the server write
 		transport.closeProcess(200.msecs, 200.msecs);
 	});
 	assert(lines == ["first", "second", "last"]);
+}
+
+version (Posix) unittest  // spawning a missing executable fails with an McpException naming it and leaks no descriptor
+{
+	import std.algorithm.searching : canFind;
+	import std.file : dirEntries, SpanMode;
+	import std.array : array;
+
+	static size_t openDescriptors() @trusted
+	{
+		return dirEntries("/dev/fd", SpanMode.shallow).array.length;
+	}
+
+	McpException[] errors;
+	size_t before, after;
+	inLoop(() @safe {
+		foreach (cmd; [
+				["/nonexistent/mcp-test-server"], [
+					"mcp-test-server-not-on-path"
+				]
+			])
+		{
+			before = before ? before : openDescriptors();
+			try
+				spawnStdioTransport(cmd);
+			catch (McpException e)
+				errors ~= e;
+		}
+		after = openDescriptors();
+	});
+	assert(errors.length == 2, "each failed spawn must raise an McpException");
+	assert(errors[0].msg.canFind("/nonexistent/mcp-test-server")
+			&& errors[0].msg.canFind("not found"), errors[0].msg);
+	assert(errors[1].msg.canFind("mcp-test-server-not-on-path")
+			&& errors[1].msg.canFind("PATH"), errors[1].msg);
+	assert(after == before, "a failed spawn must not leak pipe descriptors");
+}
+
+version (Posix) unittest  // spawning a file that is not executable fails with an McpException saying so
+{
+	import std.algorithm.searching : canFind;
+	import std.file : remove, tempDir, write;
+	import std.path : buildPath;
+	import std.process : thisProcessID;
+	import std.conv : to;
+
+	const path = buildPath(tempDir, "mcp-not-executable-" ~ thisProcessID.to!string);
+	() @trusted { write(path, "#!/bin/sh\n"); }();
+	scope (exit)
+		remove(path);
+	string msg;
+	inLoop(() @safe {
+		try
+			spawnStdioTransport([path]);
+		catch (McpException e)
+			msg = e.msg;
+	});
+	assert(msg.canFind(path) && msg.canFind("not executable"), msg);
+}
+
+version (Posix) unittest  // spawning into a missing working directory fails with an McpException naming it
+{
+	import std.algorithm.searching : canFind;
+
+	SpawnSettings s;
+	s.workingDir = "/nonexistent/mcp-test-dir";
+	string msg;
+	inLoop(() @safe {
+		try
+			spawnStdioTransport(["sh", "-c", "cat"], defaultMaxLineBytes, s);
+		catch (McpException e)
+			msg = e.msg;
+	});
+	assert(msg.canFind("/nonexistent/mcp-test-dir"), msg);
 }
 
 version (Posix) unittest  // McpClient.spawn launches the server with ClientSettings.process

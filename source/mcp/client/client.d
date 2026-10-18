@@ -963,7 +963,9 @@ final class McpClient : ClientProtocol
 	/// `close()` runs the MCP stdio shutdown sequence on the subprocess. Every
 	/// `settings` field applies except the HTTP transport knobs (`connectTimeout`,
 	/// `maxInFlight`, `tls`), which are ignored; `maxMessageBytes` bounds each
-	/// line the server writes to stdout.
+	/// line the server writes to stdout. Throws `McpException` naming the cause
+	/// when the server cannot be started (a missing or non-executable program, a
+	/// missing working directory).
 	static McpClient spawn(string[] command, ClientSettings settings = ClientSettings.init) @safe
 	{
 		import std.array : join;
