@@ -92,7 +92,11 @@ void main()
 Build the server, then run the client from the same directory (it spawns
 `./demo-server`, relative to the working directory). To launch a server binary
 that ships next to the client executable regardless of the working directory,
-use `McpClient.spawnSibling("demo-server")` instead.
+use `McpClient.spawnSibling("demo-server")` instead. The server inherits the
+client's environment, working directory and stderr; `ClientSettings.process`
+(a `SpawnSettings`) adds or replaces environment variables (`env`,
+`replaceEnv`), sets `workingDir`, and discards or captures the server's stderr
+(`stderr = StderrMode.capture` with an `onStderrLine` callback, POSIX only).
 
 ```bash
 ulimit -n 65536                 # see Build & test

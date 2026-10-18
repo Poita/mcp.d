@@ -40,7 +40,9 @@ import mcp.protocol.mrtr : MetaKey;
 /// async delegates.
 final class StdioClientTransport : ClientTransport
 {
-	version (Posix) import vibe.core.process : ProcessPipes;
+	version (Posix) import vibe.core.process : ProcessPipes, PipeInputStream;
+
+	version (Posix) import vibe.core.task : Task;
 
 	version (Windows) import core.thread : Thread;
 	import core.time : Duration, seconds, msecs;
@@ -66,6 +68,8 @@ final class StdioClientTransport : ClientTransport
 	// Windows has no eventcore pipe driver, so it owns a `WinChild` (std.process
 	// pid + blocking reader and writer threads) and shuts down via close-stdin -> terminate.
 	version (Posix) private ProcessPipes* pipes;
+	// The task reading the owned child's stderr, when it is not inherited.
+	version (Posix) private Task stderrReader_;
 	version (Posix)
 		private bool stdinClosed_;
 	else version (Windows)
@@ -437,6 +441,82 @@ final class StdioClientTransport : ClientTransport
 		this.pipes = pipes;
 	}
 
+	/// Read the owned child's stderr on a task of its own until it ends, passing
+	/// each line to `onLine`, or dropping it when `onLine` is null. The stream is
+	/// moved into the task, which closes it, so releasing the process never
+	/// closes it under the task's pending read.
+	version (Posix) package void attachStderr(ref PipeInputStream err,
+			void delegate(string) @safe nothrow onLine) @safe
+	{
+		import std.algorithm.mutation : move;
+		import vibe.core.core : runTask;
+
+		auto stream = new PipeInputStream;
+		*stream = move(err);
+		stderrReader_ = runTask(() nothrow{ readStderr(stream, onLine); });
+	}
+
+	/// The body of the stderr task: split `stream` into lines (LF or CRLF, at
+	/// most `maxStderrLineBytes` each) until it ends or the task is interrupted.
+	version (Posix) private static void readStderr(PipeInputStream* stream,
+			void delegate(string) @safe nothrow onLine) @safe nothrow
+	{
+		import vibe.core.stream : IOMode;
+
+		char[] line;
+		void emit() @safe nothrow
+		{
+			if (line.length && line[$ - 1] == '\r')
+				line = line[0 .. $ - 1];
+			if (onLine !is null)
+				onLine(line.idup);
+			line = null;
+		}
+
+		ubyte[4096] buf;
+		try
+		{
+			while (!stream.empty)
+			{
+				const n = stream.read(buf[], IOMode.once);
+				foreach (b; buf[0 .. n])
+				{
+					if (b == '\n')
+						emit();
+					else
+					{
+						line ~= cast(char) b;
+						if (line.length >= maxStderrLineBytes)
+							emit();
+					}
+				}
+			}
+		}
+		catch (Exception)
+		{
+		}
+		if (line.length)
+			emit();
+		stream.close();
+	}
+
+	/// Wait (bounded) for the stderr task to reach the end of the reaped
+	/// child's stderr, interrupting it when a grandchild still holds the pipe.
+	version (Posix) private void stopStderrReader() @safe
+	{
+		import vibe.core.core : sleep;
+
+		if (stderrReader_ == Task.init)
+			return;
+		foreach (_; 0 .. 100)
+		{
+			if (!stderrReader_.running)
+				return;
+			sleep(10.msecs);
+		}
+		stderrReader_.interrupt();
+	}
+
 	/// Attach the owned Windows child (std.process pid + pipe threads) so
 	/// `close()` runs the close-stdin -> terminate shutdown. Set by the Windows
 	/// `spawnStdioTransport`.
@@ -530,6 +610,7 @@ final class StdioClientTransport : ClientTransport
 		}
 		pipes.stdout.close();
 		destroy(*pipes);
+		stopStderrReader();
 	}
 
 	/// Whether a line is being written to the child's stdin right now.
@@ -691,25 +772,72 @@ final class StdioClientTransport : ClientTransport
 	}
 }
 
+/// What happens to the standard error output of a server started by
+/// `McpClient.spawn`.
+enum StderrMode
+{
+	/// The server writes to this process's stderr.
+	inherit,
+	/// The server's stderr is read and dropped.
+	discard,
+	/// Each line the server writes to stderr is passed to
+	/// `SpawnSettings.onStderrLine` (POSIX only).
+	capture,
+}
+
+/// How `McpClient.spawn` launches the server process.
+struct SpawnSettings
+{
+	/// Environment variables set for the server, on top of this process's
+	/// environment (or instead of it, with `replaceEnv`).
+	string[string] env;
+
+	/// Whether the server starts with only `env`, inheriting none of this
+	/// process's environment.
+	bool replaceEnv;
+
+	/// The directory the server runs in; empty runs it in this process's
+	/// current directory. A relative executable path is resolved against it.
+	string workingDir;
+
+	/// What happens to the server's stderr, which the stdio transport reserves
+	/// for the server's logging.
+	StderrMode stderr = StderrMode.inherit;
+
+	/// With `StderrMode.capture`, called on the event loop with each line the
+	/// server writes to stderr, without its line terminator. A line longer than
+	/// `maxStderrLineBytes` is delivered in pieces of at most that size.
+	void delegate(string line) @safe nothrow onStderrLine;
+}
+
+/// The longest stderr line `StderrMode.capture` delivers in one piece.
+enum size_t maxStderrLineBytes = 64 * 1024;
+
 /// Launch an MCP server as a subprocess and wire a `StdioClientTransport` to its
 /// stdin/stdout via vibe's async process pipes. `args` is the command line
 /// (`args[0]` is the executable); newline-delimited JSON-RPC requests are written
 /// to the child's stdin and responses are read from its stdout; the child's
-/// stderr is inherited for logging. The read/write delegates are async
-/// (cooperative on the vibe event loop) so the duplex read loop never blocks the
-/// loop. The returned transport owns the subprocess: its `close()` runs the stdio
-/// shutdown sequence. Used by `McpClient.spawn`. REQUIRES a running event loop.
+/// environment, working directory and stderr follow `spawn`. The read/write
+/// delegates are async (cooperative on the vibe event loop) so the duplex read
+/// loop never blocks the loop. The returned transport owns the subprocess: its
+/// `close()` runs the stdio shutdown sequence. Used by `McpClient.spawn`.
+/// REQUIRES a running event loop.
 version (Posix) StdioClientTransport spawnStdioTransport(string[] args,
-		size_t maxLineBytes = defaultMaxLineBytes) @safe
+		size_t maxLineBytes = defaultMaxLineBytes, SpawnSettings spawn = SpawnSettings.init) @safe
 {
-	import vibe.core.process : pipeProcess, ProcessPipes, Redirect;
+	import vibe.core.process : pipeProcess, ProcessPipes, Redirect, Config;
+	import vibe.core.path : NativePath;
 	import eventcore.driver : IOMode;
 
+	auto redirect = Redirect.stdin | Redirect.stdout;
+	if (spawn.stderr != StderrMode.inherit)
+		redirect |= Redirect.stderr;
 	// Heap-box the pipes so the read/write closures capture a stable, long-lived
 	// handle past this function's return (`attachProcess` keeps the same pointer
 	// for the shutdown sequence).
 	auto pipes = new ProcessPipes;
-	*pipes = pipeProcess(args, Redirect.stdin | Redirect.stdout);
+	*pipes = pipeProcess(args, redirect, spawn.env, spawn.replaceEnv ? Config.newEnv
+			: Config.none, spawn.workingDir.length ? NativePath(spawn.workingDir) : NativePath.init);
 	StdioClientTransport transport;
 
 	// Async, cooperative line read over the child's stdout, in chunks through a
@@ -763,6 +891,9 @@ version (Posix) StdioClientTransport spawnStdioTransport(string[] args,
 
 	transport = new StdioClientTransport(&readLine, &writeLine);
 	transport.attachProcess(pipes);
+	if (spawn.stderr != StderrMode.inherit)
+		transport.attachStderr(pipes.stderr, spawn.stderr == StderrMode.capture
+				? spawn.onStderrLine : null);
 	return transport;
 }
 
@@ -922,10 +1053,13 @@ version (Windows) private final class ChildStdinWriter
 /// hands them to the cooperative read loop through a thread-safe vibe `Channel`
 /// (`readLine` drains it, yielding the fiber), and its stdin is written by a
 /// dedicated thread (`ChildStdinWriter`) that `writeLine` hands each line to.
+/// `StderrMode.capture` is not supported on Windows.
 version (Windows) StdioClientTransport spawnStdioTransport(string[] args,
-		size_t maxLineBytes = defaultMaxLineBytes) @safe
+		size_t maxLineBytes = defaultMaxLineBytes, SpawnSettings spawn = SpawnSettings.init) @safe
 {
-	import std.process : pipeProcess, Redirect;
+	import std.process : pipe, spawnProcess, Config;
+	import std.stdio : File;
+	static import std.stdio;
 	import core.thread : Thread;
 
 	import core.sys.windows.windef : HANDLE, FALSE;
@@ -940,16 +1074,22 @@ version (Windows) StdioClientTransport spawnStdioTransport(string[] args,
 	// handle into one its thread owns outright (and closes when done), and let
 	// the original Files close here. The duplicates keep the pipe ends open,
 	// mirroring the server's raw-HANDLE pumps.
+	if (spawn.stderr == StderrMode.capture)
+		throw internalError("StderrMode.capture is not supported on Windows");
 	HANDLE readHandle, writeHandle;
 	() @trusted {
-		auto pp = pipeProcess(args, Redirect.stdin | Redirect.stdout);
-		child.pid = pp.pid;
+		auto toChild = pipe();
+		auto fromChild = pipe();
+		auto errFile = spawn.stderr == StderrMode.discard ? File("NUL", "w") : std.stdio.stderr;
+		child.pid = spawnProcess(args, toChild.readEnd, fromChild.writeEnd,
+				errFile, spawn.env, spawn.replaceEnv ? Config.newEnv
+				: Config.none, spawn.workingDir);
 		auto proc = GetCurrentProcess();
-		DuplicateHandle(proc, pp.stdout.windowsHandle, proc, &readHandle, 0,
-				FALSE, DUPLICATE_SAME_ACCESS);
-		DuplicateHandle(proc, pp.stdin.windowsHandle, proc, &writeHandle, 0,
-				FALSE, DUPLICATE_SAME_ACCESS);
-		pp.stdin.close();
+		DuplicateHandle(proc, fromChild.readEnd.windowsHandle, proc,
+				&readHandle, 0, FALSE, DUPLICATE_SAME_ACCESS);
+		DuplicateHandle(proc, toChild.writeEnd.windowsHandle, proc,
+				&writeHandle, 0, FALSE, DUPLICATE_SAME_ACCESS);
+		toChild.writeEnd.close();
 	}();
 
 	child.writer = new ChildStdinWriter(writeHandle);
@@ -1512,6 +1652,124 @@ version (Posix) unittest  // a final reply the server leaves unterminated at EOF
 		transport.closeProcess(200.msecs, 200.msecs);
 	});
 	assert(result["ok"].get!bool, "an unterminated final line must not be dropped");
+}
+
+version (Posix) unittest  // a spawned server sees the environment variables SpawnSettings.env adds
+{
+	import core.time : msecs;
+
+	SpawnSettings s;
+	s.env = ["MCP_SPAWN_TEST_VAR": "from-settings"];
+	Json result;
+	inLoop(() @safe {
+		auto transport = spawnStdioTransport([
+			"sh", "-c",
+			`read line; printf '{"jsonrpc":"2.0","id":1,"result":{"v":"%s","home":"%s"}}\n' "$MCP_SPAWN_TEST_VAR" "$HOME"`
+		], defaultMaxLineBytes, s);
+		result = transport.deliver(parseJsonString(`{"jsonrpc":"2.0","id":1,"method":"ping"}`), 1);
+		transport.closeProcess(200.msecs, 200.msecs);
+	});
+	assert(result["v"].get!string == "from-settings");
+	assert(result["home"].get!string.length, "the inherited environment must be kept");
+}
+
+version (Posix) unittest  // SpawnSettings.replaceEnv starts the server with only SpawnSettings.env
+{
+	import core.time : msecs;
+
+	SpawnSettings s;
+	s.env = ["MCP_SPAWN_TEST_VAR": "only"];
+	s.replaceEnv = true;
+	Json result;
+	inLoop(() @safe {
+		auto transport = spawnStdioTransport([
+			"/bin/sh", "-c",
+			`read line; printf '{"jsonrpc":"2.0","id":1,"result":{"v":"%s","home":"%s"}}\n' "$MCP_SPAWN_TEST_VAR" "$HOME"`
+		], defaultMaxLineBytes, s);
+		result = transport.deliver(parseJsonString(`{"jsonrpc":"2.0","id":1,"method":"ping"}`), 1);
+		transport.closeProcess(200.msecs, 200.msecs);
+	});
+	assert(result["v"].get!string == "only");
+	assert(result["home"].get!string.length == 0, "no inherited variable may reach the server");
+}
+
+version (Posix) unittest  // a spawned server runs in SpawnSettings.workingDir
+{
+	import core.time : msecs;
+	import std.file : mkdirRecurse, rmdirRecurse, tempDir;
+	import std.path : buildPath;
+	import std.process : thisProcessID;
+	import std.conv : to;
+
+	const dir = buildPath(tempDir, "mcp-spawn-cwd-" ~ thisProcessID.to!string);
+	mkdirRecurse(dir);
+	scope (exit)
+		rmdirRecurse(dir);
+	() @trusted {
+		import std.file : write;
+
+		write(buildPath(dir, "marker"), "here");
+	}();
+	SpawnSettings s;
+	s.workingDir = dir;
+	Json result;
+	inLoop(() @safe {
+		auto transport = spawnStdioTransport([
+			"sh", "-c",
+			`read line; printf '{"jsonrpc":"2.0","id":1,"result":{"v":"%s"}}\n' "$(cat marker)"`
+		], defaultMaxLineBytes, s);
+		result = transport.deliver(parseJsonString(`{"jsonrpc":"2.0","id":1,"method":"ping"}`), 1);
+		transport.closeProcess(200.msecs, 200.msecs);
+	});
+	assert(result["v"].get!string == "here");
+}
+
+version (Posix) unittest  // StderrMode.capture hands each line the server writes to stderr to onStderrLine
+{
+	import core.time : msecs, seconds;
+	import std.datetime.stopwatch : StopWatch, AutoStart;
+	import vibe.core.core : sleep;
+
+	string[] lines;
+	SpawnSettings s;
+	s.stderr = StderrMode.capture;
+	s.onStderrLine = (string line) @safe nothrow{ lines ~= line; };
+	inLoop(() @safe {
+		auto transport = spawnStdioTransport([
+			"sh", "-c",
+			`printf 'first\nsecond\n' >&2; read line; printf '{"jsonrpc":"2.0","id":1,"result":{}}\n'; printf 'last' >&2`
+		], defaultMaxLineBytes, s);
+		transport.deliver(parseJsonString(`{"jsonrpc":"2.0","id":1,"method":"ping"}`), 1);
+		auto sw = StopWatch(AutoStart.yes);
+		while (lines.length < 3 && sw.peek < 5.seconds)
+			sleep(10.msecs);
+		transport.closeProcess(200.msecs, 200.msecs);
+	});
+	assert(lines == ["first", "second", "last"]);
+}
+
+version (Posix) unittest  // McpClient.spawn launches the server with ClientSettings.process
+{
+	import core.time : Duration;
+	import std.algorithm.searching : canFind;
+	import mcp.client.client : ClientSettings, TransportClosedException;
+
+	string msg;
+	inLoop(() @safe {
+		ClientSettings settings;
+		settings.requestTimeout = Duration.zero;
+		settings.process.env = ["MCP_SPAWN_EXIT": "7"];
+		auto client = McpClient.spawn([
+			"sh", "-c", "read line; exit $MCP_SPAWN_EXIT"
+		], settings);
+		try
+			client.ping();
+		catch (TransportClosedException e)
+			msg = e.msg;
+		client.close();
+	});
+	assert(msg.canFind("exited with status 7"),
+			"the settings' environment must reach the server, got: " ~ msg);
 }
 
 // An in-memory server->client line queue so a test can play the server side of

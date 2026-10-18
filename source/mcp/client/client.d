@@ -20,7 +20,7 @@ import mcp.protocol.mrtr;
 import mcp.client.transport : BearerProvider, ClientTransport, ClientProtocol, InboundOrigin;
 import mcp.client.http_transport : HttpClientTransport, HttpStatusException,
 	SessionExpiredException, isLegacyFallbackStatus, defaultMaxMessageBytes;
-import mcp.client.stdio : StdioClientTransport, spawnStdioTransport;
+import mcp.client.stdio : SpawnSettings, StdioClientTransport, spawnStdioTransport;
 import mcp.client.subscription : SubscriptionStream, SubscriptionFilter;
 import mcp.client.cache : CacheStore, InMemoryCacheStore, CacheKey, CacheEntry, noCache;
 import mcp.client.event_subscription : EventSubscription;
@@ -308,6 +308,11 @@ struct ClientSettings
 	/// broken server cannot make the client allocate without bound. Ignored by
 	/// `McpClient.stdio`, whose caller supplies `readLine`.
 	size_t maxMessageBytes = defaultMaxMessageBytes;
+
+	/// `spawn` / `spawnSibling` only: the server process's environment, working
+	/// directory and stderr handling. By default the server inherits all three
+	/// from this process.
+	SpawnSettings process;
 
 	/// HTTP transport only: how https servers are validated. The default
 	/// requires a certificate chaining to a CA in the system store and matching
@@ -950,8 +955,10 @@ final class McpClient : ClientProtocol
 	}
 
 	/// Launch an MCP server as a subprocess and build a client over its
-	/// stdin/stdout (stderr inherited for logging). `command` is the command line
-	/// (`command[0]` is the executable). The returned client is NOT yet
+	/// stdin/stdout. `command` is the command line (`command[0]` is the
+	/// executable); `settings.process` sets the server's environment, working
+	/// directory and stderr handling (inherited by default, so its log output
+	/// reaches this process's stderr). The returned client is NOT yet
 	/// initialized — call `initialize()` (or `ping()` for a stateless probe).
 	/// `close()` runs the MCP stdio shutdown sequence on the subprocess. Every
 	/// `settings` field applies except the HTTP transport knobs (`connectTimeout`,
@@ -963,7 +970,7 @@ final class McpClient : ClientProtocol
 
 		if (!settings.cacheServer.length)
 			settings.cacheServer = "stdio:" ~ command.join(" ");
-		auto transport = spawnStdioTransport(command, settings.maxMessageBytes);
+		auto transport = spawnStdioTransport(command, settings.maxMessageBytes, settings.process);
 		transport.listenTimeout_ = settings.listenTimeout;
 		return new McpClient(transport, settings);
 	}
