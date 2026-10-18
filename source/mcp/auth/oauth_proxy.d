@@ -1845,21 +1845,26 @@ final class OAuthProxy
 		relayedRefreshTokens.put(refreshTokenKey(refreshToken), true);
 	}
 
-	/// Consume the record of a relayed `refreshToken`, returning whether this
-	/// proxy relayed it. A refresh grant presenting any other token is refused
-	/// before it reaches the upstream, so the proxy's confidential client
-	/// credentials never back a refresh token obtained elsewhere. The caller
-	/// re-records the token (or its rotation) once the upstream answers.
+	/// Whether this proxy relayed `refreshToken` to a client. A refresh grant
+	/// presenting any other token is refused before it reaches the upstream, so
+	/// the proxy's confidential client credentials never back a refresh token
+	/// obtained elsewhere. The record stays in place while the upstream judges
+	/// the grant, so concurrent refreshes with the same token are all forwarded;
+	/// the caller forgets it once the upstream rejects or rotates it.
 	///
 	/// The record is in memory: after a restart, or on another instance of a
 	/// multi-process deployment, clients must sign in again to refresh.
-	bool takeRelayedRefreshToken(string refreshToken) @safe
+	bool isRelayedRefreshToken(string refreshToken) @safe
 	{
-		if (refreshToken.length == 0)
-			return false;
-		bool found;
-		cast(void) relayedRefreshTokens.take(refreshTokenKey(refreshToken), found);
-		return found;
+		return refreshToken.length && relayedRefreshTokens.contains(refreshTokenKey(refreshToken));
+	}
+
+	/// Forget a relayed `refreshToken` the upstream rejected or rotated away,
+	/// so a later grant presenting it is refused without reaching the upstream.
+	void forgetRelayedRefreshToken(string refreshToken) @safe
+	{
+		if (refreshToken.length)
+			cast(void) relayedRefreshTokens.remove(refreshTokenKey(refreshToken));
 	}
 
 	private static string refreshTokenKey(string refreshToken) @safe

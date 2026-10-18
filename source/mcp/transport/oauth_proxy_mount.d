@@ -1307,7 +1307,7 @@ void mountOAuthToken(URLRouter router, OAuthProxy proxy) @safe
 /// endpoint with the fixed credentials, relaying the upstream token response back
 /// to the client verbatim — the client presents the UPSTREAM token as its MCP
 /// bearer. A refresh grant is forwarded only for a refresh token this proxy
-/// relayed (`OAuthProxy.takeRelayedRefreshToken`); any other is refused with
+/// relayed (`OAuthProxy.isRelayedRefreshToken`); any other is refused with
 /// `invalid_grant`.
 ///
 /// In both modes a 2xx upstream response that carries an OAuth `error` member
@@ -1385,7 +1385,7 @@ in (exchange !is null)
 		const refreshToken = isRefresh ? formField(form, "refresh_token") : "";
 		if (isRefresh)
 		{
-			if (!proxy.brokerEnabled() && !proxy.takeRelayedRefreshToken(refreshToken))
+			if (!proxy.brokerEnabled() && !proxy.isRelayedRefreshToken(refreshToken))
 			{
 				Json err = Json.emptyObject;
 				err["error"] = "invalid_grant";
@@ -1421,8 +1421,6 @@ in (exchange !is null)
 		{
 			import vibe.core.log : logWarn;
 
-			proxy.recordRelayedRefreshToken(refreshToken);
-
 			// An SSRF refusal, connect failure or timeout: the upstream never
 			// answered, so report it as an RFC 6749 error rather than letting the
 			// exception surface as an HTML 500.
@@ -1447,7 +1445,8 @@ in (exchange !is null)
 			HTTPStatus errStatus;
 			if (upstreamTokenError(upstreamJson, err, errStatus))
 			{
-				proxy.recordRelayedRefreshToken(refreshToken);
+				if (errStatus == HTTPStatus.badRequest)
+					proxy.forgetRelayedRefreshToken(refreshToken);
 				res.statusCode = errStatus;
 				res.writeJsonBody(err);
 				return;
@@ -1488,9 +1487,17 @@ in (exchange !is null)
 
 		// A relayed refresh token (new, or rotated from the presented one) is
 		// remembered so the client can refresh with it; one the upstream did not
-		// rotate stays valid.
-		const relayedRefresh = is2xx ? relayedRefreshToken(responseBody) : "";
-		proxy.recordRelayedRefreshToken(relayedRefresh.length ? relayedRefresh : refreshToken);
+		// rotate stays valid. A 4xx is the upstream refusing the grant, so the
+		// presented token is forgotten; a 5xx leaves it to be retried.
+		if (is2xx)
+		{
+			const relayedRefresh = relayedRefreshToken(responseBody);
+			if (relayedRefresh.length && relayedRefresh != refreshToken)
+				proxy.forgetRelayedRefreshToken(refreshToken);
+			proxy.recordRelayedRefreshToken(relayedRefresh.length ? relayedRefresh : refreshToken);
+		}
+		else if (status >= 400 && status < 500)
+			proxy.forgetRelayedRefreshToken(refreshToken);
 		res.statusCode = cast(HTTPStatus) status;
 		res.writeBody(responseBody.length ? responseBody : "{}", "application/json");
 	});
@@ -4255,6 +4262,94 @@ unittest  // PASSTHROUGH: a relayed refresh token refreshes once and is replaced
 	assert(calls == 2);
 	assert(browserPost(router, "https://mcp.example.com/token",
 			"grant_type=refresh_token&refresh_token=rt2", "").status == 200);
+}
+
+unittest  // PASSTHROUGH: a relayed refresh token stays redeemable while an earlier refresh with it is in flight
+{
+	auto proxy = mountSampleProxy();
+	auto router = new URLRouter;
+	int calls;
+	int innerStatus;
+	mountOAuthToken(router, proxy, (string endpoint, string body_,
+			string authHeader, out string rb, out int status) @safe {
+		++calls;
+		if (calls == 2)
+			innerStatus = browserPost(router, "https://mcp.example.com/token",
+				"grant_type=refresh_token&refresh_token=rt1", "").status;
+		rb = `{"access_token":"at","refresh_token":"rt1"}`;
+		status = 200;
+	});
+
+	assert(browserPost(router, "https://mcp.example.com/token",
+			redeemableCodeForm(proxy), "").status == 200);
+	assert(browserPost(router, "https://mcp.example.com/token",
+			"grant_type=refresh_token&refresh_token=rt1", "").status == 200);
+	assert(innerStatus == 200);
+	assert(calls == 3);
+}
+
+unittest  // PASSTHROUGH: a refresh token the upstream rejects is forgotten, so it is not forwarded again
+{
+	import std.algorithm : canFind;
+
+	foreach (rejection; [
+			`400:{"error":"invalid_grant"}`,
+			`200:{"error":"bad_verification_code"}`
+		])
+	{
+		auto proxy = mountSampleProxy();
+		auto router = new URLRouter;
+		int calls;
+		mountOAuthToken(router, proxy, (string endpoint, string body_,
+				string authHeader, out string rb, out int status) @safe {
+			++calls;
+			if (calls == 1)
+			{
+				rb = `{"access_token":"at","refresh_token":"rt1"}`;
+				status = 200;
+				return;
+			}
+			status = rejection.startsWith("400") ? 400 : 200;
+			rb = rejection[4 .. $];
+		});
+
+		assert(browserPost(router, "https://mcp.example.com/token",
+				redeemableCodeForm(proxy), "").status == 200);
+		assert(browserPost(router, "https://mcp.example.com/token",
+				"grant_type=refresh_token&refresh_token=rt1", "").status == 400);
+		const again = browserPost(router, "https://mcp.example.com/token",
+				"grant_type=refresh_token&refresh_token=rt1", "");
+		assert(again.status == 400);
+		assert(again.body_.canFind("not issued through this proxy"), again.body_);
+		assert(calls == 2, rejection);
+	}
+}
+
+unittest  // PASSTHROUGH: a refresh token stays redeemable when the upstream fails without judging it
+{
+	auto proxy = mountSampleProxy();
+	auto router = new URLRouter;
+	int calls;
+	mountOAuthToken(router, proxy, (string endpoint, string body_,
+			string authHeader, out string rb, out int status) @safe {
+		++calls;
+		if (calls == 2)
+		{
+			rb = `{"error":"temporarily_unavailable"}`;
+			status = 503;
+			return;
+		}
+		rb = `{"access_token":"at","refresh_token":"rt1"}`;
+		status = 200;
+	});
+
+	assert(browserPost(router, "https://mcp.example.com/token",
+			redeemableCodeForm(proxy), "").status == 200);
+	assert(browserPost(router, "https://mcp.example.com/token",
+			"grant_type=refresh_token&refresh_token=rt1", "").status == 503);
+	assert(browserPost(router, "https://mcp.example.com/token",
+			"grant_type=refresh_token&refresh_token=rt1", "").status == 200);
+	assert(calls == 3);
 }
 
 unittest  // an unknown grant_type is refused with unsupported_grant_type (RFC 6749 §5.2)
