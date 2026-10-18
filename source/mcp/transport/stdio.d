@@ -837,6 +837,8 @@ else version (Windows)
 	private bool isRead_;
 	// Read end only: the chunk channel fed by the reader thread.
 	private Channel!(immutable(ubyte)[]) chan_;
+	// Read end only: what is left of the latest chunk after a short `readOnce`.
+	private ChunkCursor cursor_;
 	// Write end only: the thread doing the blocking writes.
 	private StdoutWriter writer_;
 
@@ -894,19 +896,17 @@ else version (Windows)
 			writer_.close();
 	}
 
-	/// Drain the next chunk the reader thread produced into `buf`, blocking the
-	/// calling fiber (not the event-loop thread) until a chunk arrives or stdin
+	/// Copy the next bytes the reader thread produced into `buf`, keeping what
+	/// does not fit for the next call, and blocking the calling fiber (not the event-loop thread) until a chunk arrives or stdin
 	/// reaches EOF (channel closed -> `disconnected`, mirroring a 0-byte POSIX read).
 	IoResult readOnce(ubyte[] buf) @safe
 	{
 		import eventcore.driver : IOStatus;
 
-		immutable(ubyte)[] chunk;
-		const got = () @trusted { return chan_.tryConsumeOne(chunk); }();
-		if (!got)
+		const n = cursor_.take(buf,
+				(out immutable(ubyte)[] chunk) @trusted => chan_.tryConsumeOne(chunk));
+		if (n == 0)
 			return IoResult(IOStatus.disconnected, 0);
-		const n = chunk.length <= buf.length ? chunk.length : buf.length;
-		buf[0 .. n] = chunk[0 .. n];
 		return IoResult(IOStatus.ok, n);
 	}
 
@@ -1020,8 +1020,7 @@ else version (Windows)
 
 	/// Reader-thread body: blocking `ReadFile` into 32 KiB chunks, each handed to
 	/// the fiber through the channel; a failed/0-byte read closes the channel to
-	/// signal EOF. Chunks are <= the reader loop's refill buffer (64 KiB), so
-	/// `readOnce` never has to split a chunk across calls.
+	/// signal EOF.
 	private static void pumpStdin(HANDLE h, Channel!(immutable(ubyte)[]) chan) @system
 	{
 		ubyte[32 * 1024] buf;
@@ -1035,6 +1034,53 @@ else version (Windows)
 		}
 		chan.close();
 	}
+}
+
+/// Copies a sequence of byte chunks out into read buffers of any size, keeping
+/// the part of a chunk that does not fit for the next read.
+private struct ChunkCursor
+{
+	private immutable(ubyte)[] rest;
+
+	/// Fill `buf` from the held remainder, else from the chunk `next` produces
+	/// (false: no more chunks). Returns the byte count, 0 once `next` reports none.
+	size_t take(ubyte[] buf, scope bool delegate(out immutable(ubyte)[]) @safe next) @safe
+	{
+		while (rest.length == 0)
+			if (!next(rest))
+				return 0;
+		const n = rest.length <= buf.length ? rest.length : buf.length;
+		buf[0 .. n] = rest[0 .. n];
+		rest = rest[n .. $];
+		return n;
+	}
+}
+
+unittest  // ChunkCursor hands out a chunk larger than the read buffer across several reads
+{
+	immutable(ubyte)[][] chunks = [
+		cast(immutable(ubyte)[]) "abcdefg", cast(immutable(ubyte)[]) "hi"
+	];
+	bool next(out immutable(ubyte)[] c) @safe
+	{
+		if (chunks.length == 0)
+			return false;
+		c = chunks[0];
+		chunks = chunks[1 .. $];
+		return true;
+	}
+
+	ChunkCursor cursor;
+	auto buf = new ubyte[3];
+	string got;
+	for (;;)
+	{
+		const n = cursor.take(buf, &next);
+		if (n == 0)
+			break;
+		got ~= cast(const(char)[]) buf[0 .. n];
+	}
+	assert(got == "abcdefghi", "no byte of a chunk is dropped");
 }
 
 /// Points a descriptor at another open file for the duration of the transport and
