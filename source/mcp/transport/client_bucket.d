@@ -28,6 +28,18 @@ package(mcp) string clientBucket(in NetworkAddress addr, uint ipv6Prefix = defau
 	return ipv6Bucket(ip, ipv6Prefix);
 }
 
+/// `clientBucket` for the numeric IP address `literal`, or null when `literal`
+/// is not one. Never resolves a hostname.
+package(mcp) string clientBucketOfLiteral(string literal, uint ipv6Prefix = defaultIpv6BucketPrefix) @safe nothrow
+{
+	import std.socket : parseAddress;
+
+	try
+		return clientBucket(NetworkAddress(parseAddress(literal)), ipv6Prefix);
+	catch (Exception)
+		return null;
+}
+
 /// `clientBucket` for the IPv6 address `ip`.
 private string ipv6Bucket(const ubyte[16] ip, uint prefix) @safe pure nothrow
 {
@@ -103,6 +115,18 @@ unittest  // the IPv6 bucket prefix is configurable
 unittest  // an IPv4-mapped IPv6 address shares its IPv4 address's bucket
 {
 	assert(clientBucket(ip("::ffff:10.0.0.1")) == "10.0.0.1");
+}
+
+unittest  // a numeric address literal is bucketed like the address it names
+{
+	assert(clientBucketOfLiteral("10.0.0.1") == "10.0.0.1");
+	assert(clientBucketOfLiteral("2001:db8:1:2::1") == clientBucket(ip("2001:db8:1:2::1")));
+}
+
+unittest  // a literal that is not a numeric address has no bucket
+{
+	assert(clientBucketOfLiteral("localhost") is null);
+	assert(clientBucketOfLiteral("") is null);
 }
 
 unittest  // a caller not connected over IP has no bucket

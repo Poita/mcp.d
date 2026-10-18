@@ -17,7 +17,7 @@ import mcp.protocol.events;
 import mcp.transport.coordinator : defaultServerRequestTimeout, cancelledNotification;
 import mcp.transport.sse_context;
 import mcp.transport.session;
-import mcp.transport.client_bucket : clientBucket, defaultIpv6BucketPrefix;
+import mcp.transport.client_bucket : clientBucket, clientBucketOfLiteral, defaultIpv6BucketPrefix;
 import mcp.auth.resource_server;
 import mcp.server.context : RequestContext, BaseRequestContext,
 	ConnectionScoped, StdioContext, StdioContextOptions;
@@ -190,10 +190,12 @@ struct StreamableHttpOptions
 	/// `resource_metadata` URL comes from `auth.resource` rather than the
 	/// client-supplied `Host`.
 	bool validateHost = true;
-	/// Honour the `X-Forwarded-Proto` request header (`http` or `https` only)
-	/// as the scheme of the 401 challenge's `resource_metadata` URL. Off by
-	/// default, since any client can send the header; enable only behind a
-	/// reverse proxy that sets it.
+	/// Honour the reverse proxy's forwarding headers: `X-Forwarded-Proto`
+	/// (`http` or `https` only) as the scheme of the 401 challenge's
+	/// `resource_metadata` URL, and the last `X-Forwarded-For` entry as the
+	/// client address the per-address caps count. Off by default, since any
+	/// client can send these headers; enable only behind a single reverse proxy
+	/// that sets `X-Forwarded-Proto` and appends to `X-Forwarded-For`.
 	bool trustProxyHeaders = false;
 	/// DNS-rebinding protection, part 2: reject a request carrying an `Origin`
 	/// that is not a localhost origin or in `allowedOrigins` (MCP transport
@@ -1828,9 +1830,62 @@ private string principalOf(TokenInfo token) @safe
 }
 
 /// The key the per-address caps count `req`'s caller under; see `clientBucket`.
+/// With `trustProxyHeaders` the caller is the last `X-Forwarded-For` entry, the
+/// one the trusted proxy appended; earlier entries are client-supplied.
 private string remoteAddressOf(HTTPServerRequest req, StreamableHttpOptions opts) @safe nothrow
 {
+	import std.string : lastIndexOf, strip;
+
+	if (opts.trustProxyHeaders)
+	{
+		string last;
+		try
+		{
+			const forwarded = req.headers.get("X-Forwarded-For", "");
+			last = forwarded[forwarded.lastIndexOf(',') + 1 .. $].strip;
+		}
+		catch (Exception)
+		{
+		}
+		if (auto bucket = clientBucketOfLiteral(last, opts.ipv6BucketPrefix))
+			return bucket;
+	}
 	return clientBucket(req.clientAddress, opts.ipv6BucketPrefix);
+}
+
+unittest  // behind a trusted proxy the per-address key is the address the proxy forwarded
+{
+	StreamableHttpOptions opts;
+	opts.trustProxyHeaders = true;
+	auto req = makeInitPostReq("{}", [
+		"X-Forwarded-For": "192.0.2.1, 198.51.100.7"
+	]);
+	assert(remoteAddressOf(req, opts) == "198.51.100.7");
+}
+
+unittest  // a forwarded IPv6 address is bucketed by its prefix
+{
+	StreamableHttpOptions opts;
+	opts.trustProxyHeaders = true;
+	auto a = makeInitPostReq("{}", ["X-Forwarded-For": "2001:db8:1:2::1"]);
+	auto b = makeInitPostReq("{}", ["X-Forwarded-For": "2001:db8:1:2::9"]);
+	assert(remoteAddressOf(a, opts).length);
+	assert(remoteAddressOf(a, opts) == remoteAddressOf(b, opts));
+}
+
+unittest  // X-Forwarded-For is ignored unless proxy headers are trusted
+{
+	StreamableHttpOptions opts;
+	auto req = makeInitPostReq("{}", ["X-Forwarded-For": "198.51.100.7"]);
+	assert(remoteAddressOf(req, opts) == "");
+}
+
+unittest  // an unparseable forwarded address falls back to the connection's address
+{
+	StreamableHttpOptions opts;
+	opts.trustProxyHeaders = true;
+	auto req = makeInitPostReq("{}", ["X-Forwarded-For": "not-an-ip"]);
+	assert(remoteAddressOf(req, opts) == "");
 }
 
 /// Answer a GET refused a stream slot: 503 when the mount-wide cap is reached,
