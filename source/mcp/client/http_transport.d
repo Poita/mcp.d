@@ -1287,7 +1287,7 @@ final class HttpClientTransport : ClientTransport
 				readSseBody(conn, chunked, cursor, () @safe => got
 						|| err !is null || closing, (string eventType, string data) @safe {
 					dispatchSse(data, expectId, result, got, err);
-				});
+				}, head.contentLength);
 			}
 			catch (Exception e)
 			{
@@ -1491,7 +1491,7 @@ final class HttpClientTransport : ClientTransport
 					conn.release();
 				const sentSession = sessionId;
 				const getReq = buildHttpRequest("GET", ep.path, ep.hostHeader,
-						"text/event-stream", "keep-alive", bearer, verHeaders,
+						"text/event-stream", "close", bearer, verHeaders,
 						cursor.lastEventId, null);
 				conn.write(cast(const(ubyte)[]) getReq);
 
@@ -1538,7 +1538,7 @@ final class HttpClientTransport : ClientTransport
 					// observable outcome as the POST path.
 					dispatchSse(data, expectId, result, got, err);
 					done = awaitSatisfied(got, err);
-				});
+				}, head.contentLength);
 			}
 			catch (Exception e)
 				failure = e.msg;
@@ -1800,8 +1800,8 @@ final class HttpClientTransport : ClientTransport
 	/// stops between reads (and after each flushed event) once `shouldStop()`
 	/// returns true. Must run inside a `@trusted` block (raw socket I/O).
 	private void readSseBody(Conn)(Conn conn, bool chunked, ref SseCursor cursor,
-			scope bool delegate() @safe shouldStop,
-			scope void delegate(string eventType, string data) @safe onEvent) @safe
+			scope bool delegate() @safe shouldStop, scope void delegate(string eventType,
+				string data) @safe onEvent, long contentLength = -1) @safe
 	{
 		import vibe.core.stream : IOMode;
 		import std.string : indexOfAny, representation, startsWith, strip;
@@ -1934,12 +1934,20 @@ final class HttpClientTransport : ClientTransport
 			}
 			else
 			{
+				// A body with a Content-Length ends there, even on a connection
+				// the server keeps open.
+				if (contentLength == 0)
+					break;
 				const avail = conn.leastSize;
 				if (avail == 0)
 					break;
-				const toRead = avail > 4096 ? 4096 : cast(size_t) avail;
+				auto toRead = avail > 4096 ? 4096 : cast(size_t) avail;
+				if (contentLength > 0 && toRead > contentLength)
+					toRead = cast(size_t) contentLength;
 				auto buf = new ubyte[toRead];
 				const n = conn.read(buf, IOMode.once);
+				if (contentLength > 0)
+					contentLength -= n;
 				acc ~= cast(string) buf[0 .. n].idup;
 				tokenize();
 			}
@@ -2082,7 +2090,7 @@ final class HttpClientTransport : ClientTransport
 					// The protocol-version header is read per attempt, so a reconnect
 					// after a re-negotiation carries the current version.
 					const req = buildHttpRequest("GET", ep.path, ep.hostHeader,
-							"text/event-stream", "keep-alive",
+							"text/event-stream", "close",
 							bearer, requestHeaders(Json.undefined), cursor.lastEventId, null);
 					conn.write(cast(const(ubyte)[]) req);
 
@@ -2128,7 +2136,7 @@ final class HttpClientTransport : ClientTransport
 						catch (Exception)
 						{
 						}
-					});
+					}, head.contentLength);
 				}
 				catch (Exception)
 				{
@@ -2410,7 +2418,7 @@ final class HttpClientTransport : ClientTransport
 						catch (Exception)
 						{
 						}
-					});
+					}, head.contentLength);
 					// A listen stream ends only with the answer to its request, so a
 					// server close before that answer is a failure, not a clean end.
 					if (!answered && !isCancelled())
@@ -2685,7 +2693,7 @@ final class HttpClientTransport : ClientTransport
 					const sentBearer = mayRetry && bearerProvider.onRejected !is null ? bearer
 						: null;
 					const req = buildHttpRequest("GET", ep.path, ep.hostHeader,
-							"text/event-stream", "keep-alive", bearer, null, null, null);
+							"text/event-stream", "close", bearer, null, null, null);
 					conn.write(cast(const(ubyte)[]) req);
 
 					head = readResponseHead(conn);
@@ -2726,7 +2734,7 @@ final class HttpClientTransport : ClientTransport
 					// `message` event (or untyped): a JSON-RPC message, resolved to its
 					// waiter or handed to the inbound handler on its own task.
 					resolveLegacyMessage(data);
-				});
+				}, head.contentLength);
 			}
 			catch (Exception e)
 			{
@@ -4111,6 +4119,48 @@ unittest  // readSseBody ignores a byte-order mark opening the stream, even when
 		events ~= d;
 	});
 	assert(events == ["{}"]);
+}
+
+unittest  // readSseBody stops at the end of a Content-Length body instead of reading to end-of-stream
+{
+	import vibe.stream.memory : createMemoryStream;
+
+	auto t = new HttpClientTransport("http://host:8080/mcp");
+	enum body = "data: {}\n\n";
+	auto stream = createMemoryStream(cast(ubyte[])(body ~ "data: past-the-body\n\n").dup, false);
+	SseCursor cursor;
+	string[] events;
+	t.readSseBody(stream, false, cursor, () @safe => false, (string e, string d) @safe {
+		events ~= d;
+	}, body.length);
+	assert(events == ["{}"], "bytes past Content-Length are not part of the stream");
+}
+
+unittest  // the standalone and legacy GET streams ask the server to close the connection after the response
+{
+	import core.time : msecs, MonoTime;
+	import vibe.core.core : sleep;
+
+	string[] connection;
+	auto router = new URLRouter;
+	router.get("/mcp", (HTTPServerRequest req, HTTPServerResponse res) @safe {
+		connection ~= req.headers.get("Connection", "");
+		res.statusCode = 405;
+		res.writeBody("");
+	});
+	const failure = runAgainstFakeServer(router, (string url) @safe {
+		auto t = new HttpClientTransport(url);
+		scope (exit)
+			t.close();
+		t.startServerStream();
+		try
+			t.startLegacyFallback();
+		catch (Exception)
+		{
+		}
+	});
+	assert(failure.length == 0, "scenario failed: " ~ failure);
+	assert(connection == ["close", "close"], "each one-shot GET must send Connection: close");
 }
 
 unittest  // each readSseBody caller's cursor is independent (no shared resumption state)
