@@ -1,6 +1,7 @@
 module mcp.transport.stdio;
 
 import core.time : Duration, seconds;
+import std.typecons : Nullable;
 import vibe.data.json : Json;
 
 import mcp.protocol.jsonrpc : Message, takeBatchReplies;
@@ -138,6 +139,39 @@ void serveStdio(McpServer server, string delegate() @safe readLine,
 	size_t running;
 	Admitted[] backlog;
 
+	// Batches whose members are being run, so a cancellation can reach the
+	// members still waiting their turn; each with the index of its running member.
+	size_t[BatchState] runningBatches;
+
+	// Run a legacy batch's members in order and return its one JSON-array reply
+	// ("" when nothing answers). Each request member's server->client requests
+	// are released when it is cancelled, and a member withdrawn before its turn
+	// is skipped.
+	string runBatch(BatchState batch) @safe
+	{
+		import mcp.protocol.jsonrpc : errorReplyId, makeErrorResponse;
+
+		runningBatches[batch] = 0;
+		scope (exit)
+			runningBatches.remove(batch);
+		Json responses = Json.emptyArray;
+		foreach (i, m; batch.input.messages)
+		{
+			runningBatches[batch] = i;
+			if (batch.withdrawn[i])
+				continue;
+			Json delegate(string, Json) @safe requester = &serverRequest;
+			if (m.kind == MessageKind.request)
+				requester = cancellableServerRequest(m.id);
+			auto reply = dispatchStdio(server, &sink, requester, m, channel);
+			if (!reply.isNull)
+				responses ~= reply.get;
+		}
+		foreach (err; batch.input.errors)
+			responses ~= makeErrorResponse(errorReplyId(err.error), err.error);
+		return responses.length == 0 ? "" : responses.toString();
+	}
+
 	void runAdmitted(Admitted item) @safe nothrow
 	{
 		if (item.batch is null)
@@ -153,7 +187,9 @@ void serveStdio(McpServer server, string delegate() @safe readLine,
 		}
 		try
 		{
-			auto reply = server.handleRaw(item.batch, &sink, &serverRequest);
+			auto reply = item.members is null
+				|| server.negotiatedVersion >= ProtocolVersion.v2025_06_18
+				? server.handleRaw(item.batch, &sink, &serverRequest) : runBatch(item.members);
 			if (reply.length)
 				channel.sendRaw(reply);
 		}
@@ -178,7 +214,8 @@ void serveStdio(McpServer server, string delegate() @safe readLine,
 				return;
 			}
 			Json[] replies;
-			foreach (msg; parseAny(item.batch).messages)
+			foreach (msg; item.members is null ? parseAny(item.batch).messages
+					: item.members.input.messages)
 				if (msg.kind == MessageKind.request)
 					replies ~= makeErrorResponse(msg.id, err);
 			// Posted: a refused batch is refused on the read loop, which must not
@@ -257,12 +294,18 @@ void serveStdio(McpServer server, string delegate() @safe readLine,
 			return;
 		const id = params["requestId"];
 		foreach (i, item; backlog)
+		{
 			if (item.batch is null && item.request.id == id)
 			{
 				backlog = backlog[0 .. i] ~ backlog[i + 1 .. $];
 				inflight.finish();
 				return;
 			}
+			if (item.members !is null)
+				item.members.withdraw(id, 0);
+		}
+		foreach (batch, runningIndex; runningBatches)
+			batch.withdraw(id, runningIndex + 1);
 	}
 
 	void onInbound(Message m) @safe
@@ -328,12 +371,12 @@ void serveStdio(McpServer server, string delegate() @safe readLine,
 		}
 	}
 
-	// An inbound JSON-RPC batch array is dispatched as a whole through the server's
-	// `handleRaw`, so its negotiated-version gate (reject a batch with a null-id
-	// -32600 on 2025-06-18+) and its single JSON-array response framing both apply —
-	// splitting the batch into separate lines would bypass both. The batch runs in
-	// its own task (tracked as in-flight) so a long-running member handler cannot
-	// stall the read loop, and `handleRaw` returns the one aggregated array frame.
+	// An inbound JSON-RPC batch array is handled as a unit: on 2025-06-18+ the
+	// server's `handleRaw` rejects it with one null-id -32600, and otherwise
+	// `runBatch` runs its members in order and answers with one JSON-array frame.
+	// The batch runs in its own task (tracked as in-flight) so a long-running
+	// member handler cannot stall the read loop, and each member can be cancelled
+	// like a lone request, before or while it runs.
 	void onInboundBatch(string raw) @safe
 	{
 		// Client replies in a batch the version gate admits wake their waiters
@@ -344,6 +387,18 @@ void serveStdio(McpServer server, string delegate() @safe readLine,
 			return;
 		Admitted batch;
 		batch.batch = raw;
+		try
+		{
+			import mcp.protocol.jsonrpc : parseAny;
+
+			auto members = new BatchState;
+			members.input = parseAny(raw);
+			members.withdrawn = new bool[members.input.messages.length];
+			batch.members = members;
+		}
+		catch (Exception)
+		{
+		}
 		if (admit(batch))
 			runTask((Admitted first) nothrow{ runSlot(first); }, batch);
 	}
@@ -423,6 +478,28 @@ private struct Admitted
 {
 	Message request;
 	string batch;
+	BatchState members; // the parsed batch, null when `batch` could not be parsed
+}
+
+/// A legacy batch's parsed members and which of them a `notifications/cancelled`
+/// withdrew before they started.
+private final class BatchState
+{
+	import mcp.protocol.jsonrpc : ParsedInput;
+
+	ParsedInput input;
+	bool[] withdrawn; // parallel to input.messages
+
+	/// Withdraw the request member with `id`, unless it has already started (a
+	/// running member is cancelled through its in-flight token instead).
+	void withdraw(Json id, size_t started) @safe
+	{
+		import mcp.protocol.jsonrpc : MessageKind;
+
+		foreach (i, m; input.messages)
+			if (i >= started && m.kind == MessageKind.request && m.id == id)
+				withdrawn[i] = true;
+	}
 }
 
 /// Count of running request handler tasks, signalling each time it returns to
@@ -475,19 +552,25 @@ private final class InflightCount
 private void replyToRequest(McpServer server, void delegate(string) @safe sink,
 		Json delegate(string, Json) @safe serverRequest, Message msg, DuplexChannel channel) @safe nothrow
 {
-	import std.typecons : Nullable;
+	auto reply = dispatchStdio(server, sink, serverRequest, msg, channel);
+	if (reply.isNull)
+		return;
+	try
+		channel.sendRaw(reply.get.toString());
+	catch (Exception e)
+		channel.reportError("request " ~ idText(msg) ~ ": reply write failed: " ~ e.msg);
+}
+
+/// Dispatch inbound stdio message `msg` through `server` with a `StdioContext`
+/// and return its reply, if any. A request whose dispatch throws is reported
+/// and answered with a -32603 error so the peer does not wait forever.
+private Nullable!Json dispatchStdio(McpServer server, void delegate(string) @safe sink,
+		Json delegate(string, Json) @safe serverRequest, Message msg, DuplexChannel channel) @safe nothrow
+{
 	import mcp.protocol.errors : internalError;
-	import mcp.protocol.jsonrpc : makeErrorResponse;
+	import mcp.protocol.jsonrpc : MessageKind, makeErrorResponse;
 	import mcp.server.context : StdioContext, StdioContextOptions;
 	import mcp.transport.sse_context : extractProgressToken;
-
-	string idText() @safe nothrow
-	{
-		try
-			return msg.id.toString();
-		catch (Exception)
-			return "?";
-	}
 
 	Nullable!Json reply;
 	try
@@ -503,19 +586,25 @@ private void replyToRequest(McpServer server, void delegate(string) @safe sink,
 	}
 	catch (Exception e)
 	{
-		channel.reportError("request " ~ idText() ~ ": " ~ e.msg);
+		channel.reportError("request " ~ idText(msg) ~ ": " ~ e.msg);
 		try
-			reply = makeErrorResponse(msg.id, internalError("request handling failed"));
+		{
+			if (msg.kind == MessageKind.request)
+				reply = makeErrorResponse(msg.id, internalError("request handling failed"));
+		}
 		catch (Exception)
 		{
 		}
 	}
-	if (reply.isNull)
-		return;
+	return reply;
+}
+
+private string idText(Message msg) @safe nothrow
+{
 	try
-		channel.sendRaw(reply.get.toString());
-	catch (Exception e)
-		channel.reportError("request " ~ idText() ~ ": reply write failed: " ~ e.msg);
+		return msg.id.toString();
+	catch (Exception)
+		return "?";
 }
 
 /// Static options for the stdio server transport, bundled into one value so
@@ -2453,6 +2542,85 @@ unittest  // stdio: cancelling a request releases its pending ctx.elicit and can
 			sawCancel = true;
 	}
 	assert(sawCancel, "the client is told the elicitation was cancelled");
+}
+
+version (unittest)
+{
+	// A pre-2025-06-18 stdio session with a batch whose first member, tool "ask",
+	// waits in ctx.listRoots and whose second member, tool "quick", records that
+	// it ran. `drive` gets the link once "ask" waits for the client's reply.
+	private void withBlockedBatch(scope void delegate(ServerLink) @safe drive,
+			out bool askReleased, out bool quickRan) @safe
+	{
+		import core.time : seconds;
+
+		auto s = McpServer.stateful("stdio-batch-cancel", "1.0");
+		auto entered = createManualEvent();
+		bool released, ran;
+		Tool ask = {name: "ask"};
+		s.registerTool(ask, (Json args, RequestContext ctx) @safe {
+			scope (exit)
+				released = true;
+			entered.emit();
+			ctx.listRoots();
+			return CallToolResult.init;
+		});
+		Tool quick = {name: "quick"};
+		s.registerTool(quick, (Json args, RequestContext ctx) @safe {
+			ran = true;
+			return CallToolResult.init;
+		});
+
+		StdioOptions opts;
+		opts.serverRequestTimeout = 60.seconds;
+		withServer(s, (ServerLink link) @safe {
+			link.feed(`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{"roots":{}},"clientInfo":{"name":"t","version":"1"}}}`);
+			link.feed(`{"jsonrpc":"2.0","method":"notifications/initialized"}`);
+			link.feed(`[{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"ask"}},`
+				~ `{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"quick"}}]`);
+			auto ec = entered.emitCount;
+			entered.wait(ec);
+			foreach (_; 0 .. 8)
+				yield();
+			drive(link);
+		}, opts);
+		askReleased = released;
+		quickRan = ran;
+	}
+}
+
+unittest  // stdio: cancelling a running legacy batch member releases its pending server->client request
+{
+	bool askReleased, quickRan, releasedInTime;
+	withBlockedBatch((ServerLink link) @safe {
+		link.feed(`{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":2}}`);
+		foreach (_; 0 .. 16)
+			yield();
+		bool sawRootsCancel;
+		foreach (o; link.outbound)
+		{
+			auto j = parseJsonString(o);
+			if (j.type == Json.Type.object && "method" in j
+				&& j["method"].get!string == "notifications/cancelled")
+				sawRootsCancel = true;
+		}
+		releasedInTime = sawRootsCancel;
+	}, askReleased, quickRan);
+	assert(releasedInTime, "the cancelled member's roots/list is cancelled toward the client");
+	assert(askReleased);
+}
+
+unittest  // stdio: a legacy batch member cancelled before it starts never runs
+{
+	bool askReleased, quickRan;
+	withBlockedBatch((ServerLink link) @safe {
+		link.feed(`{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":3}}`);
+		link.feed(`{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":2}}`);
+		foreach (_; 0 .. 16)
+			yield();
+	}, askReleased, quickRan);
+	assert(askReleased);
+	assert(!quickRan, "a member cancelled while waiting its turn must not run");
 }
 
 unittest  // stdio: a roots/list_changed observer can re-list roots on its own context
