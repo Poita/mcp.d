@@ -2621,26 +2621,47 @@ final class HttpClientTransport : ClientTransport
 		() {
 			try
 			{
-				if (closing || legacyStopRequested)
-					return;
-				auto sock = connectTimed(pinnedHost, ep.port);
-				// `attach` closes `sock` immediately if a `close()` already ran during
-				// the `connectTCP` yield, so the socket is never leaked or left parked.
-				slot.attach(sock);
-				if (closing || legacyStopRequested)
-					return;
-				// Wrap in TLS for https; plaintext is returned unwrapped.
-				auto conn = openClientStream(sock, ep.tls ? tlsContext() : null, ep.host);
+				// A 401 rejecting the bearer is reported to the provider's
+				// `onRejected`, and the stream is opened once more with the
+				// refreshed token, as `runServerStream` does.
+				bool mayRetry = true;
+				ClientStream conn;
 				scope (exit)
-					conn.release();
-
-				const req = buildHttpRequest("GET", ep.path, ep.hostHeader,
-						"text/event-stream", "keep-alive", currentBearer(), null, null, null);
-				conn.write(cast(const(ubyte)[]) req);
-
-				const head = readResponseHead(conn);
-				if (head.status != 200)
+					if (conn !is null)
+						conn.release();
+				ResponseHead head;
+				for (;;)
 				{
+					if (closing || legacyStopRequested)
+						return;
+					auto sock = connectTimed(pinnedHost, ep.port);
+					// `attach` closes `sock` immediately if a `close()` already ran during
+					// the `connectTCP` yield, so the socket is never leaked or left parked.
+					slot.attach(sock);
+					if (closing || legacyStopRequested)
+						return;
+					// Wrap in TLS for https; plaintext is returned unwrapped.
+					conn = openClientStream(sock, ep.tls ? tlsContext() : null, ep.host);
+
+					const bearer = currentBearer();
+					const sentBearer = mayRetry && bearerProvider.onRejected !is null ? bearer
+						: null;
+					const req = buildHttpRequest("GET", ep.path, ep.hostHeader,
+							"text/event-stream", "keep-alive", bearer, null, null, null);
+					conn.write(cast(const(ubyte)[]) req);
+
+					head = readResponseHead(conn);
+					if (head.status == 200)
+						break;
+					if (sentBearer.length && isRejectedBearer(head.status,
+							head.wwwAuthenticate) && refreshBearer(sentBearer))
+					{
+						mayRetry = false;
+						conn.release();
+						conn = null;
+						slot.detach();
+						continue;
+					}
 					legacyStreamFailure = new HttpStatusException(head.status,
 							"legacy HTTP+SSE server rejected the GET stream with HTTP " ~ idStr(
 								head.status), head.wwwAuthenticate);
@@ -7271,6 +7292,77 @@ unittest  // startLegacyFallback surfaces a rejected legacy GET stream promptly 
 	assert(status == 401);
 	assert(challenge == `Bearer realm="mcp"`);
 	assert(took < 5.seconds);
+}
+
+unittest  // the legacy GET stream refreshes a rejected bearer token and retries once
+{
+	string token = "old";
+	string[] rejected;
+	string[] seen;
+	auto router = new URLRouter;
+	router.get("/mcp", (HTTPServerRequest req, HTTPServerResponse res) @safe {
+		import core.time : msecs;
+		import vibe.core.core : sleep;
+
+		const auth = req.headers.get("Authorization", "");
+		seen ~= auth;
+		if (auth != "Bearer new")
+		{
+			res.headers["WWW-Authenticate"] = `Bearer error="invalid_token"`;
+			res.statusCode = 401;
+			res.writeBody("");
+			return;
+		}
+		res.headers["Content-Type"] = "text/event-stream";
+		res.bodyWriter.write("event: endpoint\ndata: /messages\n\n");
+		res.bodyWriter.flush();
+		sleep(200.msecs);
+	});
+	string error;
+	const failure = runAgainstFakeServer(router, (string url) @safe {
+		auto t = new HttpClientTransport(url);
+		scope (exit)
+			t.close();
+		t.setBearerProvider(BearerProvider(() @safe => token, (string tok) @safe {
+				rejected ~= tok;
+				token = "new";
+				return true;
+			}));
+		try
+			t.startLegacyFallback();
+		catch (Exception e)
+			error = e.msg;
+	});
+	assert(failure.length == 0, "scenario failed: " ~ failure);
+	assert(error.length == 0, "startLegacyFallback failed: " ~ error);
+	assert(rejected == ["old"]);
+	assert(seen.length >= 2 && seen[0 .. 2] == ["Bearer old", "Bearer new"]);
+}
+
+unittest  // the legacy GET stream surfaces a 401 its bearer refresh does not answer
+{
+	int gets;
+	auto router = new URLRouter;
+	router.get("/mcp", (HTTPServerRequest req, HTTPServerResponse res) @safe {
+		gets++;
+		res.headers["WWW-Authenticate"] = `Bearer error="invalid_token"`;
+		res.statusCode = 401;
+		res.writeBody("");
+	});
+	int status;
+	const failure = runAgainstFakeServer(router, (string url) @safe {
+		auto t = new HttpClientTransport(url);
+		scope (exit)
+			t.close();
+		t.setBearerProvider(BearerProvider(() @safe => "tok", (string tok) @safe => true));
+		try
+			t.startLegacyFallback();
+		catch (HttpStatusException e)
+			status = e.status;
+	});
+	assert(failure.length == 0, "scenario failed: " ~ failure);
+	assert(status == 401);
+	assert(gets == 2, "a rejected bearer must be refreshed and retried exactly once");
 }
 
 unittest  // startLegacyFallback surfaces a refused legacy GET connection promptly
