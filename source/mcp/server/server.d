@@ -2962,11 +2962,13 @@ final class McpServer : ServerCore
 
 		// Stdio `events/stream` teardown: a push stream returns no JSON-RPC response,
 		// so the client cancels it by `notifications/cancelled` referencing the
-		// stream's request id. Close the handle (fires on_unsubscribe) and drop it.
+		// stream's request id. Drop the handle, then close it (fires on_unsubscribe):
+		// the hook may yield, and the ticker must not reach the stream meanwhile.
 		if (auto h = fromStdioPeer ? cancelKey in stdioEventStreams_ : null)
 		{
-			h.close();
+			auto handle = *h;
 			stdioEventStreams_.remove(cancelKey);
+			handle.close();
 			return;
 		}
 
@@ -8787,6 +8789,41 @@ unittest  // a stdio events/stream cancelled mid-tick gets no heartbeat from tha
 	assert(lines.length == before, lines.length > before ? lines[before] : "");
 }
 
+unittest  // a stdio events/stream being cancelled gets no tick while its onUnsubscribe runs
+{
+	import mcp.server.event_context : EventContext, EventResult;
+	import mcp.server.events_runtime : EventRegistration;
+
+	auto s = McpServer.stateless("t", "1");
+	s.enableEvents();
+
+	string[] lines;
+	size_t closedAt;
+	EventRegistration reg;
+	reg.descriptor.name = "email.received";
+	reg.check = (EventContext ctx) @safe => EventResult.empty("c0");
+	// The ticker can run while the hook is suspended; drive it from the hook.
+	reg.onUnsubscribe = (EventContext ctx, string id) @safe {
+		closedAt = lines.length;
+		s.tickStdioEventStreams(100_000);
+	};
+	s.registerEventType(reg);
+
+	void sink(string line) @safe
+	{
+		lines ~= line;
+	}
+
+	Json params = Json.emptyObject;
+	params["name"] = "email.received";
+	s.tryServeStdioEventsStream(modernReq(1, "events/stream", params), &sink);
+	s.handle(Message(makeNotification("notifications/cancelled", Json([
+		"requestId": Json(1)
+	]))));
+	assert(!s.hasStdioEventStreams());
+	assert(lines.length == closedAt, lines[$ - 1]);
+}
+
 unittest  // tickStdioEventStreams polls a check-backed stream and heartbeats only every 15s
 {
 	import std.algorithm : count, canFind;
@@ -11875,7 +11912,7 @@ unittest  // notify delivers unsolicited notifications to GET-stream listeners
 	string[] received;
 	ch.addListener((string f) @safe { received ~= f; });
 	const n = s.notify("notifications/example/list_changed", Json([
-			"id": Json("x")
+		"id": Json("x")
 	]));
 	assert(n == 1);
 	assert(received.length == 1);
