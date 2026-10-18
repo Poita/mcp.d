@@ -1007,6 +1007,9 @@ private T bindLeaf(T)(Json v, string path)
 			const b = v.get!BigInt;
 			if (b < T.min || b > T.max)
 				throw new BindException(located(path, outOfRange ~ v.toString));
+			// vibe reads a JSON bigInt through `long`, saturating a `ulong` above
+			// `long.max`; the range check above makes the direct cast exact.
+			return cast(T) b;
 		}
 	}
 
@@ -1476,6 +1479,14 @@ unittest  // an integer rejects a fractional or out-of-range JSON number, in JSO
 	assert(big !is null && big.msg == "expected an integer from 0 to 255, got 256", big.msg);
 	auto over = collectException!BindException(bindJson!ubyte(Json(256)));
 	assert(over !is null && over.msg == "expected an integer from 0 to 255, got 256", over.msg);
+}
+
+unittest  // a ulong parameter binds a JSON integer above long.max exactly
+{
+	import vibe.data.json : parseJsonString;
+
+	assert(bindJson!ulong(parseJsonString("18446744073709551615")) == ulong.max);
+	assert(bindJson!ulong(parseJsonString("9223372036854775808")) == 1UL << 63);
 }
 
 unittest  // a floating-point parameter rejects a JSON number outside its range
