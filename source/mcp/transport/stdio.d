@@ -2750,7 +2750,7 @@ unittest  // notify() and notifyElicitationComplete reach a 2025-era stdio clien
 		legacyHandshake(link);
 		Json p = Json.emptyObject;
 		p["x"] = 1;
-		custom = s.notify("notifications/custom", p);
+		custom = s.notify("notifications/custom/list_changed", p);
 		complete = s.notifyElicitationComplete("", "e-1");
 		foreach (_; 0 .. 8)
 			yield();
@@ -2760,7 +2760,7 @@ unittest  // notify() and notifyElicitationComplete reach a 2025-era stdio clien
 	assert(custom == 1);
 	assert(complete == 1);
 	assert(outputs.length == 3);
-	assert(parseJsonString(outputs[1])["method"].get!string == "notifications/custom");
+	assert(parseJsonString(outputs[1])["method"].get!string == "notifications/custom/list_changed");
 	auto done = parseJsonString(outputs[2]);
 	assert(done["method"].get!string == "notifications/elicitation/complete");
 	assert(done["params"]["elicitationId"].get!string == "e-1");

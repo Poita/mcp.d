@@ -1692,12 +1692,17 @@ final class McpServer : ServerCore
 		return pushChannel;
 	}
 
-	/// Send an *unsolicited* JSON-RPC notification to every client currently
+	/// Broadcast an *unsolicited* change notification to every client currently
 	/// listening on the standalone GET SSE stream or a `subscriptions/listen`
 	/// stream: once per session (on one of its streams) and once per listen
 	/// stream, skipping listen streams whose filter did not request this type.
-	/// This is the public entry point for server-initiated traffic outside an
-	/// in-flight request. Returns the number of sessions / listen streams reached;
+	/// `method` must be a server-sent `notifications/<...>/list_changed` or
+	/// `notifications/resources/updated`; any other method throws an
+	/// `Exception`, since those notifications are scoped to one request or
+	/// session and have their own gated APIs (`RequestContext.log` /
+	/// `reportProgress` for log messages and progress, and
+	/// `notifyElicitationComplete` for URL elicitation completion).
+	/// Returns the number of sessions / listen streams reached;
 	/// `0` when none is open (or the server is not on a Streamable HTTP
 	/// transport). On a stdio server with an
 	/// active modern `subscriptions/listen` it is additionally written to stdout
@@ -1708,6 +1713,15 @@ final class McpServer : ServerCore
 	/// session subscribed to the URI, exactly as `notifyResourceUpdated`.
 	size_t notify(string method, Json params = Json.undefined) @safe
 	{
+		import std.algorithm : endsWith, startsWith;
+
+		const isChange = method == "notifications/resources/updated"
+			|| (method.startsWith("notifications/")
+					&& method.endsWith("/list_changed")
+					&& method != "notifications/roots/list_changed");
+		if (!isChange)
+			throw new Exception("notify() broadcasts only list_changed and resources/updated"
+					~ " notifications, not " ~ method);
 		return notifyChange(method, params, listenFilterKey(method, params));
 	}
 
@@ -11848,7 +11862,7 @@ unittest  // notify is a no-op (returns 0) before a push channel exists
 {
 	auto s = McpServer.stateless("t", "1");
 	assert(s.serverPushChannel() is null);
-	assert(s.notify("notifications/message") == 0);
+	assert(s.notify("notifications/example/list_changed") == 0);
 }
 
 unittest  // notify delivers unsolicited notifications to GET-stream listeners
@@ -11860,12 +11874,31 @@ unittest  // notify delivers unsolicited notifications to GET-stream listeners
 
 	string[] received;
 	ch.addListener((string f) @safe { received ~= f; });
-	const n = s.notify("notifications/example/changed", Json(["id": Json("x")]));
+	const n = s.notify("notifications/example/list_changed", Json([
+			"id": Json("x")
+	]));
 	assert(n == 1);
 	assert(received.length == 1);
 	import std.algorithm : canFind;
 
-	assert(received[0].canFind("notifications/example/changed"));
+	assert(received[0].canFind("notifications/example/list_changed"));
+}
+
+unittest  // notify refuses notifications that have their own gated API
+{
+	import std.exception : assertThrown;
+
+	auto s = McpServer.stateless("t", "1");
+	auto ch = ensurePushChannel(s, new StreamCoordinator);
+	string[] received;
+	ch.addListener((string f) @safe { received ~= f; });
+	foreach (method; [
+		"notifications/message", "notifications/progress",
+		"notifications/elicitation/complete", "notifications/tasks",
+		"notifications/cancelled", "notifications/roots/list_changed"
+	])
+		assertThrown(s.notify(method, Json.emptyObject), method);
+	assert(received.length == 0);
 }
 
 unittest  // notifyResourceUpdated emits resources/updated for a subscribed uri
@@ -12216,17 +12249,9 @@ unittest  // a listen stream receives only the notification types its filter req
 	assert(s.tryServeStdioListen(Message(makeRequest(Json(1),
 			"subscriptions/listen", params)), &sink));
 
-	s.notify("notifications/message", Json([
-		"level": Json("info"),
-		"data": Json("x")
-	]));
-	s.notify("notifications/progress", Json([
-		"progressToken": Json(1),
-		"progress": Json(1)
-	]));
+	s.notify("notifications/example/list_changed");
 	s.notify("notifications/events/list_changed");
-	assert(!frames.canFind!(fr => fr.canFind("notifications/message")));
-	assert(!frames.canFind!(fr => fr.canFind("notifications/progress")));
+	assert(!frames.canFind!(fr => fr.canFind("notifications/example/list_changed")));
 	assert(!frames.canFind!(fr => fr.canFind("notifications/events/list_changed")));
 	s.notify("notifications/tools/list_changed");
 	assert(frames.canFind!(fr => fr.canFind("notifications/tools/list_changed")));
