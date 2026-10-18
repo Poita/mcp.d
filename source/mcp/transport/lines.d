@@ -57,7 +57,7 @@ package(mcp) struct LineReader
 	/// trailing '\r'), or null at end-of-input. `read` fills the slice it is
 	/// given and returns the byte count, 0 at end-of-input. A final line left
 	/// unterminated at end-of-input is returned before the null. An over-long line
-	/// (> maxLineBytes) is dropped — `next` returns "" and `takeOversized` reports
+	/// (> maxLineBytes, not counting its '\r\n' or '\n') is dropped — `next` returns "" and `takeOversized` reports
 	/// it so the caller can answer the peer — and reading resumes after the next
 	/// newline.
 	string next(scope size_t delegate(ubyte[]) @safe read) @safe
@@ -151,7 +151,8 @@ package(mcp) struct LineReader
 				else
 				{
 					acc ~= rest;
-					if (acc.length > maxLineBytes)
+					if (acc.length > maxLineBytes
+							&& !(acc.length == maxLineBytes + 1 && acc[$ - 1] == '\r'))
 					{
 						beginOversized(acc);
 						acc = null;
@@ -178,6 +179,8 @@ package(mcp) struct LineReader
 					line = rest[0 .. nl];
 			}
 			bufPos += nl + 1;
+			if (line.length && line[$ - 1] == '\r')
+				line = line[0 .. $ - 1];
 			// Enforce the size cap here too: when the line and its newline land in the
 			// same chunk the no-newline accumulation path above never runs, so the cap
 			// must also be checked on the newline-found path. An over-long line (already
@@ -191,8 +194,6 @@ package(mcp) struct LineReader
 				endOversized();
 				return "";
 			}
-			if (line.length && line[$ - 1] == '\r')
-				line = line[0 .. $ - 1];
 			// A blank line is "" rather than null, which the read loop takes as EOF.
 			if (!line.length)
 				return "";
@@ -446,6 +447,28 @@ unittest  // LineReader strips a trailing CR on a CRLF-terminated line
 	auto lines = drainLineReader(64, [cast(ubyte[]) "ok\r\n".dup]);
 	assert(lines.length == 1);
 	assert(lines[0] == "ok", "trailing CR must be stripped");
+}
+
+unittest  // LineReader accepts a CRLF line whose content is exactly maxLineBytes
+{
+	auto lines = drainLineReader(8, [cast(ubyte[]) "12345678\r\nnext\n".dup]);
+	assert(lines == ["12345678", "next"], "the CR of a CRLF terminator is not content");
+}
+
+unittest  // LineReader accepts a CRLF line of exactly maxLineBytes split before its LF
+{
+	auto lines = drainLineReader(8, [
+		cast(ubyte[]) "12345678\r".dup, cast(ubyte[]) "\nnext\n".dup
+	]);
+	assert(lines == ["12345678", "next"], "a CR awaiting its LF is not content");
+}
+
+unittest  // LineReader still drops a CRLF line whose content exceeds maxLineBytes
+{
+	auto lines = drainLineReader(8, [
+		cast(ubyte[]) "123456789\r".dup, cast(ubyte[]) "\nnext\n".dup
+	]);
+	assert(lines == ["next"]);
 }
 
 unittest  // LineReader drops an over-long line and resumes reading after the next newline
