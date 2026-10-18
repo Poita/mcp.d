@@ -1016,8 +1016,10 @@ handle. The SDK runs the poll loop (pacing by `nextPollMs` above a configurable
 floor, default 1 s), demuxes the push stream and reopens it from the last cursor
 when no frame arrives for `streamDeadAfter` (default 60 s), keeps the webhook grant
 refreshed before it lapses (and, for a no-expiry grant, at a health-check cadence),
-deduplicates by `eventId`, and signals gaps; `sub.cursor()` exposes the live
-watermark for resume and `sub.cancel()` tears the subscription down. The low-level
+deduplicates by `eventId`, and signals gaps (including a webhook subscribe or
+refresh reported `truncated`); `sub.cursor()` exposes the live watermark for
+resume, `sub.deliveryStatus()` the webhook delivery health the server last
+reported, and `sub.cancel()` tears the subscription down. The low-level
 `pollEvents(...)`/`streamEvents(...)`/`subscribeWebhookEvents(...)` round-trips
 remain for callers who want to drive the loop themselves. A `WebhookReceiver`
 verifies inbound Standard Webhooks deliveries, answers the verification challenge,

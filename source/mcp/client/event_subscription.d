@@ -10,7 +10,7 @@ import std.typecons : Nullable;
 
 import vibe.core.sync : LocalManualEvent, createManualEvent;
 
-import mcp.protocol.events : DeliveryMode;
+import mcp.protocol.events : DeliveryMode, DeliveryStatus;
 
 @safe:
 
@@ -24,6 +24,7 @@ final class EventSubscription
 	private bool terminated_;
 	private DeliveryMode mode_;
 	private Nullable!string cursor_;
+	private Nullable!DeliveryStatus deliveryStatus_;
 	private void delegate() @safe nothrow teardown_;
 	private void delegate() @safe nothrow onEnd_;
 	// Bounded `eventId` memory for deduplication: a fixed ring of the most recent
@@ -48,6 +49,14 @@ final class EventSubscription
 	DeliveryMode mode() @safe
 	{
 		return mode_;
+	}
+
+	/// The webhook delivery health the server last reported on a subscribe or
+	/// refresh (`active: false` means it suspended delivery after repeated
+	/// failures). Null in poll and push mode, and until the server reports one.
+	Nullable!DeliveryStatus deliveryStatus() @safe
+	{
+		return deliveryStatus_;
 	}
 
 	/// True until `cancel()` is called or a terminal `terminated` control ends the
@@ -138,6 +147,14 @@ final class EventSubscription
 	{
 		if (!c.isNull && c.get.length)
 			cursor_ = c;
+	}
+
+	/// Record the delivery health a webhook subscribe or refresh reported; a
+	/// response without one keeps the last report.
+	package void updateDeliveryStatus(Nullable!DeliveryStatus s) @safe
+	{
+		if (!s.isNull)
+			deliveryStatus_ = s;
 	}
 
 	/// Mark the subscription ended by the server (a `terminated` control, or a

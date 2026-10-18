@@ -3490,7 +3490,9 @@ final class McpClient : ClientProtocol
 	/// to `onEvent`/`onControl` without the placeholder-then-re-register dance), and
 	/// runs a background loop that re-subscribes before `refreshBefore` so
 	/// deliveries never lapse silently — or, for a no-expiry grant, at the
-	/// `noExpiryRefreshInterval` health-check cadence. `cancel()` unsubscribes,
+	/// `noExpiryRefreshInterval` health-check cadence. A subscribe or refresh the
+	/// server marks `truncated` reaches `onControl` as a `gap`, and its
+	/// `deliveryStatus` is kept on the handle's `deliveryStatus()`. `cancel()` unsubscribes,
 	/// deregisters the receiver, and stops the refresh loop.
 	EventSubscription subscribeWebhook(WebhookReceiver rx, SubscribeParams p,
 			void delegate(EventOccurrence) @safe onEvent,
@@ -3510,7 +3512,7 @@ final class McpClient : ClientProtocol
 			res = subscribeWebhookEvents(p);
 		}
 		const id = res.id;
-		sub.advanceCursor(res.cursor);
+		applyWebhookGrant(sub, res, onControl);
 		// Bind deliveries to the subscription's watermark, dedup, and terminal
 		// state before the caller's handlers, as the poll and stream modes do.
 		rx.register(id, p.delivery.secret, (EventOccurrence o) @safe {
@@ -3564,6 +3566,23 @@ final class McpClient : ClientProtocol
 		return sub;
 	}
 
+	/// Apply one `events/subscribe` response to a webhook subscription: advance
+	/// the watermark, record the reported `deliveryStatus`, and report a
+	/// `truncated` result (occurrences were lost) to `onControl` as a `gap`.
+	private static void applyWebhookGrant(EventSubscription sub,
+			SubscribeResult res, void delegate(EventControl) @safe onControl) @safe
+	{
+		sub.advanceCursor(res.cursor);
+		sub.updateDeliveryStatus(res.deliveryStatus);
+		if (res.truncated && onControl !is null)
+		{
+			EventControl c;
+			c.kind = EventControlKind.gap;
+			c.cursor = res.cursor;
+			onControl(c);
+		}
+	}
+
 	/// The webhook refresh loop: sleeps until shortly before the current grant
 	/// expires (or, for a no-expiry grant, for the health-check interval),
 	/// re-subscribes (refreshing the TTL and advancing the watermark), and repeats
@@ -3592,8 +3611,8 @@ final class McpClient : ClientProtocol
 			{
 				cur.cursor = sub.cursor();
 				res = subscribeWebhookEvents(cur);
-				sub.advanceCursor(res.cursor);
 				failures = 0;
+				applyWebhookGrant(sub, res, onControl);
 			}
 			catch (McpException e)
 			{
@@ -12231,4 +12250,63 @@ unittest  // a resources/updated arriving while that resource's read is in fligh
 	c.readResource("a"); // the second one was
 	assert(calls == 2);
 	assert(c.cacheGenerations_.length == 0);
+}
+
+unittest  // a truncated webhook subscribe result reaches onControl as a gap
+{
+	auto c = new McpClient(new RecordingClientTransport());
+	c.enableModern();
+	c.onRpcForTest = (string method, Json params) @safe {
+		SubscribeResult r;
+		r.id = "sub_x";
+		r.cursor = "w1";
+		r.truncated = true;
+		return r.toJson();
+	};
+	auto rx = new WebhookReceiver();
+	SubscribeParams sp;
+	sp.name = "incident.created";
+	sp.delivery = WebhookDelivery("https://hook/x", managedTestWhsec);
+	EventControl[] ctrls;
+	auto sub = c.subscribeWebhook(rx, sp, (EventOccurrence o) @safe {}, (EventControl ctl) @safe {
+		ctrls ~= ctl;
+	});
+	assert(ctrls.length == 1 && ctrls[0].kind == EventControlKind.gap);
+	assert(ctrls[0].cursor.get == "w1");
+	sub.cancel();
+}
+
+unittest  // a webhook refresh surfaces a gap and the server's deliveryStatus
+{
+	auto c = new McpClient(new RecordingClientTransport());
+	c.enableModern();
+	c.onRpcForTest = (string method, Json params) @safe {
+		SubscribeResult r;
+		r.id = "sub_x";
+		r.cursor = "w2";
+		r.truncated = true;
+		DeliveryStatus ds;
+		ds.active = false;
+		ds.lastError = DeliveryErrorCategory.http5xx;
+		r.deliveryStatus = ds;
+		return r.toJson();
+	};
+	auto sub = new EventSubscription();
+	SubscribeParams sp;
+	sp.name = "incident.created";
+	sp.delivery = WebhookDelivery("https://hook/x", managedTestWhsec);
+	SubscribeResult first;
+	first.id = "sub_x";
+	c.onWebhookRefreshSleepForTest = (Duration d) @safe {
+		if (!sub.deliveryStatus.isNull)
+			sub.cancel();
+	};
+	EventControl[] ctrls;
+	c.runWebhookRefreshLoop(sub, sp, first, (EventControl ctl) @safe {
+		ctrls ~= ctl;
+	});
+	assert(ctrls.length == 1 && ctrls[0].kind == EventControlKind.gap);
+	assert(ctrls[0].cursor.get == "w2");
+	assert(!sub.deliveryStatus.get.active);
+	assert(sub.deliveryStatus.get.lastError.get == DeliveryErrorCategory.http5xx);
 }
