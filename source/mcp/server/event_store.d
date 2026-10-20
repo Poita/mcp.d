@@ -331,6 +331,9 @@ struct WebhookSubscription
 		return !noExpiry && nowMs >= expiresAtMs;
 	}
 
+	/// The record as JSON, for a store to persist. It includes `secret` and
+	/// `previousSecret` in plaintext; see `WebhookSubscriptionStore` on
+	/// protecting them at rest.
 	Json toJson() const @safe
 	{
 		Json j = Json.emptyObject;
@@ -417,6 +420,13 @@ struct WebhookSubscription
 /// short TTLs can keep these purely in memory (the default); one granting long or
 /// no-expiry TTLs supplies a durable implementation, since a no-expiry
 /// subscription must survive restarts (its client never refreshes).
+///
+/// A stored subscription carries its signing secrets in plaintext (`secret`,
+/// and `previousSecret` during a rotation's grace window; `toJson` writes both
+/// as is), because every delivery must sign with them. Anyone who reads a
+/// record can forge deliveries its receiver accepts, so a durable
+/// implementation must protect them at rest: encrypt the records (or those
+/// fields) with a key kept outside the store, and restrict who can read it.
 interface WebhookSubscriptionStore
 {
 	/// Whether stored subscriptions survive a restart. A no-expiry grant is
