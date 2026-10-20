@@ -3,6 +3,7 @@ module mcp.transport.sse_context;
 import core.time : Duration, seconds, msecs;
 import std.typecons : Nullable;
 
+import vibe.core.core : Timer;
 import vibe.core.sync : LocalManualEvent, createManualEvent, TaskMutex;
 import vibe.data.json : Json;
 import vibe.http.server : HTTPServerResponse;
@@ -2939,6 +2940,10 @@ final class HttpStreamContext : RequestContext, ConnectionScoped
 	private bool resumedElsewhere_;
 	private TaskMutex writeMtx_;
 	private Duration stallTimeout_ = defaultResponseStallTimeout;
+	// Set once the final response has been written; no heartbeat follows it.
+	private bool finished_;
+	private Timer heartbeat_;
+	private bool heartbeatRunning_;
 	// The id of the inbound request this context serves; undefined when unknown.
 	private Json requestId_;
 
@@ -3358,6 +3363,41 @@ final class HttpStreamContext : RequestContext, ConnectionScoped
 	void finishWith(Json response) @safe
 	{
 		writeEvent(response);
+		finished_ = true;
+	}
+
+	/// Write an SSE comment every `interval` while the response is streaming and
+	/// its final event has not been written, so a proxy that closes idle
+	/// connections does not cut a long-running request, and a client that has
+	/// gone is noticed. A response that has not begun streaming is left alone, so
+	/// it can still be answered as plain JSON. `Duration.zero` disables it. Pair
+	/// with `stopHeartbeat`.
+	void startHeartbeat(Duration interval) @safe
+	{
+		import vibe.core.core : setTimer;
+
+		if (interval <= Duration.zero)
+			return;
+		heartbeat_ = setTimer(interval, () nothrow @safe {
+			try
+			{
+				synchronized (writeMtx_)
+					if (streaming_ && !finished_ && !resumedElsewhere_)
+						writeFrame(": ping\n\n");
+			}
+			catch (Exception)
+			{
+			}
+		}, true);
+		heartbeatRunning_ = true;
+	}
+
+	/// Stop the heartbeat started by `startHeartbeat`.
+	void stopHeartbeat() @safe nothrow
+	{
+		if (heartbeatRunning_)
+			heartbeat_.stop();
+		heartbeatRunning_ = false;
 	}
 }
 
@@ -4543,6 +4583,74 @@ version (unittest) private final class PausingSink : OutputStream
 	void finalize()
 	{
 	}
+}
+
+unittest  // a streaming POST response heartbeats while its handler runs, and stops once finished
+{
+	import core.time : msecs;
+	import std.algorithm : count;
+	import vibe.core.core : runTask, runEventLoop, exitEventLoop, sleep;
+	import vibe.http.server : createTestHTTPServerResponse, TestHTTPResponseMode;
+	import vibe.stream.memory : createMemoryOutputStream;
+
+	auto sink = createMemoryOutputStream();
+	auto res = createTestHTTPServerResponse(sink, null, TestHTTPResponseMode.bodyOnly);
+	ClientCapabilities caps;
+	auto ctx = new HttpStreamContext(res, new StreamCoordinator, caps, Json("tok"));
+	size_t whileRunning, afterFinish;
+	runTask(() nothrow{
+		scope (exit)
+			exitEventLoop();
+		try
+		{
+			ctx.startHeartbeat(40.msecs);
+			scope (exit)
+				ctx.stopHeartbeat();
+			ctx.log("info", Json("x"));
+			sleep(250.msecs);
+			whileRunning = (cast(string) sink.data).count(": ping\n\n");
+			ctx.finishWith(makeResponse(Json(1), Json.emptyObject));
+			const atFinish = (cast(string) sink.data).count(": ping\n\n");
+			sleep(200.msecs);
+			afterFinish = (cast(string) sink.data).count(": ping\n\n") - atFinish;
+		}
+		catch (Exception)
+		{
+		}
+	});
+	runEventLoop();
+	assert(whileRunning >= 2, "a running streamed request must heartbeat");
+	assert(afterFinish == 0, "no heartbeat follows the final response");
+}
+
+unittest  // a POST whose response has not begun streaming gets no heartbeat
+{
+	import core.time : msecs;
+	import vibe.core.core : runTask, runEventLoop, exitEventLoop, sleep;
+	import vibe.http.server : createTestHTTPServerResponse, TestHTTPResponseMode;
+	import vibe.stream.memory : createMemoryOutputStream;
+
+	auto sink = createMemoryOutputStream();
+	auto res = createTestHTTPServerResponse(sink, null, TestHTTPResponseMode.bodyOnly);
+	ClientCapabilities caps;
+	auto ctx = new HttpStreamContext(res, new StreamCoordinator, caps, Json("tok"));
+	runTask(() nothrow{
+		scope (exit)
+			exitEventLoop();
+		try
+		{
+			ctx.startHeartbeat(20.msecs);
+			scope (exit)
+				ctx.stopHeartbeat();
+			sleep(150.msecs);
+		}
+		catch (Exception)
+		{
+		}
+	});
+	runEventLoop();
+	assert(!ctx.streaming, "a heartbeat must not turn a plain JSON response into a stream");
+	assert(sink.data.length == 0);
 }
 
 unittest  // a POST stream's default stall timeout rides out a client pausing for seconds

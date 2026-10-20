@@ -332,6 +332,13 @@ struct StreamableHttpOptions
 	/// or modern wire output. When zero (the default) no `retry:` hint is sent.
 	uint reconnectDelayMs = 0;
 
+	/// How often an SSE stream carries a comment heartbeat: the standalone GET,
+	/// legacy HTTP+SSE and `subscriptions/listen` streams throughout, and a
+	/// streaming POST response while its handler runs. It keeps proxies that
+	/// close idle connections from cutting a quiet stream, and a failed write
+	/// detects a client that has gone. `Duration.zero` disables it.
+	Duration sseHeartbeat = 15.seconds;
+
 	/// Opt-in backwards compatibility with the deprecated 2024-11-05 HTTP+SSE
 	/// two-endpoint transport (basic/transports §HTTP with SSE; and the
 	/// 2025-06-18 / 2025-11-25 / modern §Backwards Compatibility guidance:
@@ -728,7 +735,8 @@ private void mountLegacyRoutes(URLRouter router, McpServer server, StreamableHtt
 		}
 		scope (exit)
 			streams.release(principal, address);
-		handleLegacyGet(server, channel, push, principal, opts.streamLimits, res);
+		handleLegacyGet(server, channel, push, principal, opts.streamLimits,
+			opts.sseHeartbeat, res);
 	});
 
 	router.post(opts.legacyMessagePath, (HTTPServerRequest req, HTTPServerResponse res) @safe {
@@ -1221,7 +1229,7 @@ private SseWriter sseFrameWriter(HTTPServerResponse res, StreamLimits limits = S
 /// Hold an SSE stream fed by push-channel listener `listenerId` open until the
 /// listener is closed (for a GET stream, its session was terminated), the
 /// session `sid` has expired or been evicted, or the client disconnects. Every
-/// `interval` it writes a comment heartbeat, which detects a disconnect and
+/// `interval` (when positive) it writes a comment heartbeat, which detects a disconnect and
 /// refreshes the session's idle timer, so a client that only listens keeps its
 /// session alive. A failed write ends it at once, as does `clientAlive`
 /// reporting the client gone: it is polled every `livenessProbeInterval`, since
@@ -1246,7 +1254,9 @@ private void holdSessionStream(SseWriter writeFrame, ServerPushChannel push, lon
 	};
 	scope (exit)
 		push.removeListener(listenerId);
-	const wakeEvery = clientAlive is null ? interval : min(interval, livenessProbeInterval);
+	const pings = interval > Duration.zero;
+	const pingEvery = pings ? interval : Duration.max;
+	const wakeEvery = clientAlive is null ? pingEvery : min(pingEvery, livenessProbeInterval);
 	auto lastPing = MonoTime.currTime;
 	// The writer may have failed before `onFailure` was set; `failed` covers that.
 	while (!writeFrame.failed && !push.awaitClosed(listenerId, wakeEvery))
@@ -1255,7 +1265,7 @@ private void holdSessionStream(SseWriter writeFrame, ServerPushChannel push, lon
 			break;
 		if (clientAlive !is null && !clientAlive())
 			break;
-		if (MonoTime.currTime - lastPing < interval)
+		if (!pings || MonoTime.currTime - lastPing < interval)
 			continue;
 		try
 			writeFrame(": ping\n\n");
@@ -1275,8 +1285,8 @@ private enum Duration livenessProbeInterval = 1.seconds;
 /// It also listens on `push`, the server's push channel, under its own session
 /// token, so server notifications and requests reach it as `message` events;
 /// `notifications/resources/updated` is gated on the stream's own subscriptions.
-private void handleLegacyGet(McpServer server, LegacySseChannel channel,
-		ServerPushChannel push, string principal, StreamLimits limits, HTTPServerResponse res) @safe
+private void handleLegacyGet(McpServer server, LegacySseChannel channel, ServerPushChannel push,
+		string principal, StreamLimits limits, Duration heartbeat, HTTPServerResponse res) @safe
 {
 	res.contentType = "text/event-stream";
 	applySseStreamHeaders(res, false);
@@ -1299,7 +1309,7 @@ private void handleLegacyGet(McpServer server, LegacySseChannel channel,
 	scope (exit)
 		push.removeListener(pushId);
 
-	holdSessionStream(writeFrame, push, pushId, null, sessionId, 15.seconds, connectionProbe(res));
+	holdSessionStream(writeFrame, push, pushId, null, sessionId, heartbeat, connectionProbe(res));
 }
 
 /// Parse a legacy POST body. A malformed one is answered with a JSON-RPC error
@@ -2268,7 +2278,7 @@ private void handleGet(McpServer server, ServerPushChannel push,
 	}
 
 	holdSessionStream(writeFrame, push, listenerId, sessions, ownerToken,
-			15.seconds, connectionProbe(res));
+			opts.sseHeartbeat, connectionProbe(res));
 }
 
 /// Serve a modern `subscriptions/listen` request as a long-lived SSE notification
@@ -2284,9 +2294,10 @@ private void handleGet(McpServer server, ServerPushChannel push,
 /// existing `notify*` / `notifyResourceUpdated` APIs deliver opted-in change
 /// notifications onto it. The connection is held open (with SSE comment
 /// heartbeats) until the client disconnects.
-private void handleListenStream(McpServer server, ServerPushChannel push, Message msg,
-		HTTPServerResponse res, string protoHeader, string connToken,
-		TokenInfo token, StreamLimits limits) @safe
+private void handleListenStream(McpServer server, ServerPushChannel push,
+		Message msg, HTTPServerResponse res,
+		string protoHeader, string connToken, TokenInfo token,
+		StreamLimits limits, Duration heartbeat) @safe
 {
 	// Record the opted-in filters (route -> doSubscribeListen). The one-shot JSON
 	// result is discarded on success: the acknowledgement is delivered as the
@@ -2344,7 +2355,7 @@ private void handleListenStream(McpServer server, ServerPushChannel push, Messag
 	push.emitTo(listenerId,
 			subscriptionsAcknowledgedNotification(server.acknowledgedSubsetFor(streamFilter)));
 
-	holdSessionStream(writeFrame, push, listenerId, null, "", 15.seconds, connectionProbe(res));
+	holdSessionStream(writeFrame, push, listenerId, null, "", heartbeat, connectionProbe(res));
 }
 
 /// Register a `subscriptions/listen` stream on `push`: its notifications are
@@ -3225,8 +3236,8 @@ private void handlePost(McpServer server, ServerPushChannel push,
 			}
 			scope (exit)
 				pushStreams.release(principal, address);
-			handleListenStream(server, push, msg, res,
-					req.headers.get(HttpHeader.protocolVersion, ""), connToken, token, limits);
+			handleListenStream(server, push, msg, res, req.headers.get(HttpHeader.protocolVersion,
+					""), connToken, token, limits, opts.sseHeartbeat);
 			return;
 		}
 		// Modern events/stream (push): like subscriptions/listen, this POST opens a
@@ -3290,6 +3301,9 @@ private void handlePost(McpServer server, ServerPushChannel push,
 				reqState, server.mode == ServerMode.stateless, reqAcceptsSse);
 		ctx.setStallTimeout(opts.streamLimits.responseStallTimeout);
 		ctx.setRequestId(msg.id);
+		ctx.startHeartbeat(opts.sseHeartbeat);
+		scope (exit)
+			ctx.stopHeartbeat();
 		// A session-bound 2025-11-25 stream advertises resumability with its
 		// priming event, so record its events for a GET Last-Event-ID resume.
 		if (sessions !is null && sendsPrimingEvent(effVersion))
@@ -6132,7 +6146,8 @@ unittest  // a 2025-11-25 session's streamed POST leads with the priming event
 
 /// The bytes a standalone GET stream on a fresh `ver` session has written
 /// 500ms after opening, and whether a DELETE then ended it.
-version (unittest) private string firstGetStreamBytes(string ver, out bool ended) @safe
+version (unittest) private string firstGetStreamBytes(string ver, out bool ended,
+		StreamableHttpOptions opts = StreamableHttpOptions.init) @safe
 {
 	import core.time : msecs;
 	import vibe.core.core : runTask, sleep, exitEventLoop, runEventLoop;
@@ -6143,7 +6158,7 @@ version (unittest) private string firstGetStreamBytes(string ver, out bool ended
 
 	auto server = McpServer.stateful("t", "1");
 	auto router = new URLRouter;
-	mountMcp(router, server);
+	mountMcp(router, server, opts);
 
 	auto initRes = createTestHTTPServerResponse(createMemoryOutputStream(),
 			null, TestHTTPResponseMode.bodyOnly);
@@ -6192,6 +6207,20 @@ version (unittest) private string firstGetStreamBytes(string ver, out bool ended
 	runEventLoop();
 	ended = done;
 	return early;
+}
+
+unittest  // the GET stream heartbeats at the configured sseHeartbeat cadence
+{
+	import core.time : msecs;
+	import std.algorithm : count;
+
+	StreamableHttpOptions opts;
+	opts.sseHeartbeat = 100.msecs;
+	bool ended;
+	const early = firstGetStreamBytes("2025-11-25", ended, opts);
+	assert(early.count(": ping\n\n") >= 2,
+			"the GET stream must heartbeat every sseHeartbeat: " ~ early);
+	assert(ended);
 }
 
 unittest  // a 2025-11-25 GET stream opens at once with a priming event
