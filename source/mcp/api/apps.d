@@ -211,10 +211,39 @@ struct UiResourceMeta
 /// descriptor built for `server.registerTool`, as
 /// `server.setUiToolMeta(tool, ui)`; the `@ui` UDA does the same for the
 /// FastMCP-style `@tool` API.
+///
+/// Throws, leaving `tool` unchanged, when `ui.resourceUri` is not a `ui://` URI
+/// naming a resource or a `ui.visibility` role is not `"model"` or `"app"`.
 void setUiToolMeta(McpServer server, ref Tool tool, UiToolMeta ui) @safe
 {
+	if (const problem = uiToolMetaProblem(ui.resourceUri, ui.visibility))
+		throw new Exception(problem);
 	attachUiToolMeta(tool, ui);
 	ensureApps(server);
+}
+
+/// Why `uri` cannot identify a UI resource, or `null` when it can: it must be
+/// in the `ui://` scheme and name something after it. Evaluable at compile
+/// time, so the `@ui` UDA and the runtime registration share one rule.
+package(mcp) string uiResourceUriProblem(string uri) @safe pure nothrow
+{
+	enum scheme = "ui://";
+	if (uri.length <= scheme.length || uri[0 .. scheme.length] != scheme)
+		return "a UI resource uri must be a ui:// URI naming a resource, got: \"" ~ uri ~ "\"";
+	return null;
+}
+
+/// Why a UI link to `resourceUri` visible to `visibility` is invalid, or `null`
+/// when it is valid: the URI must pass `uiResourceUriProblem` and each role must
+/// be `"model"` or `"app"`. Evaluable at compile time (see `uiResourceUriProblem`).
+package(mcp) string uiToolMetaProblem(string resourceUri, const(string)[] visibility) @safe pure nothrow
+{
+	if (const problem = uiResourceUriProblem(resourceUri))
+		return problem;
+	foreach (v; visibility)
+		if (v != "model" && v != "app")
+			return "a UI visibility role must be \"model\" or \"app\", got: \"" ~ v ~ "\"";
+	return null;
 }
 
 /// Attach a UI link to a tool's `_meta` under the `ui` key, preserving any
@@ -291,15 +320,13 @@ struct UiResource
 /// `text/html;profile=mcp-app` MIME type and, when `resource.meta` carries any
 /// field, a `_meta.ui` object on both the listing and the read contents.
 /// Enables the Apps extension (see `enableApps`) when it is not yet enabled.
-/// Throws if `resource.uri` is not in the `ui://` scheme, or unless exactly one
-/// of `html` and `htmlProvider` is set.
+/// Throws if `resource.uri` is not a `ui://` URI naming a resource, or unless
+/// exactly one of `html` and `htmlProvider` is set.
 void registerUiResource(McpServer server, UiResource resource) @safe
 {
-	import std.algorithm.searching : startsWith;
-
 	const uri = resource.uri;
-	if (!uri.startsWith("ui://"))
-		throw new Exception("a UI resource uri must start with \"ui://\", got: " ~ uri);
+	if (const problem = uiResourceUriProblem(uri))
+		throw new Exception(problem);
 	if (resource.html.length && resource.htmlProvider !is null)
 		throw new Exception("UI resource " ~ uri ~ " sets both html and htmlProvider; set only one");
 	if (!resource.html.length && resource.htmlProvider is null)
@@ -597,6 +624,30 @@ unittest  // registerUiResource rejects a uri that is not in the ui:// scheme
 
 	auto s = McpServer.stateless("t", "1");
 	assertThrown!Exception(registerUiResource(s, UiResource("https://demo/widget", "w", "<x/>")));
+}
+
+unittest  // registerUiResource rejects a bare ui:// uri with no resource path
+{
+	import std.exception : assertThrown;
+
+	auto s = McpServer.stateless("t", "1");
+	assertThrown!Exception(registerUiResource(s, UiResource("ui://", "w", "<x/>")));
+}
+
+unittest  // setUiToolMeta rejects a non-ui:// resource uri or an unknown visibility role
+{
+	import std.exception : assertThrown;
+
+	auto s = McpServer.stateless("t", "1");
+	Tool t;
+	t.name = "render";
+	assertThrown!Exception(s.setUiToolMeta(t, UiToolMeta("https://demo/widget")));
+	assertThrown!Exception(s.setUiToolMeta(t, UiToolMeta("ui://")));
+	assertThrown!Exception(s.setUiToolMeta(t, UiToolMeta("ui://demo/widget", [
+		"admin"
+	])));
+	assert(t.meta.type != Json.Type.object || "ui" !in t.meta);
+	s.setUiToolMeta(t, UiToolMeta("ui://demo/widget", ["app"]));
 }
 
 unittest  // attachUiToolMeta attaches the ui link under a tool's _meta.ui

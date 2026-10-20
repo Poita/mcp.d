@@ -19,7 +19,7 @@ import mcp.server.event_context : EventContext, EventResult, Event, EventBatch,
 	FetchContext, SubContext;
 import mcp.server.events_runtime : EventRegistration, EventCheck;
 import mcp.api.attributes;
-import mcp.api.apps : UiToolMeta, attachUiToolMeta, ensureApps;
+import mcp.api.apps : UiToolMeta, attachUiToolMeta, ensureApps, uiToolMetaProblem;
 import mcp.api.skills : Skill, isValidSkillPath, registerSkill,
 	skillFieldProblem, skillPathRule, unregisterSkill;
 import mcp.api.binding : bindJson, bindString, defaultAs, isAdvertisableDefault,
@@ -1261,11 +1261,9 @@ private Tool toolDescriptor(alias overload, A)(A attr) @safe
 	{
 		static if (is(typeof(a) == ui))
 		{
-			static assert(a.resourceUri.length > 5 && a.resourceUri[0 .. 5] == "ui://",
-					"@ui resourceUri must be a ui:// URI, got: \"" ~ a.resourceUri ~ "\"");
-			static foreach (v; a.visibility)
-				static assert(v == "model" || v == "app",
-						"@ui visibility must be \"model\" or \"app\", got: \"" ~ v ~ "\"");
+			static assert(uiToolMetaProblem(a.resourceUri, a.visibility) is null,
+					"@ui on '" ~ __traits(identifier,
+						overload) ~ "': " ~ uiToolMetaProblem(a.resourceUri, a.visibility));
 			attachUiToolMeta(descriptor, UiToolMeta(a.resourceUri, a.visibility));
 		}
 	}
