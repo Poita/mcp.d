@@ -972,6 +972,12 @@ struct FetchOptions
 	/// reading the response, however slowly the server trickles bytes — so an
 	/// unresponsive endpoint cannot hold the calling task indefinitely. Zero
 	/// removes the bound.
+	///
+	/// The overall bound needs a vibe.d task to interrupt, so it applies only
+	/// when `secureRequestHTTP` runs inside one. Called from outside a task
+	/// (e.g. plain `main` before the event loop), the value instead bounds
+	/// each connect and each read separately, and a server that keeps
+	/// trickling bytes can stretch the request past it.
 	Duration timeout = 30.seconds;
 
 	/// Certificate validation for `https` URLs.
@@ -1073,7 +1079,8 @@ void delegate(TLSContext) @safe nothrow tlsContextSetup(TlsTrust trust) @safe
 ///
 /// An `https` server must present a certificate chaining to a trusted CA and
 /// matching the original host name; `options.tls` selects the trusted CAs.
-/// `options.timeout` bounds the whole request.
+/// `options.timeout` bounds the whole request when called from a vibe.d task,
+/// and each connect and read separately otherwise (see `FetchOptions.timeout`).
 ///
 /// Throws `invalidRequest` when the URL is unsafe under `policy` (insecure
 /// scheme for `blockInternal`/`allowLoopback`, an internal IP-literal/resolved address, or an
