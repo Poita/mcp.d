@@ -146,7 +146,8 @@ enum SchemaUse
 /// `U` widened in place to admit `null`, since binding reads `null` as an unset
 /// value; for an output it is `anyOf: [U, null]`. A `Json` value is the empty
 /// schema, which admits any JSON. `TimeOfDay` and `DateTime` are strings
-/// constrained by a pattern, as they carry no UTC offset. Other scalars, enums
+/// constrained by a pattern, as they carry no UTC offset. A `UUID` is a string
+/// with the `uuid` format. Other scalars, enums
 /// (by member name), and custom-serialized types come from the `jsonschema`
 /// generator.
 Json jsonSchemaOf(T, SchemaUse use = SchemaUse.input)()
@@ -164,9 +165,16 @@ package(mcp) JsonNode schemaNode(T, SchemaUse use, Ancestors...)()
 	import std.datetime.date : DateTime, TimeOfDay;
 	import std.meta : staticIndexOf;
 	import std.sumtype : isSumType;
+	import std.uuid : UUID;
 
 	static if (is(T == Json))
 		return JsonNode.emptyObject();
+	else static if (is(T == UUID))
+	{
+		auto s = typeNode("string");
+		s.set("format", JsonNode("uuid"));
+		return s;
+	}
 	else static if (is(T == TimeOfDay))
 		return patternNode(timeOfDayPattern);
 	else static if (is(T == DateTime))
@@ -324,12 +332,17 @@ package(mcp) string unsupportedTypeReason(T, SchemaUse use, Ancestors...)()
 {
 	import std.datetime.date : DateTime, TimeOfDay;
 	import std.meta : staticIndexOf;
+	import core.time : Duration;
 	import std.sumtype : isSumType;
 	import std.typecons : Tuple;
+	import std.uuid : UUID;
 
 	static if (is(T == Json) || is(T == TimeOfDay) || is(T == DateTime)
-			|| staticIndexOf!(T, Ancestors) >= 0)
+			|| is(T == UUID) || staticIndexOf!(T, Ancestors) >= 0)
 		return null;
+	else static if (is(Unqual!T == Duration))
+		return T.stringof ~ ": a Duration has no JSON form; take a long count of a unit "
+			~ "(such as milliseconds) and convert it";
 	else static if (isInstanceOf!(Tuple, T))
 		return T.stringof ~ ": a Tuple has no JSON Schema; use a struct with named fields";
 	else static if (isInstanceOf!(Nullable, T))
@@ -350,6 +363,11 @@ package(mcp) string unsupportedTypeReason(T, SchemaUse use, Ancestors...)()
 		static if (use == SchemaUse.input && !is(typeof({ T t; })))
 			return T.stringof ~ ": its default construction is disabled, so it cannot be "
 				~ "bound from JSON";
+		// A struct whose state is all private or @ignore'd would be described,
+		// bound, and written as an empty object, losing its value.
+		static if (FieldNameTuple!T.length && !hasBoundField!T)
+			return T.stringof ~ ": it has no public, non-@ignore'd field, so it has no "
+				~ "JSON form; use a struct with public fields";
 		static foreach (field; FieldNameTuple!T)
 		{
 			static if (isBoundField!(T, field))
@@ -395,6 +413,17 @@ package(mcp) string unsupportedTypeReason(T, SchemaUse use, Ancestors...)()
 		return T.stringof ~ ": the type has no JSON representation";
 }
 
+/// Whether struct `T` has at least one field that takes part in
+/// (de)serialization.
+private bool hasBoundField(T)()
+{
+	bool found;
+	static foreach (field; FieldNameTuple!T)
+		static if (isBoundField!(T, field))
+			found = true;
+	return found;
+}
+
 /// The first JSON Schema facet among `udas` that cannot constrain a `T`, as
 /// `@name`, or `null` when every facet fits: a string facet (`@minLength`,
 /// `@maxLength`, `@pattern`, `@schemaFormat`) needs a value written as a JSON
@@ -408,6 +437,7 @@ package(mcp) string facetMismatch(T, udas...)()
 	import std.datetime.date : Date, DateTime, TimeOfDay;
 	import std.datetime.systime : SysTime;
 	import std.sumtype : isSumType;
+	import std.uuid : UUID;
 
 	static if (isInstanceOf!(Nullable, T))
 		return facetMismatch!(TemplateArgsOf!T[0], udas)();
@@ -416,7 +446,7 @@ package(mcp) string facetMismatch(T, udas...)()
 	else
 	{
 		enum isString = isSomeString!T || is(T == enum) || is(T == SysTime)
-			|| is(T == Date) || is(T == DateTime) || is(T == TimeOfDay);
+			|| is(T == Date) || is(T == DateTime) || is(T == TimeOfDay) || is(T == UUID);
 		enum isList = isArray!T && !isString;
 		enum isNumber = (isIntegral!T || isFloatingPoint!T) && !is(T == enum);
 		static foreach (uda; udas)
@@ -939,6 +969,11 @@ private T bindLeaf(T)(Json v, string path)
 			throw new BindException(located(path,
 					"expected a date-time with a UTC offset (Z or +hh:mm), got " ~ v.toString));
 	}
+	else static if (is(T == imported!"std.uuid".UUID))
+	{
+		if (v.type != Json.Type.string)
+			throw new BindException(located(path, "expected a string, got " ~ jsonTypeName(v)));
+	}
 	else static if (is(T == bool))
 	{
 		if (v.type != Json.Type.bool_)
@@ -1390,6 +1425,51 @@ unittest  // a type with a JSON form is not reported as unsupported
 	static assert(unsupportedTypeReason!(int[string], SchemaUse.input)() is null);
 	static assert(unsupportedTypeReason!(real, SchemaUse.output)() is null);
 	static assert(unsupportedTypeReason!(string, SchemaUse.input)() is null);
+}
+
+unittest  // a struct with no public fields is reported as unsupported
+{
+	static struct Opaque
+	{
+		private int x;
+	}
+
+	static assert(unsupportedTypeReason!(Opaque, SchemaUse.input)().length);
+	static assert(unsupportedTypeReason!(Opaque, SchemaUse.output)().length);
+	static assert(unsupportedTypeReason!(Opaque[], SchemaUse.input)().length);
+}
+
+unittest  // a Duration is reported as unsupported with a hint to use a number
+{
+	import core.time : Duration;
+	import std.algorithm.searching : canFind;
+
+	enum reason = unsupportedTypeReason!(Duration, SchemaUse.input)();
+	static assert(reason.canFind("Duration") && reason.canFind("long"), reason);
+	static assert(unsupportedTypeReason!(Duration, SchemaUse.output)().length);
+}
+
+unittest  // a UUID is a string with the uuid format
+{
+	import std.uuid : UUID;
+	import vibe.data.json : parseJsonString;
+
+	assert(jsonSchemaOf!UUID == parseJsonString(`{"type":"string","format":"uuid"}`));
+	assert(jsonSchemaOf!(UUID,
+			SchemaUse.output) == parseJsonString(`{"type":"string","format":"uuid"}`));
+	static assert(unsupportedTypeReason!(UUID, SchemaUse.input)() is null);
+}
+
+unittest  // a UUID binds from its string form and rejects anything else
+{
+	import std.exception : collectException;
+	import std.uuid : UUID;
+
+	enum text = "8ab3060e-2cba-4f23-b74c-b52db3bdfb46";
+	assert(bindJson!UUID(Json(text)) == UUID(text));
+	assert(bindString!UUID(text) == UUID(text));
+	assert(collectException!BindException(bindJson!UUID(Json("nope"))));
+	assert(collectException!BindException(bindJson!UUID(Json(3))));
 }
 
 unittest  // a struct field whose @schemaDefault does not convert to its type is reported

@@ -12,7 +12,7 @@ import jsonschema : Validator;
 /// Derived schemas describe enums as `{type:"string", enum:[names…]}`, so both
 /// directions of marshalling must agree: struct params/returns and bare-enum
 /// values are (de)serialized by-name. The policy only defines
-/// `toRepresentation`/`fromRepresentation` for enums, `SumType`s, `SysTime` and `ulong`
+/// `toRepresentation`/`fromRepresentation` for enums, `SumType`s, `SysTime`, `UUID` and `ulong`
 /// (see the arms below), so vibe's `isPolicySerializable` is false for every
 /// other type and the default behaviour is preserved (it still recurses into
 /// nested struct/array fields, applying this rule at any depth).
@@ -114,6 +114,22 @@ template EnumByNamePolicy(T) if (is(T == imported!"std.datetime.systime".SysTime
 	}
 }
 
+/// The `UUID` arm of `EnumByNamePolicy`: a `UUID` is written as its canonical
+/// hyphenated string, matching the `format: uuid` string derived schemas
+/// advertise. vibe would otherwise write its sixteen raw bytes as an object.
+template EnumByNamePolicy(T) if (is(T == imported!"std.uuid".UUID))
+{
+	static string toRepresentation(T v) @safe
+	{
+		return v.toString();
+	}
+
+	static T fromRepresentation(string s) @safe
+	{
+		return T(s);
+	}
+}
+
 /// The `ulong` arm of `EnumByNamePolicy`: vibe stores integers as `long`, so a
 /// `ulong` above `long.max` would be written negative. Such a value is written
 /// and read as a JSON big integer instead; smaller ones stay plain integers.
@@ -195,6 +211,23 @@ unittest  // a ulong above long.max is written and read back as its exact value
 	auto back = deserializeWithPolicy!(JsonSerializer, EnumByNamePolicy, S)(j);
 	assert(back.n == ulong.max && back.ns == [1, 1UL << 63]);
 	assert(serializeWithPolicy!(JsonSerializer, EnumByNamePolicy)(ulong(7)).type == Json.Type.int_);
+}
+
+unittest  // a UUID is written and read back as its string form
+{
+	import std.uuid : UUID;
+	import vibe.data.json : JsonSerializer;
+	import vibe.data.serialization : deserializeWithPolicy, serializeWithPolicy;
+
+	static struct S
+	{
+		UUID id;
+	}
+
+	enum text = "8ab3060e-2cba-4f23-b74c-b52db3bdfb46";
+	auto j = serializeWithPolicy!(JsonSerializer, EnumByNamePolicy)(S(UUID(text)));
+	assert(j["id"] == Json(text), j.toString);
+	assert(deserializeWithPolicy!(JsonSerializer, EnumByNamePolicy, S)(j).id == UUID(text));
 }
 
 unittest  // a SumType reads back as the member matching the JSON value's own type

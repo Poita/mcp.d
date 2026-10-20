@@ -12,19 +12,20 @@ import vibe.data.json : Json;
 @safe:
 
 /// Whether struct `T` is (de)serialized field by field. Structs vibe serializes
-/// in a custom form (`std.datetime` types, `toJson`/`fromJson`, `toString`/
-/// `fromString`, `toRepresentation`/`fromRepresentation`) and the `Nullable` /
-/// `SumType` / `Json` wrappers are not.
+/// in a custom form (`std.datetime` types, `std.uuid.UUID`, `toJson`/`fromJson`,
+/// `toString`/`fromString`, `toRepresentation`/`fromRepresentation`) and the
+/// `Nullable` / `SumType` / `Json` wrappers are not.
 package(mcp) template isFieldwiseStruct(T)
 {
 	import std.datetime.date : Date, DateTime, TimeOfDay;
 	import std.datetime.systime : SysTime;
 	import std.sumtype : isSumType;
 	import std.traits : isInstanceOf;
+	import std.uuid : UUID;
 
 	static if (!is(T == struct) || is(T == Json) || isInstanceOf!(Nullable, T)
 			|| isSumType!T || is(T == SysTime) || is(T == DateTime)
-			|| is(T == Date) || is(T == TimeOfDay))
+			|| is(T == Date) || is(T == TimeOfDay) || is(T == UUID))
 		enum isFieldwiseStruct = false;
 	else
 		enum isFieldwiseStruct = !hasCustomRepresentation!T;

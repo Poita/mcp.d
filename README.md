@@ -748,6 +748,7 @@ is predictable when porting a hand-built server):
 | `struct` | `{"type": "object", "properties": …, "required": […]}`, keyed by the serialized field name (vibe's `@name`, else the field name minus one trailing `_`); a `Nullable`, vibe-`@optional`, or defaulted field (an initializer differing from the type's `.init`, which an input schema also advertises as its `"default"`) is not required, and `@allOptional` on the struct makes every field optional |
 | `Json` | `{}` (any JSON value) |
 | `std.datetime` `SysTime` / `Date` | `{"type": "string", "format": "date-time"/"date"}`; a `SysTime` argument must carry a UTC offset (`Z` or `+hh:mm`), as RFC 3339 requires |
+| `std.uuid` `UUID` | `{"type": "string", "format": "uuid"}`, read and written as the hyphenated string form |
 | `std.datetime` `DateTime` / `TimeOfDay` | `{"type": "string", "pattern": …}` matching `YYYY-MM-DDTHH:MM:SS` / `HH:MM:SS` (no UTC offset, so not the RFC 3339 `date-time`/`time` formats) |
 | `SumType!(A, B, …)` | `{"anyOf": [<A>, <B>, …]}`; an argument binds to the member its JSON type natively matches (an integer to `int` over `double`), else the first member that accepts it; a result is written as the value it holds |
 | `Nullable!T` (tool parameter / input field) | `<T>` widened to admit `null` (`"type": [<T's type>, "null"]`, plus `null` in an `enum`), made optional by omission from `required`; an explicit `null` binds as unset |
@@ -756,7 +757,9 @@ is predictable when porting a hand-built server):
 
 A parameter, field, or return type with no JSON form — a class, pointer,
 delegate, `char`, `std.typecons.Tuple`, an associative array keyed by a
-non-string, or a `real` parameter (use `double`) — is rejected at compile time
+non-string, a struct whose fields are all private or `@ignore`d, a
+`core.time.Duration` (take a `long` count of milliseconds or seconds instead),
+or a `real` parameter (use `double`) — is rejected at compile time
 with a message naming the handler and parameter, as is a `@schemaDefault` whose
 value is not exactly a value of the parameter's type: it must convert implicitly,
 an integer must be within the parameter's range (`@schemaDefault(300) ubyte` is
