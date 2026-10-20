@@ -7,7 +7,7 @@ import std.typecons : Nullable;
 import core.time : Duration, seconds;
 
 import mcp.server.server;
-import mcp.server.settings : ServerSettings;
+import mcp.settings : ServerSettings;
 import mcp.protocol.jsonrpc;
 import mcp.protocol.errors;
 import mcp.protocol.versions;

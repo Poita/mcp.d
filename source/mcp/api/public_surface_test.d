@@ -258,7 +258,7 @@ unittest
 {
 	static assert(__traits(compiles, {
 			import mcp.server.server : McpServer;
-			import mcp.server.settings : ServerSettings;
+			import mcp.settings : ServerSettings;
 			import mcp.transport;
 
 			McpServer srv;

@@ -60,7 +60,7 @@ public import mcp.server.events_runtime : EventsRuntime, EventsOptions,
 public import mcp.server.context;
 public import mcp.server.server;
 public import mcp.server.responses;
-public import mcp.server.settings;
+public import mcp.settings;
 public import mcp.client.client;
 public import mcp.client.runner;
 public import mcp.client.subscription;

@@ -6,7 +6,10 @@
 /// argument per knob. Build the server from the settings with `newServer`, then
 /// serve it with the `ServerSettings` overloads of `runStreamableHttp` / `runStdio`
 /// from `mcp.transport` (which read the nested `http` / `stdio` options).
-module mcp.server.settings;
+///
+/// It sits above both the server core and the transports, since it names
+/// options from each; `mcp.server` itself has no transport dependency.
+module mcp.settings;
 
 import std.typecons : Nullable;
 
@@ -16,15 +19,15 @@ import mcp.server.server : McpServer, ServerMode;
 import mcp.transport.streamable_http : StreamableHttpOptions;
 import mcp.transport.stdio : StdioOptions;
 
-/// Static configuration for an MCP server, and the primary documented path for
-/// declaring it. `newServer` constructs an `McpServer` from the identity + mode
-/// and then applies the capability/validation flags by calling the corresponding
-/// `enable*`/`disable*` methods. The per-flag `enable*` methods remain on
-/// `McpServer` for dynamic/runtime configuration (toggling a capability after
-/// construction); for the fixed configuration a server is born with, set it here.
+/// Static configuration for an MCP server, gathered in one value. `newServer`
+/// constructs an `McpServer` from the identity + mode and then applies the
+/// capability/validation flags by calling the corresponding `enable*`/`disable*`
+/// methods, so it is equivalent to calling the `McpServer` factory and those
+/// methods directly; either path is fine, and the methods also serve runtime
+/// changes after construction.
 ///
 /// The nested `http` / `stdio` carry the transport options consumed by the
-/// matching `run*` overloads below.
+/// `ServerSettings` overloads of `runStreamableHttp` / `runStdio`.
 ///
 /// Note: `enableTasks` is deliberately NOT a settings flag — it returns a
 /// `TaskRuntime` and takes a `TaskStore`, so it stays a method-only surface called

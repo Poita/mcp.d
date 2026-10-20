@@ -7,7 +7,7 @@ import vibe.data.json : Json;
 import mcp.protocol.jsonrpc : Message, takeBatchReplies;
 import mcp.protocol.versions : ProtocolVersion;
 import mcp.server.server;
-import mcp.server.settings : ServerSettings;
+import mcp.settings : ServerSettings;
 import mcp.transport.coordinator : defaultServerRequestTimeout;
 import mcp.transport.duplex : DuplexChannel, PostQueue, defaultMaxLineBytes, stderrLog;
 import mcp.transport.lines : FrameHead, LineReader;
