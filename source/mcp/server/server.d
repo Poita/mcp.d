@@ -1292,12 +1292,7 @@ final class McpServer : ServerCore
 					~ " 2026-07-28. Construct the server with McpServer.stateless() instead.");
 		if (taskRuntime_ !is null)
 		{
-			bool holdsTasks;
-			taskRuntime_.store.removeIf((const TaskRecord) @safe {
-				holdsTasks = true;
-				return false;
-			});
-			if (holdsTasks)
+			if (!taskRuntime_.store.empty)
 				throw new Exception("enableTasks() must come before any task is created:"
 						~ " a new runtime would drop the tasks the current one holds");
 			taskRuntime_.stopSweeper();

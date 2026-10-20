@@ -2037,6 +2037,11 @@ version (unittest) private final class RacingTaskStore : TaskStore
 		return inner.removeIf(pred);
 	}
 
+	bool empty() @safe
+	{
+		return inner.empty;
+	}
+
 	size_t countUnsettled(string owner) @safe
 	{
 		return inner.countUnsettled(owner);
@@ -2264,6 +2269,11 @@ version (unittest) private final class StaleReadTaskStore : TaskStore
 		return inner.removeIf(pred);
 	}
 
+	bool empty() @safe
+	{
+		return inner.empty;
+	}
+
 	size_t countUnsettled(string owner) @safe
 	{
 		return inner.countUnsettled(owner);
@@ -2432,6 +2442,11 @@ version (unittest) private final class SweepCountingStore : TaskStore
 	{
 		sweeps++;
 		return inner.removeIf(pred);
+	}
+
+	bool empty() @safe
+	{
+		return inner.empty;
 	}
 
 	size_t countUnsettled(string owner) @safe

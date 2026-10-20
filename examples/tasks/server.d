@@ -152,6 +152,7 @@ void main(string[] args) @safe
 	//       bool compareAndSwap(TaskRecord r, ulong expected) { /* WATCH id; check revision; MULTI; SET */ }
 	//       void remove(string id)               { redis.del(id); }
 	//       size_t removeIf(scope bool delegate(const TaskRecord) @safe pred) { /* SCAN + DEL */ }
+	//       bool empty()                     { /* DBSIZE == 0, or a key count */ }
 	//       size_t countUnsettled(string owner)  { /* per-owner set of unsettled ids */ }
 	//       size_t countSettled(string owner)    { /* per-owner set of settled ids */ }
 	//   }

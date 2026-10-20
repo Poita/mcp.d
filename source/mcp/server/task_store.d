@@ -228,6 +228,10 @@ interface TaskStore
 	/// evaluate `pred` on every record even when it also expires keys natively.
 	size_t removeIf(scope bool delegate(const TaskRecord) @safe pred) @safe;
 
+	/// Whether the store holds no records at all. `McpServer.enableTasks`
+	/// checks it before replacing a runtime, so it must not scan the store.
+	bool empty() @safe;
+
 	/// How many records owned by `owner` ("" for unbound tasks) are not yet
 	/// terminal, leaving out `requestBacked` ones. The runtime enforces its per-principal task caps with it on
 	/// every task creation, so it must not scan the store: a shared store answers
@@ -326,6 +330,11 @@ final class InMemoryTaskStore : TaskStore
 		foreach (id; doomed)
 			remove(id);
 		return doomed.length;
+	}
+
+	bool empty() @safe
+	{
+		return records.length == 0;
 	}
 
 	size_t countUnsettled(string owner) @safe
@@ -642,6 +651,18 @@ unittest  // countSettled follows a record into and out of a terminal status, sk
 
 	s.remove("a");
 	assert(s.countSettled("alice") == 0);
+}
+
+unittest  // InMemoryTaskStore.empty reports whether any record is stored
+{
+	auto s = new InMemoryTaskStore();
+	assert(s.empty);
+	TaskRecord r;
+	r.meta.taskId = "a";
+	s.put(r);
+	assert(!s.empty);
+	s.remove("a");
+	assert(s.empty);
 }
 
 unittest  // removeIf drops exactly the records matching the predicate
