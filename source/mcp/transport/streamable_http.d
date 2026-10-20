@@ -4149,7 +4149,8 @@ package bool hostAllowed(string host, const string[] extra) @safe
 	foreach (entry; extra)
 	{
 		string entryName, entryPort;
-		splitHostPort(entry, entryName, entryPort);
+		if (!splitHostPort(entry, entryName, entryPort))
+			continue;
 		if (entryName.length && sicmp(entryName, name) == 0
 				&& (entryPort.length == 0 || entryPort == port
 					|| (port.length == 0 && isDefaultPort(entryPort))))
@@ -4244,8 +4245,7 @@ private string normalizeOrigin(string origin) @safe
 	if ((scheme == "http" && o.endsWith(":80")) || (scheme == "https" && o.endsWith(":443")))
 	{
 		string name, port;
-		splitHostPort(o[sep + 3 .. $], name, port);
-		if (port.length)
+		if (splitHostPort(o[sep + 3 .. $], name, port) && port.length)
 			o = o[0 .. o.length - port.length - 1];
 	}
 	return o;
