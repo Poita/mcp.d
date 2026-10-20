@@ -1280,7 +1280,8 @@ final class HttpClientTransport : ClientTransport
 				// reaches the caller, with the HTTP status kept for the fallback.
 				if (isLegacyFallbackStatus(status))
 				{
-					const b = readRemaining(conn, chunked, maxMessageBytes, head.contentLength);
+					const b = readRemaining(conn, chunked, maxMessageBytes,
+							head.contentLength, true);
 					McpException modernErr;
 					err = modernErrorFromBody(b, modernErr) ? modernErr : httpStatusError(status,
 							b, wwwAuthenticate);
@@ -1292,7 +1293,7 @@ final class HttpClientTransport : ClientTransport
 				if (status < 200 || status >= 300)
 				{
 					err = httpStatusError(status, readRemaining(conn, chunked,
-							maxMessageBytes, head.contentLength), wwwAuthenticate);
+							maxMessageBytes, head.contentLength, true), wwwAuthenticate);
 					return;
 				}
 
@@ -1306,7 +1307,12 @@ final class HttpClientTransport : ClientTransport
 						m = parseMessage(b);
 					catch (Exception)
 					{
-						err = httpStatusError(status, b, wwwAuthenticate);
+						// No body at all (a 202 for a request) is reported with its
+						// status; a body that is there but does not parse is a broken
+						// response, not an HTTP-level rejection.
+						err = b.length == 0 ? httpStatusError(status, b,
+								wwwAuthenticate) : internalError("HTTP " ~ idStr(status)
+								~ " response body from the MCP endpoint is not a valid JSON-RPC message");
 						return;
 					}
 					const forUs = m.id.type == Json.Type.int_ && m.id.get!long == expectId;
@@ -1439,9 +1445,11 @@ final class HttpClientTransport : ClientTransport
 	/// transfer-encoding when `chunked` is true, else exactly `contentLength`
 	/// bytes when it is known (non-negative), else to end-of-stream. Used for the
 	/// small non-streaming JSON body and the 4xx legacy-fallback body. A body
-	/// longer than `maxBytes` fails with an `McpException`.
+	/// longer than `maxBytes` fails with an `McpException`. A read error before
+	/// the end of an end-of-stream body throws, unless `partialOk` asks for what
+	/// arrived (an error status's body, wanted only for its detail).
 	private static string readRemaining(Conn)(Conn conn, bool chunked,
-			size_t maxBytes, long contentLength = -1) @safe
+			size_t maxBytes, long contentLength = -1, bool partialOk = false) @safe
 	{
 		import vibe.core.stream : IOMode;
 
@@ -1463,14 +1471,26 @@ final class HttpClientTransport : ClientTransport
 		}
 		else
 		{
+			// An unframed body ends where the peer closes the connection. `empty`
+			// reports that clean end; a read that fails before it (a timeout, a
+			// TLS error) is a transport failure, never a complete body, unless
+			// `partialOk` (an error status's body, read only for its detail).
 			for (;;)
 			{
 				ubyte[4096] buf;
 				size_t n;
 				try
+				{
+					if (conn.empty)
+						break;
 					n = conn.read(buf, IOMode.once);
-				catch (Exception)
-					break;
+				}
+				catch (Exception e)
+				{
+					if (partialOk)
+						break;
+					throw e;
+				}
 				if (n == 0)
 					break;
 				if (n > maxBytes - acc.length)
@@ -2406,8 +2426,8 @@ final class HttpClientTransport : ClientTransport
 					}
 					if (status < 200 || status >= 300)
 					{
-						const b = readRemaining(conn, chunked,
-								maxMessageBytes, head.contentLength);
+						const b = readRemaining(conn, chunked, maxMessageBytes,
+								head.contentLength, true);
 						if (sentBearer.length && isRejectedBearer(status,
 								wwwAuthenticate) && refreshBearer(sentBearer))
 						{
@@ -4318,6 +4338,82 @@ unittest  // readRemaining rejects a raw body that exceeds the message limit
 	auto stream = createMemoryStream(cast(ubyte[]) "x".replicate(4096).dup, false);
 	auto e = collectException(HttpClientTransport.readRemaining(stream, false, 1024));
 	assert(cast(McpException) e !is null, "a raw body past the limit must fail the read");
+}
+
+unittest  // readRemaining fails, rather than returning a truncated body, when an unframed read errors
+{
+	import std.exception : collectException;
+	import vibe.core.stream : InputStream, IOMode;
+
+	// Delivers the start of a body, then fails the way a reset connection does.
+	static final class ResetConn : InputStream
+	{
+		bool delivered;
+		alias read = InputStream.read;
+
+		@property bool empty() @safe
+		{
+			return false;
+		}
+
+		@property ulong leastSize() @safe
+		{
+			return delivered ? 1 : 9;
+		}
+
+		@property bool dataAvailableForRead() @safe
+		{
+			return !delivered;
+		}
+
+		const(ubyte)[] peek() @safe
+		{
+			return null;
+		}
+
+		size_t read(scope ubyte[] buf, IOMode mode) @safe
+		{
+			if (delivered)
+				throw new Exception("connection reset by peer");
+			delivered = true;
+			buf[0 .. 9] = cast(const(ubyte)[]) `{"jsonrpc`;
+			return 9;
+		}
+	}
+
+	auto e = collectException(HttpClientTransport.readRemaining(new ResetConn, false, 1024));
+	assert(e !is null, "a read error mid-body must not look like the end of the body");
+}
+
+unittest  // a 200 reply whose body is not JSON-RPC fails as a broken response, not an HTTP rejection
+{
+	import mcp.client.client : McpClient;
+
+	auto router = answeringRouter((Json req, HTTPServerResponse res) @safe {
+		res.writeBody(`{"jsonrpc":"2.0","res`, "application/json");
+	});
+	Exception caught;
+	const failure = runAgainstFakeServer(router, (string url) @safe {
+		auto client = McpClient.http(url);
+		scope (exit)
+			client.close();
+		client.initialize("2025-11-25");
+		try
+			client.listTools();
+		catch (Exception e)
+			caught = e;
+	});
+	assert(failure.length == 0, "scenario failed: " ~ failure);
+	assert(cast(McpException) caught !is null, caught is null ? "no error" : caught.msg);
+	assert(cast(HttpStatusException) caught is null, "misreported as an HTTP error: " ~ caught.msg);
+}
+
+unittest  // readRemaining reads an unframed body to its clean end
+{
+	import vibe.stream.memory : createMemoryStream;
+
+	auto stream = createMemoryStream(cast(ubyte[]) `{"jsonrpc":"2.0"}`.dup, false);
+	assert(HttpClientTransport.readRemaining(stream, false, 1024) == `{"jsonrpc":"2.0"}`);
 }
 
 unittest  // readHeaderLines rejects a header line longer than the header line limit
