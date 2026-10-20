@@ -31,10 +31,7 @@ ProtocolVersion extensionMinVersion(string identifier) pure nothrow @safe @nogc
 	case "io.modelcontextprotocol/ui": // Apps
 	case "io.modelcontextprotocol/skills": // Skills (SEP-2640)
 		return ProtocolVersion.v2025_11_25;
-	case tasksExtensionKey: // Tasks (SEP-2663) — modern only
-	case eventsExtensionKey: // Events — modern only
-		return ProtocolVersion.v2026_07_28;
-	default:
+	default: // Tasks, Events and any unknown extension
 		return ProtocolVersion.v2026_07_28;
 	}
 }
