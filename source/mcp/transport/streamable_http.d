@@ -1688,7 +1688,10 @@ private string resourceMetadataUrl(scope HTTPServerRequest req, StreamableHttpOp
 	{
 		import std.string : strip, toLower;
 
-		string scheme = isLoopbackHostname(stripPort(host)) ? "http" : "https";
+		// A TLS connection is https. A plain one is http on a loopback host and
+		// otherwise taken to sit behind a TLS-terminating proxy; a trusted
+		// X-Forwarded-Proto names the scheme the proxy received.
+		string scheme = req.tls || !isLoopbackHostname(stripPort(host)) ? "https" : "http";
 		if (opts.trustProxyHeaders)
 		{
 			const forwarded = req.headers.get("X-Forwarded-Proto", "").strip.toLower;
@@ -8629,6 +8632,19 @@ unittest  // X-Forwarded-Proto is ignored unless proxy headers are trusted
 
 	const www = challengeWith(false, "http");
 	assert(www.canFind(`resource_metadata="https://mcp.example.com/`), www);
+}
+
+unittest  // a TLS request on a loopback host advertises an https resource_metadata URL
+{
+	import std.string : startsWith;
+	import vibe.http.server : createTestHTTPServerRequest;
+	import vibe.inet.url : URL;
+
+	StreamableHttpOptions opts;
+	auto req = createTestHTTPServerRequest(URL("https://localhost:8443/mcp"));
+	req.headers["Host"] = "localhost:8443";
+	const url = resourceMetadataUrl(req, opts);
+	assert(url.startsWith("https://localhost:8443/"), url);
 }
 
 unittest  // a trusted X-Forwarded-Proto sets the resource_metadata scheme
