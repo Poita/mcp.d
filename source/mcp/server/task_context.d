@@ -278,7 +278,8 @@ alias TaskExecutor = Json delegate(TaskContext tc) @safe;
 /// afterwards. A task whose record was removed during the run is left gone.
 /// A task already cancelled or removed when the dispatch starts is settled
 /// without invoking the executor, and one that is not `working` (already
-/// settled or awaiting input) or was detached is left as it is.
+/// settled or awaiting input), was detached, or is held by another running
+/// dispatch (`TaskOptions.dispatchLease`) is left as it is.
 /// Pure over the store, so it is correct whether invoked in-process or by a
 /// remote worker. Throws only when the outcome cannot be recorded (e.g. the
 /// store is unreachable).
@@ -332,11 +333,14 @@ private void drive(ref TaskContext tc, TaskExecutor executor) @safe
 		settleCancelled();
 		return;
 	}
-	// Only a working task with no detached hand-off awaits this dispatch; a
-	// redelivered one for a task that settled, suspended or detached would
-	// repeat the executor's side effects.
+	// Only a working task with no detached hand-off and no other dispatch
+	// running it awaits this dispatch; a redelivered one for a task that
+	// settled, suspended, detached or is mid-run would repeat the executor's
+	// side effects.
+	if (!rt.claimDispatch(taskId))
+		return;
 	auto rec = rt.recordOf(taskId);
-	if (rec.isNull || rec.get.meta.status != TaskStatus.working || rec.get.detached)
+	if (rec.isNull)
 		return;
 	tc.outcome_.executorInput = rec.get.executorInput;
 	tc.outcome_.inputs = rec.get.inputResponses;
@@ -730,6 +734,52 @@ unittest  // a redelivered dispatch of a task awaiting input never invokes the e
 	runTaskExecutor(rt, t.taskId, exec);
 	assert(runs == 1);
 	assert(rt.getDetailed(t.taskId)["status"].get!string == "input_required");
+}
+
+unittest  // a dispatch redelivered while the first one runs never invokes the executor again
+{
+	import mcp.server.task_runtime : TaskOptions;
+
+	auto rt = new TaskRuntime(TaskOptions.init);
+	auto t = rt.createFor("charge", Json.undefined);
+	int runs;
+	TaskExecutor exec;
+	exec = (TaskContext tc) @safe {
+		runs++;
+		// The queue redelivers the task while this dispatch is mid-run.
+		runTaskExecutor(rt, tc.taskId, exec);
+		return Json(["structuredContent": Json(["run": Json(runs)])]);
+	};
+	runTaskExecutor(rt, t.taskId, exec);
+	assert(runs == 1);
+	assert(rt.getDetailed(t.taskId)["status"].get!string == "completed");
+}
+
+unittest  // a dispatch claim past its lease lets a redelivery take over the task
+{
+	import core.time : minutes;
+	import mcp.server.task_runtime : TaskOptions;
+
+	string now = "2026-06-07T10:00:00Z";
+	TaskOptions o;
+	o.nowIso = () @safe => now;
+	o.dispatchLease = 5.minutes;
+	auto rt = new TaskRuntime(o);
+	auto t = rt.createFor("job", Json.undefined);
+	// A worker claimed the task, then crashed without settling it.
+	assert(rt.claimDispatch(t.taskId));
+	int runs;
+	TaskExecutor exec = (TaskContext tc) @safe {
+		runs++;
+		return Json(["content": Json.emptyArray]);
+	};
+	now = "2026-06-07T10:04:00Z";
+	runTaskExecutor(rt, t.taskId, exec);
+	assert(runs == 0);
+	now = "2026-06-07T10:05:00Z";
+	runTaskExecutor(rt, t.taskId, exec);
+	assert(runs == 1);
+	assert(rt.getDetailed(t.taskId)["status"].get!string == "completed");
 }
 
 unittest  // a redelivered dispatch of a detached task never invokes the executor

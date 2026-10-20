@@ -37,6 +37,11 @@ enum Duration unlimitedTaskTtl = Duration.max;
 /// node vanished — and is failed, or cancelled when a cancel was requested, then
 /// expires by its TTL like any settled task. An executor that runs longer keeps
 /// its task alive by reporting progress; zero disables the bound.
+/// `dispatchLease` is how long a dispatch's claim on a running task holds
+/// without the executor reporting progress: until then a redelivered dispatch
+/// of the task is skipped, and after it the claim is taken to belong to a
+/// crashed worker and a redelivery runs the executor again (zero keeps a claim
+/// until the dispatch ends or the task is settled as abandoned).
 /// `sweepInterval` is how often `enableTasks`'s background sweep removes expired
 /// tasks (zero disables it; expired tasks are still hidden on access). `nowIso` is an
 /// injectable clock returning an ISO-8601 extended timestamp (the runtime throws
@@ -50,6 +55,7 @@ struct TaskOptions
 	Duration defaultPollInterval = 5.seconds;
 	Duration sweepInterval = 30.seconds;
 	Duration maxUnsettledIdle = 24.hours;
+	Duration dispatchLease = 5.minutes;
 	/// Most unsettled (working or input_required) tasks one authenticated
 	/// principal may hold; creating another fails with `-32013` (0 = unlimited).
 	size_t maxUnsettledPerPrincipal = 100;
@@ -505,10 +511,63 @@ final class TaskRuntime
 
 	/// Move `r` to `status`. The status message describes the state being left,
 	/// so it is cleared; a caller with a message for the new state sets it after.
+	/// A status change ends the running dispatch's hold, so its claim is
+	/// released.
 	private static void transition(ref TaskRecord r, TaskStatus status) @safe
 	{
 		r.meta.status = status;
 		r.meta.statusMessage = Nullable!string.init;
+		r.dispatchClaimedAt = null;
+	}
+
+	/// Claim the `working` task `id` for the dispatch about to run its
+	/// executor, so a redelivery of the same task while it runs is skipped.
+	/// Returns false, changing nothing, when the task is unknown, not
+	/// `working`, detached, or held by another dispatch whose claim is within
+	/// `TaskOptions.dispatchLease` of its claim or of the task's last progress.
+	/// The claim is released when the task changes status or is detached.
+	package(mcp) bool claimDispatch(string id) @safe
+	{
+		bool claimed;
+		try
+			modify(id, (ref TaskRecord r) @safe {
+				claimed = false;
+				if (r.meta.status != TaskStatus.working || r.detached
+					|| holdsLiveClaim(r, currentTime()))
+					return Change.none;
+				r.dispatchClaimedAt = stamp();
+				claimed = true;
+				return Change.state;
+			});
+		catch (McpException e)
+		{
+			if (!statusOf(id).isNull)
+				throw e;
+			return false;
+		}
+		return claimed;
+	}
+
+	/// Whether a dispatch's claim on `r` still holds at `now`: it was taken,
+	/// and neither it nor the task's last status change is a full
+	/// `dispatchLease` old. An unparseable timestamp cannot be aged, so its
+	/// claim lapses.
+	private bool holdsLiveClaim(const TaskRecord r, SysTime now) @safe
+	{
+		if (r.dispatchClaimedAt.length == 0)
+			return false;
+		if (opts_.dispatchLease <= Duration.zero)
+			return true;
+		try
+		{
+			auto since = SysTime.fromISOExtString(r.dispatchClaimedAt);
+			const updated = SysTime.fromISOExtString(r.meta.lastUpdatedAt);
+			if (updated > since)
+				since = updated;
+			return now - since < opts_.dispatchLease;
+		}
+		catch (Exception)
+			return false;
 	}
 
 	/// Update a `working`/`input_required` task's human-readable status message.
@@ -623,6 +682,7 @@ final class TaskRuntime
 				return Change.status;
 			}
 			r.detached = true;
+			r.dispatchClaimedAt = null;
 			return Change.state;
 		});
 	}

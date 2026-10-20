@@ -32,6 +32,10 @@ struct TaskRecord
 	/// The executor handed the task off via `TaskContext.detach`: no dispatch is
 	/// running, so a cancel settles the task at once.
 	bool detached;
+	/// When the dispatch running the executor claimed the task (ISO-8601);
+	/// empty when no dispatch holds it. A redelivered dispatch finding a live
+	/// claim leaves the task to the running one.
+	string dispatchClaimedAt;
 	string toolName; /// executor key — which registered task executor drives this task
 	/// The authenticated principal (token subject) whose request created the
 	/// task; every later tasks/* request must come from the same principal. Empty
@@ -59,6 +63,7 @@ struct TaskRecord
 			r.inputResponses[k] = cloneJson(v);
 		r.cancelRequested = cancelRequested;
 		r.detached = detached;
+		r.dispatchClaimedAt = dispatchClaimedAt;
 		r.toolName = toolName;
 		r.owner = owner;
 		r.revision = revision;
@@ -86,6 +91,8 @@ struct TaskRecord
 		j["cancelRequested"] = cancelRequested;
 		if (detached)
 			j["detached"] = true;
+		if (dispatchClaimedAt.length)
+			j["dispatchClaimedAt"] = dispatchClaimedAt;
 		j["toolName"] = toolName;
 		j["revision"] = revision;
 		if (owner.length)
@@ -128,6 +135,8 @@ struct TaskRecord
 			&& j["cancelRequested"].type == Json.Type.bool_ && j["cancelRequested"].get!bool;
 		r.detached = ("detached" in j) && j["detached"].type == Json.Type.bool_
 			&& j["detached"].get!bool;
+		if ("dispatchClaimedAt" in j && j["dispatchClaimedAt"].type == Json.Type.string)
+			r.dispatchClaimedAt = j["dispatchClaimedAt"].get!string;
 		if ("toolName" in j && j["toolName"].type == Json.Type.string)
 			r.toolName = j["toolName"].get!string;
 		if ("revision" in j && j["revision"].type == Json.Type.int_)
