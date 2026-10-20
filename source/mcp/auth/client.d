@@ -41,12 +41,13 @@ enum FetchResult
 
 /// Whether a protected-resource metadata document's `resource` identifies the
 /// MCP server at `mcpEndpoint` (RFC 9728 §3.3). After canonicalizing both, the
-/// resource must equal the endpoint or be a same-origin path prefix of it ending
-/// on a `/` boundary — the latter covers a document served at the root
-/// well-known URL that names the whole origin (or a parent path) as the
-/// resource. An endpoint's query string is ignored unless the resource names
-/// that same query. A missing `resource` never matches.
-package bool prmResourceMatches(string prmResource, string mcpEndpoint) @safe
+/// resource must equal the endpoint; with `allowParent` it may instead be a
+/// same-origin path prefix of it ending on a `/` boundary, which covers a
+/// document served at the endpoint's own well-known URL that names the whole
+/// origin (or a parent path) as the resource. An endpoint's query string is
+/// ignored unless the resource names that same query. A missing `resource`
+/// never matches.
+package bool prmResourceMatches(string prmResource, string mcpEndpoint, bool allowParent) @safe
 {
 	import std.string : indexOf, startsWith;
 
@@ -60,7 +61,8 @@ package bool prmResourceMatches(string prmResource, string mcpEndpoint) @safe
 	const wantPath = query < 0 ? want : canonicalResourceUri(want[0 .. query]);
 	if (have == wantPath)
 		return true;
-	return wantPath.length > have.length && wantPath.startsWith(have) && wantPath[have.length] == '/';
+	return allowParent && wantPath.length > have.length
+		&& wantPath.startsWith(have) && wantPath[have.length] == '/';
 }
 
 /// Where an MCP endpoint's authorization server was found
@@ -240,6 +242,8 @@ final class OAuthClient
 	ProtectedResourceMetadata discoverProtectedResource(string mcpEndpoint,
 			string wwwAuthenticateHeader = "") @safe
 	{
+		import std.algorithm.searching : canFind;
+
 		string[] urls;
 		if (wwwAuthenticateHeader.length)
 		{
@@ -254,7 +258,8 @@ final class OAuthClient
 					policyAnchoredAt(mcpEndpoint)))
 				urls ~= w.resourceMetadata;
 		}
-		urls ~= protectedResourceMetadataUrls(mcpEndpoint);
+		const wellKnown = protectedResourceMetadataUrls(mcpEndpoint);
+		urls ~= wellKnown;
 		// Every candidate is fetched under the policy the user-configured
 		// endpoint permits.
 		const prmPolicy = policyAnchoredAt(mcpEndpoint);
@@ -268,8 +273,12 @@ final class OAuthClient
 			case FetchResult.ok:
 				auto prm = ProtectedResourceMetadata.fromJson(j);
 				// RFC 9728 §3.3: a document describing some other resource MUST NOT
-				// be used (it could steer the client to an attacker's AS).
-				if (!prmResourceMatches(prm.resource, mcpEndpoint))
+				// be used (it could steer the client to an attacker's AS). Only the
+				// endpoint's own well-known URLs, which the origin's operator
+				// controls, may name a parent path as the resource; any other URL
+				// may be served by a co-tenant of a shared origin, so its document
+				// must name the endpoint exactly.
+				if (!prmResourceMatches(prm.resource, mcpEndpoint, wellKnown.canFind(u)))
 					throw internalError("Protected-resource metadata names resource '"
 							~ prm.resource
 							~ "', which does not match the MCP endpoint " ~ mcpEndpoint);
@@ -1911,14 +1920,78 @@ unittest  // a cross-origin resource_metadata document naming another resource i
 	assertThrown(c.discoverProtectedResource(mcp.base ~ "/mcp", www));
 }
 
-unittest  // prmResourceMatches accepts the endpoint itself or a path prefix of it on the same origin
+unittest  // prmResourceMatches with allowParent accepts the endpoint itself or a path prefix of it on the same origin
 {
-	assert(prmResourceMatches("https://mcp.example.com/mcp", "https://mcp.example.com/mcp"));
-	assert(prmResourceMatches("https://MCP.example.com/mcp/", "https://mcp.example.com/mcp"));
-	assert(prmResourceMatches("https://mcp.example.com", "https://mcp.example.com/mcp"));
-	assert(prmResourceMatches("https://mcp.example.com/", "https://mcp.example.com/mcp"));
+	assert(prmResourceMatches("https://mcp.example.com/mcp", "https://mcp.example.com/mcp", true));
+	assert(prmResourceMatches("https://MCP.example.com/mcp/", "https://mcp.example.com/mcp", true));
+	assert(prmResourceMatches("https://mcp.example.com", "https://mcp.example.com/mcp", true));
+	assert(prmResourceMatches("https://mcp.example.com/", "https://mcp.example.com/mcp", true));
 	assert(prmResourceMatches("https://mcp.example.com/tenant",
-			"https://mcp.example.com/tenant/mcp"));
+			"https://mcp.example.com/tenant/mcp", true));
+}
+
+unittest  // prmResourceMatches without allowParent accepts only the endpoint itself
+{
+	assert(prmResourceMatches("https://mcp.example.com/mcp", "https://mcp.example.com/mcp", false));
+	assert(prmResourceMatches("https://MCP.example.com/mcp/", "https://mcp.example.com/mcp", false));
+	assert(prmResourceMatches("https://h.example/mcp", "https://h.example/mcp?tenant=x", false));
+	assert(!prmResourceMatches("https://mcp.example.com", "https://mcp.example.com/mcp", false));
+	assert(!prmResourceMatches("https://mcp.example.com/", "https://mcp.example.com/mcp", false));
+	assert(!prmResourceMatches("https://mcp.example.com/tenant",
+			"https://mcp.example.com/tenant/mcp", false));
+}
+
+unittest  // a challenge-named resource_metadata document naming a parent of the endpoint is rejected
+{
+	import std.exception : assertThrown;
+
+	// A tenant at /evil/mcp on a shared origin names its own document, which
+	// claims the whole origin as the resource.
+	LoopbackServer srv;
+	srv = startLoopback((scope HTTPServerRequest req, scope HTTPServerResponse res) @safe {
+		if (req.requestURI == "/evil/prm")
+			res.writeBody(
+				`{"resource":"` ~ srv.base ~ `","authorization_servers":["https://as.example"]}`,
+				"application/json");
+		else
+		{
+			res.statusCode = 404;
+			res.writeBody("", "text/plain");
+		}
+	});
+	scope (exit)
+		srv.stop();
+
+	auto c = new OAuthClient();
+	const www = `Bearer resource_metadata="` ~ srv.base ~ `/evil/prm"`;
+	assertThrown(c.discoverProtectedResource(srv.base ~ "/evil/mcp", www));
+}
+
+unittest  // a well-known protected-resource document may name a parent of the endpoint
+{
+	import std.algorithm : canFind;
+
+	LoopbackServer srv;
+	srv = startLoopback((scope HTTPServerRequest req, scope HTTPServerResponse res) @safe {
+		if (req.path.canFind("oauth-protected-resource"))
+			res.writeBody(
+				`{"resource":"` ~ srv.base ~ `","authorization_servers":["https://as.example"]}`,
+				"application/json");
+		else
+		{
+			res.statusCode = 404;
+			res.writeBody("", "text/plain");
+		}
+	});
+	scope (exit)
+		srv.stop();
+
+	auto c = new OAuthClient();
+	const endpoint = srv.base ~ "/mcp";
+	assert(c.discoverProtectedResource(endpoint).resource == srv.base);
+	// The challenge may name the endpoint's own well-known URL too.
+	const www = `Bearer resource_metadata="` ~ srv.base ~ `/.well-known/oauth-protected-resource"`;
+	assert(c.discoverProtectedResource(endpoint, www).resource == srv.base);
 }
 
 unittest  // an https loopback MCP endpoint may reach loopback over TLS, but still not private hosts
@@ -1945,21 +2018,25 @@ unittest  // a plain-http loopback MCP endpoint does not open loopback TLS servi
 
 unittest  // prmResourceMatches matches an endpoint carrying a query by its path
 {
-	assert(prmResourceMatches("https://h.example/mcp", "https://h.example/mcp?tenant=x"));
-	assert(prmResourceMatches("https://h.example", "https://h.example/mcp?tenant=x"));
-	assert(prmResourceMatches("https://h.example/mcp?tenant=x", "https://h.example/mcp?tenant=x"));
-	assert(!prmResourceMatches("https://h.example/mcp?tenant=y", "https://h.example/mcp?tenant=x"));
-	assert(!prmResourceMatches("https://h.example/mc", "https://h.example/mcp?tenant=x"));
+	assert(prmResourceMatches("https://h.example/mcp", "https://h.example/mcp?tenant=x", true));
+	assert(prmResourceMatches("https://h.example", "https://h.example/mcp?tenant=x", true));
+	assert(prmResourceMatches("https://h.example/mcp?tenant=x",
+			"https://h.example/mcp?tenant=x", true));
+	assert(!prmResourceMatches("https://h.example/mcp?tenant=y",
+			"https://h.example/mcp?tenant=x", true));
+	assert(!prmResourceMatches("https://h.example/mc", "https://h.example/mcp?tenant=x", true));
 }
 
 unittest  // prmResourceMatches rejects another origin, a sibling path, and a missing resource
 {
-	assert(!prmResourceMatches("https://other.example/mcp", "https://mcp.example.com/mcp"));
-	assert(!prmResourceMatches("https://mcp.example.com:8443/mcp", "https://mcp.example.com/mcp"));
-	assert(!prmResourceMatches("http://mcp.example.com/mcp", "https://mcp.example.com/mcp"));
-	assert(!prmResourceMatches("https://mcp.example.com/mc", "https://mcp.example.com/mcp"));
-	assert(!prmResourceMatches("https://mcp.example.com/mcp/admin", "https://mcp.example.com/mcp"));
-	assert(!prmResourceMatches("", "https://mcp.example.com/mcp"));
+	assert(!prmResourceMatches("https://other.example/mcp", "https://mcp.example.com/mcp", true));
+	assert(!prmResourceMatches("https://mcp.example.com:8443/mcp",
+			"https://mcp.example.com/mcp", true));
+	assert(!prmResourceMatches("http://mcp.example.com/mcp", "https://mcp.example.com/mcp", true));
+	assert(!prmResourceMatches("https://mcp.example.com/mc", "https://mcp.example.com/mcp", true));
+	assert(!prmResourceMatches("https://mcp.example.com/mcp/admin",
+			"https://mcp.example.com/mcp", true));
+	assert(!prmResourceMatches("", "https://mcp.example.com/mcp", true));
 }
 
 unittest  // discovery refuses an oversized metadata document instead of buffering it

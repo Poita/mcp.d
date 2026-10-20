@@ -1488,8 +1488,12 @@ OAuthSession useOAuth(McpClient client, string mcpEndpoint, OAuthLogin opts) @sa
 
 	auto store = opts.store !is null ? opts.store : new FileTokenStore(defaultTokenStorePath());
 
+	// Tokens are stored under the configured endpoint, never a broader resource a
+	// metadata document names, so a token obtained for one endpoint is only ever
+	// presented to that endpoint.
+	const storeKey = canonicalResourceUri(mcpEndpoint);
 	auto oauth = new OAuthClient();
-	oauth.resource = canonicalResourceUri(mcpEndpoint);
+	oauth.resource = storeKey;
 	oauth.authMethod = opts.authMethod;
 	oauth.clientIdMetadataUrl = opts.clientIdMetadataUrl;
 	oauth.ssrfPolicy = opts.ssrfPolicy;
@@ -1502,8 +1506,9 @@ OAuthSession useOAuth(McpClient client, string mcpEndpoint, OAuthLogin opts) @sa
 	// origin fallback.
 	const located = oauth.discoverIssuer(mcpEndpoint, opts.wwwAuthenticate);
 	// RFC 9728: the protected-resource metadata names the resource the server
-	// protects, which may be a parent of the endpoint (`prmResourceMatches`); that
-	// is the audience the server checks, so it is the resource indicator to send.
+	// protects, which a well-known document may give as a parent of the endpoint
+	// (`prmResourceMatches`); that is the audience the server checks, so it is the
+	// resource indicator to send.
 	if (located.fromProtectedResourceMetadata && located.metadata.resource.length)
 		oauth.resource = canonicalResourceUri(located.metadata.resource);
 	auto as_ = oauth.discoverAuthServer(located.issuer, located.fromProtectedResourceMetadata);
@@ -1520,7 +1525,7 @@ OAuthSession useOAuth(McpClient client, string mcpEndpoint, OAuthLogin opts) @sa
 	// refresh token at the same time.
 	OAuthSession fromCache() @safe
 	{
-		auto cached = store.load(oauth.resource);
+		auto cached = store.load(storeKey);
 		if (cached.issuer.length == 0 || cached.issuer != as_.issuer)
 			cached = StoredToken.init;
 		// An expired client secret can no longer authenticate a refresh, so the
@@ -1537,7 +1542,7 @@ OAuthSession useOAuth(McpClient client, string mcpEndpoint, OAuthLogin opts) @sa
 		if (scopesGranted && cached.hasToken && !needsRefresh(cached, now))
 		{
 			return new OAuthSession(oauth, as_, cacheHitClient(cached, opts),
-					store, oauth.resource, cached);
+					store, storeKey, cached);
 		}
 
 		// A refresh token is bound to the client that obtained it (RFC 6749 §6), so
@@ -1551,15 +1556,15 @@ OAuthSession useOAuth(McpClient client, string mcpEndpoint, OAuthLogin opts) @sa
 				auto ts = oauth.refresh(as_, prior, cached.refreshToken);
 				if (ts.accessToken.length)
 				{
-					auto refreshed = StoredToken.fromTokenSet(ts,
-							oauth.resource, now, cached.refreshToken);
+					auto refreshed = StoredToken.fromTokenSet(ts, storeKey,
+							now, cached.refreshToken);
 					if (refreshed.scope_.length == 0)
 						refreshed.scope_ = cached.scope_;
 					refreshed.setClient(persistedClient(prior, opts));
 					refreshed.tokenEndpointAuthMethod = cached.tokenEndpointAuthMethod;
 					refreshed.issuer = as_.issuer;
-					store.save(oauth.resource, refreshed);
-					return new OAuthSession(oauth, as_, prior, store, oauth.resource, refreshed);
+					store.save(storeKey, refreshed);
+					return new OAuthSession(oauth, as_, prior, store, storeKey, refreshed);
 				}
 				logWarn("OAuth refresh for %s returned no access token; "
 						~ "starting an interactive login", oauth.resource);
@@ -1574,7 +1579,7 @@ OAuthSession useOAuth(McpClient client, string mcpEndpoint, OAuthLogin opts) @sa
 	}
 
 	OAuthSession cachedSession;
-	store.withLock(oauth.resource, () @safe { cachedSession = fromCache(); });
+	store.withLock(storeKey, () @safe { cachedSession = fromCache(); });
 	if (cachedSession !is null)
 		return attachSession(client, cachedSession);
 
@@ -1613,7 +1618,7 @@ OAuthSession useOAuth(McpClient client, string mcpEndpoint, OAuthLogin opts) @sa
 	// wall time, not the time useOAuth was entered (which predates the
 	// interactive browser wait by however long the user took to authenticate).
 	const long issuedAt = Clock.currTime().toUnixTime();
-	auto stored = StoredToken.fromTokenSet(ts, oauth.resource, issuedAt);
+	auto stored = StoredToken.fromTokenSet(ts, storeKey, issuedAt);
 	// An omitted `scope` means the requested scope was granted (RFC 6749 §5.1).
 	if (stored.scope_.length == 0)
 		stored.scope_ = opts.scopeString();
@@ -1621,8 +1626,8 @@ OAuthSession useOAuth(McpClient client, string mcpEndpoint, OAuthLogin opts) @sa
 	if (rc.clientId != opts.clientId)
 		stored.tokenEndpointAuthMethod = cast(string) oauth.authMethod;
 	stored.issuer = as_.issuer;
-	store.save(oauth.resource, stored);
-	return attachSession(client, new OAuthSession(oauth, as_, rc, store, oauth.resource, stored));
+	store.save(storeKey, stored);
+	return attachSession(client, new OAuthSession(oauth, as_, rc, store, storeKey, stored));
 }
 
 /// Install `session` as `client`'s bearer provider, so each request carries a
@@ -3312,6 +3317,42 @@ unittest  // useOAuth requests the resource the protected-resource metadata name
 
 	assertThrown(useOAuth(McpClient.http(endpoint), endpoint, opts));
 	assert((authUrl ~ "&").canFind("resource=" ~ encodeComponent(srv.base) ~ "&"), authUrl);
+}
+
+unittest  // useOAuth keys the token store by the endpoint, not a parent resource the metadata names
+{
+	import core.time : msecs;
+	import std.exception : assertThrown;
+	import mcp.auth.oauth : canonicalResourceUri;
+
+	auto srv = startIssuerTestAuthServer();
+	scope (exit)
+		srv.stop();
+	srv.prmResource = srv.base;
+	const endpoint = srv.base ~ "/mcp";
+
+	// A token cached for the whole origin is never sent to an endpoint beneath it.
+	auto store = new MemoryTokenStore();
+	StoredToken t;
+	t.accessToken = "origin-token";
+	t.resource = canonicalResourceUri(srv.base);
+	t.issuer = srv.base;
+	store.save(canonicalResourceUri(srv.base), t);
+
+	OAuthLogin opts;
+	opts.store = store;
+	opts.callbackTimeout = 50.msecs;
+	opts.openBrowser = (string url) @safe {};
+	assertThrown(useOAuth(McpClient.http(endpoint), endpoint, opts));
+
+	// A token cached under the endpoint itself is reused.
+	t.accessToken = "endpoint-token";
+	t.resource = canonicalResourceUri(endpoint);
+	store.save(canonicalResourceUri(endpoint), t);
+	opts.openBrowser = (string url) @safe {
+		assert(0, "no interactive login expected");
+	};
+	assert(useOAuth(McpClient.http(endpoint), endpoint, opts).token.accessToken == "endpoint-token");
 }
 
 unittest  // useOAuth never sends a refresh token to an authorization server other than its issuer
