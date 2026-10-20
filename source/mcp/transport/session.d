@@ -472,7 +472,7 @@ unittest  // two sessions on one manager get INDEPENDENT ConnectionStates (no cr
 	// in-flight id; NONE may be visible through session B's state.
 	csA.negotiated = ProtocolVersion.v2025_03_26;
 	csA.logLevel = "error";
-	csA.subscriptions["res://a"] = true;
+	csA.subscriptions["res://a"] = 1;
 	csA.inFlight["i:1"] = new CancellationToken;
 
 	assert(csB.negotiated != ProtocolVersion.v2025_03_26,
