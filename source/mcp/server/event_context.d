@@ -174,10 +174,14 @@ final class EventContext
 	private Nullable!long maxAgeMs_;
 	private Nullable!long maxEvents_;
 
+	version (unittest) package static size_t constructed; // contexts built on this thread
+
 	this(Nullable!string cursor, Json arguments, string principal,
 			Nullable!long maxAgeMs = Nullable!long.init,
 			Nullable!long maxEvents = Nullable!long.init) @safe
 	{
+		version (unittest)
+			constructed++;
 		cursor_ = cursor;
 		// A private copy, so a hook that mutates its arguments cannot reach the
 		// stored subscription they came from.

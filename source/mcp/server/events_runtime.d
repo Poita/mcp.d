@@ -2281,10 +2281,10 @@ final class EventsRuntime
 	{
 		EventOccurrence shaped = occ;
 		// A throwing author callback costs only this subscription this event.
-		auto ctx = new EventContext(sub.cursor, sub.arguments, sub.principal);
 		try
 		{
-			if (!shapeFor(reg, ctx, shaped))
+			if (!shapeFor(reg, ()@safe => new EventContext(sub.cursor,
+					sub.arguments, sub.principal), shaped))
 				return false;
 		}
 		catch (Exception e)
@@ -2593,14 +2593,21 @@ final class EventsRuntime
 		return result;
 	}
 
+	// Apply `reg`'s match and transform to `occ` for one subscriber, whose
+	// context `makeCtx` builds only when the type has either: building one
+	// copies the subscription's arguments, a cost every publish would otherwise
+	// pay once per subscriber.
+	private static bool shapeFor(EventRegistration* reg,
+			scope EventContext delegate() @safe makeCtx, ref EventOccurrence occ) @safe
+	{
+		if (reg is null || (reg.match is null && reg.transform is null))
+			return true;
+		return shapeFor(*reg, makeCtx(), occ);
+	}
+
 	// Apply the type's `match`/`transform` to `occ` for the subscription `ctx`
 	// describes, in place. Returns false when `match` drops it. Exceptions from
 	// the author's callbacks propagate.
-	private static bool shapeFor(EventRegistration* reg, EventContext ctx, ref EventOccurrence occ) @safe
-	{
-		return reg is null || shapeFor(*reg, ctx, occ);
-	}
-
 	private static bool shapeFor(ref EventRegistration reg, EventContext ctx,
 			ref EventOccurrence occ) @safe
 	{
@@ -2646,13 +2653,13 @@ final class EventsRuntime
 
 	private void deliverToStream(EventRegistration* reg, PushStream s, EventOccurrence occ) @safe
 	{
-		auto ctx = new EventContext(s.cursor, s.arguments, s.principal);
 		EventOccurrence shaped = occ;
 		// A throwing author callback costs this subscriber this one event, reported
 		// as a recoverable error; the stream stays open for the events after it.
 		try
 		{
-			if (!shapeFor(reg, ctx, shaped))
+			if (!shapeFor(reg, ()@safe => new EventContext(s.cursor,
+					s.arguments, s.principal), shaped))
 				return;
 		}
 		catch (Exception e)
@@ -2717,11 +2724,11 @@ final class EventsRuntime
 			return false;
 		if (!sub.active)
 		{
-			auto ctx = new EventContext(sub.cursor, sub.arguments, sub.principal);
 			bool matched = true;
 			// A throwing match counts as a miss, so the gap signal still covers it.
 			try
-				matched = reg is null || reg.match is null || reg.match(ctx, occ);
+				matched = reg is null || reg.match is null
+					|| reg.match(new EventContext(sub.cursor, sub.arguments, sub.principal), occ);
 			catch (Exception e)
 				logEventsError("match threw", e);
 			if (matched)
@@ -8575,6 +8582,35 @@ unittest  // an unverified endpoint is not re-probed on every emit (verification
 	now += verifyBackoffBaseMs + 1;
 	rt.emit(EventOccurrence("evt_3", "n", "t"));
 	assert(ft.posts.length == afterFirst + 1);
+}
+
+unittest  // publishing to a type with no match or transform builds no per-subscriber context
+{
+	auto ft = new FakeWebhookTransport();
+	EventsOptions o;
+	o.nowMs = () @safe => 1_000_000L;
+	o.nowIso = () @safe => "t";
+	o.allowPrivateCallbackHosts = true;
+	o.callbackAllowlist = ["https://proxy/"];
+	o.webhookTransport = ft;
+	o.deliveryExecutor = (void delegate() @safe job) @safe { job(); };
+	o.pushExecutor = (void delegate() @safe job) @safe { job(); };
+	auto rt = new EventsRuntime(null, o);
+	EventRegistration reg = {descriptor: EventType("n"), emitOnly: true};
+	rt.register(reg);
+	auto a = rt.subscribeWebhook(webhookSub("n", "https://proxy/a"), "user-1");
+	auto b = rt.subscribeWebhook(webhookSub("n", "https://proxy/b"), "user-1");
+	auto suspended = rt.webhookStore().get(b.id).get;
+	suspended.active = false;
+	(cast(InMemoryWebhookSubscriptionStore) rt.webhookStore()).put(suspended);
+	int frames;
+	openLive(rt, "n", Json.emptyObject, "user-1", Json(1), (string m, Json p) @safe {
+		frames++;
+	});
+	const before = EventContext.constructed;
+	rt.emit(EventOccurrence("evt_1", "n", "t"));
+	assert(EventContext.constructed == before);
+	assert(eventIdsPostedTo(ft, "https://proxy/a") == ["evt_1"] && frames == 1);
 }
 
 unittest  // a 410 Gone response is not retried (single event attempt)
