@@ -335,6 +335,9 @@ final class McpServer : ServerCore
 	private bool toolListChangedEnabled;
 	private bool resourcesListChangedEnabled;
 	private bool promptsListChangedEnabled;
+	// The list-changed methods already warned about being sent without their
+	// capability enabled, so each warns once rather than on every notify.
+	private bool[string] listChangedWarned_;
 	private bool validateOutputSchema_;
 	// Per server/tools § Security Considerations ("Servers MUST: Validate all
 	// tool inputs"), input-schema validation is ON by default. It only activates
@@ -867,7 +870,8 @@ final class McpServer : ServerCore
 	/// after a runtime `registerTool` / `removeTool`. For the modern protocol,
 	/// the notification is suppressed unless a client opted in via
 	/// `subscriptions/listen` with `toolsListChanged:true`. Sends nothing
-	/// unless `enableToolsListChanged` advertised the capability.
+	/// unless `enableToolsListChanged` advertised the capability
+	/// (the first such call logs a warning).
 	size_t notifyToolsListChanged() @safe
 	{
 		return notifyChange("notifications/tools/list_changed", Json.undefined, "");
@@ -881,7 +885,8 @@ final class McpServer : ServerCore
 	/// `registerResourceTemplate` (or a removal). For the modern protocol, the
 	/// notification is suppressed unless a client opted in via
 	/// `subscriptions/listen` with `resourcesListChanged:true`. Sends nothing
-	/// unless `enableResourcesListChanged` advertised the capability.
+	/// unless `enableResourcesListChanged` advertised the capability
+	/// (the first such call logs a warning).
 	size_t notifyResourcesListChanged() @safe
 	{
 		return notifyChange("notifications/resources/list_changed", Json.undefined, "");
@@ -894,7 +899,8 @@ final class McpServer : ServerCore
 	/// Call after a runtime `registerPrompt` (or a removal). For 2026-07-28
 	/// protocol, the notification is suppressed unless a client opted in via
 	/// `subscriptions/listen` with `promptsListChanged:true`. Sends nothing
-	/// unless `enablePromptsListChanged` advertised the capability.
+	/// unless `enablePromptsListChanged` advertised the capability
+	/// (the first such call logs a warning).
 	size_t notifyPromptsListChanged() @safe
 	{
 		return notifyChange("notifications/prompts/list_changed", Json.undefined, "");
@@ -1841,6 +1847,33 @@ final class McpServer : ServerCore
 		return 1;
 	}
 
+	/// Log, once per method, that a list-changed notification was dropped because
+	/// its `enable*ListChanged` was never called: the notify call otherwise
+	/// returns 0 exactly as it does with no listener, hiding the missing opt-in.
+	private void warnListChangedDisabled(string method) @safe
+	{
+		import vibe.core.log : logWarn;
+
+		if (method in listChangedWarned_)
+			return;
+		listChangedWarned_[method] = true;
+		string enabler;
+		switch (method)
+		{
+		case "notifications/tools/list_changed":
+			enabler = "enableToolsListChanged";
+			break;
+		case "notifications/resources/list_changed":
+			enabler = "enableResourcesListChanged";
+			break;
+		default:
+			enabler = "enablePromptsListChanged";
+			break;
+		}
+		logWarn("%s is not sent: call %s() to advertise the listChanged capability",
+				method, enabler);
+	}
+
 	/// Whether the server advertises the `listChanged` capability a list-changed
 	/// `method` belongs to; true for any other method.
 	private bool listChangedAdvertised(string method) @safe
@@ -2177,7 +2210,10 @@ final class McpServer : ServerCore
 		// A list-changed notification is sent only when the server advertises
 		// the matching `listChanged` capability, on every transport.
 		if (!listChangedAdvertised(method))
+		{
+			warnListChangedDisabled(method);
 			return 0;
+		}
 		// The stdio transport has no `pushChannel`; its listen stream filters by
 		// its own per-URI `ListenFilter`.
 		size_t delivered = writeStdioListen(method, params, uri);
@@ -12725,6 +12761,40 @@ unittest  // a listen stream receives only the notification types its filter req
 	assert(!frames.canFind!(fr => fr.canFind("notifications/events/list_changed")));
 	s.notify("notifications/tools/list_changed");
 	assert(frames.canFind!(fr => fr.canFind("notifications/tools/list_changed")));
+}
+
+unittest  // a list-changed notify without its capability enabled warns once
+{
+	import std.algorithm : canFind, count;
+	import vibe.core.log : deregisterLogger, LogLevel, Logger, LogLine, registerLogger;
+
+	static final class CaptureLogger : Logger
+	{
+		string[] lines;
+		this() @safe
+		{
+			minLevel = LogLevel.warn;
+		}
+
+		override void log(ref LogLine line) @safe
+		{
+			lines ~= line.text;
+		}
+	}
+
+	auto logger = new CaptureLogger;
+	auto shared_ = () @trusted { return cast(shared) logger; }();
+	() @trusted { registerLogger(shared_); }();
+	scope (exit)
+		() @trusted { deregisterLogger(shared_); }();
+
+	auto s = McpServer.stateless("t", "1");
+	assert(s.notifyToolsListChanged() == 0);
+	assert(s.notifyToolsListChanged() == 0);
+	assert(s.notifyPromptsListChanged() == 0);
+	auto lines = (cast() logger).lines;
+	assert(lines.count!(l => l.canFind("enableToolsListChanged")) == 1);
+	assert(lines.count!(l => l.canFind("enablePromptsListChanged")) == 1);
 }
 
 unittest  // tools listChanged is not advertised by default
