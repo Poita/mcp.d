@@ -707,9 +707,11 @@ private Json withoutNull(Json prop)
 }
 
 /// Bind the JSON value `v` to `T`. `path` is the location of `v` relative to the
-/// top-level value (empty at the top) and prefixes error messages. Throws
-/// `BindException` for a shape or value that does not fit `T`.
-package(mcp) T bindJson(T)(Json v, string path = "")
+/// top-level value (empty at the top) and prefixes error messages. `use` is the
+/// schema `v` conforms to: an output (`SchemaUse.output`) may carry `null` for a
+/// floating-point value, the NaN vibe writes that way, which an input may not.
+/// Throws `BindException` for a shape or value that does not fit `T`.
+package(mcp) T bindJson(T, SchemaUse use = SchemaUse.input)(Json v, string path = "")
 {
 	import jsonschema.attributes : SchemaDefault;
 	import std.conv : to;
@@ -721,7 +723,7 @@ package(mcp) T bindJson(T)(Json v, string path = "")
 	{
 		if (v.type == Json.Type.null_ || v.type == Json.Type.undefined)
 			return T.init;
-		return T(bindJson!(TemplateArgsOf!T[0])(v, path));
+		return T(bindJson!(TemplateArgsOf!T[0], use)(v, path));
 	}
 	else static if (isSumType!T)
 	{
@@ -743,7 +745,7 @@ package(mcp) T bindJson(T)(Json v, string path = "")
 				{
 					try
 					{
-						auto bound = bindJson!V(v, path);
+						auto bound = bindJson!(V, use)(v, path);
 						size_t kept, added;
 						objectFit!V(v, kept, added);
 						if (!found || kept > bestKept || (kept == bestKept && added < bestAdded))
@@ -767,7 +769,7 @@ package(mcp) T bindJson(T)(Json v, string path = "")
 			if (isNativeJsonType!V(v.type))
 			{
 				try
-					return T(bindJson!V(v, path));
+					return T(bindJson!(V, use)(v, path));
 				catch (BindException)
 				{
 				}
@@ -776,7 +778,7 @@ package(mcp) T bindJson(T)(Json v, string path = "")
 		static foreach (V; TemplateArgsOf!T)
 		{
 			try
-				return T(bindJson!V(v, path));
+				return T(bindJson!(V, use)(v, path));
 			catch (BindException)
 			{
 			}
@@ -797,8 +799,9 @@ package(mcp) T bindJson(T)(Json v, string path = "")
 					enum key = wireFieldName!(T, field);
 					const fieldPath = path.length ? path ~ "." ~ key : key;
 					auto p = key in v;
-					if (isPresent!FT(p))
-						setBound(__traits(getMember, result, field), bindJson!FT(*p, fieldPath));
+					if (isPresent!(FT, use)(p))
+						setBound(__traits(getMember, result, field),
+								bindJson!(FT, use)(*p, fieldPath));
 					else if (isInstanceOf!(Nullable, FT) && p !is null && p.type == Json.Type.null_)
 						setBound(__traits(getMember, result, field), FT.init);
 					else static if (hasUDA!(__traits(getMember, T, field), SchemaDefault))
@@ -826,7 +829,7 @@ package(mcp) T bindJson(T)(Json v, string path = "")
 		else
 			auto result = new E[v.length];
 		foreach (idx; 0 .. v.length)
-			result[idx] = bindJson!E(v[idx], path ~ "[" ~ idx.to!string ~ "]");
+			result[idx] = bindJson!(E, use)(v[idx], path ~ "[" ~ idx.to!string ~ "]");
 		return result;
 	}
 	else static if (isAssociativeArray!T && isSomeString!(KeyType!T))
@@ -837,12 +840,12 @@ package(mcp) T bindJson(T)(Json v, string path = "")
 		foreach (kv; v.byKeyValue)
 		{
 			const entryPath = path.length ? path ~ "." ~ kv.key : kv.key;
-			result[kv.key.to!(KeyType!T)] = bindJson!(ValueType!T)(kv.value, entryPath);
+			result[kv.key.to!(KeyType!T)] = bindJson!(ValueType!T, use)(kv.value, entryPath);
 		}
 		return result;
 	}
 	else
-		return bindLeaf!T(v, path);
+		return bindLeaf!(T, use)(v, path);
 }
 
 /// Whether vibe serializes a `V` as a JSON value of type `t`, so a value of
@@ -904,13 +907,14 @@ package(mcp) void setBound(X)(ref X dst, X value)
 
 /// Whether a struct member's JSON value `p` counts as supplied. JSON `null`
 /// means not supplied except for a `Json` field, which binds `null` verbatim, and
-/// a floating-point field, which binds `null` as the NaN vibe writes that way; a
-/// `Nullable` field given `null` binds as unset rather than taking its default.
-private bool isPresent(FT)(const(Json)* p)
+/// a floating-point field of an output (`use` is `SchemaUse.output`), which binds
+/// `null` as the NaN vibe writes that way; a `Nullable` field given `null` binds
+/// as unset rather than taking its default.
+private bool isPresent(FT, SchemaUse use)(const(Json)* p)
 {
 	if (p is null || p.type == Json.Type.undefined)
 		return false;
-	static if (is(FT == Json) || isFloatingPoint!FT)
+	static if (is(FT == Json) || (isFloatingPoint!FT && use == SchemaUse.output))
 		return true;
 	else
 		return p.type != Json.Type.null_;
@@ -960,7 +964,7 @@ package(mcp) T bindString(T)(string raw, string path = "")
 /// not a member, and an integer outside `T`'s range are reported in JSON terms.
 /// An integer also binds from a JSON number with no fractional part (`2.0`),
 /// which JSON Schema's `integer` admits and some clients send.
-private T bindLeaf(T)(Json v, string path)
+private T bindLeaf(T, SchemaUse use)(Json v, string path)
 {
 	import mcp.protocol.schema : EnumByNamePolicy;
 	import std.conv : to;
@@ -1010,8 +1014,12 @@ private T bindLeaf(T)(Json v, string path)
 		import std.math : isFinite, isNaN;
 
 		// vibe writes a NaN, such as an unset field's `.init`, as `null`, and a
-		// floating-point output schema admits it, so both read back as NaN.
-		if (v.type == Json.Type.null_ || (v.type == Json.Type.float_ && v.get!double.isNaN))
+		// floating-point output schema admits it, so an output reads it back as
+		// NaN. An input schema does not admit `null`.
+		static if (use == SchemaUse.output)
+			if (v.type == Json.Type.null_)
+				return T.nan;
+		if (v.type == Json.Type.float_ && v.get!double.isNaN)
 			return T.nan;
 		if (v.type != Json.Type.int_ && v.type != Json.Type.bigInt && v.type != Json.Type.float_)
 			throw new BindException(located(path, "expected a number, got " ~ jsonTypeName(v)));
@@ -1239,6 +1247,34 @@ unittest  // bindJson rejects an object missing an undefaulted floating-point fi
 	}
 
 	assertThrown!BindException(bindJson!S(parseJsonString(`{}`)));
+}
+
+unittest  // an input floating-point field given null is rejected rather than bound as NaN
+{
+	import std.exception : assertThrown;
+	import vibe.data.json : parseJsonString;
+
+	static struct S
+	{
+		double x;
+	}
+
+	assertThrown!BindException(bindJson!S(parseJsonString(`{"x":null}`)));
+	assertThrown!BindException(bindJson!(double[])(parseJsonString(`[1, null]`)));
+}
+
+unittest  // an output floating-point value given null binds as the NaN vibe writes that way
+{
+	import std.math : isNaN;
+	import vibe.data.json : parseJsonString;
+
+	static struct S
+	{
+		double x;
+	}
+
+	assert(bindJson!(S, SchemaUse.output)(parseJsonString(`{"x":null}`)).x.isNaN);
+	assert(bindJson!(double[], SchemaUse.output)(parseJsonString(`[1, null]`))[1].isNaN);
 }
 
 unittest  // a bounded integer schema carries its type's minimum and maximum

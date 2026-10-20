@@ -1312,7 +1312,7 @@ struct CallToolResult
 			throw invalidParams("structuredContent: expected a JSON object, got " ~ (
 					structuredContent.type == Json.Type.undefined
 					? "no structuredContent" : "a non-object value"));
-		import mcp.api.binding : bindJson;
+		import mcp.api.binding : bindJson, SchemaUse;
 		import mcp.protocol.jsonhelpers : isFieldwiseStruct;
 
 		static if (isFieldwiseStruct!T)
@@ -1320,7 +1320,7 @@ struct CallToolResult
 		else
 			Json src = structuredContent["result"];
 		try
-			return bindJson!T(src);
+			return bindJson!(T, SchemaUse.output)(src);
 		catch (McpException e)
 			throw e;
 		catch (Exception e)

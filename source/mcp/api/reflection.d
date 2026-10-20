@@ -916,13 +916,19 @@ private bool argPresent(P)(Json args, string name) @safe
 		return args[name].type != Json.Type.null_;
 }
 
+/// Whether argument `name` is keyed in `args` with an explicit JSON `null`.
+private bool isNullArg(Json args, string name) @safe
+{
+	return (name in args) !is null && args[name].type == Json.Type.null_;
+}
+
 /// Whether argument `name` of a `P` parameter is an explicit JSON `null` that
 /// binds as unset: `P` is `Nullable`, so `null` is a value of its own rather
 /// than an omission that takes the parameter's default.
 private bool isExplicitNull(P)(Json args, string name) @safe
 {
 	static if (isInstanceOf!(Nullable, P))
-		return (name in args) !is null && args[name].type == Json.Type.null_;
+		return isNullArg(args, name);
 	else
 		return false;
 }
@@ -1185,7 +1191,8 @@ private string bindToolArgs(alias overload)(Json args, ref Tuple!(BoundParameter
 		{
 			static if (isRequiredParam!(overload, i))
 				if (!argPresent!P(args, names[i]))
-					return "argument '" ~ names[i] ~ "': required argument is missing";
+					return "argument '" ~ names[i] ~ (isNullArg(args, names[i])
+							? "': must not be null" : "': required argument is missing");
 			try
 			{
 				// An omitted argument takes its advertised default: a @schemaDefault
@@ -5225,6 +5232,24 @@ version (unittest) private Json callToolArgs(McpServer s, string name, string ar
 	p["name"] = name;
 	p["arguments"] = parseJsonString(arguments);
 	return s.handle(Message(makeRequest(Json(1), "tools/call", p))).get["result"];
+}
+
+version (unittest) private final class RequiredIntApi
+{
+	@tool("twice", "Doubles a required integer")
+	int twice(int n) @safe
+	{
+		return 2 * n;
+	}
+}
+
+unittest  // binding a required argument given null reports it as null, not as missing
+{
+	Tuple!(BoundParameters!(RequiredIntApi.twice)) argv;
+	const isNull = bindToolArgs!(RequiredIntApi.twice)(parseJsonString(`{"n":null}`), argv);
+	assert(isNull == "argument 'n': must not be null", isNull);
+	const missing = bindToolArgs!(RequiredIntApi.twice)(Json.emptyObject, argv);
+	assert(missing == "argument 'n': required argument is missing", missing);
 }
 
 version (unittest) private final class AllOptionalParamApi
