@@ -107,7 +107,10 @@ dub run --single client.d       # prints "2 + 3 = 5"
 ### Serving over HTTP
 
 The same server speaks Streamable HTTP by swapping `runStdio` for
-`runStreamableHttp`, which blocks serving `http://127.0.0.1:8080/mcp`:
+`runStreamableHttp`, which blocks serving `http://127.0.0.1:8080/mcp`. In
+`server.d`, keep the `dub.sdl` header, `module demo;` (which
+`registerModule!demo` names), and the `@tool` functions, and replace the imports
+and `main`:
 
 ```d
 import mcp;
@@ -272,8 +275,9 @@ on the proxy's CIMD consent screen (a spec `SHOULD`).
 ## Requirements
 
 - A D toolchain with frontend **2.111+** (DMD 2.111+, or LDC 1.41+).
-- **OpenSSL 3.x** must be installed on the system. The `openssl` / vibe-d:tls
-  dependency links against it for TLS (HTTPS transport, OAuth 2.1).
+- **OpenSSL 3.x** must be installed on the system. The `openssl` dependency, and
+  the `vibe-d:tls` package that `vibe-d:http` pulls in, link against it for TLS
+  (HTTPS transport, OAuth 2.1).
   - **Ubuntu/Debian:** ships with OpenSSL 3.x (`apt install libssl-dev` if headers
     are missing).
   - **macOS:** `brew install openssl@3`, then export
