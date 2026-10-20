@@ -1117,9 +1117,7 @@ final class EventsRuntime
 		return webhookStore_;
 	}
 
-	/// The effective delivery modes for a registered type: poll, push, and (when
-	/// enabled) webhook, minus any the author disabled. Emit-only types still
-	/// support poll (served from the ring buffer).
+	// Whether `m` is listed in `disabled`.
 	private static bool isDisabled(DeliveryMode m, const DeliveryMode[] disabled) @safe
 	{
 		foreach (d; disabled)
@@ -1128,6 +1126,10 @@ final class EventsRuntime
 		return false;
 	}
 
+	/// The effective delivery modes for a registered type: poll, push, and (when
+	/// enabled) webhook, minus any the server or the author disabled. Emit-only
+	/// types still support poll (served from the ring buffer). Null for an
+	/// unknown type.
 	DeliveryMode[] effectiveDelivery(string name) @safe
 	{
 		auto p = name in types_;
