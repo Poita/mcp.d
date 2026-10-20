@@ -196,6 +196,11 @@ struct TaskContext
 	/// Never returns — its `noreturn` result type lets an executor write
 	/// `return tc.detach();` from a value-returning method.
 	///
+	/// A detached task is still bound by `TaskOptions.maxUnsettledIdle`: left
+	/// that long without a status change it is failed as abandoned. This
+	/// context's writes stop once it detaches, so whatever finishes the work
+	/// keeps the task alive by calling `rt.progress` with the task ID.
+	///
 	/// An executor running inline (the client did not declare the Tasks
 	/// extension) has no task the client could later observe, so `detach` throws
 	/// a -32021 `McpException` naming the extension instead.

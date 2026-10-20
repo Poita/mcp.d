@@ -36,7 +36,8 @@ enum Duration unlimitedTaskTtl = Duration.max;
 /// message, an input round or a `tasks/update` answer) is taken to be abandoned — its executor hung or its
 /// node vanished — and is failed, or cancelled when a cancel was requested, then
 /// expires by its TTL like any settled task. An executor that runs longer keeps
-/// its task alive by reporting progress; zero disables the bound.
+/// its task alive by reporting progress, as does the out-of-band worker of a
+/// detached task (`TaskRuntime.progress`); zero disables the bound.
 /// `dispatchLease` is how long a dispatch's claim on a running task holds
 /// without the executor reporting progress: until then a redelivered dispatch
 /// of the task is skipped, and after it the claim is taken to belong to a
