@@ -128,7 +128,13 @@ struct CancelRegistration
 /// HTTP: a fresh state per request).
 interface ConnectionScoped
 {
-	/// A stable, non-empty identifier for this request's connection / session.
+	/// A stable identifier for this request's connection / session. A
+	/// transport that distinguishes connections returns a non-empty token; an
+	/// empty token names the single shared connection, exactly as a context
+	/// that does not implement this interface does. A decorator such as
+	/// `RequestScope` returns its wrapped context's token, so it is empty when
+	/// that context is not connection-scoped. Read it through
+	/// `connectionTokenOf`, which treats both cases alike.
 	string connectionToken() @safe;
 
 	/// The per-connection / per-session `ConnectionState` this request is bound to.
