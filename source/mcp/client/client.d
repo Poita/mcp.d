@@ -795,6 +795,11 @@ final class McpClient : ClientProtocol
 	/// Null => unsupported (the client answers `roots/list`-style with
 	/// `Method not found`). The SDK validates the request's tool-result message
 	/// constraints (client/sampling §Error Handling) before invoking this.
+	///
+	/// Over Streamable HTTP a server that sends this request outside a tool
+	/// call's response stream sends it on the standalone server stream, which is
+	/// open only after `startServerStream` (or when `initialize` opened it for a
+	/// notification observer or a positive `defaultCacheTtl`).
 	CreateMessageResult delegate(CreateMessageRequest request) @safe onSampling;
 	/// Handler for `elicitation/create`; receives the typed `ElicitParams` and
 	/// returns the typed `ElicitResult`. Null => unsupported.
@@ -808,12 +813,27 @@ final class McpClient : ClientProtocol
 	/// the advertised-mode capability check before invoking this. A handler
 	/// waiting on the user can watch `serverRequestCancellation` to stop once
 	/// the server cancels the request.
+	///
+	/// Over Streamable HTTP a server that sends this request outside a tool
+	/// call's response stream sends it on the standalone server stream, which is
+	/// open only after `startServerStream` (or when `initialize` opened it for a
+	/// notification observer or a positive `defaultCacheTtl`).
 	ElicitResult delegate(ElicitParams params) @safe onElicitation;
 	/// Handler for `roots/list`; returns the typed `ListRootsResult`. Null =>
 	/// unsupported. (`roots/list` carries no meaningful params, so the handler
 	/// takes none; prefer `setRoots` for the common static-roots case.)
+	///
+	/// Over Streamable HTTP a server that sends this request outside a tool
+	/// call's response stream sends it on the standalone server stream, which is
+	/// open only after `startServerStream` (or when `initialize` opened it for a
+	/// notification observer or a positive `defaultCacheTtl`).
 	ListRootsResult delegate() @safe onListRoots;
 	/// Observer for inbound notifications (progress, message, resource updates).
+	///
+	/// Over Streamable HTTP a notification the server sends outside a request's
+	/// response arrives on the standalone server stream, which `initialize` opens
+	/// when this observer is installed beforehand; install it later and call
+	/// `startServerStream` to receive such notifications.
 	void delegate(string method, Json params) @safe onNotification;
 	/// Typed observer for `notifications/progress` (basic/utilities/progress).
 	///
@@ -831,25 +851,50 @@ final class McpClient : ClientProtocol
 	/// `onNotification`. Inspect `n.level` (a `LogLevel`), the optional
 	/// `n.logger`, and the arbitrary `n.data` payload to present log output in
 	/// the UI / display severity visually.
+	///
+	/// Over Streamable HTTP a notification the server sends outside a request's
+	/// response arrives on the standalone server stream, which `initialize` opens
+	/// when this observer is installed beforehand; install it later and call
+	/// `startServerStream` to receive such notifications.
 	void delegate(LogMessageNotification n) @safe onLogMessage;
 
 	/// Fired on `notifications/tools/list_changed`, after the cached `tools/list`
 	/// entry is evicted (so a `listTools` from inside the callback refetches).
 	/// Delivered in addition to the generic `onNotification`.
+	///
+	/// Over Streamable HTTP a notification the server sends outside a request's
+	/// response arrives on the standalone server stream, which `initialize` opens
+	/// when this observer is installed beforehand; install it later and call
+	/// `startServerStream` to receive such notifications.
 	void delegate() @safe onToolsListChanged;
 
 	/// Fired on `notifications/prompts/list_changed`, after the cached
 	/// `prompts/list` entry is evicted. In addition to `onNotification`.
+	///
+	/// Over Streamable HTTP a notification the server sends outside a request's
+	/// response arrives on the standalone server stream, which `initialize` opens
+	/// when this observer is installed beforehand; install it later and call
+	/// `startServerStream` to receive such notifications.
 	void delegate() @safe onPromptsListChanged;
 
 	/// Fired on `notifications/resources/list_changed`, after the cached
 	/// `resources/list` and `resources/templates/list` entries are evicted. In
 	/// addition to `onNotification`.
+	///
+	/// Over Streamable HTTP a notification the server sends outside a request's
+	/// response arrives on the standalone server stream, which `initialize` opens
+	/// when this observer is installed beforehand; install it later and call
+	/// `startServerStream` to receive such notifications.
 	void delegate() @safe onResourcesListChanged;
 
 	/// Fired on `notifications/resources/updated` with the changed resource `uri`,
 	/// after that URI's cached `resources/read` entry is evicted. In addition to
 	/// `onNotification`.
+	///
+	/// Over Streamable HTTP a notification the server sends outside a request's
+	/// response arrives on the standalone server stream, which `initialize` opens
+	/// when this observer is installed beforehand; install it later and call
+	/// `startServerStream` to receive such notifications.
 	void delegate(string uri) @safe onResourceUpdated;
 
 	/// Construct over an explicit `ClientTransport`, configured by `settings`. The
@@ -1353,12 +1398,22 @@ final class McpClient : ClientProtocol
 		didInitialize = true;
 		notify("notifications/initialized", Json.emptyObject);
 		sessionEpoch_++;
-		// Over Streamable HTTP the `*/list_changed` notifications that evict cached
-		// lists arrive only on the standalone server stream, so a client caching
-		// unhinted results opens it rather than serve stale lists for the whole TTL.
-		if (cacheStore_ !is null && defaultCacheTtl_ > Duration.zero)
+		// Over Streamable HTTP a notification outside any request's response
+		// (`*/list_changed`, `resources/updated`, a log message) arrives only on the
+		// standalone server stream, so a client that observes notifications opens
+		// it, as does one caching unhinted results, whose cached lists would
+		// otherwise stay stale for the whole TTL.
+		if ((cacheStore_ !is null && defaultCacheTtl_ > Duration.zero) || observesNotifications)
 			startServerStream();
 		return init;
+	}
+
+	/// Whether any observer of server notifications is installed.
+	private bool observesNotifications() const @safe nothrow
+	{
+		return onNotification !is null || onLogMessage !is null || onToolsListChanged !is null
+			|| onPromptsListChanged !is null
+			|| onResourcesListChanged !is null || onResourceUpdated !is null;
 	}
 
 	/// Park the calling fiber while another fiber runs the initialize handshake.
@@ -4841,7 +4896,10 @@ final class McpClient : ClientProtocol
 	///
 	/// Without it a Streamable HTTP client receives no `*/list_changed`
 	/// notifications, so cached lists are evicted only by their TTL.
-	/// `initialize` opens the stream itself when `defaultCacheTtl` is positive.
+	/// `initialize` opens the stream itself when `defaultCacheTtl` is positive
+	/// or a notification observer (`onNotification`, `onLogMessage`,
+	/// `onToolsListChanged`, `onPromptsListChanged`, `onResourcesListChanged`,
+	/// `onResourceUpdated`) is installed.
 	void startServerStream() @safe
 	{
 		transport.startServerStream();
@@ -9778,8 +9836,11 @@ version (unittest)
 			return false;
 		}
 
+		int serverStreamStarts; // calls to startServerStream
+
 		void startServerStream() @safe
 		{
+			serverStreamStarts++;
 		}
 
 		void startLegacyFallback() @safe
@@ -10019,6 +10080,48 @@ unittest  // connect() rethrows a modern-only probe rejection instead of assumin
 		assert(thrown is failure, "connect() must surface a modern-only rejection");
 		assert(!initialized, "a modern-only rejection must not fall back to initialize");
 	}
+}
+
+version (unittest) private Json minimalInitializeResult(Json message, long expectId) @safe
+{
+	Json r = Json.emptyObject;
+	r["protocolVersion"] = latestLegacy.toWire;
+	r["capabilities"] = Json.emptyObject;
+	r["serverInfo"] = Json(["name": Json("srv"), "version": Json("1.0")]);
+	return r;
+}
+
+unittest  // initialize opens the standalone server stream when a notification observer is installed
+{
+	foreach (install; [
+		(McpClient c)@safe { c.onNotification = (string, Json)@safe {}; },
+		(McpClient c)@safe { c.onLogMessage = (LogMessageNotification)@safe {}; },
+		(McpClient c)@safe { c.onToolsListChanged = ()@safe {}; }, (McpClient c)@safe {
+			c.onPromptsListChanged = ()@safe {};
+		}, (McpClient c)@safe { c.onResourcesListChanged = ()@safe {}; },
+		(McpClient c)@safe { c.onResourceUpdated = (string)@safe {}; },
+	])
+	{
+		auto transport = new RecordingClientTransport();
+		ClientSettings settings;
+		settings.defaultCacheTtl = Duration.zero;
+		auto c = new McpClient(transport, settings);
+		install(c);
+		transport.responder = (Json m, long id) @safe => minimalInitializeResult(m, id);
+		c.initialize();
+		assert(transport.serverStreamStarts == 1);
+	}
+}
+
+unittest  // initialize leaves the standalone server stream closed with no observer and no cache TTL
+{
+	auto transport = new RecordingClientTransport();
+	ClientSettings settings;
+	settings.defaultCacheTtl = Duration.zero;
+	auto c = new McpClient(transport, settings);
+	transport.responder = (Json m, long id) @safe => minimalInitializeResult(m, id);
+	c.initialize();
+	assert(transport.serverStreamStarts == 0);
 }
 
 unittest  // initialize after enableModern runs the legacy handshake and leaves modern mode
