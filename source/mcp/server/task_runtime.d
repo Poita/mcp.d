@@ -270,12 +270,13 @@ final class TaskRuntime
 		if (!overUnsettled() && !overSettled())
 			return;
 		// Tasks idle past `maxUnsettledIdle` are settled, and settled ones past
-		// their TTL removed, only when accessed or swept, so sweep now rather
-		// than let them hold the principal's slots (the sweeper may be
-		// disabled). The sweep scans the whole store, so creates hammering a cap
-		// trigger it at most once a second.
+		// their TTL removed, only when accessed or swept. Without a background
+		// sweeper, sweep now rather than let them hold the principal's slots
+		// for good; a running sweeper frees them within its interval, so the
+		// request path leaves the whole-store scan to it. Creates hammering a
+		// cap trigger the scan at most once a second.
 		const now = currentTime();
-		if (now >= lastCapSweep_ + 1.seconds)
+		if (sweeper_ is null && now >= lastCapSweep_ + 1.seconds)
 		{
 			lastCapSweep_ = now;
 			sweepExpired();
@@ -2000,56 +2001,56 @@ unittest  // a task idle past maxUnsettledIdle frees its unsettled slot without 
 	assert(rt.store.get(hung.taskId).get.meta.status == TaskStatus.failed);
 }
 
+version (unittest) private final class SweepCountingStore : TaskStore
+{
+	InMemoryTaskStore inner;
+	size_t sweeps;
+
+	this() @safe
+	{
+		inner = new InMemoryTaskStore();
+	}
+
+	bool put(TaskRecord r) @safe
+	{
+		return inner.put(r);
+	}
+
+	Nullable!TaskRecord get(string id) @safe
+	{
+		return inner.get(id);
+	}
+
+	bool compareAndSwap(TaskRecord r, ulong expected) @safe
+	{
+		return inner.compareAndSwap(r, expected);
+	}
+
+	void remove(string id) @safe
+	{
+		inner.remove(id);
+	}
+
+	size_t removeIf(scope bool delegate(const TaskRecord) @safe pred) @safe
+	{
+		sweeps++;
+		return inner.removeIf(pred);
+	}
+
+	size_t countUnsettled(string owner) @safe
+	{
+		return inner.countUnsettled(owner);
+	}
+
+	size_t countSettled(string owner) @safe
+	{
+		return inner.countSettled(owner);
+	}
+}
+
 unittest  // repeated creates at the unsettled-task cap sweep the store at most once a second
 {
 	import std.exception : collectException;
-
-	static final class SweepCountingStore : TaskStore
-	{
-		InMemoryTaskStore inner;
-		size_t sweeps;
-
-		this() @safe
-		{
-			inner = new InMemoryTaskStore();
-		}
-
-		bool put(TaskRecord r) @safe
-		{
-			return inner.put(r);
-		}
-
-		Nullable!TaskRecord get(string id) @safe
-		{
-			return inner.get(id);
-		}
-
-		bool compareAndSwap(TaskRecord r, ulong expected) @safe
-		{
-			return inner.compareAndSwap(r, expected);
-		}
-
-		void remove(string id) @safe
-		{
-			inner.remove(id);
-		}
-
-		size_t removeIf(scope bool delegate(const TaskRecord) @safe pred) @safe
-		{
-			sweeps++;
-			return inner.removeIf(pred);
-		}
-
-		size_t countUnsettled(string owner) @safe
-		{
-			return inner.countUnsettled(owner);
-		}
-
-		size_t countSettled(string owner) @safe
-		{
-			return inner.countSettled(owner);
-		}
-	}
 
 	string now = "2026-06-07T10:00:00Z";
 	auto store = new SweepCountingStore();
@@ -2067,6 +2068,34 @@ unittest  // repeated creates at the unsettled-task cap sweep the store at most 
 	now = "2026-06-07T10:00:01Z";
 	assert(collectException!McpException(rt.createFor("", Json.undefined, alice)) !is null);
 	assert(store.sweeps == 2);
+}
+
+unittest  // creates at a cap leave sweeping to a running background sweeper
+{
+	import core.time : hours;
+	import std.exception : collectException;
+
+	string now = "2026-06-07T10:00:00Z";
+	auto store = new SweepCountingStore();
+	TaskOptions o;
+	o.store = store;
+	o.nowIso = () @safe => now;
+	o.maxUnsettledPerPrincipal = 1;
+	auto rt = new TaskRuntime(o);
+	rt.startSweeper(1.hours);
+	scope (exit)
+		rt.stopSweeper();
+	TaskCreateOptions alice;
+	alice.owner = "alice";
+	rt.createFor("", Json.undefined, alice);
+	foreach (second; 0 .. 5)
+	{
+		import std.format : format;
+
+		now = format("2026-06-07T10:00:%02dZ", second);
+		assert(collectException!McpException(rt.createFor("", Json.undefined, alice)) !is null);
+	}
+	assert(store.sweeps == 0);
 }
 
 unittest  // unauthenticated tasks share the anonymous unsettled-task cap
