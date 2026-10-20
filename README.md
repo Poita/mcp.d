@@ -169,6 +169,34 @@ at that release's tag, since its API may differ from `main`.
 
 Then `import mcp;` in your source files.
 
+### Names `import mcp;` brings into scope
+
+Besides its `PascalCase` types, `import mcp;` exposes a number of short,
+lowercase names, mostly UDAs:
+
+- handler UDAs: `tool`, `taskTool`, `prompt`, `resource`, `resourceTemplate`,
+  `event`, `skill`, `skillDir`;
+- metadata and hint UDAs: `title`, `icon`, `ui`, `meta`, `audience`, `priority`,
+  `lastModified`, `cacheable`, `readOnly`, `destructive`, `idempotent`, `openWorld`;
+- schema facets from `jsonschema`: `minimum`, `maximum`, `minLength`,
+  `maxLength`, `pattern`, `minItems`, `maxItems`, `fieldDescription`,
+  `schemaDefault` (and `format`, re-exported as `schemaFormat`);
+- vibe's field attributes `name`, `optional`, and `ignore`;
+- `core.time`'s `dur`, `msecs`, `seconds`, `minutes`, `hours`, and `days`, and
+  Phobos's `nullable`.
+
+Your own declarations of these names (a local `name` variable, a module-level
+`title` function) take precedence over the import and are unaffected. A clash
+arises only when another imported module exports the same name, which D reports
+as an ambiguity error at the use site. Resolve it by qualifying the use
+(`mcp.api.attributes.title`), importing that module selectively or under a
+renamed import, or narrowing the mcp import:
+
+```d
+import mcp : McpServer, tool, registerModule;   // only what this module uses
+import ui = mylib.ui;                           // or rename the other module
+```
+
 ## Goals
 
 - Full MCP support across every protocol version (`2024-11-05` → `2026-07-28`) with negotiation.
