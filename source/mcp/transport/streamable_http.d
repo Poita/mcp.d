@@ -5131,13 +5131,13 @@ unittest  // a listed origin matches regardless of case, a trailing slash or an 
 {
 	assert(originAllowed("https://app.example.com", ["https://App.Example.com/"]));
 	assert(originAllowed("https://app.example.com", [
-			"https://app.example.com:443"
+		"https://app.example.com:443"
 	]));
 	assert(originAllowed("http://app.example.com:80", ["http://app.example.com"]));
 	assert(originAllowed("HTTPS://APP.EXAMPLE.COM", ["https://app.example.com"]));
 	assert(!originAllowed("http://app.example.com", ["https://app.example.com"]));
 	assert(!originAllowed("https://app.example.com:8443", [
-			"https://app.example.com"
+		"https://app.example.com"
 	]));
 }
 
