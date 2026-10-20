@@ -730,10 +730,27 @@ private immutable(ubyte)[] readWithinBudget(string base, string rel, size_t budg
 	return bytes;
 }
 
+// POSIX.1-2008 `openat`, declared here because the glibc bindings of the
+// oldest supported druntime (LDC 1.41) omit it. 32-bit glibc needs the
+// large-file entry point so the descriptor can open files of any size.
+version (Posix)
+{
+	version (CRuntime_Glibc)
+	{
+		version (D_LP64)
+			private extern (C) int openat(int dirfd, const scope char* path, int flags, ...) nothrow @nogc @system;
+		else
+			pragma(mangle, "openat64") private extern (C) int openat(int dirfd,
+					const scope char* path, int flags, ...) nothrow @nogc @system;
+	}
+	else
+		private extern (C) int openat(int dirfd, const scope char* path, int flags, ...) nothrow @nogc @system;
+}
+
 version (Posix) private immutable(ubyte)[] readNoFollow(string base, string rel, size_t budget) @system
 {
 	import core.stdc.errno : ELOOP, errno;
-	import core.sys.posix.fcntl : O_NOFOLLOW, O_NONBLOCK, O_RDONLY, open, openat;
+	import core.sys.posix.fcntl : O_NOFOLLOW, O_NONBLOCK, O_RDONLY, open;
 	import core.sys.posix.sys.stat : S_IFDIR, S_IFMT, S_IFREG, fstat, stat_t;
 	import core.sys.posix.unistd : close, read;
 	import std.array : split;
