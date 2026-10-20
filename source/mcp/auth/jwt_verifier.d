@@ -10,7 +10,7 @@
 module mcp.auth.jwt_verifier;
 
 import core.stdc.config : c_long;
-import core.time : Duration, seconds;
+import core.time : Duration, MonoTime, seconds;
 
 import std.algorithm : canFind;
 import std.array : split;
@@ -91,9 +91,12 @@ struct JwtVerifierConfig
 	/// whose `typ` does not match the expected type, defeating type-confusion
 	/// attacks (e.g. an OIDC `id_token` signed with the same key replayed as an
 	/// access token). The default also accepts the bare `JWT` that many issuers
-	/// emit. A token whose `typ` is
-	/// absent or not listed here is rejected; set this empty to disable the
-	/// check for legacy issuers.
+	/// emit. A token whose `typ` is not listed here is rejected, and so is one
+	/// with no `typ` unless the list holds an empty-string entry. Issuers whose
+	/// access tokens carry no `typ` (Okta, Amazon Cognito) need `""` added, e.g.
+	/// `["at+jwt", "JWT", ""]`; set the list empty to disable the check entirely.
+	/// Rejections for `typ` are logged at warning level (at most once a minute)
+	/// so a mismatch with the issuer is visible without diagnostic logging.
 	///
 	/// Accepting `JWT` means `typ` alone cannot tell an access token from an OIDC
 	/// `id_token`, whose `aud` is the client id. The verifier therefore also
@@ -223,6 +226,29 @@ private TokenInfo reject(string reason) @safe
 	return TokenInfo.invalid();
 }
 
+// When the last `typ` rejection warning was logged on this thread.
+private MonoTime lastTypWarning;
+
+/// Warn, at most once per minute per thread, that a token was rejected for its
+/// `typ`: a valid token from an issuer that omits `typ` or uses another value
+/// is otherwise refused with only a diagnostic-level trace, which looks like an
+/// authentication outage. The value is truncated since it is attacker-chosen.
+private void warnTypRejected(const string[] accepted, string typ) @safe
+{
+	import core.time : minutes;
+	import vibe.core.log : logWarn;
+
+	const now = MonoTime.currTime;
+	if (lastTypWarning != MonoTime.init && now - lastTypWarning < 1.minutes)
+		return;
+	lastTypWarning = now;
+	logWarn("jwtVerifier: rejected a token whose typ header is %s; acceptedTokenTypes is %s. "
+			~ "Add the issuer's typ to acceptedTokenTypes (\"\" accepts a missing typ, "
+			~ "as Okta and Amazon Cognito access tokens have)",
+			typ.length ? "'" ~ (typ.length > 32 ? typ[0 .. 32] ~ "..." : typ) ~ "'" : "missing",
+			accepted);
+}
+
 /// Answer a token that cannot be judged because the JWKS could not be fetched:
 /// the verifier, not the token, is at fault.
 private TokenInfo keysOutage(Duration retryAfter) @safe
@@ -274,7 +300,10 @@ package TokenInfo verifyToken(JwtVerifierConfig cfg, string token, KeySource key
 	// type, so a token of another type (e.g. an OIDC `id_token`) signed with the
 	// same key cannot be replayed as an access token.
 	if (!typAccepted(cfg.acceptedTokenTypes, jsonStr(headerJson, "typ")))
+	{
+		warnTypRejected(cfg.acceptedTokenTypes, jsonStr(headerJson, "typ"));
 		return reject("typ header is absent or not an accepted token type");
+	}
 
 	// Gather candidate keys: the JWKS keys for this kid (every JWKS key when it
 	// names none, the kid-less ones when it names an unknown one), then the
@@ -1194,7 +1223,7 @@ package string[] splitScopes(string s) @safe
 /// Whether a token's `typ` header is one of the `accepted` types. The match is
 /// case-insensitive and ignores an optional `application/` media-type prefix on
 /// either side (RFC 7515 §4.1.9). An empty `accepted` disables the check; an
-/// absent (empty) `typ` matches nothing and is therefore rejected.
+/// absent (empty) `typ` matches only an empty-string entry.
 package bool typAccepted(string[] accepted, string typ) @safe
 {
 	import std.uni : toLower;
@@ -1210,8 +1239,6 @@ package bool typAccepted(string[] accepted, string typ) @safe
 	}
 
 	const want = normalize(typ);
-	if (want.length == 0)
-		return false;
 	foreach (a; accepted)
 		if (want == normalize(a))
 			return true;
@@ -1446,6 +1473,46 @@ unittest  // a `typ` rejection is logged with its reason
 
 	auto lines = (cast() logger).lines;
 	assert(lines.any!(l => l.canFind("typ")), "the typ rejection must be logged");
+}
+
+unittest  // a `typ` rejection is logged at warning level, at most once per interval
+{
+	import std.algorithm : count;
+	import vibe.core.log : deregisterLogger, LogLevel, Logger, LogLine, registerLogger;
+
+	static final class WarnLogger : Logger
+	{
+		string[] lines;
+		this() @safe
+		{
+			minLevel = LogLevel.warn;
+		}
+
+		override void log(ref LogLine line) @safe
+		{
+			lines ~= line.text;
+		}
+	}
+
+	auto logger = new WarnLogger;
+	auto shared_ = () @trusted { return cast(shared) logger; }();
+	() @trusted { registerLogger(shared_); }();
+	scope (exit)
+		() @trusted { deregisterLogger(shared_); }();
+	lastTypWarning = MonoTime.init;
+
+	JwtVerifierConfig cfg;
+	cfg.allowAnyAudience = true;
+	cfg.allowAnyIssuer = true;
+	cfg.acceptedTokenTypes = ["at+jwt"];
+	cfg.staticPublicKeysPem = [testEcPubPem];
+	auto tok = makeEs256(`{"sub":"u","exp":1700003600}`);
+	assert(!verifyToken(cfg, tok, new NoKeys, 1_700_001_000).valid);
+	assert(!verifyToken(cfg, tok, new NoKeys, 1_700_001_000).valid);
+
+	auto lines = (cast() logger).lines;
+	assert(lines.count!(l => l.canFind("acceptedTokenTypes")) == 1,
+			"the typ rejection must be warned about exactly once per interval");
 }
 
 unittest  // allowAnyIssuer explicitly accepts a token from any issuer
@@ -1818,6 +1885,30 @@ unittest  // a token with no `typ` header is rejected by default (RFC 9068 §4.1
 
 	auto ti = verifyToken(cfg, jwt, new NoKeys, 1_700_001_000);
 	assert(!ti.valid);
+}
+
+unittest  // an empty-string acceptedTokenTypes entry accepts a token with no `typ` and nothing else
+{
+	import mcp.auth.jwt : signEs256;
+	import mcp.auth.oauth : base64UrlNoPad;
+
+	JwtVerifierConfig cfg;
+	cfg.allowAnyAudience = true;
+	cfg.allowAnyIssuer = true;
+	cfg.staticPublicKeysPem = [testEcPubPem];
+	cfg.acceptedTokenTypes = ["at+jwt", ""];
+
+	string sign(string header) @safe
+	{
+		const si = base64UrlNoPad(cast(const(ubyte)[]) header) ~ "." ~ base64UrlNoPad(
+				cast(const(ubyte)[]) `{"sub":"ec-user","exp":1700003600}`);
+		return si ~ "." ~ base64UrlNoPad(signEs256(testEcPrivPem, cast(const(ubyte)[]) si));
+	}
+
+	assert(verifyToken(cfg, sign(`{"alg":"ES256"}`), new NoKeys, 1_700_001_000).valid);
+	assert(!verifyToken(cfg, sign(`{"alg":"ES256","typ":"id_token"}`),
+			new NoKeys, 1_700_001_000).valid);
+	assert(!verifyToken(cfg, sign(`{"alg":"ES256","typ":"JWT"}`), new NoKeys, 1_700_001_000).valid);
 }
 
 unittest  // emptying acceptedTokenTypes disables the `typ` check (escape hatch for legacy issuers)
