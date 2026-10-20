@@ -51,7 +51,8 @@ private __gshared bool _ranStdio;
 ///     `channel.send`).
 ///
 /// Requires a running vibe event loop; `serveStdio` runs the read loop on the
-/// CURRENT task and blocks until end-of-input, then waits up to
+/// CURRENT task and blocks until end-of-input, or until a write to the client
+/// fails (the client is gone, so nothing more is read or dispatched), then waits up to
 /// `opts.drainTimeout` for request handlers still running to write their replies
 /// and for queued error replies to be written.
 ///
@@ -403,7 +404,21 @@ void serveStdio(McpServer server, string delegate() @safe readLine,
 			runTask((Admitted first) nothrow{ runSlot(first); }, batch);
 	}
 
-	channel = new DuplexChannel(readLine, writeLine, &onInbound, &onInboundBatch);
+	// stdout is the client's only way to receive anything, so a failed write
+	// means it has gone: close the channel and end the read loop rather than keep
+	// dispatching requests whose replies can never be delivered.
+	void writeOrStop(string line) @safe
+	{
+		try
+			writeLine(line);
+		catch (Exception e)
+		{
+			channel.closeAndStopReading();
+			throw e;
+		}
+	}
+
+	channel = new DuplexChannel(readLine, &writeOrStop, &onInbound, &onInboundBatch);
 	channel.onError = opts.onError;
 	channel.answersMalformed = true;
 	// Requests are admitted above, under `opts.maxInFlight`.
@@ -2820,6 +2835,58 @@ unittest  // a request reply that fails to write is reported through StdioOption
 	runEventLoop();
 	assert(errors.canFind!(e => e.canFind("stdout gone")),
 			"a failed reply write must be reported, not swallowed");
+}
+
+unittest  // a failed stdout write ends the server without waiting for stdin to close
+{
+	import core.time : MonoTime, msecs, seconds;
+	import vibe.core.core : sleep;
+
+	auto s = McpServer.stateless("t", "1");
+	auto link = new ServerLink;
+	StdioOptions opts;
+	opts.onError = (string) @safe nothrow{};
+	size_t writes;
+	void failingWrite(string line) @safe
+	{
+		++writes;
+		throw new Exception("EPIPE");
+	}
+
+	bool served, inputClosed;
+	runTask(() nothrow{
+		scope (exit)
+			exitEventLoop();
+		try
+			serveStdio(s, &link.readLine, &failingWrite, opts);
+		catch (Exception)
+		{
+		}
+		served = true;
+	});
+	runTask(() nothrow{
+		try
+		{
+			link.feed(`{"jsonrpc":"2.0","id":1,"method":"ping"}`);
+			const deadline = MonoTime.currTime + 2.seconds;
+			while (!served && MonoTime.currTime < deadline)
+				sleep(5.msecs);
+			if (!served)
+			{
+				link.feed(`{"jsonrpc":"2.0","id":2,"method":"ping"}`);
+				foreach (_; 0 .. 8)
+					yield();
+				inputClosed = true;
+				link.closeInput();
+			}
+		}
+		catch (Exception)
+		{
+		}
+	});
+	runEventLoop();
+	assert(!inputClosed, "the server must stop once stdout is broken");
+	assert(writes == 1, "no request is dispatched after stdout broke");
 }
 
 unittest  // a handler still running when stdin EOFs is drained: its reply is not dropped

@@ -65,6 +65,8 @@ final class DuplexChannel
 	// The task performing the write in progress, so `interruptWrite` can end it.
 	private Task writer_;
 	private Task readTask_;
+	// The task running the read loop while it runs, however it was started.
+	private Task readingTask_;
 	// Set by `stopReadLoop` and `close`: the read loop exits at its next
 	// iteration and a read it was interrupted out of is not reported as a failure.
 	private bool stopping_;
@@ -229,6 +231,9 @@ final class DuplexChannel
 
 	private void readLoop() @safe nothrow
 	{
+		readingTask_ = Task.getThis();
+		scope (exit)
+			readingTask_ = Task.init;
 		while (!stopping_)
 		{
 			string line;
@@ -806,6 +811,16 @@ final class DuplexChannel
 		stopping_ = true;
 		closed_ = true;
 		coord.failPending(internalError("stdio channel closed"));
+	}
+
+	/// Close the channel, as `close` does, and end the read loop now: a read it
+	/// is parked in is interrupted rather than left to return the next inbound
+	/// line. For a peer known to be gone, such as one whose input pipe broke.
+	void closeAndStopReading() @safe
+	{
+		close();
+		if (readingTask_ != Task.init && readingTask_ != Task.getThis())
+			readingTask_.interrupt();
 	}
 }
 
