@@ -3331,8 +3331,11 @@ final class McpClient : ClientProtocol
 				failures++;
 			if (failures)
 			{
-				eventPollSleep(sub,
-						eventSettings_.pollFloor.total!"msecs" << (failures < 6 ? failures : 6));
+				// Grow from at least 1ms, so a zero poll floor still backs off;
+				// `eventPollSleep` caps the delay at the poll ceiling.
+				const baseMs = eventSettings_.pollFloor.total!"msecs" > 0
+					? eventSettings_.pollFloor.total!"msecs" : 1;
+				eventPollSleep(sub, baseMs << (failures < 6 ? failures : 6));
 				continue;
 			}
 			bool delivered; // at least one occurrence not already seen
@@ -11252,6 +11255,53 @@ unittest  // cancelling a poll subscription wakes its loop from a long nextPollM
 	});
 	runEventLoop();
 	assert(took < 2.seconds, "a cancelled poll subscription must not sleep out nextPollMs");
+}
+
+unittest  // the poll loop backs off after a failed poll even with a zero poll floor
+{
+	auto c = new McpClient(new RecordingClientTransport());
+	c.enableModern();
+	EventClientSettings es;
+	es.pollFloor = Duration.zero;
+	c.eventSettings = es;
+	c.onRpcForTest = (string method, Json params) @safe {
+		throw new RequestTimeoutException("slow");
+	};
+	Duration[] slept;
+	auto sub = new EventSubscription();
+	c.onEventPollSleepForTest = (Duration d) @safe {
+		slept ~= d;
+		if (slept.length == 3)
+			sub.cancel();
+	};
+	c.runPollLoop(sub, PollParams("incident.created"), null, null);
+	assert(slept.length == 3);
+	foreach (i, d; slept)
+		assert(d > Duration.zero, "a failed poll must never retry without a pause");
+	assert(slept[0] < slept[1] && slept[1] < slept[2], "the failure backoff must grow");
+}
+
+unittest  // the poll loop's failure backoff never exceeds the poll ceiling
+{
+	auto c = new McpClient(new RecordingClientTransport());
+	c.enableModern();
+	EventClientSettings es;
+	es.pollCeiling = 3.seconds;
+	c.eventSettings = es;
+	c.onRpcForTest = (string method, Json params) @safe {
+		throw new RequestTimeoutException("slow");
+	};
+	Duration longest;
+	int sleeps;
+	auto sub = new EventSubscription();
+	c.onEventPollSleepForTest = (Duration d) @safe {
+		if (d > longest)
+			longest = d;
+		if (++sleeps == 8)
+			sub.cancel();
+	};
+	c.runPollLoop(sub, PollParams("incident.created"), null, null);
+	assert(longest == 3.seconds);
 }
 
 unittest  // the poll floor is configurable via EventClientSettings
