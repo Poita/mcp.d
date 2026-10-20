@@ -932,20 +932,32 @@ final class HttpClientTransport : ClientTransport
 		string challenge;
 		void attempt(string bearer)
 		{
+			import vibe.core.task : InterruptException;
+
 			// Funnel the pooled-client oneway POST through the resolve-validate-pin
 			// connector with the user-configured policy: the user-chosen endpoint
 			// host is resolved and the connection pinned to that vetted address
 			// (preserving the Host header + TLS SNI), but internal/loopback targets
-			// stay permitted.
-			secureRequestHTTP(target, SsrfPolicy.allowUserConfigured, (scope HTTPClientRequest req) {
-				setupRequest(req, message, bearer);
-			}, (scope HTTPClientResponse res) {
-				captureSession(res, message);
-				status = res.statusCode;
-				challenge = res.headers.get("WWW-Authenticate", "");
-				location = res.headers.get("Location", "");
-				res.dropBody();
-			}, FetchOptions(sendTimeout, tlsTrust));
+			// stay permitted. A connect, TLS or socket failure surfaces as an
+			// `McpException`, as on the request path; an interrupt (`abort`) passes
+			// through untouched.
+			try
+				secureRequestHTTP(target, SsrfPolicy.allowUserConfigured,
+						(scope HTTPClientRequest req) {
+					setupRequest(req, message, bearer);
+				}, (scope HTTPClientResponse res) {
+					captureSession(res, message);
+					status = res.statusCode;
+					challenge = res.headers.get("WWW-Authenticate", "");
+					location = res.headers.get("Location", "");
+					res.dropBody();
+				}, FetchOptions(sendTimeout, tlsTrust));
+			catch (InterruptException e)
+				throw e;
+			catch (McpException e)
+				throw e;
+			catch (Exception e)
+				throw internalError("MCP HTTP send failed: " ~ e.msg);
 		}
 
 		// As in `deliver`: a rejected bearer is reported once, and the POST
@@ -5355,6 +5367,21 @@ unittest  // a request the server accepted is not re-sent when its session vanis
 	assert(callPosts == 1, "an accepted request must not be re-sent on a new session");
 	assert(unknownOutcome, "the error must report that the request's outcome is unknown");
 	assert(msg.canFind("unknown"), msg);
+}
+
+unittest  // a oneway send that cannot connect fails with an McpException, not a raw socket error
+{
+	import mcp.protocol.jsonrpc : makeNotification;
+
+	auto t = new HttpClientTransport("http://127.0.0.1:1/mcp");
+	Exception caught;
+	try
+		t.sendOneway(makeNotification("notifications/roots/list_changed", Json.emptyObject));
+	catch (Exception e)
+		caught = e;
+	assert(caught !is null, "a refused connection must fail the send");
+	assert(cast(McpException) caught !is null, "unexpected " ~ typeid(caught)
+			.name ~ ": " ~ caught.msg);
 }
 
 unittest  // initialize fails when the server rejects notifications/initialized
