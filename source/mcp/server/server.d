@@ -1997,7 +1997,6 @@ final class McpServer : ServerCore
 		// Stdio carries one listen stream: a new listen replaces the open one,
 		// which is answered with its result so the client's request completes.
 		closeStdioListen();
-		cs().listenFilter = parsed.listenFilter;
 
 		// The listen request's id is the stream's subscriptionId; every
 		// notification on this channel (starting with the acknowledgement) is
@@ -2005,11 +2004,10 @@ final class McpServer : ServerCore
 		// id stays numeric on the wire.
 		stdioListenSubscriptionId = msg.id;
 		stdioListenSink = writeLine;
-		// Capture THIS listen request's parsed per-stream filter (recorded on the
-		// stdio connection's state) so subsequent notify*/notifyResourceUpdated
-		// deliver only the types/URIs it opted into (per-URI), independent of any
-		// other connection's state.
-		stdioListenFilter_ = cs().listenFilter;
+		// Keep THIS listen request's parsed per-stream filter on the stream itself
+		// so subsequent notify*/notifyResourceUpdated deliver only the types/URIs
+		// it opted into (per-URI), and closing the stream drops it.
+		stdioListenFilter_ = parsed.listenFilter;
 
 		// First message on the stream: the acknowledgement carrying the agreed-upon
 		// subset for THIS listen request only (2026-07-28 basic/utilities/subscriptions
@@ -8368,6 +8366,24 @@ unittest  // a stdio events/stream reusing the open listen stream's id is refuse
 	assert(frames.length == 1);
 	assert(parseJsonString(frames[0])["error"]["code"].get!int == ErrorCode.invalidRequest);
 	assert(!s.hasStdioEventStreams());
+}
+
+unittest  // a stdio listen keeps its filter on the stream, not the bound connection
+{
+	auto s = McpServer.stateless("t", "1");
+	s.enableToolsListChanged();
+	string[] frames;
+	void sink(string line) @safe
+	{
+		frames ~= line;
+	}
+
+	assert(s.tryServeStdioListen(stdioListenReq(1), &sink));
+	assert(!s.cs().listenFilter.active);
+	assert(s.notifyToolsListChanged() == 1);
+	assert(s.closeStdioListen());
+	assert(!s.cs().listenFilter.active);
+	assert(s.notifyToolsListChanged() == 0);
 }
 
 unittest  // a second stdio subscriptions/listen closes the first with its result
