@@ -627,17 +627,24 @@ private string hostOf(string authorityAndRest) @safe
 	return s;
 }
 
-/// Records the exact set of `redirect_uris` a dynamically-registered client
-/// presented at `/register`, keyed by a server-issued registration handle, and
-/// answers whether a given `redirect_uri` is an exact member of that set. This is
-/// the allowlist the proxy enforces at `/authorize` before relaying an upstream
-/// authorization code.
 /// Upper bound on the number of `redirect_uris` a single `/register` request may
 /// register. An unauthenticated DCR request carrying more than this is truncated
 /// to the first `maxRedirectUrisPerRegistration` entries so one request cannot
 /// inflate the registry without bound.
 enum size_t maxRedirectUrisPerRegistration = 10;
 
+/// Records the exact set of `redirect_uris` a dynamically-registered client
+/// presented at `/register`, keyed by a server-issued registration handle, and
+/// answers whether a given `redirect_uri` is an exact member of that set. This is
+/// the allowlist the proxy enforces at `/authorize` before relaying an upstream
+/// authorization code.
+///
+/// The allowlist is global, not per client: every DCR client shares the proxy's
+/// single upstream `client_id`, and `/authorize` accepts any registered
+/// `redirect_uri` whoever registered it. Registration is unauthenticated, so
+/// anyone can add a redirect URI they control; what stops a code reaching it is
+/// the per-browser consent screen, which shows the redirect URI and its host.
+/// Users approving a DCR client should be told to check that host.
 interface RedirectUriRegistry
 {
 	/// Persist the exact `redirect_uris` registered under `registrationHandle`.

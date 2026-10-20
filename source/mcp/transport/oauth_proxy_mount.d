@@ -220,9 +220,11 @@ struct ConsentScreen
 ///
 /// A CIMD client's `clientName` is shown alongside the host of its `clientId`,
 /// since the name is chosen by whoever hosts the metadata document while the
-/// host identifies who that is. The `clientRedirectUri` is always shown: the
-/// spec requires the redirect URI hostname be clearly displayed during
-/// authorization, since under CIMD a localhost redirect cannot be attested.
+/// host identifies who that is. The `clientRedirectUri` is always shown, with
+/// its host in bold: the spec requires the redirect URI hostname be clearly
+/// displayed during authorization, since under CIMD a localhost redirect cannot
+/// be attested. For a DCR client the host is the only identifying detail, since
+/// any caller may register any allowlisted redirect URI under a fresh client.
 string consentScreenHtml(ConsentScreen screen) @safe
 {
 	const safeName = htmlEscape(screen.clientName);
@@ -235,6 +237,10 @@ string consentScreenHtml(ConsentScreen screen) @safe
 	const clientHost = urlHost(screen.clientId);
 	const hostSection = clientHost.length
 		? "<p>Published by: <strong>" ~ htmlEscape(clientHost) ~ "</strong></p>" : "";
+	const redirectHost = urlHost(screen.clientRedirectUri);
+	const redirectHostSection = redirectHost.length
+		? "<p>Approving sends you back to: <strong>" ~ htmlEscape(redirectHost)
+		~ "</strong></p>" : "";
 	string scopeSection = "<p>Requested access: the upstream provider's default scopes.</p>";
 	if (screen.scopes.length)
 	{
@@ -248,10 +254,10 @@ string consentScreenHtml(ConsentScreen screen) @safe
 		~ "<title>Authorize application</title></head><body>" ~ "<h1>Authorize application</h1>"
 		~ "<p>An application is requesting to sign in via this server and be"
 		~ " forwarded to the upstream identity provider.</p>" ~ nameSection ~ hostSection
-		~ scopeSection ~ "<p>Redirect URI: <code>"
-		~ safeUri ~ "</code></p>" ~ "<form method=\"post\" action=\"" ~ safeAction
-		~ "\">" ~ "<input type=\"hidden\" name=\"state\" value=\"" ~ safeState
-		~ "\">" ~ "<input type=\"hidden\" name=\"csrf\" value=\"" ~ safeCsrf
+		~ redirectHostSection ~ scopeSection ~ "<p>Redirect URI: <code>" ~ safeUri
+		~ "</code></p>" ~ "<form method=\"post\" action=\""
+		~ safeAction ~ "\">" ~ "<input type=\"hidden\" name=\"state\" value=\""
+		~ safeState ~ "\">" ~ "<input type=\"hidden\" name=\"csrf\" value=\"" ~ safeCsrf
 		~ "\">" ~ "<button type=\"submit\">Approve and continue</button></form>" ~ "</body></html>";
 }
 
@@ -2379,6 +2385,15 @@ unittest  // CONSENT SCREEN: an empty client_name (DCR client) renders no name s
 	// The redirect_uri is still shown; there is no empty "Application:" label.
 	assert(html.canFind("http://localhost:5000/cb"));
 	assert(!html.canFind("Application:"));
+}
+
+unittest  // CONSENT SCREEN: a DCR client's redirect URI host is shown prominently
+{
+	import std.algorithm : canFind;
+
+	const html = consentScreenHtml(ConsentScreen("", "",
+			"https://evil.example:8443/oauth/cb?x=1", "/consent", "abc", "tok"));
+	assert(html.canFind("<strong>evil.example:8443</strong>"), html);
 }
 
 unittest  // CONFUSED DEPUTY: an un-consented client gets the consent screen, NOT a 302 upstream
