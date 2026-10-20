@@ -653,7 +653,7 @@ struct StdioContextOptions
 /// out-of-band `notifications/cancelled` is dispatched (flipping the matching
 /// in-flight `CancellationToken`) *concurrently* with a running handler — the
 /// handler's `ctx.isCancelled()` simply observes the flipped token.
-final class StdioContext : RequestContext
+final class StdioContext : BaseRequestContext
 {
 	private void delegate(string) @safe sink;
 	private Json delegate(string, Json) @safe serverRequestFn;
@@ -675,12 +675,7 @@ final class StdioContext : RequestContext
 		this.serverStateless_ = opts.serverStateless;
 	}
 
-	bool isCancelled() @safe
-	{
-		return false;
-	}
-
-	void reportProgress(double progress,
+	override void reportProgress(double progress,
 			Nullable!double total = Nullable!double.init, string message = null) @safe
 	{
 		if (progressTok.type == Json.Type.undefined)
@@ -697,7 +692,7 @@ final class StdioContext : RequestContext
 		emit(makeNotification("notifications/progress", p));
 	}
 
-	void log(string level, Json data, string logger = null) @safe
+	override void log(string level, Json data, string logger = null) @safe
 	{
 		Json p = Json.emptyObject;
 		p["level"] = level;
@@ -715,17 +710,17 @@ final class StdioContext : RequestContext
 			sink(frame.toString());
 	}
 
-	Json sampleRaw(Json params) @safe
+	override Json sampleRaw(Json params) @safe
 	{
 		return serverRequest("sampling/createMessage", params);
 	}
 
-	Json elicitRaw(Json params) @safe
+	override Json elicitRaw(Json params) @safe
 	{
 		return serverRequest("elicitation/create", params);
 	}
 
-	Json listRootsRaw() @safe
+	override Json listRootsRaw() @safe
 	{
 		return serverRequest("roots/list", Json.emptyObject);
 	}
@@ -744,34 +739,13 @@ final class StdioContext : RequestContext
 		return serverRequestFn(method, params);
 	}
 
-	bool clientSupports(ClientCapability cap) @safe
+	override bool clientSupports(ClientCapability cap) @safe
 	{
 		// No channel wired -> report false (cannot satisfy a server->client
 		// request).
 		if (serverRequestFn is null)
 			return false;
 		return clientCaps.supports(cap);
-	}
-
-	bool usesInputRequired() @safe
-	{
-		return false;
-	}
-
-	Json[string] inputResponses() @safe
-	{
-		Json[string] empty;
-		return empty;
-	}
-
-	string requestState() @safe
-	{
-		return "";
-	}
-
-	TokenInfo auth() @safe
-	{
-		return TokenInfo.invalid();
 	}
 }
 

@@ -86,13 +86,16 @@ TaskStatus taskStatusFromWire(string s) @safe pure nothrow
 
 /// Operational metadata about an asynchronous task (SEP-2663 `Task`).
 ///
-/// `ttlMs` is the time-to-live from creation in integer milliseconds, after
-/// which the server may delete the task whatever its status; a null `ttlMs`
-/// means unlimited, and the field is always emitted (as `null` when unlimited).
-/// mcp.d's `TaskRuntime` is more lenient: it never deletes a task that has not
-/// settled, and counts the TTL from when it settles. `pollIntervalMs` is the suggested polling interval and is omitted
-/// when unset. `statusMessage` is an optional human-readable description of the
-/// current state.
+/// `ttlMs` is the time-to-live in integer milliseconds; a null `ttlMs` means
+/// unlimited, and the field is always emitted (as `null` when unlimited). The
+/// spec counts it from creation and lets the server delete the task once it
+/// lapses, whatever its status. mcp.d's `TaskRuntime` is more lenient: it
+/// never deletes a task that has not settled, and counts the TTL from when the
+/// task settles (its final `lastUpdatedAt`), so a client always has the full
+/// TTL to collect a result. A client reading another server's `Task` should
+/// assume the spec's from-creation reading. `pollIntervalMs` is the suggested
+/// polling interval and is omitted when unset. `statusMessage` is an optional
+/// human-readable description of the current state.
 struct Task
 {
 	string taskId; /// server-generated, unguessable identifier

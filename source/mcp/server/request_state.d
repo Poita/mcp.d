@@ -15,9 +15,12 @@
 ///   payload = {"s":<stateJson>,"exp":<unixSeconds>,"b":<bindTagHex>}
 ///   - signed (HMAC-SHA256): "v1."  ~ b64url(payload) ~ "." ~ b64url(mac)
 ///   - encrypted (AES-256-GCM): "v1e." ~ b64url(nonce ~ ciphertext ~ tag)
-/// The bind tag is HMAC-SHA256(key, subject [~ "\0" ~ tool [~ "\0" ~ args]])
-/// hex, where `args` is the request's canonical `arguments` JSON; in the
-/// encrypted mode it is also fed as GCM AAD. Verification is fail-closed: a bad
+/// The bind tag is HMAC-SHA256(bindKey, subject [~ "\0" ~ target [~ "\0" ~
+/// args]]) hex, where `bindKey` is a sub-key HKDF-SHA256 derives from the
+/// operator secret, `target` is the request's method and name joined by a NUL
+/// (`requestStateTarget`, e.g. "tools/call\0deploy"), and `args` is the
+/// request's canonical `arguments` JSON; in the encrypted mode the tag is also
+/// fed as GCM AAD. Verification is fail-closed: a bad
 /// MAC, a GCM auth failure, an expired blob, a wrong-subject bind, or an
 /// unparseable envelope all yield `Nullable!string.init` (the dispatch path
 /// then re-elicits).
