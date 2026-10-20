@@ -1981,6 +1981,12 @@ final class EventsRuntime
 				if (occ.cursor.isNull)
 					occ.cursor = er.cursor; // a batch-cursor event settles with its batch
 		}
+		// The replay is queued before the fetch position moves past it, so a
+		// failure or crash in between leaves it to the poll-driven pass rather
+		// than losing it; a job id already queued is not queued twice.
+		bool any;
+		foreach (occ; er.events)
+			any |= enqueueForWebhook(sub, reg, occ);
 		// The check can yield: apply the backfill's cursors to the current record
 		// rather than the pre-check copy, and stop if it was removed meanwhile.
 		WebhookSubscription committed;
@@ -1994,11 +2000,12 @@ final class EventsRuntime
 			return true;
 		}, committed);
 		if (!applied)
+		{
+			if (any)
+				kickDrain();
 			return false;
+		}
 		sub = committed;
-		bool any;
-		foreach (occ; er.events)
-			any |= enqueueForWebhook(sub, reg, occ);
 		if (!emitOnly && !any && er.events.length)
 			advanceFilteredWatermark(sub.id, er.cursor);
 		if (emitOnly && !er.hasMore)
@@ -2165,13 +2172,31 @@ final class EventsRuntime
 			if (occ.cursor.isNull)
 				occ.cursor = er.cursor;
 		// The check can yield, so the subscription may have been removed,
-		// refreshed, or advanced meanwhile: apply this fetch's cursors to the
-		// current record, and drop the batch if another pass already fetched it.
+		// refreshed, or advanced meanwhile: apply this fetch to the current
+		// record, and drop the batch if another pass already fetched it.
 		const gap = er.truncated;
 		const fetchedFrom = sub.fetchCursor;
+		bool stillDue(const ref WebhookSubscription s) @safe
+		{
+			return !s.isExpired(opts_.nowMs()) && s.active && s.fetchCursor == fetchedFrom;
+		}
+
+		auto sn = webhookStore_.get(sub.id);
+		if (sn.isNull || !stillDue(sn.get))
+			return false;
+		// The batch is queued before the fetch position moves past it, so a
+		// failure or crash in between fetches it again rather than losing it;
+		// a job id already queued is not queued twice.
+		bool any;
+		foreach (occ; er.events)
+			any |= enqueueForWebhook(sn.get, reg, occ);
+		// The gap is queued behind the batch, so the watermark reaches its
+		// position only after the batch settles and the endpoint is verified.
+		if (gap)
+			any |= enqueueGap(sn.get, er.cursor);
 		WebhookSubscription cur;
 		const applied = modifyWebhook(sub.id, (ref WebhookSubscription s) @safe {
-			if (s.isExpired(opts_.nowMs()) || !s.active || s.fetchCursor != fetchedFrom)
+			if (!stillDue(s))
 				return false;
 			s.fetchCursor = er.cursor;
 			// A quiet fetch advances the watermark only when no delivery is
@@ -2183,16 +2208,9 @@ final class EventsRuntime
 			return true;
 		}, cur);
 		if (!applied)
-			return false;
-		bool any;
-		foreach (occ; er.events)
-			any |= enqueueForWebhook(cur, reg, occ);
+			return any;
 		if (!gap && !any && er.events.length)
 			advanceFilteredWatermark(cur.id, er.cursor);
-		// The gap is queued behind the batch, so the watermark reaches its
-		// position only after the batch settles and the endpoint is verified.
-		if (gap)
-			any |= enqueueGap(cur, er.cursor);
 		sub = cur;
 		more = er.hasMore;
 		return any;
@@ -7677,6 +7695,130 @@ unittest  // a check-backed type is served over webhook by replaying from the cu
 	rt.pollWebhookSubscriptions();
 	assert(seen.length == 3);
 	assert(ft.eventPosts().length == 1); // quiet polls deliver nothing
+}
+
+version (unittest)
+{
+	// A delivery queue forwarding to an in-memory one whose next `failEnqueues`
+	// enqueues throw, as a shared queue's I/O failure would.
+	private final class FailingQueue : DeliveryQueue
+	{
+		InMemoryDeliveryQueue inner;
+		int failEnqueues;
+
+		this() @safe
+		{
+			inner = new InMemoryDeliveryQueue();
+		}
+
+		bool enqueue(Delivery job) @safe
+		{
+			if (failEnqueues > 0)
+			{
+				failEnqueues--;
+				throw new Exception("queue unavailable");
+			}
+			return inner.enqueue(job);
+		}
+
+		Delivery[] lease(long nowMs, long leaseMs, size_t maxJobs) @safe
+		{
+			return inner.lease(nowMs, leaseMs, maxJobs);
+		}
+
+		void touch(string jobId, int attempt, long leasedUntilMs) @safe
+		{
+			inner.touch(jobId, attempt, leasedUntilMs);
+		}
+
+		void renew(string jobId, long leasedUntilMs) @safe
+		{
+			inner.renew(jobId, leasedUntilMs);
+		}
+
+		void ack(string jobId) @safe
+		{
+			inner.ack(jobId);
+		}
+
+		bool contains(string jobId) @safe
+		{
+			return inner.contains(jobId);
+		}
+
+		bool hasPendingFor(string subscriptionId) @safe
+		{
+			return inner.hasPendingFor(subscriptionId);
+		}
+	}
+
+	// A runtime over `q` with a check-backed "email.received" type whose check
+	// returns m1 after cursor h0, and is quiet from h1.
+	private EventsRuntime failingQueueRuntime(FakeWebhookTransport ft, FailingQueue q) @safe
+	{
+		EventsOptions o;
+		o.nowMs = () @safe => 1_000_000L;
+		o.nowIso = () @safe => "t";
+		o.allowPrivateCallbackHosts = true;
+		o.webhookTransport = ft;
+		o.deliveryQueue = q;
+		o.deliveryExecutor = (void delegate() @safe job) @safe { job(); };
+		o.fetchExecutor = (void delegate() @safe job) @safe {
+			try
+				job();
+			catch (Exception)
+			{
+			}
+		};
+		o.webhookRetryBase = Duration.zero;
+		auto rt = new EventsRuntime(null, o);
+		EventRegistration reg;
+		reg.descriptor.name = "email.received";
+		reg.pollInterval = Duration.zero;
+		reg.check = (EventContext ctx) @safe {
+			if (ctx.isBootstrap())
+				return EventResult.empty("h0");
+			if (ctx.cursor.get == "h0")
+				return EventResult.of([
+					EventOccurrence("m1", "email.received", "t")
+			], "h1");
+			return EventResult.empty(ctx.cursor.get);
+		};
+		rt.register(reg);
+		return rt;
+	}
+}
+
+unittest  // a polled batch whose enqueue throws is fetched again rather than skipped
+{
+	auto ft = new FakeWebhookTransport();
+	auto q = new FailingQueue();
+	auto rt = failingQueueRuntime(ft, q);
+	auto r = rt.subscribeWebhook(webhookSub("email.received", "https://proxy/hooks"), "user-1");
+	auto sub = rt.webhookStore().get(r.id).get;
+	sub.fetchCursor = "h0";
+	sub.cursor = "h0";
+	(cast(InMemoryWebhookSubscriptionStore) rt.webhookStore()).put(sub);
+	q.failEnqueues = 1;
+	rt.pollWebhookSubscriptions();
+	assert(ft.eventPosts().length == 0);
+	rt.pollWebhookSubscriptions();
+	assert(ft.eventPosts().length == 1); // m1 delivered on the retry
+}
+
+unittest  // a backfill whose enqueue throws leaves the replay to the next fetch
+{
+	import std.exception : collectException;
+
+	auto ft = new FakeWebhookTransport();
+	auto q = new FailingQueue();
+	auto rt = failingQueueRuntime(ft, q);
+	auto p = webhookSub("email.received", "https://proxy/hooks");
+	p.cursor = "h0";
+	q.failEnqueues = 1;
+	assert(collectException(rt.subscribeWebhook(p, "user-1")) !is null);
+	rt.pollWebhookSubscriptions();
+	assert(ft.eventPosts().length == 1); // m1 delivered by the poll-driven pass
 }
 
 unittest  // a check that throws during a webhook backfill is logged
