@@ -52,8 +52,9 @@ struct StreamLimits
 	/// `maxLegacyInFlight` notification slots; past it a notification POST is
 	/// answered 429. `notifications/cancelled` is never queued or refused.
 	size_t maxLegacyQueuedNotifications = 64;
-	/// Standalone GET streams open at once on one session; past it a GET is
-	/// answered 429.
+	/// Standalone GET streams open at once on one session; past it a GET
+	/// closes the session's oldest GET stream, since a client reconnecting
+	/// believes that stream dead.
 	size_t maxGetStreamsPerSession = 4;
 	/// Standalone GET streams open at once across the mount; past it a GET is
 	/// answered 503. A session holding a GET stream is never evicted, so keep
@@ -446,8 +447,9 @@ private void mountProtectedResourceMetadata(URLRouter router, StreamableHttpOpti
 ///     server->client SSE stream wired to the server-push channel
 ///     (`McpServer.notify`): 400 without `Mcp-Session-Id`, 404 for an unknown
 ///     session, 406 when Accept excludes `text/event-stream`, 429 past
-///     `StreamLimits.maxGetStreamsPerSession`, `maxGetStreamsPerPrincipal` or
-///     `maxGetStreamsPerAddress`, 503 past `maxGetStreams`. A stateless
+///     `StreamLimits.maxGetStreamsPerPrincipal` or `maxGetStreamsPerAddress`,
+///     503 past `maxGetStreams`. Past `maxGetStreamsPerSession` the
+///     session's oldest GET stream is closed to make room. A stateless
 ///     server keeps no session to push on, so GET is always 405 (`Allow: POST`).
 ///   - DELETE: on a stateful server, terminates the session named by
 ///     `Mcp-Session-Id` (204; 400 without the header, 404 for an unknown
@@ -1135,11 +1137,20 @@ private SseWriter sseFrameWriter(HTTPServerResponse res, StreamLimits limits = S
 /// session `sid` has expired or been evicted, or the client disconnects. Every
 /// `interval` it writes a comment heartbeat, which detects a disconnect and
 /// refreshes the session's idle timer, so a client that only listens keeps its
-/// session alive. A failed write ends it at once. With no `sessions` the stream
-/// has no session to watch.
-private void holdSessionStream(SseWriter writeFrame, ServerPushChannel push,
-		long listenerId, SessionManager sessions, string sid, Duration interval) @safe
+/// session alive. A failed write ends it at once, as does `clientAlive`
+/// reporting the client gone: it is polled every `livenessProbeInterval`, since
+/// a write into the socket buffer of a client that has closed its connection
+/// can succeed and leave the stream counted against its session's caps until a
+/// later heartbeat fails. With no `sessions` the stream has no session to
+/// watch; a null `clientAlive` skips the probe. The listener is dropped on
+/// return.
+private void holdSessionStream(SseWriter writeFrame, ServerPushChannel push, long listenerId,
+		SessionManager sessions, string sid, Duration interval,
+		bool delegate() @safe nothrow clientAlive) @safe
 {
+	import core.time : MonoTime;
+	import std.algorithm : min;
+
 	writeFrame.onFailure = () @safe nothrow{
 		try
 			push.removeListener(listenerId);
@@ -1147,16 +1158,29 @@ private void holdSessionStream(SseWriter writeFrame, ServerPushChannel push,
 		{
 		}
 	};
-	while (!push.awaitClosed(listenerId, interval))
+	scope (exit)
+		push.removeListener(listenerId);
+	const wakeEvery = clientAlive is null ? interval : min(interval, livenessProbeInterval);
+	auto lastPing = MonoTime.currTime;
+	// The writer may have failed before `onFailure` was set; `failed` covers that.
+	while (!writeFrame.failed && !push.awaitClosed(listenerId, wakeEvery))
 	{
 		if (sessions !is null && sessions.stateFor(sid) is null)
 			break;
+		if (clientAlive !is null && !clientAlive())
+			break;
+		if (MonoTime.currTime - lastPing < interval)
+			continue;
 		try
 			writeFrame(": ping\n\n");
 		catch (Exception)
 			break;
+		lastPing = MonoTime.currTime;
 	}
 }
+
+/// How often a held SSE stream checks whether its client has disconnected.
+private enum Duration livenessProbeInterval = 1.seconds;
 
 /// Open a legacy GET SSE stream: register it on `channel` (which emits the
 /// leading `endpoint` event), then hold the connection open with SSE comment
@@ -1189,7 +1213,7 @@ private void handleLegacyGet(McpServer server, LegacySseChannel channel,
 	scope (exit)
 		push.removeListener(pushId);
 
-	holdSessionStream(writeFrame, push, pushId, null, sessionId, 15.seconds);
+	holdSessionStream(writeFrame, push, pushId, null, sessionId, 15.seconds, connectionProbe(res));
 }
 
 /// Parse a legacy POST body. A malformed one is answered with a JSON-RPC error
@@ -2077,29 +2101,23 @@ private void handleGet(McpServer server, ServerPushChannel push,
 					"text/plain");
 			return;
 		}
-		const cap = opts.streamLimits.maxGetStreamsPerSession;
-		if (cap != 0 && sessions.openStreams(sid) >= cap)
-		{
-			res.statusCode = HTTPStatus.tooManyRequests;
-			res.headers["Retry-After"] = "1";
-			res.writeBody("Too many open streams on this session", "text/plain");
-			return;
-		}
 		if (const why = getStreams.tryAcquire(principal, address))
 		{
 			refuseTooManyStreams(res, why);
 			return;
 		}
+		// A client reconnects its GET stream when it believes the old one is
+		// dead, which the server may not have noticed yet; closing the session's
+		// oldest stream keeps such a reconnect from being refused.
+		const cap = opts.streamLimits.maxGetStreamsPerSession;
+		if (cap != 0 && sessions.openStreams(sid) >= cap)
+			push.removeListener(sessions.oldestStream(sid));
 		getConn = sessions.stateFor(sid);
 		ownerToken = sid;
-		sessions.streamOpened(sid);
 	}
 	scope (exit)
 		if (sessions !is null)
-		{
-			sessions.streamClosed(ownerToken);
 			getStreams.release(principal, address);
-		}
 
 	// Open a long-lived SSE stream wired to the server-push channel, so the
 	// server can deliver unsolicited notifications/requests outside any POST.
@@ -2125,6 +2143,11 @@ private void handleGet(McpServer server, ServerPushChannel push,
 	// Drop the listener when the stream ends so the channel self-heals.
 	scope (exit)
 		push.removeListener(listenerId);
+	if (sessions !is null)
+		sessions.streamOpened(ownerToken, listenerId);
+	scope (exit)
+		if (sessions !is null)
+			sessions.streamClosed(ownerToken, listenerId);
 
 	// vibe.d sends the response headers with the first body write; an SSE comment
 	// flushes them now so the client sees the stream open without waiting for the
@@ -2150,7 +2173,8 @@ private void handleGet(McpServer server, ServerPushChannel push,
 		}
 	}
 
-	holdSessionStream(writeFrame, push, listenerId, sessions, ownerToken, 15.seconds);
+	holdSessionStream(writeFrame, push, listenerId, sessions, ownerToken,
+			15.seconds, connectionProbe(res));
 }
 
 /// Serve a modern `subscriptions/listen` request as a long-lived SSE notification
@@ -2226,7 +2250,7 @@ private void handleListenStream(McpServer server, ServerPushChannel push, Messag
 	push.emitTo(listenerId,
 			subscriptionsAcknowledgedNotification(server.acknowledgedSubsetFor(streamFilter)));
 
-	holdSessionStream(writeFrame, push, listenerId, null, "", 15.seconds);
+	holdSessionStream(writeFrame, push, listenerId, null, "", 15.seconds, connectionProbe(res));
 }
 
 /// Register a `subscriptions/listen` stream on `push`: its notifications are
@@ -4472,7 +4496,7 @@ unittest  // a session GET stream keeps its session alive and ends when the sess
 	bool ended, aliveAfterIdle;
 	runTask(() @safe nothrow{
 		try
-			holdSessionStream(discardingSseWriter(), push, lid, sessions, sid, 10.msecs);
+			holdSessionStream(discardingSseWriter(), push, lid, sessions, sid, 10.msecs, null);
 		catch (Exception)
 		{
 		}
@@ -4513,7 +4537,7 @@ unittest  // a session GET stream ends once its session has been evicted
 	bool ended;
 	runTask(() @safe nothrow{
 		try
-			holdSessionStream(discardingSseWriter(), push, lid, sessions, sid, 10.msecs);
+			holdSessionStream(discardingSseWriter(), push, lid, sessions, sid, 10.msecs, null);
 		catch (Exception)
 		{
 		}
@@ -5017,7 +5041,7 @@ unittest  // a held SSE stream ends as soon as its writer fails, not at the next
 		try
 		{
 			writer("data: {}\n\n");
-			holdSessionStream(writer, push, lid, null, "", 5.seconds);
+			holdSessionStream(writer, push, lid, null, "", 5.seconds, null);
 		}
 		catch (Exception)
 		{
@@ -5027,6 +5051,75 @@ unittest  // a held SSE stream ends as soon as its writer fails, not at the next
 	});
 	runEventLoop();
 	assert(took < 2.seconds, "the hold loop must wake when the writer fails");
+}
+
+unittest  // a held SSE stream whose writer failed before the hold loop began ends at once
+{
+	import core.time : MonoTime, msecs;
+	import vibe.core.core : runTask, sleep, exitEventLoop, runEventLoop;
+	import vibe.http.server : createTestHTTPServerResponse, TestHTTPResponseMode;
+
+	auto writer = sseFrameWriter(createTestHTTPServerResponse(new FailingSink,
+			null, TestHTTPResponseMode.bodyOnly));
+	auto push = new ServerPushChannel(new StreamCoordinator);
+	const lid = push.addListener((string f) @safe { writer(f); });
+	Duration took = Duration.max;
+	size_t listenersAfter = size_t.max;
+	runTask(() @safe nothrow{
+		try
+		{
+			writer(": open\n\n");
+			sleep(300.msecs);
+			const started = MonoTime.currTime;
+			holdSessionStream(writer, push, lid, null, "", 5.seconds, null);
+			took = MonoTime.currTime - started;
+			listenersAfter = push.listenerCount;
+		}
+		catch (Exception)
+		{
+		}
+		exitEventLoop();
+	});
+	runEventLoop();
+	assert(took < 1.seconds, "a stream that already failed must not wait for a heartbeat");
+	assert(listenersAfter == 0, "the failed stream's listener must be dropped");
+}
+
+unittest  // a held SSE stream ends soon after its client disconnects, between heartbeats
+{
+	import core.time : MonoTime, msecs;
+	import vibe.core.core : runTask, sleep, exitEventLoop, runEventLoop;
+
+	auto push = new ServerPushChannel(new StreamCoordinator);
+	const lid = push.addListener((string) @safe {});
+	bool connected = true;
+	Duration took;
+	size_t listenersAfter = size_t.max;
+	runTask(() @safe nothrow{
+		const started = MonoTime.currTime;
+		try
+		{
+			holdSessionStream(discardingSseWriter(), push, lid, null, "",
+				30.seconds, () @safe nothrow => connected);
+			listenersAfter = push.listenerCount;
+		}
+		catch (Exception)
+		{
+		}
+		took = MonoTime.currTime - started;
+		exitEventLoop();
+	});
+	runTask(() @safe nothrow{
+		try
+			sleep(100.msecs);
+		catch (Exception)
+		{
+		}
+		connected = false;
+	});
+	runEventLoop();
+	assert(took < 3.seconds, "a disconnected client must end the stream before the next heartbeat");
+	assert(listenersAfter == 0, "the disconnected stream's listener must be dropped");
 }
 
 unittest  // several stalled SSE readers hold up a fan-out for one stall timeout, not one each
@@ -6227,7 +6320,7 @@ unittest  // the version gate rejects a version the server does not serve
 	assert(validateProtocolVersionHeader("2025-11-25", legacyOnly) is null);
 }
 
-unittest  // a GET past the per-session stream cap is refused with 429
+unittest  // a GET past the per-session stream cap closes the session's oldest GET stream
 {
 	import core.time : msecs;
 	import vibe.core.core : runTask, sleep, exitEventLoop, runEventLoop;
@@ -6249,6 +6342,7 @@ unittest  // a GET past the per-session stream cap is refused with 429
 		return res;
 	}
 
+	bool firstEnded, secondEnded, firstEndedBeforeDelete, secondOpenBeforeDelete;
 	int second;
 	runTask(() @safe nothrow{
 		try
@@ -6256,12 +6350,25 @@ unittest  // a GET past the per-session stream cap is refused with 429
 		catch (Exception)
 		{
 		}
+		firstEnded = true;
 	});
 	runTask(() @safe nothrow{
 		try
 		{
 			sleep(100.msecs);
 			second = get().statusCode;
+		}
+		catch (Exception)
+		{
+		}
+		secondEnded = true;
+	});
+	runTask(() @safe nothrow{
+		try
+		{
+			sleep(300.msecs);
+			firstEndedBeforeDelete = firstEnded;
+			secondOpenBeforeDelete = !secondEnded;
 			router.handleRequest(sessionReq(HTTPMethod.DELETE, sid),
 				createTestHTTPServerResponse(createMemoryOutputStream(),
 				null, TestHTTPResponseMode.bodyOnly));
@@ -6273,7 +6380,9 @@ unittest  // a GET past the per-session stream cap is refused with 429
 		exitEventLoop();
 	});
 	runEventLoop();
-	assert(second == HTTPStatus.tooManyRequests);
+	assert(firstEndedBeforeDelete, "the oldest GET stream must be closed to make room");
+	assert(secondOpenBeforeDelete, "the new GET stream must be held open");
+	assert(second == HTTPStatus.ok);
 }
 
 unittest  // a GET past the mount-wide stream cap is refused with 503, whatever its session

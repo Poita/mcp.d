@@ -93,8 +93,9 @@ final class SessionManager
 		/// authenticated, else a key derived from the remote address ("" when
 		/// neither is known).
 		string bucket;
-		/// Standalone GET streams currently open on the session.
-		size_t streams;
+		/// The push-channel listener ids of the standalone GET streams open on
+		/// the session, oldest first.
+		long[] streams;
 	}
 
 	/// Construct a session manager with the default `SessionLimits`.
@@ -110,7 +111,7 @@ final class SessionManager
 		maxPerPrincipal = limits.maxPerPrincipal;
 		maxAnonymousPerAddress = limits.maxAnonymousPerAddress;
 		sessions.onEvict = &evicted;
-		sessions.busy = (ref Session s) @safe => s.state.inFlight.length > 0 || s.streams > 0;
+		sessions.busy = (ref Session s) @safe => s.state.inFlight.length > 0 || s.streams.length > 0;
 	}
 
 	/// Called with a session's id after the idle sweep or the active-session cap
@@ -190,28 +191,45 @@ final class SessionManager
 		}
 	}
 
-	/// Record that a standalone GET stream opened on session `id`. While any is
-	/// open the session neither expires nor is evicted to make room.
-	void streamOpened(string id) @safe
+	/// Record that the standalone GET stream fed by push-channel listener
+	/// `listener` opened on session `id`. While any is open the session neither
+	/// expires nor is evicted to make room.
+	void streamOpened(string id, long listener) @safe
 	{
 		if (auto p = sessions.get(id, true))
-			p.streams++;
+			p.streams ~= listener;
 	}
 
 	/// Number of standalone GET streams open on session `id`.
 	size_t openStreams(string id) @safe
 	{
 		if (auto p = sessions.get(id, false))
-			return p.streams;
+			return p.streams.length;
 		return 0;
 	}
 
-	/// Record that a standalone GET stream on session `id` closed.
-	void streamClosed(string id) @safe
+	/// The listener id of the oldest standalone GET stream open on session `id`,
+	/// or 0 when none is.
+	long oldestStream(string id) @safe
 	{
+		if (auto p = sessions.get(id, false))
+			if (p.streams.length)
+				return p.streams[0];
+		return 0;
+	}
+
+	/// Record that the standalone GET stream fed by `listener` on session `id`
+	/// closed.
+	void streamClosed(string id, long listener) @safe
+	{
+		import std.algorithm : countUntil, remove;
+
 		if (auto p = sessions.get(id, true))
-			if (p.streams > 0)
-				p.streams--;
+		{
+			const at = p.streams.countUntil(listener);
+			if (at >= 0)
+				p.streams = p.streams.remove(at);
+		}
 	}
 
 	/// Whether `id` is an active session created by `principal`. A session id
@@ -684,12 +702,29 @@ unittest  // past the cap, a session holding a GET stream is never evicted
 
 	auto mgr = new SessionManager(SessionLimits(Duration.zero, 1));
 	const a = mgr.create();
-	mgr.streamOpened(a);
+	mgr.streamOpened(a, 1);
 	assertThrown!SessionCapacityException(mgr.create());
 	assert(mgr.isActive(a));
-	mgr.streamClosed(a);
+	mgr.streamClosed(a, 1);
 	const b = mgr.create();
 	assert(!mgr.isActive(a) && mgr.isActive(b), "an idle session makes room once its stream ends");
+}
+
+unittest  // a session's GET streams are reported oldest first and close in any order
+{
+	auto mgr = new SessionManager;
+	const a = mgr.create();
+	assert(mgr.oldestStream(a) == 0);
+	mgr.streamOpened(a, 7);
+	mgr.streamOpened(a, 9);
+	mgr.streamOpened(a, 11);
+	assert(mgr.openStreams(a) == 3 && mgr.oldestStream(a) == 7);
+	mgr.streamClosed(a, 9);
+	assert(mgr.openStreams(a) == 2 && mgr.oldestStream(a) == 7);
+	mgr.streamClosed(a, 7);
+	assert(mgr.oldestStream(a) == 11);
+	mgr.streamClosed(a, 7);
+	assert(mgr.openStreams(a) == 1, "closing an unknown stream changes nothing");
 }
 
 unittest  // a session holding a GET stream does not expire as idle
@@ -699,7 +734,7 @@ unittest  // a session holding a GET stream does not expire as idle
 
 	auto mgr = new SessionManager(SessionLimits(5.msecs, 0));
 	const a = mgr.create();
-	mgr.streamOpened(a);
+	mgr.streamOpened(a, 1);
 	Thread.sleep(20.msecs);
 	assert(mgr.isActive(a));
 }
@@ -733,7 +768,7 @@ unittest  // past the per-principal cap with every session busy, create fails
 	limits.maxPerPrincipal = 1;
 	auto mgr = new SessionManager(limits);
 	const a = mgr.create("alice");
-	mgr.streamOpened(a);
+	mgr.streamOpened(a, 1);
 	assertThrown!SessionCapacityException(mgr.create("alice"));
 	assert(mgr.isActive(a));
 	mgr.create("bob");
@@ -795,7 +830,7 @@ unittest  // terminated and cap-evicted sessions free their slot in the creator'
 	Thread.sleep(2.msecs);
 	mgr.create("bob");
 	assert(!mgr.isActive(a2), "the global cap evicts the oldest session");
-	mgr.streamOpened(a3);
+	mgr.streamOpened(a3, 1);
 	mgr.create("alice");
 	assert(mgr.isActive(a3), "a cap-evicted session frees its slot");
 }

@@ -2755,6 +2755,23 @@ package(mcp) bool clientConnected(HTTPServerResponse res) @safe nothrow
 		return false;
 }
 
+/// A `clientConnected` probe for `res`, or null when `res` has no raw connection
+/// to probe (a test response), where the probe would always report the client
+/// gone.
+package(mcp) bool delegate() @safe nothrow connectionProbe(HTTPServerResponse res) @safe nothrow
+{
+	foreach (i, ref field; res.tupleof)
+	{
+		static if (__traits(identifier, res.tupleof[i]) == "m_rawConnection")
+		{
+			if (!field)
+				return null;
+			return () @safe nothrow => clientConnected(res);
+		}
+	}
+	return null;
+}
+
 /// Whether the peer of socket `fd` has closed its side and every byte it sent
 /// has been read off the socket. eventcore's sockets are non-blocking, so the
 /// peek never waits. Only POSIX sockets are peeked; on other platforms this
