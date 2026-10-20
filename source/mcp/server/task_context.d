@@ -87,6 +87,8 @@ struct TaskContext
 	}
 
 	/// Set the task's human-readable status message (visible via `tasks/get`).
+	/// Each changed message is a store write and a `notifications/tasks` push
+	/// (see `TaskRuntime.progress`), so throttle rapid updates.
 	void progress(string statusMessage) @safe
 	{
 		if (unwound)

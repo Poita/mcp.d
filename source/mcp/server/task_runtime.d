@@ -600,12 +600,18 @@ final class TaskRuntime
 
 	/// Update a `working`/`input_required` task's human-readable status message.
 	/// A no-op if the task is already terminal. The next status transition
-	/// clears it.
+	/// clears it. Every call is a store write that stamps `lastUpdatedAt`
+	/// (renewing the task against `maxUnsettledIdle` and `dispatchLease`); a
+	/// changed message also pushes a `notifications/tasks` to the owner, while
+	/// repeating the current one does not. Updates are not coalesced, so an
+	/// executor reporting many distinct messages a second should throttle them.
 	void progress(string id, string statusMessage) @safe
 	{
 		modify(id, (ref TaskRecord r) @safe {
 			if (isTerminal(r.meta.status))
 				return Change.none;
+			if (!r.meta.statusMessage.isNull && r.meta.statusMessage.get == statusMessage)
+				return Change.activity;
 			r.meta.statusMessage = nullable(statusMessage);
 			return Change.status;
 		});
@@ -1319,6 +1325,27 @@ unittest  // cancelling a running executor's task records the request without a 
 	assert(rt.cancelRequested(t.taskId));
 	assert(notified == 0);
 	assert(rt.getDetailed(t.taskId)["lastUpdatedAt"].get!string == "2026-06-07T10:00:00Z");
+}
+
+unittest  // repeating an unchanged progress message renews the task without a notification
+{
+	string now = "2026-06-07T10:00:00Z";
+	TaskOptions o;
+	o.nowIso = () @safe => now;
+	auto rt = new TaskRuntime(o);
+	int notified;
+	rt.onStatusChange((Json detailed, string owner) @safe { notified++; });
+	auto t = rt.createFor("tool", Json.emptyObject);
+	rt.progress(t.taskId, "copying");
+	assert(notified == 1);
+	now = "2026-06-07T10:00:05Z";
+	rt.progress(t.taskId, "copying");
+	assert(notified == 1);
+	auto d = rt.getDetailed(t.taskId);
+	assert(d["statusMessage"].get!string == "copying");
+	assert(d["lastUpdatedAt"].get!string == "2026-06-07T10:00:05Z");
+	rt.progress(t.taskId, "verifying");
+	assert(notified == 2);
 }
 
 unittest  // stopSweeper ends the sweep loop, including one a restart replaced
