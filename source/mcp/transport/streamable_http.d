@@ -77,6 +77,20 @@ struct StreamLimits
 	/// that address's request is answered 429. Behind a reverse proxy every
 	/// caller shares the proxy's address; raise this, or set it to `0`, there.
 	size_t maxPushStreamsPerAddress = 100;
+	/// Streamable HTTP POST requests dispatched at once across the mount; past
+	/// it a request POST is answered 503. `subscriptions/listen` and
+	/// `events/stream` count against `maxPushStreams` instead, and a client's
+	/// notification or reply POST is never refused.
+	size_t maxRequests = 1_000;
+	/// Streamable HTTP POST requests one authenticated principal has dispatched
+	/// at once across all its sessions; past it that principal's request POST is
+	/// answered 429.
+	size_t maxRequestsPerPrincipal = 100;
+	/// Streamable HTTP POST requests unauthenticated callers from one remote
+	/// address have dispatched at once; past it that address's request POST is
+	/// answered 429. Behind a reverse proxy every caller shares the proxy's
+	/// address; raise this, or set it to `0`, there.
+	size_t maxRequestsPerAddress = 100;
 	/// Bytes queued for one long-lived SSE stream whose client is not reading.
 	/// Past it, delivery waits up to `stallTimeout` for the
 	/// client to catch up, then closes and drops the stream, so a stalled client
@@ -460,6 +474,8 @@ void mountMcp(URLRouter router, McpServer server,
 			opts.streamLimits.maxPushStreamsPerAddress);
 	auto getStreams = new StreamGate(opts.streamLimits.maxGetStreams,
 			opts.streamLimits.maxGetStreamsPerPrincipal, opts.streamLimits.maxGetStreamsPerAddress);
+	auto requestSlots = new StreamGate(opts.streamLimits.maxRequests,
+			opts.streamLimits.maxRequestsPerPrincipal, opts.streamLimits.maxRequestsPerAddress);
 
 	// This mount owns a single fallback `ConnectionState`, which the server core
 	// threads through dispatch and reads back for the notify/push path. It is the
@@ -486,7 +502,7 @@ void mountMcp(URLRouter router, McpServer server,
 		if (!readPostBody(req, res, opts.maxRequestBytes, payload))
 			return;
 		handlePost(server, push, sessions, statelessInFlight, pushStreams,
-			opts, token, payload, req, res);
+			requestSlots, opts, token, payload, req, res);
 	});
 	if (sessions !is null)
 		sessions.onExpire = (string sid) @safe { push.closeSession(sid); };
@@ -2653,6 +2669,20 @@ private void refuseTooManyPushStreams(HTTPServerResponse res, Json id, StreamGat
 			: "too many open notification streams")).toString(), "application/json");
 }
 
+/// Answer a request POST refused a dispatch slot: 503 when the mount already
+/// runs `StreamLimits.maxRequests` requests, 429 when the caller runs
+/// `StreamLimits.maxRequestsPerPrincipal` (authenticated) or
+/// `maxRequestsPerAddress` (unauthenticated).
+private void refuseTooManyRequests(HTTPServerResponse res, Json id, StreamGate.Refusal why) @safe
+{
+	const mine = why == StreamGate.Refusal.caller;
+	res.statusCode = mine ? HTTPStatus.tooManyRequests : HTTPStatus.serviceUnavailable;
+	res.headers["Retry-After"] = "1";
+	res.writeBody(makeErrorResponse(id, internalError(mine
+			? "too many concurrent requests for this client" : "too many concurrent requests"))
+			.toString(), "application/json");
+}
+
 /// The token a POST's request is scoped by (its cancellation, server->client
 /// waiter and replay-owner key): the session an `initialize` just minted, else
 /// `headerScope`, the scope the request's own headers name. A stateful
@@ -2671,9 +2701,8 @@ unittest  // a stateful initialize is scoped by its minted session, never the he
 }
 
 private void handlePost(McpServer server, ServerPushChannel push,
-		SessionManager sessions, StatelessInFlight statelessInFlight,
-		StreamGate pushStreams,
-		StreamableHttpOptions opts,
+		SessionManager sessions, StatelessInFlight statelessInFlight, StreamGate pushStreams,
+		StreamGate requestSlots, StreamableHttpOptions opts,
 		TokenInfo token, string payload, HTTPServerRequest req, HTTPServerResponse res) @safe
 {
 	auto coord = push.coordinator;
@@ -2810,6 +2839,19 @@ private void handlePost(McpServer server, ServerPushChannel push,
 					.toString(), "application/json");
 			return;
 		}
+		// A batch carrying requests holds one dispatch slot while it runs.
+		const batchPrincipal = principalOf(token);
+		const batchAddress = remoteAddressOf(req, opts);
+		const batchSlot = carriesRequest(input);
+		if (batchSlot)
+			if (const why = requestSlots.tryAcquire(batchPrincipal, batchAddress))
+			{
+				refuseTooManyRequests(res, Json(null), why);
+				return;
+			}
+		scope (exit)
+			if (batchSlot)
+				requestSlots.release(batchPrincipal, batchAddress);
 		// 2025-03-26 back-compat: the non-streaming batch path (no in-flight
 		// server->client traffic), dispatched against the resolved state so the
 		// legacy path is actually reachable for a session that negotiated 2025-03-26.
@@ -3034,6 +3076,16 @@ private void handlePost(McpServer server, ServerPushChannel push,
 			handleEventsStream(server, msg, res, principal, limits);
 			return;
 		}
+		const slotPrincipal = principalOf(token);
+		const slotAddress = remoteAddressOf(req, opts);
+		if (const why = requestSlots.tryAcquire(slotPrincipal, slotAddress))
+		{
+			sessions !is null && sessions.terminate(mintedSessionId);
+			refuseTooManyRequests(res, msg.id, why);
+			return;
+		}
+		scope (exit)
+			requestSlots.release(slotPrincipal, slotAddress);
 		// Resolve THIS request's per-connection state and hand it to
 		// the context so the server core dispatches against it (never the single
 		// bound `activeConnection`). Stateful HTTP -> the SessionManager-owned state
@@ -6478,6 +6530,80 @@ unittest  // a stateful server answers a body-signalled 2026-07-28 subscriptions
 	assert(res.statusCode == HTTPStatus.badRequest);
 	auto resp = parseJsonString(cast(string) sink.data.idup);
 	assert(resp["error"]["code"].get!int == ErrorCode.unsupportedProtocolVersion);
+}
+
+unittest  // one anonymous address past its concurrent-request cap is refused with 429
+{
+	import core.time : MonoTime, msecs, seconds;
+	import vibe.core.core : runTask, sleep, exitEventLoop, runEventLoop;
+	import vibe.core.net : resolveHost;
+	import vibe.http.server : createTestHTTPServerResponse, TestHTTPResponseMode;
+	import vibe.stream.memory : createMemoryOutputStream;
+	import mcp.protocol.types : Tool, CallToolResult;
+
+	auto server = McpServer.stateless("t", "1");
+	bool started, release;
+	Tool wait = {name: "wait"};
+	server.registerTool(wait, (Json args, RequestContext ctx) @safe {
+		started = true;
+		const deadline = MonoTime.currTime + 2.seconds;
+		while (!release && MonoTime.currTime < deadline)
+			sleep(5.msecs);
+		CallToolResult r;
+		return r;
+	});
+	auto router = new URLRouter;
+	StreamableHttpOptions opts;
+	opts.streamLimits.maxRequestsPerAddress = 1;
+	mountMcp(router, server, opts);
+
+	void call(string from, HTTPServerResponse res) @safe
+	{
+		auto req = makeInitPostReq(makeRequest(Json(1), "tools/call",
+				Json(["name": Json("wait"), "arguments": Json.emptyObject])).toString(),
+				[
+					"Accept": "application/json, text/event-stream",
+					"MCP-Protocol-Version": "2025-11-25",
+		]);
+		req.clientAddress = resolveHost(from);
+		router.handleRequest(req, res);
+	}
+
+	HTTPServerResponse response() @safe
+	{
+		return createTestHTTPServerResponse(createMemoryOutputStream(), null,
+				TestHTTPResponseMode.bodyOnly);
+	}
+
+	auto first = response(), second = response();
+	runTask(() @safe nothrow{
+		try
+			call("10.0.0.1", first);
+		catch (Exception)
+		{
+		}
+	});
+	runTask(() @safe nothrow{
+		try
+		{
+			while (!started)
+				sleep(5.msecs);
+			call("10.0.0.1", second);
+		}
+		catch (Exception)
+		{
+		}
+		release = true;
+		try
+			sleep(50.msecs);
+		catch (Exception)
+		{
+		}
+		exitEventLoop();
+	});
+	runEventLoop();
+	assert(second.statusCode == HTTPStatus.tooManyRequests);
+	assert(first.statusCode == HTTPStatus.ok);
 }
 
 unittest  // a stateful server refuses a session-less 2026-07-28 request with -32022, not a missing-session 400
