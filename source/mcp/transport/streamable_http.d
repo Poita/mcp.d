@@ -1915,7 +1915,9 @@ private string principalOf(TokenInfo token) @safe
 
 /// The key the per-address caps count `req`'s caller under; see `clientBucket`.
 /// With `trustProxyHeaders` the caller is the last `X-Forwarded-For` entry, the
-/// one the trusted proxy appended; earlier entries are client-supplied.
+/// one the trusted proxy appended; earlier entries are client-supplied. Several
+/// `X-Forwarded-For` lines form one list in order, so a proxy that adds its own
+/// line rather than extending the client's still has the last word.
 private string remoteAddressOf(HTTPServerRequest req, StreamableHttpOptions opts) @safe nothrow
 {
 	import std.string : lastIndexOf, strip;
@@ -1925,7 +1927,8 @@ private string remoteAddressOf(HTTPServerRequest req, StreamableHttpOptions opts
 		string last;
 		try
 		{
-			const forwarded = req.headers.get("X-Forwarded-For", "");
+			const lines = req.headers.getAll("X-Forwarded-For");
+			const forwarded = lines.length ? lines[$ - 1] : "";
 			last = forwarded[forwarded.lastIndexOf(',') + 1 .. $].strip;
 		}
 		catch (Exception)
@@ -1944,6 +1947,16 @@ unittest  // behind a trusted proxy the per-address key is the address the proxy
 	auto req = makeInitPostReq("{}", [
 		"X-Forwarded-For": "192.0.2.1, 198.51.100.7"
 	]);
+	assert(remoteAddressOf(req, opts) == "198.51.100.7");
+}
+
+unittest  // a proxy appending its own X-Forwarded-For line outranks a client-sent line
+{
+	StreamableHttpOptions opts;
+	opts.trustProxyHeaders = true;
+	auto req = makeInitPostReq("{}");
+	req.headers.addField("X-Forwarded-For", "192.0.2.1");
+	req.headers.addField("X-Forwarded-For", "198.51.100.7");
 	assert(remoteAddressOf(req, opts) == "198.51.100.7");
 }
 
