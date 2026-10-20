@@ -384,7 +384,7 @@ struct EventsOptions
 	bool webhookEnabled = true; /// advertise/serve webhook delivery
 	DeliveryMode[] disabledModes; /// modes disabled for ALL types (a type may narrow further, not re-enable)
 	int webhookMaxSubscriptionsPerPrincipal = 1000; /// cap on live webhook subscriptions one principal may hold (0 = unlimited)
-	string[] callbackAllowlist; /// callback URL prefixes treated as pre-verified (same origin; the path matches on whole segments)
+	string[] callbackAllowlist; /// callback URL prefixes treated as pre-verified (same origin; the path matches on whole segments); each must be an absolute URL without userinfo, or construction throws
 	bool wellKnownReceiverVerification = true; /// honour a receiver-published /.well-known/mcp-webhook-receiver.json
 	Duration wellKnownCacheTtl = 10.minutes; /// how long a fetched (or absent) receiver document is cached per origin
 	bool allowPrivateCallbackHosts; /// permit non-globally-routable callback IPs (tests/dev)
@@ -715,6 +715,16 @@ final class EventsRuntime
 		webhookStore_ = (webhookStore is null) ? new InMemoryWebhookSubscriptionStore()
 			: webhookStore;
 		opts_ = opts;
+		// An entry the matcher cannot parse would otherwise be skipped on every
+		// subscribe, silently pre-verifying nothing.
+		foreach (entry; opts_.callbackAllowlist)
+		{
+			string scheme, host, path;
+			ushort port;
+			bool hasUserinfo;
+			if (!parseAuthority(entry, scheme, host, port, path, hasUserinfo) || hasUserinfo)
+				throw new Exception(`EventsOptions.callbackAllowlist entry "` ~ entry ~ `" is not an absolute URL without userinfo, such as "https://hooks.example.com/mcp/"`);
+		}
 		if (opts_.allowNoExpiry && !webhookStore_.durable())
 			throw new Exception("EventsOptions.allowNoExpiry requires a durable "
 					~ "WebhookSubscriptionStore: a no-expiry subscription is never refreshed, "
@@ -849,8 +859,7 @@ final class EventsRuntime
 	/// Register (or replace) an event type.
 	void register(EventRegistration reg) @safe
 	{
-		const name = reg.descriptor.name;
-		// Compile before touching live subscriptions: a malformed schema is
+		const name = reg.descriptor.name; // Compile before touching live subscriptions: a malformed schema is
 		// rejected with the current registration and its subscribers intact.
 		reg.inputValidator = compileInputValidator(reg.descriptor.inputSchema);
 		auto existing = name in types_;
@@ -2183,6 +2192,7 @@ final class EventsRuntime
 		const fresh = trackJob(job.subscriptionId, job.jobId, job.occ.cursor);
 		enqueuing_[job.jobId] = true;
 		bool added;
+
 		{
 			scope (exit)
 				enqueuing_.remove(job.jobId);
@@ -2269,9 +2279,8 @@ final class EventsRuntime
 			string eScheme, eHost, ePath;
 			ushort ePort;
 			bool eUserinfo;
-			if (!parseAuthority(entry, eScheme, eHost, ePort, ePath, eUserinfo))
-				continue;
-			if (eUserinfo)
+			// Construction rejects an entry that does not parse or carries userinfo.
+			if (!parseAuthority(entry, eScheme, eHost, ePort, ePath, eUserinfo) || eUserinfo)
 				continue;
 			// Authority must match exactly (scheme/host/port), then the entry's path is
 			// a prefix of the URL's path so an origin entry covers everything under it.
@@ -6955,6 +6964,22 @@ unittest  // an allowlist path prefix covers only whole path segments
 	auto below = rt.subscribeWebhook(webhookSub("n",
 			"https://proxy.example.com/hooks/a"), "user-1");
 	assert(rt.webhookStore().get(below.id).get.verified);
+}
+
+unittest  // an allowlist entry that is not an absolute URL is rejected at construction
+{
+	import std.algorithm.searching : canFind;
+	import std.exception : collectException;
+
+	foreach (entry; [
+		"proxy.example.com/hooks", "/hooks", "https://user@proxy.example.com/"
+	])
+	{
+		EventsOptions o;
+		o.callbackAllowlist = ["https://ok.example.com/", entry];
+		auto e = collectException(new EventsRuntime(null, o));
+		assert(e !is null && e.msg.canFind(entry), entry);
+	}
 }
 
 unittest  // an allowlisted callback URL is pre-verified at subscribe time
