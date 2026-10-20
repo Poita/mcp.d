@@ -855,7 +855,9 @@ final class EventsRuntime
 		reg.inputValidator = compileInputValidator(reg.descriptor.inputSchema);
 		auto existing = name in types_;
 		reg.generation = existing is null ? ++generations_ : existing.generation;
-		bool descriptorChanged = existing is null;
+		// Clients see only the listed descriptor, so only a change to it (not,
+		// say, to emitOnly) is announced with list_changed.
+		const listedBefore = listedDescriptor(name);
 		if (existing !is null)
 		{
 			// A breaking change to either schema invalidates the contract every
@@ -870,24 +872,37 @@ final class EventsRuntime
 					: reg.descriptor.payloadSchema;
 				if (canonicalJsonString(before) == canonicalJsonString(after))
 					continue;
-				descriptorChanged = true;
 				if (!isAdditiveSchemaChange(before, after, feature == "inputSchema"))
 					terminateEventType(name, schemaChangedError(name, feature));
 			}
-			descriptorChanged = descriptorChanged
-				|| existing.descriptor.description != reg.descriptor.description
-				|| existing.descriptor.title != reg.descriptor.title
-				|| existing.disabledModes != reg.disabledModes
-				|| existing.emitOnly != reg.emitOnly || canonicalJsonString(
-						existing.descriptor.meta) != canonicalJsonString(reg.descriptor.meta);
 		}
 		const offeredBefore = existing is null ? null : effectiveDelivery(name);
 		types_[name] = reg;
 		endDisabledModes(name, offeredBefore);
 		if (reg.onSubscribe !is null)
 			adoptStoredWebhooks(name);
-		if (descriptorChanged)
+		if (listedDescriptor(name) != listedBefore)
 			notifyListChanged();
+	}
+
+	// The `events/list` entry for `name`, or null when it is not listed (not
+	// registered, or offering no delivery mode).
+	private Nullable!EventType listedType(string name) @safe
+	{
+		auto p = name in types_;
+		if (p is null)
+			return Nullable!EventType.init;
+		EventType t = p.descriptor;
+		t.name = name;
+		t.delivery = effectiveDelivery(name);
+		return t.delivery.length ? nullable(t) : Nullable!EventType.init;
+	}
+
+	// The canonical JSON of `name`'s `events/list` entry, or null when unlisted.
+	private string listedDescriptor(string name) @safe
+	{
+		auto t = listedType(name);
+		return t.isNull ? null : canonicalJsonString(t.get.toJson());
 	}
 
 	// Take a lifecycle reference for every live stored webhook subscription to
@@ -1115,13 +1130,11 @@ final class EventsRuntime
 	EventListResult list() @safe
 	{
 		EventListResult r;
-		foreach (name, reg; types_)
+		foreach (name; types_.byKey)
 		{
-			EventType t = reg.descriptor;
-			t.name = name;
-			t.delivery = effectiveDelivery(name);
-			if (t.delivery.length)
-				r.events ~= t;
+			auto t = listedType(name);
+			if (!t.isNull)
+				r.events ~= t.get;
 		}
 		// Deterministic order so list output is stable across calls.
 		r.events.sort!((a, b) => a.name < b.name);
@@ -5828,6 +5841,30 @@ unittest  // an additive schema change keeps subscriptions but still notifies li
 	assert(changed == 2);
 	rt.emit(EventOccurrence("evt", "n", "t"));
 	assert(methods == [eventsEventNotification]); // still subscribed
+}
+
+unittest  // re-registering with only a change clients cannot see does not notify list_changed
+{
+	EventsOptions o;
+	o.nowMs = () @safe => 1_000_000L;
+	o.nowIso = () @safe => "2026-02-19T15:30:00Z";
+	o.disabledModes = [DeliveryMode.push];
+	auto rt = new EventsRuntime(null, o);
+	int changed;
+	rt.onListChanged(() @safe { changed++; });
+	EventRegistration reg = {descriptor: EventType("n"), emitOnly: true};
+	rt.register(reg);
+	assert(changed == 1);
+	reg.emitOnly = false;
+	rt.register(reg);
+	assert(changed == 1);
+	// Push is off server-wide, so opting the type out of it changes nothing listed.
+	reg.disabledModes = [DeliveryMode.push];
+	rt.register(reg);
+	assert(changed == 1);
+	reg.disabledModes = [DeliveryMode.poll];
+	rt.register(reg);
+	assert(changed == 2);
 }
 
 unittest  // notifyListChanged invokes the registered callback
