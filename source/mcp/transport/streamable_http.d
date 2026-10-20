@@ -222,8 +222,9 @@ struct StreamableHttpOptions
 	/// Requests without an `Origin` (non-browser clients) are unaffected.
 	bool validateOrigin = true;
 	string[] allowedHosts = []; /// extra Host header values to accept
-	/// Extra Origin header values to accept. Requests from these origins, and
-	/// from localhost origins, get CORS headers (and their `OPTIONS` preflights
+	/// Extra Origin header values to accept, compared case-insensitively and
+	/// ignoring a trailing slash or the scheme's default port. Requests from
+	/// these origins, and from localhost origins, get CORS headers (and their `OPTIONS` preflights
 	/// are answered) so browser-based clients can reach the endpoint.
 	string[] allowedOrigins = [];
 
@@ -3983,7 +3984,7 @@ McpException validateProtocolVersionHeader(string protoHeader, const(ProtocolVer
 /// Whether a `Host` header value (e.g. "127.0.0.1:3000") is localhost or listed.
 /// Host names compare case-insensitively. A listed entry without a port accepts
 /// its host on any port, as the loopback check does; an entry with a port
-/// accepts only that port.
+/// accepts only that port, or no port when it names a default one (80, 443).
 package bool hostAllowed(string host, const string[] extra) @safe
 {
 	import std.uni : sicmp;
@@ -3995,10 +3996,17 @@ package bool hostAllowed(string host, const string[] extra) @safe
 		string entryName, entryPort;
 		splitHostPort(entry, entryName, entryPort);
 		if (entryName.length && sicmp(entryName, name) == 0
-				&& (entryPort.length == 0 || entryPort == port))
+				&& (entryPort.length == 0 || entryPort == port
+					|| (port.length == 0 && isDefaultPort(entryPort))))
 			return true;
 	}
 	return isLoopbackHostname(name);
+}
+
+/// Whether `port` is a default HTTP(S) port, which a `Host` header may omit.
+private bool isDefaultPort(string port) @safe pure nothrow
+{
+	return port == "80" || port == "443";
 }
 
 /// Split a `host[:port]` value into its host name and port ("" when absent). A
@@ -4031,14 +4039,16 @@ private void splitHostPort(string value, out string name, out string port) @safe
 }
 
 /// Whether an `Origin` header value (e.g. "http://localhost:3000") is localhost
-/// or listed.
+/// or listed. A listed entry matches by scheme, host and port, compared as by
+/// `normalizeOrigin`.
 package bool originAllowed(string origin, const string[] extra) @safe
 {
-	import std.algorithm : canFind;
 	import std.string : indexOf;
 
-	if (extra.canFind(origin))
-		return true;
+	const wanted = normalizeOrigin(origin);
+	foreach (entry; extra)
+		if (normalizeOrigin(entry) == wanted)
+			return true;
 
 	// Strip the scheme, then the path, then the port to isolate the hostname.
 	auto rest = origin;
@@ -4049,6 +4059,30 @@ package bool originAllowed(string origin, const string[] extra) @safe
 	if (slash >= 0)
 		rest = rest[0 .. slash];
 	return isLoopbackHostname(stripPort(rest));
+}
+
+/// `origin` in a canonical form for comparison: scheme and host lowercased,
+/// a trailing slash and the scheme's default port (80 for http, 443 for https)
+/// dropped.
+private string normalizeOrigin(string origin) @safe
+{
+	import std.string : endsWith, indexOf, toLower;
+
+	auto o = origin.toLower;
+	while (o.endsWith("/"))
+		o = o[0 .. $ - 1];
+	const sep = o.indexOf("://");
+	if (sep < 0)
+		return o;
+	const scheme = o[0 .. sep];
+	if ((scheme == "http" && o.endsWith(":80")) || (scheme == "https" && o.endsWith(":443")))
+	{
+		string name, port;
+		splitHostPort(o[sep + 3 .. $], name, port);
+		if (port.length)
+			o = o[0 .. o.length - port.length - 1];
+	}
+	return o;
 }
 
 private string stripPort(string hostport) @safe
@@ -5091,6 +5125,28 @@ unittest  // localhost origins are accepted, foreign origins rejected
 	assert(originAllowed("https://127.0.0.1", []));
 	assert(!originAllowed("http://evil.example.com", []));
 	assert(originAllowed("http://app.example.com", ["http://app.example.com"]));
+}
+
+unittest  // a listed origin matches regardless of case, a trailing slash or an explicit default port
+{
+	assert(originAllowed("https://app.example.com", ["https://App.Example.com/"]));
+	assert(originAllowed("https://app.example.com", [
+			"https://app.example.com:443"
+	]));
+	assert(originAllowed("http://app.example.com:80", ["http://app.example.com"]));
+	assert(originAllowed("HTTPS://APP.EXAMPLE.COM", ["https://app.example.com"]));
+	assert(!originAllowed("http://app.example.com", ["https://app.example.com"]));
+	assert(!originAllowed("https://app.example.com:8443", [
+			"https://app.example.com"
+	]));
+}
+
+unittest  // a listed host with an explicit default port accepts a Host without one
+{
+	assert(hostAllowed("example.com", ["example.com:443"]));
+	assert(hostAllowed("example.com", ["example.com:80"]));
+	assert(!hostAllowed("example.com", ["example.com:8443"]));
+	assert(!hostAllowed("example.com:8443", ["example.com:443"]));
 }
 
 version (unittest)
