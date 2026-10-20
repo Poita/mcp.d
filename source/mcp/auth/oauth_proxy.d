@@ -1438,13 +1438,15 @@ final class OAuthProxy
 	/// Maximum number of cached Client ID Metadata Documents.
 	enum size_t maxCachedClientIdMetadata = 1_000;
 
-	/// Maximum number of Client ID Metadata Document fetches to one host per
-	/// `cimdCacheMinTtl` window. Each distinct `client_id` URL is its own cache
-	/// entry, so without this an unauthenticated `/authorize` with random paths
-	/// on one host would make the proxy fetch from that host once per request.
+	/// Maximum number of failed Client ID Metadata Document fetches to one host
+	/// per `cimdCacheMinTtl` window before further uncached `client_id`s on it
+	/// are refused without a fetch. Each distinct `client_id` URL is its own
+	/// cache entry, so without this an unauthenticated `/authorize` with random
+	/// paths on one host would make the proxy fetch from that host once per
+	/// request.
 	enum size_t maxClientIdMetadataFetchesPerHost = 10;
 
-	// Fetch counts per client_id host, for `maxClientIdMetadataFetchesPerHost`.
+	// Failed-fetch counts per client_id host, for `maxClientIdMetadataFetchesPerHost`.
 	private BoundedExpiringMap!HostFetchWindow cimdFetchesByHost = BoundedExpiringMap!HostFetchWindow(
 			cimdCacheMinTtl, maxCachedClientIdMetadata, null);
 
@@ -1685,10 +1687,12 @@ final class OAuthProxy
 	/// `cimdCacheDefaultTtl`), and a failed fetch for `cimdCacheMinTtl`, so the
 	/// `/consent` leg and repeated `/authorize` requests for one client do not
 	/// refetch an attacker-chosen URL. Fetches of a `client_id` with no cached
-	/// document are further limited to `maxClientIdMetadataFetchesPerHost` per
-	/// host per `cimdCacheMinTtl`, so distinct `client_id` paths on one host
-	/// cannot each trigger a fetch; past the limit such a `client_id` fails
-	/// without a fetch. A cached document is refetched once stale regardless of
+	/// document stop once `maxClientIdMetadataFetchesPerHost` fetches to that
+	/// host have failed within a `cimdCacheMinTtl` window, so distinct invalid
+	/// `client_id` paths on one host cannot each trigger a fetch; past the limit
+	/// such a `client_id` fails without a fetch. Successful fetches are not
+	/// counted, so many legitimate clients hosted on one domain are never held
+	/// back by one another. A cached document is refetched once stale regardless of
 	/// that budget, and when the refetch fails the cached copy keeps being served
 	/// (retrying every `cimdCacheMinTtl`) until `cimdCacheMaxTtl + cimdStaleTtl`
 	/// after its last successful fetch, so neither a
@@ -1713,9 +1717,9 @@ final class OAuthProxy
 			if (auto failed = cimdFailures.get(clientIdUrl, false))
 				if (now < failed.expiresAt)
 					throw new InvalidClientIdMetadataException(clientIdUrl, failed.reason);
-			// Only a URL with no validated document draws on its host's budget, so
+			// Only a URL with no validated document is held to its host's budget, so
 			// requests for other paths on a host cannot block a known client's refetch.
-			chargeClientIdMetadataFetch(clientIdUrl, now);
+			enforceClientIdMetadataFetchBudget(clientIdUrl, now);
 		}
 
 		ClientIdMetadataDocument doc;
@@ -1734,6 +1738,7 @@ final class OAuthProxy
 				known.freshUntil = now + cimdCacheMinTtl;
 				return known.doc;
 			}
+			chargeFailedClientIdMetadataFetch(clientIdUrl, now);
 			cimdFailures.put(clientIdUrl, FailedClientIdMetadata(e.msg, now + cimdCacheMinTtl));
 			throw e;
 		}
@@ -1742,23 +1747,34 @@ final class OAuthProxy
 		return doc;
 	}
 
-	// Count a fetch against the client_id host's budget for the current window,
-	// throwing when the budget is spent.
-	private void chargeClientIdMetadataFetch(string clientIdUrl, MonoTime now) @safe
+	// Throw when the client_id host's failed-fetch budget for the current window
+	// is spent. Only failures are counted, so a host serving many valid client
+	// documents is not locked out by its own legitimate first-time clients.
+	private void enforceClientIdMetadataFetchBudget(string clientIdUrl, MonoTime now) @safe
+	{
+		auto w = cimdFetchesByHost.get(cimdBudgetHost(clientIdUrl), false);
+		if (w !is null && now - w.start < cimdCacheMinTtl
+				&& w.count >= maxClientIdMetadataFetchesPerHost)
+			throw new InvalidClientIdMetadataException(clientIdUrl,
+					"too many metadata document fetches for this host; try again later");
+	}
+
+	// Count a failed fetch against the client_id host's budget for the current window.
+	private void chargeFailedClientIdMetadataFetch(string clientIdUrl, MonoTime now) @safe
+	{
+		const host = cimdBudgetHost(clientIdUrl);
+		auto w = cimdFetchesByHost.get(host, false);
+		if (w is null || now - w.start >= cimdCacheMinTtl)
+			cimdFetchesByHost.put(host, HostFetchWindow(now, 1));
+		else
+			++w.count;
+	}
+
+	private static string cimdBudgetHost(string clientIdUrl) @safe
 	{
 		import std.uni : toLower;
 
-		const host = hostOf(clientIdUrl["https://".length .. $]).toLower;
-		auto w = cimdFetchesByHost.get(host, false);
-		if (w is null || now - w.start >= cimdCacheMinTtl)
-		{
-			cimdFetchesByHost.put(host, HostFetchWindow(now, 1));
-			return;
-		}
-		if (w.count >= maxClientIdMetadataFetchesPerHost)
-			throw new InvalidClientIdMetadataException(clientIdUrl,
-					"too many metadata document fetches for this host; try again later");
-		++w.count;
+		return hostOf(clientIdUrl["https://".length .. $]).toLower;
 	}
 
 	// The SSRF-guarded fetch behind `fetchClientIdMetadata`; `ttl` receives the
@@ -2355,12 +2371,34 @@ unittest  // CIMD FETCH: the per-host fetch budget is case-insensitive in the ho
 	int fetches;
 	proxy.clientIdMetadataFetcher = (string url) @safe {
 		++fetches;
+		throw new InvalidClientIdMetadataException(url, "not found");
 		return sampleCimdDoc();
 	};
 	foreach (i; 0 .. OAuthProxy.maxClientIdMetadataFetchesPerHost)
-		cast(void) proxy.fetchClientIdMetadata("https://victim.example/" ~ cast(char)('a' + i));
+		assertThrown!InvalidClientIdMetadataException(
+				proxy.fetchClientIdMetadata("https://victim.example/" ~ cast(char)('a' + i)));
 	assertThrown!InvalidClientIdMetadataException(
 			proxy.fetchClientIdMetadata("https://VICTIM.example/other"));
+	assert(fetches == OAuthProxy.maxClientIdMetadataFetchesPerHost);
+}
+
+unittest  // CIMD FETCH: successful fetches of first-time client_ids on one host do not spend its budget
+{
+	import std.conv : to;
+
+	auto cfg = sampleConfig();
+	cfg.clientIdMetadataDocumentSupported = true;
+	auto proxy = new OAuthProxy(cfg);
+	proxy.clientIdMetadataFetcher = (string url) @safe {
+		auto doc = sampleCimdDoc();
+		doc.clientId = url;
+		return doc;
+	};
+	foreach (i; 0 .. OAuthProxy.maxClientIdMetadataFetchesPerHost * 3)
+	{
+		const url = "https://popular.example/app" ~ i.to!string ~ ".json";
+		assert(proxy.fetchClientIdMetadata(url).clientId == url);
+	}
 }
 
 unittest  // CIMD FETCH: a host's spent fetch budget does not lock out a client whose document is already cached
