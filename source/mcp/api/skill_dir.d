@@ -93,7 +93,7 @@ string registerSkillDir(McpServer server, string dir, SkillDirOptions options = 
 		throw new Exception(
 				"registerSkillDir: SKILL.md must be a regular file, not a symlink: " ~ skillMdPath);
 
-	const skillMd = readTextFile(skillMdPath, options.maxTotalBytes);
+	const skillMd = readTextFile(dir, "SKILL.md", options.maxTotalBytes);
 	Json frontmatter;
 	try
 		frontmatter = parseSkillFrontmatter(skillMd);
@@ -532,7 +532,7 @@ private void walkInto(string base, string rel, ref RawFile[] files, ref size_t t
 		// `files` excludes the root SKILL.md, which counts as a resource too.
 		if (files.length + 2 > maxFiles)
 			throw new Exception("registerSkillDir: skill directory exceeds maxFiles");
-		const bytes = readWithinBudget(joinPath(base, childRel), maxTotalBytes - total);
+		const bytes = readWithinBudget(base, childRel, maxTotalBytes - total);
 		total += bytes.length;
 
 		RawFile r;
@@ -681,55 +681,105 @@ private bool pathIsDir(string p) @safe
 	return exists(p) && isDir(p);
 }
 
-/// The contents of the file `p`, at most `budget` bytes (see
-/// `readWithinBudget`), as UTF-8 text. Throws, naming `p`, when they are not
-/// valid UTF-8.
-private string readTextFile(string p, size_t budget) @safe
+/// The contents of the file `rel` under `dir`, at most `budget` bytes (see
+/// `readWithinBudget`), as UTF-8 text. Throws, naming the file, when they are
+/// not valid UTF-8.
+private string readTextFile(string dir, string rel, size_t budget) @safe
 {
 	import std.utf : UTFException, validate;
 
-	auto text = cast(string) readWithinBudget(p, budget);
+	auto text = cast(string) readWithinBudget(dir, rel, budget);
 	try
 		validate(text);
 	catch (UTFException)
-		throw new Exception("registerSkillDir: " ~ p ~ " is not valid UTF-8 text");
+		throw new Exception("registerSkillDir: " ~ joinPath(dir, rel) ~ " is not valid UTF-8 text");
 	return text;
 }
 
-/// Called with each path just before it is read, so a test can change the file
-/// between its size check and its read.
+/// Called with each path just before it is opened, so a test can change the
+/// file between the directory listing and its read.
 version (unittest) private void delegate(string path) @safe beforeReadHook;
 
-/// The contents of the file `p`, reading at most `upTo` bytes.
-private immutable(ubyte)[] readBytes(string p, size_t upTo = size_t.max) @trusted
+/// The contents of the regular file at the `/`-separated relative path `rel`
+/// under `base`, which may add at most `budget` bytes to a skill's total. The
+/// listing that found `rel` rejected symlinks, but the tree can change before
+/// the read, so on POSIX every component is opened with `O_NOFOLLOW` relative
+/// to its already-opened parent: a file or directory swapped for a symlink in
+/// between is refused rather than followed out of the skill directory. The
+/// size is checked on the opened file before reading, so an oversized file is
+/// never slurped into memory, and the read stops one byte past the budget in
+/// case it grew in between.
+private immutable(ubyte)[] readWithinBudget(string base, string rel, size_t budget) @trusted
 {
-	import std.file : read;
-
 	version (unittest)
 		if (beforeReadHook !is null)
-			beforeReadHook(p);
-	return cast(immutable(ubyte)[]) read(p, upTo);
-}
+			beforeReadHook(joinPath(base, rel));
+	version (Posix)
+		auto bytes = readNoFollow(base, rel, budget);
+	else
+	{
+		import std.file : getSize, read;
 
-/// The contents of the file `p`, which may add at most `budget` bytes to a
-/// skill's total. The size is checked before the read, so an oversized file is
-/// never slurped into memory, and again after it, since the file may have grown
-/// in between; the read stops one byte past the budget.
-private immutable(ubyte)[] readWithinBudget(string p, size_t budget) @safe
-{
-	if (fileSize(p) > budget)
-		throw new Exception("registerSkillDir: skill directory exceeds maxTotalBytes");
-	auto bytes = readBytes(p, budget == size_t.max ? budget : budget + 1);
+		const p = joinPath(base, rel);
+		if (getSize(p) > budget)
+			throw new Exception("registerSkillDir: skill directory exceeds maxTotalBytes");
+		auto bytes = cast(immutable(ubyte)[]) read(p, budget == size_t.max ? budget : budget + 1);
+	}
 	if (bytes.length > budget)
 		throw new Exception("registerSkillDir: skill directory exceeds maxTotalBytes");
 	return bytes;
 }
 
-private ulong fileSize(string p) @safe
+version (Posix) private immutable(ubyte)[] readNoFollow(string base, string rel, size_t budget) @system
 {
-	import std.file : getSize;
+	import core.stdc.errno : ELOOP, errno;
+	import core.sys.posix.fcntl : O_NOFOLLOW, O_NONBLOCK, O_RDONLY, open, openat;
+	import core.sys.posix.sys.stat : S_IFDIR, S_IFMT, S_IFREG, fstat, stat_t;
+	import core.sys.posix.unistd : close, read;
+	import std.array : split;
+	import std.string : toStringz;
 
-	return getSize(p);
+	const where = joinPath(base, rel);
+	int fd = open(base.toStringz, O_RDONLY);
+	if (fd < 0)
+		throw new Exception("registerSkillDir: cannot open " ~ base);
+	scope (exit)
+		close(fd);
+	auto parts = rel.split("/");
+	foreach (i, part; parts)
+	{
+		const last = i + 1 == parts.length;
+		// O_NONBLOCK keeps a FIFO planted in the tree from blocking the open.
+		const next = openat(fd, part.toStringz, O_RDONLY | O_NOFOLLOW | (last ? O_NONBLOCK : 0));
+		if (next < 0)
+			throw new Exception(errno == ELOOP
+					? "registerSkillDir: symlinks are not allowed " ~ "in a skill directory: " ~ rel
+					: "registerSkillDir: cannot open " ~ where);
+		close(fd);
+		fd = next;
+		stat_t st;
+		if (fstat(fd, &st) != 0)
+			throw new Exception("registerSkillDir: cannot stat " ~ where);
+		const kind = st.st_mode & S_IFMT;
+		if (last ? kind != S_IFREG : kind != S_IFDIR)
+			throw new Exception("registerSkillDir: " ~ where ~ " changed while being read");
+		if (last && cast(ulong) st.st_size > budget)
+			throw new Exception("registerSkillDir: skill directory exceeds maxTotalBytes");
+	}
+	const cap = budget == size_t.max ? budget : budget + 1;
+	ubyte[] buf;
+	ubyte[64 * 1024] chunk;
+	while (buf.length < cap)
+	{
+		const want = cap - buf.length < chunk.length ? cap - buf.length : chunk.length;
+		const n = read(fd, chunk.ptr, want);
+		if (n < 0)
+			throw new Exception("registerSkillDir: cannot read " ~ where);
+		if (n == 0)
+			break;
+		buf ~= chunk[0 .. n];
+	}
+	return cast(immutable(ubyte)[]) buf;
 }
 
 private DirEntryInfo[] listDir(string dir) @trusted
@@ -1558,6 +1608,63 @@ unittest  // a SKILL.md that grows past maxTotalBytes before its read is rejecte
 	catch (Exception e)
 		msg = e.msg;
 	assert(msg.canFind("maxTotalBytes"), msg);
+}
+
+version (Posix) unittest  // a file swapped for a symlink after the listing is not followed
+{
+	import std.algorithm.searching : canFind, endsWith;
+	import std.exception : collectException;
+	import std.file : remove;
+	import std.path : dirName;
+
+	const root = tmpRoot("swapfile", "pdf-forms");
+	writeSkillFixture(root);
+	const outside = root.dirName ~ "/secret.md";
+	writeFile(outside, "# secret\n");
+	scope (exit)
+	{
+		beforeReadHook = null;
+		removeTree(root);
+	}
+	beforeReadHook = (string p) @safe {
+		if (p.endsWith("FORMS.md"))
+		{
+			remove(p);
+			makeSymlink(outside, p);
+		}
+	};
+	auto s = McpServer.stateless("t", "1");
+	auto e = collectException(registerSkillDir(s, root));
+	assert(e !is null && e.msg.canFind("symlink"), e is null ? "no exception" : e.msg);
+}
+
+version (Posix) unittest  // a directory swapped for a symlink after the listing is not followed
+{
+	import std.algorithm.searching : canFind, endsWith;
+	import std.exception : collectException;
+	import std.file : mkdirRecurse, rename;
+	import std.path : dirName;
+
+	const root = tmpRoot("swapdir", "pdf-forms");
+	writeSkillFixture(root);
+	const outside = root.dirName ~ "/elsewhere";
+	mkdirRecurse(outside);
+	writeFile(outside ~ "/FORMS.md", "# secret\n");
+	scope (exit)
+	{
+		beforeReadHook = null;
+		removeTree(root);
+	}
+	beforeReadHook = (string p) @safe {
+		if (p.endsWith("FORMS.md"))
+		{
+			rename(root ~ "/references", root.dirName ~ "/moved");
+			makeSymlink(outside, root ~ "/references");
+		}
+	};
+	auto s = McpServer.stateless("t", "1");
+	auto e = collectException(registerSkillDir(s, root));
+	assert(e !is null && e.msg.canFind("symlink"), e is null ? "no exception" : e.msg);
 }
 
 version (unittest) private string skillDigestOf(string s) @safe
