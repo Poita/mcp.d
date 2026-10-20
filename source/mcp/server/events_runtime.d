@@ -1643,7 +1643,10 @@ final class EventsRuntime
 		// torn down and the call creates a fresh one from the supplied cursor.
 		if (!existing.isNull && existing.get.isExpired(now))
 		{
-			removeWebhookState(existing.get);
+			// A concurrent subscribe that re-created it first leaves a record
+			// this call refreshes instead.
+			if (!removeWebhookState(existing.get))
+				return subscribeWebhookAttempt(p, principal, attempt + 1);
 			existing = Nullable!WebhookSubscription.init;
 		}
 		const isNew = existing.isNull;
@@ -1821,7 +1824,15 @@ final class EventsRuntime
 	{
 		const now = opts_.nowMs();
 		foreach (sub; webhookStore_.lapsed(now))
-			removeWebhookState(sub);
+		{
+			// The sweep may yield between reading the lapsed records and removing
+			// one, so it removes only a record still of that incarnation and
+			// still lapsed.
+			const incarnation = sub.incarnation;
+			removeWebhookIf(sub.id,
+					(const WebhookSubscription cur) @safe => cur.incarnation == incarnation
+					&& cur.isExpired(opts_.nowMs()));
+		}
 		evictEndpointCaches(now);
 	}
 
@@ -1853,11 +1864,41 @@ final class EventsRuntime
 	}
 
 	// Forget a webhook subscription everywhere: the store, and this node's
-	// bookkeeping and lifecycle reference.
-	private void removeWebhookState(WebhookSubscription sub) @safe
+	// bookkeeping and lifecycle reference. Only the incarnation `sub` was read
+	// from is removed: one re-created under the same id since then stands.
+	// Returns whether it was removed.
+	private bool removeWebhookState(WebhookSubscription sub) @safe
 	{
-		webhookStore_.remove(sub.id);
-		forgetSubscription(sub.id);
+		const incarnation = sub.incarnation;
+		return removeWebhookIf(sub.id,
+				(const WebhookSubscription cur) @safe => cur.incarnation == incarnation);
+	}
+
+	// Remove the stored subscription `id` and forget it on this node, but only
+	// while `due` holds for its current record. The record is re-read and
+	// removed with a conditional delete, so a concurrent writer's change is
+	// judged by `due` rather than overridden. Returns whether it was removed.
+	private bool removeWebhookIf(string id, scope bool delegate(const WebhookSubscription) @safe due) @safe
+	{
+		enum maxAttempts = 64;
+		foreach (_; 0 .. maxAttempts)
+		{
+			auto sn = webhookStore_.get(id);
+			if (sn.isNull)
+			{
+				// Removed elsewhere: this node's bookkeeping for it goes too.
+				forgetSubscription(id);
+				return false;
+			}
+			if (!due(sn.get))
+				return false;
+			if (webhookStore_.compareAndRemove(id, sn.get.revision))
+			{
+				forgetSubscription(id);
+				return true;
+			}
+		}
+		throw internalError("webhook subscription is contended; it was not removed");
 	}
 
 	// Drop this node's bookkeeping for a subscription that is gone from the
@@ -6346,9 +6387,9 @@ version (unittest)
 			return inner.get(id);
 		}
 
-		void remove(string id) @safe
+		bool compareAndRemove(string id, ulong expectedRevision) @safe
 		{
-			inner.remove(id);
+			return inner.compareAndRemove(id, expectedRevision);
 		}
 
 		WebhookSubscription[] all() @safe
@@ -7950,6 +7991,49 @@ unittest  // sweepWebhookSubscriptions drops lapsed subscriptions and fires on_u
 	assert(unsubs == 1);
 }
 
+unittest  // the sweep leaves a subscription re-created after it read the lapsed records
+{
+	static final class YieldingStore : ForwardingStore
+	{
+		void delegate() @safe afterLapsedRead; // run once, as a yield in the read would
+
+		override WebhookSubscription[] lapsed(long nowMs) @safe
+		{
+			auto result = inner.lapsed(nowMs);
+			if (afterLapsedRead !is null)
+			{
+				auto hook = afterLapsedRead;
+				afterLapsedRead = null;
+				hook();
+			}
+			return result;
+		}
+	}
+
+	long now = 1_000_000;
+	auto store = new YieldingStore();
+	EventsOptions o;
+	o.nowMs = () @safe => now;
+	o.nowIso = () @safe => "t";
+	o.allowPrivateCallbackHosts = true;
+	o.webhookTransport = new FakeWebhookTransport();
+	o.deliveryExecutor = (void delegate() @safe job) @safe { job(); };
+	auto rt = new EventsRuntime(store, o);
+	EventRegistration reg = {descriptor: EventType("n"), emitOnly: true};
+	rt.register(reg);
+	auto r = rt.subscribeWebhook(webhookSub("n", "https://proxy/hooks"), "user-1");
+	now += 365L * 24 * 3600 * 1000;
+	string fresh;
+	store.afterLapsedRead = () @safe {
+		rt.subscribeWebhook(webhookSub("n", "https://proxy/hooks"), "user-1");
+		fresh = store.get(r.id).get.incarnation;
+	};
+	rt.sweepWebhookSubscriptions();
+	assert(fresh.length);
+	auto kept = store.get(r.id);
+	assert(!kept.isNull && kept.get.incarnation == fresh);
+}
+
 unittest  // events sharing a batch cursor settle the watermark together
 {
 	auto ft = new FakeWebhookTransport();
@@ -8283,6 +8367,30 @@ unittest  // a 410 Gone response ends the subscription and fires on_unsubscribe
 	assert(rt.webhookStore().get(r.id).isNull && unsubs == 1);
 	rt.emit(EventOccurrence("evt_2", "n", "t"));
 	assert(ft.eventPosts().length == 1);
+}
+
+unittest  // a 410 Gone leaves a subscription re-created while the POST was in flight
+{
+	auto ft = new FakeWebhookTransport();
+	ft.eventStatuses = [200, 410];
+	auto rt = engineRuntime(ft);
+	auto p = webhookSub("n", "https://proxy/hooks");
+	auto r = rt.subscribeWebhook(p, "user-1");
+	rt.emit(EventOccurrence("evt_1", "n", "t"));
+	string fresh;
+	ft.duringPost = () @safe {
+		UnsubscribeParams u;
+		u.name = "n";
+		u.url = p.delivery.url;
+		u.arguments = p.arguments;
+		rt.unsubscribeWebhook(u, "user-1");
+		rt.subscribeWebhook(p, "user-1");
+		fresh = rt.webhookStore().get(r.id).get.incarnation;
+	};
+	rt.emit(EventOccurrence("evt_2", "n", "t"));
+	assert(fresh.length);
+	auto kept = rt.webhookStore().get(r.id);
+	assert(!kept.isNull && kept.get.incarnation == fresh);
 }
 
 unittest  // a 413 response skips the event with a gap and does not count as a healthy delivery

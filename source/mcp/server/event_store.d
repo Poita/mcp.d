@@ -445,8 +445,14 @@ interface WebhookSubscriptionStore
 	/// The subscription with `id`, or null if unknown.
 	Nullable!WebhookSubscription get(string id) @safe;
 
-	/// Drop the subscription identified by `id`. A no-op if unknown.
-	void remove(string id) @safe;
+	/// Drop the subscription identified by `id` only if its stored `revision`
+	/// still equals `expectedRevision`. Returns false, changing nothing, when
+	/// the subscription is unknown or another writer changed it first. The id
+	/// is derived from the subscription's key, so one re-created since the
+	/// caller read it has the same id: an unconditional delete would end it. A
+	/// shared store implements this as one atomic conditional delete (e.g. a
+	/// Redis WATCH/MULTI or a SQL `DELETE ... WHERE revision = ?`).
+	bool compareAndRemove(string id, ulong expectedRevision) @safe;
 
 	/// Every stored subscription, lapsed or not. Used by `terminatePrincipal`
 	/// across all event types (revoking a principal's access); per-event paths
@@ -531,7 +537,7 @@ final class InMemoryWebhookSubscriptionStore : WebhookSubscriptionStore
 
 	private void store(WebhookSubscription sub) @safe
 	{
-		remove(sub.id);
+		unstore(sub.id);
 		records_[sub.id] = Record(sub.toJson().clone(), sub.name,
 				sub.principal, sub.noExpiry, sub.expiresAtMs, sub.revision);
 		idsByName_[sub.name][sub.id] = true;
@@ -545,7 +551,16 @@ final class InMemoryWebhookSubscriptionStore : WebhookSubscriptionStore
 		return Nullable!WebhookSubscription.init;
 	}
 
-	void remove(string id) @safe
+	bool compareAndRemove(string id, ulong expectedRevision) @safe
+	{
+		auto p = id in records_;
+		if (p is null || p.revision != expectedRevision)
+			return false;
+		unstore(id);
+		return true;
+	}
+
+	private void unstore(string id) @safe
 	{
 		auto p = id in records_;
 		if (p is null)
@@ -1433,7 +1448,7 @@ unittest  // WebhookSubscription persists previousSecret only during rotation gr
 	assert(back.previousSecret == "whsec_old" && back.previousSecretGraceUntilMs == 9999);
 }
 
-unittest  // InMemoryWebhookSubscriptionStore put/get/remove/all
+unittest  // InMemoryWebhookSubscriptionStore put/get/compareAndRemove/all
 {
 	auto store = new InMemoryWebhookSubscriptionStore();
 	WebhookSubscription s;
@@ -1443,8 +1458,21 @@ unittest  // InMemoryWebhookSubscriptionStore put/get/remove/all
 	assert(!store.get("id1").isNull && store.get("id1").get.name == "n");
 	assert(store.get("missing").isNull);
 	assert(store.all().length == 1);
-	store.remove("id1");
+	assert(store.compareAndRemove("id1", store.get("id1").get.revision));
 	assert(store.get("id1").isNull && store.all().length == 0);
+}
+
+unittest  // InMemoryWebhookSubscriptionStore.compareAndRemove leaves a record changed since it was read
+{
+	auto store = new InMemoryWebhookSubscriptionStore();
+	WebhookSubscription s;
+	s.id = "id1";
+	store.put(s);
+	const read = store.get("id1").get.revision;
+	store.put(s);
+	assert(!store.compareAndRemove("id1", read));
+	assert(!store.get("id1").isNull);
+	assert(!store.compareAndRemove("missing", 0));
 }
 
 unittest  // InMemoryWebhookSubscriptionStore.byName returns only that event type's subscriptions
@@ -1460,7 +1488,7 @@ unittest  // InMemoryWebhookSubscriptionStore.byName returns only that event typ
 	}
 	assert(store.byName("x", 0).length == 2 && store.byName("y", 0).length == 1);
 	assert(store.byName("z", 0).length == 0);
-	store.remove("a");
+	assert(store.compareAndRemove("a", store.get("a").get.revision));
 	assert(store.byName("x", 0).length == 1 && store.byName("x", 0)[0].id == "c");
 }
 
