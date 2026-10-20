@@ -175,6 +175,20 @@ struct ModelPreferences
 		return j;
 	}
 
+	/// The priority `key` of `j`, null when absent; throws -32602 when it is
+	/// not a number in 0..1, the range the schema gives every priority.
+	private static Nullable!double priorityOf(Json j, string key) @safe
+	{
+		if (key !in j || j[key].type == Json.Type.undefined || j[key].type == Json.Type.null_)
+			return Nullable!double.init;
+		const double v = numberOrThrow(j[key], key);
+		// `!(v >= 0)` also rejects NaN.
+		if (!(v >= 0) || v > 1)
+			throw invalidParams("'" ~ key ~ "' must be a number from 0 to 1");
+		return Nullable!double(v);
+	}
+
+	/// Throws -32602 when a priority is not a number from 0 to 1.
 	static ModelPreferences fromJson(Json j) @safe
 	{
 		requireObject(j, "ModelPreferences");
@@ -182,16 +196,9 @@ struct ModelPreferences
 		if ("hints" in j && j["hints"].type == Json.Type.array)
 			foreach (i; 0 .. j["hints"].length)
 				p.hints ~= ModelHint.fromJson(j["hints"][i]);
-		if ("costPriority" in j && j["costPriority"].type != Json.Type.undefined
-				&& j["costPriority"].type != Json.Type.null_)
-			p.costPriority = numberOrThrow(j["costPriority"], "costPriority");
-		if ("speedPriority" in j && j["speedPriority"].type != Json.Type.undefined
-				&& j["speedPriority"].type != Json.Type.null_)
-			p.speedPriority = numberOrThrow(j["speedPriority"], "speedPriority");
-		if ("intelligencePriority" in j && j["intelligencePriority"].type != Json.Type.undefined
-				&& j["intelligencePriority"].type != Json.Type.null_)
-			p.intelligencePriority = numberOrThrow(j["intelligencePriority"],
-					"intelligencePriority");
+		p.costPriority = priorityOf(j, "costPriority");
+		p.speedPriority = priorityOf(j, "speedPriority");
+		p.intelligencePriority = priorityOf(j, "intelligencePriority");
 		return p;
 	}
 
@@ -303,9 +310,10 @@ struct CreateMessageRequest
 	{
 		requireObject(j, "CreateMessageRequest");
 		CreateMessageRequest r;
-		if ("messages" in j && j["messages"].type == Json.Type.array)
-			foreach (i; 0 .. j["messages"].length)
-				r.messages ~= SamplingMessage.fromJson(j["messages"][i]);
+		if ("messages" !in j || j["messages"].type != Json.Type.array)
+			throw invalidParams("'messages' is required and must be an array");
+		foreach (i; 0 .. j["messages"].length)
+			r.messages ~= SamplingMessage.fromJson(j["messages"][i]);
 		if ("modelPreferences" in j && j["modelPreferences"].type == Json.Type.object)
 			r.modelPreferences = ModelPreferences.fromJson(j["modelPreferences"]);
 		tryGet(j, "systemPrompt", r.systemPrompt);
@@ -903,6 +911,44 @@ unittest  // CreateMessageRequest.fromJson rejects a negative or out-of-range ma
 	}
 }
 
+unittest  // CreateMessageRequest.fromJson rejects a missing or non-array messages with -32602
+{
+	import std.exception : collectException;
+
+	foreach (bad; [Json.undefined, Json("hi"), Json.emptyObject, Json(null)])
+	{
+		Json j = Json.emptyObject;
+		if (bad.type != Json.Type.undefined)
+			j["messages"] = bad;
+		j["maxTokens"] = Json(16L);
+		auto ex = cast(McpException) collectException(CreateMessageRequest.fromJson(j));
+		assert(ex !is null && ex.code == ErrorCode.invalidParams, bad.toString);
+	}
+}
+
+unittest  // ModelPreferences.fromJson rejects a priority outside 0..1 with -32602
+{
+	import std.exception : collectException;
+
+	foreach (key; ["costPriority", "speedPriority", "intelligencePriority"])
+		foreach (bad; [Json(1.5), Json(-0.1), Json(2L)])
+		{
+			Json j = Json.emptyObject;
+			j[key] = bad;
+			auto ex = cast(McpException) collectException(ModelPreferences.fromJson(j));
+			assert(ex !is null && ex.code == ErrorCode.invalidParams, key ~ " " ~ bad.toString);
+		}
+}
+
+unittest  // ModelPreferences.fromJson accepts the priority bounds 0 and 1
+{
+	Json j = Json.emptyObject;
+	j["costPriority"] = Json(0L);
+	j["speedPriority"] = Json(1.0);
+	auto p = ModelPreferences.fromJson(j);
+	assert(p.costPriority.get == 0 && p.speedPriority.get == 1);
+}
+
 unittest  // CreateMessageRequest.toJson rejects a negative maxTokens as a local error
 {
 	import std.exception : collectException;
@@ -1411,10 +1457,12 @@ unittest  // CreateMessageRequest.fromJson rejects non-numeric temperature and m
 			Json(["maxTokens": Json(10), "stopSequences": Json([Json(1)])])
 		])
 	{
+		bad["messages"] = Json.emptyArray;
 		auto ex = cast(McpException) collectException(CreateMessageRequest.fromJson(bad));
 		assert(ex !is null && ex.code == ErrorCode.invalidParams, bad.toString());
 	}
 	auto ok = CreateMessageRequest.fromJson(Json([
+		"messages": Json.emptyArray,
 		"maxTokens": Json(100.0),
 		"temperature": Json(1)
 	]));
