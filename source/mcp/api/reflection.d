@@ -4706,7 +4706,7 @@ version (unittest) private final class TaskUdaApi
 			return tc.requireInput([
 			InputRequest.elicitation("ok", "Approve " ~ topic ~ "?")
 		]);
-		return Approved(topic, tc.input("ok").get!bool);
+		return Approved(topic, tc.input("ok")["action"].get!string == "accept");
 	}
 }
 
@@ -4827,7 +4827,7 @@ unittest  // @taskTool UDA: a mid-task elicitation suspends and resumes via task
 
 	Json up = Json([
 		"taskId": Json(id),
-		"inputResponses": Json(["ok": Json(true)])
+		"inputResponses": Json(["ok": Json(["action": Json("accept")])])
 	]);
 	up["_meta"] = modernMeta();
 	auto ack = s.handle(Message(makeRequest(Json(4), "tasks/update", up))).get;

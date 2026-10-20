@@ -796,8 +796,10 @@ final class TaskRuntime
 	/// `inputResponses` is not a non-empty object, when the task is unknown, when
 	/// it is already terminal (no executor will ever read the answers), or when
 	/// any key is not among the task's current `inputRequests`, or when an
-	/// accepted form elicitation's `content` violates its `requestedSchema`
-	/// (nothing is recorded then; `data.keys` lists the offending keys).
+	/// answer is not a valid result for its request — a malformed elicitation,
+	/// sampling or roots result, or accepted form elicitation `content` that
+	/// violates its `requestedSchema` (nothing is recorded then; `data.keys`
+	/// lists the offending keys).
 	bool deliverInput(string id, Json inputResponses) @safe
 	{
 		import mcp.protocol.errors : invalidParams;
@@ -834,7 +836,7 @@ final class TaskRuntime
 			string reasons;
 			foreach (k, v; inputResponses.byKeyValue)
 			{
-				const why = elicitationContentError(r.inputRequests[k], v);
+				const why = inputResponseError(r.inputRequests[k], v);
 				if (why.length)
 				{
 					invalid ~= k;
@@ -847,7 +849,7 @@ final class TaskRuntime
 				data["taskId"] = id;
 				data["keys"] = serializeToJson(invalid);
 				throw new McpException(ErrorCode.invalidParams,
-					"Input does not match the requested schema: " ~ reasons, data);
+					"Invalid input responses: " ~ reasons, data);
 			}
 			foreach (k, v; inputResponses.byKeyValue)
 				r.inputResponses[k] = v;
@@ -867,28 +869,88 @@ final class TaskRuntime
 		return resumed;
 	}
 
-	/// Why `answer` does not satisfy the form elicitation `request`, or "" when
-	/// it does or nothing can be checked. Only accepted form answers carry
-	/// `content`, which must conform to the request's `requestedSchema`; a
-	/// rejected answer is refused at `tasks/update`, so the client can correct
-	/// it instead of the executor failing on it.
-	private static string elicitationContentError(Json request, Json answer) @safe
+	/// Why `answer` is not a valid result for the input request `request`, or
+	/// "" when it is or the request's method is not one the runtime knows. An
+	/// `elicitation/create` answer must be an `ElicitResult` whose `action` is
+	/// `accept`, `decline` or `cancel`, and an accepted form answer's `content`
+	/// must conform to the request's `requestedSchema`; a
+	/// `sampling/createMessage` answer must be a `CreateMessageResult`; a
+	/// `roots/list` answer must be a `ListRootsResult` whose roots each carry a
+	/// `uri`. A rejected answer is refused at `tasks/update`, so the client can
+	/// correct it instead of the executor failing on it.
+	private static string inputResponseError(Json request, Json answer) @safe
+	{
+		if (request.type != Json.Type.object)
+			return "";
+		auto method = "method" in request;
+		if (method is null || method.type != Json.Type.string)
+			return "";
+		switch (method.get!string)
+		{
+		case "elicitation/create":
+			return elicitationAnswerError(request, answer);
+		case "sampling/createMessage":
+			return samplingAnswerError(answer);
+		case "roots/list":
+			return rootsAnswerError(answer);
+		default:
+			return "";
+		}
+	}
+
+	private static string elicitationAnswerError(Json request, Json answer) @safe
 	{
 		import mcp.protocol.schema : validateAgainstSchema;
 
-		if (request.type != Json.Type.object || answer.type != Json.Type.object)
+		if (answer.type != Json.Type.object)
+			return "an elicitation answer must be an object";
+		auto action = "action" in answer;
+		if (action is null || action.type != Json.Type.string)
+			return "an elicitation answer must carry a string 'action'";
+		const verb = action.get!string;
+		if (verb == "decline" || verb == "cancel")
 			return "";
-		auto method = "method" in request;
+		if (verb != "accept")
+			return "elicitation action '" ~ verb ~ "' is not accept, decline or cancel";
+		auto content = "content" in answer;
+		if (content !is null && content.type != Json.Type.object)
+			return "elicitation 'content' must be an object";
 		auto params = "params" in request;
-		if (method is null || *method != Json("elicitation/create")
-				|| params is null || params.type != Json.Type.object)
+		if (params is null || params.type != Json.Type.object)
 			return "";
 		auto schema = "requestedSchema" in *params;
-		auto action = "action" in answer;
-		if (schema is null || action is null || *action != Json("accept"))
+		if (schema is null)
 			return "";
-		auto content = "content" in answer;
 		return validateAgainstSchema(content is null ? Json.emptyObject : *content, *schema);
+	}
+
+	private static string samplingAnswerError(Json answer) @safe
+	{
+		import mcp.protocol.sampling : CreateMessageResult;
+
+		try
+			CreateMessageResult.fromJson(answer);
+		catch (Exception e)
+			return "not a valid sampling result: " ~ e.msg;
+		return "";
+	}
+
+	private static string rootsAnswerError(Json answer) @safe
+	{
+		if (answer.type != Json.Type.object)
+			return "a roots answer must be an object";
+		auto roots = "roots" in answer;
+		if (roots is null || roots.type != Json.Type.array)
+			return "a roots answer must carry a 'roots' array";
+		foreach (root; roots.byValue)
+		{
+			if (root.type != Json.Type.object)
+				return "each root must be an object";
+			auto uri = "uri" in root;
+			if (uri is null || uri.type != Json.Type.string)
+				return "each root must carry a string 'uri'";
+		}
+		return "";
 	}
 
 	/// The stored record for `id`, or null when unknown or expired.
@@ -1064,8 +1126,8 @@ unittest  // requireInput surfaces inputRequests and deliverInput records respon
 	assert(d["status"].get!string == "input_required");
 	assert(d["inputRequests"]["k1"]["method"].get!string == "elicitation/create");
 
-	rt.deliverInput(t.taskId, Json(["k1": Json(["answer": Json("yes")])]));
-	assert(rt.takenInput(t.taskId)["k1"]["answer"].get!string == "yes");
+	rt.deliverInput(t.taskId, Json(["k1": Json(["action": Json("accept")])]));
+	assert(rt.takenInput(t.taskId)["k1"]["action"].get!string == "accept");
 }
 
 unittest  // a manual (executor-less) task cancels immediately
@@ -1260,8 +1322,10 @@ unittest  // STATELESSNESS: two runtimes sharing one store see each other's stat
 
 	// B receives the tasks/update; A (a different node) must see the answer and
 	// the durable executor input.
-	nodeB.deliverInput(t.taskId, Json(["approval": Json(["answer": Json("ok")])]));
-	assert(nodeA.takenInput(t.taskId)["approval"]["answer"].get!string == "ok");
+	nodeB.deliverInput(t.taskId, Json([
+			"approval": Json(["action": Json("accept")])
+	]));
+	assert(nodeA.takenInput(t.taskId)["approval"]["action"].get!string == "accept");
 	assert(nodeA.executorInput(t.taskId)["build"].get!string == "v9");
 
 	// A completes; B sees the result.
@@ -1556,7 +1620,9 @@ unittest  // a partial tasks/update answer keeps an input_required task from goi
 	]));
 	const before = notified;
 	now = "2026-06-07T10:50:00Z";
-	assert(!rt.deliverInput(t.taskId, Json(["a": Json("first")])));
+	assert(!rt.deliverInput(t.taskId, Json([
+				"a": Json(["action": Json("accept")])
+	])));
 	assert(notified == before, "a partial answer changes no status");
 	now = "2026-06-07T11:30:00Z";
 	auto d = rt.getDetailed(t.taskId);
@@ -1629,12 +1695,12 @@ unittest  // deliverInput rejects a key the task has not requested and records n
 			"a": Json(["method": Json("elicitation/create")])
 	]));
 	auto ex = cast(McpException) collectException(rt.deliverInput(t.taskId,
-			Json(["a": Json(1), "junk": Json(2)])));
+			Json(["a": Json(["action": Json("accept")]), "junk": Json(2)])));
 	assert(ex !is null && ex.code == ErrorCode.invalidParams);
 	assert(ex.data["taskId"].get!string == t.taskId);
 	assert(rt.takenInput(t.taskId).length == 0);
-	rt.deliverInput(t.taskId, Json(["a": Json(1)]));
-	assert(rt.takenInput(t.taskId)["a"].get!int == 1);
+	rt.deliverInput(t.taskId, Json(["a": Json(["action": Json("decline")])]));
+	assert(rt.takenInput(t.taskId)["a"]["action"].get!string == "decline");
 }
 
 unittest  // deliverInput rejects accepted elicitation content that violates the requested schema
@@ -1670,6 +1736,74 @@ unittest  // deliverInput rejects accepted elicitation content that violates the
 		"q": Json(["action": Json("accept"), "content": Json(["n": Json(3)])])
 	]);
 	assert(rt.deliverInput(t.taskId, good));
+}
+
+version (unittest) private void assertAnswerRejected(Json request, Json answer) @safe
+{
+	import std.exception : collectException;
+
+	auto rt = new TaskRuntime(TaskOptions.init);
+	auto t = rt.createFor("gate", Json.undefined);
+	rt.requireInput(t.taskId, Json(["q": request]));
+	auto ex = cast(McpException) collectException(rt.deliverInput(t.taskId, Json([
+				"q": answer
+	])));
+	assert(ex !is null && ex.code == ErrorCode.invalidParams);
+	assert(ex.data["keys"][0].get!string == "q");
+	assert(rt.takenInput(t.taskId).length == 0);
+	assert(rt.statusOf(t.taskId).get == TaskStatus.inputRequired);
+}
+
+unittest  // deliverInput rejects an elicitation answer that is not an object or has no valid action
+{
+	auto request = Json([
+		"method": Json("elicitation/create"),
+		"params": Json(["message": Json("ok?")])
+	]);
+	assertAnswerRejected(request, Json("yes"));
+	assertAnswerRejected(request, Json.emptyObject);
+	assertAnswerRejected(request, Json(["action": Json(1)]));
+	assertAnswerRejected(request, Json(["action": Json("maybe")]));
+	assertAnswerRejected(request, Json([
+		"action": Json("accept"),
+		"content": Json("x")
+	]));
+}
+
+unittest  // deliverInput rejects a sampling answer that is not a CreateMessageResult
+{
+	auto request = Json([
+		"method": Json("sampling/createMessage"),
+		"params": Json.emptyObject
+	]);
+	assertAnswerRejected(request, Json("text"));
+	assertAnswerRejected(request, Json(["role": Json("assistant")]));
+}
+
+unittest  // deliverInput rejects a roots answer that is not a ListRootsResult
+{
+	auto request = Json(["method": Json("roots/list")]);
+	assertAnswerRejected(request, Json(5));
+	assertAnswerRejected(request, Json.emptyObject);
+	assertAnswerRejected(request, Json(["roots": Json([Json(1)])]));
+}
+
+unittest  // deliverInput accepts well-formed sampling and roots answers
+{
+	auto rt = new TaskRuntime(TaskOptions.init);
+	auto t = rt.createFor("gate", Json.undefined);
+	rt.requireInput(t.taskId, Json([
+			"s": Json(["method": Json("sampling/createMessage")]),
+			"r": Json(["method": Json("roots/list")])
+	]));
+	assert(rt.deliverInput(t.taskId, Json([
+		"s": Json([
+			"role": Json("assistant"),
+			"content": Json(["type": Json("text"), "text": Json("hi")]),
+			"model": Json("m")
+		]),
+		"r": Json(["roots": Json([Json(["uri": Json("file:///tmp")])])])
+	])));
 }
 
 unittest  // deliverInput accepts a declined elicitation without checking its content
@@ -1852,12 +1986,12 @@ unittest  // concurrent tasks/update deliveries both keep their answers
 			"b": Json(["method": Json("elicitation/create")])
 	]));
 	store.beforeNextSwap = () @safe {
-		rt.deliverInput(t.taskId, Json(["b": Json("second")]));
+		rt.deliverInput(t.taskId, Json(["b": Json(["action": Json("decline")])]));
 	};
-	rt.deliverInput(t.taskId, Json(["a": Json("first")]));
+	rt.deliverInput(t.taskId, Json(["a": Json(["action": Json("accept")])]));
 	auto got = rt.takenInput(t.taskId);
-	assert(got["a"].get!string == "first");
-	assert(got["b"].get!string == "second");
+	assert(got["a"]["action"].get!string == "accept");
+	assert(got["b"]["action"].get!string == "decline");
 }
 
 unittest  // only one of two racing resumers moves the task back to working

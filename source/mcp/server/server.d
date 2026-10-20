@@ -9000,12 +9000,12 @@ unittest  // input_required surfaces inputRequests and tasks/update is acknowled
 
 	Json up = Json([
 		"taskId": Json(t.taskId),
-		"inputResponses": Json(["k1": Json(["answer": Json("yes")])])
+		"inputResponses": Json(["k1": Json(["action": Json("accept")])])
 	]);
 	auto ack = s.handle(modernReq(2, "tasks/update", up)).get;
 	assert("error" !in ack);
 	assert(ack["result"].type == Json.Type.object);
-	assert(rt.takenInput(t.taskId)["k1"]["answer"].get!string == "yes");
+	assert(rt.takenInput(t.taskId)["k1"]["action"].get!string == "accept");
 }
 
 version (unittest) private McpServer twoQuestionTaskServer(out int* runs) @safe
@@ -9938,7 +9938,12 @@ unittest  // registerTaskTool: a mid-task input_required resumes on tasks/update
 	s.registerTaskTool(desc, (TaskContext tc) @safe {
 		if (!tc.hasInput("ok"))
 			return tc.requireInput([InputRequest.elicitation("ok", "Proceed?")]);
-		return Json(["structuredContent": Json(["approved": tc.input("ok")])]);
+		return Json([
+			"structuredContent": Json(
+				[
+				"approved": Json(tc.input("ok")["action"].get!string == "accept")
+			])
+		]);
 	});
 
 	auto call = s.handle(modernReq(1, "tools/call", Json([
@@ -9955,7 +9960,7 @@ unittest  // registerTaskTool: a mid-task input_required resumes on tasks/update
 	// The answer resumes the executor (re-dispatched inline) to completion.
 	auto ack = s.handle(modernReq(3, "tasks/update", Json([
 		"taskId": Json(id),
-		"inputResponses": Json(["ok": Json(true)])
+		"inputResponses": Json(["ok": Json(["action": Json("accept")])])
 	]))).get;
 	assert("error" !in ack);
 	auto done = s.handle(modernReq(4, "tasks/get", Json(["taskId": Json(id)]))).get;

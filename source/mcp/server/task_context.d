@@ -964,19 +964,28 @@ unittest  // re-requesting an input key discards its earlier answer, so only a f
 	TaskExecutor exec = (TaskContext tc) @safe {
 		if (!tc.hasInput("x"))
 			return tc.requireInput([InputRequest.elicitation("x", "x?")]);
-		if (tc.inputAs!int("x") < 0) // invalid: ask again
+		const x = tc.input("x")["content"]["x"].get!int;
+		if (x < 0) // invalid: ask again
 			return tc.requireInput([InputRequest.elicitation("x", "x again?")]);
-		return Json([
-			"structuredContent": Json(["x": Json(tc.inputAs!int("x"))])
-		]);
+		return Json(["structuredContent": Json(["x": Json(x)])]);
 	};
 	runTaskExecutor(rt, t.taskId, exec);
-	rt.deliverInput(t.taskId, Json(["x": Json(-1)]));
+	rt.deliverInput(t.taskId, Json([
+			"x": Json([
+				"action": Json("accept"),
+				"content": Json(["x": Json(-1)])
+			])
+	]));
 	rt.resumeWorking(t.taskId);
 	runTaskExecutor(rt, t.taskId, exec);
 	assert(rt.getDetailed(t.taskId)["status"].get!string == "input_required");
 	assert(("x" in rt.takenInput(t.taskId)) is null, "the stale answer was discarded");
-	rt.deliverInput(t.taskId, Json(["x": Json(5)]));
+	rt.deliverInput(t.taskId, Json([
+			"x": Json([
+				"action": Json("accept"),
+				"content": Json(["x": Json(5)])
+			])
+	]));
 	rt.resumeWorking(t.taskId);
 	runTaskExecutor(rt, t.taskId, exec);
 	assert(rt.getDetailed(t.taskId)["result"]["structuredContent"]["x"].get!int == 5);
@@ -992,7 +1001,7 @@ unittest  // re-requesting one key keeps the answers to other keys from earlier 
 	rt.requireInput(t.taskId, Json([
 			"a": Json(["method": Json("elicitation/create")])
 	]));
-	rt.deliverInput(t.taskId, Json(["a": Json(1)]));
+	rt.deliverInput(t.taskId, Json(["a": Json(["action": Json("accept")])]));
 	rt.resumeWorking(t.taskId);
 	rt.requireInput(t.taskId, Json([
 			"b": Json(["method": Json("elicitation/create")])
@@ -1018,7 +1027,7 @@ unittest  // checkpoint state survives a suspension and is restored on re-run
 		]);
 	};
 	runTaskExecutor(rt, t.taskId, exec);
-	rt.deliverInput(t.taskId, Json(["go": Json(true)]));
+	rt.deliverInput(t.taskId, Json(["go": Json(["action": Json("accept")])]));
 	runTaskExecutor(rt, t.taskId, exec);
 	auto d = rt.getDetailed(t.taskId);
 	assert(d["result"]["structuredContent"]["state"].get!string == "carried");
@@ -1116,7 +1125,7 @@ unittest  // an answer that does not decode as the requested type fails the task
 		]);
 	};
 	runTaskExecutor(rt, t.taskId, exec);
-	rt.deliverInput(t.taskId, Json(["n": Json("abc")]));
+	rt.deliverInput(t.taskId, Json(["n": Json(["roots": Json.emptyArray])]));
 	runTaskExecutor(rt, t.taskId, exec);
 	auto d = rt.getDetailed(t.taskId);
 	assert(d["status"].get!string == "failed");
