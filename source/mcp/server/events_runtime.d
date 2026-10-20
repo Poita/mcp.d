@@ -8,7 +8,7 @@ module mcp.server.events_runtime;
 
 import core.time : Duration, seconds, minutes, msecs;
 import std.typecons : Nullable, nullable;
-import std.algorithm : max, sort;
+import std.algorithm : max, min, sort;
 import vibe.data.json : Json;
 
 import mcp.internal.background_loop : BackgroundLoop;
@@ -3114,17 +3114,24 @@ final class EventsRuntime
 		}
 		// Each failed attempt is one sample for the suspension policy, so an
 		// endpoint that never answers reaches the threshold within the window.
+		// A 429 is an endpoint answering and asking for less, not failing: it
+		// still spends an attempt, but is no sample.
 		const cat = res.error.isNull ? DeliveryErrorCategory.http5xx : res.error.get;
-		if (!recordFailure(subId, cat) || attempt >= opts_.webhookMaxAttempts)
+		const throttled = res.statusCode == 429;
+		if ((!throttled && !recordFailure(subId, cat)) || attempt >= opts_.webhookMaxAttempts)
 		{
 			abandonUndelivered(job);
 			return false;
 		}
 		// The retry waits out its backoff in the queue, not in this run: the job
 		// stays leased until then, which holds the subscription's later jobs
-		// behind it, and any node's drain delivers it once the backoff ends.
-		deliveryQueue_.touch(job.jobId, attempt,
-				opts_.nowMs() + backoffFor(attempt).total!"msecs");
+		// behind it, and any node's drain delivers it once the backoff ends. A
+		// `Retry-After` longer than the backoff is honoured, up to the longest
+		// backoff.
+		long delayMs = backoffFor(attempt).total!"msecs";
+		if (!res.retryAfterMs.isNull)
+			delayMs = max(delayMs, min(res.retryAfterMs.get, maxRetryBackoff.total!"msecs"));
+		deliveryQueue_.touch(job.jobId, attempt, opts_.nowMs() + delayMs);
 		return true;
 	}
 
@@ -7419,9 +7426,13 @@ version (unittest)
 			eventCount++;
 			if (status / 100 == 2)
 				return WebhookHttpResult.success(status);
-			return WebhookHttpResult.failure(status / 100 == 4
+			auto failed = WebhookHttpResult.failure(status / 100 == 4
 					? DeliveryErrorCategory.http4xx : DeliveryErrorCategory.http5xx, status);
+			failed.retryAfterMs = retryAfterMs;
+			return failed;
 		}
+
+		Nullable!long retryAfterMs; // the Retry-After every failed event delivery reports
 
 		string wellKnownBody; // served for GET /.well-known/mcp-webhook-receiver.json when set
 		string[] gets; // every GET url, in order
@@ -8807,6 +8818,58 @@ unittest  // a sustained failure rate over the minimum sample suspends the subsc
 	auto suspended = rt.webhookStore().get(r.id).get;
 	assert(!suspended.active); // 2 of 2 failed: 100% over a sample of 2
 	assert(suspended.windowAttempts == 2 && suspended.windowFailures == 2);
+}
+
+unittest  // a throttled (429) delivery is retried but is no sample for the suspension policy
+{
+	auto ft = new FakeWebhookTransport();
+	EventsOptions o;
+	o.nowMs = () @safe => 1_000_000L;
+	o.nowIso = () @safe => "t";
+	o.allowPrivateCallbackHosts = true;
+	o.webhookTransport = ft;
+	o.deliveryExecutor = (void delegate() @safe job) @safe { job(); };
+	o.webhookRetryBase = Duration.zero;
+	o.webhookMaxAttempts = 1;
+	o.webhookSuspension.minAttempts = 2;
+	auto rt = new EventsRuntime(null, o);
+	EventRegistration reg = {descriptor: EventType("n"), emitOnly: true};
+	rt.register(reg);
+
+	auto r = rt.subscribeWebhook(webhookSub("n", "https://proxy/hooks"), "user-1");
+	ft.eventStatuses = [429, 429, 429];
+	foreach (id; ["evt_1", "evt_2", "evt_3"])
+		rt.emit(EventOccurrence(id, "n", "t"));
+	auto sub = rt.webhookStore().get(r.id).get;
+	assert(sub.active && sub.windowFailures == 0);
+}
+
+unittest  // a failed delivery's Retry-After holds its retry back at least that long
+{
+	long now = 1_000_000;
+	auto ft = new FakeWebhookTransport();
+	EventsOptions o;
+	o.nowMs = () @safe => now;
+	o.nowIso = () @safe => "t";
+	o.allowPrivateCallbackHosts = true;
+	o.webhookTransport = ft;
+	o.deliveryExecutor = (void delegate() @safe job) @safe { job(); };
+	o.webhookRetryBase = Duration.zero;
+	auto rt = new EventsRuntime(null, o);
+	EventRegistration reg = {descriptor: EventType("n"), emitOnly: true};
+	rt.register(reg);
+
+	rt.subscribeWebhook(webhookSub("n", "https://proxy/hooks"), "user-1");
+	ft.eventStatuses = [503];
+	ft.retryAfterMs = 120_000L;
+	rt.emit(EventOccurrence("evt_1", "n", "t"));
+	assert(ft.eventPosts().length == 1);
+	now += 60_000;
+	rt.drainDeliveries();
+	assert(ft.eventPosts().length == 1); // still within the Retry-After
+	now += 60_000;
+	rt.drainDeliveries();
+	assert(ft.eventPosts().length == 2);
 }
 
 unittest  // the refresh that reactivates a suspended subscription reports the suspension

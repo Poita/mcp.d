@@ -8,6 +8,7 @@
 /// network.
 module mcp.server.webhook_delivery;
 
+import std.datetime : SysTime;
 import std.typecons : Nullable, nullable;
 import vibe.data.json : Json;
 
@@ -34,6 +35,9 @@ struct WebhookHttpResult
 	int statusCode; /// HTTP status (0 when no response was received)
 	string body; /// response body (used to read a verification challenge echo)
 	Nullable!DeliveryErrorCategory error; /// failure category when !ok
+	/// How long a failure response's `Retry-After` asks the sender to wait, in
+	/// milliseconds; null when it carried none (or an unparseable one).
+	Nullable!long retryAfterMs;
 
 	static WebhookHttpResult success(int status, string body = "") @safe
 	{
@@ -133,8 +137,14 @@ final class SecureWebhookTransport : WebhookTransport
 				if (res.statusCode / 100 == 2)
 					result = WebhookHttpResult.success(res.statusCode, rbody);
 				else
+				{
+					import std.datetime : Clock, UTC;
+
 					result = WebhookHttpResult.failure(categoryForStatus(res.statusCode),
 						res.statusCode);
+					if (auto retryAfter = "Retry-After" in res.headers)
+						result.retryAfterMs = parseRetryAfter(*retryAfter, Clock.currTime(UTC()));
+				}
 				answered = true;
 			}, FetchOptions(requestTimeout_));
 		}
@@ -209,6 +219,33 @@ string readBoundedBody(S)(S stream, size_t cap, out bool truncated) @safe
 DeliveryErrorCategory categoryForStatus(int status) @safe pure nothrow @nogc
 {
 	return (status / 100 == 5) ? DeliveryErrorCategory.http5xx : DeliveryErrorCategory.http4xx;
+}
+
+/// The wait an HTTP `Retry-After` value asks for, in milliseconds from `now`:
+/// either delta-seconds or an HTTP-date (a past date asks for no wait). Null
+/// for a malformed value.
+Nullable!long parseRetryAfter(string value, SysTime now) @safe
+{
+	import std.ascii : isDigit;
+	import std.algorithm : all, max;
+	import std.conv : to;
+	import std.string : strip;
+	import std.datetime.systime : parseRFC822DateTime;
+
+	const v = value.strip;
+	if (v.length == 0)
+		return Nullable!long.init;
+	if (v.all!isDigit)
+	{
+		// More digits than a long holds in milliseconds is no sensible wait.
+		if (v.length > 12)
+			return Nullable!long.init;
+		return nullable(v.to!long * 1000);
+	}
+	try
+		return nullable(max(0L, (parseRFC822DateTime(v) - now).total!"msecs"));
+	catch (Exception)
+		return Nullable!long.init;
 }
 
 /// Best-effort classification of a connector exception message into a category.
@@ -535,6 +572,52 @@ unittest  // a response body is read only up to the cap
 		result = t.post("http://127.0.0.1:" ~ port.to!string ~ "/hook", null, "{}", true);
 	});
 	assert(result.ok && result.body.length <= maxWebhookResponseBytes);
+}
+
+unittest  // a failure response's Retry-After is reported in milliseconds
+{
+	import core.time : seconds;
+
+	WebhookHttpResult result;
+	withLoopbackServer((scope TCPConnection conn) @safe {
+		conn.write(
+			"HTTP/1.1 429 Too Many Requests\r\nRetry-After: 120\r\nContent-Length: 0\r\n\r\n");
+		conn.flush();
+	}, (ushort port) @safe {
+		auto t = new SecureWebhookTransport(5.seconds);
+		result = t.post("http://127.0.0.1:" ~ port.to!string ~ "/hook", null, "{}", true);
+	});
+	assert(!result.ok && result.statusCode == 429);
+	assert(!result.retryAfterMs.isNull && result.retryAfterMs.get == 120_000);
+}
+
+unittest  // parseRetryAfter reads delta-seconds
+{
+	import std.datetime : DateTime, SysTime, UTC;
+
+	const now = SysTime(DateTime(2026, 10, 20, 12, 0, 0), UTC());
+	assert(parseRetryAfter("120", now).get == 120_000);
+	assert(parseRetryAfter(" 0 ", now).get == 0);
+}
+
+unittest  // parseRetryAfter reads an HTTP-date relative to now, and never a past one as negative
+{
+	import std.datetime : DateTime, SysTime, UTC;
+
+	const now = SysTime(DateTime(2026, 10, 20, 12, 0, 0), UTC());
+	assert(parseRetryAfter("Tue, 20 Oct 2026 12:01:30 GMT", now).get == 90_000);
+	assert(parseRetryAfter("Tue, 20 Oct 2026 11:00:00 GMT", now).get == 0);
+}
+
+unittest  // parseRetryAfter rejects a malformed value
+{
+	import std.datetime : DateTime, SysTime, UTC;
+
+	const now = SysTime(DateTime(2026, 10, 20, 12, 0, 0), UTC());
+	assert(parseRetryAfter("", now).isNull);
+	assert(parseRetryAfter("-5", now).isNull);
+	assert(parseRetryAfter("soon", now).isNull);
+	assert(parseRetryAfter("99999999999999999999", now).isNull);
 }
 
 unittest  // categoryForStatus splits 4xx and 5xx
