@@ -39,16 +39,20 @@ ENV PATH="/opt/dlang/ldc-${LDC_VERSION}/bin:${PATH}"
 ENV DC=ldc2
 
 WORKDIR /src
-# Copy the manifest first for layer caching. For reproducible dependency
-# versions, commit dub.selections.json and add it here too:
-#   COPY dub.json dub.selections.json ./
-COPY dub.json ./
+# Copy the manifest first for layer caching. The glob takes the recipe
+# (dub.json or dub.sdl) and, when committed, dub.selections.json, which pins
+# dependency versions for reproducible builds.
+COPY dub.* ./
 COPY source ./source
 
 # Your dub `targetName` — the executable `dub build` produces. Required.
 ARG APP
 RUN test -n "$APP" || { echo "ERROR: pass --build-arg APP=<your dub targetName>"; exit 1; }
-RUN dub build --build=release --compiler=ldc2 && cp "./${APP}" /out
+# The binary lands in the recipe's `targetPath` (the project root by default);
+# dub describe reports it.
+RUN dub build --build=release --compiler=ldc2 \
+    && target_path="$(dub describe --build=release --compiler=ldc2 --data-list --data=target-path)" \
+    && cp "${target_path}${APP}" /out
 
 # ---- runtime stage -------------------------------------------------------
 FROM ubuntu:24.04

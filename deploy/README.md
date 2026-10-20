@@ -56,14 +56,18 @@ Two things that will otherwise cost you a build cycle each:
 
 ## Build
 
-Commit `dub.selections.json` for reproducible dependency versions, then:
+Commit `dub.selections.json` for reproducible dependency versions (the
+Dockerfile copies it, with your `dub.json` or `dub.sdl`, when present), then:
 
 ```bash
 docker build --build-arg APP=<your dub targetName> -t my-server .
 ```
 
-`APP` is the executable `dub build` produces (your `dub.json` `targetName`). The
-[`Dockerfile`](Dockerfile) copies that binary into a slim runtime image.
+`APP` is the executable `dub build` produces (your recipe's `targetName`). The
+[`Dockerfile`](Dockerfile) takes it from the recipe's `targetPath` (the project
+root by default) and copies it into a slim runtime image. It copies only the
+recipe files and `source/`; add a `COPY` for any other directory your build
+reads (views, string imports).
 
 ## Server-side requirements
 
