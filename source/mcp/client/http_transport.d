@@ -855,16 +855,14 @@ final class HttpClientTransport : ClientTransport
 		const status = post(message);
 		const initialized = message.type == Json.Type.object && "method" in message
 			&& message["method"] == Json("notifications/initialized");
-		// The handshake is incomplete until the server takes `initialized`, so a
-		// rejection fails `initialize` instead of leaving an unusable session.
-		if (initialized && status != 0 && (status < 200 || status >= 300))
-		{
-			if (status == 404 || status == 410)
-				throw new SessionExpiredException(status, "MCP session expired: the server answered notifications/initialized with HTTP " ~ idStr(
-						status));
-			throw new HttpStatusException(status,
-					"the server rejected notifications/initialized with HTTP " ~ idStr(status));
-		}
+		// A 404/410 means the new session is already gone, so `initialize` fails
+		// rather than handing back an unusable session. Any other refusal is only
+		// logged by `post`: servers in the wild answer the notification 400 yet
+		// serve the session normally.
+		if (initialized && (status == 404 || status == 410))
+			throw new SessionExpiredException(status,
+					"MCP session expired: the server answered notifications/initialized with HTTP "
+					~ idStr(status));
 		// A new session is ready once the server has its `initialized`.
 		if (reopenServerStream && initialized && status >= 200 && status < 300 && sessionId.length)
 		{
@@ -5530,12 +5528,12 @@ unittest  // a oneway send that cannot connect fails with an McpException, not a
 			.name ~ ": " ~ caught.msg);
 }
 
-unittest  // initialize fails when the server rejects notifications/initialized
+unittest  // initialize fails when the server answers notifications/initialized 404 or 410
 {
 	import std.algorithm.searching : canFind;
 	import mcp.client.client : McpClient;
 
-	foreach (rejectStatus; [400, 404, 500])
+	foreach (rejectStatus; [404, 410])
 	{
 		auto router = new URLRouter;
 		router.post("/mcp", (HTTPServerRequest req, HTTPServerResponse res) @safe {
@@ -5567,8 +5565,38 @@ unittest  // initialize fails when the server rejects notifications/initialized
 		});
 		assert(failure.length == 0, "scenario failed: " ~ failure);
 		assert(msg.canFind("notifications/initialized"),
-				"initialize must fail when notifications/initialized is rejected: " ~ msg);
-		assert(expired == (rejectStatus == 404), msg);
+				"initialize must fail when the session is gone: " ~ msg);
+		assert(expired, msg);
+	}
+}
+
+unittest  // initialize succeeds when the server refuses notifications/initialized with another status
+{
+	import mcp.client.client : McpClient;
+
+	foreach (rejectStatus; [400, 500])
+	{
+		auto router = new URLRouter;
+		router.post("/mcp", (HTTPServerRequest req, HTTPServerResponse res) @safe {
+			auto j = requestJson(req);
+			const method = ("method" in j) ? j["method"].get!string : "";
+			if (method == "initialize")
+			{
+				res.headers["Mcp-Session-Id"] = "s1";
+				res.writeBody(initializeReply(j, "2025-11-25").toString(), "application/json");
+				return;
+			}
+			res.statusCode = method == "notifications/initialized" ? rejectStatus : 202;
+			res.writeBody("", "text/plain");
+		});
+
+		const failure = runAgainstFakeServer(router, (string url) @safe {
+			auto client = McpClient.http(url);
+			scope (exit)
+				client.close();
+			client.initialize("2025-11-25");
+		});
+		assert(failure.length == 0, "initialize must succeed: " ~ failure);
 	}
 }
 
