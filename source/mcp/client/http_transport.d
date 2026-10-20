@@ -1340,6 +1340,13 @@ final class HttpClientTransport : ClientTransport
 			}
 			catch (Exception e)
 			{
+				import vibe.core.task : InterruptException;
+
+				// An interrupt that is not this request's `abort` belongs to the
+				// caller's task, so it propagates rather than reading as a dropped
+				// connection.
+				if (cast(InterruptException) e !is null && (req is null || req.aborted is null))
+					throw e;
 				// A connection that dropped after an event id is resumable, like a
 				// stream that closed cleanly; the caller decides whether to resume.
 				// A protocol failure (an oversized event, say) is not.
@@ -6636,6 +6643,44 @@ unittest  // a POST stream cut mid-chunk after an event id is resumed via GET
 	assert(failure.length == 0, "scenario failed: " ~ failure);
 	assert(methods == ["POST", "GET"], "the cut stream must be resumed");
 	assert(result["tools"].length == 0);
+}
+
+unittest  // interrupting a request's task while its SSE response streams surfaces the interrupt
+{
+	import core.time : msecs, MonoTime;
+	import vibe.core.core : runTask, sleep;
+	import vibe.core.task : InterruptException;
+
+	bool interrupted;
+	bool otherError;
+	bool finished;
+	const failure = runAgainstRawServer((string method, string body_, TCPConnection conn) @safe {
+		writeRaw(conn, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n"
+			~ "Connection: close\r\n\r\n: open\n\n");
+		sleep(2.seconds);
+	}, (string url) @safe {
+		auto t = new HttpClientTransport(url);
+		scope (exit)
+			t.close();
+		auto task = runTask(() nothrow{
+			scope (exit)
+				finished = true;
+			try
+				t.deliver(parseJsonString(
+				`{"jsonrpc":"2.0","id":7,"method":"tools/list","params":{}}`), 7);
+			catch (InterruptException)
+				interrupted = true;
+			catch (Exception)
+				otherError = true;
+		});
+		sleep(200.msecs);
+		task.interrupt();
+		const until = MonoTime.currTime + 3.seconds;
+		while (!finished && MonoTime.currTime < until)
+			sleep(10.msecs);
+	});
+	assert(failure.length == 0, "scenario failed: " ~ failure);
+	assert(interrupted && !otherError, "an interrupt must reach the interrupted task");
 }
 
 unittest  // a resume GET that fails is retried rather than ending the request
