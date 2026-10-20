@@ -350,11 +350,11 @@ struct CreateMessageRequest
 		// or a float such as 100.0) and reject a fraction rather than truncate it.
 		if ("maxTokens" !in j || j["maxTokens"].type == Json.Type.null_)
 			throw invalidParams("'maxTokens' is required");
-		long maxTokens;
-		if (!tryGetWhole(j, "maxTokens", maxTokens) || maxTokens < 0)
+		long tokens;
+		if (!tryGetWhole(j, "maxTokens", tokens) || tokens < 0)
 			throw invalidParams(
 					"'maxTokens' must be a non-negative whole number within the integer range");
-		r.maxTokens = maxTokens;
+		r.maxTokens = tokens;
 		if ("stopSequences" in j && j["stopSequences"].type == Json.Type.array)
 			foreach (i; 0 .. j["stopSequences"].length)
 				r.stopSequences ~= stringOrThrow(j["stopSequences"][i], "stopSequences");
