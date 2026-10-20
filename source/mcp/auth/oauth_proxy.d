@@ -1001,7 +1001,9 @@ class InvalidClientIdMetadataException : Exception
 ///   * the document carries the required fields (`client_id`, `client_name`, `redirect_uris`);
 ///   * `redirectUri` is an exact-string member of the document's `redirect_uris`
 ///     (ignoring a loopback IP literal's port, `redirectUriMatchKey`);
-///   * `redirectUri` uses a scheme the proxy will relay a code to (RFC 8252).
+///   * `redirectUri` uses a scheme the proxy will relay a code to (RFC 8252);
+///   * `token_endpoint_auth_method` is `none` (absent defaults to it), the only
+///     method the proxy's `/token` supports.
 /// Pure (no HTTP): the SSRF-guarded fetch is performed by
 /// `OAuthProxy.fetchClientIdMetadata`; this carries the validation logic so it is
 /// unit-testable against a document obtained any way. Throws
@@ -1033,6 +1035,13 @@ void validateClientIdMetadata(string clientIdUrl,
 	if (!isAllowedRedirectUri(redirectUri))
 		throw new InvalidClientIdMetadataException(clientIdUrl,
 				"redirect_uri not allowed (https, or http for loopback only; no fragment or userinfo)");
+	// The proxy's /token authenticates no client (it advertises only `none`), so
+	// a client expecting its credentials to be checked is refused rather than
+	// silently treated as public.
+	if (doc.tokenEndpointAuthMethod != "none")
+		throw new InvalidClientIdMetadataException(clientIdUrl,
+				"token_endpoint_auth_method '" ~ doc.tokenEndpointAuthMethod
+				~ "' is not supported; only 'none' (public client) is accepted");
 }
 
 /// Upper bound on the size of a fetched Client ID Metadata Document. A document
@@ -2111,6 +2120,23 @@ unittest  // CIMD VALIDATE: the requested redirect_uri MUST be an exact member o
 	assertThrown!InvalidClientIdMetadataException(validateClientIdMetadata(
 			"https://app.example.com/oauth/client.json", doc,
 			"http://127.0.0.1:8765/callback/extra"));
+}
+
+unittest  // CIMD VALIDATE: a document declaring token endpoint client authentication is rejected
+{
+	import std.exception : assertThrown;
+
+	foreach (method; [
+		"private_key_jwt", "client_secret_basic", "client_secret_post",
+		"tls_client_auth"
+	])
+	{
+		auto doc = sampleCimdDoc();
+		doc.tokenEndpointAuthMethod = method;
+		assertThrown!InvalidClientIdMetadataException(validateClientIdMetadata(
+				"https://app.example.com/oauth/client.json",
+				doc, "http://127.0.0.1:8765/callback"), method);
+	}
 }
 
 unittest  // CIMD VALIDATE: a redirect_uri using a disallowed scheme is rejected even if listed
