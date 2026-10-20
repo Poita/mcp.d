@@ -54,8 +54,9 @@ alias ToolHandler = CallToolResult delegate(Json arguments, RequestContext ctx) 
 alias MrtrToolHandler = ToolResponse delegate(Json arguments, RequestContext ctx) @safe;
 
 /// A prompt handler receiving the raw `Json arguments` and the per-request
-/// `RequestContext`, always producing a final result. See `MrtrPromptHandler`
-/// for one that may ask the client for more input.
+/// `RequestContext`, producing a final result unless the `GetPromptResult`
+/// carries MRTR `inputRequests`/`requestState` (see `PromptResponse.complete`).
+/// See `MrtrPromptHandler` for one that asks the client for more input.
 alias PromptHandler = GetPromptResult delegate(Json arguments, RequestContext ctx) @safe;
 
 /// A prompt handler that may, on a stateless (MRTR) modern request, ask the client

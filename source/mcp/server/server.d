@@ -1092,8 +1092,11 @@ final class McpServer : ServerCore
 	}
 
 	/// As the context-less overload, but the handler also receives the
-	/// per-request `RequestContext`. It always produces a final result, so a
-	/// prompt registered this way never emits an `InputRequiredResult`.
+	/// per-request `RequestContext`. Its `GetPromptResult` is the final result
+	/// unless it carries MRTR `inputRequests`/`requestState`: such a result is
+	/// an `InputRequiredResult` (see `PromptResponse.complete`), sent on the
+	/// modern protocol and answered with -32603 on the 2025-era protocols. The
+	/// `MrtrPromptHandler` overload is the explicit way to ask for input.
 	void registerPrompt(Prompt descriptor, PromptHandler handler) @safe
 	{
 		requirePromptNameAvailable(descriptor.name);
