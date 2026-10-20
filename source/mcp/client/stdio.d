@@ -72,6 +72,10 @@ final class StdioClientTransport : ClientTransport
 	version (Posix) private ProcessPipes* pipes;
 	// The task reading the owned child's stderr, when it is not inherited.
 	version (Posix) private Task stderrReader_;
+	// The task discarding the owned child's stdout while it shuts down, and the
+	// flag that ends it.
+	version (Posix) private Task stdoutDrain_;
+	version (Posix) private bool stopDrain_;
 	version (Posix)
 		private bool stdinClosed_;
 	else version (Windows)
@@ -598,6 +602,9 @@ final class StdioClientTransport : ClientTransport
 			pipes.stdin.close();
 			stdinClosed_ = true;
 		}
+		// The drain ends before the read loop is stopped, so it never reads the
+		// pipe after an interrupted read loop.
+		stopStdoutDrain();
 		// Its stdout is at end-of-input too, so the loop exits promptly; the
 		// grace only bounds a grandchild still holding the pipe.
 		if (channel !is null && started && !channel.stopReadLoop(1.seconds))
@@ -616,6 +623,54 @@ final class StdioClientTransport : ClientTransport
 		pipes.stdout.close();
 		destroy(*pipes);
 		stopStderrReader();
+	}
+
+	/// Read and discard the owned child's stdout on a task of its own until it
+	/// ends or `stopStdoutDrain` runs. The read loop reads that pipe until the
+	/// channel's close ends it, so the drain takes over only once the loop has
+	/// returned by itself: a pipe read cannot be resumed after one is
+	/// interrupted.
+	version (Posix) private void startStdoutDrain() @safe
+	{
+		import vibe.core.core : runTask, sleep;
+		import vibe.core.stream : IOMode;
+
+		if (stdoutDrain_ != Task.init)
+			return;
+		stdoutDrain_ = runTask(() nothrow{
+			ubyte[4096] buf;
+			try
+			{
+				while (!stopDrain_ && channel !is null && started && channel.readLoopRunning)
+					sleep(5.msecs);
+				while (!stopDrain_ && !pipes.stdout.empty)
+					cast(void) pipes.stdout.read(buf, IOMode.once);
+			}
+			catch (Exception)
+			{
+			}
+		});
+	}
+
+	/// End the stdout drain: the child has exited, so its stdout reaches
+	/// end-of-input; a read still pending after a grace (a grandchild holding
+	/// the pipe) is interrupted.
+	version (Posix) private void stopStdoutDrain() @safe
+	{
+		import vibe.core.core : sleep;
+
+		if (stdoutDrain_ == Task.init)
+			return;
+		stopDrain_ = true;
+		foreach (_; 0 .. 100)
+		{
+			if (!stdoutDrain_.running)
+				break;
+			sleep(10.msecs);
+		}
+		if (stdoutDrain_.running)
+			stdoutDrain_.interrupt();
+		stdoutDrain_.joinUninterruptible();
 	}
 
 	/// Whether a line is being written to the child's stdin right now.
@@ -638,6 +693,10 @@ final class StdioClientTransport : ClientTransport
 		import core.sys.posix.signal : SIGTERM, SIGKILL;
 
 		auto p = pipes;
+		// A child blocked writing a full stdout pipe can neither exit nor see a
+		// signal's handler run to completion, so its stdout keeps being read
+		// (and discarded) until it is gone.
+		startStdoutDrain();
 		// Step 0: close the child's stdin so a well-behaved server sees EOF and
 		// exits. A write still parked on it means the child has stopped reading;
 		// closing the pipe under that write would strand the writer, so stdin is
@@ -1474,6 +1533,30 @@ version (Posix) unittest  // close() returns the child's clean exit status when 
 		auto status = transport.closeProcess(5.seconds, 5.seconds);
 		assert(status == 0);
 	});
+}
+
+version (Posix) unittest  // close() drains the child's stdout so a child writing on shutdown can exit
+{
+	import std.datetime.stopwatch : StopWatch, AutoStart;
+	import core.time : Duration, seconds, msecs;
+	import vibe.core.core : sleep;
+
+	Duration took;
+	inLoop(() @safe {
+		// On stdin EOF the child writes far more than a pipe buffer holds before
+		// exiting, so it only exits if someone keeps reading its stdout.
+		auto transport = spawnStdioTransport([
+			"sh", "-c", "cat >/dev/null; exec head -c 1000000 /dev/zero"
+		]);
+		transport.chan();
+		sleep(100.msecs);
+		auto sw = StopWatch(AutoStart.yes);
+		transport.close();
+		took = sw.peek;
+	});
+	assert(took < 3.seconds,
+			"close() must not wait out the SIGTERM grace for a child "
+			~ "blocked writing to its stdout");
 }
 
 version (Posix) unittest  // spawned transport round-trips a request/response over async pipes
