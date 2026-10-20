@@ -42,10 +42,12 @@ enum size_t defaultMaxLineBytes = 16 * 1024 * 1024;
 /// emitting at once cannot interleave bytes of different frames on the wire (the
 /// stdio transport requires each message to be a single newline-delimited line).
 ///
-/// Construct it with three async delegates supplied by the concrete transport:
+/// Construct it with async delegates supplied by the concrete transport:
 /// `readLine` (returns the next line without its terminator, or `null` at
 /// end-of-input), `writeLine` (emits one line; the delegate appends the
-/// terminator), and `onInbound` (dispatches an inbound request/notification).
+/// terminator), `onInbound` (dispatches an inbound request/notification), and
+/// optionally `onInboundBatch` (dispatches an inbound batch line whole, as the
+/// server does; without it a batch is split into its members).
 final class DuplexChannel
 {
 	private string delegate() @safe readLineDg;

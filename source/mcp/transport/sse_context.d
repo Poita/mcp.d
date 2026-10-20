@@ -115,8 +115,8 @@ final class StreamCoordinator
 	/// while polling `alive` in short slices so a dropped connection releases the
 	/// awaiting fiber promptly rather than parking for the full `timeout`. When
 	/// `alive` returns false before a response arrives, the pending request is
-	/// failed with `disconnectError` (mirroring the GET path's `failPendingForIds`
-	/// on listener disconnect) and that error is thrown. A null `alive` probe
+	/// failed with `disconnectError` (as `failPending` fails it when the GET
+	/// listener it was delivered on disconnects) and that error is thrown. A null `alive` probe
 	/// degrades to the plain `await(id, timeout, sessionToken)` behaviour.
 	Json awaitLive(long id, bool delegate() @safe alive, McpException disconnectError,
 			Duration timeout = 60.seconds, Duration slice = 250.msecs, string sessionToken = "") @safe
@@ -218,12 +218,13 @@ final class StreamCoordinator
 	///
 	/// The waiter is left in the table: cleanup is the awaiter's responsibility via
 	/// `await`/`awaitLive`'s `scope (exit) waiters.remove(key)`. Callers MUST only
-	/// fail keys that have (or will have) a live awaiter, which holds for the sole
-	/// caller `removeListenerLocked`: every id it fails was registered in
-	/// `requestOnSession` immediately before its `awaitLive`, and an id whose
-	/// delivery failed is dropped via `cancel` rather than reaching this path. A
-	/// failed waiter that is awaited only afterwards still observes `done`/`error`
-	/// (see the fail-then-await unittest).
+	/// fail keys that have (or will have) a live awaiter. That holds for both
+	/// callers: `removeListenerLocked` fails ids registered in `requestOnSession`
+	/// immediately before their `awaitLive` (an id whose delivery failed is
+	/// dropped via `cancel` rather than reaching this path), and `releaseOnCancel`
+	/// fails the id whose awaiter registered it and removes the registration once
+	/// that request settles. A failed waiter that is awaited only afterwards still
+	/// observes `done`/`error` (see the fail-then-await unittest).
 	void failPending(long id, McpException error, string sessionToken = "") @safe
 	{
 		if (auto w = WaiterKey(sessionToken, id) in waiters)
@@ -237,14 +238,6 @@ final class StreamCoordinator
 			w.done = true;
 			w.evt.emit();
 		}
-	}
-
-	/// Fail several pending outbound requests at once for one session
-	/// (see `failPending`).
-	void failPendingForIds(long[] ids, McpException error, string sessionToken = "") @safe
-	{
-		foreach (id; ids)
-			failPending(id, error, sessionToken);
 	}
 }
 
@@ -430,12 +423,12 @@ struct ReplayHistoryOptions
 /// The channel serializes delivery and listener-list mutation internally with a
 /// vibe `TaskMutex`, so concurrent fibers cannot interleave the bytes of two SSE
 /// frames, reuse an event id, or dangle the listener list across an async write.
-/// Callers that ALSO write to the same underlying `HTTPServerResponse.bodyWriter`
-/// outside the channel (e.g. a heartbeat loop or an up-front `retry:` event on the
-/// GET/listen stream) MUST serialize those writes against the channel's listener
-/// write callback through a shared per-stream lock, since the channel's mutex
-/// guards only its own state and its own writes — not a foreign writer on the same
-/// connection. Like the rest of the SDK, this assumes vibe.d's default
+/// The channel's mutex guards only its own state and its own writes, so a
+/// caller that also writes to a listener's connection outside the channel (a
+/// heartbeat, an up-front `retry:` event) must route those writes through the
+/// same single writer as the listener's callback, as the Streamable HTTP
+/// transport's queued SSE writer does, rather than writing to the response
+/// directly. Like the rest of the SDK, this assumes vibe.d's default
 /// single-threaded event loop; running the router with `HTTPServerOption.distribute`
 /// or worker threads is unsupported.
 final class ServerPushChannel : PushChannel
