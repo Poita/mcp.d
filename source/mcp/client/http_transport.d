@@ -5129,6 +5129,56 @@ unittest  // ClientSettings.reinitializeOnSessionExpiry starts a new session and
 			"the expiry must trigger one fresh initialize without a session id");
 }
 
+unittest  // a client caching unhinted results opens the server stream so list_changed evicts them
+{
+	import core.time : msecs, MonoTime;
+	import vibe.core.core : sleep;
+	import mcp.client.client : McpClient, ClientSettings;
+
+	int lists;
+	bool changed;
+	auto router = answeringRouter((Json req, HTTPServerResponse res) @safe {
+		++lists;
+		auto reply = parseJsonString(`{"jsonrpc":"2.0","result":{"tools":[]}}`);
+		reply["id"] = req["id"];
+		res.writeBody(reply.toString(), "application/json");
+	});
+	router.get("/mcp", (HTTPServerRequest req, HTTPServerResponse res) @safe {
+		res.headers["Content-Type"] = "text/event-stream";
+		res.bodyWriter.write(": open\n\n");
+		res.bodyWriter.flush();
+		while (!changed)
+			sleep(10.msecs);
+		res.bodyWriter.write(
+			"data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/tools/list_changed\"}\n\n");
+		res.bodyWriter.flush();
+		sleep(500.msecs);
+	});
+
+	int afterChange;
+	const failure = runAgainstFakeServer(router, (string url) @safe {
+		ClientSettings s;
+		s.defaultCacheTtl = 60.seconds;
+		auto client = McpClient.http(url, s);
+		scope (exit)
+			client.close();
+		bool notified;
+		client.onToolsListChanged = () @safe { notified = true; };
+		client.initialize("2025-11-25");
+		client.listTools();
+		client.listTools();
+		changed = true;
+		const deadline = MonoTime.currTime + 2.seconds;
+		while (!notified && MonoTime.currTime < deadline)
+			sleep(10.msecs);
+		const before = lists;
+		client.listTools();
+		afterChange = lists - before;
+	});
+	assert(failure.length == 0, "scenario failed: " ~ failure);
+	assert(afterChange == 1, "tools/list_changed must evict the cached list");
+}
+
 unittest  // the standalone server stream follows a same-origin redirect
 {
 	import core.time : msecs, MonoTime;

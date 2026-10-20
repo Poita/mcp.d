@@ -346,6 +346,11 @@ struct ClientSettings
 	/// This governs only which responses are cached. The tool schemas used for
 	/// `x-mcp-header` mirroring and output-schema validation are kept from every
 	/// `listTools` independently of the cache, until `tools/list_changed`.
+	///
+	/// Cached lists are evicted early by the server's `*/list_changed`
+	/// notifications, which a Streamable HTTP server sends only on the standalone
+	/// server stream. With a positive value (and a `cache`), `initialize`
+	/// therefore opens that stream itself, as `McpClient.startServerStream` does.
 	Duration defaultCacheTtl = Duration.zero;
 
 	/// This client's cache partition — a stable principal identifier (user / tenant
@@ -1334,6 +1339,11 @@ final class McpClient : ClientProtocol
 		didInitialize = true;
 		notify("notifications/initialized", Json.emptyObject);
 		sessionEpoch_++;
+		// Over Streamable HTTP the `*/list_changed` notifications that evict cached
+		// lists arrive only on the standalone server stream, so a client caching
+		// unhinted results opens it rather than serve stale lists for the whole TTL.
+		if (cacheStore_ !is null && defaultCacheTtl_ > Duration.zero)
+			startServerStream();
 		return init;
 	}
 
@@ -1746,7 +1756,10 @@ final class McpClient : ClientProtocol
 	}
 
 	/// Set the fallback freshness applied when a cacheable result carries no
-	/// server `ttlMs` hint. Zero (the default) caches nothing unhinted.
+	/// server `ttlMs` hint. Zero (the default) caches nothing unhinted. As with
+	/// `ClientSettings.defaultCacheTtl`, a positive value makes the next
+	/// `initialize` open the server stream; set it after `initialize` and call
+	/// `startServerStream` so list changes still evict the cache.
 	void setDefaultCacheTtl(Duration ttl) @safe nothrow
 	{
 		defaultCacheTtl_ = ttl;
@@ -4798,7 +4811,12 @@ final class McpClient : ClientProtocol
 	/// Open the standalone server->client stream (HTTP GET SSE), so the server
 	/// can deliver sampling / elicitation / roots requests and notifications
 	/// outside of any request response. A no-op on stdio (and tolerated as a
-	/// no-op when an HTTP server does not offer the stream).
+	/// no-op when an HTTP server does not offer the stream), and when the stream
+	/// is already open.
+	///
+	/// Without it a Streamable HTTP client receives no `*/list_changed`
+	/// notifications, so cached lists are evicted only by their TTL.
+	/// `initialize` opens the stream itself when `defaultCacheTtl` is positive.
 	void startServerStream() @safe
 	{
 		transport.startServerStream();
