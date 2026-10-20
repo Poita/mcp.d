@@ -137,11 +137,13 @@ final class EmitBuffer
 		return occ.cursor.get;
 	}
 
-	/// Forget every event retained for `name` (its type was removed).
+	/// Forget every event retained for `name` (its type was removed). Every
+	/// position so far counts as evicted for `name`, so a poller resuming from
+	/// before the drop sees a gap if the type is registered again.
 	void drop(string name) @safe
 	{
 		byName_.remove(name);
-		evictedThrough_.remove(name);
+		evictedThrough_[name] = seqCounter_;
 	}
 
 	/// Evict aged events for every type, including those no longer emitted
@@ -1083,6 +1085,19 @@ unittest  // EmitBuffer delivers events appended after the cursor
 	assert(r.events[0].eventId == "a" && r.events[1].eventId == "b");
 	// the new cursor is the last event's cursor
 	assert(r.cursor.get == r.events[1].cursor.get);
+}
+
+unittest  // EmitBuffer reports a gap to a cursor from before its type was dropped and re-added
+{
+	auto buf = new EmitBuffer();
+	const start = buf.headCursor();
+	buf.append("n", EventOccurrence("a", "n", "t"));
+	buf.append("n", EventOccurrence("b", "n", "t"));
+	buf.drop("n");
+	buf.append("n", EventOccurrence("c", "n", "t"));
+	auto r = buf.readSince("n", nullable(start), Nullable!long.init, Nullable!long.init);
+	assert(r.truncated);
+	assert(r.events.length == 1 && r.events[0].eventId == "c");
 }
 
 unittest  // EmitBuffer assigns each event a monotonically increasing cursor
