@@ -998,16 +998,20 @@ unittest  // re-requesting an input key discards its earlier answer, so only a f
 		return Json(["structuredContent": Json(["x": Json(x)])]);
 	};
 	runTaskExecutor(rt, t.taskId, exec);
-	rt.deliverInput(t.taskId, Json([
-		"x": Json(["action": Json("accept"), "content": Json(["x": Json(-1)])])
-	]));
+	auto stale = Json([
+		"action": Json("accept"),
+		"content": Json(["x": Json(-1)])
+	]);
+	rt.deliverInput(t.taskId, Json(["x": stale]));
 	rt.resumeWorking(t.taskId);
 	runTaskExecutor(rt, t.taskId, exec);
 	assert(rt.getDetailed(t.taskId)["status"].get!string == "input_required");
 	assert(("x" in rt.takenInput(t.taskId)) is null, "the stale answer was discarded");
-	rt.deliverInput(t.taskId, Json([
-		"x": Json(["action": Json("accept"), "content": Json(["x": Json(5)])])
-	]));
+	auto fresh = Json([
+		"action": Json("accept"),
+		"content": Json(["x": Json(5)])
+	]);
+	rt.deliverInput(t.taskId, Json(["x": fresh]));
 	rt.resumeWorking(t.taskId);
 	runTaskExecutor(rt, t.taskId, exec);
 	assert(rt.getDetailed(t.taskId)["result"]["structuredContent"]["x"].get!int == 5);
