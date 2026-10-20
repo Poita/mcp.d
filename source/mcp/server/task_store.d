@@ -78,6 +78,22 @@ struct TaskRecord
 		return r;
 	}
 
+	/// A copy carrying only the scalar fields, with every payload left at its
+	/// default: the form `TaskStore.header` returns.
+	TaskRecord headerOnly() const @safe
+	{
+		TaskRecord r;
+		r.meta = meta;
+		r.cancelRequested = cancelRequested;
+		r.detached = detached;
+		r.dispatchClaimedAt = dispatchClaimedAt;
+		r.toolName = toolName;
+		r.requestBacked = requestBacked;
+		r.owner = owner;
+		r.revision = revision;
+		return r;
+	}
+
 	/// Serialize to a self-contained JSON object, the form a persistent store
 	/// writes. `fromJson` is its inverse.
 	Json toJson() const @safe
@@ -186,6 +202,13 @@ interface TaskStore
 	/// The record with `taskId`, or null if unknown (or already removed/expired).
 	Nullable!TaskRecord get(string taskId) @safe;
 
+	/// The record with `taskId` without its payloads — `result`, `error`,
+	/// `inputRequests`, `inputResponses`, `executorInput` and `checkpoints` are
+	/// left at their defaults — or null if unknown. The runtime reads it where
+	/// only the status, timestamps and flags matter, such as an executor
+	/// polling for cancellation, so a shared store reads just those fields.
+	Nullable!TaskRecord header(string taskId) @safe;
+
 	/// Replace the stored record identified by `record.meta.taskId` only if its
 	/// stored `revision` still equals `expectedRevision`, storing `record` with
 	/// `revision = expectedRevision + 1`. Returns false, changing nothing, when
@@ -263,6 +286,13 @@ final class InMemoryTaskStore : TaskStore
 	{
 		if (auto p = taskId in records)
 			return nullable(p.dup);
+		return Nullable!TaskRecord.init;
+	}
+
+	Nullable!TaskRecord header(string taskId) @safe
+	{
+		if (auto p = taskId in records)
+			return nullable(p.headerOnly);
 		return Nullable!TaskRecord.init;
 	}
 
@@ -411,6 +441,27 @@ unittest  // InMemoryTaskStore stores, fetches, updates, and removes a record
 	assert(s.get("missing").isNull);
 	s.remove("id1");
 	assert(s.get("id1").isNull);
+}
+
+unittest  // InMemoryTaskStore.header returns the scalar fields without the payloads
+{
+	import mcp.protocol.tasks : TaskStatus;
+
+	auto s = new InMemoryTaskStore();
+	TaskRecord r;
+	r.meta.taskId = "h";
+	r.meta.status = TaskStatus.working;
+	r.cancelRequested = true;
+	r.owner = "alice";
+	r.executorInput = Json(["big": Json("input")]);
+	r.checkpoints["c"] = Json(1);
+	r.inputResponses["k"] = Json(2);
+	s.put(r);
+	auto h = s.header("h").get;
+	assert(h.meta.taskId == "h" && h.cancelRequested && h.owner == "alice");
+	assert(h.executorInput.type == Json.Type.undefined);
+	assert(h.checkpoints.length == 0 && h.inputResponses.length == 0);
+	assert(s.header("missing").isNull);
 }
 
 unittest  // compareAndSwap on an unknown taskId fails and does not insert

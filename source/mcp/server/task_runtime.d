@@ -796,11 +796,20 @@ final class TaskRuntime
 	/// Whether cancellation was requested for `id` (cooperative check for a
 	/// running handler). A task that no longer exists (expired past its TTL, or
 	/// removed) also reports `true`: nothing can collect its result, so its
-	/// executor should stop.
+	/// executor should stop. Reads only the record's header (`TaskStore.header`),
+	/// since an executor polls this at every safe point.
 	bool cancelRequested(string id) @safe
 	{
-		auto r = fetch(id);
-		return r.isNull || r.get.cancelRequested;
+		auto h = store_.header(id);
+		if (h.isNull)
+			return true;
+		const now = currentTime();
+		if (isExpired(h.get, now) || isOverdue(h.get, now))
+		{
+			auto r = fetch(id);
+			return r.isNull || r.get.cancelRequested;
+		}
+		return h.get.cancelRequested;
 	}
 
 	/// Record `tasks/update` input responses for a task, keeping the latest value
@@ -1876,6 +1885,8 @@ version (unittest) private final class RacingTaskStore : TaskStore
 	/// Runs once, just before the next compareAndSwap, to simulate a concurrent
 	/// writer on another fiber or node.
 	void delegate() @safe beforeNextSwap;
+	/// How many full records `get` has returned.
+	size_t fullReads;
 
 	this() @safe
 	{
@@ -1889,12 +1900,18 @@ version (unittest) private final class RacingTaskStore : TaskStore
 
 	Nullable!TaskRecord get(string id) @safe
 	{
+		fullReads++;
 		return inner.get(id);
 	}
 
 	/// Runs once, just after the next successful compareAndSwap, to simulate a
 	/// writer landing between a commit and anything that reads it back.
 	void delegate() @safe afterNextSwap;
+
+	Nullable!TaskRecord header(string id) @safe
+	{
+		return inner.header(id);
+	}
 
 	bool compareAndSwap(TaskRecord r, ulong expected) @safe
 	{
@@ -2027,6 +2044,20 @@ unittest  // a dispatch that fails to record its outcome releases its claim so a
 	assert(rt.statusOf(t.taskId).get == TaskStatus.completed);
 }
 
+unittest  // polling cancelRequested reads no full task record
+{
+	auto store = new RacingTaskStore();
+	auto rt = new TaskRuntime(TaskOptions(store));
+	auto t = rt.createFor("job", Json(["big": Json("input")]));
+	assert(rt.claimDispatch(t.taskId));
+	const before = store.fullReads;
+	foreach (_; 0 .. 5)
+		assert(!rt.cancelRequested(t.taskId));
+	assert(store.fullReads == before);
+	rt.cancel(t.taskId);
+	assert(rt.cancelRequested(t.taskId));
+}
+
 unittest  // concurrent tasks/update deliveries both keep their answers
 {
 	auto store = new RacingTaskStore();
@@ -2094,6 +2125,11 @@ version (unittest) private final class StaleReadTaskStore : TaskStore
 
 	// Never sees a record, as a replica lagging behind another node's insert.
 	Nullable!TaskRecord get(string id) @safe
+	{
+		return Nullable!TaskRecord.init;
+	}
+
+	Nullable!TaskRecord header(string id) @safe
 	{
 		return Nullable!TaskRecord.init;
 	}
@@ -2264,6 +2300,11 @@ version (unittest) private final class SweepCountingStore : TaskStore
 	Nullable!TaskRecord get(string id) @safe
 	{
 		return inner.get(id);
+	}
+
+	Nullable!TaskRecord header(string id) @safe
+	{
+		return inner.header(id);
 	}
 
 	bool compareAndSwap(TaskRecord r, ulong expected) @safe

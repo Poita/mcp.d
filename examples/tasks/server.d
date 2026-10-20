@@ -148,6 +148,7 @@ void main(string[] args) @safe
 	//   final class RedisTaskStore : TaskStore {
 	//       bool put(TaskRecord r)               { return redis.setNx(r.meta.taskId, r.toJson.toString); }
 	//       Nullable!TaskRecord get(string id)   { ... TaskRecord.fromJson(...) ... }
+	//       Nullable!TaskRecord header(string id) { /* get without the payload fields */ }
 	//       bool compareAndSwap(TaskRecord r, ulong expected) { /* WATCH id; check revision; MULTI; SET */ }
 	//       void remove(string id)               { redis.del(id); }
 	//       size_t removeIf(scope bool delegate(const TaskRecord) @safe pred) { /* SCAN + DEL */ }

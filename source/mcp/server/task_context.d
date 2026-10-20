@@ -983,14 +983,20 @@ unittest  // re-requesting an input key discards its earlier answer, so only a f
 	};
 	runTaskExecutor(rt, t.taskId, exec);
 	rt.deliverInput(t.taskId, Json([
-		"x": Json(["action": Json("accept"), "content": Json(["x": Json(-1)])])
+			"x": Json([
+				"action": Json("accept"),
+				"content": Json(["x": Json(-1)])
+			])
 	]));
 	rt.resumeWorking(t.taskId);
 	runTaskExecutor(rt, t.taskId, exec);
 	assert(rt.getDetailed(t.taskId)["status"].get!string == "input_required");
 	assert(("x" in rt.takenInput(t.taskId)) is null, "the stale answer was discarded");
 	rt.deliverInput(t.taskId, Json([
-		"x": Json(["action": Json("accept"), "content": Json(["x": Json(5)])])
+			"x": Json([
+				"action": Json("accept"),
+				"content": Json(["x": Json(5)])
+			])
 	]));
 	rt.resumeWorking(t.taskId);
 	runTaskExecutor(rt, t.taskId, exec);
@@ -1063,6 +1069,11 @@ unittest  // an executor's input and checkpoint reads come from the dispatch's o
 		{
 			gets++;
 			return inner.get(id);
+		}
+
+		Nullable!TaskRecord header(string id) @safe
+		{
+			return inner.header(id);
 		}
 
 		bool compareAndSwap(TaskRecord r, ulong expected) @safe
