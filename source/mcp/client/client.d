@@ -8398,6 +8398,7 @@ unittest  // MRTR: resolveInputRequest routes an elicitation request to onElicit
 	};
 	Json ep = Json.emptyObject;
 	ep["message"] = "When?";
+	ep["requestedSchema"] = Json(["type": Json("object")]);
 	InputResponse answer;
 	const ok = c.resolveInputRequest(InputRequest("date", "elicitation", ep), answer);
 	assert(ok);
@@ -8482,6 +8483,7 @@ unittest  // MRTR: resolveInputRequest accepts form-mode elicitation when form c
 	Json params = Json.emptyObject;
 	params["mode"] = "form";
 	params["message"] = "hello";
+	params["requestedSchema"] = Json(["type": Json("object")]);
 	InputResponse answer;
 	const ok = c.resolveInputRequest(InputRequest("f1", "elicitation", params), answer);
 	assert(ok);
@@ -8543,7 +8545,7 @@ unittest  // a server that keeps requesting input stops at exactly maxRounds too
 		calls++;
 		// Always answer with an inputRequired result so the loop runs to its bound.
 		InputRequiredResult ir;
-		ir.inputRequests = [InputRequest("q", "elicitation", Json.emptyObject)];
+		ir.inputRequests = [InputRequest.elicitation("q", "Q?")];
 		return ir.toJson();
 	};
 
@@ -8602,7 +8604,7 @@ version (unittest)
 		import vibe.data.json : parseJsonString;
 
 		return parseJsonString(`{"resultType":"input_required",
-			"inputRequests":{"date":{"method":"elicitation/create","params":{"message":"When?"}}},
+			"inputRequests":{"date":{"method":"elicitation/create","params":{"message":"When?","requestedSchema":{"type":"object"}}}},
 			"requestState":"s1"}`);
 	}
 
@@ -10455,9 +10457,7 @@ unittest  // MRTR: getPrompt drives a retry loop when the server returns inputRe
 		{
 			// First call: respond with inputRequired asking for elicitation.
 			InputRequiredResult ir;
-			ir.inputRequests = [
-				InputRequest("q", "elicitation", Json.emptyObject)
-			];
+			ir.inputRequests = [InputRequest.elicitation("q", "Q?")];
 			return ir.toJson();
 		}
 		// Second call: respond with a completed prompt result.
@@ -10481,7 +10481,7 @@ unittest  // MRTR: getPrompt surfaces an inputRequired result when no handler is
 	// No onElicitation handler registered — resolveInputRequest must return false.
 	c.onRpcForTest = (string method, Json params) @safe {
 		InputRequiredResult ir;
-		ir.inputRequests = [InputRequest("q", "elicitation", Json.emptyObject)];
+		ir.inputRequests = [InputRequest.elicitation("q", "Q?")];
 		return ir.toJson();
 	};
 
@@ -10505,7 +10505,7 @@ unittest  // MRTR: getPrompt stops at maxRounds prompts/get requests
 		assert(method == "prompts/get");
 		calls++;
 		InputRequiredResult ir;
-		ir.inputRequests = [InputRequest("q", "elicitation", Json.emptyObject)];
+		ir.inputRequests = [InputRequest.elicitation("q", "Q?")];
 		return ir.toJson();
 	};
 

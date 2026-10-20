@@ -3944,6 +3944,9 @@ struct ElicitParams
 		// The id correlates the request with its completion notification.
 		if (p.isUrl && p.elicitationId.length == 0)
 			throw invalidParams("URL-mode elicitation requires an elicitationId");
+		// ElicitRequestFormParams requires the schema the client renders.
+		if (!p.isUrl && p.requestedSchema.type != Json.Type.object)
+			throw invalidParams("Form-mode elicitation requires an object requestedSchema");
 		return p;
 	}
 }
@@ -4298,8 +4301,23 @@ unittest  // ElicitParams rejects a url-mode request without an elicitationId wi
 
 unittest  // ElicitParams accepts an explicit form mode
 {
-	auto p = ElicitParams.fromJson(parseJsonString(`{"mode":"form","message":"m"}`));
+	auto p = ElicitParams.fromJson(parseJsonString(
+			`{"mode":"form","message":"m","requestedSchema":{"type":"object"}}`));
 	assert(p.mode == "form" && !p.isUrl);
+}
+
+unittest  // ElicitParams rejects a form-mode request without an object requestedSchema with -32602
+{
+	import std.exception : collectException;
+
+	foreach (text; [
+		`{"message":"m"}`, `{"mode":"form","message":"m"}`,
+		`{"message":"m","requestedSchema":"s"}`
+	])
+	{
+		auto e = collectException!McpException(ElicitParams.fromJson(parseJsonString(text)));
+		assert(e !is null && e.code == ErrorCode.invalidParams, text);
+	}
 }
 
 unittest  // ElicitParams.toJson omits mode for the form default
