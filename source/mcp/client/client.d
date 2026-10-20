@@ -629,9 +629,12 @@ final class McpClient : ClientProtocol
 	// The order queue is compacted once it holds more than twice this many
 	// entries or twice the live set, whichever is larger.
 	private enum size_t minCancelledOrderCompaction_ = 64;
-	// Size backstop for `cancelledRequests_`: ids are normally evicted when their
-	// late response is observed (`isCancelled`), but a late response that never
-	// arrives would otherwise pin its id forever. Once the tracked set is full,
+	// Size backstop for `cancelledRequests_`: an id is evicted when its late
+	// response reaches the client (`isCancelled`, consulted by the Streamable
+	// HTTP transport and on every unclaimed response the inbound dispatcher
+	// sees), but a late response that never arrives, or that a transport drops
+	// on its own (stdio correlates by id and discards it), would otherwise pin
+	// its id forever. Once the tracked set is full,
 	// the next `cancel` evicts only the OLDEST tracked id, so recently-cancelled
 	// ids stay remembered and their late responses are still dropped per
 	// basic/utilities/cancellation. The only id at risk is the oldest one, whose
@@ -4910,7 +4913,11 @@ final class McpClient : ClientProtocol
 			break;
 		case MessageKind.response:
 		case MessageKind.errorResponse:
-			break; // not expected on the listening stream
+			// A response no waiter claimed (the legacy HTTP+SSE stream hands those
+			// here) is dropped; one for a cancelled request also retires its id.
+			if (msg.id.type == Json.Type.int_)
+				isCancelled(msg.id.get!long);
+			break;
 		}
 	}
 
@@ -5088,10 +5095,11 @@ final class McpClient : ClientProtocol
 	/// `ClientProtocol.isCancelled`: the transport consults this through the
 	/// `ClientProtocol` seam to drop a late response for a request the client has
 	/// cancelled (basic/utilities/cancellation). The id is evicted from the
-	/// cancelled-id set once its late response has been observed and dropped here,
-	/// so the set does not grow without bound over a long-lived client; an id
-	/// whose late response never arrives is reclaimed by the size backstop in
-	/// `cancel`.
+	/// cancelled-id set once its late response has been observed and dropped here
+	/// or reaches the inbound dispatcher unclaimed, so the set does not grow
+	/// without bound over a long-lived client; an id whose late response never
+	/// reaches the client (it never arrives, or stdio discards it by id) is
+	/// reclaimed by the size backstop in `cancel`.
 	bool isCancelled(long id) @safe
 	{
 		if (id !in cancelledRequests_)
@@ -7464,6 +7472,20 @@ unittest  // overflowing the cancelled set evicts only the oldest, keeping recen
 	assert(c.isResponseCancelled(recent));
 	assert(c.isResponseCancelled(1000L)); // a mid-set filler survives
 	assert(!c.isResponseCancelled(oldest));
+}
+
+unittest  // a late response a transport hands to the inbound dispatcher evicts its cancelled id
+{
+	auto c = McpClient.http("http://localhost");
+	c.onNotifyForTest = (Json message) @safe {};
+	c.cancel(7);
+	c.cancel(8);
+	assert(c.isResponseCancelled(7) && c.isResponseCancelled(8));
+	c.dispatchInbound(Message(parseJsonString(`{"jsonrpc":"2.0","id":7,"result":{}}`)));
+	c.dispatchInbound(Message(parseJsonString(
+			`{"jsonrpc":"2.0","id":8,"error":{"code":-32603,"message":"late"}}`)));
+	assert(!c.isResponseCancelled(7));
+	assert(!c.isResponseCancelled(8));
 }
 
 unittest  // cancel() refuses to cancel the initialize request per spec
