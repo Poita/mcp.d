@@ -7,7 +7,7 @@ import vibe.stream.operations : readAllUTF8;
 
 import mcp.protocol.errors;
 import mcp.protocol.jsonrpc : parseUntrustedJson;
-import mcp.protocol.ssrf : SsrfPolicy;
+import mcp.protocol.ssrf : SsrfPolicy, redactUrl;
 import std.typecons : Nullable;
 import mcp.auth.oauth;
 
@@ -872,7 +872,7 @@ final class OAuthClient
 			import vibe.core.log : logDiagnostic;
 
 			logDiagnostic("Discovery fetch of %s failed (not treated as document-absent): %s",
-					url, e.msg);
+					redactUrl(url), e.msg);
 			outcome = FetchResult.error;
 		}
 		result = parsed;
@@ -929,6 +929,40 @@ final class OAuthClient
 		throwIfOAuthError("Token endpoint", j);
 		return j;
 	}
+}
+
+unittest  // a failed discovery fetch logs the URL without its query secrets
+{
+	import std.algorithm.searching : any, canFind;
+	import vibe.core.log : Logger, LogLevel, LogLine, registerLogger, deregisterLogger;
+
+	static final class DiagLogger : Logger
+	{
+		string[] lines;
+		this() @safe
+		{
+			minLevel = LogLevel.diagnostic;
+		}
+
+		override void log(ref LogLine line) @safe
+		{
+			lines ~= line.text;
+		}
+	}
+
+	auto logger = new DiagLogger;
+	auto shared_ = () @trusted { return cast(shared) logger; }();
+	() @trusted { registerLogger(shared_); }();
+	scope (exit)
+		() @trusted { deregisterLogger(shared_); }();
+
+	auto c = new OAuthClient();
+	Json j;
+	assert(c.tryGetJson("http://127.0.0.1:1/.well-known/x?key=s3cret",
+			SsrfPolicy.allowLoopback, j) == FetchResult.error);
+	auto lines = (cast() logger).lines;
+	assert(lines.any!(l => l.canFind("127.0.0.1")), "the failed fetch must be logged");
+	assert(!lines.any!(l => l.canFind("s3cret")), "the query secret must never be logged");
 }
 
 unittest  // CIMD client uses the configured HTTPS-URL client_id when advertised

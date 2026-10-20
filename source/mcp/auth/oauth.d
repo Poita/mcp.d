@@ -4,7 +4,7 @@ import std.typecons : Nullable;
 import vibe.data.json : Json;
 import vibe.http.client : HTTPClientRequest, HTTPClientResponse;
 
-import mcp.protocol.ssrf : SsrfPolicy;
+import mcp.protocol.ssrf : SsrfPolicy, redactUrl;
 
 @safe:
 
@@ -1087,12 +1087,14 @@ void requireSecureUrl(string url, SsrfPolicy policy) @safe
 
 	string scheme, host;
 	if (!parseSchemeHost(url, scheme, host))
-		throw invalidRequest("Refusing to fetch URL with no parseable host: " ~ url);
+		throw invalidRequest("Refusing to fetch URL with no parseable host: " ~ redactUrl(url));
 	if (!passesLexicalGate(scheme, host, policy))
 		throw invalidRequest(policy == SsrfPolicy.blockInternal
 				? "Refusing to fetch insecure OAuth/discovery URL (must be https to a public host): "
-				~ url : "Refusing to fetch insecure OAuth/discovery URL (must be https, or http to "
-				~ "an explicit loopback host; private/link-local addresses are rejected): " ~ url);
+				~ redactUrl(
+					url) : "Refusing to fetch insecure OAuth/discovery URL (must be https, or http to "
+				~ "an explicit loopback host; private/link-local addresses are rejected): " ~ redactUrl(
+					url));
 }
 
 /// Non-throwing scheme/host + resolution gate. Returns true only when the
@@ -1171,6 +1173,24 @@ unittest  // requireSecureUrl reports an unparseable URL accurately, not as mere
 	}
 	assert(threw);
 	assert(msg.canFind("no parseable host"), "expected a parse-failure message, got: " ~ msg);
+}
+
+unittest  // requireSecureUrl keeps credentials and query secrets out of its error text
+{
+	import std.algorithm.searching : canFind;
+
+	foreach (url; [
+		"http://user:pw@as.example.com/token?key=s3cret", "http://?key=s3cret"
+	])
+	{
+		string msg;
+		try
+			requireSecureUrl(url, SsrfPolicy.allowLoopback);
+		catch (Exception e)
+			msg = e.msg;
+		assert(msg.length, "expected a rejection for " ~ url);
+		assert(!msg.canFind("s3cret") && !msg.canFind("pw@"), "secret leaked: " ~ msg);
+	}
 }
 
 unittest  // isSecureFetchUrl accepts https and rejects plaintext http to a remote host
