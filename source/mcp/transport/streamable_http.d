@@ -3158,8 +3158,8 @@ private void handlePost(McpServer server, ServerPushChannel push,
 		// Session Management: mint a session id for an `initialize` so dispatch can
 		// negotiate against the SessionManager-owned `ConnectionState`. The id is
 		// COMMITTED to the response (its `Mcp-Session-Id` header) only once
-		// `server.handle` returns a successful `InitializeResult`; on any error path
-		// below the minted session is rolled back via `sessions.terminate` so a
+		// `server.handle` returns a successful `InitializeResult`; every other way
+		// out, an exception included, rolls the minted session back so a
 		// failed/invalid initialize neither leaks a session nor stamps the header on
 		// a non-`InitializeResult` response (the spec ties that header to "the HTTP
 		// response containing the InitializeResult").
@@ -3187,12 +3187,12 @@ private void handlePost(McpServer server, ServerPushChannel push,
 				return;
 			}
 		}
+		bool sessionCommitted;
+		scope (exit)
+			if (!sessionCommitted && mintedSessionId.length)
+				sessions.terminate(mintedSessionId);
 		if (auto hdrErr = validatePostRequestHeaders(req, msg, isModernReq, server))
 		{
-			// Roll back a session minted above for an initialize that fails header
-			// validation: it never reached a successful InitializeResult, so it must
-			// not survive as a leaked session (no-op when nothing was minted).
-			sessions !is null && sessions.terminate(mintedSessionId);
 			res.statusCode = HTTPStatus.badRequest;
 			res.writeBody(makeErrorResponse(msg.id, hdrErr).toString(), "application/json");
 			return;
@@ -3221,7 +3221,6 @@ private void handlePost(McpServer server, ServerPushChannel push,
 			// upgrading regardless (mirroring the GET path). A missing Accept is permissive.
 			if (!acceptsEventStream(req.headers.get("Accept", "")))
 			{
-				sessions !is null && sessions.terminate(mintedSessionId);
 				res.statusCode = HTTPStatus.notAcceptable;
 				res.writeBody(makeErrorResponse(msg.id,
 						eventStreamNotAcceptable()).toString(), "application/json");
@@ -3250,7 +3249,6 @@ private void handlePost(McpServer server, ServerPushChannel push,
 			// provably excludes it is refused with 406 rather than upgraded anyway.
 			if (!acceptsEventStream(req.headers.get("Accept", "")))
 			{
-				sessions !is null && sessions.terminate(mintedSessionId);
 				res.statusCode = HTTPStatus.notAcceptable;
 				res.writeBody(makeErrorResponse(msg.id,
 						eventStreamNotAcceptable()).toString(), "application/json");
@@ -3272,7 +3270,6 @@ private void handlePost(McpServer server, ServerPushChannel push,
 		const slotAddress = remoteAddressOf(req, opts);
 		if (const why = requestSlots.tryAcquire(slotPrincipal, slotAddress))
 		{
-			sessions !is null && sessions.terminate(mintedSessionId);
 			refuseTooManyRequests(res, msg.id, why);
 			return;
 		}
@@ -3329,11 +3326,9 @@ private void handlePost(McpServer server, ServerPushChannel push,
 		// cancelled request suppresses its reply rather than asserting on `resp.get`.
 		if (resp.isNull)
 		{
-			// No response to commit. Roll back any session minted for an initialize
-			// that produced no result so a cancelled initialize leaves nothing behind,
-			// then send the spec's no-body acknowledgement on the non-streaming path
-			// (a streamed response has already written its events and simply ends).
-			sessions !is null && sessions.terminate(mintedSessionId);
+			// No response to commit, so a minted session is rolled back. Send the
+			// spec's no-body acknowledgement on the non-streaming path (a streamed
+			// response has already written its events and simply ends).
 			if (!ctx.streaming)
 			{
 				res.statusCode = HTTPStatus.accepted;
@@ -3342,17 +3337,13 @@ private void handlePost(McpServer server, ServerPushChannel push,
 			return;
 		}
 		auto j = resp.get;
-		// Commit the minted session only now that initialize produced a successful
-		// InitializeResult: set its Mcp-Session-Id header. Any other outcome (a
-		// JSON-RPC error result) rolls the minted session back so neither the leaked
-		// session nor the spec-deviating header on an error response survives.
-		if (mintedSessionId.length)
-		{
-			if (initializeSucceeded(j))
-				res.headers[SessionHeader] = mintedSessionId;
-			else
-				sessions.terminate(mintedSessionId);
-		}
+		// Stamp the minted session's Mcp-Session-Id only on a successful
+		// InitializeResult; it is committed once that response has been written. Any
+		// other outcome (a JSON-RPC error result) rolls it back, so neither a leaked
+		// session nor the header on an error response survives.
+		const initialized = mintedSessionId.length && initializeSucceeded(j);
+		if (initialized)
+			res.headers[SessionHeader] = mintedSessionId;
 		// The handler tried to stream but this POST's Accept excludes
 		// text/event-stream, so the context refused the SSE upgrade (no body was
 		// written). When the handler failed, surface 406 Not Acceptable with the
@@ -3378,6 +3369,7 @@ private void handlePost(McpServer server, ServerPushChannel push,
 			else
 				res.writeBody(formatSseEvent("", j), "text/event-stream");
 		}
+		sessionCommitted = initialized;
 		return;
 	}
 }
@@ -6336,6 +6328,46 @@ version (unittest) private HTTPServerRequest sessionReq(HTTPMethod method,
 	auto req = makeInitPostReq(body_, h);
 	req.method = method;
 	return req;
+}
+
+unittest  // an initialize whose response cannot be written leaves no session behind
+{
+	import vibe.core.core : runTask, exitEventLoop, runEventLoop;
+	import vibe.http.server : createTestHTTPServerResponse, TestHTTPResponseMode;
+	import vibe.stream.memory : createMemoryOutputStream;
+
+	auto router = new URLRouter;
+	mountMcp(router, McpServer.stateful("t", "1"));
+	string sid;
+	bool threw;
+	int later;
+	runTask(() @safe nothrow{
+		scope (exit)
+			exitEventLoop();
+		try
+		{
+			auto res = createTestHTTPServerResponse(new FailingSink, null,
+				TestHTTPResponseMode.bodyOnly);
+			try
+				router.handleRequest(makeInitPostReq(initializeBody(),
+					["Accept": "application/json, text/event-stream"]), res);
+			catch (Exception)
+				threw = true;
+			sid = res.headers.get(SessionHeader, "");
+			auto ping = createTestHTTPServerResponse(createMemoryOutputStream(),
+				null, TestHTTPResponseMode.bodyOnly);
+			router.handleRequest(sessionReq(HTTPMethod.POST, sid,
+				`{"jsonrpc":"2.0","id":2,"method":"ping"}`), ping);
+			later = ping.statusCode;
+		}
+		catch (Exception)
+		{
+		}
+	});
+	runEventLoop();
+	assert(threw, "the failed write must surface");
+	assert(sid.length, "the session id was stamped before the write");
+	assert(later == HTTPStatus.notFound, "the minted session must be rolled back");
 }
 
 unittest  // a POST accepting only text/event-stream gets its non-streamed reply as an SSE event
