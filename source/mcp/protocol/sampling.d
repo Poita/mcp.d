@@ -16,7 +16,8 @@ import std.typecons : Nullable, nullable;
 import vibe.data.json : Json;
 import mcp.protocol.types : Content, ContentKind, Tool;
 import mcp.protocol.errors : McpException, invalidParams;
-import mcp.protocol.jsonhelpers : getOr, tryGet, numberOrThrow, stringOrThrow, requireObject;
+import mcp.protocol.jsonhelpers : getOr, tryGet, tryGetWhole, numberOrThrow,
+	stringOrThrow, requireObject;
 
 @safe:
 
@@ -344,17 +345,16 @@ struct CreateMessageRequest
 		if ("temperature" in j && j["temperature"].type != Json.Type.undefined
 				&& j["temperature"].type != Json.Type.null_)
 			r.temperature = numberOrThrow(j["temperature"], "temperature");
-		// `maxTokens` is a required spec `number` (schema.ts: `maxTokens: number;`),
-		// so accept any numeric representation (int, bigInt, or float) and not just
-		// an integer literal: a conformant sender may emit e.g. 100.0.
+		// `maxTokens` is a required spec `number` (schema.ts: `maxTokens: number;`)
+		// counting tokens, so accept any whole-valued representation (int, bigInt,
+		// or a float such as 100.0) and reject a fraction rather than truncate it.
 		if ("maxTokens" !in j || j["maxTokens"].type == Json.Type.null_)
 			throw invalidParams("'maxTokens' is required");
-		const v = numberOrThrow(j["maxTokens"], "maxTokens");
-		// `!(v >= 0)` also rejects NaN; the upper bound keeps the cast defined.
-		if (!(v >= 0) || v >= 0x1p63)
+		long maxTokens;
+		if (!tryGetWhole(j, "maxTokens", maxTokens) || maxTokens < 0)
 			throw invalidParams(
-					"'maxTokens' must be a non-negative number within the integer range");
-		r.maxTokens = cast(long) v;
+					"'maxTokens' must be a non-negative whole number within the integer range");
+		r.maxTokens = maxTokens;
 		if ("stopSequences" in j && j["stopSequences"].type == Json.Type.array)
 			foreach (i; 0 .. j["stopSequences"].length)
 				r.stopSequences ~= stringOrThrow(j["stopSequences"][i], "stopSequences");
@@ -930,6 +930,20 @@ unittest  // CreateMessageRequest.fromJson rejects a negative or out-of-range ma
 	import std.exception : collectException;
 
 	foreach (bad; [Json(-1L), Json(-0.5), Json(1e300)])
+	{
+		Json j = Json.emptyObject;
+		j["messages"] = Json.emptyArray;
+		j["maxTokens"] = bad;
+		auto ex = cast(McpException) collectException(CreateMessageRequest.fromJson(j));
+		assert(ex !is null && ex.code == ErrorCode.invalidParams, bad.toString);
+	}
+}
+
+unittest  // CreateMessageRequest.fromJson rejects a fractional or non-numeric maxTokens with -32602
+{
+	import std.exception : collectException;
+
+	foreach (bad; [Json(100.9), Json(0.5), Json("100"), Json(true)])
 	{
 		Json j = Json.emptyObject;
 		j["messages"] = Json.emptyArray;
