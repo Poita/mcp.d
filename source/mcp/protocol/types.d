@@ -457,10 +457,10 @@ struct Content
 			t.toolUseId = c.toolUseId;
 			foreach (b; c.content)
 				t.content ~= b.dupSelf();
-			t.structuredContent = c.structuredContent;
+			t.structuredContent = c.structuredContent.clone;
 			t.isError = c.isError;
 			t.annotations = c.annotations.dup;
-			t.meta = c.meta;
+			t.meta = c.meta.clone;
 			return Content(t);
 		}, (const ref c) {
 			import std.traits : Unqual;
@@ -468,7 +468,11 @@ struct Content
 			Unqual!(typeof(c)) x;
 			static foreach (i; 0 .. x.tupleof.length)
 			{
-				static if (is(typeof(x.tupleof[i]) == Annotations))
+				// Json objects and arrays are reference types, so they are cloned
+				// to keep the copy independent of the original.
+				static if (is(typeof(x.tupleof[i]) == Json))
+					x.tupleof[i] = c.tupleof[i].clone;
+				else static if (is(typeof(x.tupleof[i]) == Annotations))
 					x.tupleof[i] = c.tupleof[i].dup;
 				else static if (is(typeof(x.tupleof[i]) == Icon[]))
 				{
@@ -541,11 +545,12 @@ struct Content
 	}
 
 	/// Attach an optional `_meta` object to this content block. Per the MCP
-	/// schema every content kind may carry `_meta`. Returns a copy.
+	/// schema every content kind may carry `_meta`. Returns a copy holding its
+	/// own clone of `m`.
 	Content withContentMeta(Json m) const @safe
 	{
 		Content c = dupSelf();
-		c.payload.match!((ref x) { x.meta = m; });
+		c.payload.match!((ref x) { x.meta = m.clone; });
 		return c;
 	}
 
@@ -561,11 +566,14 @@ struct Content
 	}
 
 	/// Attach an optional `structuredContent` object to a `tool_result` content
-	/// block (sampling). Returns a copy. Only valid for the `toolResult` kind.
+	/// block (sampling). Returns a copy holding its own clone of `sc`. Only
+	/// valid for the `toolResult` kind.
 	Content withStructuredContent(Json sc) const @safe
 	{
 		Content c = dupSelf();
-		c.payload.match!((ref ToolResultContent x) { x.structuredContent = sc; }, (ref _) {
+		c.payload.match!((ref ToolResultContent x) {
+			x.structuredContent = sc.clone;
+		}, (ref _) {
 			throw new Exception("withStructuredContent is only valid on tool_result content");
 		});
 		return c;
@@ -2263,6 +2271,37 @@ unittest  // tool_result nested content deep-copies through dupSelf (no aliasing
 	assert(copy.kind == ContentKind.toolResult);
 	assert(copy.toolContent.length == 1);
 	assert(copy.toolContent[0].text == "inner");
+}
+
+unittest  // dupSelf deep-copies the Json fields of a content block (no aliasing)
+{
+	auto use = Content.makeToolUse("call_1", "t", Json(["a": Json(1)]))
+		.withContentMeta(Json(["k": Json("v")]));
+	auto copy = use.dupSelf();
+	copy.input()["a"] = 2;
+	copy.meta()["k"] = "changed";
+	assert(use.input()["a"].get!int == 1);
+	assert(use.meta()["k"].get!string == "v");
+
+	auto tr = Content.makeToolResult("call_1").withStructuredContent(Json([
+			"x": Json(1)
+	]));
+	auto trCopy = tr.dupSelf();
+	trCopy.structuredContent()["x"] = 2;
+	assert(tr.structuredContent()["x"].get!int == 1);
+
+	auto res = Content.makeEmbeddedText("test://x", "text/plain", "hi");
+	auto resCopy = res.dupSelf();
+	resCopy.resource()["text"] = "changed";
+	assert(res.resource()["text"].get!string == "hi");
+}
+
+unittest  // withContentMeta keeps its own copy of the caller's _meta object
+{
+	Json m = Json(["k": Json("v")]);
+	auto c = Content.makeText("hi").withContentMeta(m);
+	m["k"] = "changed";
+	assert(c.meta()["k"].get!string == "v");
 }
 
 unittest  // text content round-trips through the SumType-backed Content
@@ -6683,8 +6722,8 @@ unittest  // CompleteRequest.fromJson and ElicitParams.fromJson reject non-objec
 	import std.exception : collectException;
 
 	foreach (v; [
-			Json.undefined, Json(null), Json(5), Json("x"), Json.emptyArray
-		])
+		Json.undefined, Json(null), Json(5), Json("x"), Json.emptyArray
+	])
 	{
 		auto c = collectException!McpException(CompleteRequest.fromJson(v));
 		assert(c !is null && c.code == ErrorCode.invalidParams, v.toString);
