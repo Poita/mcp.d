@@ -6231,6 +6231,7 @@ unittest  // a timed-out connect() probe is cancelled by closing its stream, not
 	const failure = runAgainstFakeServer(router, (string url) @safe {
 		ClientSettings s;
 		s.requestTimeout = 200.msecs;
+		s.discoverTimeout = Duration.zero; // surface the probe timeout itself
 		auto client = McpClient.http(url, s);
 		scope (exit)
 			client.close();

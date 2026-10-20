@@ -2109,6 +2109,51 @@ unittest  // a stdio request with no reply fails after ClientSettings.requestTim
 	assert(cancelled["params"]["requestId"] == req["id"]);
 }
 
+unittest  // connect falls back to initialize when a stdio server never answers server/discover
+{
+	import core.time : msecs, seconds, MonoTime, Duration;
+	import mcp.client.client : ClientSettings;
+	import mcp.protocol.versions : latestLegacy, toWire;
+
+	auto toClient = new TestLines;
+	string[] methods;
+	bool connected;
+	Duration took;
+	const failure = inLoopCapturing(() @safe {
+		ClientSettings s;
+		s.requestTimeout = 3.seconds;
+		s.discoverTimeout = 200.msecs;
+		auto client = McpClient.stdio(() @safe => toClient.take(), (string l) @safe {
+			auto m = parseJsonString(l);
+			if ("method" !in m)
+				return;
+			methods ~= m["method"].get!string;
+			if (m["method"].get!string != "initialize")
+				return;
+			Json r = Json.emptyObject;
+			r["protocolVersion"] = latestLegacy.toWire;
+			r["capabilities"] = Json.emptyObject;
+			r["serverInfo"] = Json(["name": Json("old"), "version": Json("1")]);
+			toClient.put(Json([
+				"jsonrpc": Json("2.0"),
+				"id": m["id"],
+				"result": r
+			]).toString());
+		}, s);
+		const start = MonoTime.currTime;
+		client.connect();
+		connected = true;
+		took = MonoTime.currTime - start;
+		toClient.closeEnd();
+	});
+	assert(failure.length == 0, failure);
+	assert(connected);
+	assert(took < 2.seconds, "the probe must give up after discoverTimeout");
+	assert(methods.length >= 2 && methods[0] == "server/discover" && methods[$ - 2 .. $] == [
+		"initialize", "notifications/initialized"
+	], "the client must fall back to initialize");
+}
+
 unittest  // progress for a stdio request resets its timeout
 {
 	import core.time : msecs;

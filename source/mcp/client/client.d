@@ -383,6 +383,15 @@ struct ClientSettings
 	/// server requests), which otherwise default to a 30-second bound.
 	Duration requestTimeout = 60.seconds;
 
+	/// How long `connect()`'s `server/discover` probe waits for an answer before
+	/// the client takes the peer for one that predates the probe (some older
+	/// servers never answer a request sent before `initialize`) and falls back to
+	/// the `initialize` handshake. A `requestTimeout` shorter than this bounds the
+	/// probe instead, with the same fallback. `Duration.zero` leaves the probe
+	/// bounded by `requestTimeout` alone, and a probe timeout then fails
+	/// `connect()`.
+	Duration discoverTimeout = 5.seconds;
+
 	/// How long opening a `subscriptions/listen` or `events/stream` stream waits
 	/// for the server's leading frame before the stream is cancelled and the open
 	/// fails with `RequestTimeoutException`. Applied by `http`, `stdio` and
@@ -465,7 +474,10 @@ private final class InFlightRequest
 
 	Timer timer;
 	bool armed;
-	// When the `requestTimeout` window ends; `MonoTime.max` when there is none.
+	// The request's timeout window: `requestTimeout`, or a shorter bound the
+	// request was sent with. Zero when there is none.
+	Duration window;
+	// When the timeout window ends; `MonoTime.max` when there is none.
 	MonoTime deadline = MonoTime.max;
 	// When `maxTotalTimeout` ends; `MonoTime.max` when there is no cap.
 	MonoTime hardDeadline = MonoTime.max;
@@ -923,6 +935,7 @@ final class McpClient : ClientProtocol
 		now_ = () @safe => Clock.currTime();
 		eventSettings_ = settings.events;
 		resetTimeoutOnProgress_ = settings.resetTimeoutOnProgress;
+		discoverTimeout_ = settings.discoverTimeout;
 		maxTotalTimeout_ = settings.maxTotalTimeout;
 		reinitializeOnSessionExpiry_ = settings.reinitializeOnSessionExpiry;
 		taskPollInterval_ = settings.taskPollInterval;
@@ -943,6 +956,7 @@ final class McpClient : ClientProtocol
 	private Duration maxTaskPollInterval_ = ClientSettings.init.maxTaskPollInterval;
 
 	private Duration requestTimeout_ = ClientSettings.init.requestTimeout;
+	private Duration discoverTimeout_ = ClientSettings.init.discoverTimeout;
 	private bool resetTimeoutOnProgress_ = ClientSettings.init.resetTimeoutOnProgress;
 	private bool reinitializeOnSessionExpiry_;
 	// The version the last `initialize` requested, which a session restarted
@@ -1301,7 +1315,7 @@ final class McpClient : ClientProtocol
 	private DiscoverResult discoverProbe() @safe
 	{
 		return DiscoverResult.fromJson(rpc("server/discover", Json.emptyObject,
-				nullable(ProtocolVersion.v2026_07_28)));
+				nullable(ProtocolVersion.v2026_07_28), discoverTimeout_));
 	}
 
 	/// Attach an OAuth bearer access token, sent as `Authorization: Bearer
@@ -1446,10 +1460,12 @@ final class McpClient : ClientProtocol
 	///   - HTTP 400/404/405 without a recognised modern error → an older server;
 	///     try a Streamable HTTP `initialize`, and only if that is rejected the
 	///     same way fall back to the 2024-11-05 HTTP+SSE transport.
+	///   - no answer within `ClientSettings.discoverTimeout` → an older server
+	///     that ignores requests before `initialize`; run the handshake.
 	/// Returns the negotiated protocol version. Throws if there is no mutually
-	/// supported version, or on any other error — including a probe that times
-	/// out, fails at the transport, or gets an internal error, none of which
-	/// identify a legacy server.
+	/// supported version, or on any other error — including a probe that fails
+	/// at the transport or gets an internal error, neither of which identifies
+	/// a legacy server.
 	ProtocolVersion connect() @safe
 	{
 		string[] serverVersions;
@@ -1491,9 +1507,16 @@ final class McpClient : ClientProtocol
 		}
 		catch (McpException e)
 		{
-			// A timeout, a dead transport, a local failure or a server internal
-			// error says nothing about the peer's protocol era, so it is surfaced
-			// rather than read as a legacy server.
+			// Some older servers never answer a request sent before `initialize`,
+			// so a probe that outlives `discoverTimeout` falls back to the handshake.
+			if (cast(RequestTimeoutException) e && discoverTimeout_ > Duration.zero)
+			{
+				initialize();
+				return negotiated;
+			}
+			// A dead transport, a local failure or a server internal error says
+			// nothing about the peer's protocol era, so it is surfaced rather than
+			// read as a legacy server.
 			if (!isDiscoverRejection(e))
 				throw e;
 			// Only UnsupportedProtocolVersionError carries a version list to
@@ -3979,22 +4002,24 @@ final class McpClient : ClientProtocol
 	/// rather than dropped as "unknown".
 	///
 	/// `framing` sends the request with modern framing at that version whatever
-	/// the session's own framing; null uses the session's.
+	/// the session's own framing; null uses the session's. A positive `bound`
+	/// times the request out sooner than `requestTimeout`.
 	private Json rpc(string method, Json params,
-			Nullable!ProtocolVersion framing = Nullable!ProtocolVersion.init) @safe
+			Nullable!ProtocolVersion framing = Nullable!ProtocolVersion.init,
+			Duration bound = Duration.zero) @safe
 	{
 		if (method != "initialize")
 			awaitInitializeEnded();
 		const epoch = sessionEpoch_;
 		try
-			return rpcOnce(method, params, framing);
+			return rpcOnce(method, params, framing, bound);
 		catch (SessionExpiredException e)
 		{
 			if (!reinitializeOnSessionExpiry_ || !didInitialize
 					|| method == "initialize" || e.outcomeUnknown)
 				throw e;
 			reinitializeAfterExpiry(epoch, e);
-			return rpcOnce(method, params, framing);
+			return rpcOnce(method, params, framing, bound);
 		}
 	}
 
@@ -4015,7 +4040,8 @@ final class McpClient : ClientProtocol
 	}
 
 	/// One attempt of `rpc`.
-	private Json rpcOnce(string method, Json params, Nullable!ProtocolVersion framing) @safe
+	private Json rpcOnce(string method, Json params,
+			Nullable!ProtocolVersion framing, Duration bound) @safe
 	{
 		ensureNotReleased();
 		try
@@ -4031,7 +4057,7 @@ final class McpClient : ClientProtocol
 			auto token = callTokens_.get(currentFiberKey(), null);
 			if (token !is null && token.isCancelled)
 				throw cancelledError(token.reason);
-			auto req = beginRequest(id, params);
+			auto req = beginRequest(id, params, bound);
 			req.modern = modern;
 			scope (exit)
 				endRequest(id, req);
@@ -4066,9 +4092,9 @@ final class McpClient : ClientProtocol
 		}
 	}
 
-	/// Track request `id` as in flight and, when a `requestTimeout` is set, arm
-	/// its deadline timer.
-	private InFlightRequest beginRequest(long id, Json params) @safe
+	/// Track request `id` as in flight and, when a `requestTimeout` or a
+	/// positive `bound` is set, arm its deadline timer for the shorter of them.
+	private InFlightRequest beginRequest(long id, Json params, Duration bound) @safe
 	{
 		import vibe.core.core : createTimer;
 
@@ -4077,8 +4103,11 @@ final class McpClient : ClientProtocol
 				&& params["_meta"].type == Json.Type.object && "progressToken" in params["_meta"])
 			req.progressKey = params["_meta"]["progressToken"].toString();
 		const now = MonoTime.currTime;
-		if (requestTimeout_ > Duration.zero)
-			req.deadline = now + requestTimeout_;
+		req.window = requestTimeout_;
+		if (bound > Duration.zero && (req.window <= Duration.zero || bound < req.window))
+			req.window = bound;
+		if (req.window > Duration.zero)
+			req.deadline = now + req.window;
 		if (maxTotalTimeout_ > Duration.zero)
 			req.hardDeadline = now + maxTotalTimeout_;
 		if (req.deadline != MonoTime.max || req.hardDeadline != MonoTime.max)
@@ -4125,8 +4154,7 @@ final class McpClient : ClientProtocol
 			return;
 		abortRequest(id,
 				new RequestTimeoutException("Request " ~ id.to!string ~ " timed out after " ~ (capped
-					? maxTotalTimeout_.toString() ~ " (maxTotalTimeout)" : requestTimeout_.toString())),
-				"Request timed out");
+					? maxTotalTimeout_.toString() ~ " (maxTotalTimeout)" : (*r).window.toString())), "Request timed out");
 	}
 
 	/// Arm `req`'s timer to fire at the earlier of its `requestTimeout` window
@@ -4161,13 +4189,12 @@ final class McpClient : ClientProtocol
 	{
 		if (!resetTimeoutOnProgress_ || progressKey.length == 0)
 			return;
-		if (requestTimeout_ <= Duration.zero)
-			return;
 		const now = MonoTime.currTime;
 		foreach (r; inFlight_.byValue)
-			if (r.armed && r.progressKey == progressKey && r.abortReason is null && !r.paused)
+			if (r.armed && r.window > Duration.zero
+					&& r.progressKey == progressKey && r.abortReason is null && !r.paused)
 			{
-				r.deadline = now + requestTimeout_;
+				r.deadline = now + r.window;
 				armDeadline(r, now);
 			}
 	}
@@ -5619,7 +5646,7 @@ unittest  // a failed task's error keeps its code and data
 unittest  // a finished request releases its deadline timer
 {
 	auto c = McpClient.http("http://localhost");
-	auto req = c.beginRequest(1, Json.emptyObject);
+	auto req = c.beginRequest(1, Json.emptyObject, Duration.zero);
 	assert(cast(bool) req.timer);
 	c.endRequest(1, req);
 	assert(!cast(bool) req.timer,
@@ -10032,7 +10059,7 @@ unittest  // connect() falls back to initialize when the discover probe gets any
 	}
 }
 
-unittest  // connect() rethrows a probe timeout, transport failure or internal error instead of assuming a legacy server
+unittest  // connect() rethrows a transport failure or internal error, and a probe timeout without discoverTimeout, instead of assuming a legacy server
 {
 	import std.exception : collectException;
 
@@ -10044,7 +10071,9 @@ unittest  // connect() rethrows a probe timeout, transport failure or internal e
 	foreach (failure; failures)
 	{
 		auto transport = new RecordingClientTransport();
-		auto c = new McpClient(transport);
+		ClientSettings settings;
+		settings.discoverTimeout = Duration.zero;
+		auto c = new McpClient(transport, settings);
 		bool initialized;
 		transport.responder = (Json message, long expectId) @safe {
 			if (message["method"].get!string == "server/discover")
@@ -10056,6 +10085,21 @@ unittest  // connect() rethrows a probe timeout, transport failure or internal e
 		assert(thrown is failure, "connect() must surface the probe failure");
 		assert(!initialized, "a failed probe must not fall back to initialize");
 	}
+}
+
+unittest  // connect() falls back to initialize when the probe times out under discoverTimeout
+{
+	auto transport = new RecordingClientTransport();
+	auto c = new McpClient(transport);
+	string[] methods;
+	transport.responder = (Json message, long expectId) @safe {
+		methods ~= message["method"].get!string;
+		if (message["method"].get!string == "server/discover")
+			throw new RequestTimeoutException("timed out");
+		return minimalInitializeResult(message, expectId);
+	};
+	assert(c.connect() == latestLegacy);
+	assert(methods == ["server/discover", "initialize"]);
 }
 
 unittest  // connect() rethrows a modern-only probe rejection instead of assuming a legacy server
