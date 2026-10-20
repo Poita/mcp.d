@@ -576,6 +576,23 @@ final class TaskRuntime
 		return claimed;
 	}
 
+	/// Release the dispatch claim on task `id`, for a dispatch that ends
+	/// without recording a status change, so a redelivery may run the
+	/// executor again instead of waiting out `TaskOptions.dispatchLease` (or
+	/// forever, with a zero lease). A no-op when the task is unknown, settled,
+	/// or holds no claim.
+	package(mcp) void releaseDispatch(string id) @safe
+	{
+		if (statusOf(id).isNull)
+			return;
+		modify(id, (ref TaskRecord r) @safe {
+			if (isTerminal(r.meta.status) || r.dispatchClaimedAt.length == 0)
+				return Change.none;
+			r.dispatchClaimedAt = null;
+			return Change.state;
+		});
+	}
+
 	/// Whether a dispatch's claim on `r` still holds at `now`: it was taken,
 	/// and neither it nor the task's last status change is a full
 	/// `dispatchLease` old. An unparseable timestamp cannot be aged, so its
@@ -1746,7 +1763,7 @@ version (unittest) private void assertAnswerRejected(Json request, Json answer) 
 	auto t = rt.createFor("gate", Json.undefined);
 	rt.requireInput(t.taskId, Json(["q": request]));
 	auto ex = cast(McpException) collectException(rt.deliverInput(t.taskId, Json([
-				"q": answer
+		"q": answer
 	])));
 	assert(ex !is null && ex.code == ErrorCode.invalidParams);
 	assert(ex.data["keys"][0].get!string == "q");
@@ -1974,6 +1991,40 @@ unittest  // each status notification carries the state its own transition commi
 	]));
 	seen.sort();
 	assert(seen == ["completed", "input_required"]);
+}
+
+unittest  // a dispatch that fails to record its outcome releases its claim so a redelivery runs
+{
+	import std.exception : collectException;
+	import mcp.server.task_context : runTaskExecutor, TaskContext;
+
+	auto store = new RacingTaskStore();
+	TaskOptions o;
+	o.store = store;
+	o.dispatchLease = Duration.zero;
+	auto rt = new TaskRuntime(o);
+	auto t = rt.createFor("job", Json.undefined);
+	int runs;
+	int failingWrites;
+	void delegate() @safe unreachable;
+	// Fails the completion and the failure recorded after it.
+	unreachable = () @safe {
+		if (++failingWrites < 2)
+			store.beforeNextSwap = unreachable;
+		throw new Exception("store unreachable");
+	};
+	auto first = collectException(runTaskExecutor(rt, t.taskId, (TaskContext tc) @safe {
+			runs++;
+			store.beforeNextSwap = unreachable;
+			return Json(["content": Json.emptyArray]);
+		}));
+	assert(first !is null && runs == 1);
+	runTaskExecutor(rt, t.taskId, (TaskContext tc) @safe {
+		runs++;
+		return Json(["content": Json.emptyArray]);
+	});
+	assert(runs == 2);
+	assert(rt.statusOf(t.taskId).get == TaskStatus.completed);
 }
 
 unittest  // concurrent tasks/update deliveries both keep their answers

@@ -284,7 +284,8 @@ alias TaskExecutor = Json delegate(TaskContext tc) @safe;
 /// dispatch (`TaskOptions.dispatchLease`) is left as it is.
 /// Pure over the store, so it is correct whether invoked in-process or by a
 /// remote worker. Throws only when the outcome cannot be recorded (e.g. the
-/// store is unreachable).
+/// store is unreachable), first releasing the dispatch's claim so a
+/// redelivery can run the executor again.
 void runTaskExecutor(TaskRuntime rt, string taskId, TaskExecutor executor) @safe
 {
 	auto tc = TaskContext(rt, taskId);
@@ -341,6 +342,17 @@ private void drive(ref TaskContext tc, TaskExecutor executor) @safe
 	// side effects.
 	if (!rt.claimDispatch(taskId))
 		return;
+	// A dispatch that cannot record its outcome leaves the task working with
+	// no executor running, so it gives up its claim for a redelivery to take.
+	scope (failure)
+	{
+		import vibe.core.log : logWarn;
+
+		try
+			rt.releaseDispatch(taskId);
+		catch (Exception e)
+			logWarn("task %s: could not release the dispatch claim: %s", taskId, e.msg);
+	}
 	auto rec = rt.recordOf(taskId);
 	if (rec.isNull)
 		return;
@@ -971,20 +983,14 @@ unittest  // re-requesting an input key discards its earlier answer, so only a f
 	};
 	runTaskExecutor(rt, t.taskId, exec);
 	rt.deliverInput(t.taskId, Json([
-			"x": Json([
-				"action": Json("accept"),
-				"content": Json(["x": Json(-1)])
-			])
+		"x": Json(["action": Json("accept"), "content": Json(["x": Json(-1)])])
 	]));
 	rt.resumeWorking(t.taskId);
 	runTaskExecutor(rt, t.taskId, exec);
 	assert(rt.getDetailed(t.taskId)["status"].get!string == "input_required");
 	assert(("x" in rt.takenInput(t.taskId)) is null, "the stale answer was discarded");
 	rt.deliverInput(t.taskId, Json([
-			"x": Json([
-				"action": Json("accept"),
-				"content": Json(["x": Json(5)])
-			])
+		"x": Json(["action": Json("accept"), "content": Json(["x": Json(5)])])
 	]));
 	rt.resumeWorking(t.taskId);
 	runTaskExecutor(rt, t.taskId, exec);
