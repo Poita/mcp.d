@@ -664,7 +664,9 @@ string validateInputSchemaHeaders(Json inputSchema) @safe
 // ===========================================================================
 
 /// The kind of server->client request an MRTR `InputRequest` stands in for.
-/// Maps to the wire `type` discriminator (`"sampling"`/`"elicitation"`/`"roots"`).
+/// The wire identifies it only by the request object's `method`
+/// (`sampling/createMessage`, `elicitation/create`, `roots/list`); see
+/// `InputRequest.type` for the short name the SDK keeps instead.
 enum InputKind
 {
 	sampling,
@@ -678,10 +680,14 @@ enum InputKind
 struct InputRequest
 {
 	string id; /// correlation id chosen by the server (the `InputRequests` map key)
-	string type; /// "sampling" | "elicitation" | "roots"
+	/// The SDK's short name for the request kind: "sampling", "elicitation" or
+	/// "roots". It is not on the wire, which carries the full `method` instead
+	/// (`methodForType`). An `InputRequest` parsed from an unrecognised method
+	/// keeps that method here.
+	string type;
 	Json params = Json.emptyObject; /// the would-be request params
 
-	/// The typed `InputKind` for this request's wire `type`, or null when the
+	/// The typed `InputKind` for this request's `type`, or null when the
 	/// `type` is not one of the three recognised kinds.
 	Nullable!InputKind kind() const @safe
 	{
@@ -802,10 +808,12 @@ struct InputRequest
 		return "";
 	}
 
-	/// The spec wire `method` for this request's `type`: an `InputRequests` value
-	/// is a request object whose `method` is the full JSON-RPC method name
+	/// The spec wire `method` for a `type`: an `InputRequests` value is a
+	/// request object whose `method` is the full JSON-RPC method name
 	/// (`elicitation/create`, `sampling/createMessage`, `roots/list`) — not the
-	/// short internal discriminator.
+	/// short `type`. A `type` holding a method (one containing `/`, as kept
+	/// from an unrecognised wire method by `fromJson`) is returned as is; any
+	/// other unrecognised `type` yields null.
 	static string methodForType(string type) @safe pure nothrow
 	{
 		switch (type)
@@ -817,7 +825,10 @@ struct InputRequest
 		case "roots":
 			return "roots/list";
 		default:
-			return type;
+			foreach (char c; type)
+				if (c == '/')
+					return type;
+			return null;
 		}
 	}
 
@@ -841,10 +852,18 @@ struct InputRequest
 	/// Serialize this request as an `InputRequests` *value* (the request object):
 	/// a `{ method, params }` object. The `id` is the surrounding map key and is
 	/// therefore not part of the value (see `InputRequiredResult.toJson`).
+	/// Throws when `type` names no method (`methodForType`), such as a
+	/// misspelled kind; that is a local builder mistake, so it is a plain
+	/// Exception.
 	Json toJson() const @safe
 	{
+		import std.exception : enforce;
+
+		const method = methodForType(type);
+		enforce(method.length, "InputRequest '" ~ id ~ "' has unrecognised type '"
+				~ type ~ "'; expected sampling, elicitation or roots");
 		Json j = Json.emptyObject;
-		j["method"] = methodForType(type);
+		j["method"] = method;
 		j["params"] = params;
 		return j;
 	}
@@ -939,8 +958,9 @@ void parseInputRequired(Json j, ref InputRequest[] requests, ref string requestS
 /// Serialize a list of `InputRequest`s as a spec `InputRequests` object: a map
 /// keyed by each request's server-assigned `id`, with `{ method, params }`
 /// request objects as values (SEP-2322, 2026-07-28 basic/utilities/mrtr).
-/// Throws when two requests share an `id`, since the map would keep only one;
-/// that is a local builder mistake, so it is a plain Exception.
+/// Throws when two requests share an `id`, since the map would keep only one,
+/// or when a request's `type` names no method (`InputRequest.toJson`); both are
+/// local builder mistakes, so it is a plain Exception.
 Json inputRequestsToJson(const(InputRequest)[] requests) @safe
 {
 	import std.exception : enforce;
@@ -966,6 +986,23 @@ unittest  // inputRequestsToJson rejects duplicate request ids
 		InputRequest("a", "elicitation", Json.emptyObject),
 		InputRequest("b", "roots", Json.emptyObject)
 	]).length == 2);
+}
+
+unittest  // an InputRequest of an unrecognised kind is refused rather than sent as its method
+{
+	import std.exception : assertThrown;
+
+	assertThrown(InputRequest("a", "elicit", Json.emptyObject).toJson());
+	assertThrown(inputRequestsToJson([
+			InputRequest("a", "elicit", Json.emptyObject)
+	]));
+}
+
+unittest  // an InputRequest parsed from an unknown wire method serializes back to that method
+{
+	auto r = InputRequest.fromJson("a", Json(["method": Json("vendor/ask")]));
+	assert(r.kind.isNull);
+	assert(r.toJson()["method"].get!string == "vendor/ask");
 }
 
 /// Parse a spec `InputRequests` object (map keyed by id) back into the internal
