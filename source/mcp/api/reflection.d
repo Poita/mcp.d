@@ -1588,7 +1588,7 @@ private void registerPromptMethod(string memberName, alias overload, alias paren
 				// the resource-template path. Protocol errors thrown by the
 				// marshaller are passed through unchanged so an inner
 				// invalidParams is not double-wrapped.
-				static if (!isInstanceOf!(Nullable, P))
+				static if (isRequiredParam!(overload, i))
 					if (!argPresent!P(args, names[i]))
 						throw invalidParams(
 							"Missing required argument '" ~ names[i] ~ "' for prompt: " ~ attr.name);
@@ -2432,6 +2432,42 @@ unittest  // @prompt string arg given JSON null -> clean InvalidParams, not vibe
 	const msg = resp["error"]["message"].get!string;
 	assert(msg.canFind("Missing required argument") || msg.canFind("required argument is missing"),
 			"expected a clean missing-required diagnostic, got: " ~ msg);
+}
+
+version (unittest) private final class AllOptionalPromptApi
+{
+	@allOptional static struct Opts
+	{
+		int limit;
+		string q;
+	}
+
+	@prompt("opts", "Prompt with an @allOptional struct argument")
+	string opts(string topic, Opts opts) @safe
+	{
+		import std.conv : to;
+
+		return topic ~ ":" ~ opts.limit.to!string ~ ":" ~ opts.q;
+	}
+}
+
+unittest  // an omitted @allOptional struct prompt argument binds its .init, as advertised
+{
+	import mcp.protocol.jsonrpc : Message, makeRequest;
+
+	auto s = McpServer.stateless("t", "1");
+	registerHandlers(s, new AllOptionalPromptApi);
+	auto list = s.handle(Message(makeRequest(Json(1), "prompts/list", Json.emptyObject))).get;
+	auto args = list["result"]["prompts"][0]["arguments"];
+	assert(args[1]["name"].get!string == "opts");
+	assert(!("required" in args[1] && args[1]["required"].get!bool), args.toString);
+
+	Json pp = Json.emptyObject;
+	pp["name"] = "opts";
+	pp["arguments"] = Json(["topic": Json("t")]);
+	auto resp = s.handle(Message(makeRequest(Json(2), "prompts/get", pp))).get;
+	assert("error" !in resp, resp.toString);
+	assert(resp["result"]["messages"][0]["content"]["text"].get!string == "t:0:");
 }
 
 unittest  // @prompt reflection: optional title is emitted in prompts/list
