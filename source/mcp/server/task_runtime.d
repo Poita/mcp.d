@@ -738,11 +738,13 @@ final class TaskRuntime
 
 	/// Request cancellation. Always records the cooperative `cancelRequested`
 	/// flag. A task with no executor running to honor it — a manual task
-	/// (`toolName` empty), one suspended in `input_required`, or one the executor
-	/// detached — transitions to `cancelled` immediately; for a running executor
-	/// the status is left untouched so it can observe the flag and stop at a safe
-	/// point, and a repeated request for it stores nothing. Once requested, the
-	/// cancel wins: a later `complete` or `fail` records the task `cancelled`.
+	/// (`toolName` empty), one suspended in `input_required`, one the executor
+	/// detached, or one whose dispatch claim has lapsed past
+	/// `TaskOptions.dispatchLease` (its worker is taken to have crashed) —
+	/// transitions to `cancelled` immediately; for a running executor the status
+	/// is left untouched so it can observe the flag and stop at a safe point, and
+	/// a repeated request for it stores nothing. Once requested, the cancel wins:
+	/// a later `complete` or `fail` records the task `cancelled`.
 	void cancel(string id) @safe
 	{
 		modify(id, (ref TaskRecord r) @safe {
@@ -750,7 +752,9 @@ final class TaskRuntime
 				return Change.none;
 			const alreadyRequested = r.cancelRequested;
 			r.cancelRequested = true;
-			if (r.toolName.length == 0 || r.detached || r.meta.status == TaskStatus.inputRequired)
+			const claimLapsed = r.dispatchClaimedAt.length && !holdsLiveClaim(r, currentTime());
+			if (r.toolName.length == 0 || r.detached
+				|| r.meta.status == TaskStatus.inputRequired || claimLapsed)
 			{
 				transition(r, TaskStatus.cancelled);
 				r.inputRequests = Json.emptyObject;
@@ -1083,6 +1087,35 @@ unittest  // an executor-backed task cancels cooperatively (flag set, status unc
 	assert(rt.getDetailed(t.taskId)["status"].get!string == "working");
 	rt.markCancelled(t.taskId);
 	assert(rt.getDetailed(t.taskId)["status"].get!string == "cancelled");
+}
+
+unittest  // cancelling a task whose dispatch claim lapsed settles it at once
+{
+	string now = "2026-06-07T10:00:00Z";
+	TaskOptions o;
+	o.nowIso = () @safe => now;
+	o.dispatchLease = 5.minutes;
+	auto rt = new TaskRuntime(o);
+	auto t = rt.createFor("job", Json.undefined);
+	assert(rt.claimDispatch(t.taskId));
+	now = "2026-06-07T10:05:00Z";
+	rt.cancel(t.taskId);
+	assert(rt.getDetailed(t.taskId)["status"].get!string == "cancelled");
+}
+
+unittest  // cancelling a task whose dispatch claim is live leaves it to the executor
+{
+	string now = "2026-06-07T10:00:00Z";
+	TaskOptions o;
+	o.nowIso = () @safe => now;
+	o.dispatchLease = 5.minutes;
+	auto rt = new TaskRuntime(o);
+	auto t = rt.createFor("job", Json.undefined);
+	assert(rt.claimDispatch(t.taskId));
+	now = "2026-06-07T10:04:59Z";
+	rt.cancel(t.taskId);
+	assert(rt.cancelRequested(t.taskId));
+	assert(rt.getDetailed(t.taskId)["status"].get!string == "working");
 }
 
 unittest  // complete does not override an already-cancelled task
