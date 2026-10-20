@@ -1702,28 +1702,31 @@ final class EventsRuntime
 		}
 		if (!sub.verified && urlAllowlisted(p.delivery.url))
 			sub.verified = true;
+		// A lifecycle reference this call acquired but has neither recorded nor
+		// released: any throw (a hook, the cap, a store write) releases it, so a
+		// failed subscribe never pins the key's lifecycle.
+		bool holdsRef;
+		scope (failure)
+			if (holdsRef)
+				releaseLifecycle(p.name, p.arguments, principal);
 		// on_subscribe runs before the subscription is stored, so a throwing hook
 		// leaves nothing behind that delivers to a client that got an error.
 		if (isNew)
 		{
 			acquireLifecycle(*reg, p.name, p.arguments, principal, id);
+			holdsRef = true;
 			// on_subscribe may yield, letting a concurrent subscribe of the same
 			// key store it first: that one holds the reference, so this call
 			// drops its own and proceeds as a refresh.
 			if (!webhookStore_.get(id).isNull)
 			{
+				holdsRef = false;
 				releaseLifecycle(p.name, p.arguments, principal);
 				return subscribeWebhookAttempt(p, principal, attempt + 1);
 			}
 			// Subscriptions stored while the hook ran count too: check again
 			// right before storing this one.
-			try
-				enforceWebhookCap(principal, now);
-			catch (McpException e)
-			{
-				releaseLifecycle(p.name, p.arguments, principal);
-				throw e;
-			}
+			enforceWebhookCap(principal, now);
 			// Until a new emit-only subscription's replay is read, live emits
 			// leave it to that replay: one routed live while the write is in
 			// flight would be queued ahead of the replayed events and carry the
@@ -1737,6 +1740,7 @@ final class EventsRuntime
 			if (!webhookStore_.insert(sub))
 			{
 				awaitingReplay_.remove(id);
+				holdsRef = false;
 				releaseLifecycle(p.name, p.arguments, principal);
 				return subscribeWebhookAttempt(p, principal, attempt + 1);
 			}
@@ -1749,6 +1753,7 @@ final class EventsRuntime
 		// subscription during the write already holds its reference.
 		if (isNew)
 		{
+			holdsRef = false;
 			if ((id in heldWebhookRefs_) is null)
 				heldWebhookRefs_[id] = WebhookRef(p.name, p.arguments, principal);
 			else
@@ -9443,6 +9448,37 @@ version (unittest)
 		rt.register(reg);
 		return rt;
 	}
+}
+
+unittest  // a store write that throws while creating a subscription releases its lifecycle reference
+{
+	static final class FailingStore : ForwardingStore
+	{
+		bool failInsert = true;
+
+		override bool insert(WebhookSubscription sub) @safe
+		{
+			if (failInsert)
+				throw new Exception("store unavailable");
+			return inner.insert(sub);
+		}
+	}
+
+	import std.exception : collectException;
+
+	auto store = new FailingStore();
+	auto rt = racingRuntime(store);
+	int subs, unsubs;
+	EventRegistration reg = {descriptor: EventType("m"), emitOnly: true};
+	reg.onSubscribe = (EventContext ctx, string id) @safe { subs++; };
+	reg.onUnsubscribe = (EventContext ctx, string id) @safe { unsubs++; };
+	rt.register(reg);
+	auto p = webhookSub("m", "https://proxy/hooks");
+	assert(collectException(rt.subscribeWebhook(p, "user-1")) !is null);
+	assert(subs == 1 && unsubs == 1);
+	store.failInsert = false;
+	rt.subscribeWebhook(p, "user-1");
+	assert(subs == 2);
 }
 
 unittest  // a subscription created concurrently on another node is adopted, not overwritten
