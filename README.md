@@ -276,7 +276,7 @@ on the proxy's CIMD consent screen (a spec `SHOULD`).
 
 - A D toolchain with frontend **2.111+** (DMD 2.111+, or LDC 1.41+).
 - **OpenSSL 3.x** must be installed on the system. The `openssl` dependency, and
-  the `vibe-d:tls` package that `vibe-d:http` pulls in, link against it for TLS
+  the `vibe-stream:tls` package that `vibe-d:http` pulls in, link against it for TLS
   (HTTPS transport, OAuth 2.1).
   - **Ubuntu/Debian:** ships with OpenSSL 3.x (`apt install libssl-dev` if headers
     are missing).

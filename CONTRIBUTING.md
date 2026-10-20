@@ -10,7 +10,7 @@ expected to follow, and the pull-request flow.
 - A D toolchain with frontend **2.111+** — DMD 2.111+, or LDC 1.41+ (the
   `toolchainRequirements` floor in `dub.json`) — and [`dub`](https://dub.pm)
   (ships with the compiler).
-- **OpenSSL 3.x** on the system. The `openssl` dependency, and the `vibe-d:tls`
+- **OpenSSL 3.x** on the system. The `openssl` dependency, and the `vibe-stream:tls`
   package that `vibe-d:http` pulls in, link against it for TLS (HTTPS transport,
   OAuth 2.1).
   - **Ubuntu/Debian:** ships with OpenSSL 3.x (`apt install libssl-dev` if the
