@@ -111,7 +111,10 @@ final class WebhookReceiver
 	bool verifyTimestamp = true;
 
 	/// Register (or replace) the secret and callbacks for a subscription id (the
-	/// value carried in `X-MCP-Subscription-Id`). `onControl` is optional.
+	/// value carried in `X-MCP-Subscription-Id`). `onControl` receives the
+	/// `gap` and `terminated` control envelopes, which report events lost and the
+	/// subscription ending; without it they are acknowledged, logged at warn,
+	/// and otherwise dropped.
 	void register(string subscriptionId, string secret,
 			void delegate(EventOccurrence occ) @safe onEvent,
 			void delegate(EventControl control) @safe onControl = null) @safe
@@ -202,12 +205,12 @@ final class WebhookReceiver
 				inProgress_.remove(key);
 			// Recorded only once the delivery is handled: a callback that throws
 			// (the adapter answers 5xx) leaves the server's retry to be processed.
-			auto resp = route(j, *reg);
+			auto resp = route(subId, j, *reg);
 			if (resp.status == 200)
 				recordSeen(key, ts);
 			return resp;
 		}
-		return route(j, *reg);
+		return route(subId, j, *reg);
 	}
 
 	// The 2xx reply that proves intent to receive: the challenge echoed back.
@@ -246,14 +249,24 @@ final class WebhookReceiver
 		return ReceiverResponse(503, "");
 	}
 
-	// Hand a verified, parsed, non-verification delivery to the subscription's
-	// callbacks.
-	private ReceiverResponse route(Json j, ref Reg reg) @safe
+	// Hand a verified, parsed, non-verification delivery to subscription
+	// `subId`'s callbacks. A control envelope for a subscription with no
+	// `onControl` is acknowledged and logged at warn, since a gap or termination
+	// it reports would otherwise go unnoticed.
+	private ReceiverResponse route(string subId, Json j, ref Reg reg) @safe
 	{
 		if (isControlEnvelope(j))
 		{
 			EventControl ctrl;
-			if (reg.onControl !is null && controlFromWebhookEnvelope(j, ctrl))
+			if (reg.onControl is null)
+			{
+				import vibe.core.log : logWarn;
+
+				logWarn("[mcp.client] webhook subscription %s: dropped a %s control envelope "
+						~ "(register it with an onControl callback to receive gaps and terminations)",
+						subId, j["type"].get!string);
+			}
+			else if (controlFromWebhookEnvelope(j, ctrl))
 				reg.onControl(ctrl);
 			return ReceiverResponse(200, "");
 		}
@@ -777,6 +790,45 @@ unittest  // at capacity the oldest dedup entries go first, the newest are kept
 	assert(count == 5);
 	rx.processDelivery(bodies[0], sent[0]); // oldest arrival: evicted, processed again
 	assert(count == 6);
+}
+
+unittest  // a control envelope for a subscription with no onControl is logged at warn
+{
+	import std.algorithm.searching : any, canFind;
+	import mcp.protocol.events : terminatedEnvelope;
+	import vibe.core.log : deregisterLogger, LogLevel, Logger, LogLine, registerLogger;
+
+	static final class CaptureLogger : Logger
+	{
+		string[] lines;
+		this() @safe
+		{
+			minLevel = LogLevel.warn;
+		}
+
+		override void log(ref LogLine line) @safe
+		{
+			lines ~= line.text;
+		}
+	}
+
+	auto logger = new CaptureLogger;
+	auto shared_ = () @trusted { return cast(shared) logger; }();
+	() @trusted { registerLogger(shared_); }();
+	scope (exit)
+		() @trusted { deregisterLogger(shared_); }();
+
+	auto rx = new WebhookReceiver();
+	rx.verifyTimestamp = false;
+	rx.register("sub_1", testSecret, (EventOccurrence occ) @safe {});
+	const 
+	body = terminatedEnvelope(Json(["code": Json(-32012)])).toString();
+	DeliverySigning signing = {
+		secret: testSecret, messageId: "msg_term", timestamp: 1700, subscriptionId: "sub_1"
+	};
+	assert(rx.processDelivery(body, signDeliveryHeaders(signing, body)).status == 200);
+	assert(logger.lines.any!(l => l.canFind("sub_1")
+			&& l.canFind("terminated")), logger.lines.length ? logger.lines[0] : "no warning");
 }
 
 unittest  // a terminated control envelope is routed to onControl
