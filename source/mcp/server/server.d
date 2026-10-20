@@ -3051,7 +3051,7 @@ final class McpServer : ServerCore
 
 		size_t begin, end;
 		Nullable!string next;
-		pageBounds(params, items.map!keyOf.array, pageSize_, begin, end, next);
+		pageBounds(listMethod, params, items.map!keyOf.array, pageSize_, begin, end, next);
 
 		ResultT result;
 		foreach (key; items[begin .. end])
@@ -3805,7 +3805,7 @@ final class McpServer : ServerCore
 		sort(uris);
 		size_t begin, end;
 		Nullable!string next;
-		pageBounds(params, uris, pageSize_, begin, end, next);
+		pageBounds("skills/list", params, uris, pageSize_, begin, end, next);
 
 		ListSkillsResult result;
 		foreach (uri; uris[begin .. end])
@@ -13516,6 +13516,26 @@ unittest  // setPageSize paginates tools/list across cursor-following pages
 	auto page3 = s.handle(req(3, "tools/list", p3)).get;
 	assert(page3["result"]["tools"].length == 1);
 	assert("nextCursor" !in page3["result"]);
+}
+
+unittest  // a tools/list cursor replayed against prompts/list is rejected with -32602
+{
+	import std.conv : to;
+
+	auto s = McpServer.stateless("t", "1");
+	foreach (i; 0 .. 3)
+	{
+		Tool tool = {name: "item" ~ i.to!string};
+		s.registerTool(tool, (Json) @safe => CallToolResult());
+		Prompt pr = {name: "item" ~ i.to!string};
+		s.registerPrompt(pr, (Json) @safe => GetPromptResult.init);
+	}
+	s.setPageSize(1);
+	auto page1 = s.handle(req(1, "tools/list")).get;
+	Json p = Json.emptyObject;
+	p["cursor"] = page1["result"]["nextCursor"];
+	auto resp = s.handle(req(2, "prompts/list", p)).get;
+	assert(resp["error"]["code"].get!int == ErrorCode.invalidParams);
 }
 
 unittest  // a tools/list cursor resumes after the last-seen tool when earlier tools are removed
