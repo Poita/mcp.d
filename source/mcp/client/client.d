@@ -635,6 +635,10 @@ final class McpClient : ClientProtocol
 	// `notifications/tools/list_changed` and an identity change clear it.
 	private Tool[string] listedTools_;
 	private bool haveListedTools_;
+	// Set when a bearer change drops a listed tool set, so the next string-name
+	// `callTool` lists the tools again under the new token instead of running
+	// without the schemas.
+	private bool relistTools_;
 	// A memoized parse of a `tools/list` entry found in the CacheStore, used
 	// only before this client has run `listTools` (a shared or pre-seeded store).
 	// It is re-derived whenever the underlying entry changes (a different
@@ -1261,9 +1265,7 @@ final class McpClient : ClientProtocol
 	void setBearerToken(string token) @safe
 	{
 		transport.setBearerToken(token);
-		identityEpoch_++;
-		evictIdentityEntries();
-		clearToolIndex();
+		identityChanged();
 	}
 
 	/// Attach an OAuth bearer provider, whose `token` is called for every request
@@ -1274,8 +1276,18 @@ final class McpClient : ClientProtocol
 	void setBearerProvider(BearerProvider provider) @safe
 	{
 		transport.setBearerProvider(provider);
+		identityChanged();
+	}
+
+	/// The bearer behind requests changed: drop what the previous token's
+	/// requests cached and indexed. A token change may be a refresh for the same
+	/// principal or a different principal, so a listed tool set is dropped too
+	/// but is listed again before the next string-name `callTool`.
+	private void identityChanged() @safe
+	{
 		identityEpoch_++;
 		evictIdentityEntries();
+		relistTools_ = relistTools_ || haveListedTools_;
 		clearToolIndex();
 	}
 
@@ -1700,6 +1712,7 @@ final class McpClient : ClientProtocol
 			foreach (t; acc.tools)
 				listedTools_[t.name] = Tool.fromJson(t.toJson().clone);
 			haveListedTools_ = true;
+			relistTools_ = false;
 		}
 		return acc;
 	}
@@ -2044,10 +2057,18 @@ final class McpClient : ClientProtocol
 	/// shared/pre-seeded `CacheStore`), the returned `structuredContent` is
 	/// validated against it and a non-conforming result raises an
 	/// `OutputSchemaViolation` — the same guarantee as `callTool(Tool, ...)`, without the
-	/// caller holding the descriptor.
+	/// caller holding the descriptor. A bearer change (`setBearerToken`,
+	/// `setBearerProvider`) after a `listTools` drops the listed tools, so the
+	/// next call lists them again under the new token first.
 	CallToolResult callTool(string name, Json arguments = Json.emptyObject,
 			RequestOptions opts = RequestOptions.init) @safe
 	{
+		if (relistTools_)
+		{
+			RequestOptions listOpts;
+			listOpts.cancellation = opts.cancellation;
+			listTools(listOpts);
+		}
 		auto result = callToolImpl(name, arguments, opts);
 		enforceKnownOutputSchema(name, result);
 		return result;
@@ -10279,6 +10300,63 @@ unittest  // a cacheable read that completes after a bearer switch is neither ca
 	assert(!c.haveListedTools_, "identity A's tool list must not be indexed for identity B");
 	c.listTools();
 	assert(calls == 2, "identity A's response must not be served to identity B");
+}
+
+unittest  // output-schema validation survives a bearer token change by re-listing tools
+{
+	import mcp.api.binding : jsonSchemaOf, SchemaUse;
+
+	struct AddResult
+	{
+		int result;
+	}
+
+	auto c = McpClient.http("http://localhost");
+	c.enableOutputSchemaValidation();
+	Tool t = {
+		name: "add", outputSchema: jsonSchemaOf!(AddResult, SchemaUse.output)
+	};
+	int lists;
+	c.onRpcForTest = (string method, Json params) @safe {
+		if (method == "tools/list")
+		{
+			lists++;
+			return Json(["tools": Json([t.toJson()])]);
+		}
+		return Json([
+			"content": Json.emptyArray,
+			"structuredContent": Json(["result": Json("oops")])
+		]);
+	};
+	c.listTools();
+	c.setBearerToken("refreshed");
+	bool violated;
+	try
+		c.callTool("add");
+	catch (OutputSchemaViolation)
+		violated = true;
+	assert(violated, "a token change must not switch output-schema validation off");
+	assert(lists == 2, "the tool list is fetched afresh for the new token");
+	try
+		c.callTool("add");
+	catch (OutputSchemaViolation)
+	{
+	}
+	assert(lists == 2, "the re-listed tools serve later calls");
+}
+
+unittest  // a client that never listed tools does not list them after a bearer token change
+{
+	auto c = McpClient.http("http://localhost");
+	c.enableOutputSchemaValidation();
+	string[] methods;
+	c.onRpcForTest = (string method, Json params) @safe {
+		methods ~= method;
+		return Json(["content": Json.emptyArray]);
+	};
+	c.setBearerToken("t");
+	c.callTool("add");
+	assert(methods == ["tools/call"]);
 }
 
 unittest  // a default client caps every request with a finite maxTotalTimeout
