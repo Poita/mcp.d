@@ -264,6 +264,12 @@ unittest  // the per-address cap warning is logged once and names trustProxyHead
 }
 
 /// Configuration for the Streamable HTTP server transport.
+///
+/// On a 2026-07-28 request a client disconnect cancels the request
+/// (`RequestContext.isCancelled`). The connection is probed by reading it, so a
+/// client that shuts down only its sending side after the request reads as
+/// disconnected: a handler polling `isCancelled` sees it cancelled. A handler
+/// that runs to completion still has its response written.
 struct StreamableHttpOptions
 {
 	ushort port = 8080; /// the TCP port to listen on
@@ -3294,22 +3300,11 @@ private void handlePost(McpServer server, ServerPushChannel push,
 			if (statelessInFlight !is null)
 				statelessInFlight.untrack(principalOf(token), msg.id, cancelScope);
 		auto resp = server.handle(msg, ctx);
-		// Modern basic/utilities/cancellation §Transport-Specific Cancellation: on
-		// Streamable HTTP "Closing the SSE response stream is the cancellation
-		// signal. The server MUST treat a client disconnect as cancellation of that
-		// request. No notifications/cancelled message is required or expected." If the
-		// client dropped the connection while the handler ran, honour it as a
-		// cancellation: emit no response, exactly as `notifications/cancelled` would
-		// suppress it. Released versions (2025-*) keep their behaviour: a dropped
-		// connection still completes the write, which is a harmless no-op there.
-		if (suppressOnDisconnect(isModernReq, clientConnected(res)))
-		{
-			// 2026-07-28 is stateless-only, so it never mints a session; the rollback
-			// is a no-op there. Kept for symmetry: a suppressed initialize must not
-			// leave a session behind.
-			sessions !is null && sessions.terminate(mintedSessionId);
-			return;
-		}
+		// A response is written whether or not the client still looks connected:
+		// one that shut down only its sending side is indistinguishable from one
+		// that is gone until a write fails, and a write to a gone client is a
+		// harmless no-op. A modern handler that observed the disconnect as
+		// cancellation (`ctx.isCancelled`) returns no response, handled below.
 		// A request whose handling was cancelled mid-flight (e.g. a
 		// `notifications/cancelled` arrived on a sibling POST, or 2026-07-28
 		// client-disconnect cancellation) returns a NULL response: the spec says no
@@ -3751,36 +3746,6 @@ unittest  // a successful InitializeResult commits; an error response does not
 	assert(!initializeSucceeded(Json.emptyObject));
 }
 
-/// Decide whether a finished POST response must be suppressed because the client
-/// disconnected mid-request. On the modern Streamable HTTP transport a client
-/// disconnect IS the cancellation signal (2026-07-28 basic/utilities/cancellation
-/// §Transport-Specific Cancellation: "Closing the SSE response stream is the
-/// cancellation signal. The server MUST treat a client disconnect as cancellation
-/// of that request. No notifications/cancelled message is required or expected.").
-/// So when the connection has dropped on a modern request, the response is
-/// suppressed. Released versions (2025-*) never suppress on this basis: that MUST
-/// is modern-only, so their wire behaviour is unchanged.
-private bool suppressOnDisconnect(bool modern, bool connected) @safe pure nothrow @nogc
-{
-	return modern && !connected;
-}
-
-unittest  // modern: a disconnected client cancels the request -> response suppressed
-{
-	assert(suppressOnDisconnect(true, false));
-}
-
-unittest  // modern: a still-connected client gets its response (no suppression)
-{
-	assert(!suppressOnDisconnect(true, true));
-}
-
-unittest  // released versions never suppress on disconnect (modern-only MUST)
-{
-	assert(!suppressOnDisconnect(false, false));
-	assert(!suppressOnDisconnect(false, true));
-}
-
 unittest  // modern: a client closing its TCP connection mid-request cancels the request
 {
 	import core.time : MonoTime, msecs;
@@ -3918,6 +3883,74 @@ version (Posix) unittest  // modern: a client that sends unread bytes before clo
 	assert(failure.length == 0, failure);
 	assert(started, "the tool handler never ran");
 	assert(cancelled, "a client disconnect must cancel a modern request despite unread bytes");
+}
+
+version (Posix) unittest  // modern: a client that only half-closes its connection still gets its response
+{
+	import core.sys.posix.sys.socket : shutdown, SHUT_WR;
+	import core.time : MonoTime, msecs;
+	import std.algorithm : canFind;
+	import std.conv : to;
+	import vibe.core.core : runTask, runEventLoop, exitEventLoop, sleep;
+	import vibe.core.net : connectTCP;
+	import vibe.http.server : HTTPServerSettings, listenHTTP;
+	import mcp.protocol.types : Tool, CallToolResult;
+
+	auto server = McpServer.stateless("t", "1");
+	bool started;
+	Tool work = {name: "work"};
+	server.registerTool(work, (Json args, RequestContext ctx) @safe {
+		started = true;
+		sleep(200.msecs);
+		CallToolResult r;
+		return r;
+	});
+	auto router = new URLRouter;
+	mountMcp(router, server);
+	auto settings = new HTTPServerSettings;
+	settings.port = 0;
+	settings.bindAddresses = ["127.0.0.1"];
+
+	string failure, reply;
+	runTask(() nothrow{
+		scope (exit)
+			exitEventLoop();
+		try
+		{
+			auto listener = listenHTTP(settings, router);
+			scope (exit)
+				listener.stopListening();
+			auto conn = connectTCP("127.0.0.1", listener.bindAddresses[0].port);
+			scope (exit)
+				conn.close();
+			const body_ = `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"work",`
+				~ `"arguments":{},"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28",`
+				~ `"io.modelcontextprotocol/clientCapabilities":{}}}}`;
+			conn.write(
+				"POST /mcp HTTP/1.1\r\nHost: 127.0.0.1\r\n" ~ "Content-Type: application/json\r\n"
+				~ "Accept: application/json, text/event-stream\r\n"
+				~ "MCP-Protocol-Version: 2026-07-28\r\nMcp-Method: tools/call\r\n"
+				~ "Mcp-Name: work\r\nConnection: close\r\nContent-Length: "
+				~ body_.length.to!string ~ "\r\n\r\n" ~ body_);
+			conn.flush();
+			() @trusted { shutdown(conn.fd, SHUT_WR); }();
+			const until = MonoTime.currTime + 3.seconds;
+			ubyte[4096] buf;
+			while (!reply.canFind(`"result"`) && MonoTime.currTime < until
+				&& conn.waitForData(until - MonoTime.currTime))
+			{
+				const n = conn.read(buf[], IOMode.once);
+				if (n == 0)
+					break;
+				reply ~= cast(string) buf[0 .. n].idup;
+			}
+		}
+		catch (Exception e)
+			failure = e.msg;
+	});
+	runEventLoop();
+	assert(started, "the tool handler never ran: " ~ failure);
+	assert(reply.canFind(`"result"`), "a half-closed client must still get its response: " ~ reply);
 }
 
 unittest  // a POST stream whose client stops reading does not pin its handler
