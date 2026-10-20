@@ -1110,6 +1110,8 @@ final class EventsRuntime
 	}
 
 	/// Build the `events/list` result (single page — the registry is in-memory).
+	/// A type that offers no delivery mode is left out, as no client could
+	/// subscribe to it.
 	EventListResult list() @safe
 	{
 		EventListResult r;
@@ -1118,7 +1120,8 @@ final class EventsRuntime
 			EventType t = reg.descriptor;
 			t.name = name;
 			t.delivery = effectiveDelivery(name);
-			r.events ~= t;
+			if (t.delivery.length)
+				r.events ~= t;
 		}
 		// Deterministic order so list output is stable across calls.
 		r.events.sort!((a, b) => a.name < b.name);
@@ -4388,6 +4391,22 @@ unittest  // list returns registered types sorted by name with computed delivery
 	assert(r.events.length == 2);
 	assert(r.events[0].name == "a.event" && r.events[1].name == "b.event");
 	assert(r.events[0].delivery.length >= 1);
+}
+
+unittest  // list omits a type that offers no delivery mode
+{
+	auto rt = testRuntime();
+	EventRegistration a;
+	a.descriptor.name = "a";
+	a.disabledModes = [
+		DeliveryMode.poll, DeliveryMode.push, DeliveryMode.webhook
+	];
+	EventRegistration b;
+	b.descriptor.name = "b";
+	rt.register(a);
+	rt.register(b);
+	auto r = rt.list();
+	assert(r.events.length == 1 && r.events[0].name == "b");
 }
 
 unittest  // poll on an unknown event type throws NotFound
