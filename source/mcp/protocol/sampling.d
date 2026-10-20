@@ -350,11 +350,12 @@ struct CreateMessageRequest
 ///   `tool_result` `toolUseId`, before any other message.
 /// - Every `tool_result` `toolUseId` MUST match a `tool_use` `id` of the
 ///   immediately preceding `assistant` message.
+/// - Each `tool_use` `id` is answered by exactly one `tool_result`.
 ///
 /// On violation throws an `McpException` with the spec's `-32602` (Invalid
 /// params) code; the message distinguishes "Tool result missing in request",
-/// "Tool result has no matching tool_use" and "Tool results mixed with other
-/// content". A well-formed (or
+/// "Tool result has no matching tool_use", "Duplicate tool_result for a
+/// toolUseId" and "Tool results mixed with other content". A well-formed (or
 /// tool-free) request returns normally.
 ///
 /// `params` is the raw `sampling/createMessage` params JSON — the same value
@@ -470,7 +471,11 @@ void validateSamplingMessages(Json params) @safe
 				if (b.type != Json.Type.object || "toolUseId" !in b
 						|| b["toolUseId"].type != Json.Type.string)
 					throw invalidParams("Tool result block missing required string toolUseId");
-				resultIds[b["toolUseId"].get!string] = true;
+				// Each tool_use is matched by exactly one tool_result.
+				const resultId = b["toolUseId"].get!string;
+				if (resultId in resultIds)
+					throw invalidParams("Duplicate tool_result for a toolUseId");
+				resultIds[resultId] = true;
 			}
 			foreach (id; toolUseIds.byKey)
 				if (id !in resultIds)
@@ -1244,6 +1249,23 @@ unittest  // an unmatched toolUseId among parallel tool uses is rejected
 		threw = true;
 		assert(e.code == ErrorCode.invalidParams);
 		assert(e.msg == "Tool result missing in request");
+	}
+	assert(threw);
+}
+
+unittest  // two tool_result blocks answering the same toolUseId are rejected
+{
+	auto p = samplingParams(msg("assistant", toolUse("call_1", "get_weather")),
+			msg("user", toolResult("call_1"), toolResult("call_1")));
+
+	bool threw;
+	try
+		validateSamplingMessages(p);
+	catch (McpException e)
+	{
+		threw = true;
+		assert(e.code == ErrorCode.invalidParams);
+		assert(e.msg == "Duplicate tool_result for a toolUseId");
 	}
 	assert(threw);
 }
