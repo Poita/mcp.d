@@ -198,6 +198,32 @@ string stringOrThrow(Json v, string what) @safe
 	return v.get!string;
 }
 
+/// The required string field `key` of the object `j`. Throws -32602 naming
+/// `owner` when the field is absent or not a string.
+string requiredString(Json j, string key, string owner) @safe
+{
+	import mcp.protocol.errors : invalidParams;
+
+	auto p = j.type == Json.Type.object ? key in j : null;
+	if (p is null || p.type != Json.Type.string)
+		throw invalidParams(owner ~ " requires a string '" ~ key ~ "'");
+	return p.get!string;
+}
+
+@safe unittest  // requiredString returns a present string and rejects an absent or non-string field
+{
+	import mcp.protocol.errors : McpException, ErrorCode;
+	import std.exception : collectException;
+	import vibe.data.json : parseJsonString;
+
+	assert(requiredString(parseJsonString(`{"a":""}`), "a", "T") == "");
+	foreach (b; [`{}`, `{"a":1}`, `{"a":null}`, `5`])
+	{
+		auto ex = collectException!McpException(requiredString(parseJsonString(b), "a", "T"));
+		assert(ex !is null && ex.code == ErrorCode.invalidParams, b);
+	}
+}
+
 /// `Nullable` overload: assigns the unwrapped value into `val` (leaving it
 /// untouched — preserving any pre-set default — on a missing/mismatched field),
 /// so a struct's `Nullable!T` field can be filled directly without a temporary.

@@ -5,7 +5,8 @@ import vibe.data.json : Json, parseJsonString, deserializeJson, serializeToJson;
 import mcp.protocol.capabilities;
 import mcp.protocol.errors : ErrorCode, McpException, invalidParams, isValidElicitationUrl;
 import mcp.protocol.versions : ProtocolVersion, toWire;
-import mcp.protocol.jsonhelpers : getOr, tryGet, tryGetWhole, requireObject, tryNumber;
+import mcp.protocol.jsonhelpers : getOr, tryGet, tryGetWhole, requireObject,
+	requiredString, tryNumber;
 import mcp.protocol.tasks : Task, makeCreateTaskResult, isCreateTaskResult;
 import mcp.protocol.mrtr : InputRequest, emitInputRequired, parseInputRequired;
 import mcp.protocol.modern : CacheHint, parseCacheHint, withCache;
@@ -1784,11 +1785,15 @@ struct InitializeParams
 		return j;
 	}
 
+	/// Throws -32602 when the required `protocolVersion` is absent or not a
+	/// string, or a present `capabilities`/`clientInfo` is malformed. An absent
+	/// `capabilities` or `clientInfo` parses as the empty default so a peer that
+	/// leaves them out can still connect.
 	static InitializeParams fromJson(Json j) @safe
 	{
 		InitializeParams p;
 		p.parseMetaField(j);
-		p.protocolVersion = j.getOr("protocolVersion", "");
+		p.protocolVersion = requiredString(j, "protocolVersion", "InitializeParams");
 		if ("capabilities" in j)
 			p.capabilities = ClientCapabilities.fromJson(j["capabilities"]);
 		if ("clientInfo" in j)
@@ -1818,11 +1823,15 @@ struct InitializeResult
 		return j;
 	}
 
+	/// Throws -32602 when the required `protocolVersion` is absent or not a
+	/// string, or a present `capabilities`/`serverInfo` is malformed. An absent
+	/// `capabilities` or `serverInfo` parses as the empty default so a peer that
+	/// leaves them out can still connect.
 	static InitializeResult fromJson(Json j) @safe
 	{
 		InitializeResult r;
 		r.parseMetaField(j);
-		r.protocolVersion = j.getOr("protocolVersion", "");
+		r.protocolVersion = requiredString(j, "protocolVersion", "InitializeResult");
 		if ("capabilities" in j)
 			r.capabilities = ServerCapabilities.fromJson(j["capabilities"]);
 		if ("serverInfo" in j)
@@ -6818,6 +6827,19 @@ unittest  // initialize with a non-object capabilities value is rejected with -3
 	auto ex = cast(McpException) collectException(InitializeParams.fromJson(
 			`{"protocolVersion":"2025-11-25","capabilities":5}`.parseJsonString));
 	assert(ex !is null && ex.code == ErrorCode.invalidParams);
+}
+
+unittest  // InitializeParams and InitializeResult reject a missing or non-string protocolVersion with -32602
+{
+	import std.exception : collectException;
+
+	foreach (b; [`{}`, `{"protocolVersion":20251125}`])
+	{
+		auto p = cast(McpException) collectException(InitializeParams.fromJson(b.parseJsonString));
+		assert(p !is null && p.code == ErrorCode.invalidParams, b);
+		auto r = cast(McpException) collectException(InitializeResult.fromJson(b.parseJsonString));
+		assert(r !is null && r.code == ErrorCode.invalidParams, b);
+	}
 }
 
 unittest  // every object-shaped fromJson rejects a non-object value with -32602

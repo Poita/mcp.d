@@ -3,7 +3,7 @@ module mcp.protocol.capabilities;
 import std.typecons : Nullable, nullable;
 import vibe.data.json : Json;
 import mcp.protocol.versions : ProtocolVersion;
-import mcp.protocol.jsonhelpers : getOr, tryGet, stringOrThrow, requireObject;
+import mcp.protocol.jsonhelpers : getOr, tryGet, stringOrThrow, requiredString, requireObject;
 
 @safe:
 
@@ -216,12 +216,14 @@ struct Implementation
 		return j;
 	}
 
+	/// Throws -32602 when `j` is not an object or its required `name` or
+	/// `version` is absent or not a string.
 	static Implementation fromJson(Json j) @safe
 	{
 		requireObject(j, "Implementation");
 		Implementation impl;
-		impl.name = j.getOr("name", "");
-		impl.version_ = j.getOr("version", "");
+		impl.name = requiredString(j, "name", "Implementation");
+		impl.version_ = requiredString(j, "version", "Implementation");
 		tryGet(j, "title", impl.title);
 		tryGet(j, "description", impl.description);
 		tryGet(j, "websiteUrl", impl.websiteUrl);
@@ -1264,6 +1266,22 @@ unittest  // Implementation round-trips description/websiteUrl/icons from a peer
 	assert(impl.websiteUrl.get == "https://client.example");
 	assert(impl.icons.length == 1);
 	assert(impl.icons[0].src == "https://client.example/logo.svg");
+}
+
+unittest  // Implementation.fromJson rejects a missing or non-string name or version with -32602
+{
+	import mcp.protocol.errors : McpException, ErrorCode;
+	import std.exception : collectException;
+	import vibe.data.json : parseJsonString;
+
+	foreach (b; [
+		`{"version":"1"}`, `{"name":"x"}`, `{"name":5,"version":"1"}`,
+		`{"name":"x","version":1}`
+	])
+	{
+		auto ex = collectException!McpException(Implementation.fromJson(parseJsonString(b)));
+		assert(ex !is null && ex.code == ErrorCode.invalidParams, b);
+	}
 }
 
 unittest  // ClientCapabilities.forVersion: 2025-03-26 emits a bare sampling and no elicitation
