@@ -61,8 +61,10 @@ struct EventResult
 
 /// One typed event in a fetch batch: the strongly-typed `payload`, plus an
 /// optional `cursor` (this event's position — falls back to the batch cursor),
-/// `eventId` (for dedup; when empty, derived from the event's position and payload,
-/// so a re-fetch of the same batch yields the same id), and `timestamp` (ISO-8601;
+/// `eventId` (the id receivers recognise a redelivery by; when empty, derived
+/// from the event's position and payload, so a re-fetch of the same batch yields
+/// the same id; the server itself collapses a repeat only while a webhook
+/// delivery with that id is still queued), and `timestamp` (ISO-8601;
 /// stamped to now when empty).
 struct Event(P)
 {

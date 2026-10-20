@@ -628,7 +628,7 @@ final class InMemoryWebhookSubscriptionStore : WebhookSubscriptionStore
 /// node's leased-but-unacked jobs are re-leased by another.
 struct Delivery
 {
-	string jobId; /// unique (subscription id + incarnation + event id)
+	string jobId; /// unique (subscription id + incarnation + event id, or gap position)
 	string subscriptionId;
 	EventOccurrence occ; /// the event to deliver (carries its watermark cursor)
 	int attempt; /// attempts already made

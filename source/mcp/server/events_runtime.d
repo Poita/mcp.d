@@ -116,8 +116,10 @@ final class EventHandle(A, P)
 		rt_.emit(occ);
 	}
 
-	/// Publish a typed payload carrying an upstream identity: `eventId` (used for
-	/// dedup) and the occurrence `timestamp`. Use when re-publishing an event that
+	/// Publish a typed payload carrying an upstream identity: `eventId` (the id
+	/// receivers recognise a redelivery by; the server itself collapses a repeat
+	/// only while a webhook delivery with that id is still queued) and the
+	/// occurrence `timestamp`. Use when re-publishing an event that
 	/// already has its own id/time — a bridge from Slack/GitHub/an SSE feed — where
 	/// the no-arg `publish` would otherwise mint a fresh id and stamp the current
 	/// time. An empty `timestamp` is filled with the current time by the runtime.
@@ -2307,7 +2309,7 @@ final class EventsRuntime
 			noteMissed(sub.id, shaped.cursor);
 			return false;
 		}
-		auto job = Delivery(jobPrefix(sub) ~ shaped.eventId, sub.id, shaped, 0);
+		auto job = Delivery(eventJobId(sub, shaped.eventId), sub.id, shaped, 0);
 		job.incarnation = sub.incarnation;
 		return enqueueTracked(job);
 	}
@@ -2317,6 +2319,20 @@ final class EventsRuntime
 	private static string jobPrefix(const WebhookSubscription sub) @safe pure
 	{
 		return sub.id ~ "/" ~ sub.incarnation ~ "/";
+	}
+
+	// The job id delivering event `eventId` to `sub`. Event and gap jobs live in
+	// separate namespaces (`e/`, `g/`), so no author-chosen event id can
+	// collide with a gap's job and be collapsed into it by the queue.
+	private static string eventJobId(const WebhookSubscription sub, string eventId) @safe pure
+	{
+		return jobPrefix(sub) ~ "e/" ~ eventId;
+	}
+
+	// The job id of `sub`'s gap envelope for position (or message id) `key`.
+	private static string gapJobId(const WebhookSubscription sub, string key) @safe pure
+	{
+		return jobPrefix(sub) ~ "g/" ~ key;
 	}
 
 	// Enqueue `job`, tracking it for the watermark and the pending bound first (a
@@ -3329,7 +3345,7 @@ final class EventsRuntime
 		occ.name = sub.name;
 		occ.cursor = cursor;
 		const key = cursor.isNull ? occ.eventId : cursor.get;
-		Delivery job = Delivery(jobPrefix(sub) ~ "gap/" ~ key, sub.id, occ, 0);
+		Delivery job = Delivery(gapJobId(sub, key), sub.id, occ, 0);
 		job.incarnation = sub.incarnation;
 		job.gap = true;
 		job.owed = owed;
@@ -9923,6 +9939,15 @@ unittest  // a subscription created concurrently on another node is adopted, not
 	auto stored = store.get(r.id).get;
 	assert(stored.incarnation == otherIncarnation);
 	assert(stored.revision > 0); // refreshed in place by the second subscribe
+}
+
+unittest  // an event whose id looks like a gap's never shares that gap's job id
+{
+	WebhookSubscription sub;
+	sub.id = "sub_1";
+	sub.incarnation = "inc";
+	assert(EventsRuntime.eventJobId(sub, "gap/c7") != EventsRuntime.gapJobId(sub, "c7"));
+	assert(EventsRuntime.eventJobId(sub, "e1") != EventsRuntime.eventJobId(sub, "e2"));
 }
 
 unittest  // forgetting a subscription examines only its own tracked jobs
