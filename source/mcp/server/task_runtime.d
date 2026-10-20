@@ -811,14 +811,19 @@ final class TaskRuntime
 	}
 
 	/// Request cancellation. Always records the cooperative `cancelRequested`
-	/// flag. A task with no executor running to honor it — a manual task
-	/// (`toolName` empty), one suspended in `input_required`, one the executor
-	/// detached, or one whose dispatch claim has lapsed past
+	/// flag. Whether an executor is running to honor it is read from the
+	/// task's dispatch claim (`claimDispatch`): a task no dispatch holds — a
+	/// manual task, an executor-backed one whose dispatch has not started (or
+	/// that no dispatcher drives, as with `createFor` on a runtime without
+	/// `McpServer.enableTasks`), one suspended in `input_required`, one the
+	/// executor detached, or one whose claim has lapsed past
 	/// `TaskOptions.dispatchLease` (its worker is taken to have crashed) —
-	/// transitions to `cancelled` immediately; for a running executor the status
-	/// is left untouched so it can observe the flag and stop at a safe point, and
-	/// a repeated request for it stores nothing. Once requested, the cancel wins:
-	/// a later `complete` or `fail` records the task `cancelled`.
+	/// transitions to `cancelled` immediately; a dispatch that starts later
+	/// finds it settled and never runs the executor. For a running executor
+	/// the status is left untouched so it can observe the flag and stop at a
+	/// safe point, and a repeated request for it stores nothing. Once
+	/// requested, the cancel wins: a later `complete` or `fail` records the
+	/// task `cancelled`.
 	void cancel(string id) @safe
 	{
 		modify(id, (ref TaskRecord r) @safe {
@@ -826,9 +831,8 @@ final class TaskRuntime
 				return Change.none;
 			const alreadyRequested = r.cancelRequested;
 			r.cancelRequested = true;
-			const claimLapsed = r.dispatchClaimedAt.length && !holdsLiveClaim(r, currentTime());
-			if (r.toolName.length == 0 || r.detached
-				|| r.meta.status == TaskStatus.inputRequired || claimLapsed)
+			// Detaching and suspending release the claim, so neither holds one.
+			if (!holdsLiveClaim(r, currentTime()))
 			{
 				transition(r, TaskStatus.cancelled);
 				r.inputRequests = Json.emptyObject;
@@ -1222,15 +1226,24 @@ unittest  // a manual (executor-less) task cancels immediately
 	assert(rt.getDetailed(t.taskId)["status"].get!string == "cancelled");
 }
 
-unittest  // an executor-backed task cancels cooperatively (flag set, status unchanged)
+unittest  // a task whose executor is running cancels cooperatively (flag set, status unchanged)
 {
 	auto rt = new TaskRuntime(TaskOptions.init);
 	auto t = rt.createFor("slow", Json.undefined);
+	assert(rt.claimDispatch(t.taskId));
 	rt.cancel(t.taskId);
 	assert(rt.cancelRequested(t.taskId));
 	// Status stays working until the executor honors the request.
 	assert(rt.getDetailed(t.taskId)["status"].get!string == "working");
 	rt.markCancelled(t.taskId);
+	assert(rt.getDetailed(t.taskId)["status"].get!string == "cancelled");
+}
+
+unittest  // cancelling an executor-backed task no dispatch has claimed settles it at once
+{
+	auto rt = new TaskRuntime(TaskOptions.init);
+	auto t = rt.createFor("slow", Json.undefined);
+	rt.cancel(t.taskId);
 	assert(rt.getDetailed(t.taskId)["status"].get!string == "cancelled");
 }
 
@@ -1500,6 +1513,7 @@ unittest  // cancelling a running executor's task records the request without a 
 	int notified;
 	rt.onStatusChange((Json detailed, string owner) @safe { notified++; });
 	auto t = rt.createFor("tool", Json.emptyObject);
+	assert(rt.claimDispatch(t.taskId));
 	now = "2026-06-07T10:00:01Z";
 	rt.cancel(t.taskId);
 	assert(rt.cancelRequested(t.taskId));
@@ -1739,6 +1753,7 @@ unittest  // a task whose cancel never settled is cancelled, not failed, at maxU
 	o.maxUnsettledIdle = 1.hours;
 	auto rt = new TaskRuntime(o);
 	auto t = rt.createFor("slow", Json.undefined);
+	assert(rt.claimDispatch(t.taskId));
 	rt.cancel(t.taskId);
 	assert(rt.getDetailed(t.taskId)["status"].get!string == "working");
 	now = "2026-06-07T11:00:00Z";
@@ -2257,6 +2272,7 @@ unittest  // a repeated cancel of a running executor's task writes nothing
 	o.store = store;
 	auto rt = new TaskRuntime(o);
 	auto t = rt.createFor("tool", Json.emptyObject);
+	assert(rt.claimDispatch(t.taskId));
 	rt.cancel(t.taskId);
 	const rev = store.get(t.taskId).get.revision;
 	rt.cancel(t.taskId);
