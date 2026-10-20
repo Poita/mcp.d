@@ -203,8 +203,8 @@ McpException resourceNotFound(string uri, ProtocolVersion v, Json data = Json.un
 /// absolute URI: the scheme is followed by `:` and a hierarchical `//authority`
 /// with a non-empty host and no userinfo. Relative references, bare strings
 /// such as `"not a url"`, `scheme:`-only values, userinfo (`user@host`),
-/// whitespace, control characters, a backslash and an unbalanced IPv6 bracket
-/// are rejected. Validation is
+/// whitespace, control characters, a backslash, an unbalanced IPv6 bracket and
+/// a port that is not a number from 0 to 65535 are rejected. Validation is
 /// permissive about the path/query/fragment so any real `https://…` consent or
 /// OAuth URL passes.
 bool isValidElicitationUrl(string url) @safe pure nothrow @nogc
@@ -271,7 +271,7 @@ bool isValidElicitationUrl(string url) @safe pure nothrow @nogc
 		if (close < 2 || indexOf(authority[close + 1 .. $], ']') >= 0)
 			return false;
 		const rest = authority[close + 1 .. $];
-		return rest.length == 0 || rest[0] == ':';
+		return rest.length == 0 || (rest[0] == ':' && isValidPort(rest[1 .. $]));
 	}
 	if (indexOf(authority, '[') >= 0 || indexOf(authority, ']') >= 0)
 		return false;
@@ -279,8 +279,30 @@ bool isValidElicitationUrl(string url) @safe pure nothrow @nogc
 	// A URL such as "https://:8080/" has authority ":8080" with an empty host.
 	const colon = indexOf(authority, ':');
 	if (colon >= 0)
+	{
+		if (!isValidPort(authority[colon + 1 .. $]))
+			return false;
 		authority = authority[0 .. colon];
+	}
 	return authority.length > 0;
+}
+
+/// Whether `port` is a URL port: empty (RFC 3986 allows `host:` for the
+/// scheme's default) or decimal digits with a value from 0 to 65535.
+private bool isValidPort(scope const(char)[] port) @safe pure nothrow @nogc
+{
+	import std.ascii : isDigit;
+
+	uint value;
+	foreach (c; port)
+	{
+		if (!isDigit(c))
+			return false;
+		value = value * 10 + (c - '0');
+		if (value > 65_535)
+			return false;
+	}
+	return true;
 }
 
 /// A single URL-mode elicitation entry carried by a `-32042`
@@ -588,6 +610,27 @@ unittest  // isValidElicitationUrl rejects empty host when port is present
 	assert(!isValidElicitationUrl("https://:8080/"));
 	assert(!isValidElicitationUrl("http://:443"));
 	assert(!isValidElicitationUrl("https://:"));
+}
+
+unittest  // isValidElicitationUrl rejects a port that is not a number from 0 to 65535
+{
+	assert(!isValidElicitationUrl("https://host:abc/"));
+	assert(!isValidElicitationUrl("https://host:80a/"));
+	assert(!isValidElicitationUrl("https://host:-1/"));
+	assert(!isValidElicitationUrl("https://host:65536/"));
+	assert(!isValidElicitationUrl("https://host:1:2/"));
+	assert(!isValidElicitationUrl("https://[::1]:x/"));
+	assert(!isValidElicitationUrl("https://[::1]:99999"));
+}
+
+unittest  // isValidElicitationUrl accepts a numeric or empty port
+{
+	assert(isValidElicitationUrl("https://host:0/"));
+	assert(isValidElicitationUrl("https://host:8443/consent"));
+	assert(isValidElicitationUrl("https://host:65535"));
+	assert(isValidElicitationUrl("https://host:/"));
+	assert(isValidElicitationUrl("https://[::1]:8080/"));
+	assert(isValidElicitationUrl("https://[::1]/"));
 }
 
 unittest  // isValidElicitationUrl still accepts http/https (case-insensitive scheme)
