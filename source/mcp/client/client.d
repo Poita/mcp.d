@@ -734,7 +734,7 @@ final class McpClient : ClientProtocol
 	// Set by `close()`; a closed client opens no new streams or subscriptions.
 	private bool closed_;
 	// Set once `close()` has torn down its subscriptions and streams: from then
-	// on no request or notification is sent.
+	// on not even teardown traffic is sent.
 	private bool released_;
 	// The open listen streams and managed event subscriptions `close()` cancels.
 	private bool[SubscriptionStream] liveStreams_;
@@ -1020,6 +1020,10 @@ final class McpClient : ClientProtocol
 	/// an `McpException` ("the client is closed") without being sent.
 	void close() @safe
 	{
+		const self = currentFiberKey();
+		teardownFibers_[self] = true;
+		scope (exit)
+			teardownFibers_.remove(self);
 		closed_ = true;
 		foreach (wake; pollWakes_)
 			wake.emit();
@@ -1044,6 +1048,9 @@ final class McpClient : ClientProtocol
 	// Server-side teardown requests still running, and the event each emits
 	// when it finishes.
 	private uint teardownsInFlight_;
+	// The tasks running `close()` or a teardown task, which may still send
+	// while the client is closed but its transport not yet released.
+	private bool[void* ] teardownFibers_;
 	private LocalManualEvent teardownDone_;
 	private bool teardownDoneInit_;
 
@@ -1066,8 +1073,11 @@ final class McpClient : ClientProtocol
 			scope (failure)
 				teardownsInFlight_--;
 			runTask(() nothrow{
+				const self = currentFiberKey();
+				teardownFibers_[self] = true;
 				scope (exit)
 				{
+					teardownFibers_.remove(self);
 					teardownsInFlight_--;
 					teardownDone_.emit();
 				}
@@ -1139,11 +1149,13 @@ final class McpClient : ClientProtocol
 			throw new TransportClosedException("the client is closed");
 	}
 
-	/// Throw when `close()` has released the transport, so a request or
-	/// notification fails clearly instead of reaching a closed transport.
+	/// Throw when the client is closed, so a request or notification fails
+	/// clearly without being sent. Until the transport is released the tasks
+	/// doing `close()`'s own teardown (unsubscribing, cancelling streams) are
+	/// still let through.
 	private void ensureNotReleased() @safe
 	{
-		if (released_)
+		if (released_ || (closed_ && (currentFiberKey() in teardownFibers_) is null))
 			throw new TransportClosedException("the client is closed");
 	}
 
@@ -10528,6 +10540,48 @@ unittest  // a request on a closed client is refused without reaching the transp
 	catch (McpException e)
 		msg = e.msg;
 	assert(sent == 0, "a closed client must not send requests");
+	assert(msg == "the client is closed", "unexpected error: " ~ msg);
+}
+
+unittest  // during close()'s teardown grace new requests are refused while teardown traffic still flows
+{
+	import core.time : msecs;
+	import vibe.core.core : runTask, sleep;
+
+	auto c = McpClient.http("http://localhost");
+	string[] sent;
+	c.onRpcForTest = (string method, Json params) @safe {
+		sent ~= method;
+		return Json(["tools": Json.emptyArray]);
+	};
+	bool teardownSent;
+	c.runTeardownTask(() @safe {
+		sleep(50.msecs);
+		c.rpc("events/unsubscribe", Json.emptyObject);
+		teardownSent = true;
+		sleep(100.msecs);
+	});
+	auto closer = runTask(() nothrow{
+		try
+			c.close();
+		catch (Exception)
+		{
+		}
+	});
+	string msg;
+	auto user = runTask(() nothrow{
+		try
+		{
+			sleep(20.msecs);
+			c.listTools();
+		}
+		catch (Exception e)
+			msg = e.msg;
+	});
+	user.join();
+	closer.join();
+	assert(teardownSent, "teardown requests must still be sent while close() waits");
+	assert(sent == ["events/unsubscribe"], "a request made after close() began was sent");
 	assert(msg == "the client is closed", "unexpected error: " ~ msg);
 }
 
