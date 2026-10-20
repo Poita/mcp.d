@@ -999,20 +999,14 @@ unittest  // re-requesting an input key discards its earlier answer, so only a f
 	};
 	runTaskExecutor(rt, t.taskId, exec);
 	rt.deliverInput(t.taskId, Json([
-			"x": Json([
-				"action": Json("accept"),
-				"content": Json(["x": Json(-1)])
-			])
+		"x": Json(["action": Json("accept"), "content": Json(["x": Json(-1)])])
 	]));
 	rt.resumeWorking(t.taskId);
 	runTaskExecutor(rt, t.taskId, exec);
 	assert(rt.getDetailed(t.taskId)["status"].get!string == "input_required");
 	assert(("x" in rt.takenInput(t.taskId)) is null, "the stale answer was discarded");
 	rt.deliverInput(t.taskId, Json([
-			"x": Json([
-				"action": Json("accept"),
-				"content": Json(["x": Json(5)])
-			])
+		"x": Json(["action": Json("accept"), "content": Json(["x": Json(5)])])
 	]));
 	rt.resumeWorking(t.taskId);
 	runTaskExecutor(rt, t.taskId, exec);
