@@ -13,7 +13,7 @@
 /// Run: `bench-server --port 8550 --host 127.0.0.1 --threads 4`
 module bench_server;
 
-import std.getopt : getopt;
+import std.getopt : defaultGetoptPrinter, getopt;
 
 import vibe.core.core : runEventLoop, lowerPrivileges;
 import vibe.http.router : URLRouter;
@@ -37,10 +37,14 @@ void main(string[] args) @safe
 	ushort port = 8550;
 	string host = "127.0.0.1";
 	int threads = 1;
-	(() @trusted {
-		getopt(args, "port|p", "Listen port.", &port, "host|h", "Bind host.", &host,
-			"threads|t", "Event-loop threads sharing the port via SO_REUSEPORT.", &threads);
-	})();
+	auto parsed = (() @trusted => getopt(args, "port|p", "Listen port.", &port,
+			"host", "Bind host.", &host,
+			"threads|t", "Event-loop threads sharing the port via SO_REUSEPORT.", &threads))();
+	if (parsed.helpWanted)
+	{
+		(() @trusted => defaultGetoptPrinter("Usage: " ~ args[0] ~ " [options]", parsed.options))();
+		return;
+	}
 	if (threads < 1)
 		threads = 1;
 

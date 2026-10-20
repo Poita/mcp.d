@@ -108,7 +108,8 @@ void main(string[] args)
 	StreamableHttpOptions opts;
 	ushort port;
 	string host;
-	parseHttpServerArgs(args, 8742, opts, port, host);
+	if (!parseHttpServerArgs(args, 8742, opts, port, host))
+		return;
 
 	// Derive the resource identifier (RFC 8707 audience / RFC 9728 PRM `resource`)
 	// from the ACTUAL bind host/port so the listening socket and the

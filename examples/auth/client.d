@@ -58,7 +58,7 @@ module auth_example_client;
 import std.algorithm : canFind;
 import std.conv : to;
 import std.datetime.systime : Clock;
-import std.getopt : getopt;
+import std.getopt : defaultGetoptPrinter, getopt;
 import std.string : indexOf;
 
 import vibe.http.client : requestHTTP, HTTPClientRequest, HTTPClientResponse;
@@ -90,12 +90,15 @@ int main(string[] args) @safe
 	ushort port = 8742;
 	string host = "127.0.0.1";
 	string url;
-	(() @trusted {
-		getopt(args, "url|u",
+	auto parsed = (() @trusted => getopt(args, "url|u",
 			"Server MCP endpoint (default http://127.0.0.1:8742/mcp)", &url, "port|p",
 			"Port (used to build the default URL)",
-			&port, "host|h", "Host (used to build the default URL)", &host);
-	})();
+			&port, "host", "Host (used to build the default URL)", &host))();
+	if (parsed.helpWanted)
+	{
+		(() @trusted => defaultGetoptPrinter("Usage: " ~ args[0] ~ " [options]", parsed.options))();
+		return 0;
+	}
 
 	if (url.length)
 	{

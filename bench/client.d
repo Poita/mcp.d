@@ -19,7 +19,7 @@ module bench_client;
 
 import core.time : MonoTime, Duration;
 
-import std.getopt : getopt;
+import std.getopt : defaultGetoptPrinter, getopt;
 import std.stdio : writefln, writeln;
 
 import vibe.core.core : runTask, runEventLoop, exitEventLoop, Task;
@@ -33,12 +33,15 @@ void main(string[] args) @safe
 	long calls = 20_000;
 	int concurrency = 1;
 	long warmup = 200;
-	(() @trusted {
-		getopt(args, "url|u", "Server endpoint URL.", &url, "calls|n",
-			"Total timed tool calls.", &calls, "concurrency|c",
-			"Parallel client connections.",
-			&concurrency, "warmup|w", "Warmup calls per client.", &warmup);
-	})();
+	auto parsed = (() @trusted => getopt(args, "url|u", "Server endpoint URL.",
+			&url, "calls|n", "Total timed tool calls.",
+			&calls, "concurrency|c", "Parallel client connections.",
+			&concurrency, "warmup|w", "Warmup calls per client.", &warmup))();
+	if (parsed.helpWanted)
+	{
+		(() @trusted => defaultGetoptPrinter("Usage: " ~ args[0] ~ " [options]", parsed.options))();
+		return;
+	}
 
 	if (concurrency < 1)
 		concurrency = 1;

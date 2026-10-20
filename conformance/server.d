@@ -12,7 +12,7 @@
  */
 module conformance_server;
 
-import std.getopt : getopt;
+import std.getopt : defaultGetoptPrinter, getopt;
 import std.stdio : writefln, stderr;
 import std.typecons : nullable;
 
@@ -30,10 +30,15 @@ void main(string[] args)
 	ushort port = 3000;
 	string host = "127.0.0.1";
 	bool stateless;
-	getopt(args, "port|p", "Port to listen on (default 3000)", &port,
-			"host|h", "Address to bind (default 127.0.0.1)", &host, "stateless",
+	auto parsed = getopt(args, "port|p", "Port to listen on (default 3000)",
+			&port, "host", "Address to bind (default 127.0.0.1)", &host, "stateless",
 			"Serve the modern (2026-07-28) stateless lifecycle instead of the "
 			~ "stateful initialize handshake the dated revisions use", &stateless);
+	if (parsed.helpWanted)
+	{
+		defaultGetoptPrinter("Usage: " ~ args[0] ~ " [options]", parsed.options);
+		return;
+	}
 
 	// Two lanes, matching the harness's per-revision requirement sets. The dated
 	// revisions through 2025-11-25 are a correlated multi-call client that

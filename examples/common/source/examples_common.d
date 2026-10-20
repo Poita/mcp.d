@@ -19,6 +19,7 @@ module examples_common;
 import mcp.client.client : McpClient;
 import mcp.server.server : McpServer;
 import mcp.transport.streamable_http : StreamableHttpOptions;
+import std.getopt : GetoptResult;
 
 /// Shared structured result of the auth example's `whoami` tool. Defined
 /// once here so the server (which infers `whoami`'s output schema +
@@ -92,24 +93,38 @@ int runClient(scope int delegate() @safe scenario) @trusted
 	}
 }
 
+/// Print the usage of a parsed command line that asked for `--help` / `-h`,
+/// returning whether it did.
+private bool showHelp(GetoptResult result, string summary) @trusted
+{
+	import std.getopt : defaultGetoptPrinter;
+
+	if (!result.helpWanted)
+		return false;
+	defaultGetoptPrinter(summary, result.options);
+	return true;
+}
+
 /// Build the example client's transport from command-line `args`. If a
 /// `--http <url>` (alias `--url <url>`) option is supplied, connect over
 /// Streamable HTTP via `McpClient.http(url)`; otherwise spawn the sibling server
 /// binary named `siblingServerName` (resolved next to this executable) over
 /// stdio via `McpClient.spawnSibling`. The returned client is NOT yet
-/// connected — call `connect()`.
+/// connected — call `connect()`. `--help` prints the usage and exits.
 McpClient connectFromArgs(string[] args, string siblingServerName) @safe
 {
+	import core.stdc.stdlib : exit;
 	import std.getopt : getopt;
 
 	string httpUrl;
 	// `getopt` takes the address of the stack locals, which the compiler infers
 	// `@system`; the wired-up parse is otherwise pure argv handling, so confine
 	// it to a `@trusted` shim to keep this function `@safe`.
-	(() @trusted {
-		getopt(args, "http", "Connect to a running Streamable HTTP server at <url>.",
-			&httpUrl, "url", "Alias for --http: Streamable HTTP server <url>.", &httpUrl);
-	})();
+	auto parsed = (() @trusted => getopt(args, "http",
+			"Connect to a running Streamable HTTP server at <url>.",
+			&httpUrl, "url", "Alias for --http: Streamable HTTP server <url>.", &httpUrl))();
+	if (showHelp(parsed, "Usage: " ~ args[0] ~ " [--http <url>]"))
+		(() @trusted => exit(0))();
 
 	if (httpUrl.length)
 		return McpClient.http(httpUrl);
@@ -120,7 +135,8 @@ McpClient connectFromArgs(string[] args, string siblingServerName) @safe
 /// If `--http` (a bool flag) is present, serve Streamable HTTP via
 /// `runStreamableHttp` on `--port` (default `defaultPort`) and `--host`
 /// (default `defaultHost`); otherwise serve stdio via `runStdio(server)`.
-/// Blocks until the chosen transport exits.
+/// Blocks until the chosen transport exits. `--help` prints the usage and
+/// returns without serving.
 void runServerFromArgs(McpServer server, string[] args, ushort defaultPort,
 		string defaultHost = "127.0.0.1") @safe
 {
@@ -133,10 +149,11 @@ void runServerFromArgs(McpServer server, string[] args, ushort defaultPort,
 	string host = defaultHost;
 	// See `connectFromArgs`: `getopt`'s `&local` arguments force `@system`, so
 	// the parse lives in a `@trusted` shim.
-	(() @trusted {
-		getopt(args, "http", "Serve over Streamable HTTP instead of stdio.", &http, "port",
-			"Streamable HTTP listen port.", &port, "host", "Streamable HTTP bind host.", &host);
-	})();
+	auto parsed = (() @trusted => getopt(args, "http",
+			"Serve over Streamable HTTP instead of stdio.", &http, "port",
+			"Streamable HTTP listen port.", &port, "host", "Streamable HTTP bind host.", &host))();
+	if (showHelp(parsed, "Usage: " ~ args[0] ~ " [--http [--port <port>] [--host <host>]]"))
+		return;
 
 	if (http)
 	{
@@ -157,8 +174,9 @@ void runServerFromArgs(McpServer server, string[] args, ushort defaultPort,
 /// `runHttpServerFromArgs` so it can be unit tested and so a caller that needs the
 /// resolved host/port -- e.g. the auth example deriving its RFC 8707 resource
 /// audience from the actual socket -- can reuse the exact parse the bind will use.
-/// `opts` is taken by `ref` and updated in place.
-void parseHttpServerArgs(string[] args, ushort defaultPort, ref StreamableHttpOptions opts,
+/// `opts` is taken by `ref` and updated in place. Returns false, after
+/// printing the usage, when `args` ask for `--help` / `-h`.
+bool parseHttpServerArgs(string[] args, ushort defaultPort, ref StreamableHttpOptions opts,
 		out ushort port, out string host, string defaultHost = "127.0.0.1") @safe
 {
 	import std.getopt : getopt;
@@ -167,16 +185,17 @@ void parseHttpServerArgs(string[] args, ushort defaultPort, ref StreamableHttpOp
 	host = defaultHost;
 	// See `connectFromArgs`: `getopt`'s `&local` arguments force `@system`, so the
 	// parse lives in a `@trusted` shim.
-	(() @trusted {
-		getopt(args, "port|p", "Streamable HTTP listen port.", &port,
-			"host|h", "Streamable HTTP bind host.", &host);
-	})();
+	auto parsed = (() @trusted => getopt(args, "port|p", "Streamable HTTP listen port.",
+			&port, "host", "Streamable HTTP bind host.", &host))();
+	if (showHelp(parsed, "Usage: " ~ args[0] ~ " [--port <port>] [--host <host>]"))
+		return false;
 	opts.port = port;
 
 	// Honour `--host` unless the caller pinned a non-default bind set: a default or
 	// empty `bindAddresses` is replaced by the parsed host so the flag takes effect.
 	if (opts.bindAddresses.length == 0 || opts.bindAddresses == ["127.0.0.1"])
 		opts.bindAddresses = [host];
+	return true;
 }
 
 /// Run the example `server` over Streamable HTTP ONLY, with the caller-supplied
@@ -187,15 +206,16 @@ void parseHttpServerArgs(string[] args, ushort defaultPort, ref StreamableHttpOp
 /// host drive `opts.bindAddresses`, writes the resolved bind host/port back
 /// through `port`/`host` (so the caller can derive its RFC 8707 resource audience
 /// from the actual socket), then calls `runStreamableHttp(server, opts)`.
-/// Blocks until the transport exits.
+/// Blocks until the transport exits. `--help` prints the usage and returns
+/// without serving.
 void runHttpServerFromArgs(McpServer server, string[] args, ushort defaultPort,
 		ref StreamableHttpOptions opts, out ushort port, out string host,
 		string defaultHost = "127.0.0.1") @safe
 {
 	import mcp.transport.streamable_http : runStreamableHttp;
 
-	parseHttpServerArgs(args, defaultPort, opts, port, host, defaultHost);
-	runStreamableHttp(server, opts);
+	if (parseHttpServerArgs(args, defaultPort, opts, port, host, defaultHost))
+		runStreamableHttp(server, opts);
 }
 
 @safe unittest
@@ -213,7 +233,7 @@ void runHttpServerFromArgs(McpServer server, string[] args, ushort defaultPort,
 
 @safe unittest
 {
-	// --port/--host (and their -p/-h aliases) are parsed and the host drives the
+	// --port/--host are parsed and the host drives the
 	// bind, replacing the SDK-default bindAddresses.
 	StreamableHttpOptions opts;
 	ushort port;
@@ -234,4 +254,16 @@ void runHttpServerFromArgs(McpServer server, string[] args, ushort defaultPort,
 	parseHttpServerArgs(["prog", "--host", "127.0.0.1"], 8742, opts, port, host);
 	assert(host == "127.0.0.1");
 	assert(opts.bindAddresses == ["10.0.0.5"]);
+}
+
+@safe unittest
+{
+	// -h asks for help rather than taking a bind host, so no server is started.
+	StreamableHttpOptions opts;
+	ushort port;
+	string host;
+	assert(!parseHttpServerArgs(["prog", "-h"], 8742, opts, port, host));
+	assert(!parseHttpServerArgs(["prog", "--help"], 8742, opts, port, host));
+	assert(parseHttpServerArgs(["prog", "-p", "9001"], 8742, opts, port, host));
+	assert(port == 9001);
 }

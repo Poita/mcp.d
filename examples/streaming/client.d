@@ -55,7 +55,7 @@ import core.time : msecs;
 import std.algorithm : map, canFind;
 import std.array : array;
 import std.conv : to;
-import std.getopt : getopt;
+import std.getopt : defaultGetoptPrinter, getopt;
 
 import vibe.core.core : runTask, sleep;
 
@@ -98,10 +98,15 @@ int main(string[] args) @safe
 	// HTTP-only and needs to open its OWN modern-mode client to the same URL. The
 	// transport for phases A/C is chosen by the scaffold's `connectFromArgs`.
 	string httpUrl;
-	(() @trusted {
-		getopt(args, "http", "Connect over Streamable HTTP to this MCP endpoint.",
-			&httpUrl, "url", "Alias for --http.", &httpUrl);
-	})();
+	auto parsed = (() @trusted => getopt(args, "http",
+			"Connect over Streamable HTTP to this MCP endpoint.",
+			&httpUrl, "url", "Alias for --http.", &httpUrl))();
+	if (parsed.helpWanted)
+	{
+		(() @trusted => defaultGetoptPrinter("Usage: " ~ args[0] ~ " [--http <url>]",
+				parsed.options))();
+		return 0;
+	}
 	const bool useHttp = httpUrl.length != 0;
 
 	// `runClient` drives the vibe event loop so the same scenario body works over

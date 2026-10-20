@@ -53,10 +53,10 @@ For examples that serve over **HTTP only** (e.g. the auth example, which must
 never silently degrade to an unauthenticated stdio transport):
 
 - `parseHttpServerArgs(args, defaultPort, opts, port, host)` — parses
-  `--port`/`-p` and `--host`/`-h` from `args`, sets `opts.port`, updates
+  `--port`/`-p` and `--host` from `args`, sets `opts.port`, updates
   `opts.bindAddresses` from the parsed host unless the caller pinned a
   non-default set, and writes the resolved values back through `port`/`host`
-  out-params.
+  out-params. Returns false, after printing the usage, for `--help`/`-h`.
 - `runHttpServerFromArgs(server, args, defaultPort, opts, port, host)` — calls
   `parseHttpServerArgs` then `runStreamableHttp(server, opts)`.
 

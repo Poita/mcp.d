@@ -3,7 +3,7 @@
 /// `--http <url>`, then calls `greet` and checks the reply.
 module hello_client;
 
-import std.getopt : getopt;
+import std.getopt : defaultGetoptPrinter, getopt;
 import std.stdio : writeln;
 
 import mcp;
@@ -11,7 +11,13 @@ import mcp;
 int main(string[] args)
 {
 	string url;
-	getopt(args, "http", "Streamable HTTP endpoint, e.g. http://127.0.0.1:8540/mcp.", &url);
+	auto parsed = getopt(args, "http",
+			"Streamable HTTP endpoint, e.g. http://127.0.0.1:8540/mcp.", &url);
+	if (parsed.helpWanted)
+	{
+		defaultGetoptPrinter("Usage: " ~ args[0] ~ " [--http <url>]", parsed.options);
+		return 0;
+	}
 
 	const text = runWithEventLoop(() @safe {
 		auto client = url.length ? McpClient.http(url) : McpClient.spawnSibling("hello-server");
