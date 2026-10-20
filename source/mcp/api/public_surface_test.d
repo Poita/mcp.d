@@ -470,3 +470,20 @@ unittest
 			auto s = jsonSchemaOf!Page;
 		}));
 }
+
+// The README constructs `SkillDirOptions` and `@skillDir` with named arguments
+// (a trailing comma included); both build from `import mcp;` alone. The
+// expressions are mixed in from strings because dfmt cannot parse named
+// arguments.
+unittest
+{
+	import mcp;
+
+	auto opts = mixin(`SkillDirOptions(
+		path: "team/release-helper",
+	)`);
+	assert(opts.path == "team/release-helper");
+	assert(opts.publishNested);
+	auto uda = mixin(`skillDir(publishNested: false)`);
+	assert(uda.path.length == 0 && !uda.publishNested);
+}
