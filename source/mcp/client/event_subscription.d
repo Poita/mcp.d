@@ -70,14 +70,16 @@ final class EventSubscription
 	/// stream (deregistering its handlers), or unsubscribes the webhook and stops
 	/// its refresh loop — whichever the factory wired. Returns without waiting
 	/// for the server: a webhook's `events/unsubscribe` is sent on a task of its
-	/// own, after its receiver registration is already dropped.
+	/// own, after its receiver registration is already dropped. A subscription
+	/// the server already ended has released its resources and has nothing to
+	/// unsubscribe, so cancelling it runs no teardown.
 	void cancel() @safe
 	{
 		if (cancelled_)
 			return;
 		cancelled_ = true;
 		wakeSleepers();
-		if (teardown_ !is null)
+		if (!terminated_ && teardown_ !is null)
 			teardown_();
 	}
 
@@ -183,7 +185,8 @@ final class EventSubscription
 		return cancelled_;
 	}
 
-	/// Wire the idempotent teardown action invoked once on the first `cancel()`.
+	/// Wire the idempotent teardown action invoked once on the first `cancel()`
+	/// of a subscription the server has not ended.
 	package void onTeardown(void delegate() @safe nothrow t) @safe
 	{
 		teardown_ = t;
@@ -257,4 +260,17 @@ unittest  // a terminated control ends the subscription without a cancel
 	auto s = new EventSubscription();
 	s.markTerminated();
 	assert(!s.active);
+}
+
+unittest  // cancel after the server ended the subscription skips the teardown
+{
+	auto s = new EventSubscription();
+	int teardowns, ends;
+	s.onTeardown(() @safe nothrow{ teardowns++; });
+	s.onEnd(() @safe nothrow{ ends++; });
+	s.markTerminated();
+	s.cancel();
+	assert(ends == 1);
+	assert(teardowns == 0, "a terminated subscription has nothing left to unsubscribe");
+	assert(s.isCancelled());
 }

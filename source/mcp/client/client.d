@@ -3702,7 +3702,6 @@ final class McpClient : ClientProtocol
 			res = subscribeWebhookEvents(p);
 		}
 		const id = res.id;
-		applyWebhookGrant(sub, res, onControl);
 		// Bind deliveries to the subscription's watermark, dedup, and terminal
 		// state before the caller's handlers, as the poll and stream modes do.
 		rx.register(id, p.delivery.secret, (EventOccurrence o) @safe {
@@ -3750,6 +3749,16 @@ final class McpClient : ClientProtocol
 		{
 			sub.cancel();
 			throw new TransportClosedException("the client is closed");
+		}
+		// The grant reaches `onControl` only once the teardown is wired, so a
+		// throwing handler still unsubscribes rather than leaving the server
+		// subscription to lapse at its TTL.
+		try
+			applyWebhookGrant(sub, res, onControl);
+		catch (Exception e)
+		{
+			sub.cancel();
+			throw e;
 		}
 		trackSubscription(sub);
 		spawnEventTask(() @safe { runWebhookRefreshLoop(sub, p, res, onControl); });
@@ -12901,6 +12910,41 @@ unittest  // a truncated webhook subscribe result reaches onControl as a gap
 	assert(ctrls.length == 1 && ctrls[0].kind == EventControlKind.gap);
 	assert(ctrls[0].cursor.get == "w1");
 	sub.cancel();
+}
+
+unittest  // subscribeWebhook unsubscribes when onControl throws on the subscribe's gap
+{
+	import std.exception : collectException;
+	import vibe.core.core : exitEventLoop, runEventLoop, runTask;
+
+	auto c = new McpClient(new RecordingClientTransport());
+	c.enableModern();
+	int unsubs;
+	c.onRpcForTest = (string method, Json params) @safe {
+		if (method == "events/unsubscribe")
+		{
+			unsubs++;
+			return Json.emptyObject;
+		}
+		SubscribeResult r;
+		r.id = "sub_x";
+		r.cursor = "w1";
+		r.truncated = true;
+		return r.toJson();
+	};
+	auto rx = new WebhookReceiver();
+	SubscribeParams sp;
+	sp.name = "incident.created";
+	sp.delivery = WebhookDelivery("https://hook/x", managedTestWhsec);
+	auto thrown = collectException(c.subscribeWebhook(rx, sp, (EventOccurrence o) @safe {
+		}, (EventControl ctl) @safe { throw new Exception("handler failed"); }));
+	assert(thrown !is null && thrown.msg == "handler failed");
+	runTask(() nothrow{ exitEventLoop(); });
+	runEventLoop();
+	assert(unsubs == 1, "the server subscription must not be left to lapse");
+	string[string] known;
+	known["x-mcp-subscription-id"] = "sub_x";
+	assert(rx.processDelivery("{}", known).status == 503, "the receiver must be deregistered");
 }
 
 unittest  // a webhook refresh surfaces a gap and the server's deliveryStatus
