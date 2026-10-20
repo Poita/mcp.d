@@ -1022,7 +1022,7 @@ struct Tool
 	{
 		requireObject(j, "Tool");
 		Tool t;
-		t.name = j.getOr("name", "");
+		t.name = requiredString(j, "name", "Tool");
 		tryGet(j, "title", t.title);
 		tryGet(j, "description", t.description);
 		if ("inputSchema" in j)
@@ -3194,8 +3194,8 @@ struct Resource
 	{
 		requireObject(j, "Resource");
 		Resource r;
-		r.uri = j.getOr("uri", "");
-		r.name = j.getOr("name", "");
+		r.uri = requiredString(j, "uri", "Resource");
+		r.name = requiredString(j, "name", "Resource");
 		tryGet(j, "title", r.title);
 		tryGet(j, "description", r.description);
 		tryGet(j, "mimeType", r.mimeType);
@@ -3288,8 +3288,8 @@ struct ResourceTemplate
 	{
 		requireObject(j, "ResourceTemplate");
 		ResourceTemplate t;
-		t.uriTemplate = j.getOr("uriTemplate", "");
-		t.name = j.getOr("name", "");
+		t.uriTemplate = requiredString(j, "uriTemplate", "ResourceTemplate");
+		t.name = requiredString(j, "name", "ResourceTemplate");
 		tryGet(j, "title", t.title);
 		tryGet(j, "description", t.description);
 		tryGet(j, "mimeType", t.mimeType);
@@ -3379,7 +3379,7 @@ struct ResourceContents
 	{
 		requireObject(j, "ResourceContents");
 		ResourceContents c;
-		c.uri = j.getOr("uri", "");
+		c.uri = requiredString(j, "uri", "ResourceContents");
 		tryGet(j, "mimeType", c.mimeType);
 		if ("blob" in j && j["blob"].type == Json.Type.string)
 		{
@@ -3877,7 +3877,7 @@ struct Root
 	{
 		requireObject(j, "Root");
 		Root r;
-		r.uri = j.getOr("uri", "");
+		r.uri = requiredString(j, "uri", "Root");
 		tryGet(j, "name", r.name);
 		r.parseMetaField(j);
 		return r;
@@ -4984,7 +4984,7 @@ struct PromptArgument
 	{
 		requireObject(j, "PromptArgument");
 		PromptArgument a;
-		a.name = j.getOr("name", "");
+		a.name = requiredString(j, "name", "PromptArgument");
 		tryGet(j, "title", a.title);
 		tryGet(j, "description", a.description);
 		if ("required" in j && j["required"].type == Json.Type.bool_)
@@ -5089,7 +5089,7 @@ struct Prompt
 	{
 		requireObject(j, "Prompt");
 		Prompt p;
-		p.name = j.getOr("name", "");
+		p.name = requiredString(j, "name", "Prompt");
 		tryGet(j, "title", p.title);
 		tryGet(j, "description", p.description);
 		if ("arguments" in j && j["arguments"].type == Json.Type.array)
@@ -5299,7 +5299,9 @@ struct PromptMessage
 	{
 		requireObject(j, "PromptMessage");
 		PromptMessage m;
-		m.role = j.getOr("role", "");
+		m.role = requiredString(j, "role", "PromptMessage");
+		if (m.role != "user" && m.role != "assistant")
+			throw invalidParams(`a prompt message's 'role' must be "user" or "assistant"`);
 		if ("content" !in j)
 			throw invalidParams("a prompt message requires 'content'");
 		m.content = Content.fromJson(j["content"]);
@@ -6858,4 +6860,60 @@ unittest  // every object-shaped fromJson rejects a non-object value with -32602
 			assert(ex !is null && ex.code == ErrorCode.invalidParams, T.stringof);
 		}
 	}
+}
+
+version (unittest)
+{
+	/// Assert `T.fromJson` rejects every JSON body in `bodies` with -32602.
+	private void assertRejectsAll(T)(const string[] bodies...) @safe
+	{
+		import std.exception : collectException;
+
+		foreach (b; bodies)
+		{
+			auto ex = cast(McpException) collectException(T.fromJson(b.parseJsonString));
+			assert(ex !is null && ex.code == ErrorCode.invalidParams, T.stringof ~ " " ~ b);
+		}
+	}
+}
+
+unittest  // Tool.fromJson rejects a missing or non-string name with -32602
+{
+	assertRejectsAll!Tool(`{"inputSchema":{"type":"object"}}`,
+			`{"name":3,"inputSchema":{"type":"object"}}`);
+}
+
+unittest  // Resource.fromJson rejects a missing or non-string uri or name with -32602
+{
+	assertRejectsAll!Resource(`{"name":"a"}`, `{"uri":"file:///a"}`,
+			`{"uri":1,"name":"a"}`, `{"uri":"file:///a","name":null}`);
+}
+
+unittest  // ResourceTemplate.fromJson rejects a missing or non-string uriTemplate or name with -32602
+{
+	assertRejectsAll!ResourceTemplate(`{"name":"a"}`,
+			`{"uriTemplate":"file:///{p}"}`, `{"uriTemplate":true,"name":"a"}`);
+}
+
+unittest  // ResourceContents.fromJson rejects a missing or non-string uri with -32602
+{
+	assertRejectsAll!ResourceContents(`{"text":"x"}`, `{"uri":5,"text":"x"}`);
+}
+
+unittest  // Root.fromJson rejects a missing or non-string uri with -32602
+{
+	assertRejectsAll!Root(`{"name":"r"}`, `{"uri":[]}`);
+}
+
+unittest  // Prompt and PromptArgument reject a missing or non-string name with -32602
+{
+	assertRejectsAll!Prompt(`{}`, `{"name":1}`, `{"name":"p","arguments":[{"required":true}]}`);
+	assertRejectsAll!PromptArgument(`{}`, `{"name":false}`);
+}
+
+unittest  // PromptMessage.fromJson rejects a missing or unknown role with -32602
+{
+	assertRejectsAll!PromptMessage(`{"content":{"type":"text","text":"x"}}`,
+			`{"role":"system","content":{"type":"text","text":"x"}}`,
+			`{"role":2,"content":{"type":"text","text":"x"}}`);
 }
