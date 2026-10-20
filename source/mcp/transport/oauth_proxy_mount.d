@@ -1318,7 +1318,11 @@ void mountOAuthToken(URLRouter router, OAuthProxy proxy) @safe
 /// In both modes a 2xx upstream response that carries an OAuth `error` member
 /// (GitHub answers a bad code this way) or no `access_token` is answered as an
 /// RFC 6749 §5.2 error: 400 with the upstream `error`/`error_description`, or
-/// 502 `server_error` when the upstream names no error.
+/// 502 `server_error` when the upstream names no error. A non-2xx upstream
+/// response is never relayed as is: a grant error (`invalid_grant` and the
+/// like) is answered 400 with its `error`/`error_description`, and a rejection
+/// of the proxy's upstream client credentials, a redirect, a 5xx or a non-JSON
+/// body is answered 502 `server_error`.
 ///
 /// In ISSUE-OWN-TOKEN (broker) mode (when the proxy's `issueToken` + `tokenStore`
 /// are set) the endpoint still exchanges upstream, but then mints the MCP
@@ -1461,8 +1465,8 @@ in (exchange !is null)
 		// In broker mode, mint OUR token for the client from the upstream response
 		// and keep the upstream token server-side — the client never sees the
 		// upstream token. (Broker-mode refresh grants are already refused above.)
-		// Otherwise — passthrough mode, or a non-2xx upstream — relay the upstream
-		// body to the client verbatim.
+		// Otherwise a 2xx passthrough body is relayed verbatim and a non-2xx one
+		// is mapped to an RFC 6749 error (`upstreamFailure`).
 		if (proxy.brokerEnabled() && !isRefresh && is2xx)
 		{
 			import std.array : join;
@@ -1492,20 +1496,58 @@ in (exchange !is null)
 
 		// A relayed refresh token (new, or rotated from the presented one) is
 		// remembered so the client can refresh with it; one the upstream did not
-		// rotate stays valid. A 4xx is the upstream refusing the grant, so the
-		// presented token is forgotten; a 5xx leaves it to be retried.
+		// rotate stays valid. An upstream rejection of the grant forgets the
+		// presented token; any other failure leaves it to be retried.
 		if (is2xx)
 		{
 			const relayedRefresh = relayedRefreshToken(responseBody);
 			if (relayedRefresh.length && relayedRefresh != refreshToken)
 				proxy.forgetRelayedRefreshToken(refreshToken);
 			proxy.recordRelayedRefreshToken(relayedRefresh.length ? relayedRefresh : refreshToken);
+			res.statusCode = cast(HTTPStatus) status;
+			res.writeBody(responseBody.length ? responseBody : "{}", "application/json");
+			return;
 		}
-		else if (status >= 400 && status < 500)
+		Json err;
+		const errStatus = upstreamFailure(status, responseBody, err);
+		if (errStatus == HTTPStatus.badRequest)
 			proxy.forgetRelayedRefreshToken(refreshToken);
-		res.statusCode = cast(HTTPStatus) status;
-		res.writeBody(responseBody.length ? responseBody : "{}", "application/json");
+		else
+		{
+			import vibe.core.log : logWarn;
+
+			logWarn("/token: upstream token endpoint answered HTTP %d", status);
+		}
+		res.statusCode = errStatus;
+		res.writeJsonBody(err);
 	});
+}
+
+/// The RFC 6749 §5.2 answer to a non-2xx upstream token response. A JSON
+/// `error` from a 4xx that concerns the client's grant is relayed as a 400
+/// carrying only `error` and `error_description`. Everything else — a rejection
+/// of the proxy's own upstream client credentials (`invalid_client`,
+/// `unauthorized_client`, or any 401), a redirect, a 5xx, or a body that is not
+/// an OAuth error — is the proxy's failure, not the client's, and becomes a 502
+/// `server_error` that keeps the upstream body out of the response.
+private HTTPStatus upstreamFailure(int status, string responseBody, out Json err) @safe
+{
+	const j = parseJsonBody(responseBody);
+	const e = j.type == Json.Type.object && "error" in j ? j["error"] : Json.undefined;
+	const code = e.type == Json.Type.string ? e.get!string : "";
+	err = Json.emptyObject;
+	const clientAuth = code == "invalid_client" || code == "unauthorized_client";
+	if (status >= 400 && status < 500 && code.length && !clientAuth)
+	{
+		err["error"] = code;
+		if (auto d = "error_description" in j)
+			if (d.type == Json.Type.string)
+				err["error_description"] = *d;
+		return HTTPStatus.badRequest;
+	}
+	err["error"] = "server_error";
+	err["error_description"] = "the upstream token endpoint refused the exchange";
+	return HTTPStatus.badGateway;
 }
 
 /// Whether a 2xx upstream token response is in fact a failure: it carries an
@@ -4199,6 +4241,62 @@ unittest  // PASSTHROUGH: a 200 upstream response carrying an OAuth error is ans
 	assert(j["error_description"].get!string == "The code passed is incorrect or expired.");
 }
 
+unittest  // /token answers an upstream client-auth failure, redirect, 5xx or non-JSON error with 502 server_error
+{
+	import std.algorithm : canFind;
+	import vibe.data.json : parseJsonString;
+
+	struct Upstream
+	{
+		int status;
+		string body_;
+	}
+
+	foreach (u; [
+		Upstream(401, `{"error":"invalid_client","error_description":"bad secret"}`),
+		Upstream(400, `{"error":"invalid_client"}`),
+		Upstream(302, `<html>moved</html>`),
+		Upstream(500, `{"error":"server_error","detail":"stack trace"}`),
+		Upstream(400, `<html>bad request</html>`), Upstream(404, ``),
+	])
+	{
+		auto proxy = mountSampleProxy();
+		auto router = new URLRouter;
+		mountOAuthToken(router, proxy, (string endpoint, string body_,
+				string authHeader, out string rb, out int status) @safe {
+			rb = u.body_;
+			status = u.status;
+		});
+		const res = browserPost(router, "https://mcp.example.com/token",
+				redeemableCodeForm(proxy), "");
+		assert(res.status == 502, u.body_);
+		const j = parseJsonString(res.body_);
+		assert(j["error"].get!string == "server_error", u.body_);
+		assert(!res.body_.canFind("bad secret")
+				&& !res.body_.canFind("stack trace") && !res.body_.canFind("html"), res.body_);
+	}
+}
+
+unittest  // /token relays an upstream RFC 6749 grant error as a 400 JSON error
+{
+	import vibe.data.json : parseJsonString;
+
+	auto proxy = mountSampleProxy();
+	auto router = new URLRouter;
+	mountOAuthToken(router, proxy, (string endpoint, string body_,
+			string authHeader, out string rb, out int status) @safe {
+		rb = `{"error":"invalid_grant","error_description":"code expired","extra":1}`;
+		status = 401;
+	});
+	const res = browserPost(router, "https://mcp.example.com/token",
+			redeemableCodeForm(proxy), "");
+	assert(res.status == 400);
+	const j = parseJsonString(res.body_);
+	assert(j["error"].get!string == "invalid_grant");
+	assert(j["error_description"].get!string == "code expired");
+	assert("extra" !in j);
+}
+
 unittest  // PASSTHROUGH: a 200 upstream response with no access_token is answered 502 server_error
 {
 	import vibe.data.json : parseJsonString;
@@ -4379,7 +4477,7 @@ unittest  // PASSTHROUGH: a refresh token stays redeemable when the upstream fai
 	assert(browserPost(router, "https://mcp.example.com/token",
 			redeemableCodeForm(proxy), "").status == 200);
 	assert(browserPost(router, "https://mcp.example.com/token",
-			"grant_type=refresh_token&refresh_token=rt1", "").status == 503);
+			"grant_type=refresh_token&refresh_token=rt1", "").status == 502);
 	assert(browserPost(router, "https://mcp.example.com/token",
 			"grant_type=refresh_token&refresh_token=rt1", "").status == 200);
 	assert(calls == 3);
