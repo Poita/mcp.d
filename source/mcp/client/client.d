@@ -2651,8 +2651,8 @@ final class McpClient : ClientProtocol
 	/// Validate a `CallToolResult`'s `structuredContent` against `tool`'s
 	/// `outputSchema`, independent of the opt-in flag. Returns an empty string
 	/// when it conforms, when the tool has no output schema, or when the result
-	/// is an `isError` or unfinished (`isInputRequired`) one, which the schema
-	/// does not govern; otherwise a description of the first violation — a tool
+	/// is an `isError`, unfinished (`isInputRequired`) or task-handle (`isTask`)
+	/// one, which the schema does not govern; otherwise a description of the first violation — a tool
 	/// that declares an output schema must return `structuredContent`. Exposed so
 	/// callers can validate explicitly without enabling automatic validation.
 	static string validateOutput(const Tool tool, const CallToolResult result) @safe
@@ -2662,12 +2662,14 @@ final class McpClient : ClientProtocol
 
 	/// Validate a result's `structuredContent` against a raw `outputSchema` Json.
 	/// Returns an empty string when it conforms (or the schema is not an object,
-	/// or the result is an error or unfinished), otherwise the first violation.
+	/// or the result is an error, unfinished, or a task handle), otherwise the
+	/// first violation.
 	private static string validateStructured(const CallToolResult result, Json outputSchema) @safe
 	{
 		import mcp.protocol.schema : validateAgainstSchema;
 
-		if (outputSchema.type != Json.Type.object || result.isError || result.isInputRequired)
+		if (outputSchema.type != Json.Type.object || result.isError
+				|| result.isInputRequired || result.isTask)
 			return "";
 		if (result.structuredContent.type == Json.Type.undefined)
 			return "structuredContent is missing but the tool declares an outputSchema";
@@ -6028,6 +6030,74 @@ unittest  // callToolAwait validates the awaited task result against the listed 
 	catch (OutputSchemaViolation)
 		violated = true;
 	assert(violated, "a non-conforming awaited result must fail output-schema validation");
+}
+
+unittest  // callToolAwait accepts a conforming awaited task result under output-schema validation
+{
+	import mcp.api.binding : jsonSchemaOf, SchemaUse;
+
+	struct AddResult
+	{
+		int result;
+	}
+
+	auto c = McpClient.http("http://localhost");
+	c.enableOutputSchemaValidation();
+	c.onTaskSleepForTest = (Duration d) @safe {};
+	Tool t = {
+		name: "add", outputSchema: jsonSchemaOf!(AddResult, SchemaUse.output)
+	};
+	c.onRpcForTest = (string method, Json params) @safe {
+		if (method == "tools/list")
+			return Json(["tools": Json([t.toJson()])]);
+		if (method == "tools/call")
+			return Json([
+			"resultType": Json("task"),
+			"taskId": Json("t1"),
+			"status": Json("working"),
+			"ttlMs": Json(null)
+		]);
+		return Json([
+			"taskId": Json("t1"),
+			"status": Json("completed"),
+			"result": Json([
+				"content": Json.emptyArray,
+				"structuredContent": Json(["result": Json(3)])
+			])
+		]);
+	};
+	c.listTools();
+	auto r = c.callToolAwait("add");
+	assert(r.structuredContent["result"].get!int == 3);
+}
+
+unittest  // callTool returns a task handle unvalidated when the tool declares an outputSchema
+{
+	import mcp.api.binding : jsonSchemaOf, SchemaUse;
+
+	struct AddResult
+	{
+		int result;
+	}
+
+	auto c = McpClient.http("http://localhost");
+	c.enableOutputSchemaValidation();
+	Tool t = {
+		name: "add", outputSchema: jsonSchemaOf!(AddResult, SchemaUse.output)
+	};
+	c.onRpcForTest = (string method, Json params) @safe {
+		if (method == "tools/list")
+			return Json(["tools": Json([t.toJson()])]);
+		return Json([
+			"resultType": Json("task"),
+			"taskId": Json("t1"),
+			"status": Json("working"),
+			"ttlMs": Json(null)
+		]);
+	};
+	c.listTools();
+	assert(c.callTool("add").isTask);
+	assert(c.callTool(t).isTask);
 }
 
 unittest  // cancelling callToolAwait's token stops polling and cancels the task
