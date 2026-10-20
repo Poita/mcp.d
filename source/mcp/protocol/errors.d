@@ -191,7 +191,8 @@ McpException resourceNotFound(string uri, ProtocolVersion v, Json data = Json.un
 	return new McpException(v.resourceNotFoundCode, "Resource not found: " ~ uri, data);
 }
 
-/// True if `url` is a valid absolute URI suitable for a URL-mode elicitation.
+/// True if `url` is an http(s) URL with a host, suitable for a URL-mode
+/// elicitation.
 ///
 /// Per client/elicitation §"URL Mode Elicitation Requests" (2025-11-25) the
 /// `url` parameter MUST contain a valid URL, and its schema marks the field
@@ -336,8 +337,8 @@ struct UrlElicitation
 /// `{mode:"url", elicitationId, url, message}`.
 ///
 /// At least one elicitation is required, and every entry MUST have a non-empty
-/// `elicitationId` and a `url` that is a valid absolute URI (per the spec's
-/// `format: uri` / "MUST contain a valid URL"); otherwise this throws.
+/// `elicitationId` and a `url` that passes `isValidElicitationUrl` (an http(s)
+/// URL with a host); otherwise this throws.
 McpException urlElicitationRequired(const UrlElicitation[] elicitations,
 		string message = "URL elicitation required") @safe
 {
@@ -350,7 +351,7 @@ McpException urlElicitationRequired(const UrlElicitation[] elicitations,
 	{
 		enforce(e.elicitationId.length > 0, "URL elicitation requires a non-empty elicitationId");
 		enforce(isValidElicitationUrl(e.url),
-				"URL elicitation requires a valid url (absolute URI): " ~ e.url);
+				"URL elicitation requires an http(s) URL with a host: " ~ e.url);
 		arr ~= e.toJson();
 	}
 	Json data = Json.emptyObject;
@@ -517,6 +518,17 @@ unittest  // urlElicitationRequired rejects an entry missing url
 	assertThrown!Exception(urlElicitationRequired([
 		UrlElicitation("id", "", "msg")
 	]));
+}
+
+unittest  // urlElicitationRequired names the http(s) requirement when it rejects a url
+{
+	import std.algorithm.searching : canFind;
+	import std.exception : collectExceptionMsg;
+
+	const msg = collectExceptionMsg(urlElicitationRequired([
+		UrlElicitation("id", "ftp://example.com/x", "msg")
+	]));
+	assert(msg.canFind("http(s) URL"), msg);
 }
 
 unittest  // missingRequiredClientCapability uses the -32021 code
