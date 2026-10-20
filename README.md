@@ -409,6 +409,8 @@ is re-leased) — mirroring the `TaskStore`/`TaskDispatcher` split. Like
 record's `revision` as one atomic conditional write: every update to a stored
 subscription (watermark, verification, delivery health, refresh) is a
 read-modify-write retried on a lost race, so nodes never overwrite each other.
+Removal goes through `compareAndRemove` on the same `revision`, so a node never
+deletes a subscription that was refreshed or re-created after it read it.
 Creating a subscription goes through `insert`, a create-if-absent write: when two
 nodes create the same one at once, the second refreshes the first's record.
 
