@@ -489,7 +489,8 @@ version (unittest)
 	// requestStateSecurity installs the secure requestState codec.
 	import std.algorithm.searching : startsWith;
 	import std.typecons : nullable;
-	import mcp.protocol.mrtr : InputRequest, MetaKey;
+	import mcp.protocol.mrtr : InputRequest;
+	import mcp.protocol.meta_keys : MetaKey;
 	import mcp.protocol.types : Tool;
 	import mcp.server.context : RequestContext;
 	import mcp.server.request_state : RequestStateSecurity;

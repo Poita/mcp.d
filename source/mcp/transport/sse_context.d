@@ -12,7 +12,7 @@ import mcp.protocol.errors;
 import mcp.transport.coordinator : throwOrReturn, defaultServerRequestTimeout,
 	cancelledNotification;
 import mcp.protocol.capabilities;
-import mcp.protocol.mrtr : withListenSubscriptionId;
+import mcp.protocol.subscriptions : withListenSubscriptionId;
 import mcp.protocol.versions : ProtocolVersion, latestLegacy, supportsProgressMessage;
 import mcp.server.context;
 import mcp.server.connection : ConnectionState;
@@ -2488,7 +2488,7 @@ unittest  // emitTo delivers only to the named listener, not the others
 unittest  // a notification delivered on a listen stream is stamped with its subscriptionId
 {
 	import std.algorithm : canFind;
-	import mcp.protocol.mrtr : MetaKey;
+	import mcp.protocol.meta_keys : MetaKey;
 
 	auto coord = new StreamCoordinator;
 	auto ch = new ServerPushChannel(coord);
@@ -2506,7 +2506,7 @@ unittest  // a notification delivered on a listen stream is stamped with its sub
 unittest  // a notification delivered on a plain GET stream carries no subscriptionId
 {
 	import std.algorithm : canFind;
-	import mcp.protocol.mrtr : MetaKey;
+	import mcp.protocol.meta_keys : MetaKey;
 
 	auto coord = new StreamCoordinator;
 	auto ch = new ServerPushChannel(coord);
@@ -2521,7 +2521,7 @@ unittest  // a notification delivered on a plain GET stream carries no subscript
 unittest  // emitTo to a listen stream stamps subscriptionId (e.g. the leading ack)
 {
 	import std.algorithm : canFind;
-	import mcp.protocol.mrtr : MetaKey;
+	import mcp.protocol.meta_keys : MetaKey;
 
 	auto coord = new StreamCoordinator;
 	auto ch = new ServerPushChannel(coord);

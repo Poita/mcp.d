@@ -4668,7 +4668,7 @@ unittest  // emit-only poll reads the ring buffer
 
 unittest  // emit fans out to a matching push stream
 {
-	import mcp.protocol.mrtr : MetaKey;
+	import mcp.protocol.meta_keys : MetaKey;
 
 	auto rt = testRuntime();
 	EventRegistration reg;
@@ -4846,7 +4846,7 @@ unittest  // a push stream that falls too far behind is terminated as a slow con
 
 unittest  // advancePushStream delivers a recoverable error frame when the check throws, and stays open
 {
-	import mcp.protocol.mrtr : MetaKey;
+	import mcp.protocol.meta_keys : MetaKey;
 
 	auto rt = testRuntime();
 	bool fail = true;
@@ -4988,7 +4988,7 @@ unittest  // advancePushStream re-sends active{truncated:true} with the fresh cu
 
 unittest  // terminatePush sends a terminated frame, releases the subscription, and runs the transport hook
 {
-	import mcp.protocol.mrtr : MetaKey;
+	import mcp.protocol.meta_keys : MetaKey;
 
 	auto rt = testRuntime();
 	int unsubs;

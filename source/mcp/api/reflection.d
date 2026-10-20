@@ -826,7 +826,7 @@ private template isPrimitiveHeaderParam(P)
 /// parameters, skipping any `RequestContext` parameter.
 private Json parametersSchema(alias func)() @safe
 {
-	import mcp.protocol.mrtr : validateHeaderName;
+	import mcp.protocol.http_headers : validateHeaderName;
 	import std.traits : ParameterDefaultValueTuple;
 
 	checkParamNames!func();
@@ -3128,7 +3128,7 @@ unittest  // @mcpHeader: naming an injected context parameter is rejected at com
 unittest  // @mcpHeader reflection: x-mcp-header is emitted into the param schema
 {
 	import mcp.protocol.jsonrpc : Message, makeRequest;
-	import mcp.protocol.mrtr : paramHeaders;
+	import mcp.protocol.http_headers : paramHeaders;
 
 	auto s = McpServer.stateless("t", "1");
 	registerHandlers(s, new DemoApi);
@@ -3342,7 +3342,7 @@ unittest  // @hintTitle: annotation-level title appears in annotations
 unittest  // MRTR UDA tool: returning ToolResponse.inputRequired surfaces inputRequests
 {
 	import mcp.protocol.jsonrpc : Message, makeRequest;
-	import mcp.protocol.mrtr : MetaKey;
+	import mcp.protocol.meta_keys : MetaKey;
 
 	auto s = McpServer.stateless("t", "1");
 	registerHandlers(s, new ExtApi);
@@ -3569,7 +3569,7 @@ unittest  // @icon UDA: theme field propagates through collectIcons to tools/lis
 version (unittest) private auto modernRead(string uri) @safe
 {
 	import mcp.protocol.jsonrpc : Message, makeRequest;
-	import mcp.protocol.mrtr : MetaKey;
+	import mcp.protocol.meta_keys : MetaKey;
 
 	Json meta = Json.emptyObject;
 	meta[MetaKey.protocolVersion] = "2026-07-28";
@@ -4713,7 +4713,7 @@ version (unittest) private final class TaskUdaApi
 version (unittest) private Json modernMeta() @safe
 {
 	import mcp.protocol.capabilities : tasksExtensionKey;
-	import mcp.protocol.mrtr : MetaKey;
+	import mcp.protocol.meta_keys : MetaKey;
 
 	// A client that declared the Tasks extension: the @taskTool tests exercise the
 	// task surface, which the server serves only to such a client.
@@ -5561,7 +5561,7 @@ unittest  // explicit null for a Nullable struct field passes input validation
 
 unittest  // a Nullable @mcpHeader parameter keeps the bare primitive type x-mcp-header requires
 {
-	import mcp.protocol.mrtr : paramHeaders;
+	import mcp.protocol.http_headers : paramHeaders;
 
 	auto s = McpServer.stateless("t", "1");
 	registerHandlers(s, new NullableHeaderApi);

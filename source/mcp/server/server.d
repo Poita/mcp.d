@@ -13,6 +13,8 @@ import mcp.protocol.capabilities;
 import mcp.protocol.types;
 import mcp.protocol.modern;
 import mcp.protocol.mrtr;
+import mcp.protocol.meta_keys : MetaKey;
+import mcp.protocol.subscriptions : subscriptionsListenResult, withListenSubscriptionId;
 import mcp.server.context;
 import mcp.server.connection : ConnectionState;
 import mcp.auth.resource_server : TokenInfo;

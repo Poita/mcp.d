@@ -11,7 +11,7 @@ import std.typecons : Nullable, nullable;
 import vibe.data.json : Json;
 
 import mcp.protocol.jsonhelpers : getOr, tryGet, requireObject;
-import mcp.protocol.mrtr : MetaKey;
+import mcp.protocol.meta_keys : MetaKey;
 
 @safe:
 

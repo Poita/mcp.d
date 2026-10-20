@@ -98,9 +98,11 @@ public import mcp.protocol.modern;
 // Named by the public result/response API: `CallToolResult.inputRequests`,
 // `ToolResponse`/`PromptResponse.inputRequired` and
 // `McpClient.withInputResponses` take these, and `MetaKey` names the reserved
-// `_meta` keys. The rest of `mcp.protocol.mrtr` (header codecs, wire helpers)
-// is transport plumbing, reachable via `import mcp.transport;`.
-public import mcp.protocol.mrtr : InputKind, InputRequest, InputResponse, MetaKey;
+// `_meta` keys. The rest of `mcp.protocol.mrtr` (wire helpers), like the
+// header codecs and `_meta` key validation, is transport plumbing, reachable
+// via `import mcp.transport;`.
+public import mcp.protocol.mrtr : InputKind, InputRequest, InputResponse;
+public import mcp.protocol.meta_keys : MetaKey;
 
 // --- Opt-in MRTR requestState security ---
 // Referenced by `McpServer.secureRequestState(RequestStateSecurity)`. The codec

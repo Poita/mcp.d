@@ -896,7 +896,7 @@ version (unittest)
 
 	private Message modernRequest(long id, string method, Json params) @safe
 	{
-		import mcp.protocol.mrtr : MetaKey;
+		import mcp.protocol.meta_keys : MetaKey;
 
 		Json m = Json.emptyObject;
 		m[MetaKey.protocolVersion] = "2026-07-28";

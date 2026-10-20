@@ -6,7 +6,7 @@ import core.time : Duration, msecs, seconds;
 import vibe.data.json : Json;
 
 import mcp.protocol.capabilities;
-import mcp.protocol.mrtr : MetaKey;
+import mcp.protocol.meta_keys : MetaKey;
 import mcp.protocol.jsonhelpers : tryGet, requireObject;
 
 @safe:

@@ -90,7 +90,7 @@ interface ClientProtocol
 /// modern version.
 package bool modernFraming(Json message, out ProtocolVersion version_) @safe nothrow
 {
-	import mcp.protocol.mrtr : MetaKey;
+	import mcp.protocol.meta_keys : MetaKey;
 	import mcp.protocol.versions : isModern, tryParseVersion;
 
 	try

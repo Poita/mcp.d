@@ -507,7 +507,7 @@ unittest  // UiResourceMeta round-trips through fromJson
 unittest  // enableApps surfaces the extension with its mimeTypes (2026-07-28)
 {
 	import mcp.protocol.jsonrpc : Message, makeRequest;
-	import mcp.protocol.mrtr : MetaKey;
+	import mcp.protocol.meta_keys : MetaKey;
 
 	auto s = McpServer.stateless("t", "1");
 	s.enableApps();

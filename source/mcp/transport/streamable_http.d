@@ -12,7 +12,8 @@ import mcp.protocol.jsonrpc;
 import mcp.protocol.errors;
 import mcp.protocol.versions;
 import mcp.protocol.modern;
-import mcp.protocol.mrtr;
+import mcp.protocol.meta_keys : MetaKey;
+import mcp.protocol.http_headers;
 import mcp.protocol.events;
 import mcp.transport.coordinator : defaultServerRequestTimeout, cancelledNotification;
 import mcp.transport.sse_context;
@@ -5220,7 +5221,7 @@ unittest  // modern resources/read mirrors uri into Mcp-Name
 
 unittest  // modern Mcp-Name is sentinel-decoded before matching the body value
 {
-	import mcp.protocol.mrtr : encodeHeaderValue;
+	import mcp.protocol.http_headers : encodeHeaderValue;
 
 	// A name with non-ASCII / reserved characters must travel as a Base64 sentinel
 	// (=?base64?...?=) in the Mcp-Name header; the server decodes before comparing.
@@ -5622,7 +5623,7 @@ unittest  // concurrent legacy stateless clients never observe each other's init
 unittest  // a modern (modern/MRTR) stateless request gets a FRESH state from _meta
 {
 	import vibe.data.json : parseJsonString;
-	import mcp.protocol.mrtr : MetaKey;
+	import mcp.protocol.meta_keys : MetaKey;
 
 	// The modern request carries its capabilities + log level in _meta; the fresh
 	// per-request state is built from them and retained nowhere.
@@ -7649,7 +7650,7 @@ unittest  // x-mcp-header: present param but missing header fails
 
 unittest  // x-mcp-header: non-ASCII value matched via base64-encoded header
 {
-	import mcp.protocol.mrtr : encodeHeaderValue;
+	import mcp.protocol.http_headers : encodeHeaderValue;
 
 	auto schema = schemaWithHeaderParam();
 	Json args = Json(["region": Json("Zürich")]);
@@ -7795,7 +7796,7 @@ unittest  // ordinary application errors (e.g. invalidParams) ride on HTTP 200
 unittest  // modern subscriptions/listen: ack first, then opted-in change notifications flow
 {
 	import mcp.transport.sse_context : StreamCoordinator, ServerPushChannel;
-	import mcp.protocol.mrtr : MetaKey;
+	import mcp.protocol.meta_keys : MetaKey;
 	import std.algorithm : canFind;
 
 	auto server = McpServer.stateless("t", "1");

@@ -18,7 +18,7 @@ import vibe.core.sync : LocalManualEvent, createManualEvent;
 
 import mcp.protocol.jsonrpc;
 import mcp.protocol.errors;
-import mcp.protocol.mrtr : isHeaderValueUnsafe;
+import mcp.protocol.http_headers : isHeaderValueUnsafe;
 import mcp.protocol.ssrf : FetchOptions, TlsTrust;
 import mcp.client.transport : BearerProvider, ClientTransport, ClientProtocol,
 	InboundOrigin, modernFraming;

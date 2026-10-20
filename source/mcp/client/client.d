@@ -17,6 +17,8 @@ import mcp.protocol.tasks : Task, TaskStatus;
 import mcp.protocol.sampling : validateSamplingMessages, CreateMessageRequest, CreateMessageResult;
 import mcp.protocol.modern;
 import mcp.protocol.mrtr;
+import mcp.protocol.meta_keys : MetaKey;
+import mcp.protocol.http_headers;
 import mcp.client.transport : BearerProvider, ClientTransport, ClientProtocol, InboundOrigin;
 import mcp.client.http_transport : HttpClientTransport, HttpStatusException,
 	SessionExpiredException, isLegacyFallbackStatus, defaultMaxMessageBytes;
@@ -1720,7 +1722,7 @@ final class McpClient : ClientProtocol
 	/// for a modern session (the feature is modern-only and HTTP-transport-specific).
 	package static Tool[] excludeInvalidHeaderTools(Tool[] tools) @safe
 	{
-		import mcp.protocol.mrtr : validateInputSchemaHeaders;
+		import mcp.protocol.http_headers : validateInputSchemaHeaders;
 		import vibe.core.log : logWarn;
 
 		Tool[] kept;
@@ -4546,7 +4548,7 @@ final class McpClient : ClientProtocol
 
 	/// Compute the `Mcp-Param-*` headers to emit for a `tools/call`, given the
 	/// tool's `inputSchema` and the call `arguments`. Uses the path-aware
-	/// `mcp.protocol.mrtr.paramHeaders`, which discovers every valid `x-mcp-header`
+	/// `mcp.protocol.http_headers.paramHeaders`, which discovers every valid `x-mcp-header`
 	/// annotation at *any* nesting depth (not only top-level properties), and
 	/// descends each annotation's `path` into the arguments object: for each path
 	/// segment it indexes into the current `Json` object; if any intermediate node
@@ -4562,7 +4564,7 @@ final class McpClient : ClientProtocol
 	/// helper so the mirroring can be unit-tested without a live server.
 	package static string[string] paramHeaders(Json inputSchema, Json arguments) @safe
 	{
-		import mcp.protocol.mrtr : modernParamHeaders = paramHeaders;
+		import mcp.protocol.http_headers : modernParamHeaders = paramHeaders;
 
 		string[string] headers;
 		if (arguments.type != Json.Type.object)
@@ -8276,7 +8278,7 @@ unittest  // paramHeaders omits headers for absent or null annotated arguments
 
 unittest  // paramHeaders base64-encodes a non-ASCII annotated value
 {
-	import mcp.protocol.mrtr : decodeHeaderValue;
+	import mcp.protocol.http_headers : decodeHeaderValue;
 
 	Json schema = Json.emptyObject;
 	schema["type"] = "object";
@@ -9995,7 +9997,7 @@ unittest  // a modern client's ClientProtocol yields the MCP-Protocol-Version he
 
 unittest  // a resources/read URI is encoded in Mcp-Name, never placed raw (no CR/LF injection)
 {
-	import mcp.protocol.mrtr : decodeHeaderValue;
+	import mcp.protocol.http_headers : decodeHeaderValue;
 
 	auto transport = new RecordingClientTransport();
 	auto c = new McpClient(transport);
@@ -10021,7 +10023,7 @@ unittest  // a resources/read URI is encoded in Mcp-Name, never placed raw (no C
 
 unittest  // a benign reserved-character resource URI still survives Mcp-Name encoding
 {
-	import mcp.protocol.mrtr : decodeHeaderValue;
+	import mcp.protocol.http_headers : decodeHeaderValue;
 
 	auto transport = new RecordingClientTransport();
 	auto c = new McpClient(transport);

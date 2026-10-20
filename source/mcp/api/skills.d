@@ -906,7 +906,7 @@ unittest  // skillMarkdown emits metadata in a deterministic sorted order
 unittest  // enableSkills advertises the extension (with directoryRead) and nothing else
 {
 	import mcp.protocol.jsonrpc : Message, makeRequest;
-	import mcp.protocol.mrtr : MetaKey;
+	import mcp.protocol.meta_keys : MetaKey;
 
 	auto s = McpServer.stateless("t", "1");
 	s.enableSkills();
@@ -1281,7 +1281,7 @@ unittest  // a modern-session resources/directory/read result carries resultType
 unittest  // declaring the skills extension also declares the resources capability
 {
 	import mcp.protocol.jsonrpc : Message, makeRequest;
-	import mcp.protocol.mrtr : MetaKey;
+	import mcp.protocol.meta_keys : MetaKey;
 
 	// Skill files are served through resources/read, and the base Resources spec
 	// requires a server that supports resources to declare the capability — even
@@ -1935,7 +1935,7 @@ version (unittest)
 	// is routed; mirrors the server's own `modernReq` test helper.
 	private Message modernRequest(long id, string method, Json params) @safe
 	{
-		import mcp.protocol.mrtr : MetaKey;
+		import mcp.protocol.meta_keys : MetaKey;
 
 		Json m = Json.emptyObject;
 		m[MetaKey.protocolVersion] = "2026-07-28";
@@ -2128,7 +2128,7 @@ unittest  // a skill registration that throws registering its resource leaves th
 {
 	import std.exception : assertThrown;
 	import mcp.protocol.jsonrpc : Message, makeRequest;
-	import mcp.protocol.mrtr : MetaKey;
+	import mcp.protocol.meta_keys : MetaKey;
 
 	auto s = McpServer.stateless("t", "1");
 	Resource taken;

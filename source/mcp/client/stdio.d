@@ -10,7 +10,7 @@ import mcp.client.transport : BearerProvider, ClientTransport, ClientProtocol, I
 import mcp.client.subscription : SubscriptionStream, ListenGate;
 import mcp.transport.duplex : ChannelWriteException, DuplexChannel, defaultMaxLineBytes;
 import mcp.transport.lines : FrameHead, LineReader;
-import mcp.protocol.mrtr : MetaKey;
+import mcp.protocol.meta_keys : MetaKey;
 
 @safe:
 

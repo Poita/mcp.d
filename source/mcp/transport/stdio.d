@@ -3366,7 +3366,7 @@ unittest  // a stdio server writes no plain notifications before the 2025-era ha
 
 version (unittest)
 {
-	import mcp.protocol.mrtr : MetaKey;
+	import mcp.protocol.meta_keys : MetaKey;
 
 	// A modern `subscriptions/listen` request line carrying per-request _meta
 	// (protocolVersion modern) and a nested `notifications` ListenFilter.

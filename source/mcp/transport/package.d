@@ -21,8 +21,13 @@ public import mcp.transport.session;
 public import mcp.transport.sse_context;
 public import mcp.transport.oauth_proxy_mount;
 
-// The modern transport plumbing (header encoding, param-header extraction,
-// request-state parsing, `_meta` key validation, MRTR shapes) lives in
-// `mcp.protocol.mrtr`, so it is reachable here rather than from the top-level
+// The modern transport plumbing — header encoding and param-header extraction
+// (`mcp.protocol.http_headers`), `_meta` key validation
+// (`mcp.protocol.meta_keys`), `subscriptions/listen` stamping
+// (`mcp.protocol.subscriptions`), and MRTR shapes and request-state parsing
+// (`mcp.protocol.mrtr`) — is reachable here rather than from the top-level
 // surface.
 public import mcp.protocol.mrtr;
+public import mcp.protocol.meta_keys;
+public import mcp.protocol.http_headers;
+public import mcp.protocol.subscriptions;
