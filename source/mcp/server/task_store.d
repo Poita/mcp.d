@@ -39,7 +39,7 @@ struct TaskRecord
 	string toolName; /// executor key — which registered task executor drives this task
 	/// The record backs a synchronous call from a client without the Tasks
 	/// extension: it lives only as long as that request and is not counted by
-	/// `TaskStore.countUnsettled`.
+	/// `TaskStore.countUnsettled` or `TaskStore.countSettled`.
 	bool requestBacked;
 	/// The authenticated principal (token subject) whose request created the
 	/// task; every later tasks/* request must come from the same principal. Empty
@@ -210,6 +210,12 @@ interface TaskStore
 	/// every task creation, so it must not scan the store: a shared store answers
 	/// from an index on `(owner, status)` or a per-owner counter.
 	size_t countUnsettled(string owner) @safe;
+
+	/// How many records owned by `owner` ("" for unbound tasks) are terminal
+	/// and awaiting expiry, leaving out `requestBacked` ones. Called on every
+	/// task creation like `countUnsettled`, so it must not scan the store
+	/// either.
+	size_t countSettled(string owner) @safe;
 }
 
 /// In-memory `TaskStore` backed by an associative array. The default store; it
@@ -222,24 +228,26 @@ final class InMemoryTaskStore : TaskStore
 	import mcp.protocol.tasks : isTerminal;
 
 	private TaskRecord[string] records;
-	// Unsettled records per owner, kept in step with every write so
-	// `countUnsettled` never scans the store.
+	// Unsettled and settled records per owner, kept in step with every write
+	// so `countUnsettled` and `countSettled` never scan the store.
 	private size_t[string] unsettled_;
+	private size_t[string] settled_;
 
 	private void track(const ref TaskRecord r, bool add) @safe
 	{
-		if (isTerminal(r.meta.status) || r.requestBacked)
+		if (r.requestBacked)
 			return;
+		auto counts = isTerminal(r.meta.status) ? &settled_ : &unsettled_;
 		if (add)
 		{
-			unsettled_.require(r.owner, 0)++;
+			(*counts).require(r.owner, 0)++;
 			return;
 		}
-		auto p = r.owner in unsettled_;
+		auto p = r.owner in *counts;
 		if (p is null)
 			return;
 		if (--*p == 0)
-			unsettled_.remove(r.owner);
+			(*counts).remove(r.owner);
 	}
 
 	bool put(TaskRecord record) @safe
@@ -293,6 +301,13 @@ final class InMemoryTaskStore : TaskStore
 	size_t countUnsettled(string owner) @safe
 	{
 		if (auto p = owner in unsettled_)
+			return *p;
+		return 0;
+	}
+
+	size_t countSettled(string owner) @safe
+	{
+		if (auto p = owner in settled_)
 			return *p;
 		return 0;
 	}
@@ -534,6 +549,33 @@ unittest  // countUnsettled tracks each owner's unsettled records through every 
 	assert(s.removeIf((const TaskRecord r) @safe => r.owner == "bob") == 1);
 	assert(s.countUnsettled("bob") == 0);
 	assert(s.countUnsettled("alice") == 1);
+}
+
+unittest  // countSettled follows a record into and out of a terminal status, skipping request-backed ones
+{
+	import mcp.protocol.tasks : TaskStatus;
+
+	auto s = new InMemoryTaskStore();
+	TaskRecord r;
+	r.meta.taskId = "a";
+	r.meta.status = TaskStatus.working;
+	r.owner = "alice";
+	assert(s.put(r));
+	assert(s.countSettled("alice") == 0);
+	r.meta.status = TaskStatus.completed;
+	assert(s.compareAndSwap(r, 0));
+	assert(s.countSettled("alice") == 1 && s.countUnsettled("alice") == 0);
+
+	TaskRecord sync;
+	sync.meta.taskId = "b";
+	sync.meta.status = TaskStatus.completed;
+	sync.owner = "alice";
+	sync.requestBacked = true;
+	assert(s.put(sync));
+	assert(s.countSettled("alice") == 1);
+
+	s.remove("a");
+	assert(s.countSettled("alice") == 0);
 }
 
 unittest  // removeIf drops exactly the records matching the predicate

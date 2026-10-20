@@ -152,6 +152,7 @@ void main(string[] args) @safe
 	//       void remove(string id)               { redis.del(id); }
 	//       size_t removeIf(scope bool delegate(const TaskRecord) @safe pred) { /* SCAN + DEL */ }
 	//       size_t countUnsettled(string owner)  { /* per-owner set of unsettled ids */ }
+	//       size_t countSettled(string owner)    { /* per-owner set of settled ids */ }
 	//   }
 	//   // A dispatcher that enqueues the task ID; a worker process running the same
 	//   // server + @taskTool registration picks it up and runs the executor.

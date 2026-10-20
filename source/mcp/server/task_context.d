@@ -1067,6 +1067,11 @@ unittest  // an executor's input and checkpoint reads come from the dispatch's o
 		{
 			return inner.countUnsettled(owner);
 		}
+
+		size_t countSettled(string owner) @safe
+		{
+			return inner.countSettled(owner);
+		}
 	}
 
 	auto store = new CountingStore();

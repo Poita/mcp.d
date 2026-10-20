@@ -62,6 +62,14 @@ struct TaskOptions
 	/// Most unsettled tasks all unbound (unauthenticated) creators may hold
 	/// together, since they cannot be told apart (0 = unlimited).
 	size_t maxUnsettledAnonymous = 1000;
+	/// Most settled tasks one authenticated principal may hold while their
+	/// records await expiry by TTL; creating another fails with `-32013`
+	/// (0 = unlimited). Bounds the results a principal can keep stored by
+	/// creating short tasks faster than they expire.
+	size_t maxSettledPerPrincipal = 1000;
+	/// Most settled tasks all unbound creators may hold together while their
+	/// records await expiry (0 = unlimited).
+	size_t maxSettledAnonymous = 10_000;
 	string delegate() @safe nowIso;
 }
 
@@ -189,7 +197,7 @@ final class TaskRuntime
 	Task createFor(string toolName, Json executorInput,
 			TaskCreateOptions opts = TaskCreateOptions.init) @safe
 	{
-		enforceUnsettledCap(opts.owner);
+		enforceTaskCaps(opts.owner);
 		return insertTask(toolName, executorInput, opts);
 	}
 
@@ -237,31 +245,47 @@ final class TaskRuntime
 				"task id generator failed to produce a unique id");
 	}
 
-	// Bounds the work and storage one principal can pin with tasks that never
-	// settle. The count and the insert are not atomic across nodes, so on a
-	// shared store concurrent creates may overshoot the cap slightly.
-	private void enforceUnsettledCap(string owner) @safe
+	// Bounds the work and storage one principal can pin: unsettled tasks that
+	// may never settle, and settled records awaiting expiry. The count and the
+	// insert are not atomic across nodes, so on a shared store concurrent
+	// creates may overshoot a cap slightly.
+	private void enforceTaskCaps(string owner) @safe
 	{
 		import mcp.protocol.errors : resourceExhausted;
 
-		const cap = owner.length ? opts_.maxUnsettledPerPrincipal : opts_.maxUnsettledAnonymous;
-		if (cap == 0 || store_.countUnsettled(owner) < cap)
+		const anonymous = owner.length == 0;
+		const unsettledCap = anonymous ? opts_.maxUnsettledAnonymous
+			: opts_.maxUnsettledPerPrincipal;
+		const settledCap = anonymous ? opts_.maxSettledAnonymous : opts_.maxSettledPerPrincipal;
+		bool overUnsettled() @safe
+		{
+			return unsettledCap && store_.countUnsettled(owner) >= unsettledCap;
+		}
+
+		bool overSettled() @safe
+		{
+			return settledCap && store_.countSettled(owner) >= settledCap;
+		}
+
+		if (!overUnsettled() && !overSettled())
 			return;
-		// Tasks idle past `maxUnsettledIdle` are settled only when accessed or
-		// swept, so settle them now rather than let abandoned tasks hold the
-		// principal's slots (the sweeper may be disabled). The sweep scans the
-		// whole store, so creates hammering a cap trigger it at most once a
-		// second; an overdue task has been idle far longer than that.
+		// Tasks idle past `maxUnsettledIdle` are settled, and settled ones past
+		// their TTL removed, only when accessed or swept, so sweep now rather
+		// than let them hold the principal's slots (the sweeper may be
+		// disabled). The sweep scans the whole store, so creates hammering a cap
+		// trigger it at most once a second.
 		const now = currentTime();
 		if (now >= lastCapSweep_ + 1.seconds)
 		{
 			lastCapSweep_ = now;
 			sweepExpired();
-			if (store_.countUnsettled(owner) < cap)
-				return;
 		}
-		throw resourceExhausted("too many unsettled tasks", owner.length
-				? "maxUnsettledPerPrincipal" : "maxUnsettledAnonymous", cast(long) cap);
+		if (overUnsettled())
+			throw resourceExhausted("too many unsettled tasks", anonymous
+					? "maxUnsettledAnonymous" : "maxUnsettledPerPrincipal", cast(long) unsettledCap);
+		if (overSettled())
+			throw resourceExhausted("too many settled tasks awaiting expiry", anonymous
+					? "maxSettledAnonymous" : "maxSettledPerPrincipal", cast(long) settledCap);
 	}
 
 	// A zero TTL would expire a task the moment it settles, before any client
@@ -1691,6 +1715,11 @@ version (unittest) private final class RacingTaskStore : TaskStore
 	{
 		return inner.countUnsettled(owner);
 	}
+
+	size_t countSettled(string owner) @safe
+	{
+		return inner.countSettled(owner);
+	}
 }
 
 unittest  // a cancel racing a completion does not overwrite the stored result
@@ -1846,6 +1875,11 @@ version (unittest) private final class StaleReadTaskStore : TaskStore
 	size_t countUnsettled(string owner) @safe
 	{
 		return inner.countUnsettled(owner);
+	}
+
+	size_t countSettled(string owner) @safe
+	{
+		return inner.countSettled(owner);
 	}
 }
 
@@ -2010,6 +2044,11 @@ unittest  // repeated creates at the unsettled-task cap sweep the store at most 
 		{
 			return inner.countUnsettled(owner);
 		}
+
+		size_t countSettled(string owner) @safe
+		{
+			return inner.countSettled(owner);
+		}
 	}
 
 	string now = "2026-06-07T10:00:00Z";
@@ -2040,6 +2079,50 @@ unittest  // unauthenticated tasks share the anonymous unsettled-task cap
 	rt.createUnbound();
 	auto e = collectException!McpException(rt.createUnbound());
 	assert(e !is null && e.code == ErrorCode.resourceExhausted);
+}
+
+unittest  // createFor refuses a principal whose settled tasks fill its settled-task cap
+{
+	import std.exception : collectException;
+
+	string now = "2026-06-07T10:00:00Z";
+	TaskOptions o;
+	o.nowIso = () @safe => now;
+	o.maxSettledPerPrincipal = 2;
+	auto rt = new TaskRuntime(o);
+	TaskCreateOptions alice;
+	alice.owner = "alice";
+	foreach (_; 0 .. 2)
+		rt.complete(rt.createFor("", Json.undefined, alice).taskId, Json.emptyObject);
+	assert(rt.store.countSettled("alice") == 2);
+	auto e = collectException!McpException(rt.createFor("", Json.undefined, alice));
+	assert(e !is null && e.code == ErrorCode.resourceExhausted);
+	assert(e.data["limit"].get!string == "maxSettledPerPrincipal");
+
+	TaskCreateOptions bob;
+	bob.owner = "bob";
+	rt.createFor("", Json.undefined, bob);
+
+	// Once the settled records expire by their TTL the principal may create again.
+	now = "2026-06-07T10:10:00Z";
+	rt.createFor("", Json.undefined, alice);
+}
+
+unittest  // unauthenticated settled tasks share the anonymous settled-task cap; zero is unlimited
+{
+	import std.exception : collectException;
+
+	TaskOptions o;
+	o.maxSettledAnonymous = 1;
+	auto rt = new TaskRuntime(o);
+	rt.complete(rt.createUnbound().taskId, Json.emptyObject);
+	auto e = collectException!McpException(rt.createUnbound());
+	assert(e !is null && e.code == ErrorCode.resourceExhausted);
+
+	o.maxSettledAnonymous = 0;
+	auto open = new TaskRuntime(o);
+	foreach (_; 0 .. 20)
+		open.complete(open.createUnbound().taskId, Json.emptyObject);
 }
 
 unittest  // a task backing a synchronous call takes no slot under the unsettled-task cap
