@@ -2115,8 +2115,7 @@ final class HttpClientTransport : ClientTransport
 			string wwwAuthenticate;
 			string redirect;
 			const sentSession = sessionId;
-			const bearer = currentBearer();
-			const sentBearer = bearerProvider.onRejected !is null ? bearer : null;
+			string sentBearer;
 			// Register a slot so `close()` can force-close this connection's socket
 			// even while the reader is parked on a long-lived SSE read.
 			auto slot = new ListenSocketSlot;
@@ -2130,6 +2129,20 @@ final class HttpClientTransport : ClientTransport
 				serverStreamSlots = serverStreamSlots.remove!(s => s is slot);
 			}
 			() {
+				// A bearer provider that throws fails only this attempt; the loop
+				// backs off and asks it again.
+				string bearer;
+				try
+					bearer = currentBearer();
+				catch (Exception e)
+				{
+					import vibe.core.log : logWarn;
+
+					logWarn("[mcp.client] standalone stream could not obtain a bearer token: %s",
+							e.msg);
+					return;
+				}
+				sentBearer = bearerProvider.onRejected !is null ? bearer : null;
 				try
 				{
 					// Resolve + pin the endpoint host to a numeric address on every
@@ -6740,6 +6753,39 @@ unittest  // each reconnect of the standalone stream resolves the endpoint host 
 	assert(failure.length == 0, "scenario failed: " ~ failure);
 	assert(gets >= 3, "the standalone stream must keep reconnecting");
 	assert(resolutions >= 3, "every reconnect must resolve the host, not reuse the first address");
+}
+
+unittest  // the standalone stream retries after the bearer provider throws
+{
+	import core.time : msecs, MonoTime;
+	import vibe.core.core : sleep;
+
+	int calls;
+	string[] auths;
+	auto router = new URLRouter;
+	router.get("/mcp", (HTTPServerRequest req, HTTPServerResponse res) @safe {
+		auths ~= req.headers.get("Authorization", "");
+		writeSse(res, ": open\n\n");
+	});
+	const failure = runAgainstFakeServer(router, (string url) @safe {
+		auto t = new HttpClientTransport(url);
+		scope (exit)
+			t.close();
+		BearerProvider p;
+		p.token = () @safe {
+			if (calls++ == 0)
+				throw new Exception("token store unavailable");
+			return "tok";
+		};
+		t.setBearerProvider(p);
+		t.startServerStream();
+		const until = MonoTime.currTime + 3.seconds;
+		while (auths.length == 0 && MonoTime.currTime < until)
+			sleep(20.msecs);
+	});
+	assert(failure.length == 0, "scenario failed: " ~ failure);
+	assert(auths.length >= 1 && auths[0] == "Bearer tok",
+			"a throwing token provider must not end the standalone stream");
 }
 
 unittest  // each reconnect of the standalone stream sends the current protocol-version header
