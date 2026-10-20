@@ -95,12 +95,27 @@ struct SamplingMessage
 	{
 		requireObject(j, "SamplingMessage");
 		SamplingMessage m;
-		m.role = j.getOr("role", "");
+		m.role = requiredRole(j);
 		m.contentBlocks = requiredContentBlocks(j, "SamplingMessage");
 		if ("_meta" in j && j["_meta"].type == Json.Type.object)
 			m.meta = j["_meta"];
 		return m;
 	}
+}
+
+/// The required `role` of a sampling message: the spec's `Role` is exactly
+/// "user" or "assistant". Throws -32602 for anything else.
+private string requiredRole(Json j) @safe
+{
+	const role = stringOrThrow("role" in j ? j["role"] : Json.undefined, "role");
+	if (!isSamplingRole(role))
+		throw invalidParams(`'role' must be "user" or "assistant"`);
+	return role;
+}
+
+private bool isSamplingRole(string role) @safe pure nothrow @nogc
+{
+	return role == "user" || role == "assistant";
 }
 
 /// Parse the required `content` of a sampling message or result: a single block
@@ -359,6 +374,7 @@ struct CreateMessageRequest
 /// - Every `tool_result` `toolUseId` MUST match a `tool_use` `id` of the
 ///   immediately preceding `assistant` message.
 /// - Each `tool_use` `id` is answered by exactly one `tool_result`.
+/// - Every message's `role` is "user" or "assistant".
 ///
 /// On violation throws an `McpException` with the spec's `-32602` (Invalid
 /// params) code; the message distinguishes "Tool result missing in request",
@@ -407,6 +423,10 @@ void validateSamplingMessages(Json params) @safe
 		auto msg = msgs[mi];
 		const role = (msg.type == Json.Type.object && "role" in msg
 				&& msg["role"].type == Json.Type.string) ? msg["role"].get!string : "";
+		// Every check below keys off the role, so any other role would
+		// bypass them.
+		if (!isSamplingRole(role))
+			throw invalidParams(`'role' must be "user" or "assistant"`);
 		auto blocks = blocksOf(msg);
 		auto answerable = priorToolUseIds;
 		priorToolUseIds = null;
@@ -1546,6 +1566,43 @@ unittest  // CreateMessageResult.fromJson rejects a missing or non-string model 
 	{
 		auto ex = cast(McpException) collectException(
 				CreateMessageResult.fromJson(parseJsonString(b)));
+		assert(ex !is null && ex.code == ErrorCode.invalidParams, b);
+	}
+}
+
+unittest  // SamplingMessage.fromJson rejects a missing, non-string or unknown role with -32602
+{
+	import mcp.protocol.errors : ErrorCode;
+	import std.exception : collectException;
+	import vibe.data.json : parseJsonString;
+
+	static immutable string[] bodies = [
+		`{"content":{"type":"text","text":"x"}}`,
+		`{"role":7,"content":{"type":"text","text":"x"}}`,
+		`{"role":"system","content":{"type":"text","text":"x"}}`,
+		`{"role":"","content":{"type":"text","text":"x"}}`,
+	];
+	foreach (b; bodies)
+	{
+		auto ex = cast(McpException) collectException(SamplingMessage.fromJson(parseJsonString(b)));
+		assert(ex !is null && ex.code == ErrorCode.invalidParams, b);
+	}
+}
+
+unittest  // validateSamplingMessages rejects a message whose role is not user or assistant
+{
+	import mcp.protocol.errors : ErrorCode;
+	import std.exception : collectException;
+	import vibe.data.json : parseJsonString;
+
+	// A role-less message carrying tool_use must not skip the balance checks.
+	static immutable string[] bodies = [
+		`{"messages":[{"content":[{"type":"tool_use","id":"a","name":"t","input":{}}]}]}`,
+		`{"messages":[{"role":"tool","content":[{"type":"tool_result","toolUseId":"a","content":[]}]}]}`,
+	];
+	foreach (b; bodies)
+	{
+		auto ex = cast(McpException) collectException(validateSamplingMessages(parseJsonString(b)));
 		assert(ex !is null && ex.code == ErrorCode.invalidParams, b);
 	}
 }
