@@ -2696,6 +2696,45 @@ private void handlePost(McpServer server, ServerPushChannel push,
 		return;
 	}
 
+	// Spec (2025-06-18 / 2025-11-25 Transports §Protocol Version Header): an
+	// invalid or unsupported MCP-Protocol-Version header MUST be rejected with
+	// 400 on EVERY POST to the MCP endpoint, whatever the body kind. It runs
+	// before the session gate, as on GET and DELETE, so a client probing with a
+	// version this server does not serve learns the supported list rather than
+	// a missing-session error. A batch, notification or response error body
+	// carries no id (basic/transports: "a JSON-RPC error response that has no
+	// id"); a request error echoes the request id.
+	const singleRequest = !input.isBatch && input.messages[0].kind == MessageKind.request;
+	if (auto verErr = validateProtocolVersionHeader(req.headers.get(HttpHeader.protocolVersion,
+			""), server.servedVersions))
+	{
+		res.statusCode = HTTPStatus.badRequest;
+		res.writeBody(makeErrorResponse(singleRequest ? input.messages[0].id
+				: Json(null), verErr).toString(), "application/json");
+		return;
+	}
+
+	// The effective modern signal for a request: the modern protocol is
+	// stateless-only and may negotiate via the body `_meta.protocolVersion`
+	// alone (absent/legacy MCP-Protocol-Version header), so classify the
+	// request as modern on header OR body — the same precedence the rest of this
+	// handler (opensListenStream, httpStatusForResponse, freshStatelessState)
+	// uses. All modern-gated header validation below keys off this single value.
+	const isModernReq = singleRequest && (tryModern(req.headers.get(HttpHeader.protocolVersion,
+			"")) || tryModern(RequestMeta.fromParams(input.messages[0].params).protocolVersion));
+	// 2026-07-28 is stateless-only: a stateful server refuses it, listing the
+	// versions it serves, before the session gate (a modern client carries no
+	// session) and before any modern-only route (listen, events/stream).
+	if (isModernReq && server.mode == ServerMode.stateful)
+	{
+		const requested = RequestMeta.fromParams(input.messages[0].params).protocolVersion;
+		res.statusCode = HTTPStatus.badRequest;
+		res.writeBody(makeErrorResponse(input.messages[0].id,
+				server.unsupportedVersionError(requested.length ? requested
+				: req.headers.get(HttpHeader.protocolVersion, ""))).toString(), "application/json");
+		return;
+	}
+
 	// Session Management: when enabled, the very first request MUST be an
 	// `initialize` (which receives a freshly-minted Mcp-Session-Id); every
 	// later request MUST carry that id (400 when absent, 404 when unknown or
@@ -2734,19 +2773,12 @@ private void handlePost(McpServer server, ServerPushChannel push,
 	// JSON-RPC batching (an array body) was introduced in 2025-03-26 and removed
 	// in every later revision: 2025-06-18 / 2025-11-25 / modern all require the
 	// POST body to be a SINGLE request, notification, or response
-	// (basic/transports §Sending Messages). The MCP-Protocol-Version header is
-	// first validated by validateProtocolVersionHeader (so an invalid/unsupported
-	// version on a batch is still rejected with 400), then the effective version
-	// decides batch acceptance: only 2025-03-26 keeps the legacy batch path.
+	// (basic/transports §Sending Messages). The MCP-Protocol-Version header was
+	// validated above (so an invalid/unsupported version on a batch is still
+	// rejected with 400); the effective version decides batch acceptance: only
+	// 2025-03-26 keeps the legacy batch path.
 	if (input.isBatch)
 	{
-		if (auto verErr = validateProtocolVersionHeader(req.headers.get(HttpHeader.protocolVersion,
-				""), server.servedVersions))
-		{
-			res.statusCode = HTTPStatus.badRequest;
-			res.writeBody(makeErrorResponse(Json(null), verErr).toString(), "application/json");
-			return;
-		}
 		const accept = req.headers.get("Accept", "");
 		if (carriesRequest(input) && !postAccepted(accept))
 		{
@@ -2834,22 +2866,6 @@ private void handlePost(McpServer server, ServerPushChannel push,
 
 	auto msg = input.messages[0];
 
-	// Spec (2025-06-18 / 2025-11-25 Transports §Protocol Version Header): an
-	// invalid or unsupported MCP-Protocol-Version header MUST be rejected with
-	// 400 on EVERY POST to the MCP endpoint, including notification/response
-	// bodies (which otherwise take the 202 path below). Run the gate before the
-	// per-kind switch so all branches are covered. A notification/response error
-	// body carries no id (basic/transports: "a JSON-RPC error response that has
-	// no id"); a request error echoes the request id.
-	if (auto verErr = validateProtocolVersionHeader(req.headers.get(HttpHeader.protocolVersion,
-			""), server.servedVersions))
-	{
-		const errId = (msg.kind == MessageKind.request) ? msg.id : Json(null);
-		res.statusCode = HTTPStatus.badRequest;
-		res.writeBody(makeErrorResponse(errId, verErr).toString(), "application/json");
-		return;
-	}
-
 	final switch (msg.kind)
 	{
 	case MessageKind.response:
@@ -2936,27 +2952,6 @@ private void handlePost(McpServer server, ServerPushChannel push,
 				res.writeBody(makeErrorResponse(msg.id, e).toString(), "application/json");
 				return;
 			}
-		}
-		// The effective modern signal for this request: the modern protocol is
-		// stateless-only and may negotiate via the body `_meta.protocolVersion`
-		// alone (absent/legacy MCP-Protocol-Version header), so classify the
-		// request as modern on header OR body — the same precedence the rest of this
-		// handler (opensListenStream, httpStatusForResponse, freshStatelessState)
-		// uses. All modern-gated header validation below keys off this single value.
-		const isModernReq = tryModern(req.headers.get(HttpHeader.protocolVersion, ""))
-			|| tryModern(RequestMeta.fromParams(msg.params).protocolVersion);
-		// 2026-07-28 is stateless-only: a stateful server refuses it, listing the
-		// versions it serves, before any modern-only route (listen, events/stream).
-		if (isModernReq && server.mode == ServerMode.stateful)
-		{
-			sessions !is null && sessions.terminate(mintedSessionId);
-			const requested = RequestMeta.fromParams(msg.params).protocolVersion;
-			res.statusCode = HTTPStatus.badRequest;
-			res.writeBody(makeErrorResponse(msg.id,
-					server.unsupportedVersionError(requested.length
-					? requested : req.headers.get(HttpHeader.protocolVersion, ""))).toString(),
-					"application/json");
-			return;
 		}
 		if (auto hdrErr = validatePostRequestHeaders(req, msg, isModernReq, server))
 		{
@@ -6483,6 +6478,40 @@ unittest  // a stateful server answers a body-signalled 2026-07-28 subscriptions
 	assert(res.statusCode == HTTPStatus.badRequest);
 	auto resp = parseJsonString(cast(string) sink.data.idup);
 	assert(resp["error"]["code"].get!int == ErrorCode.unsupportedProtocolVersion);
+}
+
+unittest  // a stateful server refuses a session-less 2026-07-28 request with -32022, not a missing-session 400
+{
+	import vibe.data.json : parseJsonString;
+	import vibe.http.server : createTestHTTPServerResponse, TestHTTPResponseMode;
+	import vibe.http.router : URLRouter;
+	import vibe.stream.memory : createMemoryOutputStream;
+
+	auto server = McpServer.stateful("t", "1");
+	auto router = new URLRouter;
+	mountMcp(router, server);
+
+	Json meta = Json.emptyObject;
+	meta[MetaKey.protocolVersion] = "2026-07-28";
+	meta[MetaKey.clientCapabilities] = Json.emptyObject;
+	Json params = Json.emptyObject;
+	params["_meta"] = meta;
+
+	auto sink = createMemoryOutputStream();
+	auto res = createTestHTTPServerResponse(sink, null, TestHTTPResponseMode.bodyOnly);
+	router.handleRequest(makeInitPostReq(makeRequest(Json(1),
+			"server/discover", params).toString(),
+			[
+				"Accept": "application/json, text/event-stream",
+				HttpHeader.protocolVersion: "2026-07-28",
+				HttpHeader.method: "server/discover",
+	]), res);
+
+	assert(res.statusCode == HTTPStatus.badRequest);
+	auto resp = parseJsonString(cast(string) sink.data.idup);
+	assert(resp["error"]["code"].get!int == ErrorCode.unsupportedProtocolVersion);
+	assert(resp["error"]["data"]["supported"].length > 0);
+	assert(resp["id"].get!int == 1);
 }
 
 unittest  // an initialize that fails header validation mints no surviving session and no header
