@@ -1669,8 +1669,10 @@ final class McpClient : ClientProtocol
 		if (cacheGeneration("tools/list", "") == generation && identityEpoch_ == epoch)
 		{
 			listedTools_ = null;
+			// The index keeps its own copies so caller edits to the returned
+			// schemas never change mirroring or output validation.
 			foreach (t; acc.tools)
-				listedTools_[t.name] = t;
+				listedTools_[t.name] = Tool.fromJson(t.toJson().clone);
 			haveListedTools_ = true;
 		}
 		return acc;
@@ -1900,8 +1902,11 @@ final class McpClient : ClientProtocol
 		{
 			CacheKey hitKey;
 			auto hit = cachedEntry(logical, hitKey);
+			// Results hold nested Json by reference, so both the stored entry and
+			// each hit are deep copies: a caller mutating its result cannot alter
+			// what later callers are served.
 			if (!hit.isNull)
-				return R.fromJson(hit.get.value);
+				return R.fromJson(hit.get.value.clone);
 		}
 		const generation = beginCacheFetch(logical.method, logical.key);
 		scope (exit)
@@ -1916,7 +1921,7 @@ final class McpClient : ClientProtocol
 		{
 			const scope_ = result.cache.isNull ? CacheScope.private_ : result.cache.get.cacheScope;
 			const storeKey = scopedKey(logical, scope_);
-			cacheStore_.put(storeKey, CacheEntry(result.toJson(), now_() + ttl, scope_));
+			cacheStore_.put(storeKey, CacheEntry(result.toJson().clone, now_() + ttl, scope_));
 			// If the scope flipped since a prior fetch, drop the now-stale entry
 			// that was stored under the other partition for this logical key.
 			const otherKey = (storeKey == ownKey) ? sharedKey : ownKey;
@@ -9150,6 +9155,29 @@ unittest  // defaultCacheTtl caches a response that carries no server hint
 	c.listTools();
 	c.listTools();
 	assert(calls == 1, "unhinted response cached under defaultCacheTtl");
+}
+
+unittest  // mutating a returned result's nested Json never alters the cached entry
+{
+	auto c = McpClient.http("http://localhost");
+	c.onRpcForTest = (string m, Json p) @safe {
+		Json r = Json.emptyObject;
+		r["tools"] = Json([
+			parseJsonString(`{"name":"t","inputSchema":{"type":"object",`
+					~ `"properties":{"a":{"type":"string"}}}}`)
+		]);
+		r["ttlMs"] = 5000;
+		return r;
+	};
+	auto first = c.listTools();
+	first.tools[0].inputSchema["properties"]["a"]["type"] = "number";
+	auto second = c.listTools();
+	assert(second.tools[0].inputSchema["properties"]["a"]["type"].get!string == "string",
+			"caller mutation of a stored result leaked into the cache");
+	second.tools[0].inputSchema["properties"]["a"]["type"] = "boolean";
+	auto third = c.listTools();
+	assert(third.tools[0].inputSchema["properties"]["a"]["type"].get!string == "string",
+			"caller mutation of a cache hit leaked into the cache");
 }
 
 unittest  // an expired cache entry triggers a refetch
