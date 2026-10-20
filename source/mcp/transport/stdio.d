@@ -425,6 +425,8 @@ void serveStdio(McpServer server, string delegate() @safe readLine,
 	channel.maxRequestTasks = 0;
 	// Change notifications for a 2025-era client ride the same serialized writer.
 	server.attachStdioSink(&sink);
+	server.attachStdioRequester((string method, Json params,
+			Duration timeout) @safe => channel.request(method, params, timeout));
 	scope (exit)
 		server.detachStdio();
 

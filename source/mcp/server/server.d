@@ -333,6 +333,10 @@ final class McpServer : ServerCore
 	// receives change notifications on the shared stdout channel once its
 	// stateful `initialize` handshake is processed (see `writeStdioPlain`).
 	private void delegate(string) @safe stdioSink_;
+	// The stdio transport's server->client request channel, installed by
+	// `serveStdio` for the life of the read loop; `pingClient` uses it to reach
+	// the stdio peer outside any request.
+	private Json delegate(string method, Json params, Duration timeout) @safe stdioRequester_;
 	private bool toolListChangedEnabled;
 	private bool resourcesListChangedEnabled;
 	private bool promptsListChangedEnabled;
@@ -1808,6 +1812,14 @@ final class McpServer : ServerCore
 		stdioSink_ = sink;
 	}
 
+	/// Install the stdio transport's server->client request channel. Called by
+	/// `serveStdio` before its read loop starts.
+	package(mcp) void attachStdioRequester(Json delegate(string method,
+			Json params, Duration timeout) @safe requester) @safe
+	{
+		stdioRequester_ = requester;
+	}
+
 	/// Drop every piece of stdio stream state once `serveStdio` returns: the write
 	/// sink, the `subscriptions/listen` stream, and every open `events/stream`
 	/// (closing each releases its subscription). The client has gone, so no
@@ -1815,6 +1827,7 @@ final class McpServer : ServerCore
 	package(mcp) void detachStdio() @safe
 	{
 		stdioSink_ = null;
+		stdioRequester_ = null;
 		stdioListenSink = null;
 		stdioListenSubscriptionId = Json.init;
 		stdioListenFilter_ = ListenFilter.init;
@@ -2287,35 +2300,57 @@ final class McpServer : ServerCore
 		return (string method, string uri) @safe => plainGetEligibleFor(conn, method, uri);
 	}
 
-	/// Initiate a server->client `ping` on the standalone GET SSE stream owned by
-	/// the stateful HTTP session `sessionId` (its `Mcp-Session-Id`) and block until
-	/// the client acknowledges with the spec-mandated empty result
-	/// (basic/utilities/ping: "Either the client or server can initiate a ping by
-	/// sending a `ping` request"). This is the server-side counterpart to
-	/// `McpClient.ping()`. The waiter is scoped to `sessionId`, so only a response
-	/// POSTed under the same session resolves it; `connectedSessions` lists the
-	/// sessions that can be probed.
+	/// Initiate a server->client `ping` and block until the client acknowledges
+	/// with the spec-mandated empty result (basic/utilities/ping: "Either the
+	/// client or server can initiate a ping by sending a `ping` request"). This is
+	/// the server-side counterpart to `McpClient.ping()`; `connectedSessions`
+	/// lists the `sessionId`s that can be probed.
 	///
-	/// Throws `internalError` when the server is not mounted on a Streamable HTTP
-	/// transport (no push channel) or no GET stream is connected for that session,
-	/// or on a client error / timeout (treat a timeout as a stale connection per
-	/// the spec). The request carries no params, exactly as the spec requires.
+	/// On Streamable HTTP the ping goes out on the standalone GET SSE stream owned
+	/// by the stateful session `sessionId` (its `Mcp-Session-Id`), and only a
+	/// response POSTed under the same session resolves it. On stdio the single
+	/// peer has no session id: pass `""` to ping it once it has completed a
+	/// stateful `initialize`.
+	///
+	/// Throws `internalError` when no such client is connected (no transport
+	/// attached, no GET stream for that session, a non-empty `sessionId` on stdio,
+	/// or a stdio peer that has not initialized a stateful session), or on a
+	/// client error / timeout (treat a timeout as a stale connection per the
+	/// spec). The request carries no params, exactly as the spec requires.
 	void pingClient(string sessionId, Duration timeout = 60.seconds) @safe
 	{
-		if (pushChannel is null)
-			throw internalError("No server->client push channel; the server is not mounted on a Streamable HTTP transport");
-		pushChannel.ping(timeout, sessionId);
+		if (pushChannel !is null)
+		{
+			pushChannel.ping(timeout, sessionId);
+			return;
+		}
+		if (!stdioPeerPingable())
+			throw internalError("No connected client to ping: the server is neither mounted on"
+					~ " Streamable HTTP nor serving an initialized stateful stdio client");
+		if (sessionId.length)
+			throw internalError("A stdio client has no session id; ping it with pingClient(\"\")");
+		stdioRequester_("ping", Json.emptyObject, timeout);
 	}
 
-	/// The session tokens (`Mcp-Session-Id`s) that currently have a connected GET SSE
-	/// stream, so a caller can `pingClient(token)` each live session in turn rather
-	/// than guessing. Empty when there is no push channel or no session-scoped GET
-	/// stream is open.
+	/// The session ids `pingClient` can currently reach: on Streamable HTTP the
+	/// `Mcp-Session-Id`s with a connected GET SSE stream, on stdio `[""]` once the
+	/// peer has initialized a stateful session. Empty when no such client is
+	/// connected.
 	string[] connectedSessions() @safe
 	{
-		if (pushChannel is null)
-			return null;
-		return pushChannel.connectedOwnerTokens();
+		if (pushChannel !is null)
+			return pushChannel.connectedOwnerTokens();
+		return stdioPeerPingable() ? [""] : null;
+	}
+
+	/// Whether the stdio peer can receive a server-initiated request: the stdio
+	/// transport is attached and the peer completed a stateful `initialize` (the
+	/// 2026-07-28 protocol defines no server-initiated requests outside a client
+	/// request).
+	private bool stdioPeerPingable() @safe
+	{
+		return stdioRequester_ !is null && mode_ == ServerMode.stateful
+			&& activeConnection.initializeProcessed && !activeConnection.negotiated.isModern;
 	}
 
 	/// Capabilities this server advertises, derived from what is registered.
@@ -5637,6 +5672,36 @@ unittest  // connectedSessions enumerates the live session-scoped GET streams
 	assert(tokens.length == 2);
 	assert(tokens.canFind("sess-A"));
 	assert(tokens.canFind("sess-B"));
+}
+
+unittest  // pingClient and connectedSessions reach an initialized stateful stdio client
+{
+	import core.time : Duration, seconds;
+	import std.exception : assertThrown;
+
+	auto s = McpServer.stateful("t", "1");
+	string[] sent;
+	s.attachStdioSink((string) @safe {});
+	s.attachStdioRequester((string method, Json params, Duration timeout) @safe {
+		sent ~= method;
+		return Json.emptyObject;
+	});
+	assertThrown(s.pingClient(""), "no client has initialized yet");
+	assert(s.connectedSessions().length == 0);
+
+	Json initP = Json.emptyObject;
+	initP["protocolVersion"] = "2025-06-18";
+	initP["capabilities"] = Json.emptyObject;
+	initP["clientInfo"] = Json(["name": Json("c"), "version": Json("1")]);
+	s.handle(req(1, "initialize", initP));
+	assert(s.connectedSessions() == [""]);
+	s.pingClient("", 5.seconds);
+	assert(sent == ["ping"]);
+	assertThrown(s.pingClient("sess-A"), "a stdio client has no session id");
+
+	s.detachStdio();
+	assertThrown(s.pingClient(""));
+	assert(s.connectedSessions().length == 0);
 }
 
 unittest  // notifications produce no response
