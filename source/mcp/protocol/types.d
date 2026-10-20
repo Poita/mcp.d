@@ -3929,10 +3929,9 @@ struct ElicitParams
 
 	static ElicitParams fromJson(Json j) @safe
 	{
+		requireObject(j, "ElicitParams");
 		ElicitParams p;
 		p.raw = j;
-		if (j.type != Json.Type.object)
-			return p;
 		if ("mode" in j)
 		{
 			import mcp.protocol.jsonhelpers : stringOrThrow;
@@ -5685,12 +5684,12 @@ struct CompleteRequest
 		return reference.type == "ref/resource";
 	}
 
-	/// Parse the raw `completion/complete` params object.
+	/// Parse the raw `completion/complete` params object. Throws -32602 when
+	/// `params` is not an object.
 	static CompleteRequest fromJson(Json params) @safe
 	{
+		requireObject(params, "CompleteRequest");
 		CompleteRequest r;
-		if (params.type != Json.Type.object)
-			return r;
 		if ("ref" in params && params["ref"].type == Json.Type.object)
 		{
 			auto refJson = params["ref"];
@@ -6677,6 +6676,21 @@ unittest  // CompleteRequest.fromJson parses context.arguments
 	p["context"] = ctx;
 	auto r = CompleteRequest.fromJson(p);
 	assert(r.context["repo"] == "mcp.d");
+}
+
+unittest  // CompleteRequest.fromJson and ElicitParams.fromJson reject non-object params with -32602
+{
+	import std.exception : collectException;
+
+	foreach (v; [
+			Json.undefined, Json(null), Json(5), Json("x"), Json.emptyArray
+		])
+	{
+		auto c = collectException!McpException(CompleteRequest.fromJson(v));
+		assert(c !is null && c.code == ErrorCode.invalidParams, v.toString);
+		auto e = collectException!McpException(ElicitParams.fromJson(v));
+		assert(e !is null && e.code == ErrorCode.invalidParams, v.toString);
+	}
 }
 
 unittest  // CompleteRequest.fromJson tolerates an empty/garbage params object
