@@ -3523,7 +3523,10 @@ final class McpServer : ServerCore
 		if ("uri" !in params || params["uri"].type != Json.Type.string)
 			throw invalidParams("resources/directory/read requires a string 'uri'");
 		const dir = params["uri"].get!string;
-		const prefix = dir ~ "/";
+		// Directory URIs are canonically slash-free at the end, so one trailing
+		// slash is dropped: `skill://pdf/` names the same directory as
+		// `skill://pdf`, and `skill://` lists the scheme's top-level entries.
+		const prefix = (dir.length && dir[$ - 1] == '/') ? dir : dir ~ "/";
 
 		// A directory's direct children: registered resources whose URI sits one
 		// path segment below `prefix` are files; a deeper resource contributes its
@@ -10805,6 +10808,22 @@ unittest  // resources/directory/read reports a URI that is both a file and a su
 	assert(res.length == 2);
 	assert(res[0]["uri"].get!string == "s://d/a");
 	assert(res[1]["uri"].get!string == "s://d/c");
+}
+
+unittest  // resources/directory/read accepts a directory URI written with a trailing slash
+{
+	auto s = McpServer.stateless("t", "1");
+	s.enableDirectoryRead();
+	foreach (u; ["skill://pdf/SKILL.md", "skill://pdf/ref/forms.md"])
+	{
+		Resource r = {uri: u, name: u};
+		s.registerResource(r, () @safe => ResourceContents.makeText(u, "text/plain", "x"));
+	}
+	auto res = s.handle(modernReq(1, "resources/directory/read",
+			Json(["uri": Json("skill://pdf/")]))).get["result"]["resources"];
+	assert(res.length == 2);
+	assert(res[0]["uri"].get!string == "skill://pdf/SKILL.md");
+	assert(res[1]["uri"].get!string == "skill://pdf/ref");
 }
 
 unittest  // setListCacheHint configures the modern resources/directory/read freshness hint
