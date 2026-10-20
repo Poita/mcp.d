@@ -140,7 +140,7 @@ unittest  // a page size of size_t.max after a cursor returns the rest of the li
 	size_t b, e;
 	Nullable!string next;
 	pageBounds("tools/list", Json([
-			"cursor": Json(encodeCursor("tools/list", "a"))
+		"cursor": Json(encodeCursor("tools/list", "a"))
 	]), ["a", "b", "c"], size_t.max, b, e, next);
 	assert(b == 1 && e == 3 && next.isNull);
 }
