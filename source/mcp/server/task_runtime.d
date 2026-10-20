@@ -112,6 +112,21 @@ final class TaskRuntime
 	private bool[string] silenced_;
 	// When a create refused at its cap last swept the store.
 	private SysTime lastCapSweep_;
+	// Per-task status notification ordering (see `notifyStatusChange`).
+	private NoticeQueue[string] notices_;
+
+	private static struct PendingNotice
+	{
+		Json detailed;
+		string owner;
+	}
+
+	private static struct NoticeQueue
+	{
+		ulong lastRevision;
+		bool sending;
+		Nullable!PendingNotice next;
+	}
 
 	/// Whether a task executor's unexpected (non-`McpException`) exception message
 	/// is recorded as the failed task's error, rather than a generic "Internal
@@ -381,7 +396,7 @@ final class TaskRuntime
 		r.inputRequests = Json.emptyObject;
 		r.meta.lastUpdatedAt = stamp();
 		if (store_.compareAndSwap(r, expected))
-			notifyStatusChange(r);
+			notifyStatusChange(r, expected + 1);
 		return store_.get(r.meta.taskId);
 	}
 
@@ -443,6 +458,7 @@ final class TaskRuntime
 		});
 		foreach (id; overdue)
 			fetch(id);
+		pruneNotices();
 		return removed;
 	}
 
@@ -513,29 +529,69 @@ final class TaskRuntime
 			if (!store_.compareAndSwap(r, expected))
 				continue;
 			if (change == Change.status)
-				notifyStatusChange(r);
+				notifyStatusChange(r, expected + 1);
 			return true;
 		}
 		throw internalError("task '" ~ id ~ "' is contended; the update was not applied");
 	}
 
 	/// Push a committed status change to the `onStatusChange` sink, built from the
-	/// record as committed: a re-read could observe a later writer's state, so a
-	/// state another transition superseded would never be reported. Best-effort:
-	/// the transition is already stored and visible via `tasks/get`, so a failing
+	/// record as committed at `revision`: a re-read could observe a later
+	/// writer's state, so a state another transition superseded would never be
+	/// reported. Deliveries for one task are serialized and kept in revision
+	/// order: a change committed while another is being delivered (the sink may
+	/// yield) waits for it, only the newest waiting change is sent, and one
+	/// older than a change already reported or waiting is dropped, so a client
+	/// never sees a task step back to an earlier state. Best-effort: the
+	/// transition is already stored and visible via `tasks/get`, so a failing
 	/// sink (e.g. a closed output stream) is logged rather than propagated into
 	/// the caller, which would otherwise fail or abort a healthy task.
-	private void notifyStatusChange(const TaskRecord r) @safe
+	private void notifyStatusChange(const TaskRecord r, ulong revision) @safe
 	{
 		import vibe.core.log : logWarn;
 
 		const id = r.meta.taskId;
 		if (onStatusChange_ is null || id in silenced_)
 			return;
-		try
-			onStatusChange_(detailedOf(r), r.owner);
-		catch (Exception e)
-			logWarn("task %s: status notification failed: %s", id, e.msg);
+		auto q = &notices_.require(id, NoticeQueue.init);
+		if (revision <= q.lastRevision)
+			return;
+		q.lastRevision = revision;
+		auto notice = PendingNotice(detailedOf(r), r.owner);
+		if (q.sending)
+		{
+			q.next = nullable(notice);
+			return;
+		}
+		q.sending = true;
+		while (true)
+		{
+			try
+				onStatusChange_(notice.detailed, notice.owner);
+			catch (Exception e)
+				logWarn("task %s: status notification failed: %s", id, e.msg);
+			// The sink may have yielded and the table grown, so look the
+			// queue up afresh.
+			q = id in notices_;
+			if (q.next.isNull)
+			{
+				q.sending = false;
+				return;
+			}
+			notice = q.next.get;
+			q.next.nullify();
+		}
+	}
+
+	/// Forget the notification queues of tasks no longer in the store.
+	private void pruneNotices() @safe
+	{
+		string[] gone;
+		foreach (id, ref q; notices_)
+			if (!q.sending && store_.header(id).isNull)
+				gone ~= id;
+		foreach (id; gone)
+			notices_.remove(id);
 	}
 
 	/// Move `r` to `status`. The status message describes the state being left,
@@ -1992,10 +2048,8 @@ unittest  // a failure racing a cancel request settles the task cancelled
 	assert("error" !in d);
 }
 
-unittest  // each status notification carries the state its own transition committed
+unittest  // a status notification overtaken by a later commit is dropped, not sent after it
 {
-	import std.algorithm : sort;
-
 	auto store = new RacingTaskStore();
 	auto rt = new TaskRuntime(TaskOptions(store));
 	string[] seen;
@@ -2007,8 +2061,23 @@ unittest  // each status notification carries the state its own transition commi
 	rt.requireInput(t.taskId, Json([
 			"a": Json(["method": Json("elicitation/create")])
 	]));
-	seen.sort();
-	assert(seen == ["completed", "input_required"]);
+	assert(seen == ["completed"]);
+}
+
+unittest  // a status change committed while the sink delivers is sent after the one in flight
+{
+	auto rt = new TaskRuntime(TaskOptions.init);
+	string[] seen;
+	string id;
+	rt.onStatusChange((Json d, string owner) @safe {
+		// The first delivery yields; meanwhile another fiber reports progress.
+		if (seen.length == 0 && d["statusMessage"].get!string == "a")
+			rt.progress(id, "b");
+		seen ~= d["statusMessage"].get!string;
+	});
+	id = rt.createFor("job", Json.undefined).taskId;
+	rt.progress(id, "a");
+	assert(seen == ["a", "b"]);
 }
 
 unittest  // a dispatch that fails to record its outcome releases its claim so a redelivery runs
