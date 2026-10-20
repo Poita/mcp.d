@@ -1507,6 +1507,18 @@ final class ServerPushChannel : PushChannel
 		bool forwarded;
 	}
 
+	/// The id the next event published on stream `ordinal` will carry, without
+	/// consuming it.
+	string peekStreamEventId(long ordinal) @safe
+	{
+		import std.conv : to;
+
+		return () {
+			synchronized (mtx)
+				return ordinal.to!string ~ "-" ~ nextSeq.get(ordinal, 0).to!string;
+		}();
+	}
+
 	/// Frame `msg` as the next event of the POST-initiated stream `ordinal`,
 	/// record it for replay while the stream is open (see `openStream`), and forward it to a GET listener that has resumed the
 	/// stream. Returns the frame and whether it was forwarded; the caller writes an
@@ -3024,13 +3036,16 @@ final class HttpStreamContext : RequestContext, ConnectionScoped
 		return token is null ? null : *token;
 	}
 
-	/// The globally-unique id this stream will assign to its next SSE event.
-	/// Exposed for resumability tooling and tests; the format is opaque but
-	/// stable and unique across all streams of the owning mount.
+	/// The id this stream's next SSE event will carry. On a resumable stream the
+	/// replay channel assigns event ids, so the id is read from it; otherwise it
+	/// comes from this stream's own counter (and the event itself carries no id).
+	/// The format is opaque but unique across all streams of the owning mount.
 	string nextEventId() @safe
 	{
 		import std.conv : to;
 
+		if (replay_ !is null)
+			return replay_.peekStreamEventId(streamId);
 		return streamId.to!string ~ "-" ~ eventSeq.to!string;
 	}
 
@@ -4105,6 +4120,19 @@ version (unittest) private HttpStreamContext resumablePostStream(ServerPushChann
 			TokenInfo.invalid(), false, ProtocolVersion.v2025_11_25, sid);
 	ctx.enableReplay(ch);
 	return ctx;
+}
+
+unittest  // a resumable stream's nextEventId is the id the channel gives its next event
+{
+	import std.algorithm : startsWith;
+
+	auto ch = new ServerPushChannel(new StreamCoordinator);
+	auto ctx = resumablePostStream(ch, "sess-A");
+	ctx.log("info", Json("first"));
+	ch.publishStreamEvent(ctx.streamId, "sess-A", Json("published by the channel"));
+	const expected = ctx.nextEventId();
+	const next = ch.publishStreamEvent(ctx.streamId, "sess-A", Json("next"));
+	assert(next.frame.startsWith("id: " ~ expected ~ "\n"), expected ~ " vs " ~ next.frame);
 }
 
 unittest  // a GET that resumed a POST stream ends once the POST's response is sent
