@@ -154,13 +154,24 @@ struct TaskContext
 		return (key in snapshot().checkpoints) !is null;
 	}
 
-	/// Read a previously stored checkpoint, decoded as `T`. Throws if absent.
+	/// Read a previously stored checkpoint, decoded as `T`. Throws
+	/// `internalError` (with the key in `data.key`) when no checkpoint is
+	/// stored under `key` or it does not decode as `T`: the executor wrote it,
+	/// so either is a server fault.
 	T restore(T)(string key) @safe
 	{
 		auto p = key in snapshot().checkpoints;
 		if (p is null)
-			throw new McpException(ErrorCode.internalError, "no checkpoint stored under key: " ~ key);
-		return deserializeJson!T(*p);
+			throw new McpException(ErrorCode.internalError,
+					"no checkpoint stored under key: " ~ key, Json([
+						"key": Json(key)
+		]));
+		try
+			return deserializeJson!T(*p);
+		catch (Exception e)
+			throw new McpException(ErrorCode.internalError,
+					"checkpoint '" ~ key ~ "' is not a valid " ~ T.stringof ~ ": " ~ e.msg,
+					Json(["key": Json(key)]));
 	}
 
 	/// Suspend the executor pending client input. Persists `requests` as the
@@ -988,20 +999,14 @@ unittest  // re-requesting an input key discards its earlier answer, so only a f
 	};
 	runTaskExecutor(rt, t.taskId, exec);
 	rt.deliverInput(t.taskId, Json([
-			"x": Json([
-				"action": Json("accept"),
-				"content": Json(["x": Json(-1)])
-			])
+		"x": Json(["action": Json("accept"), "content": Json(["x": Json(-1)])])
 	]));
 	rt.resumeWorking(t.taskId);
 	runTaskExecutor(rt, t.taskId, exec);
 	assert(rt.getDetailed(t.taskId)["status"].get!string == "input_required");
 	assert(("x" in rt.takenInput(t.taskId)) is null, "the stale answer was discarded");
 	rt.deliverInput(t.taskId, Json([
-			"x": Json([
-				"action": Json("accept"),
-				"content": Json(["x": Json(5)])
-			])
+		"x": Json(["action": Json("accept"), "content": Json(["x": Json(5)])])
 	]));
 	rt.resumeWorking(t.taskId);
 	runTaskExecutor(rt, t.taskId, exec);
@@ -1153,6 +1158,25 @@ unittest  // an answer that does not decode as the requested type fails the task
 	assert(d["status"].get!string == "failed");
 	assert(d["error"]["code"].get!int == cast(int) ErrorCode.invalidParams);
 	assert(d["error"]["data"]["key"].get!string == "n");
+}
+
+unittest  // restore of a checkpoint that does not decode as the requested type throws internalError
+{
+	import std.exception : collectException;
+	import mcp.server.task_runtime : TaskOptions;
+
+	auto rt = new TaskRuntime(TaskOptions.init);
+	auto t = rt.createFor("cp", Json.undefined);
+	McpException missing, mismatched;
+	runTaskExecutor(rt, t.taskId, (TaskContext tc) @safe {
+		tc.checkpoint("k", "text");
+		missing = collectException!McpException(tc.restore!int("absent"));
+		mismatched = collectException!McpException(tc.restore!int("k"));
+		return Json(["content": Json.emptyArray]);
+	});
+	assert(missing !is null && missing.code == ErrorCode.internalError);
+	assert(mismatched !is null && mismatched.code == ErrorCode.internalError);
+	assert(mismatched.data["key"].get!string == "k");
 }
 
 unittest  // an inline executor forwards its request's cancellation to the task only once
