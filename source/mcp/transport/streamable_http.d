@@ -2229,11 +2229,17 @@ private void handleGet(McpServer server, ServerPushChannel push,
 		if (sessions !is null)
 			sessions.streamClosed(ownerToken, listenerId);
 
-	// vibe.d sends the response headers with the first body write; an SSE comment
-	// flushes them now so the client sees the stream open without waiting for the
-	// first message or heartbeat.
+	// vibe.d sends the response headers with the first body write, so a first
+	// frame goes out now and the client sees the stream open without waiting for
+	// the first message or heartbeat. On 2025-11-25 it is the priming event (an
+	// event id and empty data), which gives the client a Last-Event-ID to resume
+	// with should the stream drop before any message (basic/transports
+	// §Listening for Messages: the same polling behaviour as a POST stream);
+	// elsewhere it is an SSE comment.
+	const primingId = getConn !is null && sendsPrimingEvent(getConn.negotiated)
+		? push.primeListener(listenerId) : "";
 	try
-		writeFrame(": open\n\n");
+		writeFrame(primingId.length ? formatPrimingEvent(primingId) : ": open\n\n");
 	catch (Exception)
 		return;
 
@@ -6074,10 +6080,11 @@ unittest  // a 2025-11-25 session's streamed POST leads with the priming event
 	assert(body_.startsWith(body_[0 .. body_.indexOf("\n")] ~ "\ndata: \n\n"));
 }
 
-unittest  // the standalone GET stream writes its first bytes as soon as it opens
+/// The bytes a standalone GET stream on a fresh `ver` session has written
+/// 500ms after opening, and whether a DELETE then ended it.
+version (unittest) private string firstGetStreamBytes(string ver, out bool ended) @safe
 {
 	import core.time : msecs;
-	import std.algorithm : canFind;
 	import vibe.core.core : runTask, sleep, exitEventLoop, runEventLoop;
 	import vibe.http.common : HTTPMethod;
 	import vibe.http.server : createTestHTTPServerResponse, TestHTTPResponseMode;
@@ -6090,7 +6097,7 @@ unittest  // the standalone GET stream writes its first bytes as soon as it open
 
 	auto initRes = createTestHTTPServerResponse(createMemoryOutputStream(),
 			null, TestHTTPResponseMode.bodyOnly);
-	router.handleRequest(makeInitPostReq(initializeBody(),
+	router.handleRequest(makeInitPostReq(initializeBody(ver),
 			["Accept": "application/json, text/event-stream"]), initRes);
 	const sid = initRes.headers[SessionHeader];
 
@@ -6098,7 +6105,7 @@ unittest  // the standalone GET stream writes its first bytes as soon as it open
 	{
 		auto req = makeInitPostReq("", [
 			"Accept": "text/event-stream",
-			"MCP-Protocol-Version": "2025-11-25",
+			"MCP-Protocol-Version": ver,
 			SessionHeader: sid
 		]);
 		req.method = method;
@@ -6106,7 +6113,7 @@ unittest  // the standalone GET stream writes its first bytes as soon as it open
 	}
 
 	auto sink = createMemoryOutputStream();
-	bool ended;
+	bool done;
 	runTask(() @safe nothrow{
 		try
 			router.handleRequest(getReq(HTTPMethod.GET),
@@ -6114,7 +6121,7 @@ unittest  // the standalone GET stream writes its first bytes as soon as it open
 		catch (Exception)
 		{
 		}
-		ended = true;
+		done = true;
 	});
 	string early;
 	runTask(() @safe nothrow{
@@ -6133,7 +6140,31 @@ unittest  // the standalone GET stream writes its first bytes as soon as it open
 		exitEventLoop();
 	});
 	runEventLoop();
-	assert(early.canFind(": open\n\n"), "the GET stream must flush a first frame at once: " ~ early);
+	ended = done;
+	return early;
+}
+
+unittest  // a 2025-11-25 GET stream opens at once with a priming event
+{
+	import std.algorithm : startsWith;
+	import std.regex : matchFirst, regex;
+
+	bool ended;
+	const early = firstGetStreamBytes("2025-11-25", ended);
+	assert(early.startsWith("id: "), "the GET stream must lead with a priming event: " ~ early);
+	assert(!matchFirst(early, regex(`^id: \d+-\d+\ndata: \n\n`)).empty,
+			"the priming event is an event id and an empty data field: " ~ early);
+	assert(ended, "DELETE must end the GET stream");
+}
+
+unittest  // a pre-2025-11-25 GET stream opens at once with a comment, not a priming event
+{
+	import std.algorithm : startsWith;
+
+	bool ended;
+	const early = firstGetStreamBytes("2025-06-18", ended);
+	assert(early.startsWith(": open\n\n"),
+			"the GET stream must flush a first frame at once: " ~ early);
 	assert(ended, "DELETE must end the GET stream");
 }
 

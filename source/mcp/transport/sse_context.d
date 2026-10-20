@@ -1475,6 +1475,36 @@ final class ServerPushChannel : PushChannel
 		}();
 	}
 
+	/// Consume the next event id of listener `id`'s stream and return it, for the
+	/// priming event a 2025-11-25 standalone GET stream leads with, so a client
+	/// that loses the stream before any event can still resume it with
+	/// `Last-Event-ID`. Returns "" when the listener is gone or keeps no history.
+	string primeListener(long id) @safe
+	{
+		import std.conv : to;
+
+		return () {
+			synchronized (mtx)
+			{
+				const ord = id in streamOf;
+				if (ord is null)
+					return "";
+				foreach (ref l; listeners)
+					if (l.id == id && !l.replayable)
+						return "";
+				if (*ord !in history)
+				{
+					newHistory(*ord);
+					touchHistory(*ord);
+					evictOldHistory();
+				}
+				const seq = nextSeq.get(*ord, 0);
+				nextSeq[*ord] = seq + 1;
+				return (*ord).to!string ~ "-" ~ seq.to!string;
+			}
+		}();
+	}
+
 	/// An event published on a POST-initiated stream: its SSE frame, and whether
 	/// a GET listener that resumed the stream received it.
 	struct StreamEvent
@@ -1713,6 +1743,38 @@ unittest  // removing a listener whose stream has replay history keeps it resuma
 	ch.notify("notifications/message");
 	ch.removeListener(id);
 	assert(ch.streamOwner.length == 1);
+}
+
+unittest  // a primed GET stream resumes from its priming id, replaying every later event
+{
+	import std.algorithm : canFind, startsWith;
+	import std.string : indexOf;
+
+	auto ch = new ServerPushChannel(new StreamCoordinator);
+	string[] first;
+	const a = ch.addListener((string f) @safe { first ~= f; }, Json.init,
+			ListenFilter.init, "", null, "S");
+	const primed = ch.primeListener(a);
+	const ordinal = primed[0 .. primed.indexOf("-")];
+	assert(primed == ordinal ~ "-0");
+	ch.notify("notifications/message", Json(["n": Json(1)]));
+	assert(first.length == 1 && first[0].startsWith("id: " ~ ordinal ~ "-1\n"),
+			"events follow the priming id on the same stream");
+	ch.removeListener(a);
+
+	string[] resumed;
+	ch.addListener((string f) @safe { resumed ~= f; }, Json.init,
+			ListenFilter.init, primed, null, "S");
+	assert(resumed.length == 1 && resumed[0].canFind(`"n":1`));
+}
+
+unittest  // a stream that keeps no history is not primed
+{
+	auto ch = new ServerPushChannel(new StreamCoordinator);
+	const a = ch.addListener((string) @safe {}, Json.init, ListenFilter.init,
+			"", null, "S", "", false);
+	assert(ch.primeListener(a) == "");
+	assert(ch.primeListener(a + 1) == "");
 }
 
 unittest  // a GET carrying Last-Event-ID replays events emitted after that cursor
