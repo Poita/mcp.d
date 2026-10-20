@@ -571,6 +571,11 @@ private enum int maxWebhookFetchesPerPass = 16;
 private enum long verifyBackoffBaseMs = 30 * 1000;
 private enum long verifyBackoffCapMs = 30 * 60 * 1000;
 
+/// How long a delivery waits while another delivery verifies its endpoint: a
+/// probe takes one HTTP round trip, so the waiting job retries soon after
+/// rather than on the failure backoff.
+private enum long verifyInProgressRetryMs = 1000;
+
 /// A live push delivery target — one open `events/stream`. The transport supplies
 /// `deliver`, which writes a `notifications/events/*` frame (already tagged with
 /// the subscription id) on the stream.
@@ -3032,7 +3037,7 @@ final class EventsRuntime
 		{
 			// Another delivery is verifying this endpoint: retry once it has had
 			// time to finish, without counting an attempt against this job.
-			deliveryQueue_.touch(job.jobId, job.attempt, opts_.nowMs() + verifyBackoffBaseMs);
+			deliveryQueue_.touch(job.jobId, job.attempt, opts_.nowMs() + verifyInProgressRetryMs);
 			return true;
 		}
 		if (verification == Verification.backingOff)
@@ -8593,6 +8598,35 @@ unittest  // an unverified endpoint is not re-probed on every emit (verification
 	now += verifyBackoffBaseMs + 1;
 	rt.emit(EventOccurrence("evt_3", "n", "t"));
 	assert(ft.posts.length == afterFirst + 1);
+}
+
+unittest  // a delivery that waited on another's verification of its endpoint retries soon after
+{
+	long now = 1_000_000;
+	auto ft = new FakeWebhookTransport();
+	EventsOptions o;
+	o.nowMs = () @safe => now;
+	o.nowIso = () @safe => "t";
+	o.allowPrivateCallbackHosts = true;
+	o.webhookTransport = ft;
+	o.deliveryExecutor = (void delegate() @safe job) @safe { job(); };
+	o.webhookRetryBase = Duration.zero;
+	auto rt = new EventsRuntime(null, o);
+	foreach (name; ["n", "m"])
+	{
+		EventRegistration reg = {descriptor: EventType(name), emitOnly: true};
+		rt.register(reg);
+	}
+	rt.subscribeWebhook(webhookSub("n", "https://proxy/hooks"), "user-1");
+	rt.subscribeWebhook(webhookSub("m", "https://proxy/hooks"), "user-1");
+	// The second subscription's delivery arrives while the first's challenge
+	// to the shared endpoint is in flight.
+	ft.duringPost = () @safe { rt.emit(EventOccurrence("evt_m", "m", "t")); };
+	rt.emit(EventOccurrence("evt_n", "n", "t"));
+	assert(ft.eventPosts().length == 1);
+	now += 2_000;
+	rt.drainDeliveries();
+	assert(ft.eventPosts().length == 2);
 }
 
 unittest  // publishing to a type with no match or transform builds no per-subscriber context
