@@ -1134,10 +1134,14 @@ package void mountOAuthConsent(URLRouter router, OAuthProxy proxy,
 		if (st.clientId.length)
 		{
 			import mcp.auth.oauth : ClientIdMetadataDocument;
+			import mcp.auth.oauth_proxy : validateClientIdMetadata;
 
 			ClientIdMetadataDocument doc;
 			try
+			{
 				doc = proxy.fetchClientIdMetadata(st.clientId);
+				validateClientIdMetadata(st.clientId, doc, st.clientRedirectUri);
+			}
 			catch (InvalidClientIdMetadataException)
 			{
 				res.statusCode = HTTPStatus.badRequest;
@@ -2910,6 +2914,35 @@ unittest  // CIMD MOUNT: POST /consent for a CIMD client grants consent on the c
 	assert(approved.status == 302);
 	assert(approved.location.startsWith("https://github.com/login/oauth/authorize?"));
 	assert(approved.location.canFind("code_challenge=CH"));
+}
+
+unittest  // CIMD MOUNT: POST /consent records no consent when the refetched document fails validation
+{
+	import core.time : MonoTime, minutes;
+
+	auto doc = cimdMountDoc();
+	auto now = MonoTime.currTime;
+	auto proxy = new OAuthProxy(cimdMountConfig());
+	proxy.clientIdMetadataFetcher = (string url) @safe { return doc; };
+	proxy.setCimdClock(() @safe => now);
+	auto router = new URLRouter;
+	mountOAuthProxy(router, proxy);
+
+	const page = browserGet(router,
+			"https://mcp.example.com/authorize?response_type=code&code_challenge_method=S256&"
+			~ "client_id=https%3A%2F%2Fapp.example.com%2Foauth%2Fclient.json"
+			~ "&code_challenge=CH&scope=read&redirect_uri=http%3A%2F%2F127.0.0.1%3A8765%2Fcb&state=cs",
+			"");
+	// The document changes and the cached copy goes stale before the user approves.
+	doc.redirectUris = ["http://127.0.0.1:9999/other"];
+	now += 10.minutes;
+	const approved = browserPost(router, "https://mcp.example.com/consent",
+			consentForm(page.body_), page.setCookie);
+
+	assert(approved.status == 400);
+	assert(!proxy.hasConsent(page.setCookie,
+			"https://app.example.com/oauth/client.json", ["read"]),
+			"consent must not be recorded for a client whose document failed validation");
 }
 
 unittest  // CIMD MOUNT: a document whose client_id does not match the URL yields 400 invalid_request
