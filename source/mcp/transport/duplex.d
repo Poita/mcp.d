@@ -244,8 +244,8 @@ final class DuplexChannel
 			}
 			if (line is null || stopping_)
 				break;
-			if (line.length == 0)
-				continue; // blank line, ignore
+			if (isBlankLine(line))
+				continue;
 			try
 				handleLine(line);
 			catch (Exception e)
@@ -263,6 +263,16 @@ final class DuplexChannel
 		catch (Exception)
 		{
 		}
+	}
+
+	/// Whether `line` holds only JSON whitespace (space, tab, CR, LF), which
+	/// carries no message and is skipped rather than answered as malformed.
+	private static bool isBlankLine(string line) @safe pure nothrow @nogc
+	{
+		foreach (c; line)
+			if (c != ' ' && c != '\t' && c != '\r' && c != '\n')
+				return false;
+		return true;
 	}
 
 	private void handleLine(string line) @safe
@@ -1688,6 +1698,34 @@ unittest  // a malformed inbound line is answered with a null-id JSON-RPC error 
 	assert(j["jsonrpc"].get!string == "2.0");
 	assert(j["id"].type == Json.Type.null_);
 	assert("error" in j);
+}
+
+unittest  // a whitespace-only inbound line is ignored like a blank one, not answered as malformed
+{
+	auto inbound = new LineLink;
+	string written;
+	runTask(() nothrow{
+		scope (exit)
+			exitEventLoop();
+		try
+		{
+			auto channel = new DuplexChannel(() @safe { return inbound.take(); }, (string s) @safe {
+				written ~= s;
+			}, (Message) @safe {});
+			channel.answersMalformed = true;
+			channel.start();
+			inbound.put("   ");
+			inbound.put("\t\r");
+			inbound.closeEnd();
+			foreach (_; 0 .. 8)
+				yield();
+		}
+		catch (Exception)
+		{
+		}
+	});
+	runEventLoop();
+	assert(written.length == 0, written);
 }
 
 unittest  // answering a malformed line does not stall the read loop behind a peer that stopped reading
