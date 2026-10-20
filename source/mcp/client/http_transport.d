@@ -2528,7 +2528,7 @@ final class HttpClientTransport : ClientTransport
 	void startLegacyFallback() @safe
 	{
 		import vibe.core.core : runTask;
-		import core.time : msecs, MonoTime;
+		import core.time : MonoTime;
 
 		legacyMode = true;
 		legacyStopRequested = false;
@@ -2551,13 +2551,14 @@ final class HttpClientTransport : ClientTransport
 			}
 		});
 
-		// Wait (bounded, ~10s ceiling) for the background task to discover the
-		// endpoint URI, woken by the reader's `notifyLegacy` rather than polling.
+		// Wait up to `listenTimeout_` for the background task to discover the
+		// endpoint URI (the legacy stream's leading frame), woken by the reader's
+		// `notifyLegacy` rather than polling.
 		// Exit immediately when the reader sets `legacyEndpointRejected`: a
 		// cross-origin endpoint was received and rejected by the SSRF guard, so
 		// no valid endpoint will ever arrive on this stream. Exit too when the
 		// reader has ended, since a dead stream delivers no endpoint either.
-		const deadline = MonoTime.currTime + 10_000.msecs;
+		const deadline = MonoTime.currTime + listenTimeout_;
 		while (legacyEndpoint.length == 0 && !legacyEndpointRejected && !legacyStreamEnded)
 		{
 			const now = MonoTime.currTime;
@@ -2648,14 +2649,14 @@ final class HttpClientTransport : ClientTransport
 		throw new TransportClosedException("HTTP transport closed");
 	}
 
-	/// Wait (bounded) for a legacy GET-SSE stream that is being reopened to
-	/// announce its endpoint. Throws `TransportClosedException` when no live
-	/// stream is available.
+	/// Wait up to `listenTimeout_` for a legacy GET-SSE stream that is being
+	/// reopened to announce its endpoint. Throws `TransportClosedException` when
+	/// no live stream is available.
 	private void awaitLegacyStream() @safe
 	{
-		import core.time : msecs, MonoTime;
+		import core.time : MonoTime;
 
-		const deadline = MonoTime.currTime + 10_000.msecs;
+		const deadline = MonoTime.currTime + listenTimeout_;
 		auto ec = legacyCompletionEvent().emitCount;
 		while (legacyReconnecting && !closing && !(legacyStreamAlive && legacyEndpoint.length))
 		{
@@ -7988,6 +7989,40 @@ unittest  // startLegacyFallback surfaces a refused legacy GET connection prompt
 	assert(msg.length);
 	assert(!msg.canFind("did not send an `endpoint` event"), msg);
 	assert(took < 5.seconds);
+}
+
+unittest  // startLegacyFallback waits listenTimeout_ for the endpoint event
+{
+	import core.time : MonoTime, msecs, seconds;
+	import vibe.core.core : sleep;
+
+	bool release;
+	auto router = new URLRouter;
+	router.get("/mcp", (HTTPServerRequest req, HTTPServerResponse res) @safe {
+		writeSse(res, ": no endpoint yet\n\n");
+		const until = MonoTime.currTime + 5.seconds;
+		while (!release && MonoTime.currTime < until)
+			sleep(20.msecs);
+	});
+	bool failed;
+	auto took = 0.seconds;
+	const failure = runAgainstFakeServer(router, (string url) @safe {
+		scope (exit)
+			release = true;
+		auto t = new HttpClientTransport(url);
+		scope (exit)
+			t.close();
+		t.listenTimeout_ = 200.msecs;
+		const start = MonoTime.currTime;
+		try
+			t.startLegacyFallback();
+		catch (McpException)
+			failed = true;
+		took = MonoTime.currTime - start;
+	});
+	assert(failure.length == 0, failure);
+	assert(failed, "a stream with no endpoint event must fail the fallback");
+	assert(took < 2.seconds, "the endpoint wait must follow listenTimeout_");
 }
 
 unittest  // startLegacyFallback surfaces an unresolvable legacy host promptly

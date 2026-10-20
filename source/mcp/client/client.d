@@ -395,8 +395,10 @@ struct ClientSettings
 
 	/// How long opening a `subscriptions/listen` or `events/stream` stream waits
 	/// for the server's leading frame before the stream is cancelled and the open
-	/// fails with `RequestTimeoutException`. Applied by `http`, `stdio` and
-	/// `spawn`; a transport passed to the constructor keeps its own bound.
+	/// fails with `RequestTimeoutException`. Over the legacy HTTP+SSE transport it
+	/// also bounds the wait for the GET stream's `endpoint` event, when the stream
+	/// first opens and when it reopens after a drop. Applied by `http`, `stdio`
+	/// and `spawn`; a transport passed to the constructor keeps its own bound.
 	Duration listenTimeout = 10.seconds;
 
 	/// Whether each `notifications/progress` for a request restarts its
