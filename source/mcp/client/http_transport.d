@@ -62,9 +62,16 @@ class HttpStatusException : McpException
 /// ended.
 class SessionExpiredException : HttpStatusException
 {
-	this(int status, string message) @safe
+	/// True when the server had already accepted the request (its response
+	/// stream had started) before the session vanished, so the request may
+	/// have taken effect. Such a request is never re-sent automatically, even
+	/// under `ClientSettings.reinitializeOnSessionExpiry`.
+	bool outcomeUnknown;
+
+	this(int status, string message, bool outcomeUnknown = false) @safe
 	{
 		super(status, message);
+		this.outcomeUnknown = outcomeUnknown;
 	}
 }
 
@@ -1081,8 +1088,11 @@ final class HttpClientTransport : ClientTransport
 					idle = maxIdleResumes;
 					break;
 				case ResumeOutcome.sessionGone:
+					// The server accepted the request before its session vanished,
+					// so it may have run: the caller must not assume it did not.
 					throw new SessionExpiredException(404,
-							"MCP session expired (server answered HTTP 404 for the session)");
+							"MCP session expired after the server accepted request " ~ idStr(
+								expectId) ~ "; its outcome is unknown", true);
 				case ResumeOutcome.failed:
 					if (failedInRow++ == 0)
 						failingSince = started;
@@ -5265,6 +5275,63 @@ unittest  // a resume GET answered 404 for the session reports the session expir
 	assert(failure.length == 0, "scenario failed: " ~ failure);
 	assert(expired == 2, "the resume 404 must report the expired session");
 	assert(listPosts == 1, "a request after the expiry must not be sent");
+}
+
+unittest  // a request the server accepted is not re-sent when its session vanishes mid-stream
+{
+	import std.algorithm.searching : canFind;
+	import mcp.client.client : McpClient, ClientSettings;
+
+	int callPosts, initPosts;
+	auto router = new URLRouter;
+	router.post("/mcp", (HTTPServerRequest req, HTTPServerResponse res) @safe {
+		auto j = requestJson(req);
+		const method = ("method" in j) ? j["method"].get!string : "";
+		if (method == "initialize")
+		{
+			++initPosts;
+			res.headers["Mcp-Session-Id"] = initPosts == 1 ? "s1" : "s2";
+			res.writeBody(initializeReply(j, "2025-11-25").toString(), "application/json");
+			return;
+		}
+		if (method == "tools/call")
+		{
+			++callPosts;
+			// The server accepts the call and starts its stream, which closes
+			// before the response; the session is then gone.
+			res.headers["Content-Type"] = "text/event-stream";
+			res.bodyWriter.write("id: e1\nretry: 10\n\n");
+			return;
+		}
+		res.statusCode = 202;
+		res.writeBody("", "text/plain");
+	});
+	router.get("/mcp", (HTTPServerRequest req, HTTPServerResponse res) @safe {
+		res.statusCode = 404;
+		res.writeBody("", "text/plain");
+	});
+
+	bool unknownOutcome;
+	string msg;
+	const failure = runAgainstFakeServer(router, (string url) @safe {
+		ClientSettings s;
+		s.reinitializeOnSessionExpiry = true;
+		auto client = McpClient.http(url, s);
+		scope (exit)
+			client.close();
+		client.initialize("2025-11-25");
+		try
+			client.callTool("charge-card");
+		catch (SessionExpiredException e)
+		{
+			unknownOutcome = e.outcomeUnknown;
+			msg = e.msg;
+		}
+	});
+	assert(failure.length == 0, "scenario failed: " ~ failure);
+	assert(callPosts == 1, "an accepted request must not be re-sent on a new session");
+	assert(unknownOutcome, "the error must report that the request's outcome is unknown");
+	assert(msg.canFind("unknown"), msg);
 }
 
 unittest  // a failed legacy fallback closes the GET stream it opened

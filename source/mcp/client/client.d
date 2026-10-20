@@ -401,7 +401,9 @@ struct ClientSettings
 	/// with the protocol version last requested, and is then retried once. Off
 	/// by default, so the application decides when a new session begins; the
 	/// new session does not carry over server-side state such as resource
-	/// subscriptions.
+	/// subscriptions. A request the server had already accepted when its session
+	/// vanished (`SessionExpiredException.outcomeUnknown`) is not retried, since
+	/// it may have taken effect; later requests still start the new session.
 	bool reinitializeOnSessionExpiry;
 
 	/// How long `awaitTask` waits between `tasks/get` polls when the server gives
@@ -3895,7 +3897,8 @@ final class McpClient : ClientProtocol
 			return rpcOnce(method, params, framing);
 		catch (SessionExpiredException e)
 		{
-			if (!reinitializeOnSessionExpiry_ || !didInitialize || method == "initialize")
+			if (!reinitializeOnSessionExpiry_ || !didInitialize
+					|| method == "initialize" || e.outcomeUnknown)
 				throw e;
 			reinitializeAfterExpiry(epoch, e);
 			return rpcOnce(method, params, framing);
