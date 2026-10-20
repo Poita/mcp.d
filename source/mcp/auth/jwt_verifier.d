@@ -209,10 +209,12 @@ package interface KeySource
 {
 	PublicKey[] keysFor(string kid, string alg = null) @safe;
 
-	/// Whether the source holds no keys because fetching them failed, so a
-	/// token it cannot verify may still be good. `retryAfter` is set to when
-	/// the next fetch may be attempted.
-	bool unavailable(out Duration retryAfter) @safe;
+	/// Whether a token naming `kid` that the source's keys cannot verify may
+	/// still be good: fetching failed and no keys are held, or `kid` is unknown
+	/// and the preceding `keysFor(kid)` could not consult a freshly fetched
+	/// document (the fetch failed, was rate-limited, or another was in flight).
+	/// `retryAfter` is set to when the next fetch may be attempted.
+	bool unavailable(string kid, out Duration retryAfter) @safe;
 }
 
 /// Reject a token, logging `reason` at diagnostic level so a misconfigured
@@ -310,7 +312,7 @@ package TokenInfo verifyToken(JwtVerifierConfig cfg, string token, KeySource key
 	// pinned keys.
 	PublicKey[] candidates = keys.keysFor(kid, alg) ~ pinned;
 	Duration retryAfter;
-	const keysUnavailable = keys.unavailable(retryAfter);
+	const keysUnavailable = keys.unavailable(kid, retryAfter);
 	if (candidates.length == 0)
 		return keysUnavailable ? keysOutage(retryAfter) : reject("no verification key available");
 
@@ -869,6 +871,11 @@ package final class JwksCache : KeySource
 	private bool loaded = false;
 	private bool refreshQueued = false;
 	private bool fetching = false; // a fetch holds `fetchLock`
+	private ulong loads; // documents successfully loaded
+	// The unknown kid the latest `keysFor` could not check against a fresh
+	// document. `verifyToken` reads it through `unavailable` with no yield in
+	// between, so concurrent lookups cannot interleave.
+	private string unresolvedKid;
 	private TaskMutex fetchLock;
 
 	/// Fetches the JWKS document at a URI, returning its body or null on
@@ -905,15 +912,16 @@ package final class JwksCache : KeySource
 			return null;
 		}
 		const unknownKid = kid.length && (kid in keysByKid) is null;
+		bool fresh;
 		if (!loaded || tooStale())
-			refetch();
+			fresh = refetch();
 		else if (unknownKid)
 		{
 			// Usable keys are held, so a kid they lack waits only on a fetch it
 			// starts itself: while one is in flight it is answered from the held
 			// keys at once, so forged kids cannot queue requests behind a slow IdP.
 			if (!fetching)
-				refetch();
+				fresh = refetch();
 		}
 		else if (now() - fetchedAt >= cast(long) ttl.total!"seconds")
 			refreshInBackground();
@@ -928,13 +936,17 @@ package final class JwksCache : KeySource
 			allKeys = null;
 			loaded = false;
 		}
+		unresolvedKid = unknownKid && !fresh && (kid in keysByKid) is null ? kid : null;
 		return kidKeys(kid, alg);
 	}
 
-	/// Whether a fetch has failed and no keys are held.
-	bool unavailable(out Duration retryAfter) @safe
+	/// Whether a fetch has failed and no keys are held, or `kid` is the unknown
+	/// kid the latest `keysFor` could not check against a fresh document.
+	bool unavailable(string kid, out Duration retryAfter) @safe
 	{
-		if (uri.length == 0 || loaded || lastAttemptAt < 0)
+		if (uri.length == 0 || lastAttemptAt < 0)
+			return false;
+		if (loaded && (kid.length == 0 || kid != unresolvedKid))
 			return false;
 		const wait = minRefetchInterval.total!"seconds" - (now() - lastAttemptAt);
 		retryAfter = (wait > 1 ? wait : 1).seconds;
@@ -1011,13 +1023,14 @@ package final class JwksCache : KeySource
 	/// Fetch the document unless an attempt finished within
 	/// `minRefetchInterval`. Holding `fetchLock` for the fetch makes concurrent
 	/// callers wait for the one in flight and then find the attempt recent.
-	private void refetch() @safe
+	/// Returns whether this call fetched and loaded a usable document.
+	private bool refetch() @safe
 	{
 		fetchLock.lock();
 		scope (exit)
 			fetchLock.unlock();
 		if (attemptedRecently())
-			return;
+			return false;
 		fetching = true;
 		scope (exit)
 		{
@@ -1026,7 +1039,8 @@ package final class JwksCache : KeySource
 		}
 		const doc = fetcher !is null ? fetcher(uri) : fetchJwks(uri, policy);
 		if (doc.length == 0)
-			return;
+			return false;
+		const loadsBefore = loads;
 		// An unparseable document is handled like a failed fetch: logged, with
 		// the cached keys kept, rather than failing the request that triggered it.
 		try
@@ -1038,6 +1052,7 @@ package final class JwksCache : KeySource
 			logWarn("JWKS from %s could not be parsed; keeping the cached keys: %s",
 					redactUrl(uri), e.msg);
 		}
+		return loads != loadsBefore;
 	}
 
 	/// Populate the cache from a raw JWKS document (also the test seam).
@@ -1084,6 +1099,7 @@ package final class JwksCache : KeySource
 		allKeys = newAllKeys;
 		loaded = true;
 		fetchedAt = now();
+		++loads;
 	}
 }
 
@@ -1336,7 +1352,7 @@ version (unittest)
 			return null;
 		}
 
-		bool unavailable(out Duration retryAfter) @safe
+		bool unavailable(string kid, out Duration retryAfter) @safe
 		{
 			return false;
 		}
@@ -2560,6 +2576,59 @@ unittest  // JwksCache rate-limits unknown-kid refetches (junk kids cannot drive
 	foreach (i; 0 .. 5)
 		s.cache.keysFor("junk-kid");
 	assert(s.fetches == 1);
+}
+
+version (unittest)
+{
+	private TokenInfo verifyRotatedKidToken(JwksCache cache) @safe
+	{
+		JwtVerifierConfig cfg;
+		cfg.allowAnyAudience = true;
+		cfg.allowAnyIssuer = true;
+		const payload = `{"sub":"ec-user","iat":1700000000,"exp":1700003600,"nbf":1700000000}`;
+		return verifyToken(cfg, makeEs256(payload, "ec-new"), cache, 1_700_001_000);
+	}
+}
+
+unittest  // a token naming an unknown kid is temporarily unavailable while the JWKS refetch fails
+{
+	auto s = new ScriptedJwks(rsaOnlyJwks);
+	assert(s.cache.keysFor("rsa-1").length == 1);
+
+	s.served = null;
+	s.clock += JwksCache.minRefetchInterval.total!"seconds";
+	auto ti = verifyRotatedKidToken(s.cache);
+	assert(s.fetches == 2);
+	assert(!ti.valid && ti.unavailable);
+	assert(ti.retryAfter == JwksCache.minRefetchInterval);
+}
+
+unittest  // a token naming an unknown kid is temporarily unavailable while its refetch is rate-limited
+{
+	auto s = new ScriptedJwks(rsaOnlyJwks);
+	assert(s.cache.keysFor("rsa-1").length == 1);
+
+	// The IdP rotates in a new key right after the last fetch.
+	s.served = rotatedJwks;
+	s.clock += 3;
+	auto ti = verifyRotatedKidToken(s.cache);
+	assert(s.fetches == 1);
+	assert(!ti.valid && ti.unavailable);
+	assert(ti.retryAfter == JwksCache.minRefetchInterval - 3.seconds);
+
+	s.clock += JwksCache.minRefetchInterval.total!"seconds";
+	assert(verifyRotatedKidToken(s.cache).valid);
+}
+
+unittest  // a token naming a kid a fresh JWKS fetch still lacks is invalid
+{
+	auto s = new ScriptedJwks(rsaOnlyJwks);
+	assert(s.cache.keysFor("rsa-1").length == 1);
+
+	s.clock += JwksCache.minRefetchInterval.total!"seconds";
+	auto ti = verifyRotatedKidToken(s.cache);
+	assert(s.fetches == 2);
+	assert(!ti.valid && !ti.unavailable);
 }
 
 unittest  // JwksCache negative-caches a failed fetch instead of refetching on every request
