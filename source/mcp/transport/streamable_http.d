@@ -1803,7 +1803,9 @@ private string resourceMetadataUrl(scope HTTPServerRequest req, StreamableHttpOp
 		// A TLS connection is https. A plain one is http on a loopback host and
 		// otherwise taken to sit behind a TLS-terminating proxy; a trusted
 		// X-Forwarded-Proto names the scheme the proxy received.
-		string scheme = req.tls || !isLoopbackHostname(stripPort(host)) ? "https" : "http";
+		string hostName, hostPort;
+		const loopback = splitHostPort(host, hostName, hostPort) && isLoopbackHostname(hostName);
+		string scheme = req.tls || !loopback ? "https" : "http";
 		if (opts.trustProxyHeaders)
 		{
 			const forwarded = req.headers.get("X-Forwarded-Proto", "").strip.toLower;
@@ -4136,7 +4138,8 @@ package bool hostAllowed(string host, const string[] extra) @safe
 	import std.uni : sicmp;
 
 	string name, port;
-	splitHostPort(host, name, port);
+	if (!splitHostPort(host, name, port))
+		return false;
 	foreach (entry; extra)
 	{
 		string entryName, entryPort;
@@ -4157,21 +4160,30 @@ private bool isDefaultPort(string port) @safe pure nothrow
 
 /// Split a `host[:port]` value into its host name and port ("" when absent). A
 /// bracketed IPv6 literal loses its brackets; an unbracketed value with more
-/// than one colon is a bare IPv6 address with no port.
-private void splitHostPort(string value, out string name, out string port) @safe
+/// than one colon is a bare IPv6 address with no port. Returns false for a
+/// value that is not a plain authority: one carrying userinfo (`@`), a port
+/// that is not all digits, or text after an IPv6 literal's closing bracket, so
+/// `localhost:3000@evil.com` is never read as `localhost`.
+private bool splitHostPort(string value, out string name, out string port) @safe
 {
-	import std.algorithm : count;
+	import std.algorithm : all, count;
+	import std.ascii : isDigit;
 	import std.string : indexOf, lastIndexOf;
 
+	if (value.indexOf('@') >= 0)
+		return false;
 	if (value.length && value[0] == '[')
 	{
 		const close = value.indexOf(']');
 		if (close >= 0)
 		{
 			name = value[1 .. close];
-			if (close + 1 < value.length && value[close + 1] == ':')
-				port = value[close + 2 .. $];
-			return;
+			if (close + 1 == value.length)
+				return true;
+			if (value[close + 1] != ':')
+				return false;
+			port = value[close + 2 .. $];
+			return port.length && port.all!isDigit;
 		}
 	}
 	const colon = value.lastIndexOf(':');
@@ -4179,9 +4191,10 @@ private void splitHostPort(string value, out string name, out string port) @safe
 	{
 		name = value[0 .. colon];
 		port = value[colon + 1 .. $];
-		return;
+		return port.length && port.all!isDigit;
 	}
 	name = value;
+	return true;
 }
 
 /// Whether an `Origin` header value (e.g. "http://localhost:3000") is localhost
@@ -4204,7 +4217,8 @@ package bool originAllowed(string origin, const string[] extra) @safe
 	const slash = rest.indexOf('/');
 	if (slash >= 0)
 		rest = rest[0 .. slash];
-	return isLoopbackHostname(stripPort(rest));
+	string name, port;
+	return splitHostPort(rest, name, port) && isLoopbackHostname(name);
 }
 
 /// `origin` in a canonical form for comparison: scheme and host lowercased,
@@ -4229,25 +4243,6 @@ private string normalizeOrigin(string origin) @safe
 			o = o[0 .. o.length - port.length - 1];
 	}
 	return o;
-}
-
-private string stripPort(string hostport) @safe
-{
-	import std.string : lastIndexOf;
-
-	// IPv6 literal in brackets: [::1]:port
-	if (hostport.length && hostport[0] == '[')
-	{
-		import std.string : indexOf;
-
-		const close = hostport.indexOf(']');
-		if (close >= 0)
-			return hostport[1 .. close];
-	}
-	const colon = hostport.lastIndexOf(':');
-	if (colon >= 0)
-		return hostport[0 .. colon];
-	return hostport;
 }
 
 private bool isLoopbackHostname(string h) @safe
@@ -5294,6 +5289,28 @@ unittest  // several stalled SSE readers hold up a fan-out for one stall timeout
 	assert(took < defaultSseStallTimeout + 1.seconds,
 			"stalled readers must not each add a stall timeout to the fan-out");
 	assert(remaining == 0, "every stream whose client stopped reading must be dropped");
+}
+
+unittest  // an origin whose authority only starts like localhost is not loopback
+{
+	assert(!originAllowed("http://localhost:3000@evil.com", []));
+	assert(!originAllowed("http://localhost@evil.com", []));
+	assert(!originAllowed("http://localhost:evil", []));
+	assert(!originAllowed("http://localhost:", []));
+	assert(!originAllowed("http://[::1]evil.com", []));
+	assert(originAllowed("http://localhost:3000", []));
+	assert(originAllowed("http://[::1]:8080/", []));
+	assert(originAllowed("http://127.0.0.1", []));
+}
+
+unittest  // a Host whose authority only starts like localhost is not loopback
+{
+	assert(!hostAllowed("localhost:3000@evil.com", []));
+	assert(!hostAllowed("localhost:evil", []));
+	assert(!hostAllowed("[::1]evil.com", []));
+	assert(!hostAllowed("myhost:evil", ["myhost"]));
+	assert(hostAllowed("localhost:3000", []));
+	assert(hostAllowed("[::1]", []));
 }
 
 unittest  // localhost hosts are accepted, foreign hosts rejected
