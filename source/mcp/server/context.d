@@ -424,8 +424,7 @@ interface RequestContext
 	/// `action` is typically `accept`/`decline`/`cancel`). Throws on a stateless
 	/// (MRTR) request — use `ToolResponse.inputRequired` instead — or if the
 	/// client does not support elicitation, if `url`/`elicitationId` are empty,
-	/// or if `url` is not a valid absolute URI (the spec requires `url` to
-	/// contain a valid URL).
+	/// or if `url` is not an http(s) URL with a host (`isValidElicitationUrl`).
 	final ElicitResult elicitUrl(string message, string url, string elicitationId) @safe
 	{
 		requireServerChannel(this, "elicitUrl");
@@ -437,7 +436,7 @@ interface RequestContext
 		if (url.length == 0)
 			throw internalError("URL-mode elicitation requires a non-empty url");
 		if (!isValidElicitationUrl(url))
-			throw internalError("URL-mode elicitation requires a valid url (absolute URI): " ~ url);
+			throw internalError("URL-mode elicitation requires an http(s) url: " ~ url);
 		if (elicitationId.length == 0)
 			throw internalError("URL-mode elicitation requires a non-empty elicitationId");
 		Json params = Json.emptyObject;
@@ -1130,6 +1129,16 @@ unittest  // elicitUrl() rejects an empty url with an internalError (server faul
 {
 	auto probe = new ElicitProbe;
 	assertInternalError(probe.elicitUrl("msg", "", "elic-1"));
+}
+
+unittest  // elicitUrl() names the http(s) requirement when it rejects a url
+{
+	import std.algorithm.searching : canFind;
+	import std.exception : collectException;
+
+	auto probe = new ElicitProbe();
+	auto e = collectException!McpException(probe.elicitUrl("msg", "file:///etc/passwd", "elic-1"));
+	assert(e !is null && e.msg.canFind("http(s)"));
 }
 
 unittest  // elicitUrl() rejects an empty elicitationId with an internalError (server fault)

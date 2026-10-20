@@ -737,7 +737,8 @@ struct InputRequest
 	/// form, the client is directed to a `url` to gather input out-of-band. The
 	/// modern `ElicitRequestURLParams` is `{mode:"url", message, url}` — correlation
 	/// is the MRTR `InputRequest.id`, so the request carries no `elicitationId`
-	/// (removed from 2026-07-28). `url` MUST be a non-empty valid absolute URI;
+	/// (removed from 2026-07-28). `url` MUST be an http(s) URL with a host
+	/// (`isValidElicitationUrl`);
 	/// otherwise this throws a plain `Exception` (a local programming error, not
 	/// a peer `-32602`).
 	static InputRequest elicitationUrl(string id, string message, string url) @safe
@@ -745,8 +746,7 @@ struct InputRequest
 		import std.exception : enforce;
 
 		enforce(url.length > 0, "URL-mode elicitation requires a non-empty url");
-		enforce(isValidElicitationUrl(url),
-				"URL-mode elicitation requires a valid url (absolute URI): " ~ url);
+		enforce(isValidElicitationUrl(url), "URL-mode elicitation requires an http(s) url: " ~ url);
 		Json p = Json.emptyObject;
 		p["mode"] = "url";
 		p["message"] = message;
@@ -994,7 +994,7 @@ unittest  // an InputRequest of an unrecognised kind is refused rather than sent
 
 	assertThrown(InputRequest("a", "elicit", Json.emptyObject).toJson());
 	assertThrown(inputRequestsToJson([
-			InputRequest("a", "elicit", Json.emptyObject)
+		InputRequest("a", "elicit", Json.emptyObject)
 	]));
 }
 
@@ -2074,6 +2074,15 @@ unittest  // InputRequest.elicitationUrl rejects empty url as a local error
 	auto e = collectException(InputRequest.elicitationUrl("e", "m", ""));
 	assert(e !is null);
 	assert(cast(McpException) e is null);
+}
+
+unittest  // InputRequest.elicitationUrl names the http(s) requirement when it rejects a url
+{
+	import std.algorithm.searching : canFind;
+	import std.exception : collectException;
+
+	auto e = collectException(InputRequest.elicitationUrl("e", "m", "file:///etc/passwd"));
+	assert(e !is null && e.msg.canFind("http(s)"));
 }
 
 unittest  // InputRequest.elicitationUrl rejects a malformed (non-absolute) url as a local error
