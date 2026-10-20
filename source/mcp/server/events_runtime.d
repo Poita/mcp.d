@@ -1571,17 +1571,25 @@ final class EventsRuntime
 	// reference.
 	private void dropPollLeases(string name) @safe
 	{
-		PollLease[] dropped;
+		string[] dropped;
 		foreach (key, lease; pollLeases_)
 			if (lease.name == name)
-				dropped ~= lease;
-		foreach (lease; dropped)
-			endPollLease(lease);
+				dropped ~= key;
+		foreach (key; dropped)
+			endPollLease(key, (ref const PollLease lease) @safe => lease.name == name);
 	}
 
-	private void endPollLease(PollLease lease) @safe
+	// End the poll lease recorded under `key` if `due` holds for it. Ending one
+	// lease can yield (its on_unsubscribe hook), so a caller ending several
+	// re-checks each against the lease as it stands: one renewed or ended
+	// meanwhile is left alone.
+	private void endPollLease(string key, scope bool delegate(ref const PollLease) @safe due) @safe
 	{
-		pollLeases_.remove(leaseKey(lease.name, lease.arguments, lease.principal));
+		auto p = key in pollLeases_;
+		if (p is null || !due(*p))
+			return;
+		const lease = *p;
+		pollLeases_.remove(key);
 		releasePollLeaseSlot(lease.principal);
 		releaseLifecycle(lease.name, lease.arguments, lease.principal);
 	}
@@ -1592,12 +1600,13 @@ final class EventsRuntime
 	void sweepPollLeases() @safe
 	{
 		const now = opts_.nowMs();
-		PollLease[] expired;
+		string[] expired;
 		foreach (key, lease; pollLeases_)
 			if (now >= lease.expiresAtMs)
-				expired ~= lease;
-		foreach (lease; expired)
-			endPollLease(lease);
+				expired ~= key;
+		foreach (key; expired)
+			endPollLease(key, (ref const PollLease lease) @safe => opts_.nowMs() >= lease
+					.expiresAtMs);
 	}
 
 	// --- webhook subscription management -----------------------------------
@@ -5397,6 +5406,35 @@ unittest  // poll lease fires on_subscribe on first sight and on_unsubscribe on 
 	assert(unsubs == 1);
 }
 
+unittest  // the poll lease sweep leaves a lease renewed while it was ending another
+{
+	long now = 1_000_000;
+	auto rt = testRuntime(() @safe => now);
+	int subs, unsubs;
+	EventRegistration reg;
+	reg.descriptor.name = "slack.message";
+	reg.check = (EventContext ctx) @safe => EventResult.empty("c");
+	reg.onSubscribe = (EventContext ctx, string id) @safe { subs++; };
+	auto a = Json(["channel": Json("a")]);
+	auto b = Json(["channel": Json("b")]);
+	// Ending either lease renews the other, as a poll arriving while the hook
+	// yields would.
+	reg.onUnsubscribe = (EventContext ctx, string id) @safe {
+		if (unsubs++ == 0)
+			rt.poll("slack.message", ctx.arguments["channel"].get!string == "a"
+					? b : a, "u", nullable("c"), Nullable!long.init, Nullable!long.init);
+	};
+	rt.register(reg);
+	rt.poll("slack.message", a, "u", Nullable!string.init,
+			Nullable!long.init, Nullable!long.init);
+	rt.poll("slack.message", b, "u", Nullable!string.init,
+			Nullable!long.init, Nullable!long.init);
+	now += 10 * 60 * 1000;
+	rt.sweepPollLeases();
+	assert(unsubs == 1 && subs == 2); // the renewed lease neither ended nor re-provisioned
+	assert(rt.pollLeases_.length == 1);
+}
+
 unittest  // a poll lease outlives the advertised poll interval, so on-schedule polls keep it
 {
 	import core.time : minutes;
@@ -7780,7 +7818,7 @@ version (unittest)
 				return EventResult.empty("h0");
 			if (ctx.cursor.get == "h0")
 				return EventResult.of([
-					EventOccurrence("m1", "email.received", "t")
+				EventOccurrence("m1", "email.received", "t")
 			], "h1");
 			return EventResult.empty(ctx.cursor.get);
 		};
