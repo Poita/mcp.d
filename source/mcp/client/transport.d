@@ -3,11 +3,26 @@ module mcp.client.transport;
 import core.time : Duration;
 import vibe.data.json : Json;
 
-import mcp.protocol.errors : McpException;
+import mcp.protocol.errors : ErrorCode, McpException;
 import mcp.protocol.jsonrpc : Message;
 import mcp.protocol.versions : ProtocolVersion;
 
 public import mcp.client.subscription : SubscriptionStream, SubscriptionFilter;
+
+/// Thrown by a request that cannot be carried because the connection to the
+/// server is gone for good: the client was closed, or the stdio channel ended
+/// (the server exited or closed its stdout). Retrying on the same client cannot
+/// succeed, so managed event subscriptions end rather than retry on it.
+///
+/// `code` is `ErrorCode.internalError`; catch this type to tell a dead
+/// connection apart from a server's own internal error.
+class TransportClosedException : McpException
+{
+	this(string message) @safe pure nothrow
+	{
+		super(ErrorCode.internalError, message);
+	}
+}
 
 /// The source of the OAuth bearer token an HTTP client sends (`OAuthSession`
 /// supplies one through `useOAuth`).

@@ -6,7 +6,8 @@ import vibe.data.json : Json, parseJsonString;
 
 import mcp.protocol.jsonrpc;
 import mcp.protocol.errors;
-import mcp.client.transport : BearerProvider, ClientTransport, ClientProtocol, InboundOrigin;
+import mcp.client.transport : BearerProvider, ClientTransport, ClientProtocol,
+	InboundOrigin, TransportClosedException;
 import mcp.client.subscription : SubscriptionStream, ListenGate;
 import mcp.transport.duplex : ChannelWriteException, DuplexChannel, defaultMaxLineBytes;
 import mcp.transport.lines : FrameHead, LineReader;
@@ -299,7 +300,6 @@ final class StdioClientTransport : ClientTransport
 	/// server from a failed request.
 	private McpException closedOr(McpException e) @safe nothrow
 	{
-		import mcp.client.client : TransportClosedException;
 
 		const writeFailed = cast(ChannelWriteException) e !is null;
 		bool closed = writeFailed;
@@ -1835,7 +1835,7 @@ version (Posix) unittest  // a request to a server that exits on its own fails w
 {
 	import core.time : Duration;
 	import std.algorithm.searching : canFind;
-	import mcp.client.client : ClientSettings, TransportClosedException;
+	import mcp.client.client : ClientSettings;
 
 	string msg;
 	inLoop(() @safe {
@@ -2074,7 +2074,7 @@ version (Posix) unittest  // McpClient.spawn launches the server with ClientSett
 {
 	import core.time : Duration;
 	import std.algorithm.searching : canFind;
-	import mcp.client.client : ClientSettings, TransportClosedException;
+	import mcp.client.client : ClientSettings;
 
 	string msg;
 	inLoop(() @safe {
@@ -2707,7 +2707,6 @@ unittest  // cancelling a call's CancellationToken fails it at once and sends no
 
 unittest  // a request on a stdio channel the server closed fails with TransportClosedException
 {
-	import mcp.client.client : TransportClosedException;
 
 	auto toClient = new TestLines;
 	bool closedError;
@@ -2884,7 +2883,6 @@ version (Posix) unittest  // closeProcess() with a write parked on a child that 
 
 unittest  // a stdio write that fails because the server stopped reading surfaces as TransportClosedException
 {
-	import mcp.client.client : TransportClosedException;
 
 	auto toClient = new TestLines;
 	bool requestClosed, notifyClosed;

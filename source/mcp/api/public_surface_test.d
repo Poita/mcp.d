@@ -377,6 +377,11 @@ unittest  // the client's bearer provider settings are reachable from `import mc
 	static assert(visibleFromMcp!"BearerProvider");
 }
 
+unittest  // the closed-transport exception is reachable from `import mcp;`
+{
+	static assert(visibleFromMcp!"TransportClosedException");
+}
+
 unittest  // the unlimited task TTL sentinel is reachable from `import mcp;`
 {
 	static assert(visibleFromMcp!"unlimitedTaskTtl");

@@ -21,7 +21,7 @@ import mcp.protocol.errors;
 import mcp.protocol.http_headers : isHeaderValueUnsafe;
 import mcp.protocol.ssrf : FetchOptions, TlsTrust;
 import mcp.client.transport : BearerProvider, ClientTransport, ClientProtocol,
-	InboundOrigin, modernFraming;
+	InboundOrigin, modernFraming, TransportClosedException;
 import mcp.client.subscription : SubscriptionStream, ListenGate;
 
 /// A request rejected at the HTTP layer: the server answered with a non-success
@@ -639,7 +639,6 @@ final class HttpClientTransport : ClientTransport
 	/// `ended` with no `error`.
 	void close() @safe
 	{
-		import mcp.client.client : TransportClosedException;
 
 		closeRequested = true;
 		// Close every stream socket and interrupt its reader, so a reader parked on
@@ -2600,7 +2599,6 @@ final class HttpClientTransport : ClientTransport
 	private Json legacyRpc(Json message, long expectId) @safe
 	{
 		import vibe.core.task : InterruptException, Task;
-		import mcp.client.client : TransportClosedException;
 
 		auto waiter = new LegacyWaiter;
 		waiter.result = Json.undefined;
@@ -2656,7 +2654,6 @@ final class HttpClientTransport : ClientTransport
 	private void awaitLegacyStream() @safe
 	{
 		import core.time : msecs, MonoTime;
-		import mcp.client.client : TransportClosedException;
 
 		const deadline = MonoTime.currTime + 10_000.msecs;
 		auto ec = legacyCompletionEvent().emitCount;
@@ -8191,7 +8188,6 @@ unittest  // close() fails an in-flight request with TransportClosedException
 {
 	import core.time : msecs, MonoTime;
 	import vibe.core.core : runTask, sleep;
-	import mcp.client.client : TransportClosedException;
 
 	bool release;
 	auto r = new URLRouter;
@@ -8229,7 +8225,6 @@ unittest  // close() fails an in-flight request with TransportClosedException
 
 unittest  // close() fails an outstanding legacy waiter with TransportClosedException
 {
-	import mcp.client.client : TransportClosedException;
 
 	auto t = new HttpClientTransport("http://host:8080/mcp");
 	auto pending = new LegacyWaiter;

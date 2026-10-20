@@ -19,7 +19,8 @@ import mcp.protocol.modern;
 import mcp.protocol.mrtr;
 import mcp.protocol.meta_keys : MetaKey;
 import mcp.protocol.http_headers;
-import mcp.client.transport : BearerProvider, ClientTransport, ClientProtocol, InboundOrigin;
+import mcp.client.transport : BearerProvider, ClientTransport, ClientProtocol,
+	InboundOrigin, TransportClosedException;
 import mcp.client.http_transport : HttpClientTransport, HttpStatusException,
 	SessionExpiredException, isLegacyFallbackStatus, defaultMaxMessageBytes;
 import mcp.client.stdio : SpawnSettings, StdioClientTransport, spawnStdioTransport;
@@ -434,21 +435,6 @@ struct ClientSettings
 	/// failing with `RequestTimeoutException` (the task itself is left running;
 	/// `cancelTask` stops it). `Duration.zero` polls until the task finishes.
 	Duration taskTimeout = Duration.zero;
-}
-
-/// Thrown by a request that cannot be carried because the connection to the
-/// server is gone for good: the client was closed, or the stdio channel ended
-/// (the server exited or closed its stdout). Retrying on the same client cannot
-/// succeed, so managed event subscriptions end rather than retry on it.
-///
-/// `code` is `ErrorCode.internalError`; catch this type to tell a dead
-/// connection apart from a server's own internal error.
-class TransportClosedException : McpException
-{
-	this(string message) @safe pure nothrow
-	{
-		super(ErrorCode.internalError, message);
-	}
 }
 
 /// Thrown when output-schema validation is enabled and a tool result's
