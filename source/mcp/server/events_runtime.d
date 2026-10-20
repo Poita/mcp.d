@@ -12,7 +12,6 @@ import std.algorithm : max, min, sort;
 import vibe.data.json : Json;
 
 import mcp.internal.background_loop : BackgroundLoop;
-import mcp.internal.clock : systemNowIso;
 import mcp.protocol.events;
 import mcp.protocol.jsonhelpers : getOr;
 import mcp.protocol.schema : makeValidator, validationError;
@@ -424,12 +423,11 @@ struct EventsOptions
 	V1aSigner v1aSigner; /// optional asymmetric (`v1a,`) signer; auto-wired from `webhookSigningKey`
 	string webhookSigningKey; /// `whsk_` ed25519 signing key — requires the `library-ed25519` build
 	Json webhookSigningJwks = Json.undefined; /// JWKS published at the server-identity well-known path
-	string delegate() @safe nowIso; /// injectable ISO-8601 clock
-	long delegate() @safe nowMs; /// injectable ms-epoch clock
+	long delegate() @safe nowMs; /// injectable ms-epoch clock; also stamps an event published without a timestamp
 }
 
-/// Format a millisecond epoch instant as an ISO-8601 UTC timestamp (used for the
-/// webhook `refreshBefore` grant).
+/// Format a millisecond epoch instant as an ISO-8601 UTC timestamp (a webhook
+/// `refreshBefore` grant, an event's default `timestamp`).
 string isoFromMs(long ms) @safe
 {
 	import std.datetime.systime : SysTime, unixTimeToStdTime;
@@ -748,8 +746,6 @@ final class EventsRuntime
 		if (opts_.deliveryQueue is null)
 			opts_.deliveryQueue = new InMemoryDeliveryQueue();
 		deliveryQueue_ = opts_.deliveryQueue;
-		if (opts_.nowIso is null)
-			opts_.nowIso = () @safe => systemNowIso();
 		if (opts_.nowMs is null)
 			opts_.nowMs = () @safe => nowUnixMs();
 		clampDeliveryLease();
@@ -865,10 +861,10 @@ final class EventsRuntime
 	{
 		auto p = name in types_;
 		if (p is null)
-			throw new Exception("Event type " ~ name ~ " is not registered");
+			throw notFound("Event type " ~ name ~ " is not registered", "event");
 		if (p.generation != generation)
-			throw new Exception("Event type " ~ name
-					~ " was removed and registered again since this handle was defined");
+			throw notFound("Event type " ~ name
+					~ " was removed and registered again since this handle was defined", "event");
 		return *p;
 	}
 
@@ -1169,7 +1165,7 @@ final class EventsRuntime
 	}
 
 	/// Notify connected clients that the event-type set changed.
-	void notifyListChanged() @safe
+	package void notifyListChanged() @safe
 	{
 		if (onListChanged_ !is null)
 			onListChanged_();
@@ -1285,7 +1281,7 @@ final class EventsRuntime
 		{
 			if (s.name != occ.name)
 				continue;
-			deliverToStreamSafely(reg, s, occ);
+			deliverToStreamSafely(s, occ);
 		}
 		routeToWebhooks(reg, occ);
 	}
@@ -1307,7 +1303,7 @@ final class EventsRuntime
 		foreach (live; pushStreams_)
 			if (live is s)
 			{
-				deliverToStreamSafely(occ.name in types_, s, occ);
+				deliverToStreamSafely(s, occ);
 				return;
 			}
 	}
@@ -1613,7 +1609,7 @@ final class EventsRuntime
 	/// Expire poll leases whose window has elapsed, firing `on_unsubscribe` for
 	/// each. The transport/timer calls this periodically; a well-behaved poller
 	/// renews its lease before it lapses.
-	void sweepPollLeases() @safe
+	package void sweepPollLeases() @safe
 	{
 		const now = opts_.nowMs();
 		string[] expired;
@@ -1850,7 +1846,7 @@ final class EventsRuntime
 	/// Drop every webhook subscription whose grant has lapsed, firing
 	/// `on_unsubscribe` for each. The periodic worker calls this; a lapsed
 	/// subscription found by a refresh is dropped there directly.
-	void sweepWebhookSubscriptions() @safe
+	package void sweepWebhookSubscriptions() @safe
 	{
 		const now = opts_.nowMs();
 		foreach (sub; webhookStore_.lapsed(now))
@@ -2050,7 +2046,7 @@ final class EventsRuntime
 	/// drops) with nothing in flight advances the watermark (so the client's cursor
 	/// moves during quiet periods); a fetch that reports `truncated` queues a
 	/// `gap` envelope. Emit-only types are not polled — `emit` routes them live.
-	void pollWebhookSubscriptions() @safe
+	package void pollWebhookSubscriptions() @safe
 	{
 		if (!opts_.webhookEnabled)
 			return;
@@ -2622,7 +2618,7 @@ final class EventsRuntime
 	// neither the emit nor its sibling streams and webhooks. Before the stream has
 	// started, events wait for `startPushStream`. A stream that falls more than
 	// `pushMaxQueuedEvents` behind is terminated as a slow consumer.
-	private void deliverToStreamSafely(EventRegistration* reg, PushStream s, EventOccurrence occ) @safe
+	private void deliverToStreamSafely(PushStream s, EventOccurrence occ) @safe
 	{
 		if (s.terminated || s.overflowed_)
 			return;
@@ -2758,7 +2754,7 @@ final class EventsRuntime
 	/// Process one pass of the delivery queue: lease the ready jobs (claiming them
 	/// for `deliveryLease`) and deliver + ack each. Called by the per-publish kick
 	/// and by `startDeliveryWorker`. Safe to run on any node against a shared queue.
-	void drainDeliveries() @safe
+	package void drainDeliveries() @safe
 	{
 		drainKicked_ = false;
 		const leaseMs = opts_.deliveryLease.total!"msecs";
@@ -3247,7 +3243,7 @@ final class EventsRuntime
 
 	/// Write every coalesced missed position to the store. The periodic worker
 	/// calls this, so a refresh on another node sees the furthest miss.
-	void flushCoalescedMisses() @safe
+	package void flushCoalescedMisses() @safe
 	{
 		foreach (id; coalescedMisses_.keys)
 			recordCoalescedMiss(id);
@@ -3791,7 +3787,7 @@ final class EventsRuntime
 	/// only this node can order and frees the job's slot under the pending
 	/// bound. Jobs this node is delivering or still enqueueing are skipped. The
 	/// periodic worker runs this every `EventsOptions.reconcileInterval`.
-	void reconcileDeliveries() @safe
+	package void reconcileDeliveries() @safe
 	{
 		bool[string] known;
 		foreach (subId; outstanding_.byKey)
@@ -3914,7 +3910,7 @@ final class EventsRuntime
 		if (occ.eventId.length == 0)
 			occ.eventId = randomEventId();
 		if (occ.timestamp.length == 0)
-			occ.timestamp = opts_.nowIso();
+			occ.timestamp = isoFromMs(opts_.nowMs());
 	}
 
 	// Run a type's check function and stamp the identity fields it left empty on
@@ -4329,7 +4325,6 @@ version (unittest)
 		EventsOptions o;
 		long t = 1_000_000;
 		o.nowMs = (nowMs is null) ? (() @safe => t) : nowMs;
-		o.nowIso = () @safe => "2026-02-19T15:30:00Z";
 		o.pushExecutor = (void delegate() @safe job) @safe { job(); };
 		return new EventsRuntime(null, o);
 	}
@@ -4403,7 +4398,6 @@ unittest  // the delivery lease is clamped to twice the longest wait between ren
 {
 	EventsOptions o;
 	o.nowMs = () @safe => 1_000_000L;
-	o.nowIso = () @safe => "t";
 	// Defaults: a 10 s HTTP timeout, and a job makes up to three requests
 	// between renewals, so the floor is 2 * 30 s. Retry backoff is spent in
 	// the queue, so the attempt count and retry base play no part.
@@ -4425,7 +4419,6 @@ unittest  // a delivery drain claims at most deliveryLeaseBatch jobs from the qu
 	auto queue = new InMemoryDeliveryQueue();
 	EventsOptions o;
 	o.nowMs = () @safe => 1_000_000L;
-	o.nowIso = () @safe => "t";
 	o.allowPrivateCallbackHosts = true;
 	o.webhookTransport = ft;
 	o.deliveryQueue = queue;
@@ -4447,7 +4440,6 @@ unittest  // a node that claimed a full batch claims the next once its runs fini
 	auto ft = new FakeWebhookTransport();
 	EventsOptions o;
 	o.nowMs = () @safe => 1_000_000L;
-	o.nowIso = () @safe => "t";
 	o.allowPrivateCallbackHosts = true;
 	o.webhookTransport = ft;
 	o.deliveryLeaseBatch = 2;
@@ -4479,7 +4471,6 @@ unittest  // the retry backoff doubles per attempt and is capped, never overflow
 {
 	EventsOptions o;
 	o.nowMs = () @safe => 1_000_000L;
-	o.nowIso = () @safe => "t";
 	auto rt = new EventsRuntime(null, o);
 	assert(rt.backoffFor(1) == 30.seconds);
 	assert(rt.backoffFor(4) == 240.seconds);
@@ -4582,7 +4573,6 @@ unittest  // EventsOptions.disabledModes applies server-wide, intersected with p
 {
 	EventsOptions o;
 	o.nowMs = () @safe => 1_000_000L;
-	o.nowIso = () @safe => "2026-02-19T15:30:00Z";
 	o.disabledModes = [DeliveryMode.push]; // server policy: no push for any type
 	auto rt = new EventsRuntime(null, o);
 
@@ -4939,7 +4929,6 @@ unittest  // emit hands push frames to a per-stream writer instead of writing th
 {
 	EventsOptions o;
 	o.nowMs = () @safe => 1_000_000L;
-	o.nowIso = () @safe => "t";
 	void delegate() @safe[] writers;
 	o.pushExecutor = (void delegate() @safe job) @safe { writers ~= job; };
 	auto rt = new EventsRuntime(null, o);
@@ -4962,7 +4951,6 @@ unittest  // a push stream that falls too far behind is terminated as a slow con
 {
 	EventsOptions o;
 	o.nowMs = () @safe => 1_000_000L;
-	o.nowIso = () @safe => "t";
 	o.pushMaxQueuedEvents = 2;
 	void delegate() @safe[] jobs;
 	o.pushExecutor = (void delegate() @safe job) @safe { jobs ~= job; };
@@ -5052,7 +5040,6 @@ unittest  // a check-backed push stream's backlog is capped and reports that mor
 {
 	EventsOptions o;
 	o.nowMs = () @safe => 1_000_000L;
-	o.nowIso = () @safe => "2026-02-19T15:30:00Z";
 	o.pushExecutor = (void delegate() @safe job) @safe { job(); };
 	o.pollDefaultMaxEvents = 2;
 	auto rt = new EventsRuntime(null, o);
@@ -5089,7 +5076,6 @@ unittest  // an emit-only push stream's backlog pages through the whole buffer
 {
 	EventsOptions o;
 	o.nowMs = () @safe => 1_000_000L;
-	o.nowIso = () @safe => "2026-02-19T15:30:00Z";
 	o.pushExecutor = (void delegate() @safe job) @safe { job(); };
 	o.pollDefaultMaxEvents = 2;
 	auto rt = new EventsRuntime(null, o);
@@ -5765,7 +5751,6 @@ unittest  // poll leases are capped per principal with resourceExhausted
 	long now = 1_000_000;
 	EventsOptions o;
 	o.nowMs = () @safe => now;
-	o.nowIso = () @safe => "t";
 	o.pollMaxLeasesPerPrincipal = 2;
 	auto rt = new EventsRuntime(null, o);
 	int subs;
@@ -5799,7 +5784,6 @@ unittest  // unauthenticated poll leases share their own cap, not one principal'
 
 	EventsOptions o;
 	o.nowMs = () @safe => 1_000_000L;
-	o.nowIso = () @safe => "t";
 	o.pollMaxLeasesPerPrincipal = 1;
 	o.pollMaxAnonymousLeases = 3;
 	auto rt = new EventsRuntime(null, o);
@@ -5827,7 +5811,6 @@ unittest  // a poll admitted while another's on_subscribe runs cannot overshoot 
 
 	EventsOptions o;
 	o.nowMs = () @safe => 1_000_000L;
-	o.nowIso = () @safe => "t";
 	o.pollMaxLeasesPerPrincipal = 1;
 	auto rt = new EventsRuntime(null, o);
 	PollResult poll(int i) @safe
@@ -5859,7 +5842,6 @@ unittest  // a hook that throws releases the poll lease slot it reserved
 
 	EventsOptions o;
 	o.nowMs = () @safe => 1_000_000L;
-	o.nowIso = () @safe => "t";
 	o.pollMaxLeasesPerPrincipal = 1;
 	auto rt = new EventsRuntime(null, o);
 	bool fail = true;
@@ -5886,7 +5868,6 @@ unittest  // a webhook subscribe admitted while another's on_subscribe runs cann
 	auto ft = new FakeWebhookTransport();
 	EventsOptions o;
 	o.nowMs = () @safe => 1_000_000L;
-	o.nowIso = () @safe => "t";
 	o.allowPrivateCallbackHosts = true;
 	o.webhookTransport = ft;
 	o.deliveryExecutor = (void delegate() @safe job) @safe { job(); };
@@ -6085,7 +6066,6 @@ unittest  // re-registering with only a change clients cannot see does not notif
 {
 	EventsOptions o;
 	o.nowMs = () @safe => 1_000_000L;
-	o.nowIso = () @safe => "2026-02-19T15:30:00Z";
 	o.disabledModes = [DeliveryMode.push];
 	auto rt = new EventsRuntime(null, o);
 	int changed;
@@ -6276,7 +6256,6 @@ unittest  // a poll without maxEvents is capped at the configured default
 
 	EventsOptions o;
 	o.nowMs = () @safe => 1_000_000L;
-	o.nowIso = () @safe => "t";
 	o.pollDefaultMaxEvents = 3;
 	auto rt = new EventsRuntime(null, o);
 	EventRegistration reg = {descriptor: EventType("n"), emitOnly: true};
@@ -6296,7 +6275,6 @@ unittest  // a poll's maxEvents is clamped to the configured maximum
 
 	EventsOptions o;
 	o.nowMs = () @safe => 1_000_000L;
-	o.nowIso = () @safe => "t";
 	o.pollMaxEvents = 2;
 	Nullable!long seen;
 	auto rt = new EventsRuntime(null, o);
@@ -6605,7 +6583,6 @@ unittest  // subscribeWebhook clamps a suggested TTL down to the cap
 {
 	EventsOptions o;
 	o.nowMs = () @safe => 1_000_000L;
-	o.nowIso = () @safe => "t";
 	o.webhookTtlCap = 1.minutes; // 60s cap
 	auto rt = new EventsRuntime(null, o);
 	EventRegistration reg = {descriptor: EventType("n"), emitOnly: true};
@@ -6631,7 +6608,6 @@ unittest  // subscribeWebhook grants no-expiry only when allowed
 
 	EventsOptions o;
 	o.nowMs = () @safe => 0L;
-	o.nowIso = () @safe => "t";
 	o.allowNoExpiry = true;
 	auto rt = new EventsRuntime(new DurableStore(), o);
 	EventRegistration reg = {descriptor: EventType("n"), emitOnly: true};
@@ -6644,7 +6620,6 @@ unittest  // subscribeWebhook grants no-expiry only when allowed
 	// A server that disallows no-expiry returns a finite grant instead.
 	EventsOptions o2;
 	o2.nowMs = () @safe => 0L;
-	o2.nowIso = () @safe => "t";
 	o2.allowNoExpiry = false;
 	auto rt2 = new EventsRuntime(null, o2);
 	rt2.register(reg);
@@ -6685,7 +6660,6 @@ unittest  // subscribeWebhook caps live subscriptions per principal with resourc
 
 	EventsOptions o;
 	o.nowMs = () @safe => 1_000_000L;
-	o.nowIso = () @safe => "t";
 	o.webhookMaxSubscriptionsPerPrincipal = 2; // small cap for the test
 	auto rt = new EventsRuntime(null, o);
 	EventRegistration reg = {descriptor: EventType("n"), emitOnly: true};
@@ -6717,7 +6691,6 @@ unittest  // a lapsed webhook subscription not yet swept does not count against 
 	long now = 1_000_000;
 	EventsOptions o;
 	o.nowMs = () @safe => now;
-	o.nowIso = () @safe => "t";
 	o.webhookMaxSubscriptionsPerPrincipal = 1;
 	o.webhookTtlCap = 1.minutes;
 	auto rt = new EventsRuntime(null, o);
@@ -6735,7 +6708,6 @@ unittest  // a per-principal cap of 0 disables the limit
 
 	EventsOptions o;
 	o.nowMs = () @safe => 1_000_000L;
-	o.nowIso = () @safe => "t";
 	o.webhookMaxSubscriptionsPerPrincipal = 0; // unlimited
 	auto rt = new EventsRuntime(null, o);
 	EventRegistration reg = {descriptor: EventType("n"), emitOnly: true};
@@ -6769,7 +6741,6 @@ unittest  // a runtime over a store holding webhook subscriptions fires on_subsc
 	auto store = new InMemoryWebhookSubscriptionStore();
 	EventsOptions o;
 	o.nowMs = () @safe => 1_000_000L;
-	o.nowIso = () @safe => "t";
 	auto first = new EventsRuntime(store, o);
 	EventRegistration plain = {descriptor: EventType("n"), emitOnly: true};
 	first.register(plain);
@@ -6877,7 +6848,6 @@ unittest  // the delivery worker keeps running when a pass throws
 	int passes;
 	// Each pass starts with the poll-lease sweep, which reads the clock once.
 	o.nowMs = () @safe { passes++; return 1_000_000L; };
-	o.nowIso = () @safe => "t";
 	auto rt = new EventsRuntime(new FailingAllStore(), o);
 	const constructed = passes;
 	runTask(() nothrow @safe {
@@ -6916,7 +6886,6 @@ unittest  // a delivery waiting out its retry backoff holds no delivery slot
 	auto q = new InMemoryDeliveryQueue();
 	EventsOptions o;
 	o.nowMs = () @safe => now;
-	o.nowIso = () @safe => "t";
 	o.allowPrivateCallbackHosts = true;
 	o.callbackAllowlist = ["https://proxy/"];
 	o.webhookTransport = ft;
@@ -6970,7 +6939,6 @@ unittest  // jobs queued behind a job waiting out its backoff are not leased by 
 	auto q = new InMemoryDeliveryQueue();
 	EventsOptions o;
 	o.nowMs = () @safe => now;
-	o.nowIso = () @safe => "t";
 	o.allowPrivateCallbackHosts = true;
 	o.callbackAllowlist = ["https://proxy/"];
 	o.webhookTransport = ft;
@@ -6997,7 +6965,6 @@ unittest  // jobs queued behind slow successful deliveries keep their lease
 	auto q = new InMemoryDeliveryQueue();
 	EventsOptions o;
 	o.nowMs = () @safe => now;
-	o.nowIso = () @safe => "t";
 	o.allowPrivateCallbackHosts = true;
 	o.callbackAllowlist = ["https://proxy/"];
 	o.webhookTransport = ft;
@@ -7041,7 +7008,6 @@ unittest  // a worker pass hands poll-driven fetches to tasks, so a slow check h
 
 	EventsOptions o;
 	o.nowMs = () @safe => 1_000_000L;
-	o.nowIso = () @safe => "t";
 	o.allowPrivateCallbackHosts = true;
 	o.webhookTransport = new FakeWebhookTransport();
 	auto rt = new EventsRuntime(null, o);
@@ -7086,7 +7052,6 @@ unittest  // poll-driven fetches run at most webhookMaxConcurrentFetches at a ti
 	void delegate() @safe[] tasks;
 	EventsOptions o;
 	o.nowMs = () @safe => 1_000_000L;
-	o.nowIso = () @safe => "t";
 	o.allowPrivateCallbackHosts = true;
 	o.webhookTransport = ft;
 	o.webhookMaxConcurrentFetches = 2;
@@ -7125,7 +7090,6 @@ unittest  // restarting the delivery worker stops the loop it replaces
 	EventsOptions o;
 	int clockReads;
 	o.nowMs = () @safe { clockReads++; return 1_000_000L; };
-	o.nowIso = () @safe => "t";
 	auto rt = new EventsRuntime(null, o);
 	int beforeStop, afterStop;
 	runTask(() nothrow @safe {
@@ -7154,7 +7118,6 @@ unittest  // the worker does not run on the delivery hooks: a synchronous execut
 {
 	EventsOptions o;
 	o.nowMs = () @safe => 1_000_000L;
-	o.nowIso = () @safe => "t";
 	int runs;
 	o.deliveryExecutor = (void delegate() @safe job) @safe {
 		if (++runs > 3)
@@ -7185,7 +7148,6 @@ unittest  // an allowlist path prefix covers only whole path segments
 {
 	EventsOptions o;
 	o.nowMs = () @safe => 0L;
-	o.nowIso = () @safe => "t";
 	o.callbackAllowlist = ["https://proxy.example.com/hooks"];
 	auto rt = new EventsRuntime(null, o);
 	EventRegistration reg = {descriptor: EventType("n"), emitOnly: true};
@@ -7220,7 +7182,6 @@ unittest  // an allowlisted callback URL is pre-verified at subscribe time
 {
 	EventsOptions o;
 	o.nowMs = () @safe => 0L;
-	o.nowIso = () @safe => "t";
 	o.callbackAllowlist = ["https://proxy.example.com/"];
 	auto rt = new EventsRuntime(null, o);
 	EventRegistration reg = {descriptor: EventType("n"), emitOnly: true};
@@ -7233,7 +7194,6 @@ unittest  // an allowlist entry does not pre-verify a sibling domain or a userin
 {
 	EventsOptions o;
 	o.nowMs = () @safe => 0L;
-	o.nowIso = () @safe => "t";
 	o.callbackAllowlist = ["https://hooks.example.com/"];
 	auto rt = new EventsRuntime(null, o);
 	EventRegistration reg = {descriptor: EventType("n"), emitOnly: true};
@@ -7260,7 +7220,6 @@ unittest  // assumePrincipal lets webhook subscribe succeed without an explicit 
 {
 	EventsOptions o;
 	o.nowMs = () @safe => 0L;
-	o.nowIso = () @safe => "t";
 	o.assumePrincipal = "demo-user";
 	auto rt = new EventsRuntime(null, o);
 	EventRegistration reg = {descriptor: EventType("n"), emitOnly: true};
@@ -7281,7 +7240,6 @@ unittest  // a plain-http callback is rejected by default but allowed in dev mod
 
 	EventsOptions o;
 	o.nowMs = () @safe => 0L;
-	o.nowIso = () @safe => "t";
 	o.allowPrivateCallbackHosts = true;
 	auto dev = new EventsRuntime(null, o);
 	dev.register(reg);
@@ -7297,7 +7255,6 @@ unittest  // http to a PUBLIC host is rejected at subscribe even with the dev fl
 
 	EventsOptions o;
 	o.nowMs = () @safe => 0L;
-	o.nowIso = () @safe => "t";
 	o.allowPrivateCallbackHosts = true; // dev flag set
 	auto dev = new EventsRuntime(null, o);
 	EventRegistration reg = {descriptor: EventType("n"), emitOnly: true};
@@ -7320,7 +7277,6 @@ version (MCPWebhookEd25519)
 	{
 		EventsOptions o;
 		o.nowMs = () @safe => 0L;
-		o.nowIso = () @safe => "t";
 		o.webhookSigningKey = ed25519TestKey;
 		auto rt = new EventsRuntime(null, o);
 		auto jwks = rt.webhookJwks();
@@ -7337,7 +7293,6 @@ version (MCPWebhookEd25519)
 
 		EventsOptions o;
 		o.nowMs = () @safe => 0L;
-		o.nowIso = () @safe => "t";
 		o.webhookSigningKey = ed25519TestKey;
 		auto rt = new EventsRuntime(null, o);
 
@@ -7372,7 +7327,6 @@ else
 
 		EventsOptions o;
 		o.nowMs = () @safe => 0L;
-		o.nowIso = () @safe => "t";
 		o.webhookSigningKey = "whsk_anything";
 		assertThrown!Exception(new EventsRuntime(null, o));
 	}
@@ -7501,7 +7455,6 @@ version (unittest)
 	{
 		EventsOptions o;
 		o.nowMs = () @safe => 1_000_000L;
-		o.nowIso = () @safe => "t";
 		o.allowPrivateCallbackHosts = allowPrivate;
 		o.webhookTransport = ft;
 		o.webhookRetryBase = Duration.zero;
@@ -7538,7 +7491,6 @@ unittest  // a rotated previous secret is cleared once its grace window has elap
 	auto ft = new FakeWebhookTransport();
 	EventsOptions o;
 	o.nowMs = () @safe => now;
-	o.nowIso = () @safe => "t";
 	o.allowPrivateCallbackHosts = true;
 	o.webhookTransport = ft;
 	o.deliveryExecutor = (void delegate() @safe job) @safe { job(); };
@@ -7577,7 +7529,6 @@ unittest  // end-to-end secret rotation: deliveries dual-sign within grace, sing
 	auto ft = new FakeWebhookTransport();
 	EventsOptions o;
 	o.nowMs = () @safe => now;
-	o.nowIso = () @safe => "t";
 	o.allowPrivateCallbackHosts = true;
 	o.webhookTransport = ft;
 	o.deliveryExecutor = (void delegate() @safe job) @safe { job(); };
@@ -7667,7 +7618,6 @@ unittest  // terminated envelopes waiting for a poster are bounded
 	auto ft = new FakeWebhookTransport();
 	EventsOptions o;
 	o.nowMs = () @safe => 1_000_000L;
-	o.nowIso = () @safe => "t";
 	o.allowPrivateCallbackHosts = true;
 	o.callbackAllowlist = ["https://proxy/"];
 	o.webhookTransport = ft;
@@ -7732,7 +7682,6 @@ unittest  // deliveries skipped by the verification backoff are not counted towa
 	ft.echoChallenge = false;
 	EventsOptions o;
 	o.nowMs = () @safe => 1_000_000L;
-	o.nowIso = () @safe => "t";
 	o.allowPrivateCallbackHosts = true;
 	o.webhookTransport = ft;
 	o.deliveryExecutor = (void delegate() @safe job) @safe { job(); };
@@ -7801,7 +7750,6 @@ unittest  // a check-backed type is served over webhook by replaying from the cu
 	long now = 1_000_000;
 	EventsOptions o;
 	o.nowMs = () @safe => now;
-	o.nowIso = () @safe => "t";
 	o.allowPrivateCallbackHosts = true;
 	o.webhookTransport = ft;
 	o.deliveryExecutor = (void delegate() @safe job) @safe { job(); };
@@ -7902,7 +7850,6 @@ version (unittest)
 	{
 		EventsOptions o;
 		o.nowMs = () @safe => 1_000_000L;
-		o.nowIso = () @safe => "t";
 		o.allowPrivateCallbackHosts = true;
 		o.webhookTransport = ft;
 		o.deliveryQueue = q;
@@ -7973,7 +7920,6 @@ unittest  // the worker reconciles delivery bookkeeping on its own slower cadenc
 	auto q = new FailingQueue();
 	EventsOptions o;
 	o.nowMs = () @safe => now;
-	o.nowIso = () @safe => "t";
 	o.allowPrivateCallbackHosts = true;
 	o.webhookTransport = new FakeWebhookTransport();
 	o.deliveryQueue = q;
@@ -8076,7 +8022,6 @@ unittest  // an unsubscribe while the poll-driven check runs is not undone by th
 	long now = 1_000_000;
 	EventsOptions o;
 	o.nowMs = () @safe => now;
-	o.nowIso = () @safe => "t";
 	o.allowPrivateCallbackHosts = true;
 	o.webhookTransport = ft;
 	o.deliveryExecutor = (void delegate() @safe job) @safe { job(); };
@@ -8191,7 +8136,6 @@ unittest  // a delivery yielding mid-POST does not let a sibling job of the subs
 	auto ft = new FakeWebhookTransport();
 	EventsOptions o;
 	o.nowMs = () @safe => 1_000_000L;
-	o.nowIso = () @safe => "t";
 	o.allowPrivateCallbackHosts = true;
 	o.webhookTransport = ft;
 	o.webhookRetryBase = Duration.zero;
@@ -8232,7 +8176,6 @@ unittest  // concurrent deliveries to one unverified endpoint send a single chal
 	ft.echoChallenge = false;
 	EventsOptions o;
 	o.nowMs = () @safe => 1_000_000L;
-	o.nowIso = () @safe => "t";
 	o.allowPrivateCallbackHosts = true;
 	o.webhookTransport = ft;
 	o.webhookRetryBase = Duration.zero;
@@ -8287,7 +8230,6 @@ unittest  // a lapsed subscription is recreated from the client's cursor, with l
 	long now = 1_000_000;
 	EventsOptions o;
 	o.nowMs = () @safe => now;
-	o.nowIso = () @safe => "t";
 	o.allowPrivateCallbackHosts = true;
 	o.webhookTransport = ft;
 	o.deliveryExecutor = (void delegate() @safe job) @safe { job(); };
@@ -8354,7 +8296,6 @@ unittest  // the sweep leaves a subscription re-created after it read the lapsed
 	auto store = new YieldingStore();
 	EventsOptions o;
 	o.nowMs = () @safe => now;
-	o.nowIso = () @safe => "t";
 	o.allowPrivateCallbackHosts = true;
 	o.webhookTransport = new FakeWebhookTransport();
 	o.deliveryExecutor = (void delegate() @safe job) @safe { job(); };
@@ -8411,7 +8352,6 @@ unittest  // an emit-only webhook backfill larger than the pending bound pages i
 	auto ft = new FakeWebhookTransport();
 	EventsOptions o;
 	o.nowMs = () @safe => 1_000_000L;
-	o.nowIso = () @safe => "t";
 	o.allowPrivateCallbackHosts = true;
 	o.webhookTransport = ft;
 	o.deliveryExecutor = (void delegate() @safe job) @safe { job(); };
@@ -8518,7 +8458,6 @@ unittest  // a deferred drain delivers every leased job
 	auto ft = new FakeWebhookTransport();
 	EventsOptions o;
 	o.nowMs = () @safe => 1_000_000L;
-	o.nowIso = () @safe => "t";
 	o.allowPrivateCallbackHosts = true;
 	o.webhookTransport = ft;
 	o.webhookRetryBase = Duration.zero;
@@ -8619,7 +8558,6 @@ unittest  // well-known verification can be disabled, falling back to the challe
 	ft.wellKnownBody = `{"receivers": ["/hooks/"]}`;
 	EventsOptions o;
 	o.nowMs = () @safe => 1_000_000L;
-	o.nowIso = () @safe => "t";
 	o.allowPrivateCallbackHosts = true;
 	o.webhookTransport = ft;
 	o.deliveryExecutor = (void delegate() @safe job) @safe { job(); };
@@ -8641,7 +8579,6 @@ unittest  // an unverified endpoint is not re-probed on every emit (verification
 	ft.echoChallenge = false; // the endpoint never completes the handshake
 	EventsOptions o;
 	o.nowMs = () @safe => now;
-	o.nowIso = () @safe => "t";
 	o.allowPrivateCallbackHosts = true;
 	o.webhookTransport = ft;
 	o.deliveryExecutor = (void delegate() @safe job) @safe { job(); };
@@ -8672,7 +8609,6 @@ unittest  // a delivery that waited on another's verification of its endpoint re
 	auto ft = new FakeWebhookTransport();
 	EventsOptions o;
 	o.nowMs = () @safe => now;
-	o.nowIso = () @safe => "t";
 	o.allowPrivateCallbackHosts = true;
 	o.webhookTransport = ft;
 	o.deliveryExecutor = (void delegate() @safe job) @safe { job(); };
@@ -8700,7 +8636,6 @@ unittest  // publishing to a type with no match or transform builds no per-subsc
 	auto ft = new FakeWebhookTransport();
 	EventsOptions o;
 	o.nowMs = () @safe => 1_000_000L;
-	o.nowIso = () @safe => "t";
 	o.allowPrivateCallbackHosts = true;
 	o.callbackAllowlist = ["https://proxy/"];
 	o.webhookTransport = ft;
@@ -8899,7 +8834,6 @@ unittest  // a sustained failure rate over the minimum sample suspends the subsc
 	auto ft = new FakeWebhookTransport();
 	EventsOptions o;
 	o.nowMs = () @safe => 1_000_000L;
-	o.nowIso = () @safe => "t";
 	o.allowPrivateCallbackHosts = true;
 	o.webhookTransport = ft;
 	o.deliveryExecutor = (void delegate() @safe job) @safe { job(); };
@@ -8925,7 +8859,6 @@ unittest  // a throttled (429) delivery is retried but is no sample for the susp
 	auto ft = new FakeWebhookTransport();
 	EventsOptions o;
 	o.nowMs = () @safe => 1_000_000L;
-	o.nowIso = () @safe => "t";
 	o.allowPrivateCallbackHosts = true;
 	o.webhookTransport = ft;
 	o.deliveryExecutor = (void delegate() @safe job) @safe { job(); };
@@ -8950,7 +8883,6 @@ unittest  // a failed delivery's Retry-After holds its retry back at least that 
 	auto ft = new FakeWebhookTransport();
 	EventsOptions o;
 	o.nowMs = () @safe => now;
-	o.nowIso = () @safe => "t";
 	o.allowPrivateCallbackHosts = true;
 	o.webhookTransport = ft;
 	o.deliveryExecutor = (void delegate() @safe job) @safe { job(); };
@@ -8977,7 +8909,6 @@ unittest  // the refresh that reactivates a suspended subscription reports the s
 	auto ft = new FakeWebhookTransport();
 	EventsOptions o;
 	o.nowMs = () @safe => 1_000_000L;
-	o.nowIso = () @safe => "t";
 	o.allowPrivateCallbackHosts = true;
 	o.webhookTransport = ft;
 	o.deliveryExecutor = (void delegate() @safe job) @safe { job(); };
@@ -9005,7 +8936,6 @@ unittest  // a refresh that reactivates a suspended subscription starts a fresh 
 	auto ft = new FakeWebhookTransport();
 	EventsOptions o;
 	o.nowMs = () @safe => 1_000_000L;
-	o.nowIso = () @safe => "t";
 	o.allowPrivateCallbackHosts = true;
 	o.webhookTransport = ft;
 	o.deliveryExecutor = (void delegate() @safe job) @safe { job(); };
@@ -9034,7 +8964,6 @@ unittest  // every failed retry attempt counts toward suspension, so a dead endp
 	auto ft = new FakeWebhookTransport();
 	EventsOptions o;
 	o.nowMs = () @safe => 1_000_000L;
-	o.nowIso = () @safe => "t";
 	o.allowPrivateCallbackHosts = true;
 	o.webhookTransport = ft;
 	o.deliveryExecutor = (void delegate() @safe job) @safe { job(); };
@@ -9058,7 +8987,6 @@ unittest  // the first failed attempt records lastError and failedSince before a
 	auto ft = new FakeWebhookTransport();
 	EventsOptions o;
 	o.nowMs = () @safe => 1_000_000L;
-	o.nowIso = () @safe => "t";
 	o.allowPrivateCallbackHosts = true;
 	o.webhookTransport = ft;
 	o.deliveryExecutor = (void delegate() @safe job) @safe { job(); };
@@ -9082,7 +9010,6 @@ unittest  // the default suspension policy suspends a dead endpoint within one w
 	long clock = 1_000_000;
 	EventsOptions o;
 	o.nowMs = () @safe => clock;
-	o.nowIso = () @safe => "t";
 	o.allowPrivateCallbackHosts = true;
 	o.webhookTransport = ft;
 	o.deliveryExecutor = (void delegate() @safe job) @safe { job(); };
@@ -9129,7 +9056,6 @@ unittest  // a failure rate under the threshold never suspends, however large th
 	auto ft = new FakeWebhookTransport();
 	EventsOptions o;
 	o.nowMs = () @safe => 1_000_000L;
-	o.nowIso = () @safe => "t";
 	o.allowPrivateCallbackHosts = true;
 	o.webhookTransport = ft;
 	o.deliveryExecutor = (void delegate() @safe job) @safe { job(); };
@@ -9154,7 +9080,6 @@ unittest  // the sample window tumbles: an old streak does not count against a n
 	auto ft = new FakeWebhookTransport();
 	EventsOptions o;
 	o.nowMs = () @safe => now;
-	o.nowIso = () @safe => "t";
 	o.allowPrivateCallbackHosts = true;
 	o.webhookTransport = ft;
 	o.deliveryExecutor = (void delegate() @safe job) @safe { job(); };
@@ -9180,7 +9105,6 @@ unittest  // events missed while suspended are signalled with a gap once a refre
 	auto queue = new InMemoryDeliveryQueue();
 	EventsOptions o;
 	o.nowMs = () @safe => 1_000_000L;
-	o.nowIso = () @safe => "t";
 	o.allowPrivateCallbackHosts = true;
 	o.webhookTransport = ft;
 	o.deliveryQueue = queue;
@@ -9221,7 +9145,6 @@ unittest  // a job queued before its subscription was suspended is not re-leased
 	auto queue = new InMemoryDeliveryQueue();
 	EventsOptions o;
 	o.nowMs = () @safe => 1_000_000L;
-	o.nowIso = () @safe => "t";
 	o.allowPrivateCallbackHosts = true;
 	o.webhookTransport = ft;
 	o.deliveryQueue = queue;
@@ -9250,7 +9173,6 @@ unittest  // deliveries to an endpoint that never verifies are dead-lettered aft
 	auto queue = new InMemoryDeliveryQueue();
 	EventsOptions o;
 	o.nowMs = () @safe => now;
-	o.nowIso = () @safe => "t";
 	o.allowPrivateCallbackHosts = true;
 	o.webhookTransport = ft;
 	o.deliveryQueue = queue;
@@ -9278,7 +9200,6 @@ unittest  // a subscription's queued deliveries are bounded; the overflow is sig
 	auto queue = new InMemoryDeliveryQueue();
 	EventsOptions o;
 	o.nowMs = () @safe => 1_000_000L;
-	o.nowIso = () @safe => "t";
 	o.allowPrivateCallbackHosts = true;
 	o.webhookTransport = ft;
 	o.deliveryQueue = queue;
@@ -9309,7 +9230,6 @@ unittest  // the pending bound also holds for deliveries that carry no cursor
 	auto queue = new InMemoryDeliveryQueue();
 	EventsOptions o;
 	o.nowMs = () @safe => now;
-	o.nowIso = () @safe => "t";
 	o.allowPrivateCallbackHosts = true;
 	o.webhookTransport = ft;
 	o.deliveryQueue = queue;
@@ -9343,7 +9263,6 @@ unittest  // a delivered cursor-less job frees its slot under the pending bound
 	auto ft = new FakeWebhookTransport();
 	EventsOptions o;
 	o.nowMs = () @safe => now;
-	o.nowIso = () @safe => "t";
 	o.allowPrivateCallbackHosts = true;
 	o.webhookTransport = ft;
 	o.webhookMaxPendingPerSubscription = 1;
@@ -9406,7 +9325,6 @@ unittest  // a push stream advance is batch-capped and reports when more remain
 {
 	EventsOptions o;
 	o.nowMs = () @safe => 1_000_000L;
-	o.nowIso = () @safe => "t";
 	o.pushExecutor = (void delegate() @safe job) @safe { job(); };
 	o.pollDefaultMaxEvents = 2;
 	auto rt = new EventsRuntime(null, o);
@@ -9431,7 +9349,6 @@ unittest  // a webhook subscription at its pending bound is not fetched past, so
 	auto ft = new FakeWebhookTransport();
 	EventsOptions o;
 	o.nowMs = () @safe => now;
-	o.nowIso = () @safe => "t";
 	o.allowPrivateCallbackHosts = true;
 	o.webhookTransport = ft;
 	o.webhookMaxPendingPerSubscription = 2;
@@ -9469,7 +9386,6 @@ unittest  // a batch-cursor batch larger than the free pending slots waits rathe
 	auto ft = new FakeWebhookTransport();
 	EventsOptions o;
 	o.nowMs = () @safe => now;
-	o.nowIso = () @safe => "t";
 	o.allowPrivateCallbackHosts = true;
 	o.webhookTransport = ft;
 	o.webhookMaxPendingPerSubscription = 3;
@@ -9525,7 +9441,6 @@ unittest  // a webhook fetch whose every event is filtered out advances the wate
 	auto ft = new FakeWebhookTransport();
 	EventsOptions o;
 	o.nowMs = () @safe => now;
-	o.nowIso = () @safe => "t";
 	o.allowPrivateCallbackHosts = true;
 	o.webhookTransport = ft;
 	o.webhookRetryBase = Duration.zero;
@@ -9555,7 +9470,6 @@ unittest  // a webhook poll pass keeps fetching while the check reports more
 	auto ft = new FakeWebhookTransport();
 	EventsOptions o;
 	o.nowMs = () @safe => now;
-	o.nowIso = () @safe => "t";
 	o.allowPrivateCallbackHosts = true;
 	o.webhookTransport = ft;
 	o.pollDefaultMaxEvents = 2;
@@ -9577,7 +9491,6 @@ unittest  // a no-replay check's truncation is reported to a webhook subscriber 
 	auto ft = new FakeWebhookTransport();
 	EventsOptions o;
 	o.nowMs = () @safe => now;
-	o.nowIso = () @safe => "t";
 	o.allowPrivateCallbackHosts = true;
 	o.webhookTransport = ft;
 	o.webhookRetryBase = Duration.zero;
@@ -9608,7 +9521,6 @@ unittest  // a quiet fetch does not advance the watermark past a position still 
 	ft.throwEvents = 1;
 	EventsOptions o;
 	o.nowMs = () @safe => now;
-	o.nowIso = () @safe => "t";
 	o.allowPrivateCallbackHosts = true;
 	o.webhookTransport = ft;
 	o.webhookMaxAttempts = 1;
@@ -9637,7 +9549,6 @@ unittest  // emits arriving before a drain runs share one drain kick
 	auto ft = new FakeWebhookTransport();
 	EventsOptions o;
 	o.nowMs = () @safe => 1_000_000L;
-	o.nowIso = () @safe => "t";
 	o.allowPrivateCallbackHosts = true;
 	o.webhookTransport = ft;
 	o.webhookRetryBase = Duration.zero;
@@ -9663,7 +9574,6 @@ unittest  // endpoint verification and well-known caches are evicted once stale
 	ft.wellKnownBody = `{"receivers": ["/hooks/"]}`;
 	EventsOptions o;
 	o.nowMs = () @safe => now;
-	o.nowIso = () @safe => "t";
 	o.allowPrivateCallbackHosts = true;
 	o.webhookTransport = ft;
 	o.deliveryExecutor = (void delegate() @safe job) @safe { job(); };
@@ -9690,7 +9600,6 @@ unittest  // emitted webhook deliveries respect the type's match filter
 	auto ft = new FakeWebhookTransport();
 	EventsOptions o;
 	o.nowMs = () @safe => 1_000_000L;
-	o.nowIso = () @safe => "t";
 	o.allowPrivateCallbackHosts = true;
 	o.webhookTransport = ft;
 	o.deliveryExecutor = (void delegate() @safe job) @safe { job(); };
@@ -9723,7 +9632,6 @@ unittest  // a match throwing for one webhook subscription neither escapes emit 
 	auto ft = new FakeWebhookTransport();
 	EventsOptions o;
 	o.nowMs = () @safe => 1_000_000L;
-	o.nowIso = () @safe => "t";
 	o.allowPrivateCallbackHosts = true;
 	o.webhookTransport = ft;
 	o.deliveryExecutor = (void delegate() @safe job) @safe { job(); };
@@ -9756,7 +9664,6 @@ unittest  // publish enqueues a webhook delivery; delivery happens on a queue dr
 	auto ft = new FakeWebhookTransport();
 	EventsOptions o;
 	o.nowMs = () @safe => 1_000_000L;
-	o.nowIso = () @safe => "t";
 	o.allowPrivateCallbackHosts = true;
 	o.webhookTransport = ft;
 	o.webhookRetryBase = Duration.zero;
@@ -9796,7 +9703,6 @@ unittest  // the lapsed-subscription sweep reads only lapsed subscriptions, neve
 	auto store = new CountingStore();
 	EventsOptions o;
 	o.nowMs = () @safe => now;
-	o.nowIso = () @safe => "t";
 	o.allowPrivateCallbackHosts = true;
 	o.webhookTransport = new FakeWebhookTransport();
 	o.webhookRetryBase = Duration.zero;
@@ -9830,7 +9736,6 @@ unittest  // subscribe and publish read only the subscriptions they concern, nev
 	auto ft = new FakeWebhookTransport();
 	EventsOptions o;
 	o.nowMs = () @safe => 1_000_000L;
-	o.nowIso = () @safe => "t";
 	o.allowPrivateCallbackHosts = true;
 	o.webhookTransport = ft;
 	o.webhookRetryBase = Duration.zero;
@@ -9883,7 +9788,6 @@ version (unittest)
 	{
 		EventsOptions o;
 		o.nowMs = () @safe => 1_000_000L;
-		o.nowIso = () @safe => "t";
 		o.allowPrivateCallbackHosts = true;
 		o.webhookTransport = new FakeWebhookTransport();
 		o.webhookRetryBase = Duration.zero;
@@ -9923,7 +9827,6 @@ unittest  // a subscription whose routing throws costs only itself the event
 	auto ft = new FakeWebhookTransport();
 	EventsOptions o;
 	o.nowMs = () @safe => 1_000_000L;
-	o.nowIso = () @safe => "t";
 	o.allowPrivateCallbackHosts = true;
 	o.callbackAllowlist = ["https://proxy/"];
 	o.webhookTransport = ft;
@@ -10085,7 +9988,6 @@ unittest  // a reconcile pass while a new webhook subscription is stored does no
 	auto store = new YieldingStore();
 	EventsOptions o;
 	o.nowMs = () @safe => 1_000_000L;
-	o.nowIso = () @safe => "t";
 	o.allowPrivateCallbackHosts = true;
 	o.webhookTransport = new FakeWebhookTransport();
 	o.webhookRetryBase = Duration.zero;
@@ -10131,7 +10033,6 @@ version (unittest)
 	{
 		EventsOptions o;
 		o.nowMs = () @safe => 1_000_000L;
-		o.nowIso = () @safe => "t";
 		o.allowPrivateCallbackHosts = true;
 		o.webhookTransport = ft;
 		o.webhookRetryBase = Duration.zero;
@@ -10190,7 +10091,6 @@ unittest  // an emit landing while a new subscription's replay is settled is del
 	auto ft = new FakeWebhookTransport();
 	EventsOptions o;
 	o.nowMs = () @safe => 1_000_000L;
-	o.nowIso = () @safe => "t";
 	o.allowPrivateCallbackHosts = true;
 	o.webhookTransport = ft;
 	o.webhookRetryBase = Duration.zero;
@@ -10224,7 +10124,6 @@ unittest  // a removed subscription's queued jobs are not delivered to its resub
 	auto queue = new InMemoryDeliveryQueue();
 	EventsOptions o;
 	o.nowMs = () @safe => 1_000_000L;
-	o.nowIso = () @safe => "t";
 	o.allowPrivateCallbackHosts = true;
 	o.webhookTransport = ft;
 	o.deliveryQueue = queue;
@@ -10262,7 +10161,6 @@ unittest  // a job for a subscription that lapsed before delivery is acked witho
 	auto queue = new InMemoryDeliveryQueue();
 	EventsOptions o;
 	o.nowMs = () @safe => now;
-	o.nowIso = () @safe => "t";
 	o.allowPrivateCallbackHosts = true;
 	o.webhookTransport = ft;
 	o.deliveryQueue = queue;
@@ -10291,7 +10189,6 @@ unittest  // multi-node: node B's worker delivers a job node A enqueued (shared 
 	auto ftA = new FakeWebhookTransport();
 	EventsOptions oa;
 	oa.nowMs = () @safe => 1_000_000L;
-	oa.nowIso = () @safe => "t";
 	oa.allowPrivateCallbackHosts = true;
 	oa.webhookTransport = ftA;
 	oa.webhookRetryBase = Duration.zero;
@@ -10308,7 +10205,6 @@ unittest  // multi-node: node B's worker delivers a job node A enqueued (shared 
 	auto ftB = new FakeWebhookTransport();
 	EventsOptions ob;
 	ob.nowMs = () @safe => 2_000_000L;
-	ob.nowIso = () @safe => "t";
 	ob.allowPrivateCallbackHosts = true;
 	ob.webhookTransport = ftB;
 	ob.webhookRetryBase = Duration.zero;
@@ -10362,7 +10258,6 @@ version (unittest)
 		{
 			EventsOptions o;
 			o.nowMs = () @safe => t.now;
-			o.nowIso = () @safe => "t";
 			o.allowPrivateCallbackHosts = true;
 			o.webhookTransport = ft;
 			o.deliveryQueue = t.queue;
@@ -10473,7 +10368,6 @@ unittest  // attempt persistence: a job re-leased mid-retry does not restart att
 	auto queue = new InMemoryDeliveryQueue();
 	EventsOptions o;
 	o.nowMs = () @safe => 1_000_000L;
-	o.nowIso = () @safe => "t";
 	o.allowPrivateCallbackHosts = true;
 	o.webhookTransport = ft;
 	o.deliveryQueue = queue;
@@ -10582,7 +10476,6 @@ unittest  // an owed gap survives a restart over the same subscription store
 	{
 		EventsOptions o;
 		o.nowMs = () @safe => 1_000_000L;
-		o.nowIso = () @safe => "t";
 		o.allowPrivateCallbackHosts = true;
 		o.webhookTransport = ft;
 		o.deliveryExecutor = (void delegate() @safe job) @safe { job(); };
@@ -10659,7 +10552,6 @@ unittest  // a transient failure leaves the job leased (not acked) for re-lease
 	EventsOptions o;
 	long now = 1_000_000L;
 	o.nowMs = () @safe => now;
-	o.nowIso = () @safe => "t";
 	o.allowPrivateCallbackHosts = true;
 	o.webhookTransport = ft;
 	o.deliveryQueue = queue;
@@ -10706,7 +10598,6 @@ unittest  // a delivery whose store throws is dead-lettered, not looped invisibl
 	EventsOptions o;
 	long now = 1_000_000L;
 	o.nowMs = () @safe => now;
-	o.nowIso = () @safe => "t";
 	o.allowPrivateCallbackHosts = true;
 	o.webhookTransport = ft;
 	o.deliveryQueue = queue;
@@ -10735,7 +10626,6 @@ unittest  // a delivery that throws mid-retry keeps its attempt count, so attemp
 	long now = 1_000_000;
 	EventsOptions o;
 	o.nowMs = () @safe => now;
-	o.nowIso = () @safe => "t";
 	o.allowPrivateCallbackHosts = true;
 	o.webhookTransport = ft;
 	o.webhookMaxAttempts = 5;
@@ -10766,7 +10656,6 @@ unittest  // a dead-lettered delivery settles its position so the watermark keep
 	ft.throwEvents = 1;
 	EventsOptions o;
 	o.nowMs = () @safe => 1_000_000L;
-	o.nowIso = () @safe => "t";
 	o.allowPrivateCallbackHosts = true;
 	o.webhookTransport = ft;
 	o.webhookMaxAttempts = 1;
@@ -10786,7 +10675,6 @@ unittest  // re-publishing an event id already queued does not wedge the waterma
 	auto ft = new FakeWebhookTransport();
 	EventsOptions o;
 	o.nowMs = () @safe => 1_000_000L;
-	o.nowIso = () @safe => "t";
 	o.allowPrivateCallbackHosts = true;
 	o.webhookTransport = ft;
 	o.webhookRetryBase = Duration.zero;
@@ -10903,7 +10791,6 @@ unittest  // a dead-lettered delivery is logged and owed a gap
 	ft.throwEvents = 1;
 	EventsOptions o;
 	o.nowMs = () @safe => 1_000_000L;
-	o.nowIso = () @safe => "t";
 	o.allowPrivateCallbackHosts = true;
 	o.webhookTransport = ft;
 	o.webhookMaxAttempts = 1;
@@ -10946,7 +10833,6 @@ unittest  // a deferred delivery is not overtaken by its subscription's later ev
 	long now = 1_000_000;
 	EventsOptions o;
 	o.nowMs = () @safe => now;
-	o.nowIso = () @safe => "t";
 	o.allowPrivateCallbackHosts = true;
 	o.webhookTransport = ft;
 	o.webhookRetryBase = 1.seconds;
@@ -10998,8 +10884,20 @@ unittest  // an EventHandle setter on an unregistered type throws rather than re
 	auto rt = testRuntime();
 	auto h = rt.define!(DemoArgs, DemoPayload)("x");
 	rt.unregister("x");
-	assertThrown(h.match((DemoArgs a, DemoPayload p) @safe => true));
+	assertThrown!McpException(h.match((DemoArgs a, DemoPayload p) @safe => true));
 	assert(!rt.has("x"));
+}
+
+unittest  // a published event without a timestamp is stamped from the runtime's millisecond clock
+{
+	auto rt = testRuntime(() @safe => 1_771_515_000_250L);
+	EventRegistration reg = {descriptor: EventType("n"), emitOnly: true};
+	rt.register(reg);
+	rt.emit(EventOccurrence("evt_1", "n", ""));
+	auto r = rt.poll("n", Json.emptyObject, "u", nullable(seqCursor(0)),
+			Nullable!long.init, Nullable!long.init);
+	assert(r.events.length == 1);
+	assert(r.events[0].timestamp == isoFromMs(1_771_515_000_250L));
 }
 
 unittest  // a handle to a removed type cannot amend a type later defined under its name
@@ -11010,8 +10908,9 @@ unittest  // a handle to a removed type cannot amend a type later defined under 
 	auto stale = rt.define!(DemoArgs, DemoPayload)("x");
 	rt.unregister("x");
 	rt.define!(DemoArgs, DemoPayload)("x").pollInterval(5.seconds);
-	assertThrown(stale.pollInterval(9.seconds));
-	assertThrown(stale.onSubscribe((DemoArgs a, scope SubContext ctx) @safe {}));
+	assertThrown!McpException(stale.pollInterval(9.seconds));
+	assertThrown!McpException(stale.onSubscribe((DemoArgs a, scope SubContext ctx) @safe {
+		}));
 	assert(rt.types_["x"].pollInterval.get == 5.seconds);
 	assert(rt.types_["x"].onSubscribe is null);
 }
@@ -11024,7 +10923,7 @@ unittest  // a handle to a removed type cannot publish to a type later defined u
 	auto stale = rt.define!(DemoArgs, DemoPayload)("x");
 	rt.unregister("x");
 	auto fresh = rt.define!(DemoArgs, DemoPayload)("x");
-	assertThrown(stale.publish(DemoPayload.init));
+	assertThrown!McpException(stale.publish(DemoPayload.init));
 	fresh.publish(DemoPayload.init);
 }
 
@@ -11127,7 +11026,6 @@ unittest  // dot segments never place a callback path under an allowlisted prefi
 {
 	EventsOptions o;
 	o.nowMs = () @safe => 1_000_000L;
-	o.nowIso = () @safe => "t";
 	o.callbackAllowlist = ["https://hooks.example.com/mcp/"];
 	auto rt = new EventsRuntime(null, o);
 	assert(rt.urlAllowlisted("https://hooks.example.com/mcp/a"));
@@ -11142,7 +11040,6 @@ unittest  // a delivery waiting out the verification backoff is held, not droppe
 	auto queue = new InMemoryDeliveryQueue();
 	EventsOptions o;
 	o.nowMs = () @safe => now;
-	o.nowIso = () @safe => "t";
 	o.allowPrivateCallbackHosts = true;
 	o.webhookTransport = ft;
 	o.deliveryQueue = queue;
@@ -11175,7 +11072,6 @@ unittest  // terminating many webhook subscriptions posts their envelopes from a
 	void delegate() @safe[] tasks;
 	EventsOptions o;
 	o.nowMs = () @safe => 1_000_000L;
-	o.nowIso = () @safe => "t";
 	o.allowPrivateCallbackHosts = true;
 	o.webhookTransport = ft;
 	o.callbackAllowlist = ["https://proxy/"];
@@ -11200,7 +11096,6 @@ unittest  // a terminated envelope queued while delivery runs fill the bound is 
 	void delegate() @safe[] tasks;
 	EventsOptions o;
 	o.nowMs = () @safe => 1_000_000L;
-	o.nowIso = () @safe => "t";
 	o.allowPrivateCallbackHosts = true;
 	o.webhookTransport = ft;
 	o.callbackAllowlist = ["https://proxy/"];
@@ -11225,7 +11120,6 @@ unittest  // the worker pass posts terminated envelopes still waiting for a post
 	auto ft = new FakeWebhookTransport();
 	EventsOptions o;
 	o.nowMs = () @safe => 1_000_000L;
-	o.nowIso = () @safe => "t";
 	o.allowPrivateCallbackHosts = true;
 	o.webhookTransport = ft;
 	o.deliveryExecutor = (void delegate() @safe job) @safe { job(); };
@@ -11242,7 +11136,6 @@ unittest  // a drain starts no more delivery runs than the node's concurrency bo
 	auto queue = new InMemoryDeliveryQueue();
 	EventsOptions o;
 	o.nowMs = () @safe => 1_000_000L;
-	o.nowIso = () @safe => "t";
 	o.allowPrivateCallbackHosts = true;
 	o.webhookTransport = ft;
 	o.deliveryQueue = queue;
@@ -11278,7 +11171,6 @@ unittest  // events missed while suspended cost no store write per emit, and the
 	auto ft = new FakeWebhookTransport();
 	EventsOptions o;
 	o.nowMs = () @safe => 1_000_000L;
-	o.nowIso = () @safe => "t";
 	o.allowPrivateCallbackHosts = true;
 	o.webhookTransport = ft;
 	o.deliveryExecutor = (void delegate() @safe job) @safe { job(); };
