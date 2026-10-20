@@ -644,7 +644,7 @@ final class HttpClientTransport : ClientTransport
 		// Close every stream socket and interrupt its reader, so a reader parked on
 		// `conn.read` unblocks at once even where closing a socket does not wake a
 		// pending read (the Windows event driver). A reader running an inbound
-		// handler is not interrupted; it observes `closing` once the handler returns.
+		// handler is not interrupted; it observes `closeRequested` once the handler returns.
 		foreach (slot; serverStreamSlots)
 			slot.abort();
 		if (legacyStreamSlot !is null)
@@ -703,11 +703,6 @@ final class HttpClientTransport : ClientTransport
 		catch (Exception)
 		{
 		}
-	}
-
-	private bool closing() @safe
-	{
-		return closeRequested;
 	}
 
 	/// Lazily create the legacy-path completion event (a `LocalManualEvent` must be
@@ -1002,18 +997,11 @@ final class HttpClientTransport : ClientTransport
 	/// state; a request already aborted is not sent. The POST carries `bearer`.
 	private Json postAndAwait(Json message, long expectId, PostRequest req, string bearer) @safe
 	{
-		if (req.aborted !is null)
-			throw req.aborted;
-		return awaitPostResponse(message, expectId, req, bearer);
-	}
-
-	/// Send `message` (carrying `bearer`) and read the response with id `expectId`
-	/// for `postAndAwait`, resuming a dropped 2025-era stream; `req` carries the
-	/// request's abort state.
-	private Json awaitPostResponse(Json message, long expectId, PostRequest req, string bearer) @safe
-	{
 		import core.time : msecs;
 		import vibe.core.core : sleep;
+
+		if (req.aborted !is null)
+			throw req.aborted;
 
 		Json result = Json.undefined;
 		bool got;
@@ -1244,7 +1232,7 @@ final class HttpClientTransport : ClientTransport
 				// `attach` closes `sock` immediately if a `close()` already ran during
 				// the `connectTCP` yield, so the socket is never leaked or left parked.
 				slot.attach(sock);
-				if (closing)
+				if (closeRequested)
 					return;
 				// Wrap in TLS for https; plaintext is returned unwrapped.
 				auto conn = openClientStream(sock, ep.tls ? tlsContext() : null, ep.host);
@@ -1332,8 +1320,8 @@ final class HttpClientTransport : ClientTransport
 				// immediately. This is what lets a mid-stream server->client request
 				// be answered while we keep reading for the final response. Stop once
 				// the awaited response/error arrives or the transport is closing.
-				readSseBody(conn, chunked, cursor, () @safe => got
-						|| err !is null || closing, (string eventType, string data) @safe {
+				readSseBody(conn, chunked, cursor, () @safe => got || err !is null
+						|| closeRequested, (string eventType, string data) @safe {
 					dispatchSse(data, expectId, result, got, err);
 				}, head.contentLength);
 			}
@@ -1552,7 +1540,7 @@ final class HttpClientTransport : ClientTransport
 				// `attach` closes `sock` immediately if a `close()` already ran during
 				// the `connectTCP` yield, so the socket is never leaked or left parked.
 				slot.attach(sock);
-				if (closing)
+				if (closeRequested)
 					return;
 				// Wrap in TLS for https; plaintext is returned unwrapped.
 				auto conn = openClientStream(sock, ep.tls ? tlsContext() : null, ep.host);
@@ -1606,7 +1594,7 @@ final class HttpClientTransport : ClientTransport
 					// got/err unset, so the read continues to stream end — the same
 					// observable outcome as the POST path.
 					dispatchSse(data, expectId, result, got, err);
-					done = awaitSatisfied(got, err);
+					done = got || err !is null;
 				}, head.contentLength);
 			}
 			catch (Exception e)
@@ -2108,7 +2096,7 @@ final class HttpClientTransport : ClientTransport
 		// without a session id would only be refused, so the stream is left for the
 		// next session's `notifications/initialized` to reopen.
 		const streamSession = sessionId;
-		while (!closing)
+		while (!closeRequested)
 		{
 			if (streamSession.length && sessionId.length == 0)
 			{
@@ -2162,7 +2150,7 @@ final class HttpClientTransport : ClientTransport
 					// `attach` closes `sock` immediately if a `close()` already ran during
 					// the `connectTCP` yield, so the socket is never leaked or left parked.
 					slot.attach(sock);
-					if (closing)
+					if (closeRequested)
 						return;
 					// Wrap in TLS for https; plaintext is returned unwrapped.
 					auto conn = openClientStream(sock, ep.tls ? tlsContext() : null, ep.host);
@@ -2197,8 +2185,8 @@ final class HttpClientTransport : ClientTransport
 					redirects = 0;
 					opened(true);
 
-					readSseBody(conn, head.chunked, cursor, () @safe => closing,
-							(string eventType, string data) @safe {
+					readSseBody(conn, head.chunked, cursor,
+							() @safe => closeRequested, (string eventType, string data) @safe {
 						sawData = true;
 						Message m;
 						try
@@ -2227,7 +2215,7 @@ final class HttpClientTransport : ClientTransport
 			if (redirect.length == 0 || refused)
 				opened(false);
 
-			if (closing)
+			if (closeRequested)
 				break;
 			if (refused)
 			{
@@ -2275,7 +2263,7 @@ final class HttpClientTransport : ClientTransport
 		// immediately rather than parking until the next event.
 		auto slot = new ListenSocketSlot;
 		// A slot registered after close() is born closed, so the stream ends at once.
-		if (closing)
+		if (closeRequested)
 			slot.closeSocket();
 		listenSockets ~= slot;
 		auto onCancel = () @safe nothrow{ slot.abort(); };
@@ -2352,7 +2340,7 @@ final class HttpClientTransport : ClientTransport
 
 		// A local cancel and the transport's close() both end the stream without
 		// it counting as a server failure.
-		auto isCancelled = () @safe => closing || (*cancelled);
+		auto isCancelled = () @safe => closeRequested || (*cancelled);
 
 		// Fire the establishment signal at most once: on the first dispatched frame
 		// (the stream is now confirmed open server-side) and, as a fallback, on any
@@ -2640,7 +2628,7 @@ final class HttpClientTransport : ClientTransport
 
 		// Wait for the correlated response, woken by the reader's `notifyLegacy`,
 		// `close()`, or `abort` (through which `McpClient` enforces its deadline).
-		while (!waiter.got && waiter.err is null && !closing)
+		while (!waiter.got && waiter.err is null && !closeRequested)
 			ec = legacyCompletionEvent().waitUninterruptible(Duration.max, ec);
 		if (waiter.err !is null)
 			throw waiter.err;
@@ -2658,7 +2646,8 @@ final class HttpClientTransport : ClientTransport
 
 		const deadline = MonoTime.currTime + listenTimeout_;
 		auto ec = legacyCompletionEvent().emitCount;
-		while (legacyReconnecting && !closing && !(legacyStreamAlive && legacyEndpoint.length))
+		while (legacyReconnecting && !closeRequested && !(legacyStreamAlive
+				&& legacyEndpoint.length))
 		{
 			const now = MonoTime.currTime;
 			if (now >= deadline)
@@ -2702,11 +2691,11 @@ final class HttpClientTransport : ClientTransport
 			}
 			// A first stream that never announced an endpoint is reported by
 			// `startLegacyFallback` instead.
-			if (closing || legacyStopRequested || !everEstablished)
+			if (closeRequested || legacyStopRequested || !everEstablished)
 				return;
 			legacyReconnecting = true;
 			const until = MonoTime.currTime + backoff;
-			while (!closing && MonoTime.currTime < until)
+			while (!closeRequested && MonoTime.currTime < until)
 				sleep(min(50.msecs, until - MonoTime.currTime));
 			backoff = nextBackoff(backoff, maxBackoff);
 		}
@@ -2761,13 +2750,13 @@ final class HttpClientTransport : ClientTransport
 				ResponseHead head;
 				for (;;)
 				{
-					if (closing || legacyStopRequested)
+					if (closeRequested || legacyStopRequested)
 						return;
 					auto sock = connectTimed(pinnedHost, ep.port);
 					// `attach` closes `sock` immediately if a `close()` already ran during
 					// the `connectTCP` yield, so the socket is never leaked or left parked.
 					slot.attach(sock);
-					if (closing || legacyStopRequested)
+					if (closeRequested || legacyStopRequested)
 						return;
 					// Wrap in TLS for https; plaintext is returned unwrapped.
 					conn = openClientStream(sock, ep.tls ? tlsContext() : null, ep.host);
@@ -2798,7 +2787,7 @@ final class HttpClientTransport : ClientTransport
 				}
 
 				SseCursor cursor;
-				readSseBody(conn, head.chunked, cursor, () @safe => closing
+				readSseBody(conn, head.chunked, cursor, () @safe => closeRequested
 						|| legacyStopRequested, (string eventType, string data) @safe {
 					if (eventType == "endpoint")
 					{
@@ -2926,13 +2915,6 @@ final class HttpClientTransport : ClientTransport
 	{
 		if (err is null && !got)
 			err = internalError(msg);
-	}
-
-	/// The awaited response/error has arrived, so an SSE read loop can stop. Used as
-	/// the resume-via-GET stop predicate, mirroring the POST path's predicate.
-	private static bool awaitSatisfied(bool got, McpException err) @safe
-	{
-		return got || err !is null;
 	}
 
 	private static McpException errorFrom(Json error) @safe
@@ -4089,12 +4071,12 @@ unittest  // close() interrupts the legacy GET-SSE reader
 	assert(interrupted);
 }
 
-unittest  // close() sets closing(), which the post-connect re-check in the stream readers observes
+unittest  // close() sets closeRequested, which the post-connect re-check in the stream readers observes
 {
 	auto t = new HttpClientTransport("http://host:8080/mcp");
-	assert(!t.closing);
+	assert(!t.closeRequested);
 	t.close();
-	assert(t.closing);
+	assert(t.closeRequested);
 }
 
 unittest  // a slot registered after close() is born-closed, so resumeViaGet's race-window socket is torn down
@@ -4827,7 +4809,6 @@ unittest  // the resume-via-GET read reuses dispatchSse: a matching error respon
 			9, result, got, err);
 	assert(err !is null && err.code == -32000);
 	assert(!got);
-	assert(HttpClientTransport.awaitSatisfied(got, err));
 }
 
 unittest  // a matching success response on the resume path is captured and stops the read
@@ -4838,7 +4819,6 @@ unittest  // a matching success response on the resume path is captured and stop
 	McpException err;
 	t.dispatchSse(`{"jsonrpc":"2.0","id":9,"result":{"ok":true}}`, 9, result, got, err);
 	assert(got && result["ok"].get!bool);
-	assert(HttpClientTransport.awaitSatisfied(got, err));
 }
 
 unittest  // a non-JSON keep-alive frame on the resume path neither fails nor stops the read
@@ -4849,7 +4829,6 @@ unittest  // a non-JSON keep-alive frame on the resume path neither fails nor st
 	McpException err;
 	t.dispatchSse(": keep-alive", 9, result, got, err);
 	assert(!got && err is null);
-	assert(!HttpClientTransport.awaitSatisfied(got, err));
 }
 
 unittest  // resolveLegacyMessage resolves the matching waiter from a well-formed response
