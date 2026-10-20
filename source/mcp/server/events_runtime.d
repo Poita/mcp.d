@@ -2654,39 +2654,58 @@ final class EventsRuntime
 		bool any;
 		foreach (sub; webhookStore_.byName(occ.name, now))
 		{
-			if (sub.isExpired(now))
-				continue;
-			if (!sub.active)
+			// A store or queue failure costs only this subscription this event:
+			// the rest of the fan-out proceeds, and the subscription is owed a
+			// gap for it where the store can still record one.
+			try
+				any |= routeToWebhook(reg, occ, sub, now);
+			catch (Exception e)
 			{
-				auto ctx = new EventContext(sub.cursor, sub.arguments, sub.principal);
-				bool matched = true;
-				// A throwing match counts as a miss, so the gap signal still covers it.
+				logEventsError("routing to a webhook subscription threw", e);
 				try
-					matched = reg is null || reg.match is null || reg.match(ctx, occ);
-				catch (Exception e)
-					logEventsError("match threw", e);
-				if (matched)
-				{
-					// Once the store records a debt, later misses only move its
-					// position forward: they are kept here and written by the
-					// worker or the reactivating refresh, not once per emit.
-					if (sub.owesGap && !occ.cursor.isNull)
-						coalescedMisses_[sub.id] = occ.cursor.get;
-					else
-						noteMissed(sub.id, occ.cursor);
-				}
-				continue;
+					noteMissed(sub.id, occ.cursor);
+				catch (Exception e2)
+					logEventsError("recording a missed webhook position threw", e2);
 			}
-			// A backfill still paging, or a replay not yet read, reaches this
-			// event in the ring buffer.
-			if ((sub.id in emitBackfill_) !is null || (sub.id in awaitingReplay_) !is null)
-				continue;
-			any |= enqueueForWebhook(sub, reg, occ);
 		}
 		// Kick a drain on this node so the just-enqueued jobs deliver promptly
 		// (workers on other nodes also lease from a shared queue independently).
 		if (any)
 			kickDrain();
+	}
+
+	// Route `occ` to one webhook subscription; returns whether a job was queued.
+	private bool routeToWebhook(EventRegistration* reg, EventOccurrence occ,
+			WebhookSubscription sub, long now) @safe
+	{
+		if (sub.isExpired(now))
+			return false;
+		if (!sub.active)
+		{
+			auto ctx = new EventContext(sub.cursor, sub.arguments, sub.principal);
+			bool matched = true;
+			// A throwing match counts as a miss, so the gap signal still covers it.
+			try
+				matched = reg is null || reg.match is null || reg.match(ctx, occ);
+			catch (Exception e)
+				logEventsError("match threw", e);
+			if (matched)
+			{
+				// Once the store records a debt, later misses only move its
+				// position forward: they are kept here and written by the
+				// worker or the reactivating refresh, not once per emit.
+				if (sub.owesGap && !occ.cursor.isNull)
+					coalescedMisses_[sub.id] = occ.cursor.get;
+				else
+					noteMissed(sub.id, occ.cursor);
+			}
+			return false;
+		}
+		// A backfill still paging, or a replay not yet read, reaches this
+		// event in the ring buffer.
+		if ((sub.id in emitBackfill_) !is null || (sub.id in awaitingReplay_) !is null)
+			return false;
+		return enqueueForWebhook(sub, reg, occ);
 	}
 
 	// Schedule a drain on the delivery executor unless one is already scheduled
@@ -9448,6 +9467,52 @@ version (unittest)
 		rt.register(reg);
 		return rt;
 	}
+}
+
+unittest  // a subscription whose routing throws costs only itself the event
+{
+	import std.algorithm : sort;
+
+	// Lists subscriptions in callback-URL order and fails writes to `failId`.
+	static final class FailingStore : ForwardingStore
+	{
+		string failId;
+
+		override WebhookSubscription[] byName(string name, long nowMs) @safe
+		{
+			auto subs = inner.byName(name, nowMs);
+			subs.sort!((a, b) => a.url < b.url);
+			return subs;
+		}
+
+		override bool compareAndSwap(WebhookSubscription sub, ulong expectedRevision) @safe
+		{
+			if (sub.id == failId)
+				throw new Exception("store unavailable");
+			return inner.compareAndSwap(sub, expectedRevision);
+		}
+	}
+
+	auto store = new FailingStore();
+	auto ft = new FakeWebhookTransport();
+	EventsOptions o;
+	o.nowMs = () @safe => 1_000_000L;
+	o.nowIso = () @safe => "t";
+	o.allowPrivateCallbackHosts = true;
+	o.callbackAllowlist = ["https://proxy/"];
+	o.webhookTransport = ft;
+	o.deliveryExecutor = (void delegate() @safe job) @safe { job(); };
+	auto rt = new EventsRuntime(store, o);
+	EventRegistration reg = {descriptor: EventType("n"), emitOnly: true};
+	rt.register(reg);
+	auto a = rt.subscribeWebhook(webhookSub("n", "https://proxy/a"), "user-1");
+	rt.subscribeWebhook(webhookSub("n", "https://proxy/b"), "user-1");
+	auto suspended = store.get(a.id).get;
+	suspended.active = false;
+	store.inner.put(suspended);
+	store.failId = a.id;
+	rt.emit(EventOccurrence("evt_1", "n", "t"));
+	assert(eventIdsPostedTo(ft, "https://proxy/b") == ["evt_1"]);
 }
 
 unittest  // a store write that throws while creating a subscription releases its lifecycle reference
