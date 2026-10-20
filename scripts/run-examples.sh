@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Build and e2e-run every example under examples/ (or only the examples named
 # as arguments, e.g. `scripts/run-examples.sh tools hello`) over EVERY transport
-# it supports. Run it from the repository root. Each example's client is a self-verifying e2e test (it asserts the
-# server's behaviour and exits non-zero on any mismatch).
+# it supports. It runs from the repository root wherever it is invoked from.
+# Each example's client is a self-verifying e2e test (it asserts the server's
+# behaviour and exits non-zero on any mismatch).
 #
 #   - HTTP (every example): start the server with `--http --port <P>` (auth is
 #     HTTP by default, started with just `--port <P>`), then run the client
@@ -14,6 +15,9 @@
 #     mode.
 set -uo pipefail
 fail=0
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "${SCRIPT_DIR}/.."
 
 # Raise the file-descriptor limit; the D toolchain opens many files at once.
 ulimit -n 65536 2>/dev/null || true
@@ -58,6 +62,7 @@ else
   dirs=(examples/*/)
 fi
 
+ran=0
 for d in "${dirs[@]}"; do
   n=$(basename "$d")
   [ -f "${d}dub.json" ] || continue
@@ -68,6 +73,7 @@ for d in "${dirs[@]}"; do
     continue
   fi
   echo "::group::example ${n}"
+  ran=$((ran + 1))
 
   if ! ( cd "$d" && dub build -c server && dub build -c client ); then
     echo "BUILD FAILED: ${n}"; fail=1; echo "::endgroup::"; continue
@@ -124,7 +130,10 @@ for d in "${dirs[@]}"; do
   echo "::endgroup::"
 done
 
-if [ "$fail" -eq 0 ]; then
+if [ "$ran" -eq 0 ]; then
+  echo "NO EXAMPLES FOUND under $(pwd)/examples" >&2
+  fail=1
+elif [ "$fail" -eq 0 ]; then
   echo "ALL EXAMPLES PASSED (stdio + http)"
 else
   echo "SOME EXAMPLES FAILED"
