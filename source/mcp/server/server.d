@@ -809,11 +809,16 @@ final class McpServer : ServerCore
 	/// The JSON-RPC error a non-`McpException` thrown while serving `method`
 	/// becomes: logged in full, and sent as a generic internal error unless
 	/// `exposeInternalErrors` was called.
-	package(mcp) McpException unexpectedFailure(string method, Exception e) @safe
+	package(mcp) McpException unexpectedFailure(string method, Throwable e) @safe
 	{
 		import vibe.core.log : logError;
 
-		logError("%s: unhandled %s: %s", method, typeid(e).name, e.msg);
+		if (cast(Error) e)
+			logError("%s: unhandled %s", method, () @trusted {
+				return e.toString();
+			}());
+		else
+			logError("%s: unhandled %s: %s", method, typeid(e).name, e.msg);
 		return internalError(exposeInternalErrors_ ? e.msg : "Internal error");
 	}
 
@@ -2708,6 +2713,27 @@ final class McpServer : ServerCore
 		scopeOpts.serverStateless = mode_ == ServerMode.stateless;
 		auto scoped = new RequestScope(ctx, scopeOpts);
 
+		// A handler bug (failed assert, out-of-bounds index) still owes the client
+		// a reply: without one a stdio client waits forever. Rethrowing would only
+		// end the transport task dispatching this request, so the Error is logged
+		// with its trace and answered as an internal error.
+		Nullable!Json reply;
+		if (auto err = catchHandlerError(()@safe {
+				reply = serveScoped(msg, scoped, effective, conn, token, ctx);
+			}))
+		{
+			if (token.cancelled)
+				return Nullable!Json.init;
+			return nullable(makeErrorResponse(msg.id, unexpectedFailure(msg.method, err)));
+		}
+		return reply;
+	}
+
+	/// Route `msg` under its request scope and shape the reply: the response, a
+	/// JSON-RPC error for anything the handler threw, or nothing once cancelled.
+	private Nullable!Json serveScoped(Message msg, RequestScope scoped, ProtocolVersion effective,
+			ConnectionState conn, CancellationToken token, RequestContext ctx) @safe
+	{
 		try
 		{
 			auto result = route(msg.method, msg.params, scoped, effective, conn);
@@ -2738,6 +2764,24 @@ final class McpServer : ServerCore
 				return Nullable!Json.init;
 			return nullable(makeErrorResponse(msg.id, unexpectedFailure(msg.method, e)));
 		}
+	}
+
+	/// Run `fn` and return the `Error` it throws, if any, rather than letting it
+	/// unwind the transport task. Running out of memory is not survivable and
+	/// still propagates.
+	private static Error catchHandlerError(scope void delegate() @safe fn) @trusted
+	{
+		import core.exception : InvalidMemoryOperationError, OutOfMemoryError;
+
+		try
+			fn();
+		catch (OutOfMemoryError e)
+			throw e;
+		catch (InvalidMemoryOperationError e)
+			throw e;
+		catch (Error e)
+			return e;
+		return null;
 	}
 
 	/// The in-flight registry key for a request: its connection/session token
@@ -5702,6 +5746,22 @@ unittest  // pingClient and connectedSessions reach an initialized stateful stdi
 	s.detachStdio();
 	assertThrown(s.pingClient(""));
 	assert(s.connectedSessions().length == 0);
+}
+
+unittest  // a handler that throws an Error still gets an internal-error reply
+{
+	auto s = McpServer.stateless("t", "1");
+	Tool t = {name: "oob"};
+	s.registerTool(t, (Json) @safe {
+		int[] empty;
+		const i = empty.length + 1;
+		CallToolResult r;
+		r.content = [Content.makeText(empty[i] == 0 ? "a" : "b")];
+		return r;
+	});
+	auto resp = s.handle(req(1, "tools/call", Json(["name": Json("oob")]))).get;
+	assert(resp["error"]["code"].get!int == ErrorCode.internalError);
+	assert(resp["error"]["message"].get!string == "Internal error");
 }
 
 unittest  // notifications produce no response
