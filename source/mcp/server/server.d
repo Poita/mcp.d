@@ -1341,7 +1341,9 @@ final class McpServer : ServerCore
 	/// what a client without the Tasks extension gets (see `TaskToolOptions`).
 	/// Enables the Tasks extension with default options when it is not yet
 	/// enabled; a later `enableTasks(opts)` replaces those options and keeps the
-	/// registered task tools. Throws on a `stateful` server. Used by the UDA
+	/// registered task tools. Throws on a `stateful` server, and when a tool or
+	/// task executor named `descriptor.name` is already registered; replace a
+	/// task tool with `removeTool` plus `removeTaskExecutor`. Used by the UDA
 	/// reflection layer; callable directly for dynamic task tools.
 	void registerTaskTool(Tool descriptor, TaskExecutor executor,
 			TaskToolOptions opts = TaskToolOptions.init) @safe
@@ -1351,6 +1353,7 @@ final class McpServer : ServerCore
 		// The tool is validated and built first so a bad name or schema throws
 		// before the Tasks extension is enabled or the executor map changes.
 		requireToolNameAvailable(toolName);
+		requireTaskExecutorNameAvailable(toolName);
 		auto entry = withCompiledValidators(RegisteredTool(descriptor,
 				(Json args, RequestContext ctx) @safe {
 				return startTask(toolName, args, ctx, create);
@@ -1366,11 +1369,32 @@ final class McpServer : ServerCore
 	/// listing a tool of that name. `startTask(name, …)` then creates and
 	/// dispatches such a task; `registerTaskTool` registers the executor and the
 	/// tool together. Enables the Tasks extension with default options when it is
-	/// not yet enabled, and throws on a `stateful` server.
+	/// not yet enabled. Throws on a `stateful` server, and when an executor is
+	/// already registered under `name`; call `removeTaskExecutor` first to
+	/// replace it.
 	void registerTaskExecutor(string name, TaskExecutor executor) @safe
 	{
+		requireTaskExecutorNameAvailable(name);
 		ensureTasks("task executor '" ~ name ~ "'");
 		taskExecutors_[name] = executor;
+	}
+
+	/// Unregister the task executor registered under `name`. Returns `true` if
+	/// one was removed, `false` if none was registered. A task created under
+	/// `name` that is dispatched afterwards fails, as no executor drives it.
+	/// `removeTool` leaves a task tool's executor in place, so tasks already
+	/// running keep resuming; remove both to replace a task tool.
+	bool removeTaskExecutor(string name) @safe
+	{
+		return taskExecutors_.remove(name);
+	}
+
+	/// Throw when a task executor is already registered under `name`, mirroring
+	/// the tool registration guard.
+	private void requireTaskExecutorNameAvailable(string name) @safe
+	{
+		if (name in taskExecutors_)
+			throw alreadyRegistered("a task executor named '" ~ name ~ "'", "removeTaskExecutor");
 	}
 
 	/// Set how the registered tool `name` relates to the Tasks extension (see
@@ -9004,6 +9028,31 @@ unittest  // registerTaskTool with an invalid or taken name leaves Tasks disable
 	s.registerTool(plain, (Json) @safe => CallToolResult());
 	assertThrown(s.registerTaskTool(plain, (TaskContext tc) @safe => Json.emptyObject));
 	assert(s.taskRuntime_ is null);
+}
+
+unittest  // registerTaskExecutor refuses a name that already has an executor
+{
+	import std.exception : assertThrown;
+
+	auto s = McpServer.stateless("t", "1");
+	s.registerTaskExecutor("job", (TaskContext tc) @safe => Json([
+			"first": Json(true)
+	]));
+	assertThrown(s.registerTaskExecutor("job", (TaskContext tc) @safe => Json.emptyObject));
+	Tool clash = {name: "job"};
+	assertThrown(s.registerTaskTool(clash, (TaskContext tc) @safe => Json.emptyObject));
+	assert("job" !in s.tools);
+	assert(s.taskExecutors_["job"](TaskContext.init)["first"].get!bool);
+}
+
+unittest  // removeTaskExecutor frees the name for a new executor
+{
+	auto s = McpServer.stateless("t", "1");
+	s.registerTaskExecutor("job", (TaskContext tc) @safe => Json(1));
+	assert(s.removeTaskExecutor("job"));
+	assert(!s.removeTaskExecutor("job"));
+	s.registerTaskExecutor("job", (TaskContext tc) @safe => Json(2));
+	assert(s.taskExecutors_["job"](TaskContext.init).get!int == 2);
 }
 
 version (unittest) private Json taskUpdate(string id, Json responses) @safe

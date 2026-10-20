@@ -226,7 +226,10 @@ private void registerOverload(string memberName, alias overload, alias parent)(
 					"@taskTool on '" ~ memberName ~ "' has the name '"
 					~ attr.name ~ "'; " ~ toolNameRule);
 			registerTaskMethod!(memberName, overload, parent)(server, attr);
-			rollback.add(() @safe { server.removeTool(attr.name); });
+			rollback.add(() @safe {
+				server.removeTool(attr.name);
+				server.removeTaskExecutor(attr.name);
+			});
 		}
 		else static if (is(typeof(attr) == event))
 		{
