@@ -2069,8 +2069,10 @@ final class EventsRuntime
 	// Fetch one batch for `sub` from its fetch position and enqueue it. `more` is
 	// set when the check reported further events and the batch was applied, with
 	// `sub` updated to the record it was applied to. A subscription whose pending
-	// deliveries are at their bound is not fetched: its position stays put, so
-	// the events are fetched once deliveries settle rather than dropped.
+	// deliveries are at their bound is not fetched, and a batch that cannot be cut
+	// to its free slots is not applied while deliveries are pending: its position
+	// stays put, so the events are fetched once deliveries settle rather than
+	// dropped.
 	private bool fetchForWebhook(ref WebhookSubscription sub, EventRegistration* reg, out bool more) @safe
 	{
 		Nullable!long cap;
@@ -2088,6 +2090,15 @@ final class EventsRuntime
 			return false;
 		}
 		capBatch(er, cap);
+		// A batch the cap could not cut (its events carry only the batch
+		// cursor) and that exceeds the free slots would have its overflow
+		// dropped. When it would fit once in-flight deliveries settle, it is
+		// left unapplied and fetched again then; one larger than the whole
+		// bound goes out, its overflow reported with a gap.
+		const bound = opts_.webhookMaxPendingPerSubscription;
+		const pending = pendingCount_.get(sub.id, 0);
+		if (bound > 0 && er.events.length + pending > bound && er.events.length <= bound)
+			return false;
 		foreach (ref occ; er.events)
 			if (occ.cursor.isNull)
 				occ.cursor = er.cursor;
@@ -8838,6 +8849,64 @@ unittest  // a webhook subscription at its pending bound is not fetched past, so
 	assert(ft.eventPosts().length == 5);
 	assert(controlPostsOf(ft, "gap").length == 0);
 	assert(rt.webhookStore().get(r.id).get.cursor.get == "c5");
+}
+
+unittest  // a batch-cursor batch larger than the free pending slots waits rather than dropping events
+{
+	import std.conv : to;
+
+	long now = 1_000_000;
+	auto ft = new FakeWebhookTransport();
+	EventsOptions o;
+	o.nowMs = () @safe => now;
+	o.nowIso = () @safe => "t";
+	o.allowPrivateCallbackHosts = true;
+	o.webhookTransport = ft;
+	o.webhookMaxPendingPerSubscription = 3;
+	o.webhookRetryBase = Duration.zero;
+	void delegate() @safe[] deferred;
+	o.deliveryExecutor = (void delegate() @safe job) @safe { deferred ~= job; };
+	void runAll() @safe
+	{
+		for (size_t i = 0; i < deferred.length; i++)
+			deferred[i]();
+		deferred = null;
+	}
+
+	auto rt = new EventsRuntime(null, o);
+	// Two events per batch at "b<n>", carrying only the batch cursor, up to four.
+	EventRegistration reg;
+	reg.descriptor.name = "batched";
+	reg.pollInterval = 1.seconds;
+	reg.check = (EventContext ctx) @safe {
+		if (ctx.isBootstrap())
+			return EventResult.empty("b0");
+		const from = ctx.cursor.get[1 .. $].to!size_t;
+		if (from >= 4)
+			return EventResult.empty(ctx.cursor.get);
+		return EventResult.of([
+			EventOccurrence("e" ~ (from + 1).to!string, "batched", "t"),
+			EventOccurrence("e" ~ (from + 2).to!string, "batched", "t")
+		], "b" ~ (from + 2).to!string, false, false);
+	};
+	rt.register(reg);
+	auto p = webhookSub("batched", "https://proxy/hooks");
+	p.cursor = "b0";
+	auto r = rt.subscribeWebhook(p, "user-1"); // the backfill: two of three slots
+	assert(rt.webhookStore().get(r.id).get.fetchCursor.get == "b2");
+	now += 1_000;
+	rt.pollWebhookSubscriptions(); // two more cannot fit in one slot: left unfetched
+	assert(rt.webhookStore().get(r.id).get.fetchCursor.get == "b2");
+	runAll();
+	foreach (_; 0 .. 3)
+	{
+		now += 1_000;
+		rt.pollWebhookSubscriptions();
+		runAll();
+	}
+	assert(ft.eventPosts().length == 4);
+	assert(controlPostsOf(ft, "gap").length == 0);
+	assert(rt.webhookStore().get(r.id).get.cursor.get == "b4");
 }
 
 unittest  // a webhook poll pass keeps fetching while the check reports more
