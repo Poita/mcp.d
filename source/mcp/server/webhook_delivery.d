@@ -325,28 +325,48 @@ bool callbackHostAllowed(string url, bool allowPrivate) @safe
 {
 	import mcp.protocol.ssrf : classifyHostLexical, AddressClass;
 
-	const host = hostOf(url);
-	if (host.length == 0)
+	CallbackUrl u;
+	if (!parseCallbackUrl(url, u))
 		return false;
 	if (allowPrivate)
 		return true;
 	// A registered name classifies as public_ lexically; the connector re-checks
 	// the resolved IP at delivery time, so only reject literals that are provably
 	// internal here.
-	return classifyHostLexical(host) == AddressClass.public_;
+	return classifyHostLexical(u.host) == AddressClass.public_;
 }
 
-/// The host of `url` (no scheme, userinfo, port, or path), or "" if it does not
-/// parse. Uses vibe's URL parser — the same one `mcp.protocol.ssrf` uses — which also
-/// strips the brackets from an IPv6 literal, the form `classifyHostLexical` wants.
-private string hostOf(string url) @safe
+/// The parts of a callback URL the callback policy inspects.
+package(mcp) struct CallbackUrl
+{
+	string scheme;
+	string host; /// without the brackets of an IPv6 literal
+	ushort port; /// effective port (the scheme default when unset)
+	string path;
+	bool hasUserinfo; /// a username or password is present
+}
+
+/// Parse a callback URL with vibe's URL parser — the same one
+/// `mcp.protocol.ssrf` uses, which strips the brackets from an IPv6 literal,
+/// the form `classifyHostLexical` wants. Returns false when it does not parse
+/// or has no host. Every callback-policy check parses through this, so they
+/// agree on what a URL's host is.
+package(mcp) bool parseCallbackUrl(string url, out CallbackUrl result) @safe
 {
 	import vibe.inet.url : URL;
 
 	try
-		return URL(url).host;
+	{
+		auto u = URL(url);
+		result.scheme = u.schema;
+		result.host = u.host;
+		result.port = u.port;
+		result.path = u.pathString;
+		result.hasUserinfo = u.username.length != 0 || u.password.length != 0;
+	}
 	catch (Exception)
-		return "";
+		return false;
+	return result.host.length != 0;
 }
 
 /// Whether `body` is a valid challenge echo for `expected` — a JSON object whose
@@ -657,11 +677,22 @@ unittest  // callbackHostAllowed rejects internal literals but permits public na
 	assert(callbackHostAllowed("https://127.0.0.1/hooks", true));
 }
 
-unittest  // hostOf strips scheme, userinfo, port and path
+unittest  // callbackHostAllowed judges the authority's host, not a host-like userinfo
 {
-	assert(hostOf("https://user@host.example:8443/path?q=1") == "host.example");
-	assert(hostOf("https://[2001:db8::1]:443/x") == "2001:db8::1");
-	assert(hostOf("https://plain.example") == "plain.example");
+	assert(!callbackHostAllowed("https://proxy.example.com@127.0.0.1/hooks", false));
+	assert(callbackHostAllowed("https://127.0.0.1@proxy.example.com/hooks", false));
+}
+
+unittest  // parseCallbackUrl splits out scheme, host, effective port, path and userinfo
+{
+	CallbackUrl u;
+	assert(parseCallbackUrl("https://user@host.example:8443/path?q=1", u));
+	assert(u.scheme == "https" && u.host == "host.example" && u.port == 8443);
+	assert(u.path == "/path" && u.hasUserinfo);
+	assert(parseCallbackUrl("https://[2001:db8::1]/x", u));
+	assert(u.host == "2001:db8::1" && u.port == 443 && !u.hasUserinfo);
+	assert(!parseCallbackUrl("https:///hooks", u));
+	assert(!parseCallbackUrl("not a url", u));
 }
 
 unittest  // challengeEchoed accepts a matching echo and rejects mismatches

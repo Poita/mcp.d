@@ -25,9 +25,9 @@ import mcp.server.event_store : EmitBuffer, EmitBufferOptions,
 	WebhookSubscription, WebhookSubscriptionStore,
 	InMemoryWebhookSubscriptionStore, Delivery, DeliveryQueue, InMemoryDeliveryQueue, nowUnixMs;
 import mcp.server.webhook_delivery : WebhookTransport, SecureWebhookTransport,
-	WebhookHttpResult, V1aSigner,
-	DeliverySigning, signDeliveryHeaders, callbackHostAllowed,
-	challengeEchoed, logCallbackRefused;
+	WebhookHttpResult, V1aSigner, DeliverySigning,
+	signDeliveryHeaders, callbackHostAllowed,
+	challengeEchoed, logCallbackRefused, CallbackUrl, parseCallbackUrl;
 
 /// Grace window during which a rotated webhook secret is dual-signed alongside
 /// the new one (Standard Webhooks multi-signature), so a receiver still holding
@@ -737,10 +737,8 @@ final class EventsRuntime
 		// subscribe, silently pre-verifying nothing.
 		foreach (entry; opts_.callbackAllowlist)
 		{
-			string scheme, host, path;
-			ushort port;
-			bool hasUserinfo;
-			if (!parseAuthority(entry, scheme, host, port, path, hasUserinfo) || hasUserinfo)
+			CallbackUrl u;
+			if (!parseCallbackUrl(entry, u) || u.hasUserinfo)
 				throw new Exception(`EventsOptions.callbackAllowlist entry "` ~ entry ~ `" is not an absolute URL without userinfo, such as "https://hooks.example.com/mcp/"`);
 		}
 		if (opts_.allowNoExpiry && !webhookStore_.durable())
@@ -2422,27 +2420,23 @@ final class EventsRuntime
 	// prefix matched against the parsed components, not as a byte prefix.
 	private bool urlAllowlisted(string url) @safe
 	{
-		string scheme, host, path;
-		ushort port;
-		bool hasUserinfo;
-		if (!parseAuthority(url, scheme, host, port, path, hasUserinfo))
+		CallbackUrl u;
+		if (!parseCallbackUrl(url, u))
 			return false;
-		if (hasUserinfo)
+		if (u.hasUserinfo)
 			return false; // a userinfo-bearing URL is never pre-verified
 
 		foreach (entry; opts_.callbackAllowlist)
 		{
-			string eScheme, eHost, ePath;
-			ushort ePort;
-			bool eUserinfo;
+			CallbackUrl e;
 			// Construction rejects an entry that does not parse or carries userinfo.
-			if (!parseAuthority(entry, eScheme, eHost, ePort, ePath, eUserinfo) || eUserinfo)
+			if (!parseCallbackUrl(entry, e) || e.hasUserinfo)
 				continue;
 			// Authority must match exactly (scheme/host/port), then the entry's path is
 			// a prefix of the URL's path so an origin entry covers everything under it.
-			if (scheme != eScheme || host != eHost || port != ePort)
+			if (u.scheme != e.scheme || u.host != e.host || u.port != e.port)
 				continue;
-			if (pathUnder(path, ePath))
+			if (pathUnder(u.path, e.path))
 				return true;
 		}
 		return false;
@@ -2477,28 +2471,6 @@ final class EventsRuntime
 			if (seg == "." || seg == "..")
 				return true;
 		return false;
-	}
-
-	// Parse a URL into its scheme, host, effective port, path and whether it carries
-	// userinfo, via vibe's URL parser. Returns false (rejecting the URL) when it does
-	// not parse or has no host.
-	private static bool parseAuthority(string url, out string scheme,
-			out string host, out ushort port, out string path, out bool hasUserinfo) @safe
-	{
-		import vibe.inet.url : URL;
-
-		try
-		{
-			auto u = URL(url);
-			scheme = u.schema;
-			host = u.host;
-			port = u.port; // effective port (scheme default when unset)
-			path = u.pathString;
-			hasUserinfo = u.username.length != 0 || u.password.length != 0;
-		}
-		catch (Exception)
-			return false;
-		return host.length != 0;
 	}
 
 	// Returns the absolute expiry (ms epoch), or null for a granted no-expiry.
@@ -2541,10 +2513,8 @@ final class EventsRuntime
 		// (or a URL with no host) is refused before it takes quota or fires on_subscribe.
 		if (!callbackHostAllowed(url, opts_.allowPrivateCallbackHosts))
 			throw invalidParams("delivery.url must name a publicly routable host");
-		string scheme, host, path;
-		ushort port;
-		bool hasUserinfo;
-		if (parseAuthority(url, scheme, host, port, path, hasUserinfo) && hasDotSegment(path))
+		CallbackUrl u;
+		if (parseCallbackUrl(url, u) && hasDotSegment(u.path))
 			throw invalidParams("delivery.url must not contain dot segments or encoded separators");
 	}
 
@@ -2556,12 +2526,10 @@ final class EventsRuntime
 	{
 		import mcp.protocol.ssrf : classifyHostLexical, AddressClass;
 
-		string scheme, host, path;
-		ushort port;
-		bool hasUserinfo;
-		if (!parseAuthority(url, scheme, host, port, path, hasUserinfo))
+		CallbackUrl u;
+		if (!parseCallbackUrl(url, u))
 			return false;
-		return classifyHostLexical(host) != AddressClass.public_;
+		return classifyHostLexical(u.host) != AddressClass.public_;
 	}
 
 	// Resolve the effective principal: the authenticated one, or the configured
@@ -3461,18 +3429,16 @@ final class EventsRuntime
 	// so verifying many subscriptions against one gateway costs one GET.
 	private bool wellKnownCovers(string url, long now) @safe
 	{
-		string scheme, host, path;
-		ushort port;
-		bool hasUserinfo;
-		if (!parseAuthority(url, scheme, host, port, path, hasUserinfo) || hasUserinfo)
+		CallbackUrl u;
+		if (!parseCallbackUrl(url, u) || u.hasUserinfo)
 			return false;
 		import std.algorithm : canFind;
 		import std.conv : to;
 
 		// The parser yields an IPv6 literal unbracketed; the authority needs the
 		// brackets back to keep its colons apart from the port's.
-		const hostPart = host.canFind(':') ? "[" ~ host ~ "]" : host;
-		const origin = scheme ~ "://" ~ hostPart ~ ":" ~ port.to!string;
+		const hostPart = u.host.canFind(':') ? "[" ~ u.host ~ "]" : u.host;
+		const origin = u.scheme ~ "://" ~ hostPart ~ ":" ~ u.port.to!string;
 		auto entry = origin in wellKnown_;
 		if (entry is null || now - entry.fetchedAtMs >= opts_.wellKnownCacheTtl.total!"msecs")
 		{
@@ -3480,7 +3446,7 @@ final class EventsRuntime
 			entry = origin in wellKnown_;
 		}
 		foreach (prefix; entry.prefixes)
-			if (prefix.length && pathUnder(path, prefix))
+			if (prefix.length && pathUnder(u.path, prefix))
 				return true;
 		return false;
 	}
