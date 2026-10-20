@@ -172,19 +172,32 @@ enum string statelessServerRequestError = "server-initiated requests"
 	~ " (elicitation/sampling/roots) require a stateful server; construct with McpServer.stateful()";
 
 /// Refuse `what` (`sample`, `elicit`, ...) when this request has no
-/// server->client channel: on a stateless (MRTR) request, or on a legacy request
-/// dispatched by a stateless server. Checked before the client's capabilities so
-/// the error names the server-side remedy rather than a client shortcoming.
+/// server->client channel: on a stateless (MRTR) request, on a legacy request
+/// dispatched by a stateless server, or on a `StdioContext` wired without one.
+/// Checked before the client's capabilities so the error names the server-side
+/// cause rather than a client shortcoming.
 private void requireServerChannel(RequestContext ctx, string what) @safe
 {
 	if (ctx.usesInputRequired)
 		throw internalError(what ~ "() is unavailable on a stateless (MRTR) request;"
 				~ " return ToolResponse.inputRequired instead, or construct the server with"
 				~ " McpServer.stateful() for a blocking server->client round-trip");
+	auto transport = ctx;
 	if (auto s = cast(RequestScope) ctx)
+	{
 		if (s.serverStateless)
 			throw internalError(statelessServerRequestError);
+		transport = s.inner;
+	}
+	if (auto stdio = cast(StdioContext) transport)
+		if (stdio.serverRequestFn is null)
+			throw internalError(noStdioRequestChannelError);
 }
+
+/// The message a server->client request fails with on a `StdioContext` that
+/// was given no `serverRequest` channel.
+private enum string noStdioRequestChannelError = "The stdio transport has no"
+	~ " server-to-client request channel";
 
 /// The client capabilities a `sampling/createMessage` request with `params`
 /// needs: `sampling`, plus `sampling.tools` when it carries `tools` or
@@ -722,7 +735,7 @@ final class StdioContext : RequestContext
 		if (serverStateless_)
 			throw internalError(statelessServerRequestError);
 		if (serverRequestFn is null)
-			throw internalError("The stdio transport has no server-to-client request channel");
+			throw internalError(noStdioRequestChannelError);
 		return serverRequestFn(method, params);
 	}
 
@@ -1956,4 +1969,37 @@ unittest  // listRoots() on a stateless server's legacy request names McpServer.
 	opts.serverStateless = true;
 	auto scope_ = new RequestScope(new LogProbe, opts);
 	assertStatefulRequired(() @safe { scope_.listRoots(); });
+}
+
+version (unittest) private void assertNoChannel(void delegate() @safe call) @safe
+{
+	import mcp.protocol.errors : McpException, ErrorCode;
+	import std.algorithm.searching : canFind;
+
+	bool threw;
+	try
+		call();
+	catch (McpException e)
+	{
+		threw = true;
+		assert(e.code == ErrorCode.internalError, e.msg);
+		assert(e.msg.canFind("no server-to-client request channel"), e.msg);
+	}
+	assert(threw);
+}
+
+unittest  // a StdioContext with no request channel names the channel, not a missing capability
+{
+	auto ctx = new StdioContext((string) @safe {});
+	assertNoChannel(() @safe { ctx.sample(Json.emptyObject); });
+	assertNoChannel(() @safe { ctx.elicit("m", Json.emptyObject); });
+	assertNoChannel(() @safe { ctx.elicitUrl("m", "https://example.com", "e-1"); });
+	assertNoChannel(() @safe { ctx.listRoots(); });
+}
+
+unittest  // a request scope over a channel-less StdioContext names the channel
+{
+	auto scope_ = new RequestScope(new StdioContext((string) @safe {}), RequestScopeOptions.init);
+	assertNoChannel(() @safe { scope_.sample(Json.emptyObject); });
+	assertNoChannel(() @safe { scope_.listRoots(); });
 }
