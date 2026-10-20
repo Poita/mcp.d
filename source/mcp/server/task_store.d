@@ -100,12 +100,21 @@ struct TaskRecord
 	}
 
 	/// Reconstruct a record from `toJson` output, building fresh associative
-	/// arrays so the result shares no mutable state with any other copy.
+	/// arrays so the result shares no mutable state with any other copy. Throws
+	/// `internalError` (-32603) when the stored `meta` is not a valid `Task`: a
+	/// corrupt record is a server fault, not a bad client request.
 	static TaskRecord fromJson(Json j) @safe
 	{
+		import mcp.protocol.errors : McpException, internalError;
+
 		TaskRecord r;
 		if ("meta" in j)
-			r.meta = Task.fromJson(j["meta"]);
+		{
+			try
+				r.meta = Task.fromJson(j["meta"]);
+			catch (McpException e)
+				throw internalError("corrupt stored task record: " ~ e.msg);
+		}
 		if ("result" in j && j["result"].type != Json.Type.undefined)
 			r.result = nullable(cloneJson(j["result"]));
 		if ("error" in j && j["error"].type != Json.Type.undefined)
@@ -294,6 +303,16 @@ unittest  // TaskRecord.fromJson shares no Json with its source
 	j["error"]["message"] = "mutated";
 	assert(r.result.get["structuredContent"]["ok"].get!bool);
 	assert(r.error.get["message"].get!string == "m");
+}
+
+unittest  // TaskRecord.fromJson reports a corrupt stored record as an internal error
+{
+	import std.exception : collectException;
+	import mcp.protocol.errors : McpException, ErrorCode;
+
+	auto e = collectException!McpException(
+			TaskRecord.fromJson(Json(["meta": Json(["status": Json(42)])])));
+	assert(e !is null && e.code == ErrorCode.internalError);
 }
 
 unittest  // TaskRecord round-trips all execution state through JSON
