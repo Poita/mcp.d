@@ -193,7 +193,7 @@ interface ClientTransport
 
 	/// Tell the transport the client's request timeout (`Duration.zero` when
 	/// requests have no deadline). The client enforces response deadlines itself;
-	/// the HTTP transport also bounds each one-way POST by it. A no-op on stdio.
+	/// both transports also bound each one-way send by it.
 	void setRequestTimeout(Duration timeout) @safe;
 
 	/// Whether this transport signals the cancellation of a modern (2026-07-28)

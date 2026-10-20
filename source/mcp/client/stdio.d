@@ -51,6 +51,8 @@ final class StdioClientTransport : ClientTransport
 	private void delegate(string) @safe writeLine;
 	private void delegate(Message, InboundOrigin) @safe inbound;
 	private DuplexChannel channel;
+	// How long a one-way send may wait for its line to be written.
+	private Duration sendTimeout = Duration.zero;
 	private bool started;
 	private bool closed_;
 	// Listen streams awaiting their leading frame, keyed by the listen request id
@@ -124,9 +126,12 @@ final class StdioClientTransport : ClientTransport
 	{
 	}
 
-	/// No-op: `McpClient` enforces request deadlines, and stdio sends need none.
+	/// Bound each one-way send (a notification, or a reply to a server
+	/// request) by `timeout`, so a server that stops reading stdin cannot park
+	/// the sender forever. `McpClient` enforces request deadlines itself.
 	void setRequestTimeout(Duration timeout) @safe
 	{
+		sendTimeout = timeout;
 	}
 
 	/// stdio signals cancellation with `notifications/cancelled` (it has no
@@ -425,11 +430,11 @@ final class StdioClientTransport : ClientTransport
 	/// Serialize a single message and write it as one newline-delimited line
 	/// through the channel's serialized writer. `Json.toString` never emits a raw
 	/// newline, so the line framing holds and only a valid MCP message is written
-	/// to the server's stdin.
+	/// to the server's stdin. The write may take up to the request timeout.
 	private void send(Json message) @safe
 	{
 		try
-			chan().send(message);
+			chan().send(message, sendTimeout);
 		catch (McpException e)
 			throw closedOr(e);
 	}
@@ -2295,6 +2300,37 @@ unittest  // a stdio request whose write the server never drains still times out
 	assert(failure.length == 0, failure);
 	assert(timedOut);
 	assert(took < 1200.msecs, "a stalled write must not hold a request past its timeout");
+}
+
+unittest  // a stdio notification whose write the server never drains fails after the request timeout
+{
+	import core.time : msecs, seconds, MonoTime, Duration;
+	import vibe.core.core : sleep;
+	import mcp.client.client : ClientSettings;
+
+	auto toClient = new TestLines;
+	bool timedOut;
+	Duration took;
+	const failure = inLoopCapturing(() @safe {
+		ClientSettings s;
+		s.requestTimeout = 300.msecs;
+		// A server that has stopped reading stdin: each write stalls for 2s.
+		auto client = McpClient.stdio(() @safe => toClient.take(), (string l) @safe {
+			sleep(2.seconds);
+		}, s);
+		const start = MonoTime.currTime;
+		try
+			client.sendNotification("notifications/roots/list_changed");
+		catch (RequestTimeoutException)
+			timedOut = true;
+		took = MonoTime.currTime - start;
+		sleep(3.seconds);
+		toClient.closeEnd();
+	});
+	assert(failure.length == 0, failure);
+	assert(timedOut, "a notification the server never reads must fail with a timeout");
+	assert(took < 1200.msecs,
+			"a stalled write must not hold a notification past the request timeout");
 }
 
 unittest  // a stdio request that times out before its line is written is never sent

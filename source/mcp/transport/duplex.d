@@ -626,6 +626,60 @@ final class DuplexChannel
 		sendRaw(message.toString());
 	}
 
+	/// `send`, waiting at most `timeout` for the line to be written
+	/// (`Duration.max` or a non-positive timeout: no limit). The line is written
+	/// on a task of its own, so a peer that stops reading parks only that writer;
+	/// past the timeout this throws `RequestTimeoutException`, and a line still
+	/// queued behind another writer is never written. One already being written
+	/// is left to finish, since interrupting it would break the framing of every
+	/// later line.
+	void send(Json message, Duration timeout) @safe
+	{
+		import core.time : MonoTime;
+		import vibe.core.sync : LocalManualEvent, createManualEvent;
+
+		if (timeout == Duration.max || timeout <= Duration.zero)
+			return send(message);
+		if (shut_)
+			throw internalError("stdio channel closed");
+		// The writer task may outlive this call, so what it signals through
+		// lives on the heap rather than in this frame.
+		static final class Wait
+		{
+			PendingWrite write;
+			bool finished;
+			LocalManualEvent done;
+		}
+
+		auto w = new Wait;
+		w.write = new PendingWrite;
+		w.done = createManualEvent();
+		auto write = w.write;
+		auto ec = w.done.emitCount;
+		runTask((string text, Wait w) nothrow{
+			try
+				writeLine(text, w.write);
+			catch (Exception e)
+				w.write.failure = e;
+			w.finished = true;
+			w.done.emit();
+		}, message.toString(), w);
+		const deadline = MonoTime.currTime + timeout;
+		while (!w.finished)
+		{
+			const now = MonoTime.currTime;
+			if (now >= deadline)
+			{
+				write.abandoned = true;
+				throw new RequestTimeoutException(
+						"writing to the peer timed out after " ~ timeout.toString());
+			}
+			ec = w.done.wait(deadline - now, ec);
+		}
+		if (write.failure !is null)
+			throw write.failure;
+	}
+
 	/// Write an already-serialized JSON-RPC line as a single newline-delimited line,
 	/// serialized against concurrent writers. Used by callers that already hold the
 	/// serialized text (the stdio server sink and reply path) so the line is not
