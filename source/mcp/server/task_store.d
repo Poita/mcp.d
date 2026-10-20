@@ -37,6 +37,10 @@ struct TaskRecord
 	/// claim leaves the task to the running one.
 	string dispatchClaimedAt;
 	string toolName; /// executor key — which registered task executor drives this task
+	/// The record backs a synchronous call from a client without the Tasks
+	/// extension: it lives only as long as that request and is not counted by
+	/// `TaskStore.countUnsettled`.
+	bool requestBacked;
 	/// The authenticated principal (token subject) whose request created the
 	/// task; every later tasks/* request must come from the same principal. Empty
 	/// when the creating request was unauthenticated, which leaves the task open.
@@ -65,6 +69,7 @@ struct TaskRecord
 		r.detached = detached;
 		r.dispatchClaimedAt = dispatchClaimedAt;
 		r.toolName = toolName;
+		r.requestBacked = requestBacked;
 		r.owner = owner;
 		r.revision = revision;
 		r.executorInput = cloneJson(executorInput);
@@ -94,6 +99,8 @@ struct TaskRecord
 		if (dispatchClaimedAt.length)
 			j["dispatchClaimedAt"] = dispatchClaimedAt;
 		j["toolName"] = toolName;
+		if (requestBacked)
+			j["requestBacked"] = true;
 		j["revision"] = revision;
 		if (owner.length)
 			j["owner"] = owner;
@@ -139,6 +146,8 @@ struct TaskRecord
 			r.dispatchClaimedAt = j["dispatchClaimedAt"].get!string;
 		if ("toolName" in j && j["toolName"].type == Json.Type.string)
 			r.toolName = j["toolName"].get!string;
+		r.requestBacked = ("requestBacked" in j)
+			&& j["requestBacked"].type == Json.Type.bool_ && j["requestBacked"].get!bool;
 		if ("revision" in j && j["revision"].type == Json.Type.int_)
 			r.revision = j["revision"].get!ulong;
 		if ("owner" in j && j["owner"].type == Json.Type.string)
@@ -197,7 +206,7 @@ interface TaskStore
 	size_t removeIf(scope bool delegate(const TaskRecord) @safe pred) @safe;
 
 	/// How many records owned by `owner` ("" for unbound tasks) are not yet
-	/// terminal. The runtime enforces its per-principal task caps with it on
+	/// terminal, leaving out `requestBacked` ones. The runtime enforces its per-principal task caps with it on
 	/// every task creation, so it must not scan the store: a shared store answers
 	/// from an index on `(owner, status)` or a per-owner counter.
 	size_t countUnsettled(string owner) @safe;
@@ -219,7 +228,7 @@ final class InMemoryTaskStore : TaskStore
 
 	private void track(const ref TaskRecord r, bool add) @safe
 	{
-		if (isTerminal(r.meta.status))
+		if (isTerminal(r.meta.status) || r.requestBacked)
 			return;
 		if (add)
 		{

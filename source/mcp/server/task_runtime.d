@@ -196,14 +196,16 @@ final class TaskRuntime
 	/// `createFor` exempt from the unsettled-task caps, for the record backing a
 	/// synchronous call: it lives only as long as the request that creates it,
 	/// so it pins nothing beyond that request, and a client that never sees
-	/// tasks must not be refused for a task limit.
+	/// tasks must not be refused for a task limit. The record is marked
+	/// `requestBacked`, so it takes no slot under those caps either.
 	package(mcp) Task createForRequest(string toolName, Json executorInput,
 			TaskCreateOptions opts = TaskCreateOptions.init) @safe
 	{
-		return insertTask(toolName, executorInput, opts);
+		return insertTask(toolName, executorInput, opts, true);
 	}
 
-	private Task insertTask(string toolName, Json executorInput, TaskCreateOptions opts) @safe
+	private Task insertTask(string toolName, Json executorInput,
+			TaskCreateOptions opts, bool requestBacked = false) @safe
 	{
 		const ttlDur = opts.ttl.isNull ? opts_.defaultTtl : opts.ttl.get;
 		const pollDur = opts.pollInterval.isNull ? opts_.defaultPollInterval : opts
@@ -220,6 +222,7 @@ final class TaskRuntime
 		r.meta.pollIntervalMs = nullable(pollDur.total!"msecs");
 		r.toolName = toolName;
 		r.owner = opts.owner;
+		r.requestBacked = requestBacked;
 		r.executorInput = executorInput;
 		// The store's insert-if-absent rejects an id already taken (a misbehaving
 		// custom generator, or another node minting the same id), so retry with
@@ -2037,6 +2040,18 @@ unittest  // unauthenticated tasks share the anonymous unsettled-task cap
 	rt.createUnbound();
 	auto e = collectException!McpException(rt.createUnbound());
 	assert(e !is null && e.code == ErrorCode.resourceExhausted);
+}
+
+unittest  // a task backing a synchronous call takes no slot under the unsettled-task cap
+{
+	TaskOptions o;
+	o.maxUnsettledAnonymous = 1;
+	auto rt = new TaskRuntime(o);
+	rt.createForRequest("sync", Json.undefined);
+	rt.createForRequest("sync", Json.undefined);
+	assert(rt.store.countUnsettled("") == 0);
+	rt.createUnbound();
+	assert(rt.store.countUnsettled("") == 1);
 }
 
 unittest  // a zero unsettled-task cap is unlimited
