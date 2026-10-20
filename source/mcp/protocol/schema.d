@@ -20,9 +20,17 @@ template EnumByNamePolicy(T) if (is(T == enum))
 {
 	import std.conv : to;
 
+	/// Throws when `v` is no member of `T` (such as a combination of bit
+	/// flags), which has no name and so no value the advertised schema admits.
 	static string toRepresentation(T v) @safe
 	{
-		return v.to!string;
+		import std.traits : EnumMembers, OriginalType;
+
+		static foreach (i, m; EnumMembers!T)
+			if (v == m)
+				return __traits(allMembers, T)[i];
+		throw new Exception("cannot serialize " ~ T.stringof ~ " value " ~ (cast(OriginalType!T) v)
+				.to!string ~ " by name: it is not a member of the enum");
 	}
 
 	static T fromRepresentation(string s) @safe
@@ -211,6 +219,22 @@ unittest  // a ulong above long.max is written and read back as its exact value
 	auto back = deserializeWithPolicy!(JsonSerializer, EnumByNamePolicy, S)(j);
 	assert(back.n == ulong.max && back.ns == [1, 1UL << 63]);
 	assert(serializeWithPolicy!(JsonSerializer, EnumByNamePolicy)(ulong(7)).type == Json.Type.int_);
+}
+
+version (unittest) private enum Perm
+{
+	read = 1,
+	write = 2,
+}
+
+unittest  // an enum value that is no member, such as a bit-flag combination, is not written
+{
+	import std.exception : collectException;
+	import vibe.data.json : JsonSerializer;
+	import vibe.data.serialization : serializeWithPolicy;
+
+	assert(serializeWithPolicy!(JsonSerializer, EnumByNamePolicy)(Perm.write) == Json("write"));
+	assert(collectException(serializeWithPolicy!(JsonSerializer, EnumByNamePolicy)(cast(Perm) 3)));
 }
 
 unittest  // a UUID is written and read back as its string form
