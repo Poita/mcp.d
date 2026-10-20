@@ -369,11 +369,21 @@ private alias BoundParameters(alias func) = staticMap!(Unqual, Parameters!func);
 /// or `TaskContext`) rather than bound from a client-supplied argument.
 private enum isInjected(P) = is(P : RequestContext) || is(P == TaskContext);
 
-/// Whether parameter `i` of `func` is a required argument: not `Nullable`, and
-/// with neither a D default value nor a `@schemaDefault`.
+/// Whether parameter `i` of `func` is a required argument: not `Nullable`, not
+/// an `@allOptional` struct (which an omitted argument binds as its `.init`, as
+/// it would an empty object), and with neither a D default value nor a
+/// `@schemaDefault`.
 private enum isRequiredParam(alias func, size_t i) = !isInstanceOf!(Nullable,
-			BoundParameters!func[i]) && is(ParameterDefaultValueTuple!func[i] == void)
-	&& !ParamSchemaDefaults!(func, i).length;
+			BoundParameters!func[i]) && !isAllOptionalStruct!(BoundParameters!func[i])
+	&& is(ParameterDefaultValueTuple!func[i] == void) && !ParamSchemaDefaults!(func, i).length;
+
+private template isAllOptionalStruct(P)
+{
+	static if (is(P == struct))
+		enum isAllOptionalStruct = hasUDA!(P, allOptional);
+	else
+		enum isAllOptionalStruct = false;
+}
 
 /// The UDAs attached to parameter `i` of `func`. The compiler reports the
 /// attributes of a parameter that carries any prefixed by those of `func`
@@ -5122,6 +5132,34 @@ version (unittest) private Json callToolArgs(McpServer s, string name, string ar
 	p["name"] = name;
 	p["arguments"] = parseJsonString(arguments);
 	return s.handle(Message(makeRequest(Json(1), "tools/call", p))).get["result"];
+}
+
+version (unittest) private final class AllOptionalParamApi
+{
+	@allOptional static struct Opts
+	{
+		int limit;
+		string q;
+	}
+
+	@tool("all_optional", "Takes an @allOptional struct")
+	string o(Opts opts, Nullable!Opts maybe) @safe
+	{
+		import std.conv : to;
+
+		return opts.limit.to!string ~ ":" ~ opts.q;
+	}
+}
+
+unittest  // an @allOptional struct parameter is optional and binds its .init when omitted
+{
+	auto s = McpServer.stateless("t", "1");
+	registerHandlers(s, new AllOptionalParamApi);
+	auto r = callToolArgs(s, "all_optional", `{}`);
+	assert("isError" !in r, r.toString);
+	assert(r["content"][0]["text"].get!string == "0:", r.toString);
+	auto schema = parametersSchema!(AllOptionalParamApi.o)();
+	assert("required" !in schema, schema.toString);
 }
 
 version (unittest) private final class NullInputApi
