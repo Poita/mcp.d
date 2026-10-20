@@ -118,9 +118,6 @@ struct ServerSettings
 	{
 		import mcp.api.apps : enableApps;
 
-		if (serverInfo.name.length == 0)
-			throw new Exception("ServerSettings.serverInfo.name must be set");
-
 		McpServer server;
 		final switch (mode)
 		{

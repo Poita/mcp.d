@@ -154,6 +154,14 @@ private McpException requestIdInUse() @safe
 	return invalidRequest("Request id is already in use by an unfinished request or open stream");
 }
 
+/// Throw when a required identifying field (`what`, e.g. "a prompt name") is
+/// empty: the one check every constructor and registration entry point shares.
+private void requireNonEmpty(string value, string what) @safe
+{
+	if (value.length == 0)
+		throw new Exception(what ~ " must be non-empty");
+}
+
 private Exception notRegistered(string what) @safe
 {
 	return new Exception("no " ~ what ~ " is registered");
@@ -386,6 +394,7 @@ final class McpServer : ServerCore
 
 	private this(Implementation serverInfo, Nullable!string instructions = Nullable!string.init) @safe
 	{
+		requireNonEmpty(serverInfo.name, "the server name");
 		this.serverInfo_ = serverInfo;
 		this.instructions = instructions;
 		// The fallback `ConnectionState` for requests that carry none (stdio, bare
@@ -1036,6 +1045,8 @@ final class McpServer : ServerCore
 	void registerResource(Resource descriptor, ResourceReader reader,
 			Nullable!CacheHint cache = Nullable!CacheHint.init) @safe
 	{
+		requireNonEmpty(descriptor.uri, "a resource uri");
+		requireNonEmpty(descriptor.name, "a resource name");
 		if (descriptor.uri in resources)
 			throw alreadyRegistered("a resource with uri '" ~ descriptor.uri ~ "'",
 					"removeResource");
@@ -1084,6 +1095,8 @@ final class McpServer : ServerCore
 		// A malformed template would silently never match; reject it at
 		// registration rather than serving nothing.
 		const tmpl = descriptor.uriTemplate;
+		requireNonEmpty(tmpl, "a resource uriTemplate");
+		requireNonEmpty(descriptor.name, "a resource template name");
 		if (const why = uriTemplateError(tmpl))
 			throw new Exception(
 					"resource template '" ~ descriptor.name
@@ -1143,8 +1156,7 @@ final class McpServer : ServerCore
 	/// mirroring the tool registration guard.
 	private void requirePromptNameAvailable(string name) @safe
 	{
-		if (name.length == 0)
-			throw new Exception("a prompt needs a non-empty name");
+		requireNonEmpty(name, "a prompt name");
 		if (name in prompts)
 			throw alreadyRegistered("a prompt named '" ~ name ~ "'", "removePrompt");
 	}
@@ -7464,6 +7476,39 @@ unittest  // registerResourceTemplate rejects adjacent variables that can never 
 	assertThrown!Exception(s.registerResourceTemplate(t, (string uri, string[string] params) @safe {
 			return ResourceContents.makeText(uri, "text/plain", "x");
 		}));
+}
+
+unittest  // a server needs a non-empty name in either mode
+{
+	import std.exception : assertThrown;
+
+	assertThrown(McpServer.stateless("", "1"));
+	assertThrown(McpServer.stateful("", "1"));
+	assertThrown(McpServer.stateless(Implementation("", "1")));
+	assertThrown(McpServer.stateful(Implementation("", "1")));
+}
+
+unittest  // registerResource rejects an empty uri or name
+{
+	import std.exception : assertThrown;
+
+	auto s = McpServer.stateless("t", "1");
+	auto reader = delegate() @safe => ResourceContents.makeText("u", "text/plain", "x");
+	assertThrown(s.registerResource(Resource("", "n"), reader));
+	assertThrown(s.registerResource(Resource("res://x", ""), reader));
+}
+
+unittest  // registerResourceTemplate rejects an empty uriTemplate or name
+{
+	import std.exception : assertThrown;
+
+	auto s = McpServer.stateless("t", "1");
+	auto reader = delegate(string uri, string[string] params) @safe => ResourceContents.makeText(
+			uri, "text/plain", "x");
+	ResourceTemplate noName = {uriTemplate: "res://{id}", name: ""};
+	assertThrown(s.registerResourceTemplate(noName, reader));
+	ResourceTemplate noTemplate = {uriTemplate: "", name: "n"};
+	assertThrown(s.registerResourceTemplate(noTemplate, reader));
 }
 
 unittest  // registerResourceTemplate rejects an unclosed expression
