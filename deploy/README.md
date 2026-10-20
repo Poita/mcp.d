@@ -13,7 +13,7 @@ needs. A from-scratch image (e.g. `ubuntu:24.04`) must install:
 | Package | Stage | Why |
 |---|---|---|
 | `build-essential` | build | gcc **and `libc6-dev`** — the linker needs libc's `rt`/`dl`/`pthread`/`m` stubs. Bare `gcc` under `--no-install-recommends` omits them. |
-| `libssl-dev` | build | OpenSSL headers for `vibe-d:tls` (HTTPS transport, OAuth 2.1, webhook delivery). |
+| `libssl-dev` | build | OpenSSL headers for `vibe-stream:tls` (HTTPS transport, OAuth 2.1, webhook delivery). |
 | `zlib1g-dev` | build | vibe-d links zlib. |
 | `libxml2` | build | LDC runtime dependency — `ldc2` won't start without it. |
 | `pkg-config` | build | lets dub locate OpenSSL. |

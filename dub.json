@@ -1,65 +1,77 @@
 {
-	"name": "mcp-d",
-	"description": "Model Context Protocol SDK for D",
-	"homepage": "https://github.com/Poita/mcp.d",
-	"license": "Apache-2.0",
-	"copyright": "Copyright © 2026 Peter Alexander",
+	"configurations": [
+		{
+			"targetType": "library",
+			"name": "library"
+		},
+		{
+			"dependencies": {
+				"standardwebhooks:ed25519": "~>0.2.0"
+			},
+			"targetType": "library",
+			"versions": [
+				"MCPWebhookEd25519"
+			],
+			"name": "library-ed25519"
+		},
+		{
+			"importPaths": [
+				"source"
+			],
+			"mainSourceFile": "conformance/server.d",
+			"targetType": "executable",
+			"targetName": "conformance-server",
+			"sourcePaths": [
+				"source"
+			],
+			"name": "conformance-server"
+		},
+		{
+			"importPaths": [
+				"source"
+			],
+			"mainSourceFile": "conformance/client.d",
+			"targetType": "executable",
+			"targetName": "conformance-client",
+			"sourcePaths": [
+				"source"
+			],
+			"name": "conformance-client"
+		}
+	],
 	"authors": [
 		"Peter Alexander"
 	],
 	"toolchainRequirements": {
-		"frontend": ">=2.111.0",
 		"dmd": ">=2.111.0",
-		"ldc": ">=1.41.0"
+		"ldc": ">=1.41.0",
+		"frontend": ">=2.111.0"
 	},
-	"targetType": "library",
+	"license": "Apache-2.0",
+	"importPaths-windows": [
+		"import-windows"
+	],
+	"copyright": "Copyright © 2026 Peter Alexander",
+	"name": "mcp-d",
+	"description": "Model Context Protocol SDK for D",
+	"homepage": "https://github.com/Poita/mcp.d",
 	"dependencies": {
-		"vibe-d:data": "~>0.9.8",
-		"vibe-d:http": "~>0.9.8",
-		"openssl": "~>3.4",
+		"vibe-http": "~>1.5.1",
+		"vibe-stream:tls": "~>1.4.1",
+		"standardwebhooks": "~>0.2.0",
 		"jsonschema": "~>0.3.0",
-		"jsonschema:vibe": "~>0.3.0",
+		"vibe-serialization": "~>1.2.0",
+		"openssl": "~>3.4",
 		"dyaml": "~>0.9.2",
-		"standardwebhooks": "~>0.2.0"
+		"jsonschema:vibe": "~>0.3.0"
 	},
-	"importPaths": ["source"],
-	"importPaths-windows": ["import-windows"],
-	"configurations": [
-		{
-			"name": "library",
-			"targetType": "library"
-		},
-		{
-			"name": "library-ed25519",
-			"targetType": "library",
-			"dependencies": {
-				"standardwebhooks:ed25519": "~>0.2.0"
-			},
-			"versions": ["MCPWebhookEd25519"]
-		},
-		{
-			"name": "conformance-server",
-			"targetType": "executable",
-			"targetName": "conformance-server",
-			"mainSourceFile": "conformance/server.d",
-			"sourcePaths": [
-				"source"
-			],
-			"importPaths": [
-				"source"
-			]
-		},
-		{
-			"name": "conformance-client",
-			"targetType": "executable",
-			"targetName": "conformance-client",
-			"mainSourceFile": "conformance/client.d",
-			"sourcePaths": [
-				"source"
-			],
-			"importPaths": [
-				"source"
-			]
-		}
+	"subConfigurations": {
+     "vibe-stream:tls": "openssl-3.0"
+  },
+	"lflags-osx": ["-L/opt/homebrew/opt/openssl@3/lib"],
+	"libs": ["ssl", "crypto"],
+	"targetType": "library",
+	"importPaths": [
+		"source"
 	]
 }

@@ -400,7 +400,7 @@ package(mcp) void addSkillEntry(McpServer server, Json entry) @safe
 package(mcp) void unregisterSkill(McpServer server, string path) @safe
 {
 	auto index = server.ensureSkillIndex();
-	const uri = skillUri(path);
+	auto uri = skillUri(path);
 	auto entry = uri in index.byUri;
 	if (entry is null)
 		return;
@@ -413,9 +413,9 @@ package(mcp) void unregisterSkill(McpServer server, string path) @safe
 	}
 	foreach (i; 0 .. manifest.length)
 	{
-		const fileUri = manifest[i]["uri"].get!string;
+		auto fileUri = manifest[i]["uri"].get!string;
 		server.removeResource(fileUri);
-		index.byUri.remove(fileUri);
+		index.byUri.remove(fileUri.idup);
 	}
 }
 

@@ -16,7 +16,7 @@ ENV DEBIAN_FRONTEND=noninteractive
 # Build + link dependencies for an mcp.d binary. Each is load-bearing:
 #   build-essential   gcc + libc6-dev — the linker needs libc's rt/dl/pthread/m
 #                     stubs; bare `gcc` under --no-install-recommends omits them.
-#   libssl-dev        OpenSSL, for vibe-d:tls (HTTPS transport, OAuth 2.1, and
+#   libssl-dev        OpenSSL, for vibe-stream:tls (HTTPS transport, OAuth 2.1, and
 #                     outbound webhook delivery).
 #   zlib1g-dev        vibe-d links zlib.
 #   libxml2           an LDC runtime dependency (ldc2 won't start without it).

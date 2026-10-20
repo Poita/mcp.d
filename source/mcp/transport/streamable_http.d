@@ -2789,7 +2789,7 @@ private bool readPostBody(HTTPServerRequest req, HTTPServerResponse res,
 	import std.conv : to, ConvException;
 	import std.utf : validate, UTFException;
 	import vibe.core.stream : IOMode;
-	import vibe.utils.string : stripUTF8Bom;
+	import vibe.internal.string : stripUTF8Bom;
 
 	auto tooLarge = invalidRequest("request body exceeds " ~ maxBytes.to!string ~ " bytes");
 	const declared = req.headers.get("Content-Length", "");

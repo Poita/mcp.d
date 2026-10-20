@@ -77,7 +77,7 @@ jobs:
         with:
           compiler: ${{ matrix.compiler }}
 
-      # OpenSSL 3.x is required by the `openssl` / vibe-d:tls dependency.
+      # OpenSSL 3.x is required by the `openssl` / vibe-stream:tls dependency.
       # Ubuntu runners ship OpenSSL 3.x preinstalled; macOS needs it from Homebrew.
       - name: Install OpenSSL 3.x (macOS)
         if: runner.os == 'macOS'
@@ -86,7 +86,7 @@ jobs:
           echo "PKG_CONFIG_PATH=$(brew --prefix openssl@3)/lib/pkgconfig" >> "$GITHUB_ENV"
 
       # The windows-latest image ships OpenSSL 3.x under C:\Program Files\OpenSSL.
-      # Point the linker at its import libraries so the `openssl` / vibe-d:tls
+      # Point the linker at its import libraries so the `openssl` / vibe-stream:tls
       # dependency resolves libssl/libcrypto. This wiring is the part most likely
       # to need adjustment from the first Windows CI run.
       - name: Configure OpenSSL 3.x (Windows)
