@@ -524,6 +524,11 @@ private void checkUdaPlacement(string memberName, alias f)()
 						~ "' applies only to an @event method");
 		}
 	}
+	// MCP reads destructiveHint only when readOnlyHint is false, so a tool
+	// marked both would advertise a claim clients discard.
+	static assert(!(hasUDA!(f, readOnly) && hasUDA!(f, destructive)),
+			"'" ~ memberName ~ "' is marked both @readOnly and @destructive; a read-only tool "
+			~ "modifies nothing, so keep only one");
 	checkUdaRepeats!(memberName, f)();
 }
 
@@ -2815,6 +2820,31 @@ unittest  // a @prompt with an empty name is rejected at compile time
 {
 	auto s = McpServer.stateless("t", "1");
 	assert(!__traits(compiles, registerHandlers(s, new EmptyPromptNameApi)));
+}
+
+version (unittest) private class ReadOnlyDestructiveApi
+{
+	@tool("contradictory", "Claims to be both read-only and destructive")
+	@readOnly @destructive string f() @safe
+	{
+		return "";
+	}
+}
+
+version (unittest) private class ReadOnlyIdempotentApi
+{
+	@tool("read_idempotent", "Read-only and idempotent")
+	@readOnly @idempotent string f() @safe
+	{
+		return "";
+	}
+}
+
+unittest  // @readOnly with @destructive is rejected at compile time; with @idempotent it is not
+{
+	auto s = McpServer.stateless("t", "1");
+	assert(!__traits(compiles, registerHandlers(s, new ReadOnlyDestructiveApi)));
+	assert(__traits(compiles, registerHandlers(s, new ReadOnlyIdempotentApi)));
 }
 
 version (unittest) private class OutParamApi
