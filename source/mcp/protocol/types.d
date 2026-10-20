@@ -737,8 +737,10 @@ struct Content
 		return payload.match!((const ref UnknownContent c) => c.raw, _ => Json.emptyObject);
 	}
 
-	/// Throws -32602 when `j` is not an object or its REQUIRED `type` is absent
-	/// or not a string.
+	/// Throws -32602 when `j` is not an object, its REQUIRED `type` is absent
+	/// or not a string, or a modeled block lacks one of its required string
+	/// fields (`text`; `data`/`mimeType`; `uri`/`name`; `id`/`name`;
+	/// `toolUseId`).
 	static Content fromJson(Json j) @safe
 	{
 		import mcp.protocol.errors : invalidParams;
@@ -753,25 +755,25 @@ struct Content
 		{
 		case "text":
 			TextContent c;
-			c.text = j.getOr("text", "");
+			c.text = requiredString(j, "text", "a text content block");
 			c.parseMeta(j);
 			return Content(c);
 		case "image":
 			ImageContent c;
-			c.data = j.getOr("data", "");
-			c.mimeType = j.getOr("mimeType", "");
+			c.data = requiredString(j, "data", "an image content block");
+			c.mimeType = requiredString(j, "mimeType", "an image content block");
 			c.parseMeta(j);
 			return Content(c);
 		case "audio":
 			AudioContent c;
-			c.data = j.getOr("data", "");
-			c.mimeType = j.getOr("mimeType", "");
+			c.data = requiredString(j, "data", "an audio content block");
+			c.mimeType = requiredString(j, "mimeType", "an audio content block");
 			c.parseMeta(j);
 			return Content(c);
 		case "resource_link":
 			ResourceLink c;
-			c.uri = j.getOr("uri", "");
-			c.name = j.getOr("name", "");
+			c.uri = requiredString(j, "uri", "a resource_link content block");
+			c.name = requiredString(j, "name", "a resource_link content block");
 			c.mimeType = j.getOr("mimeType", "");
 			tryGet(j, "title", c.title);
 			tryGet(j, "description", c.description);
@@ -790,16 +792,14 @@ struct Content
 			return Content(c);
 		case "tool_use":
 			ToolUseContent c;
-			c.id = j.getOr("id", "");
-			c.name = ("name" in j && j["name"].type == Json.Type.string) ? j["name"].get!string
-				: "";
+			c.id = requiredString(j, "id", "a tool_use content block");
+			c.name = requiredString(j, "name", "a tool_use content block");
 			c.input = ("input" in j) ? j["input"] : Json.emptyObject;
 			c.parseMeta(j);
 			return Content(c);
 		case "tool_result":
 			ToolResultContent c;
-			c.toolUseId = ("toolUseId" in j && j["toolUseId"].type == Json.Type.string)
-				? j["toolUseId"].get!string : "";
+			c.toolUseId = requiredString(j, "toolUseId", "a tool_result content block");
 			if ("content" in j && j["content"].type == Json.Type.array)
 				foreach (i; 0 .. j["content"].length)
 					c.content ~= Content.fromJson(j["content"][i]);
@@ -6916,4 +6916,34 @@ unittest  // PromptMessage.fromJson rejects a missing or unknown role with -3260
 	assertRejectsAll!PromptMessage(`{"content":{"type":"text","text":"x"}}`,
 			`{"role":"system","content":{"type":"text","text":"x"}}`,
 			`{"role":2,"content":{"type":"text","text":"x"}}`);
+}
+
+unittest  // Content.fromJson rejects a text, image or audio block missing a required string with -32602
+{
+	assertRejectsAll!Content(`{"type":"text"}`, `{"type":"text","text":1}`,
+			`{"type":"image","mimeType":"image/png"}`,
+			`{"type":"image","data":"AA=="}`,
+			`{"type":"audio","mimeType":"audio/wav"}`, `{"type":"audio","data":"AA=="}`);
+}
+
+unittest  // Content.fromJson rejects a resource_link missing its uri or name with -32602
+{
+	assertRejectsAll!Content(`{"type":"resource_link","name":"a"}`,
+			`{"type":"resource_link","uri":"file:///a"}`,
+			`{"type":"resource_link","uri":"file:///a","name":7}`);
+}
+
+unittest  // Content.fromJson accepts a resource_link without the optional mimeType
+{
+	auto c = Content.fromJson(
+			`{"type":"resource_link","uri":"file:///a","name":"a"}`.parseJsonString);
+	assert("mimeType" !in c.toJson());
+}
+
+unittest  // Content.fromJson rejects a tool_use or tool_result missing its id with -32602
+{
+	assertRejectsAll!Content(`{"type":"tool_use","name":"t","input":{}}`,
+			`{"type":"tool_use","id":"a","input":{}}`,
+			`{"type":"tool_use","id":1,"name":"t","input":{}}`,
+			`{"type":"tool_result","content":[]}`, `{"type":"tool_result","toolUseId":null}`);
 }
