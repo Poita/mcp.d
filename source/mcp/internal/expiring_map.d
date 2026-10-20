@@ -189,7 +189,8 @@ package(mcp) struct BoundedExpiringMap(V)
 		return true;
 	}
 
-	/// Number of live entries.
+	/// Number of stored entries, including any past their TTL that no sweep or
+	/// lookup has dropped yet.
 	size_t length() @safe
 	{
 		return nodes.length;
