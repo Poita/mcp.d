@@ -424,12 +424,14 @@ interface WebhookSubscriptionStore
 	/// subscription lost on restart would silently stop delivering.
 	bool durable() @safe;
 
-	/// Insert or replace the subscription identified by `sub.id` unconditionally.
-	/// A replaced record's revision is advanced (the stored revision becomes the
-	/// old one plus one), so a `compareAndSwap` based on the old record fails.
-	/// The runtime uses this to create a subscription; every read-modify-write of
-	/// an existing one goes through `compareAndSwap`.
-	void put(WebhookSubscription sub) @safe;
+	/// Store `sub` only if no subscription with `sub.id` exists, returning
+	/// whether it was stored. The runtime creates a subscription with this, so
+	/// two nodes creating the same subscription at once cannot overwrite each
+	/// other: the loser re-reads the winner's record and refreshes it. Every
+	/// read-modify-write of an existing one goes through `compareAndSwap`. A
+	/// shared store implements this as one atomic conditional write (e.g. a
+	/// Redis `SET NX` or a SQL `INSERT` on the primary key).
+	bool insert(WebhookSubscription sub) @safe;
 
 	/// Replace the subscription identified by `sub.id` only if its stored
 	/// `revision` still equals `expectedRevision`, storing `sub` with
@@ -487,6 +489,17 @@ final class InMemoryWebhookSubscriptionStore : WebhookSubscriptionStore
 		return false;
 	}
 
+	bool insert(WebhookSubscription sub) @safe
+	{
+		if ((sub.id in records_) !is null)
+			return false;
+		store(sub);
+		return true;
+	}
+
+	/// Insert or replace the subscription identified by `sub.id`
+	/// unconditionally, for seeding the store. A replaced record's revision is
+	/// advanced, so a `compareAndSwap` based on the old record fails.
 	void put(WebhookSubscription sub) @safe
 	{
 		if (auto p = sub.id in records_)
@@ -948,6 +961,18 @@ unittest  // the in-memory subscription store's compareAndSwap fails for an unkn
 	sub.id = "missing";
 	assert(!store.compareAndSwap(sub, 0));
 	assert(store.get("missing").isNull);
+}
+
+unittest  // the in-memory subscription store's insert stores only an unknown subscription
+{
+	auto store = new InMemoryWebhookSubscriptionStore();
+	WebhookSubscription sub;
+	sub.id = "s";
+	sub.incarnation = "first";
+	assert(store.insert(sub));
+	sub.incarnation = "second";
+	assert(!store.insert(sub));
+	assert(store.get("s").get.incarnation == "first");
 }
 
 unittest  // an unconditional put advances the revision, so an older compareAndSwap fails

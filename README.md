@@ -377,6 +377,8 @@ is re-leased) — mirroring the `TaskStore`/`TaskDispatcher` split. Like
 record's `revision` as one atomic conditional write: every update to a stored
 subscription (watermark, verification, delivery health, refresh) is a
 read-modify-write retried on a lost race, so nodes never overwrite each other.
+Creating a subscription goes through `insert`, a create-if-absent write: when two
+nodes create the same one at once, the second refreshes the first's record.
 
 > **Guidance:** if your tools initiate elicitation/sampling/roots, or use the
 > 2025-era `resources/subscribe` push over HTTP, construct the server with

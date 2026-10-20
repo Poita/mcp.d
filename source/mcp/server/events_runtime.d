@@ -1727,7 +1727,14 @@ final class EventsRuntime
 				awaitingReplay_[id] = true;
 			scope (failure)
 				awaitingReplay_.remove(id);
-			webhookStore_.put(sub);
+			// Another node may have created the same subscription meanwhile:
+			// its record stands, and this call proceeds as a refresh of it.
+			if (!webhookStore_.insert(sub))
+			{
+				awaitingReplay_.remove(id);
+				releaseLifecycle(p.name, p.arguments, principal);
+				return subscribeWebhookAttempt(p, principal, attempt + 1);
+			}
 		}
 		else if (!webhookStore_.compareAndSwap(sub, existing.get.revision))
 			return subscribeWebhookAttempt(p, principal, attempt + 1);
@@ -6311,9 +6318,9 @@ version (unittest)
 			return inner.durable();
 		}
 
-		void put(WebhookSubscription sub) @safe
+		bool insert(WebhookSubscription sub) @safe
 		{
-			inner.put(sub);
+			return inner.insert(sub);
 		}
 
 		bool compareAndSwap(WebhookSubscription sub, ulong expectedRevision) @safe
@@ -8048,7 +8055,7 @@ unittest  // a refresh refuses a stored record at its id that belongs to another
 	other.secret = testSecret;
 	other.expiresAtMs = 2_000_000_000L;
 	other.active = true;
-	rt.webhookStore().put(other);
+	assert(rt.webhookStore().insert(other));
 
 	auto e = collectException!McpException(rt.subscribeWebhook(p, "user-1"));
 	assert(e !is null && e.code == ErrorCode.internalError);
@@ -8303,7 +8310,7 @@ unittest  // a delivery to a non-globally-routable callback is rejected before a
 	sub.url = "https://10.0.0.1/hooks";
 	sub.secret = testSecret;
 	sub.noExpiry = true;
-	rt.webhookStore().put(sub);
+	assert(rt.webhookStore().insert(sub));
 	rt.emit(EventOccurrence("evt_1", "n", "t"));
 	assert(ft.posts.length == 0); // SSRF guard blocked the verification/delivery POST
 }
@@ -8652,7 +8659,7 @@ unittest  // a job queued before its subscription was suspended is not re-leased
 	rt.emit(EventOccurrence("evt_1", "n", "t"));
 	auto sub = rt.webhookStore().get(r.id).get;
 	sub.active = false;
-	rt.webhookStore().put(sub);
+	assert(rt.webhookStore().compareAndSwap(sub, sub.revision));
 	for (size_t i = 0; i < deferred.length; i++)
 		deferred[i]();
 	assert(ft.eventPosts().length == 0);
@@ -9248,10 +9255,10 @@ version (unittest)
 			hook();
 		}
 
-		override void put(WebhookSubscription sub) @safe
+		override bool insert(WebhookSubscription sub) @safe
 		{
 			race();
-			inner.put(sub);
+			return inner.insert(sub);
 		}
 
 		override bool compareAndSwap(WebhookSubscription sub, ulong expectedRevision) @safe
@@ -9276,6 +9283,23 @@ version (unittest)
 		rt.register(reg);
 		return rt;
 	}
+}
+
+unittest  // a subscription created concurrently on another node is adopted, not overwritten
+{
+	auto store = new RacingStore();
+	auto rt = racingRuntime(store);
+	auto other = racingRuntime(store.inner);
+	string otherIncarnation;
+	store.beforeWrite = () @safe {
+		const id = other.subscribeWebhook(webhookSub("n", "https://proxy/hooks"), "user-1").id;
+		otherIncarnation = store.inner.get(id).get.incarnation;
+	};
+	auto r = rt.subscribeWebhook(webhookSub("n", "https://proxy/hooks"), "user-1");
+	assert(otherIncarnation.length);
+	auto stored = store.get(r.id).get;
+	assert(stored.incarnation == otherIncarnation);
+	assert(stored.revision > 0); // refreshed in place by the second subscribe
 }
 
 unittest  // a delivery-health update does not overwrite a concurrent writer's change
@@ -9330,17 +9354,17 @@ unittest  // a reconcile pass while a new webhook subscription is stored does no
 {
 	static final class YieldingStore : ForwardingStore
 	{
-		void delegate() @safe duringPut;
+		void delegate() @safe duringInsert;
 
-		override void put(WebhookSubscription sub) @safe
+		override bool insert(WebhookSubscription sub) @safe
 		{
-			if (duringPut !is null)
+			if (duringInsert !is null)
 			{
-				auto hook = duringPut;
-				duringPut = null;
+				auto hook = duringInsert;
+				duringInsert = null;
 				hook();
 			}
-			inner.put(sub);
+			return inner.insert(sub);
 		}
 	}
 
@@ -9360,7 +9384,7 @@ unittest  // a reconcile pass while a new webhook subscription is stored does no
 	rt.register(reg);
 	// The worker's reconcile pass runs while the store write is in flight, as a
 	// shared store's network round-trip would let it.
-	store.duringPut = () @safe { rt.reconcileDeliveries(); };
+	store.duringInsert = () @safe { rt.reconcileDeliveries(); };
 	rt.subscribeWebhook(webhookSub("n", "https://proxy/hooks"), "user-1");
 	assert(subs == 1 && unsubs == 0);
 	rt.reconcileDeliveries();
@@ -9369,22 +9393,23 @@ unittest  // a reconcile pass while a new webhook subscription is stored does no
 
 version (unittest)
 {
-	// A store whose `put` lands the write and then runs `afterPut` before
+	// A store whose `insert` lands the write and then runs `afterInsert` before
 	// returning, as a shared store's round-trip lets other fibers run once the
 	// record is visible.
 	private final class LandThenYieldStore : ForwardingStore
 	{
-		void delegate() @safe afterPut;
+		void delegate() @safe afterInsert;
 
-		override void put(WebhookSubscription sub) @safe
+		override bool insert(WebhookSubscription sub) @safe
 		{
-			inner.put(sub);
-			if (afterPut !is null)
+			const stored = inner.insert(sub);
+			if (afterInsert !is null)
 			{
-				auto hook = afterPut;
-				afterPut = null;
+				auto hook = afterInsert;
+				afterInsert = null;
 				hook();
 			}
+			return stored;
 		}
 	}
 
@@ -9421,7 +9446,7 @@ unittest  // an emit landing while a new subscription is stored is delivered aft
 	const from = rt.buffer_.headCursor();
 	rt.emit(EventOccurrence("evt_1", "n", "t"));
 	rt.emit(EventOccurrence("evt_2", "n", "t"));
-	store.afterPut = () @safe { rt.emit(EventOccurrence("evt_3", "n", "t")); };
+	store.afterInsert = () @safe { rt.emit(EventOccurrence("evt_3", "n", "t")); };
 	auto p = webhookSub("n", "https://proxy/hooks");
 	p.cursor = from;
 	auto r = rt.subscribeWebhook(p, "user-1");
@@ -9473,7 +9498,7 @@ unittest  // an emit landing while a bootstrapping subscription is stored is not
 	auto store = new LandThenYieldStore();
 	auto ft = new FakeWebhookTransport();
 	auto rt = yieldingStoreRuntime(store, ft);
-	store.afterPut = () @safe { rt.emit(EventOccurrence("evt_1", "n", "t")); };
+	store.afterInsert = () @safe { rt.emit(EventOccurrence("evt_1", "n", "t")); };
 	rt.subscribeWebhook(webhookSub("n", "https://proxy/hooks"), "user-1");
 	rt.emit(EventOccurrence("evt_2", "n", "t"));
 	assert(postedEventIds(ft) == ["evt_2"]);
