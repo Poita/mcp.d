@@ -146,6 +146,13 @@ private Exception alreadyRegistered(string what, string remover) @safe
 	return new Exception(what ~ " is already registered; call " ~ remover ~ " first to replace it");
 }
 
+/// The error answering a request whose id the peer is still using for an
+/// unfinished request or open stream.
+private McpException requestIdInUse() @safe
+{
+	return invalidRequest("Request id is already in use by an unfinished request or open stream");
+}
+
 private Exception notRegistered(string what) @safe
 {
 	return new Exception("no " ~ what ~ " is registered");
@@ -1904,6 +1911,11 @@ final class McpServer : ServerCore
 			writeLine(makeErrorResponse(msg.id, err).toString());
 			return true;
 		}
+		if (stdioRequestIdInUse(msg.id))
+		{
+			writeLine(makeErrorResponse(msg.id, requestIdInUse()).toString());
+			return true;
+		}
 		// Do NOT overwrite the shared session `clientCaps` here: 2026-07-28
 		// listen request's _meta capabilities are per-request and 2026-07-28
 		// `tools/call` gate already reads them from RequestMeta.fromParams(params);
@@ -2008,6 +2020,13 @@ final class McpServer : ServerCore
 			writeLine(makeErrorResponse(msg.id, err).toString());
 			return true;
 		}
+		// The id routes cancellation and the closing response, so it must not
+		// name any request or stream the stdio peer still has open.
+		if (stdioRequestIdInUse(msg.id))
+		{
+			writeLine(makeErrorResponse(msg.id, requestIdInUse()).toString());
+			return true;
+		}
 		if (eventsRuntime_ is null)
 		{
 			writeLine(makeErrorResponse(msg.id, methodNotFound("events/stream")).toString());
@@ -2028,16 +2047,7 @@ final class McpServer : ServerCore
 		}
 
 		// Keyed like in-flight requests, so string id "9" and numeric 9 stay distinct.
-		// The id routes cancellation and the closing response, so it must not name
-		// a stream that is still open.
 		const streamKey = cancellationKey(msg.id);
-		if (streamKey in stdioEventStreams_)
-		{
-			writeLine(makeErrorResponse(msg.id,
-					invalidRequest("events/stream: request id is already in use by an open stream"))
-					.toString());
-			return true;
-		}
 
 		const subId = msg.id;
 		void deliver(string method, Json params) @safe
@@ -2132,6 +2142,22 @@ final class McpServer : ServerCore
 	package(mcp) bool hasStdioEventStreams() @safe
 	{
 		return stdioEventStreams_.length > 0;
+	}
+
+	/// Whether `id` names a request the stdio peer still has open: a request in
+	/// flight, the `subscriptions/listen` stream, or an `events/stream` push
+	/// stream. All three share one id space on the stdio channel, so a reused id
+	/// would make a `notifications/cancelled` ambiguous.
+	private bool stdioRequestIdInUse(Json id) @safe
+	{
+		const key = cancellationKey(id);
+		if (key.length == 0)
+			return false;
+		if (stdioListenSink !is null && key == cancellationKey(stdioListenSubscriptionId))
+			return true;
+		if (key in stdioEventStreams_)
+			return true;
+		return (inFlightKey("", id) in cs().inFlight) !is null;
 	}
 
 	/// Deliver a change notification on the standalone GET / `subscriptions/listen`
@@ -2560,9 +2586,9 @@ final class McpServer : ServerCore
 		// A client reusing the id of a request still in flight violates JSON-RPC
 		// and would make a cancellation ambiguous, so the duplicate is refused
 		// and the original keeps its registration.
-		if (trackable && idKey in conn.inFlight)
-			return nullable(makeErrorResponse(msg.id,
-					invalidRequest("Request id is already in flight")));
+		if (trackable && (idKey in conn.inFlight || (connectionTokenOf(ctx)
+				.length == 0 && stdioRequestIdInUse(msg.id))))
+			return nullable(makeErrorResponse(msg.id, requestIdInUse()));
 		if (trackable)
 			conn.inFlight[idKey] = token;
 		scope (exit)
@@ -8114,6 +8140,56 @@ unittest  // notify() on stdio honours the listen stream's filter
 	assert(sink.length == 1);
 	assert(s.notify("notifications/tools/list_changed") == 1);
 	assert(sink.length == 2);
+}
+
+unittest  // a stdio subscriptions/listen reusing an in-flight request id is refused
+{
+	import mcp.server.context : CancellationToken;
+	import vibe.data.json : parseJsonString;
+
+	auto s = McpServer.stateless("t", "1");
+	s.enableToolsListChanged();
+	s.activeConnection.inFlight[McpServer.inFlightKey("", Json(5))] = new CancellationToken;
+	string[] frames;
+	assert(s.tryServeStdioListen(stdioListenReq(5), (string line) @safe {
+			frames ~= line;
+		}));
+	assert(frames.length == 1);
+	assert(parseJsonString(frames[0])["error"]["code"].get!int == ErrorCode.invalidRequest);
+	assert(s.notify("notifications/tools/list_changed") == 0);
+}
+
+unittest  // a stdio request reusing the open listen stream's id is refused
+{
+	auto s = makeTestServer();
+	s.enableToolsListChanged();
+	string[] frames;
+	assert(s.tryServeStdioListen(stdioListenReq(5), (string line) @safe {
+			frames ~= line;
+		}));
+	auto resp = s.handle(modernReq(5, "tools/list")).get;
+	assert(resp["error"]["code"].get!int == ErrorCode.invalidRequest);
+}
+
+unittest  // a stdio events/stream reusing the open listen stream's id is refused
+{
+	import vibe.data.json : parseJsonString;
+
+	auto s = McpServer.stateless("t", "1");
+	s.enableToolsListChanged();
+	string[] frames;
+	void sink(string line) @safe
+	{
+		frames ~= line;
+	}
+
+	assert(s.tryServeStdioListen(stdioListenReq(5), &sink));
+	frames = null;
+	assert(s.tryServeStdioEventsStream(modernReq(5, "events/stream",
+			Json(["name": Json("x")])), &sink));
+	assert(frames.length == 1);
+	assert(parseJsonString(frames[0])["error"]["code"].get!int == ErrorCode.invalidRequest);
+	assert(!s.hasStdioEventStreams());
 }
 
 unittest  // a second stdio subscriptions/listen closes the first with its result
