@@ -413,6 +413,7 @@ struct EventsOptions
 	Duration deliveryLease = 1.minutes;
 	size_t deliveryLeaseBatch = 100; /// most jobs one drain claims from the queue, leaving the rest to other nodes and later passes (0 = unlimited)
 	size_t webhookMaxConcurrency = 64; /// most outbound webhook tasks (delivery runs and terminated-envelope posts) one node runs at once (0 = unlimited)
+	size_t webhookMaxQueuedTerminations = 10_000; /// most `terminated` envelopes one node holds waiting for a poster; past it a terminated subscription ends without one (0 = unlimited)
 	size_t webhookMaxConcurrentFetches = 16; /// most poll-driven webhook fetch tasks (check functions run for subscriptions) one node runs at once (0 = unlimited)
 	Duration webhookHttpTimeout = 10.seconds; /// per-attempt HTTP bound (default transport); also sets the `deliveryLease` floor
 	WebhookTransport webhookTransport; /// outbound HTTP (default SSRF-hardened); tests inject a fake
@@ -3532,6 +3533,20 @@ final class EventsRuntime
 			removeWebhookState(sub);
 			return;
 		}
+		// The envelope is a courtesy: past the bound, a mass termination (a
+		// revoked principal holding many subscriptions) ends the rest without
+		// one rather than queueing without limit.
+		const bound = opts_.webhookMaxQueuedTerminations;
+		if (bound > 0 && terminatePosts_.length >= bound)
+		{
+			import vibe.core.log : logWarn;
+
+			logWarn(
+					"[mcp.events] terminated-envelope queue is full; subscription %s ends without one",
+					sub.id);
+			removeWebhookState(sub);
+			return;
+		}
 		const 
 		body = terminatedEnvelope(error).toString();
 		const now = opts_.nowMs();
@@ -3540,6 +3555,27 @@ final class EventsRuntime
 		terminatePosts_ ~= TerminatePost(sub.url, headers, body);
 		pumpTerminatePosts();
 		removeWebhookState(sub);
+	}
+
+	// POST one terminated envelope, once more if the first attempt fails (the
+	// subscription is already gone, so there is no later retry), logging an
+	// envelope the callback never took.
+	private void postTerminated(TerminatePost post) @safe
+	{
+		import vibe.core.log : logWarn;
+		import mcp.protocol.ssrf : redactUrl;
+
+		foreach (_; 0 .. 2)
+		{
+			try
+			{
+				if (postToCallback(post.url, post.headers, post.body).ok)
+					return;
+			}
+			catch (Exception e)
+				logEventsError("terminated envelope post threw", e);
+		}
+		logWarn("[mcp.events] terminated envelope to %s was not accepted", redactUrl(post.url));
 	}
 
 	// Start posters for the queued terminated envelopes, up to the node's
@@ -3564,10 +3600,7 @@ final class EventsRuntime
 				{
 					auto post = terminatePosts_[0];
 					terminatePosts_ = terminatePosts_[1 .. $];
-					try
-						postToCallback(post.url, post.headers, post.body);
-					catch (Exception e)
-						logEventsError("terminated envelope post threw", e);
+					postTerminated(post);
 				}
 			});
 		}
@@ -7404,6 +7437,7 @@ version (unittest)
 		void delegate() @safe duringPost; // run once inside the next POST, as a yield would
 		int eventDepth, maxEventDepth; // event POSTs in progress at once
 		bool failGaps; // answer gap envelopes with 503
+		int failTerminated; // answer this many terminated envelopes with 503
 		Json[] acceptedGaps; // gap envelopes answered with success, in order
 
 		WebhookHttpResult post(string url, string[string] headers, string body, bool allowPrivate) @safe
@@ -7429,6 +7463,11 @@ version (unittest)
 						200, `{}`);
 			if (isControl && failGaps && j["type"].get!string == "gap")
 				return WebhookHttpResult.failure(DeliveryErrorCategory.http5xx, 503);
+			if (isControl && failTerminated > 0 && j["type"].get!string == "terminated")
+			{
+				failTerminated--;
+				return WebhookHttpResult.failure(DeliveryErrorCategory.http5xx, 503);
+			}
 			if (isControl)
 			{
 				if (j["type"].get!string == "gap")
@@ -7644,6 +7683,49 @@ unittest  // verification and terminated envelopes dual-sign within the rotation
 			terminated.headers) == terminated.body);
 	assert(Webhook(secretB).verifyIgnoringTimestamp(terminated.body,
 			terminated.headers) == terminated.body);
+}
+
+unittest  // a terminated envelope the callback fails to take is posted once more
+{
+	auto ft = new FakeWebhookTransport();
+	auto rt = engineRuntime(ft);
+	auto r = rt.subscribeWebhook(webhookSub("n", "https://proxy/hooks"), "user-1");
+	rt.emit(EventOccurrence("evt_1", "n", "t")); // verifies the endpoint
+	ft.failTerminated = 1;
+	rt.terminateWebhook(r.id, Json(["code": Json(-32012)]));
+	assert(controlPostsOf(ft, "terminated").length == 2);
+}
+
+unittest  // terminated envelopes waiting for a poster are bounded
+{
+	auto ft = new FakeWebhookTransport();
+	EventsOptions o;
+	o.nowMs = () @safe => 1_000_000L;
+	o.nowIso = () @safe => "t";
+	o.allowPrivateCallbackHosts = true;
+	o.callbackAllowlist = ["https://proxy/"];
+	o.webhookTransport = ft;
+	o.webhookMaxQueuedTerminations = 2;
+	void delegate() @safe[] deferred;
+	o.deliveryExecutor = (void delegate() @safe job) @safe { deferred ~= job; };
+	auto rt = new EventsRuntime(null, o);
+	EventRegistration reg = {descriptor: EventType("n"), emitOnly: true};
+	rt.register(reg);
+	string[] ids;
+	foreach (url; ["https://proxy/a", "https://proxy/b", "https://proxy/c"])
+		ids ~= rt.subscribeWebhook(webhookSub("n", url), "user-1").id;
+	foreach (id; ids)
+		rt.terminateWebhook(id, Json(["code": Json(-32012)]));
+	assert(rt.terminatePosts_.length == 2);
+	foreach (id; ids)
+		assert(rt.webhookStore().get(id).isNull); // every subscription still ends
+	while (deferred.length)
+	{
+		auto job = deferred[0];
+		deferred = deferred[1 .. $];
+		job();
+	}
+	assert(controlPostsOf(ft, "terminated").length == 2);
 }
 
 unittest  // emit verifies the endpoint, then delivers a signed, routable POST
