@@ -8644,15 +8644,16 @@ unittest  // publishing to a type with no match or transform builds no per-subsc
 	auto rt = new EventsRuntime(null, o);
 	EventRegistration reg = {descriptor: EventType("n"), emitOnly: true};
 	rt.register(reg);
-	auto a = rt.subscribeWebhook(webhookSub("n", "https://proxy/a"), "user-1");
+	rt.subscribeWebhook(webhookSub("n", "https://proxy/a"), "user-1");
 	auto b = rt.subscribeWebhook(webhookSub("n", "https://proxy/b"), "user-1");
 	auto suspended = rt.webhookStore().get(b.id).get;
 	suspended.active = false;
 	(cast(InMemoryWebhookSubscriptionStore) rt.webhookStore()).put(suspended);
 	int frames;
-	openLive(rt, "n", Json.emptyObject, "user-1", Json(1), (string m, Json p) @safe {
+	auto stream = openLive(rt, "n", Json.emptyObject, "user-1", Json(1), (string m, Json p) @safe {
 		frames++;
 	});
+	assert(stream !is null);
 	const before = EventContext.constructed;
 	rt.emit(EventOccurrence("evt_1", "n", "t"));
 	assert(EventContext.constructed == before);
