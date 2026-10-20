@@ -384,13 +384,16 @@ final class TaskRuntime
 	private Nullable!TaskRecord settleOverdue(TaskRecord r) @safe
 	{
 		const expected = r.revision;
+		// A task awaiting input stalled on the client, not on its executor.
+		const awaitingInput = r.meta.status == TaskStatus.inputRequired;
 		if (r.cancelRequested)
 			transition(r, TaskStatus.cancelled);
 		else
 		{
 			transition(r, TaskStatus.failed);
-			r.error = nullable(toErrorJson(internalError(
-					"Task made no progress within the server's maximum unsettled idle time")));
+			r.error = nullable(toErrorJson(internalError(awaitingInput
+					? "Task received no input within the server's maximum unsettled idle time"
+					: "Task made no progress within the server's maximum unsettled idle time")));
 		}
 		r.cancelRequested = true;
 		r.inputRequests = Json.emptyObject;
@@ -1725,6 +1728,28 @@ unittest  // a partial tasks/update answer keeps an input_required task from goi
 	auto d = rt.getDetailed(t.taskId);
 	assert(d["status"].get!string == "input_required");
 	assert(d["lastUpdatedAt"].get!string == "2026-06-07T10:50:00Z");
+}
+
+unittest  // a task idle past maxUnsettledIdle awaiting input fails for want of input
+{
+	import std.algorithm.searching : canFind;
+
+	string now = "2026-06-07T10:00:00Z";
+	TaskOptions o;
+	o.nowIso = () @safe => now;
+	o.maxUnsettledIdle = 1.hours;
+	auto rt = new TaskRuntime(o);
+	auto waiting = rt.createFor("slow", Json.undefined);
+	rt.requireInput(waiting.taskId, Json([
+			"k": Json(["method": Json("elicitation/create")])
+	]));
+	auto running = rt.createFor("slow", Json.undefined);
+	now = "2026-06-07T11:00:00Z";
+	auto d = rt.getDetailed(waiting.taskId);
+	assert(d["status"].get!string == "failed");
+	assert(d["error"]["message"].get!string.canFind("no input"));
+	auto r = rt.getDetailed(running.taskId);
+	assert(r["error"]["message"].get!string.canFind("no progress"));
 }
 
 unittest  // the sweep fails a task unsettled past maxUnsettledIdle
