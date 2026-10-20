@@ -4181,9 +4181,8 @@ final class McpServer : ServerCore
 		// a Tool Execution Error: it is reported as a CallToolResult with
 		// `isError:true`, NOT a JSON-RPC -32602 protocol error. The
 		// CallToolRequest schema only constrains `name`/`arguments`, so such a
-		// failure does not make the request malformed. Gated behind the same
-		// opt-in style as output-schema validation to preserve existing
-		// behaviour.
+		// failure does not make the request malformed. On by default; a server
+		// opts out with `disableInputSchemaValidation()`.
 		if (validateInputSchema_)
 		{
 			const schemaMsg = checkInputSchema(entry.inputValidator, entry.descriptor.name, args);
