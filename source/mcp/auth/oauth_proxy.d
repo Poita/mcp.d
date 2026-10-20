@@ -58,8 +58,8 @@ import mcp.internal.expiring_map : BoundedExpiringMap;
 /// `IssuedToken` the proxy stores and hands the client. The returned token's
 /// `subject`/`scopes`/`audience`/`claims` become the client principal; the proxy
 /// stashes the upstream token alongside it so the server can call downstream
-/// APIs with it. Always set the returned `IssuedToken.expiresAt` — an unset, zero
-/// value is already expired.
+/// APIs with it. Always set the returned `IssuedToken.expiresAt`: an unset or
+/// past value fails the `/token` request rather than minting a dead token.
 ///
 /// The hook runs synchronously on the `/token` request fiber, so any work it does
 /// to derive the principal — e.g. an upstream userinfo/tokeninfo call to resolve
@@ -508,7 +508,7 @@ struct BrokeredToken
 	IssuedToken issued; /// the stored principal the token resolves to
 	/// Seconds until `token` expires, measured by the token store's clock, for
 	/// the token response's `expires_in`. 0 when the token never expires
-	/// (`expiresAt == long.max`) or is already dead.
+	/// (`expiresAt == long.max`).
 	long expiresIn;
 }
 
@@ -1961,7 +1961,8 @@ final class OAuthProxy
 	/// audience is bound to the proxy's `resource` so the issued token validates
 	/// against this server. Only valid in broker mode (`brokerEnabled`). Throws
 	/// when `upstream` carries no access token, so a failed upstream exchange can
-	/// never yield a client token.
+	/// never yield a client token, and when the hook's `expiresAt` is unset or
+	/// not in the future.
 	BrokeredToken issueClientToken(TokenSet upstream) @safe
 	in (cfg.issueToken !is null && cfg.tokenStore !is null)
 	{
@@ -1971,13 +1972,16 @@ final class OAuthProxy
 		enforce(upstream.accessToken.length,
 				"upstream token response carries no access_token; refusing to mint a client token");
 		auto issued = cfg.issueToken(upstream);
+		// A token already expired when minted would be handed out and then fail
+		// every request, so a hook that forgot `expiresAt` fails loudly here.
+		const now = cfg.tokenStore.now();
+		enforce(issued.expiresAt > now,
+				"issueToken returned a token whose expiresAt is unset or already past");
 		if (cfg.resource.length && !issued.audience.canFind(cfg.resource))
 			issued.audience ~= cfg.resource;
 		issued.upstream = UpstreamTokens(upstream.accessToken, upstream.refreshToken);
 		const token = cfg.tokenStore.issue(issued);
-		const now = cfg.tokenStore.now();
-		const expiresIn = issued.expiresAt == long.max || issued.expiresAt <= now
-			? 0 : issued.expiresAt - now;
+		const expiresIn = issued.expiresAt == long.max ? 0 : issued.expiresAt - now;
 		return BrokeredToken(token, issued, expiresIn);
 	}
 
@@ -3702,6 +3706,30 @@ unittest  // BROKER: an upstream response without an access token mints nothing
 	auto proxy = new OAuthProxy(brokerConfig());
 	TokenSet upstream;
 	assertThrown(proxy.issueClientToken(upstream));
+}
+
+unittest  // BROKER: a hook that leaves expiresAt unset or past mints nothing
+{
+	import std.exception : assertThrown;
+	import mcp.auth.reference_token : ReferenceTokenStoreOptions;
+
+	foreach (expiresAt; [0L, 1L])
+	{
+		auto cfg = brokerConfig();
+		ReferenceTokenStoreOptions o;
+		o.clock = () @safe => 1_700_000_000L;
+		cfg.tokenStore = new ReferenceTokenStore(o);
+		cfg.issueToken = (TokenSet upstream) @safe {
+			IssuedToken t;
+			t.subject = "octocat";
+			t.expiresAt = expiresAt;
+			return t;
+		};
+		auto proxy = new OAuthProxy(cfg);
+		TokenSet upstream;
+		upstream.accessToken = "gho_upstream_secret";
+		assertThrown(proxy.issueClientToken(upstream));
+	}
 }
 
 unittest  // BROKER: the resource server accepts the issued token, rejects the raw upstream token
