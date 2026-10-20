@@ -121,6 +121,10 @@ private final class StreamGate
 	private size_t maxPerAddress;
 	private size_t[string] openBy;
 
+	/// Called with the remote address whenever an unauthenticated caller is
+	/// refused at the per-address cap.
+	void delegate(string address) @safe onAddressCap;
+
 	/// Why `tryAcquire` refused a slot.
 	enum Refusal
 	{
@@ -146,7 +150,11 @@ private final class StreamGate
 		const key = callerBucket(principal, address);
 		const cap = principal.length ? maxPerPrincipal : maxPerAddress;
 		if (key.length && cap != 0 && openBy.get(key, 0) >= cap)
+		{
+			if (!principal.length && onAddressCap !is null)
+				onAddressCap(address);
 			return Refusal.caller;
+		}
 		open++;
 		if (key.length)
 			openBy[key] = openBy.get(key, 0) + 1;
@@ -196,6 +204,61 @@ unittest  // a caller with neither principal nor address is bounded only by the 
 	assert(gate.tryAcquire("", "") == StreamGate.Refusal.mount);
 }
 
+unittest  // only an anonymous caller refused at its per-address cap is reported
+{
+	auto gate = new StreamGate(10, 1, 1);
+	string[] hits;
+	gate.onAddressCap = (string address) @safe { hits ~= address; };
+	gate.tryAcquire("alice", "10.0.0.1");
+	gate.tryAcquire("alice", "10.0.0.1");
+	gate.tryAcquire("", "10.0.0.1");
+	assert(hits.length == 0);
+	gate.tryAcquire("", "10.0.0.1");
+	assert(hits == ["10.0.0.1"]);
+}
+
+/// Logs, once per mount, that a per-address cap has been reached while the
+/// mount counts callers by their socket address. Behind a reverse proxy every
+/// anonymous caller shares the proxy's address, so the first refusal or
+/// eviction there is the sign that `trustProxyHeaders` or the per-address caps
+/// need configuring.
+private final class AddressCapWarning
+{
+	private bool warned;
+	private void delegate(string) @safe log;
+
+	this(void delegate(string) @safe log = null) @safe
+	{
+		import vibe.core.log : logWarn;
+
+		this.log = log !is null ? log : (string msg) @safe { logWarn("%s", msg); };
+	}
+
+	void opCall(string address) @safe
+	{
+		if (warned)
+			return;
+		warned = true;
+		log("Streamable HTTP: anonymous callers from " ~ address ~ " reached a "
+				~ "per-address cap, so their sessions are being evicted or their requests "
+				~ "refused. Behind a reverse proxy every anonymous caller shares the proxy's "
+				~ "address: set StreamableHttpOptions.trustProxyHeaders, or raise "
+				~ "SessionLimits.maxAnonymousPerAddress and the StreamLimits per-address caps.");
+	}
+}
+
+unittest  // the per-address cap warning is logged once and names trustProxyHeaders
+{
+	import std.algorithm : canFind;
+
+	string[] logged;
+	auto warn = new AddressCapWarning((string msg) @safe { logged ~= msg; });
+	warn("10.0.0.1");
+	warn("10.0.0.2");
+	assert(logged.length == 1);
+	assert(logged[0].canFind("10.0.0.1") && logged[0].canFind("trustProxyHeaders"));
+}
+
 /// Configuration for the Streamable HTTP server transport.
 struct StreamableHttpOptions
 {
@@ -215,7 +278,9 @@ struct StreamableHttpOptions
 	/// `resource_metadata` URL, and the last `X-Forwarded-For` entry as the
 	/// client address the per-address caps count. Off by default, since any
 	/// client can send these headers; enable only behind a single reverse proxy
-	/// that sets `X-Forwarded-Proto` and appends to `X-Forwarded-For`.
+	/// that sets `X-Forwarded-Proto` and appends to `X-Forwarded-For`. While it
+	/// is off, the first time an anonymous caller reaches a per-address cap a
+	/// warning is logged, since behind a proxy that cap is shared by everyone.
 	bool trustProxyHeaders = false;
 	/// DNS-rebinding protection, part 2: reject a request carrying an `Origin`
 	/// that is not a localhost origin or in `allowedOrigins` (MCP transport
@@ -484,6 +549,15 @@ void mountMcp(URLRouter router, McpServer server,
 			opts.streamLimits.maxGetStreamsPerPrincipal, opts.streamLimits.maxGetStreamsPerAddress);
 	auto requestSlots = new StreamGate(opts.streamLimits.maxRequests,
 			opts.streamLimits.maxRequestsPerPrincipal, opts.streamLimits.maxRequestsPerAddress);
+	if (!opts.trustProxyHeaders)
+	{
+		auto warn = new AddressCapWarning;
+		if (sessions !is null)
+			sessions.onAddressCap = &warn.opCall;
+		pushStreams.onAddressCap = &warn.opCall;
+		getStreams.onAddressCap = &warn.opCall;
+		requestSlots.onAddressCap = &warn.opCall;
+	}
 
 	// This mount owns a single fallback `ConnectionState`, which the server core
 	// threads through dispatch and reads back for the notify/push path. It is the
@@ -617,6 +691,8 @@ private void mountLegacyRoutes(URLRouter router, McpServer server, StreamableHtt
 	auto streams = new StreamGate(opts.streamLimits.maxLegacyStreams,
 			opts.streamLimits.maxLegacyStreamsPerPrincipal,
 			opts.streamLimits.maxLegacyStreamsPerAddress);
+	if (!opts.trustProxyHeaders)
+		streams.onAddressCap = &(new AddressCapWarning).opCall;
 	mountCorsPreflight(router, opts.legacySsePath, "GET", opts);
 	mountCorsPreflight(router, opts.legacyMessagePath, "POST", opts);
 

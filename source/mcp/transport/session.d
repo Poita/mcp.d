@@ -119,6 +119,11 @@ final class SessionManager
 	/// called for `terminate`.
 	void delegate(string id) @safe onExpire;
 
+	/// Called with the remote address whenever an unauthenticated `create`
+	/// reaches `SessionLimits.maxAnonymousPerAddress`, before it evicts one of
+	/// that address's sessions or refuses the new one.
+	void delegate(string address) @safe onAddressCap;
+
 	/// Report the end of an expired or evicted session. Only idle sessions
 	/// expire or are evicted, so it has no request to cancel.
 	private void evicted(string id, Session s) @safe
@@ -164,10 +169,14 @@ final class SessionManager
 			}
 
 			while (perBucket.get(bucket, 0) >= cap)
+			{
+				if (!principal.length && onAddressCap !is null)
+					onAddressCap(address);
 				if (!sessions.evictOldest(&mine))
 					throw new SessionCapacityException(principal.length
 							? "too many active sessions for this principal"
 							: "too many active sessions for this address");
+			}
 		}
 		const id = generateSessionId();
 		// put() runs the lazy idle sweep and cap eviction before inserting, so an
@@ -708,6 +717,33 @@ unittest  // past the cap, a session holding a GET stream is never evicted
 	mgr.streamClosed(a, 1);
 	const b = mgr.create();
 	assert(!mgr.isActive(a) && mgr.isActive(b), "an idle session makes room once its stream ends");
+}
+
+unittest  // the per-address cap reports each anonymous eviction and refusal
+{
+	SessionLimits limits;
+	limits.idleTtl = Duration.zero;
+	limits.maxAnonymousPerAddress = 1;
+	limits.maxPerPrincipal = 1;
+	auto mgr = new SessionManager(limits);
+	string[] hits;
+	mgr.onAddressCap = (string address) @safe { hits ~= address; };
+	mgr.create("", "10.0.0.1");
+	mgr.create("alice", "10.0.0.1");
+	mgr.create("alice", "10.0.0.1");
+	assert(hits.length == 0, "neither a first session nor a principal's eviction is reported");
+	const second = mgr.create("", "10.0.0.1");
+	assert(hits == ["10.0.0.1"], "an anonymous eviction is reported");
+	mgr.streamOpened(second, 1);
+	try
+	{
+		mgr.create("", "10.0.0.1");
+		assert(false, "a busy address must be refused");
+	}
+	catch (SessionCapacityException)
+	{
+	}
+	assert(hits == ["10.0.0.1", "10.0.0.1"], "an anonymous refusal is reported");
 }
 
 unittest  // a session's GET streams are reported oldest first and close in any order
