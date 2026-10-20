@@ -3820,7 +3820,7 @@ final class McpServer : ServerCore
 			throw methodNotFound("completion/complete");
 		validateCompleteParams(params);
 		auto request = CompleteRequest.fromJson(params);
-		requireCompletionTarget(request.reference);
+		const target = completionTarget(request.reference);
 		// The global handler takes precedence (advanced/dynamic routing); an empty
 		// result from it falls back to a per-argument completer registered via
 		// `setArgumentCompleter`.
@@ -3830,7 +3830,7 @@ final class McpServer : ServerCore
 			if (global.values.length || argumentCompleters.length == 0)
 				return global.toJson();
 		}
-		const key = argumentCompleterKey(request.reference, request.argumentName);
+		const key = argumentCompleterKey(target, request.argumentName);
 		if (auto completer = key in argumentCompleters)
 			return (*completer)(request).toJson();
 		// A registered (reference, argument) surface exists but this request
@@ -3838,22 +3838,31 @@ final class McpServer : ServerCore
 		return CompleteResult.init.toJson();
 	}
 
-	/// Reject a `completion/complete` whose `ref` names no registered prompt,
-	/// resource, or resource template (server/utilities/completion: invalid
-	/// prompt name -> -32602).
-	private void requireCompletionTarget(CompletionReference reference) @safe
+	/// The registered target a `completion/complete` `ref` names, as the
+	/// reference its per-argument completers are keyed by. A `ref/resource`
+	/// carries "the URI or URI template of the resource", so a concrete URI a
+	/// registered template matches resolves to that template. Throws -32602
+	/// when the `ref` names no registered prompt, resource, or resource template
+	/// (server/utilities/completion: invalid prompt name -> -32602).
+	private CompletionReference completionTarget(CompletionReference reference) @safe
 	{
 		if (reference.type == "ref/prompt")
 		{
 			if (reference.name !in prompts)
 				throw invalidParams("Unknown prompt: " ~ reference.name);
-			return;
+			return reference;
 		}
 		if (reference.uri in resources)
-			return;
+			return reference;
 		foreach (ref t; templates)
 			if (t.descriptor.uriTemplate == reference.uri)
-				return;
+				return reference;
+		foreach (ref t; templates)
+		{
+			string[string] captured;
+			if (matchUriTemplate(t.descriptor.uriTemplate, reference.uri, captured))
+				return CompletionReference.forResource(t.descriptor.uriTemplate);
+		}
 		throw invalidParams("Unknown resource or resource template: " ~ reference.uri);
 	}
 
@@ -9975,7 +9984,7 @@ unittest  // a 2025-era request with no initialize on its connection skips the c
 	assert(s.setPromptRequiredClientCapabilities("greet", reqCap));
 	assert(s.setResourceRequiredClientCapabilities("res://x", reqCap));
 	auto call = s.handle(req(1, "tools/call", Json([
-				"name": Json("needs-sampling")
+		"name": Json("needs-sampling")
 	]))).get;
 	assert("error" !in call);
 	auto prompt = s.handle(req(2, "prompts/get", Json(["name": Json("greet")]))).get;
@@ -13630,6 +13639,23 @@ unittest  // completion/complete for an unregistered resource or template is -32
 	]);
 	resp = s.handle(req(2, "completion/complete", p)).get;
 	assert("result" in resp);
+}
+
+unittest  // completion/complete accepts a concrete URI a registered template matches
+{
+	auto s = McpServer.stateless("t", "1");
+	ResourceTemplate t = {uriTemplate: "file:///{path}", name: "files"};
+	s.registerResourceTemplate(t, (string uri, string[string] vars, RequestContext ctx) @safe {
+		return cast(ResourceContents[])[];
+	});
+	s.setArgumentCompleter(CompletionReference.forResource("file:///{path}"), "path",
+			(CompleteRequest r) @safe => CompleteResult.prefixMatch(["readme"], r.argumentValue));
+	Json p = Json.emptyObject;
+	p["ref"] = Json(["type": Json("ref/resource"), "uri": Json("file:///docs")]);
+	p["argument"] = Json(["name": Json("path"), "value": Json("re")]);
+	auto resp = s.handle(req(1, "completion/complete", p)).get;
+	assert("error" !in resp);
+	assert(resp["result"]["completion"]["values"][0].get!string == "readme");
 }
 
 unittest  // the attached push channel is internal: its raw delivery bypasses the server's gates
