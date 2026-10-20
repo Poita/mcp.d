@@ -699,6 +699,8 @@ final class EventsRuntime
 	private bool drainKicked_; // a drain is scheduled on the delivery executor and has not started
 	private int[string] pendingCount_; // subscription id -> tracked, unsettled deliveries on this node
 	private TrackedJob[string] trackedJobs_; // job id -> its subscription and position, while this node tracks it
+	private bool[string][string] jobsBySubscription_; // subscription id -> ids of its jobs in trackedJobs_
+	version (unittest) private size_t forgetVisited_; // tracked jobs forgetSubscription has examined
 	private bool[string] enqueuing_; // job ids tracked whose enqueue call has not yet returned
 	private WebhookRef[string] heldWebhookRefs_; // subscription id -> lifecycle key acquired on this node
 	private Nullable!string[string] emitBackfill_; // emit-only subscription id -> ring-buffer position its paged backfill has reached
@@ -1868,9 +1870,14 @@ final class EventsRuntime
 	{
 		outstanding_.remove(subId);
 		pendingCount_.remove(subId);
-		foreach (jobId, job; trackedJobs_.dup)
-			if (job.subscriptionId == subId)
+		if (auto jobs = subId in jobsBySubscription_)
+			foreach (jobId; jobs.byKey)
+			{
+				version (unittest)
+					forgetVisited_++;
 				trackedJobs_.remove(jobId);
+			}
+		jobsBySubscription_.remove(subId);
 		emitBackfill_.remove(subId);
 		awaitingReplay_.remove(subId);
 		nextFetchAt_.remove(subId);
@@ -3534,6 +3541,7 @@ final class EventsRuntime
 		if ((jobId in trackedJobs_) !is null)
 			return false;
 		trackedJobs_[jobId] = TrackedJob(subId, cursor);
+		jobsBySubscription_[subId][jobId] = true;
 		pendingCount_[subId] = pendingCount_.get(subId, 0) + 1;
 		if (cursor.isNull)
 			return true;
@@ -3603,6 +3611,12 @@ final class EventsRuntime
 			return Nullable!TrackedJob.init;
 		auto job = *p;
 		trackedJobs_.remove(jobId);
+		if (auto jobs = job.subscriptionId in jobsBySubscription_)
+		{
+			(*jobs).remove(jobId);
+			if ((*jobs).length == 0)
+				jobsBySubscription_.remove(job.subscriptionId);
+		}
 		decrementPending(job.subscriptionId);
 		return nullable(job);
 	}
@@ -3643,8 +3657,8 @@ final class EventsRuntime
 			known[subId] = true;
 		foreach (subId; pendingCount_.byKey)
 			known[subId] = true;
-		foreach (_, job; trackedJobs_)
-			known[job.subscriptionId] = true;
+		foreach (subId; jobsBySubscription_.byKey)
+			known[subId] = true;
 		foreach (subId; nextFetchAt_.byKey)
 			known[subId] = true;
 		foreach (subId; heldWebhookRefs_.byKey)
@@ -9300,6 +9314,24 @@ unittest  // a subscription created concurrently on another node is adopted, not
 	auto stored = store.get(r.id).get;
 	assert(stored.incarnation == otherIncarnation);
 	assert(stored.revision > 0); // refreshed in place by the second subscribe
+}
+
+unittest  // forgetting a subscription examines only its own tracked jobs
+{
+	import std.conv : to;
+
+	auto rt = testRuntime();
+	foreach (i; 0 .. 50)
+		rt.trackJob("busy", "busy/" ~ i.to!string, nullable("c" ~ i.to!string));
+	rt.trackJob("gone", "gone/1", nullable("c1"));
+	rt.trackJob("gone", "gone/2", Nullable!string.init);
+	rt.forgetSubscription("gone");
+	assert(rt.forgetVisited_ <= 2, rt.forgetVisited_.to!string);
+	assert(("gone/1" in rt.trackedJobs_) is null && ("gone/2" in rt.trackedJobs_) is null);
+	assert(rt.trackedJobs_.length == 50 && rt.pendingCount_["busy"] == 50);
+	rt.forgetJob("busy/0");
+	rt.forgetSubscription("busy");
+	assert(rt.trackedJobs_.length == 0 && ("busy" !in rt.pendingCount_));
 }
 
 unittest  // a delivery-health update does not overwrite a concurrent writer's change
