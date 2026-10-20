@@ -82,7 +82,8 @@ struct TaskToolOptions
 	TaskCreateOptions create;
 	/// What a client that did not declare the Tasks extension gets: `optional`
 	/// runs the executor inline and returns its result as a plain tool result,
-	/// `required` rejects the call with -32021.
+	/// `required` rejects the call with -32021. A task tool always runs as a
+	/// task for a client that declared the extension, so `none` is refused.
 	TaskSupport support = TaskSupport.optional;
 }
 
@@ -1361,7 +1362,8 @@ final class McpServer : ServerCore
 	/// what a client without the Tasks extension gets (see `TaskToolOptions`).
 	/// Enables the Tasks extension with default options when it is not yet
 	/// enabled; a later `enableTasks(opts)` replaces those options and keeps the
-	/// registered task tools. Throws on a `stateful` server, and when a tool or
+	/// registered task tools. Throws on a `stateful` server, when `opts.support`
+	/// is `TaskSupport.none`, and when a tool or
 	/// task executor named `descriptor.name` is already registered; replace a
 	/// task tool with `removeTool` plus `removeTaskExecutor`. Used by the UDA
 	/// reflection layer; callable directly for dynamic task tools.
@@ -1370,8 +1372,12 @@ final class McpServer : ServerCore
 	{
 		const toolName = descriptor.name;
 		const create = opts.create;
-		// The tool is validated and built first so a bad name or schema throws
-		// before the Tasks extension is enabled or the executor map changes.
+		// The tool is validated and built first so a bad name, schema or support
+		// level throws before the Tasks extension is enabled or the executor map
+		// changes.
+		if (opts.support == TaskSupport.none)
+			throw new Exception("task tool '" ~ toolName
+					~ "' needs TaskSupport.optional or TaskSupport.required, not none");
 		requireToolNameAvailable(toolName);
 		requireTaskExecutorNameAvailable(toolName);
 		auto entry = withCompiledValidators(RegisteredTool(descriptor,
@@ -1381,8 +1387,7 @@ final class McpServer : ServerCore
 		ensureTasks("task tool '" ~ toolName ~ "'");
 		tools[toolName] = entry;
 		registerTaskExecutor(toolName, executor);
-		setToolTaskSupport(descriptor.name, opts.support == TaskSupport.none
-				? TaskSupport.optional : opts.support);
+		setToolTaskSupport(descriptor.name, opts.support);
 	}
 
 	/// Register the executor that drives tasks created under `name`, without
@@ -9321,6 +9326,19 @@ unittest  // registerTaskTool with an invalid or taken name leaves Tasks disable
 	s.registerTool(plain, (Json) @safe => CallToolResult());
 	assertThrown(s.registerTaskTool(plain, (TaskContext tc) @safe => Json.emptyObject));
 	assert(s.taskRuntime_ is null);
+}
+
+unittest  // registerTaskTool refuses TaskSupport.none and leaves Tasks disabled
+{
+	import std.exception : assertThrown;
+
+	auto s = McpServer.stateless("t", "1");
+	Tool t = {name: "job"};
+	TaskToolOptions opts;
+	opts.support = TaskSupport.none;
+	assertThrown(s.registerTaskTool(t, (TaskContext tc) @safe => Json.emptyObject, opts));
+	assert(s.taskRuntime_ is null);
+	assert("job" !in s.tools);
 }
 
 unittest  // registerTaskExecutor refuses a name that already has an executor
