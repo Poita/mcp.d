@@ -1940,6 +1940,8 @@ final class EventsRuntime
 		bool any;
 		foreach (occ; er.events)
 			any |= enqueueForWebhook(sub, reg, occ);
+		if (!emitOnly && !any && er.events.length)
+			advanceFilteredWatermark(sub.id, er.cursor);
 		if (emitOnly && !er.hasMore)
 			any |= pageEmitBackfill(sub.id, opts_.nowMs());
 		if (any)
@@ -1953,7 +1955,8 @@ final class EventsRuntime
 	/// most `webhookMaxConcurrentFetches` such tasks run at once, one per
 	/// subscription; a subscription left over is fetched by a later pass. A slow
 	/// upstream thus holds up only its own subscriptions, never the pass. A quiet
-	/// fetch with nothing in flight advances the watermark (so the client's cursor
+	/// fetch (one returning no events, or only events the subscription's filter
+	/// drops) with nothing in flight advances the watermark (so the client's cursor
 	/// moves during quiet periods); a fetch that reports `truncated` queues a
 	/// `gap` envelope. Emit-only types are not polled — `emit` routes them live.
 	void pollWebhookSubscriptions() @safe
@@ -2116,8 +2119,7 @@ final class EventsRuntime
 			// in flight for the subscription — on this node, or, over a
 			// shared queue, on any other — and no dropped position is still
 			// owed a gap, which would otherwise be skipped past unreported.
-			if (!gap && er.events.length == 0 && (s.id in outstanding_) is null
-				&& !s.owesGap && !deliveryQueue_.hasPendingFor(s.id))
+			if (!gap && er.events.length == 0 && nothingInFlight(s))
 				s.cursor = er.cursor;
 			return true;
 		}, cur);
@@ -2126,6 +2128,8 @@ final class EventsRuntime
 		bool any;
 		foreach (occ; er.events)
 			any |= enqueueForWebhook(cur, reg, occ);
+		if (!gap && !any && er.events.length)
+			advanceFilteredWatermark(cur.id, er.cursor);
 		// The gap is queued behind the batch, so the watermark reaches its
 		// position only after the batch settles and the endpoint is verified.
 		if (gap)
@@ -2133,6 +2137,29 @@ final class EventsRuntime
 		sub = cur;
 		more = er.hasMore;
 		return any;
+	}
+
+	// Whether `s` has no delivery in flight — on this node, or, over a shared
+	// queue, on any other — and no dropped position still owed a gap, so its
+	// watermark may move to its fetch position without skipping either.
+	private bool nothingInFlight(const ref WebhookSubscription s) @safe
+	{
+		return (s.id in outstanding_) is null && !s.owesGap && !deliveryQueue_.hasPendingFor(s.id);
+	}
+
+	// Advance `id`'s watermark to `cursor`, the position a fetch reached whose
+	// every event the subscription's filter dropped: such a batch leaves nothing
+	// to deliver, so it is as quiet as an empty one. Applied only while `cursor`
+	// is still the fetch position and nothing is in flight.
+	private void advanceFilteredWatermark(string id, Nullable!string cursor) @safe
+	{
+		modifyWebhook(id, (ref WebhookSubscription s) @safe {
+			if (s.isExpired(opts_.nowMs()) || !s.active
+				|| !sameCursor(s.fetchCursor, cursor) || !nothingInFlight(s))
+				return false;
+			s.cursor = cursor;
+			return true;
+		});
 	}
 
 	// The batch cap for a webhook fetch: the server's poll batch cap, lowered to
@@ -8907,6 +8934,36 @@ unittest  // a batch-cursor batch larger than the free pending slots waits rathe
 	assert(ft.eventPosts().length == 4);
 	assert(controlPostsOf(ft, "gap").length == 0);
 	assert(rt.webhookStore().get(r.id).get.cursor.get == "b4");
+}
+
+unittest  // a webhook fetch whose every event is filtered out advances the watermark
+{
+	long now = 1_000_000;
+	auto ft = new FakeWebhookTransport();
+	EventsOptions o;
+	o.nowMs = () @safe => now;
+	o.nowIso = () @safe => "t";
+	o.allowPrivateCallbackHosts = true;
+	o.webhookTransport = ft;
+	o.webhookRetryBase = Duration.zero;
+	o.deliveryExecutor = (void delegate() @safe job) @safe { job(); };
+	auto rt = new EventsRuntime(null, o);
+	// `total` upstream events, every one of which the subscriptions filter out.
+	auto filtered = (size_t total) @safe {
+		auto t = pagedCheckType("paged", total);
+		t.match = (EventContext ctx, EventOccurrence ev) @safe => false;
+		return t;
+	};
+	rt.register(filtered(3));
+	auto p = webhookSub("paged", "https://proxy/hooks");
+	p.cursor = "c0";
+	auto r = rt.subscribeWebhook(p, "user-1"); // the backfill
+	assert(rt.webhookStore().get(r.id).get.cursor.get == "c3");
+	rt.register(filtered(6));
+	now += 1_000;
+	rt.pollWebhookSubscriptions(); // the poll-driven fetch
+	assert(ft.eventPosts().length == 0);
+	assert(rt.webhookStore().get(r.id).get.cursor.get == "c6");
 }
 
 unittest  // a webhook poll pass keeps fetching while the check reports more
