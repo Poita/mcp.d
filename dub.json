@@ -22,7 +22,8 @@
 		"dyaml": "~>0.9.2",
 		"standardwebhooks": "~>0.2.0"
 	},
-	"sourceFiles-windows": ["source/deimos/openssl/version_.di"],
+	"importPaths": ["source"],
+	"importPaths-windows": ["import-windows"],
 	"configurations": [
 		{
 			"name": "library",
