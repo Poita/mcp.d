@@ -868,6 +868,7 @@ package final class JwksCache : KeySource
 	private long lastAttemptAt = -1; // when the last fetch attempt finished
 	private bool loaded = false;
 	private bool refreshQueued = false;
+	private bool fetching = false; // a fetch holds `fetchLock`
 	private TaskMutex fetchLock;
 
 	/// Fetches the JWKS document at a URI, returning its body or null on
@@ -891,8 +892,10 @@ package final class JwksCache : KeySource
 	}
 
 	/// Candidate PEM keys for a `kid`. Blocks on a (rate-limited) fetch when no
-	/// usable keys are held or `kid` is unknown; when the keys are merely past
-	/// their TTL, returns them and refreshes in the background.
+	/// usable keys are held or `kid` is unknown (unless another fetch is already
+	/// in flight, when an unknown `kid` gets the held keys without waiting);
+	/// when the keys are merely past their TTL, returns them and refreshes in
+	/// the background.
 	PublicKey[] keysFor(string kid, string alg = null) @safe
 	{
 		if (uri.length == 0)
@@ -902,8 +905,16 @@ package final class JwksCache : KeySource
 			return null;
 		}
 		const unknownKid = kid.length && (kid in keysByKid) is null;
-		if (!loaded || tooStale() || unknownKid)
+		if (!loaded || tooStale())
 			refetch();
+		else if (unknownKid)
+		{
+			// Usable keys are held, so a kid they lack waits only on a fetch it
+			// starts itself: while one is in flight it is answered from the held
+			// keys at once, so forged kids cannot queue requests behind a slow IdP.
+			if (!fetching)
+				refetch();
+		}
 		else if (now() - fetchedAt >= cast(long) ttl.total!"seconds")
 			refreshInBackground();
 		if (tooStale())
@@ -1007,8 +1018,12 @@ package final class JwksCache : KeySource
 			fetchLock.unlock();
 		if (attemptedRecently())
 			return;
+		fetching = true;
 		scope (exit)
+		{
 			lastAttemptAt = now();
+			fetching = false;
+		}
 		const doc = fetcher !is null ? fetcher(uri) : fetchJwks(uri, policy);
 		if (doc.length == 0)
 			return;
@@ -2671,6 +2686,50 @@ unittest  // JwksCache single-flights concurrent fetches
 	tb.join();
 	assert(s.fetches == 1);
 	assert(a == 1 && b == 1);
+}
+
+unittest  // JwksCache: an unknown kid arriving while a fetch is in flight does not wait for it
+{
+	import core.time : msecs;
+	import vibe.core.core : runTask, sleep;
+
+	bool slow;
+	auto s = new ScriptedJwks(rsaOnlyJwks, () @safe {
+		if (slow)
+			sleep(300.msecs);
+	});
+	auto cache = s.cache;
+	assert(cache.keysFor("rsa-1").length == 1);
+	s.clock += JwksCache.minRefetchInterval.total!"seconds";
+	slow = true;
+
+	auto ta = runTask(() nothrow{
+		try
+			cache.keysFor("forged-1");
+		catch (Exception)
+		{
+		}
+	});
+	Duration waited;
+	bool knownOk;
+	auto tb = runTask(() nothrow{
+		try
+		{
+			sleep(20.msecs);
+			const start = MonoTime.currTime;
+			cache.keysFor("forged-2");
+			knownOk = cache.keysFor("rsa-1").length == 1;
+			waited = MonoTime.currTime - start;
+		}
+		catch (Exception)
+		{
+		}
+	});
+	ta.join();
+	tb.join();
+	assert(s.fetches == 2);
+	assert(knownOk);
+	assert(waited < 150.msecs, "an unknown kid must fail fast while another fetch is in flight");
 }
 
 unittest  // JwksCache.load() retains previous keys when parsing a malformed JWKS document throws
