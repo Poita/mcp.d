@@ -146,6 +146,11 @@ private Exception alreadyRegistered(string what, string remover) @safe
 	return new Exception(what ~ " is already registered; call " ~ remover ~ " first to replace it");
 }
 
+private Exception notRegistered(string what) @safe
+{
+	return new Exception("no " ~ what ~ " is registered");
+}
+
 /// The most `resources/subscribe` URIs one connection may hold, bounding the
 /// per-session state a client can make the server keep.
 private enum maxResourceSubscriptions = 1024;
@@ -546,15 +551,15 @@ final class McpServer : ServerCore
 	/// stateless HTTP server dispatches each 2025-era request on a connection
 	/// that never saw `initialize`, so it cannot know them and does not gate
 	/// those requests; the handler sees empty `ctx.clientCapabilities()`. Passing a
-	/// default-constructed `ClientCapabilities` clears the requirement. Returns
-	/// `false` if no tool with `name` is registered.
-	bool setToolRequiredClientCapabilities(string name, ClientCapabilities caps) @safe
+	/// default-constructed `ClientCapabilities` clears the requirement. Throws
+	/// if no tool with `name` is registered, so a misspelt name cannot leave the
+	/// tool ungated.
+	void setToolRequiredClientCapabilities(string name, ClientCapabilities caps) @safe
 	{
 		auto entry = name in tools;
 		if (entry is null)
-			return false;
+			throw notRegistered("tool named '" ~ name ~ "'");
 		entry.requiredClientCapabilities = caps;
-		return true;
 	}
 
 	/// Declare the client capabilities a registered prompt's handler requires.
@@ -569,15 +574,14 @@ final class McpServer : ServerCore
 	/// stateless HTTP server dispatches each 2025-era request on a connection
 	/// that never saw `initialize`, so it cannot know them and does not gate
 	/// those requests; the handler sees empty `ctx.clientCapabilities()`. Passing a
-	/// default-constructed `ClientCapabilities` clears the requirement. Returns
-	/// `false` if no prompt with `name` is registered.
-	bool setPromptRequiredClientCapabilities(string name, ClientCapabilities caps) @safe
+	/// default-constructed `ClientCapabilities` clears the requirement. Throws
+	/// if no prompt with `name` is registered.
+	void setPromptRequiredClientCapabilities(string name, ClientCapabilities caps) @safe
 	{
 		auto entry = name in prompts;
 		if (entry is null)
-			return false;
+			throw notRegistered("prompt named '" ~ name ~ "'");
 		entry.requiredClientCapabilities = caps;
-		return true;
 	}
 
 	/// Declare the client capabilities a registered direct resource requires to
@@ -596,15 +600,14 @@ final class McpServer : ServerCore
 	/// those requests; the handler sees empty `ctx.clientCapabilities()`. Passing a
 	/// default-constructed `ClientCapabilities` clears the requirement.
 	///
-	/// For a direct resource, `uri` is the exact resource URI. Returns `false`
-	/// if no direct resource with that URI is registered.
-	bool setResourceRequiredClientCapabilities(string uri, ClientCapabilities caps) @safe
+	/// For a direct resource, `uri` is the exact resource URI. Throws if no
+	/// direct resource with that URI is registered.
+	void setResourceRequiredClientCapabilities(string uri, ClientCapabilities caps) @safe
 	{
 		auto entry = uri in resources;
 		if (entry is null)
-			return false;
+			throw notRegistered("resource with uri '" ~ uri ~ "'");
 		entry.requiredClientCapabilities = caps;
-		return true;
 	}
 
 	/// Declare the client capabilities a registered resource template requires
@@ -623,19 +626,19 @@ final class McpServer : ServerCore
 	/// those requests; the handler sees empty `ctx.clientCapabilities()`. Passing a
 	/// default-constructed `ClientCapabilities` clears the requirement.
 	///
-	/// `uriTemplate` is the URI template string (e.g. `"res://{id}"`). Returns
-	/// `false` if no template with that URI template string is registered.
-	bool setResourceTemplateRequiredClientCapabilities(string uriTemplate, ClientCapabilities caps) @safe
+	/// `uriTemplate` is the URI template string (e.g. `"res://{id}"`). Throws
+	/// if no template with that URI template string is registered.
+	void setResourceTemplateRequiredClientCapabilities(string uriTemplate, ClientCapabilities caps) @safe
 	{
 		foreach (ref t; templates)
 		{
 			if (t.descriptor.uriTemplate == uriTemplate)
 			{
 				t.requiredClientCapabilities = caps;
-				return true;
+				return;
 			}
 		}
-		return false;
+		throw notRegistered("resource template '" ~ uriTemplate ~ "'");
 	}
 
 	/// Unregister a previously registered tool by name. Returns `true` if a tool
@@ -9971,7 +9974,7 @@ unittest  // modern tools/call rejects with -32021 when a required client cap is
 	// The "add" tool now requires the client to support sampling.
 	ClientCapabilities req;
 	req.sampling = true;
-	assert(s.setToolRequiredClientCapabilities("add", req));
+	s.setToolRequiredClientCapabilities("add", req);
 	// modernReq declares empty clientCapabilities -> sampling is missing.
 	Json p = Json(["name": Json("add"), "arguments": Json.emptyObject]);
 	auto resp = s.handle(modernReq(7, "tools/call", p)).get;
@@ -9985,7 +9988,7 @@ unittest  // modern tools/call proceeds when the client declared the required ca
 	auto s = makeTestServer();
 	ClientCapabilities reqCap;
 	reqCap.sampling = true;
-	assert(s.setToolRequiredClientCapabilities("add", reqCap));
+	s.setToolRequiredClientCapabilities("add", reqCap);
 	// Build a modern request whose _meta declares sampling.
 	Json meta = Json.emptyObject;
 	meta[MetaKey.protocolVersion] = "2026-07-28";
@@ -10013,12 +10016,14 @@ unittest  // a tool without a declared requirement is never gated on the modern 
 	assert(resp["result"]["structuredContent"]["result"].get!int == 2);
 }
 
-unittest  // setToolRequiredClientCapabilities returns false for an unknown tool
+unittest  // setToolRequiredClientCapabilities throws for an unknown tool
 {
+	import std.exception : assertThrown;
+
 	auto s = makeTestServer();
 	ClientCapabilities req;
 	req.sampling = true;
-	assert(!s.setToolRequiredClientCapabilities("nope", req));
+	assertThrown!Exception(s.setToolRequiredClientCapabilities("nope", req));
 }
 
 unittest  // stateful (2025-era) tools/call gates on negotiated session capabilities
@@ -10026,7 +10031,7 @@ unittest  // stateful (2025-era) tools/call gates on negotiated session capabili
 	auto s = makeTestServer();
 	ClientCapabilities reqCap;
 	reqCap.sampling = true;
-	assert(s.setToolRequiredClientCapabilities("add", reqCap));
+	s.setToolRequiredClientCapabilities("add", reqCap);
 	// Initialize on a stateful version declaring NO sampling capability.
 	Json initP = Json.emptyObject;
 	initP["protocolVersion"] = "2025-06-18";
@@ -10054,9 +10059,9 @@ unittest  // a 2025-era request with no initialize on its connection skips the c
 	s.registerResource(Resource("res://x", "x"), () @safe => ResourceContents.init);
 	ClientCapabilities reqCap;
 	reqCap.sampling = true;
-	assert(s.setToolRequiredClientCapabilities("needs-sampling", reqCap));
-	assert(s.setPromptRequiredClientCapabilities("greet", reqCap));
-	assert(s.setResourceRequiredClientCapabilities("res://x", reqCap));
+	s.setToolRequiredClientCapabilities("needs-sampling", reqCap);
+	s.setPromptRequiredClientCapabilities("greet", reqCap);
+	s.setResourceRequiredClientCapabilities("res://x", reqCap);
 	auto call = s.handle(req(1, "tools/call", Json([
 		"name": Json("needs-sampling")
 	]))).get;
@@ -10074,7 +10079,7 @@ unittest  // modern prompts/get rejects with -32021 when a required client cap i
 	s.registerPrompt(pr, (Json) @safe { GetPromptResult r; return r; });
 	ClientCapabilities reqCap;
 	reqCap.sampling = true;
-	assert(s.setPromptRequiredClientCapabilities("greet", reqCap));
+	s.setPromptRequiredClientCapabilities("greet", reqCap);
 	// modernReq declares empty clientCapabilities -> sampling is missing.
 	Json p = Json(["name": Json("greet")]);
 	auto resp = s.handle(modernReq(1, "prompts/get", p)).get;
@@ -10090,7 +10095,7 @@ unittest  // modern prompts/get proceeds when the required cap is declared
 	s.registerPrompt(pr, (Json) @safe { GetPromptResult r; return r; });
 	ClientCapabilities reqCap;
 	reqCap.sampling = true;
-	assert(s.setPromptRequiredClientCapabilities("greet", reqCap));
+	s.setPromptRequiredClientCapabilities("greet", reqCap);
 	// Build a modern request declaring the sampling capability.
 	Json meta = Json.emptyObject;
 	meta[MetaKey.protocolVersion] = "2026-07-28";
@@ -10102,12 +10107,14 @@ unittest  // modern prompts/get proceeds when the required cap is declared
 	assert("error" !in resp);
 }
 
-unittest  // setPromptRequiredClientCapabilities returns false for an unknown prompt
+unittest  // setPromptRequiredClientCapabilities throws for an unknown prompt
 {
+	import std.exception : assertThrown;
+
 	auto s = McpServer.stateless("t", "1");
 	ClientCapabilities reqCap;
 	reqCap.sampling = true;
-	assert(!s.setPromptRequiredClientCapabilities("nope", reqCap));
+	assertThrown!Exception(s.setPromptRequiredClientCapabilities("nope", reqCap));
 }
 
 unittest  // stateful (2025-era) prompts/get gates on negotiated session capabilities
@@ -10117,7 +10124,7 @@ unittest  // stateful (2025-era) prompts/get gates on negotiated session capabil
 	s.registerPrompt(pr, (Json) @safe { GetPromptResult r; return r; });
 	ClientCapabilities reqCap;
 	reqCap.sampling = true;
-	assert(s.setPromptRequiredClientCapabilities("greet", reqCap));
+	s.setPromptRequiredClientCapabilities("greet", reqCap);
 	// Initialize on a stateful version declaring NO sampling capability.
 	Json initP = Json.emptyObject;
 	initP["protocolVersion"] = "2025-06-18";
@@ -10236,7 +10243,7 @@ unittest  // modern resources/read rejects with -32021 when a required client ca
 	});
 	ClientCapabilities reqCap;
 	reqCap.sampling = true;
-	assert(s.setResourceRequiredClientCapabilities("res://x", reqCap));
+	s.setResourceRequiredClientCapabilities("res://x", reqCap);
 	// modernReq declares empty clientCapabilities -> sampling is missing.
 	Json p = Json(["uri": Json("res://x")]);
 	auto resp = s.handle(modernReq(1, "resources/read", p)).get;
@@ -10254,7 +10261,7 @@ unittest  // modern resources/read proceeds when the required cap is declared
 	});
 	ClientCapabilities reqCap;
 	reqCap.sampling = true;
-	assert(s.setResourceRequiredClientCapabilities("res://x", reqCap));
+	s.setResourceRequiredClientCapabilities("res://x", reqCap);
 	Json meta = Json.emptyObject;
 	meta[MetaKey.protocolVersion] = "2026-07-28";
 	meta[MetaKey.clientInfo] = Json(["name": Json("c"), "version": Json("1")]);
@@ -10265,12 +10272,14 @@ unittest  // modern resources/read proceeds when the required cap is declared
 	assert("error" !in resp);
 }
 
-unittest  // setResourceRequiredClientCapabilities returns false for an unknown resource
+unittest  // setResourceRequiredClientCapabilities throws for an unknown resource
 {
+	import std.exception : assertThrown;
+
 	auto s = McpServer.stateless("t", "1");
 	ClientCapabilities reqCap;
 	reqCap.sampling = true;
-	assert(!s.setResourceRequiredClientCapabilities("res://nope", reqCap));
+	assertThrown!Exception(s.setResourceRequiredClientCapabilities("res://nope", reqCap));
 }
 
 unittest  // stateful (2025-era) resources/read gates on negotiated session capabilities
@@ -10282,7 +10291,7 @@ unittest  // stateful (2025-era) resources/read gates on negotiated session capa
 	});
 	ClientCapabilities reqCap;
 	reqCap.sampling = true;
-	assert(s.setResourceRequiredClientCapabilities("res://x", reqCap));
+	s.setResourceRequiredClientCapabilities("res://x", reqCap);
 	Json initP = Json.emptyObject;
 	initP["protocolVersion"] = "2025-06-18";
 	initP["capabilities"] = Json.emptyObject;
@@ -10303,19 +10312,21 @@ unittest  // modern resources/read via template rejects with -32021 when cap und
 	});
 	ClientCapabilities reqCap;
 	reqCap.sampling = true;
-	assert(s.setResourceTemplateRequiredClientCapabilities("res://{id}", reqCap));
+	s.setResourceTemplateRequiredClientCapabilities("res://{id}", reqCap);
 	Json p = Json(["uri": Json("res://42")]);
 	auto resp = s.handle(modernReq(1, "resources/read", p)).get;
 	assert(resp["error"]["code"].get!long == -32021);
 	assert("requiredCapabilities" in resp["error"]["data"]);
 }
 
-unittest  // setResourceTemplateRequiredClientCapabilities returns false for unknown template
+unittest  // setResourceTemplateRequiredClientCapabilities throws for an unknown template
 {
+	import std.exception : assertThrown;
+
 	auto s = McpServer.stateless("t", "1");
 	ClientCapabilities reqCap;
 	reqCap.sampling = true;
-	assert(!s.setResourceTemplateRequiredClientCapabilities("res://{nope}", reqCap));
+	assertThrown!Exception(s.setResourceTemplateRequiredClientCapabilities("res://{nope}", reqCap));
 }
 
 unittest  // server/discover advertises all supported versions + identity
