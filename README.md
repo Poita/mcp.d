@@ -1238,7 +1238,11 @@ not. Skills may nest: a
 enclosing skill (its files appear in the enclosing `resources` manifest too),
 and `SkillDirOptions.publishNested` (the default) additionally publishes each
 nested skill as its own flat entry — authored frontmatter, `resources` covering
-exactly its subtree — validated by the same rules as a top-level skill.
+exactly its subtree — validated by the same rules as a top-level skill, so one
+invalid nested `SKILL.md` rejects the whole directory. When a nested `SKILL.md`
+is not meant as a skill (a template with placeholder frontmatter, say), set
+`publishNested = false` (`SkillDirOptions` or `@skillDir(publishNested: false)`)
+to serve it as a plain supporting file.
 
 On the client, `client.skillsList()` calls `skills/list` (paginating to
 completion) and `.entries` gives the typed entries; `client.skillsGet(uri)` calls

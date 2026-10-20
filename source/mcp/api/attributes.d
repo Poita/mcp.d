@@ -279,7 +279,10 @@ struct skill
 /// are walkable via `resources/directory/read`). The directory's name must equal
 /// its `SKILL.md` frontmatter `name`. `path` is the skill path (its final
 /// segment must equal that `name` too);
-/// leave it empty to derive the path from that name. For finer control (read
+/// leave it empty to derive the path from that name. `publishNested` mirrors
+/// `SkillDirOptions.publishNested`: set it `false` to serve a `SKILL.md` in a
+/// descendant directory (a template, say) as a plain supporting file rather than
+/// validating and publishing it as a nested skill. For finer control (read
 /// filters, size caps) use the imperative `registerSkillDir` with
 /// `SkillDirOptions`.
 ///
@@ -296,6 +299,7 @@ struct skill
 struct skillDir
 {
 	string path;
+	bool publishNested = true; /// publish each nested `SKILL.md` as its own skill entry
 }
 
 /// UDA marking a method as a resource template (URI contains `{var}`

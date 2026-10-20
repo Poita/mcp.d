@@ -1917,6 +1917,7 @@ private string registerSkillDirMethod(string memberName, alias overload, alias p
 
 	SkillDirOptions options;
 	options.path = attr.path;
+	options.publishNested = attr.publishNested;
 	return registerSkillDir(server, __traits(getMember, parent, memberName)(), options);
 }
 

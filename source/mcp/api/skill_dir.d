@@ -73,7 +73,9 @@ struct SkillDirOptions
 /// `name`, the resolved skill path is invalid or its final segment does not
 /// match the frontmatter `name`, a symlink is encountered, the file count /
 /// total size exceeds the configured caps, or (`publishNested`) a nested
-/// `SKILL.md` fails the same frontmatter/naming validation as a top-level one.
+/// `SKILL.md` fails the same frontmatter/naming validation as a top-level one
+/// (that error names `publishNested = false` as the way to serve it as a plain
+/// file).
 /// Validation runs before registration, so a throw leaves the server unchanged.
 /// Returns the skill path the directory was registered under.
 string registerSkillDir(McpServer server, string dir, SkillDirOptions options = SkillDirOptions
@@ -145,7 +147,16 @@ string registerSkillDir(McpServer server, string dir, SkillDirOptions options = 
 	// without side effects; the appends after registration cannot throw.
 	Json[] nestedEntries;
 	if (options.publishNested)
-		nestedEntries = buildNestedEntries(server, path, raws);
+	{
+		// A nested SKILL.md is often not meant as a skill at all (a template with
+		// placeholder frontmatter), so the error names the opt-out.
+		try
+			nestedEntries = buildNestedEntries(server, path, raws);
+		catch (Exception e)
+			throw new Exception(e.msg ~ " (to serve nested SKILL.md files as plain "
+					~ "supporting files instead, set SkillDirOptions.publishNested = false "
+					~ "or @skillDir(publishNested: false))");
+	}
 
 	registerSkillResources(server, path, skillMd, frontmatter, files);
 	foreach (entry; nestedEntries)
@@ -1157,6 +1168,59 @@ unittest  // publishNested=false serves the nested SKILL.md as a plain file only
 	const md = readResource(s, 2, "skill://outer/references/sub-skill/SKILL.md")["text"]
 		.get!string;
 	assert(md.canFind("# Sub"));
+}
+
+unittest  // a rejected nested SKILL.md names publishNested = false as the way out
+{
+	import std.algorithm : canFind;
+	import std.exception : collectExceptionMsg;
+
+	const root = tmpRoot("nest-hint", "outer");
+	writeNestedFixture(root);
+	scope (exit)
+		removeTree(root);
+	writeFile(root ~ "/references/sub-skill/SKILL.md", "---\nname: {{name}}\n---\n");
+
+	auto s = McpServer.stateless("t", "1");
+	const msg = collectExceptionMsg(registerSkillDir(s, root));
+	assert(msg.canFind("references/sub-skill/SKILL.md"), msg);
+	assert(msg.canFind("publishNested = false"), msg);
+}
+
+version (unittest) private final class NestedOffSkillDirApi
+{
+	import mcp.api.attributes : skillDir;
+
+	string dir;
+
+	@skillDir("", false)
+	string outer() @safe
+	{
+		return dir;
+	}
+}
+
+unittest  // @skillDir with publishNested false serves a nested SKILL.md as a plain file only
+{
+	import mcp.api.reflection : registerHandlers;
+
+	const root = tmpRoot("nest-off-uda", "outer");
+	writeNestedFixture(root);
+	scope (exit)
+		removeTree(root);
+	// Placeholder frontmatter that would fail validation as a published skill.
+	writeFile(root ~ "/references/sub-skill/SKILL.md", "---\nname: {{name}}\n---\n");
+
+	auto api = new NestedOffSkillDirApi;
+	api.dir = root;
+	auto s = McpServer.stateless("t", "1");
+	registerHandlers(s, api);
+
+	auto result = s.handle(Message(makeRequest(Json(1), "skills/list",
+			Json.emptyObject))).get["result"];
+	assert(result["skills"].length == 1);
+	assert(readResource(s, 2, "skill://outer/references/sub-skill/SKILL.md")["text"].get!string
+			== "---\nname: {{name}}\n---\n");
 }
 
 unittest  // nested files are registered once and serve their authored bytes
