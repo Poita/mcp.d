@@ -448,15 +448,21 @@ interface WebhookSubscriptionStore
 	/// Drop the subscription identified by `id`. A no-op if unknown.
 	void remove(string id) @safe;
 
-	/// Every stored subscription. The runtime applies expiry filtering; the store
-	/// need not. Used by the periodic sweep and by `terminatePrincipal` across all
-	/// event types (revoking a principal's access); per-event paths use `byName`.
+	/// Every stored subscription, lapsed or not. Used by `terminatePrincipal`
+	/// across all event types (revoking a principal's access); per-event paths
+	/// use `byName`, and the periodic sweep `lapsed`.
 	WebhookSubscription[] all() @safe;
 
-	/// Every stored subscription to event type `name`, lapsed or not. Called on
-	/// every publish, so a store should answer it from an index on `name` rather
-	/// than by scanning.
-	WebhookSubscription[] byName(string name) @safe;
+	/// Every stored subscription to event type `name` that is live at `nowMs`
+	/// (see `WebhookSubscription.isExpired`). Called on every publish, so a store
+	/// should answer it from an index on `name` rather than by scanning, and
+	/// leave lapsed records unread: the sweep removes them.
+	WebhookSubscription[] byName(string name, long nowMs) @safe;
+
+	/// Every stored subscription that has lapsed at `nowMs`, for the periodic
+	/// sweep that removes them. Called on every worker pass, so a store should
+	/// read only lapsed records (e.g. from an index on `expiresAtMs`).
+	WebhookSubscription[] lapsed(long nowMs) @safe;
 
 	/// How many of `principal`'s subscriptions are live (not lapsed) at `nowMs`,
 	/// for the per-principal subscription cap.
@@ -478,6 +484,12 @@ final class InMemoryWebhookSubscriptionStore : WebhookSubscriptionStore
 		bool noExpiry;
 		long expiresAtMs;
 		ulong revision;
+
+		// `WebhookSubscription.isExpired`, read without deserializing the record.
+		bool lapsedAt(long nowMs) const @safe pure nothrow
+		{
+			return !noExpiry && nowMs >= expiresAtMs;
+		}
 	}
 
 	private Record[string] records_;
@@ -551,12 +563,25 @@ final class InMemoryWebhookSubscriptionStore : WebhookSubscriptionStore
 		return result;
 	}
 
-	WebhookSubscription[] byName(string name) @safe
+	WebhookSubscription[] byName(string name, long nowMs) @safe
 	{
 		WebhookSubscription[] result;
 		if (auto ids = name in idsByName_)
 			foreach (id, _; *ids)
-				result ~= WebhookSubscription.fromJson(records_[id].json.clone());
+			{
+				const r = records_[id];
+				if (!r.lapsedAt(nowMs))
+					result ~= WebhookSubscription.fromJson(r.json.clone());
+			}
+		return result;
+	}
+
+	WebhookSubscription[] lapsed(long nowMs) @safe
+	{
+		WebhookSubscription[] result;
+		foreach (_, r; records_)
+			if (r.lapsedAt(nowMs))
+				result ~= WebhookSubscription.fromJson(r.json.clone());
 		return result;
 	}
 
@@ -565,11 +590,8 @@ final class InMemoryWebhookSubscriptionStore : WebhookSubscriptionStore
 		size_t n;
 		if (auto ids = principal in idsByPrincipal_)
 			foreach (id, _; *ids)
-			{
-				const r = records_[id];
-				if (r.noExpiry || nowMs < r.expiresAtMs)
+				if (!records_[id].lapsedAt(nowMs))
 					n++;
-			}
 		return n;
 	}
 
@@ -992,6 +1014,7 @@ unittest  // the in-memory subscription store shares no Json with its callers
 	WebhookSubscription sub;
 	sub.id = "s";
 	sub.name = "n";
+	sub.noExpiry = true;
 	sub.arguments = Json(["channel": Json("general")]);
 	store.put(sub);
 	sub.arguments["channel"] = "mutated";
@@ -999,7 +1022,7 @@ unittest  // the in-memory subscription store shares no Json with its callers
 	assert(got.arguments["channel"].get!string == "general");
 	got.arguments["channel"] = "mutated";
 	assert(store.get("s").get.arguments["channel"].get!string == "general");
-	store.byName("n")[0].arguments["channel"] = "mutated";
+	store.byName("n", 0)[0].arguments["channel"] = "mutated";
 	store.all()[0].arguments["channel"] = "mutated";
 	assert(store.get("s").get.arguments["channel"].get!string == "general");
 }
@@ -1432,12 +1455,35 @@ unittest  // InMemoryWebhookSubscriptionStore.byName returns only that event typ
 		WebhookSubscription s;
 		s.id = id;
 		s.name = name;
+		s.noExpiry = true;
 		store.put(s);
 	}
-	assert(store.byName("x").length == 2 && store.byName("y").length == 1);
-	assert(store.byName("z").length == 0);
+	assert(store.byName("x", 0).length == 2 && store.byName("y", 0).length == 1);
+	assert(store.byName("z", 0).length == 0);
 	store.remove("a");
-	assert(store.byName("x").length == 1 && store.byName("x")[0].id == "c");
+	assert(store.byName("x", 0).length == 1 && store.byName("x", 0)[0].id == "c");
+}
+
+unittest  // InMemoryWebhookSubscriptionStore.byName leaves out lapsed subscriptions, which lapsed lists
+{
+	auto store = new InMemoryWebhookSubscriptionStore();
+	foreach (id, expiresAtMs; ["live": 2000L, "lapsed": 500L])
+	{
+		WebhookSubscription s;
+		s.id = id;
+		s.name = "x";
+		s.expiresAtMs = expiresAtMs;
+		store.put(s);
+	}
+	WebhookSubscription forever;
+	forever.id = "forever";
+	forever.name = "x";
+	forever.noExpiry = true;
+	store.put(forever);
+	auto live = store.byName("x", 1000);
+	assert(live.length == 2 && live[0].id != "lapsed" && live[1].id != "lapsed");
+	auto gone = store.lapsed(1000);
+	assert(gone.length == 1 && gone[0].id == "lapsed");
 }
 
 unittest  // InMemoryWebhookSubscriptionStore.countByPrincipal counts only live subscriptions

@@ -925,7 +925,7 @@ final class EventsRuntime
 	private void adoptStoredWebhooks(string name) @safe
 	{
 		const now = opts_.nowMs();
-		foreach (sub; webhookStore_.byName(name))
+		foreach (sub; webhookStore_.byName(name, now))
 		{
 			if ((sub.id in heldWebhookRefs_) !is null || sub.isExpired(now))
 				continue;
@@ -1562,7 +1562,7 @@ final class EventsRuntime
 		foreach (s; pushStreams_.dup)
 			if (pushPred(s))
 				terminatePush(s, error);
-		foreach (w; name.length ? webhookStore_.byName(name) : webhookStore_.all())
+		foreach (w; name.length ? webhookStore_.byName(name, opts_.nowMs()) : webhookStore_.all())
 			if (webhookPred(w))
 				terminateWebhook(w.id, error);
 	}
@@ -1820,9 +1820,8 @@ final class EventsRuntime
 	void sweepWebhookSubscriptions() @safe
 	{
 		const now = opts_.nowMs();
-		foreach (sub; webhookStore_.all())
-			if (sub.isExpired(now))
-				removeWebhookState(sub);
+		foreach (sub; webhookStore_.lapsed(now))
+			removeWebhookState(sub);
 		evictEndpointCaches(now);
 	}
 
@@ -1986,7 +1985,7 @@ final class EventsRuntime
 			if (!regIsEmitOnly(name in types_) && offersWebhook(name))
 				checkBacked ~= name;
 		foreach (name; checkBacked)
-			foreach (sub; webhookStore_.byName(name))
+			foreach (sub; webhookStore_.byName(name, now))
 			{
 				if (cap > 0 && fetching_.length >= cap)
 					return;
@@ -2607,7 +2606,7 @@ final class EventsRuntime
 			return;
 		const now = opts_.nowMs();
 		bool any;
-		foreach (sub; webhookStore_.byName(occ.name))
+		foreach (sub; webhookStore_.byName(occ.name, now))
 		{
 			if (sub.isExpired(now))
 				continue;
@@ -6357,9 +6356,14 @@ version (unittest)
 			return inner.all();
 		}
 
-		WebhookSubscription[] byName(string name) @safe
+		WebhookSubscription[] byName(string name, long nowMs) @safe
 		{
-			return inner.byName(name);
+			return inner.byName(name, nowMs);
+		}
+
+		WebhookSubscription[] lapsed(long nowMs) @safe
+		{
+			return inner.lapsed(nowMs);
 		}
 
 		size_t countByPrincipal(string principal, long nowMs) @safe
@@ -9215,6 +9219,40 @@ unittest  // publish enqueues a webhook delivery; delivery happens on a queue dr
 	for (size_t i = 0; i < deferred.length; i++)
 		deferred[i]();
 	assert(ft.eventPosts().length == 1);
+}
+
+unittest  // the lapsed-subscription sweep reads only lapsed subscriptions, never the whole store
+{
+	static final class CountingStore : ForwardingStore
+	{
+		int allCalls;
+
+		override WebhookSubscription[] all() @safe
+		{
+			allCalls++;
+			return inner.all();
+		}
+	}
+
+	long now = 1_000_000;
+	auto store = new CountingStore();
+	EventsOptions o;
+	o.nowMs = () @safe => now;
+	o.nowIso = () @safe => "t";
+	o.allowPrivateCallbackHosts = true;
+	o.webhookTransport = new FakeWebhookTransport();
+	o.webhookRetryBase = Duration.zero;
+	o.deliveryExecutor = (void delegate() @safe job) @safe { job(); };
+	auto rt = new EventsRuntime(store, o);
+	EventRegistration reg = {descriptor: EventType("n"), emitOnly: true};
+	rt.register(reg);
+	auto r = rt.subscribeWebhook(webhookSub("n", "https://proxy/hooks"), "user-1");
+	rt.sweepWebhookSubscriptions();
+	assert(!store.get(r.id).isNull);
+	now += 365L * 24 * 3600 * 1000;
+	rt.sweepWebhookSubscriptions();
+	assert(store.get(r.id).isNull);
+	assert(store.allCalls == 0);
 }
 
 unittest  // subscribe and publish read only the subscriptions they concern, never the whole store
