@@ -551,7 +551,9 @@ private alias ParamWireNames(alias func) = staticMap!(wireName, ParameterIdentif
 /// Reject a parameter of `func` with no name unless it is an injected context:
 /// every other parameter is an argument whose name is its wire name, and D
 /// gives an unnamed one an internal `__param_N` identifier. Also reject two
-/// arguments sharing a wire name (`limit` and `limit_`).
+/// arguments sharing a wire name (`limit` and `limit_`), and vibe's
+/// `@name`, `@optional`, or `@ignore` on an argument, which apply to a struct
+/// field and would otherwise be silently ignored.
 private void checkParamNames(alias func)()
 {
 	import std.algorithm.searching : startsWith;
@@ -569,6 +571,12 @@ private void checkParamNames(alias func)()
 					"parameter #" ~ (i + 1)
 						.to!string ~ " (" ~ P.stringof ~ ") of '" ~ __traits(identifier,
 							func) ~ "' has no name; name it, since its name is the argument's name");
+			static foreach (attr; ParamAttributes!(func, i))
+				static assert(vibeFieldUdaHint!attr is null,
+						vibeFieldUdaHint!attr ~ " on parameter '" ~ ids[i] ~ "' of '" ~ __traits(
+							identifier,
+							func) ~ "' has no effect on a handler parameter"
+						~ "; " ~ vibeParamAlternative!attr);
 			static foreach (j; 0 .. i)
 				static if (isArgument!j)
 					static assert(names[j] != names[i],
@@ -576,6 +584,35 @@ private void checkParamNames(alias func)()
 								func) ~ "' share the argument name '" ~ names[i] ~ "'");
 		}
 	}
+}
+
+/// `"@name"`, `"@optional"`, or `"@ignore"` when the attribute `attr` is that
+/// vibe serialization UDA, else `null`.
+private template vibeFieldUdaHint(alias attr)
+{
+	import vibe.data.serialization : IgnoreAttribute, NameAttribute, OptionalAttribute;
+
+	static if (is(typeof(attr)) && isInstanceOf!(NameAttribute, typeof(attr)))
+		enum string vibeFieldUdaHint = "@name";
+	else static if (is(typeof(attr)) && isInstanceOf!(OptionalAttribute, typeof(attr)))
+		enum string vibeFieldUdaHint = "@optional";
+	else static if (is(typeof(attr)) && isInstanceOf!(IgnoreAttribute, typeof(attr)))
+		enum string vibeFieldUdaHint = "@ignore";
+	else
+		enum string vibeFieldUdaHint = null;
+}
+
+/// What to use on a handler parameter in place of the vibe UDA `attr`.
+private template vibeParamAlternative(alias attr)
+{
+	static if (vibeFieldUdaHint!attr == "@name")
+		enum vibeParamAlternative = "an argument's name is the parameter's identifier "
+			~ "(minus one trailing _), so rename the parameter";
+	else static if (vibeFieldUdaHint!attr == "@optional")
+		enum vibeParamAlternative = "make it optional by declaring it Nullable!T, giving "
+			~ "it a default value, or adding @schemaDefault";
+	else
+		enum vibeParamAlternative = "every parameter is an argument; remove the parameter";
 }
 
 /// Reject an argument parameter of `func` whose type cannot be bound from JSON,
@@ -2793,6 +2830,59 @@ unittest  // an out or ref argument parameter is rejected at compile time
 	auto s = McpServer.stateless("t", "1");
 	assert(!__traits(compiles, registerHandlers(s, new OutParamApi)));
 	assert(!__traits(compiles, registerHandlers(s, new RefParamApi)));
+}
+
+version (unittest) private class VibeNameParamApi
+{
+	import vibe.data.serialization : name;
+
+	@tool("vibe_name", "Renames a parameter with vibe's @name")
+	string f(@name("other") string x)@safe
+	{
+		return x;
+	}
+}
+
+version (unittest) private class VibeOptionalParamApi
+{
+	import vibe.data.serialization : optional;
+
+	@tool("vibe_optional", "Marks a parameter vibe-@optional")
+	string f(@optional string x) @safe
+	{
+		return x;
+	}
+}
+
+version (unittest) private class VibeIgnoreParamApi
+{
+	import vibe.data.serialization : ignore;
+
+	@prompt("vibe_ignore", "Marks a parameter vibe-@ignore")
+	string f(@ignore string x) @safe
+	{
+		return x;
+	}
+}
+
+version (unittest) private class VibeOptionalTemplateApi
+{
+	import vibe.data.serialization : optional;
+
+	@resourceTemplate("vo://{x}", "VibeOptional", "text/plain")
+	string f(@optional string x) @safe
+	{
+		return x;
+	}
+}
+
+unittest  // vibe's @name, @optional, or @ignore on a handler parameter is rejected at compile time
+{
+	auto s = McpServer.stateless("t", "1");
+	assert(!__traits(compiles, registerHandlers(s, new VibeNameParamApi)));
+	assert(!__traits(compiles, registerHandlers(s, new VibeOptionalParamApi)));
+	assert(!__traits(compiles, registerHandlers(s, new VibeIgnoreParamApi)));
+	assert(!__traits(compiles, registerHandlers(s, new VibeOptionalTemplateApi)));
 }
 
 unittest  // @mcpHeader: a struct-typed parameter is rejected at compile time

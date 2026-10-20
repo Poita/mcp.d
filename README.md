@@ -800,7 +800,9 @@ field with no initializer, so both are listed in `required`. To make such a fiel
 optional, give it `@schemaDefault(0)` (which also advertises the default), mark
 it vibe's `@optional`, declare it `Nullable`, or put `@allOptional` on the struct.
 `import mcp;` re-exports vibe's `@optional`, `@name` (wire name) and `@ignore`
-(left out) field attributes:
+(left out) field attributes. They apply to struct fields only: on a handler
+parameter they are a compile error, since a parameter is named by its identifier
+and made optional by `Nullable`, a default value, or `@schemaDefault`:
 
 ```d
 struct Page
