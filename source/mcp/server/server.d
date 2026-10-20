@@ -35,8 +35,9 @@ import mcp.server.event_store : WebhookSubscriptionStore;
 import mcp.server.events_runtime : EventsRuntime, EventsOptions,
 	EventRegistration, PushHandle, PushStream;
 
-import mcp.server.responses : ToolHandler, MrtrToolHandler, ToolResponse, PromptResponse,
-	PromptHandler, MrtrPromptHandler, ResourceReader, TemplateReader, ToolError, PromptError;
+import mcp.server.responses : ToolHandler, MrtrToolHandler, ToolResponse,
+	PromptResponse, PromptHandler,
+	MrtrPromptHandler, ResourceReader, TemplateReader, ToolError, PromptError, catchHandlerError;
 
 // The push-integration unittests below exercise the server seam against the
 // real Streamable HTTP channel; the library build itself has no transport
@@ -2773,24 +2774,6 @@ final class McpServer : ServerCore
 				return Nullable!Json.init;
 			return nullable(makeErrorResponse(msg.id, unexpectedFailure(msg.method, e)));
 		}
-	}
-
-	/// Run `fn` and return the `Error` it throws, if any, rather than letting it
-	/// unwind the transport task. Running out of memory is not survivable and
-	/// still propagates.
-	private static Error catchHandlerError(scope void delegate() @safe fn) @trusted
-	{
-		import core.exception : InvalidMemoryOperationError, OutOfMemoryError;
-
-		try
-			fn();
-		catch (OutOfMemoryError e)
-			throw e;
-		catch (InvalidMemoryOperationError e)
-			throw e;
-		catch (Error e)
-			return e;
-		return null;
 	}
 
 	/// The in-flight registry key for a request: its connection/session token

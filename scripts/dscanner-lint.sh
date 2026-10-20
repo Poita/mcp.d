@@ -31,6 +31,12 @@
 #     event loop exits. Capture-and-rethrow, never swallow; any other finding
 #     in that file still fails the gate.
 #
+#   * source/mcp/server/responses.d "Catching Error or Throwable".
+#     `catchHandlerError` catches an `Error` from a request handler so the
+#     dispatcher can still answer the request instead of leaving the client
+#     waiting; out-of-memory errors are rethrown. Any other finding in that
+#     file still fails the gate.
+#
 # Usage:
 #   scripts/dscanner-lint.sh
 #
@@ -84,6 +90,7 @@ findings="$(printf '%s\n' "${raw}" \
   | grep -vE '^source/mcp/api/reflection\.d\([0-9]+:[0-9]+\)\[error\]: (Expected `\)` instead of `:`|Declaration expected)' \
   | grep -vE '^source/mcp/internal/unittest_runner\.d\([0-9]+:[0-9]+\)\[warn\]: Catching Error or Throwable is almost always a bad idea\.' \
   | grep -vE '^source/mcp/client/runner\.d\([0-9]+:[0-9]+\)\[warn\]: Catching Error or Throwable is almost always a bad idea\.' \
+  | grep -vE '^source/mcp/server/responses\.d\([0-9]+:[0-9]+\)\[warn\]: Catching Error or Throwable is almost always a bad idea\.' \
   || true)"
 
 if [[ -n "${findings}" ]]; then

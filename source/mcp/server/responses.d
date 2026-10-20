@@ -17,6 +17,35 @@ import mcp.server.context : RequestContext;
 
 @safe:
 
+/// Run a handler invocation `fn` and return the `Error` it throws, if any,
+/// rather than letting it unwind the transport task, so the dispatcher can
+/// still answer the request. Running out of memory is not survivable and
+/// still propagates.
+package(mcp) Error catchHandlerError(scope void delegate() @safe fn) @trusted
+{
+	import core.exception : InvalidMemoryOperationError, OutOfMemoryError;
+
+	try
+		fn();
+	catch (OutOfMemoryError e)
+		throw e;
+	catch (InvalidMemoryOperationError e)
+		throw e;
+	catch (Error e)
+		return e;
+	return null;
+}
+
+unittest  // catchHandlerError returns the Error a handler throws
+{
+	import core.exception : AssertError;
+
+	assert(catchHandlerError(() @safe {}) is null);
+	assert(cast(AssertError) catchHandlerError(() @safe {
+			throw new AssertError("boom");
+		}) !is null);
+}
+
 /// A tool execution failure whose message is written for the client. Thrown from
 /// a tool handler, it becomes a `CallToolResult` with `isError: true` and the
 /// message as its text content, so the model can see what went wrong and
