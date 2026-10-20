@@ -160,7 +160,7 @@ interface Introspector
 {
 	/// Return the raw RFC 7662 introspection response JSON for `token`. Throws
 	/// `TokenVerifierUnavailableException` when the endpoint is unreachable or
-	/// answers 429/5xx, so the request gets 503 rather than 401.
+	/// answers 401/403/429/5xx, so the request gets 503 rather than 401.
 	string introspect(string token) @safe;
 }
 
@@ -297,7 +297,10 @@ private string postIntrospect(IntrospectionConfig cfg, string token) @safe
 		import std.format : format;
 
 		const msg = format("introspection endpoint returned HTTP %d", status);
-		if (isUnavailableStatus(status))
+		// RFC 7662 reports a dead token as `active: false` in a 200. A 401/403
+		// rejects this resource server's own credentials, which says nothing
+		// about the token, so it must not log out every user or be cached.
+		if (isUnavailableStatus(status) || status == 401 || status == 403)
 			throw new TokenVerifierUnavailableException(msg, retryAfter);
 		throw new Exception(msg);
 	}
@@ -812,4 +815,47 @@ unittest  // a 503 introspection response is reported as an unavailable verifier
 	assert(failure.length == 0, failure);
 	assert(thrown.canFind("HTTP 503"), thrown);
 	assert(retryAfter == 20.seconds);
+}
+
+unittest  // a 401 or 403 introspection response reports the verifier unavailable, not the token invalid
+{
+	import std.conv : to;
+	import vibe.core.core : runTask, runEventLoop, exitEventLoop;
+	import vibe.http.server : HTTPServerRequest, HTTPServerResponse,
+		HTTPServerSettings, listenHTTP;
+
+	foreach (status; [401, 403])
+	{
+		string failure;
+		bool unavailable;
+		runTask(() @safe nothrow{
+			try
+			{
+				auto settings = new HTTPServerSettings;
+				settings.port = 0;
+				settings.bindAddresses = ["127.0.0.1"];
+				auto listener = listenHTTP(settings, (scope HTTPServerRequest req,
+					scope HTTPServerResponse res) @safe {
+					res.statusCode = status;
+					res.writeBody(`{"error":"invalid_client"}`, "application/json");
+				});
+				scope (exit)
+					listener.stopListening();
+				IntrospectionConfig cfg;
+				cfg.introspectionEndpoint = "http://127.0.0.1:"
+					~ listener.bindAddresses[0].port.to!string ~ "/introspect";
+				try
+					cast(void) new HttpIntrospector(cfg).introspect("tok");
+				catch (TokenVerifierUnavailableException e)
+					unavailable = true;
+			}
+			catch (Exception e)
+				failure = e.msg;
+			exitEventLoop();
+		});
+		runEventLoop();
+
+		assert(failure.length == 0, failure);
+		assert(unavailable, "HTTP " ~ status.to!string ~ " must report the verifier unavailable");
+	}
 }

@@ -481,7 +481,7 @@ private ProviderHttpResponse callProvider(string provider, ProviderHttp http,
 				provider ~ " token API answered HTTP " ~ res.status.to!string, res.retryAfter);
 	}
 	if (res.status != 200)
-		logDiagnostic("%s token API answered HTTP %d; rejecting the token", provider, res.status);
+		logDiagnostic("%s token API answered HTTP %d", provider, res.status);
 	return res;
 }
 
@@ -521,6 +521,9 @@ private TokenInfo providerCheck(string provider, TokenInfo delegate() @safe chec
 /// rate limit, so results are cached per `cache` (by default a valid token for
 /// 60 seconds, a rejected one for 10) and concurrent checks of one token share
 /// a request. A token revoked at GitHub keeps verifying until its entry expires.
+/// Only a 404 or another app's `client_id` rejects a token; any other failed
+/// call, including a rate limit, reports the verifier unavailable (503) and is
+/// not cached.
 TokenValidator githubTokenVerifier(string clientId, string clientSecret,
 		TokenCacheOptions cache = TokenCacheOptions.init) @safe
 {
@@ -549,8 +552,19 @@ package TokenValidator githubTokenVerifierWith(string clientId, string clientSec
 				req["access_token"] = token;
 				const res = callProvider("GitHub", http,
 				ProviderHttpRequest("POST", url, authorization, req.toString()));
-				if (res.status != 200)
+				// Only a 404 says the token is unknown to this app. Any other
+				// failure (a 403 rate limit, a 401 for the app's own credentials)
+				// is about the call, and GitHub tokens cannot be refreshed, so
+				// rejecting them would log every user out.
+				if (res.status == 404)
 					return TokenInfo.invalid();
+				if (res.status != 200)
+				{
+					import std.conv : to;
+
+					throw new TokenVerifierUnavailableException(
+					"GitHub token API answered HTTP " ~ res.status.to!string, res.retryAfter);
+				}
 				auto doc = parseUntrustedJson(res.body);
 				if (doc.type != Json.Type.object || jsonString(doc["app"], "client_id") != clientId)
 					return TokenInfo.invalid();
@@ -1425,4 +1439,19 @@ unittest  // GOOGLE: a live token issued to another client, or an expired one, i
 	fake.answer = (ProviderHttpRequest req) @safe => ProviderHttpResponse(400,
 			`{"error":"invalid_token"}`);
 	assert(!v("ya29.revoked").valid);
+}
+
+unittest  // GITHUB: a rate-limited or credential-rejected check-token call reports the verifier unavailable, uncached
+{
+	auto fake = new FakeProviderHttp;
+	auto v = githubTokenVerifierWith("Iv1.client", "ghsecret", fake.call());
+	foreach (status; [401, 403, 422])
+	{
+		fake.answer = (ProviderHttpRequest req) @safe => ProviderHttpResponse(status,
+				`{"message":"API rate limit exceeded"}`);
+		const before = fake.calls;
+		assert(v("gho_valid").unavailable);
+		assert(v("gho_valid").unavailable);
+		assert(fake.calls == before + 2, "an unavailable answer must not be cached");
+	}
 }
