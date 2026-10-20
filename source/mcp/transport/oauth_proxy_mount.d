@@ -600,6 +600,9 @@ enum string consentCookieName = "__Host-mcp_proxy_consent";
 
 /// The consent cookie name used when the proxy is served over plain http (a
 /// loopback development deployment), where a `__Host-` cookie cannot be set.
+/// Without the prefix, anyone able to set cookies for the host can plant a
+/// consent cookie carrying their own approvals (see `ConsentCookie`), so the
+/// consent gate is not a defence on a plain-http deployment reachable by others.
 enum string insecureConsentCookieName = "mcp_proxy_consent";
 
 /// How long a browser's consent cookie lives. A browser whose cookie has expired
@@ -608,9 +611,15 @@ private enum long consentCookieMaxAgeSeconds = 30L * 24 * 60 * 60;
 
 /// Mints, sets and reads back the consent cookie. A value is a random handle
 /// followed by its HMAC-SHA256 under `key`, and a request's cookie is honoured
-/// only when that MAC verifies, so a cookie planted with a value of someone
-/// else's choosing (possible over plain http, which has no `__Host-` prefix)
-/// is ignored.
+/// only when that MAC verifies, so a value the proxy never minted is ignored.
+///
+/// The MAC does not stop cookie planting: `GET /authorize` mints a validly
+/// signed cookie for anyone, so an attacker can take one, approve their own
+/// client under it, and plant it in a victim's browser, whose next authorize
+/// for that client then skips the consent screen. Over https the `__Host-`
+/// prefix blocks planting from sibling origins and the network; over plain
+/// http (`insecureConsentCookieName`) nothing does, which is why plain http
+/// suits only a loopback development deployment.
 package struct ConsentCookie
 {
 	private immutable(ubyte)[] key;
