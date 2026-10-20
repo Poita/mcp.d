@@ -2660,10 +2660,18 @@ void applySseStreamHeaders(HTTPServerResponse res, bool modern) @safe
 		res.headers[k] = v;
 }
 
-/// How long an SSE write may wait on a client that has stopped reading before
-/// the client is deemed gone and its connection closed, unless
-/// `StreamLimits.stallTimeout` says otherwise.
+/// How long a long-lived SSE stream's full queue may wait on a client that has
+/// stopped reading before the client is deemed gone and its connection closed,
+/// unless `StreamLimits.stallTimeout` says otherwise. It is short because a
+/// fan-out to a stalled stream waits on it.
 enum Duration defaultSseStallTimeout = 2.seconds;
+
+/// How long a write to a POST response stream may wait on a client that has
+/// stopped reading before the client is deemed gone and its connection closed,
+/// unless `StreamLimits.responseStallTimeout` says otherwise. It is long because
+/// the stall holds up only that request, and giving up loses the result of work
+/// already done.
+enum Duration defaultResponseStallTimeout = 30.seconds;
 
 /// Close the TCP connection under `res`, so a write blocked on a client that
 /// stopped reading fails at once. vibe.d exposes no public close for a server
@@ -2868,7 +2876,7 @@ final class HttpStreamContext : RequestContext, ConnectionScoped
 	// Set once a GET listener resumes this stream; later frames go only to it.
 	private bool resumedElsewhere_;
 	private TaskMutex writeMtx_;
-	private Duration stallTimeout_ = defaultSseStallTimeout;
+	private Duration stallTimeout_ = defaultResponseStallTimeout;
 	// The id of the inbound request this context serves; undefined when unknown.
 	private Json requestId_;
 
@@ -4439,6 +4447,67 @@ unittest  // a POST stream's write gives up on a client that stopped reading aft
 	});
 	runEventLoop();
 	assert(took < 1.seconds, "the configured stall timeout bounds the write");
+}
+
+version (unittest) private final class PausingSink : OutputStream
+{
+@safe:
+	Duration pause;
+	bool paused;
+	string received;
+
+	this(Duration pause)
+	{
+		this.pause = pause;
+	}
+
+	size_t write(scope const(ubyte)[] bytes, IOMode) @safe
+	{
+		import vibe.core.core : sleep;
+
+		if (!paused)
+		{
+			paused = true;
+			sleep(pause);
+		}
+		received ~= cast(const(char)[]) bytes;
+		return bytes.length;
+	}
+
+	void flush()
+	{
+	}
+
+	void finalize()
+	{
+	}
+}
+
+unittest  // a POST stream's default stall timeout rides out a client pausing for seconds
+{
+	import core.time : seconds;
+	import std.algorithm : canFind;
+	import vibe.core.core : runTask, runEventLoop, exitEventLoop;
+	import vibe.http.server : createTestHTTPServerResponse, TestHTTPResponseMode;
+
+	auto sink = new PausingSink(3.seconds);
+	auto res = createTestHTTPServerResponse(sink, null, TestHTTPResponseMode.bodyOnly);
+	ClientCapabilities caps;
+	auto ctx = new HttpStreamContext(res, new StreamCoordinator, caps, Json("tok"));
+	runTask(() nothrow{
+		scope (exit)
+			exitEventLoop();
+		try
+		{
+			ctx.log("info", Json("x"));
+			ctx.finishWith(makeResponse(Json(7), Json.emptyObject));
+		}
+		catch (Exception)
+		{
+		}
+	});
+	runEventLoop();
+	assert(sink.received.canFind(`"id":7`), "the final response must reach a briefly paused client");
 }
 
 unittest  // a dropped POST stream does not abort the handler's progress/log/final writes

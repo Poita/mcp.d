@@ -102,12 +102,16 @@ struct StreamLimits
 	/// client to catch up, then closes and drops the stream, so a stalled client
 	/// never blocks delivery to anyone else for long.
 	size_t maxQueuedStreamBytes = defaultMaxQueuedStreamBytes;
-	/// How long a write to an SSE stream may wait on a client that has stopped
-	/// reading before the client is deemed gone and the stream closed: a
-	/// response stream's write must make progress (one 16 KiB slice) within
-	/// it, and a long-lived stream's full queue must drain within it. Raise it
+	/// How long a long-lived SSE stream's full queue (see
+	/// `maxQueuedStreamBytes`) may wait to drain on a client that has stopped
+	/// reading before the client is deemed gone and the stream closed. Raise it
 	/// for clients on slow links that receive large messages.
 	Duration stallTimeout = defaultSseStallTimeout;
+	/// How long a write to a POST response stream must take to make progress
+	/// (one 16 KiB slice) before the client is deemed gone and the stream
+	/// closed. A stall here holds up only its own request, while giving up
+	/// loses the response to work the handler has already done.
+	Duration responseStallTimeout = defaultResponseStallTimeout;
 }
 
 /// Counts a mount's open streams of one kind against a mount-wide cap and a
@@ -3270,7 +3274,7 @@ private void handlePost(McpServer server, ServerPushChannel push,
 				reqState), extractProgressToken(msg.params),
 				token, isModernReq, effVersion, requestScope(cancelScope, mintedSessionId),
 				reqState, server.mode == ServerMode.stateless, reqAcceptsSse);
-		ctx.setStallTimeout(opts.streamLimits.stallTimeout);
+		ctx.setStallTimeout(opts.streamLimits.responseStallTimeout);
 		ctx.setRequestId(msg.id);
 		// A session-bound 2025-11-25 stream advertises resumability with its
 		// priming event, so record its events for a GET Last-Event-ID resume.
@@ -3934,7 +3938,9 @@ unittest  // a POST stream whose client stops reading does not pin its handler
 		return r;
 	});
 	auto router = new URLRouter;
-	mountMcp(router, server);
+	StreamableHttpOptions opts;
+	opts.streamLimits.responseStallTimeout = 1.seconds;
+	mountMcp(router, server, opts);
 	auto settings = new HTTPServerSettings;
 	settings.port = 0;
 	settings.bindAddresses = ["127.0.0.1"];
