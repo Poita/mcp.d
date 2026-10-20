@@ -1446,10 +1446,10 @@ private PromptResponse toPromptResponse(string memberName, R)(R ret) @safe
 				~ "GetPromptResult, PromptMessage[], or string, not " ~ R.stringof);
 }
 
-/// Whether an empty string given for a prompt argument of type `P` stands for an
-/// omitted argument: prompt arguments travel as strings, so a client sends `""`
-/// for a field left blank, and that is a value only for a string (or `Json`)
-/// parameter, or a `Nullable` of one.
+/// Whether an empty string given for a prompt argument or URI template variable
+/// of type `P` stands for an omitted one: both travel as strings, so a blank
+/// field arrives as `""` (`?n=`), and that is a value only for a string (or
+/// `Json`) parameter, or a `Nullable` of one.
 private template emptyMeansAbsent(P)
 {
 	static if (isInstanceOf!(Nullable, P))
@@ -1838,31 +1838,39 @@ private void registerTemplateMethod(string memberName, alias overload,
 				argv[i] = ctx;
 			else
 			{
-				// A captured URI variable is always a string; parse it into the
-				// declared parameter type and surface a conversion failure as
-				// InvalidParams. A variable the URI does not supply binds the
-				// parameter's declared default, or `P.init` when it has none.
-				if (auto pv = names[i] in params)
 				{
-					try
+					// A captured URI variable is always a string; parse it into the
+					// declared parameter type and surface a conversion failure as
+					// InvalidParams. A variable the URI does not supply binds the
+					// parameter's declared default, or `P.init` when it has none; so
+					// does an empty one (`?n=`) of a type an empty string cannot
+					// express, as for a prompt argument.
+					auto pv = names[i] in params;
+					static if (emptyMeansAbsent!P)
+						if (pv !is null && pv.length == 0)
+							pv = null;
+					if (pv !is null)
 					{
-						string value = *pv;
-						static if (isTemplateList!P)
+						try
 						{
-							auto ev = names[i] in encoded;
-							if (ev is null)
-								throw new Exception("no captured value");
-							value = *ev;
+							string value = *pv;
+							static if (isTemplateList!P)
+							{
+								auto ev = names[i] in encoded;
+								if (ev is null)
+									throw new Exception("no captured value");
+								value = *ev;
+							}
+							setBound(argv[i], bindTemplateVar!P(value,
+								uriTemplateListSeparator(attr.uriTemplate, names[i])));
 						}
-						setBound(argv[i], bindTemplateVar!P(value,
-							uriTemplateListSeparator(attr.uriTemplate, names[i])));
+						catch (Exception e)
+							throw invalidParams("resource template parameter '" ~ names[i]
+								~ "' could not be parsed as " ~ P.stringof ~ ": " ~ e.msg);
 					}
-					catch (Exception e)
-						throw invalidParams("resource template parameter '" ~ names[i]
-							~ "' could not be parsed as " ~ P.stringof ~ ": " ~ e.msg);
+					else static if (!is(defs[i] == void))
+						setBound!P(argv[i], defs[i]);
 				}
-				else static if (!is(defs[i] == void))
-					setBound!P(argv[i], defs[i]);
 			}
 		}
 		auto ret = __traits(getMember, parent, memberName)(argv.expand);
@@ -4158,6 +4166,26 @@ unittest  // a percent-encoded separator inside a resource-template list element
 	rr = readUri(s, "files://root/a/b%2Fc");
 	assert("error" !in rr, rr.toString);
 	assert(rr["result"]["contents"][0]["text"].get!string == "a|b/c");
+}
+
+version (unittest) private class EmptyTemplateVarApi
+{
+	@resourceTemplate("opt://{id}{?n,page,label}", "Opt", "text/plain")
+	string opt(string id, Nullable!int n, int page = 3, string label = "x") @safe
+	{
+		import std.conv : to;
+
+		return id ~ ":" ~ (n.isNull ? "-" : n.get.to!string) ~ ":" ~ page.to!string ~ ":" ~ label;
+	}
+}
+
+unittest  // an empty non-string URI template variable binds as omitted
+{
+	auto s = McpServer.stateless("t", "1");
+	registerHandlers(s, new EmptyTemplateVarApi);
+	auto rr = readUri(s, "opt://a?n=&page=&label=");
+	assert("error" !in rr, rr.toString);
+	assert(rr["result"]["contents"][0]["text"].get!string == "a:-:3:", rr.toString);
 }
 
 unittest  // an exploded query or parameter list variable collects every repeated name=value pair
