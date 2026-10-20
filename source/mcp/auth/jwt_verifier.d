@@ -101,11 +101,19 @@ struct JwtVerifierConfig
 	/// Accepting `JWT` means `typ` alone cannot tell an access token from an OIDC
 	/// `id_token`, whose `aud` is the client id. The verifier therefore also
 	/// rejects any token carrying the id_token-only claims `nonce`, `at_hash` or
-	/// `c_hash`, but an id_token without them would still pass when `audience`
-	/// is a client id. Prefer `["at+jwt"]` for an issuer that emits RFC 9068
-	/// tokens, and never set `audience` to an OAuth client id that also receives
-	/// id_tokens from the same issuer.
+	/// `c_hash` (see `rejectIdTokenClaims`), but an id_token without them would
+	/// still pass when `audience` is a client id. Prefer `["at+jwt"]` for an
+	/// issuer that emits RFC 9068 tokens, and never set `audience` to an OAuth
+	/// client id that also receives id_tokens from the same issuer.
 	string[] acceptedTokenTypes = ["at+jwt", "JWT"];
+
+	/// Reject any token carrying the OIDC id_token-only claims `nonce`,
+	/// `at_hash` or `c_hash`. Set it false only for an issuer whose access
+	/// tokens carry one of them; doing so drops the defence against an
+	/// id_token being replayed as an access token, so then also restrict
+	/// `acceptedTokenTypes` to `["at+jwt"]` or keep `audience` distinct from
+	/// every client id the issuer sends id_tokens to.
+	bool rejectIdTokenClaims = true;
 
 	/// Leeway applied to `exp`/`nbf` to tolerate clock skew.
 	Duration clockSkew = 60.seconds;
@@ -388,9 +396,10 @@ package TokenInfo validateClaims(JwtVerifierConfig cfg, Json payload, long now) 
 	// access tokens, and its `aud` is the client id, so without this check one
 	// could be replayed as an access token wherever the configured audience is
 	// that client id.
-	foreach (idTokenClaim; ["nonce", "at_hash", "c_hash"])
-		if (payload[idTokenClaim].type != Json.Type.undefined)
-			return reject("payload carries an OIDC id_token-only claim");
+	if (cfg.rejectIdTokenClaims)
+		foreach (idTokenClaim; ["nonce", "at_hash", "c_hash"])
+			if (payload[idTokenClaim].type != Json.Type.undefined)
+				return reject("payload carries an OIDC id_token-only claim");
 
 	if (!cfg.allowAnyIssuer && (cfg.issuer.length == 0 || jsonStr(payload, "iss") != cfg.issuer))
 		return reject("iss does not match the configured issuer");
@@ -2895,6 +2904,17 @@ unittest  // a token carrying OIDC id_token-only claims is rejected even when ty
 	}
 	auto plain = parseJsonString(`{"aud":"client-123","exp":1700100000}`);
 	assert(validateClaims(cfg, plain, 1_700_001_000).valid);
+}
+
+unittest  // rejectIdTokenClaims = false accepts an access token carrying nonce, at_hash or c_hash
+{
+	JwtVerifierConfig cfg;
+	cfg.allowAnyIssuer = true;
+	cfg.audience = "https://mcp.example.com/mcp";
+	cfg.rejectIdTokenClaims = false;
+	auto payload = parseJsonString(`{"aud":"https://mcp.example.com/mcp","exp":1700100000,`
+			~ `"nonce":"n-0S6_WzA2Mj","at_hash":"77QmUPtjPfzWtF2AnpK9RQ"}`);
+	assert(validateClaims(cfg, payload, 1_700_001_000).valid);
 }
 
 unittest  // a non-numeric nbf is rejected rather than skipping the not-before check
