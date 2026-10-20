@@ -180,6 +180,41 @@ private template AnnotatedDecl(alias root, string memberName, alias overload)
 	}
 }
 
+/// The expression, for `mixin`, calling the declaration `overload` itself on
+/// `parent` with the comma-separated `args`, as a handler's registered closure
+/// does. Resolving the member name instead would re-run overload resolution,
+/// which can pick a sibling overload (`f(int)` over `f(const int)`) or be
+/// ambiguous. The expression is mixed in where the closure is written so it
+/// captures `parent` directly.
+private template handlerCall(alias overload, alias parent, string args)
+{
+	alias Owner = __traits(parent, overload);
+	static if (__traits(isModule, parent) || __traits(isStaticFunction, overload))
+		enum handlerCall = "overload(" ~ args ~ ")";
+	else static if (is(Owner == class) || is(Owner == interface))
+		enum handlerCall = "callMethod!overload(parent" ~ (args.length ? ", " : "") ~ args ~ ")";
+	else
+		enum handlerCall = "callMethod!overload(*parent" ~ (args.length ? ", " : "") ~ args ~ ")";
+}
+
+/// Call the method `overload` on `target`, typed as its declaring aggregate. A
+/// class or interface receiver typed so dispatches virtually to an override
+/// (binding a derived-typed receiver to a base declaration would call the base
+/// body); a struct receiver is taken by reference so the call mutates it.
+private auto callMethod(alias overload, Args...)(ref __traits(parent,
+		overload) target, auto ref Args args)
+		if (is(__traits(parent, overload) == struct))
+{
+	return __traits(child, target, overload)(args);
+}
+
+/// ditto
+private auto callMethod(alias overload, Args...)(__traits(parent, overload) target, auto ref Args args)
+		if (is(__traits(parent, overload) == class) || is(__traits(parent, overload) == interface))
+{
+	return __traits(child, target, overload)(args);
+}
+
 /// Validate the handler UDAs on `overload` (member `memberName`) and register
 /// each one on `server`, dispatching calls through `parent`, recording in
 /// `rollback` how to remove each again.
@@ -1313,15 +1348,15 @@ private void registerToolMethod(string memberName, alias overload, alias parent)
 		// `inputRequired` (stateless elicitation) as well as `complete`; any other
 		// return type is wrapped into a CallToolResult.
 		static if (is(ReturnType!overload == ToolResponse))
-			return __traits(getMember, parent, memberName)(argv.expand);
+			return mixin(handlerCall!(overload, parent, "argv.expand"));
 		else static if (is(ReturnType!overload == void))
 		{
-			__traits(getMember, parent, memberName)(argv.expand);
+			mixin(handlerCall!(overload, parent, "argv.expand") ~ ";");
 			CallToolResult empty;
 			return empty;
 		}
 		else
-			return toToolResult(__traits(getMember, parent, memberName)(argv.expand));
+			return toToolResult(mixin(handlerCall!(overload, parent, "argv.expand")));
 	});
 	static if (hasValueUda!(overload, ui)())
 		ensureApps(server);
@@ -1377,12 +1412,12 @@ private void registerTaskMethod(string memberName, alias overload, alias parent)
 			return CallToolResult.error(failure).toJson();
 		static if (is(ReturnType!overload == void))
 		{
-			__traits(getMember, parent, memberName)(argv.expand);
+			mixin(handlerCall!(overload, parent, "argv.expand") ~ ";");
 			CallToolResult empty;
 			return empty.toJson();
 		}
 		else
-			return toToolResult(__traits(getMember, parent, memberName)(argv.expand)).toJson();
+			return toToolResult(mixin(handlerCall!(overload, parent, "argv.expand"))).toJson();
 	}, opts);
 	static if (hasValueUda!(overload, ui)())
 		ensureApps(server);
@@ -1412,8 +1447,8 @@ private void registerEventMethod(string memberName, alias overload, alias parent
 
 		auto ev = server.ensureEvents("@event '" ~ attr.name ~ "'").define!(A,
 				EP)(attr.name, attr.description, attr.title);
-		ev.onFetch((A args, scope FetchContext ctx) @safe => __traits(getMember,
-				parent, memberName)(args, ctx));
+		ev.onFetch((A args, scope FetchContext ctx) @safe => mixin(handlerCall!(overload,
+				parent, "args, ctx")));
 		static foreach (a; __traits(getAttributes, overload))
 			static if (is(typeof(a) == eventPollInterval))
 				ev.pollInterval(a.value);
@@ -1616,7 +1651,7 @@ private void registerPromptMethod(string memberName, alias overload, alias paren
 					throw invalidParams("argument '" ~ names[i] ~ "': " ~ e.msg);
 			}
 		}
-		return toPromptResponse!memberName(__traits(getMember, parent, memberName)(argv.expand));
+		return toPromptResponse!memberName(mixin(handlerCall!(overload, parent, "argv.expand")));
 	});
 }
 
@@ -1659,9 +1694,9 @@ private void registerResourceMethod(string memberName, alias overload, alias par
 
 	server.registerResource(descriptor, (RequestContext ctx) @safe {
 		static if (takesContext)
-			auto ret = __traits(getMember, parent, memberName)(ctx);
+			auto ret = mixin(handlerCall!(overload, parent, "ctx"));
 		else
-			auto ret = __traits(getMember, parent, memberName)();
+			auto ret = mixin(handlerCall!(overload, parent, ""));
 		return toResourceContents!("@resource method '" ~ memberName ~ "'")(ret,
 			attr.uri, attr.mimeType);
 	}, collectCache!overload());
@@ -1878,7 +1913,7 @@ private void registerTemplateMethod(string memberName, alias overload,
 				}
 			}
 		}
-		auto ret = __traits(getMember, parent, memberName)(argv.expand);
+		auto ret = mixin(handlerCall!(overload, parent, "argv.expand"));
 		return toResourceContents!("@resourceTemplate method '" ~ memberName ~ "'")(ret,
 			uri, attr.mimeType);
 	}, collectCache!overload());
@@ -1903,7 +1938,7 @@ private void registerSkillMethod(string memberName, alias overload, alias parent
 	sk.license = attr.license;
 	sk.compatibility = attr.compatibility;
 	sk.allowedTools = attr.allowedTools;
-	sk.instructions = __traits(getMember, parent, memberName)();
+	sk.instructions = mixin(handlerCall!(overload, parent, ""));
 	registerSkill(server, sk);
 }
 
@@ -1925,7 +1960,7 @@ private string registerSkillDirMethod(string memberName, alias overload, alias p
 	SkillDirOptions options;
 	options.path = attr.path;
 	options.publishNested = attr.publishNested;
-	return registerSkillDir(server, __traits(getMember, parent, memberName)(), options);
+	return registerSkillDir(server, mixin(handlerCall!(overload, parent, "")), options);
 }
 
 version (unittest)
@@ -5232,6 +5267,63 @@ version (unittest) private Json callToolArgs(McpServer s, string name, string ar
 	p["name"] = name;
 	p["arguments"] = parseJsonString(arguments);
 	return s.handle(Message(makeRequest(Json(1), "tools/call", p))).get["result"];
+}
+
+version (unittest) private final class OverloadedToolApi
+{
+	@tool("by_const", "Takes a const integer")
+	string f(const int n) @safe
+	{
+		return "const";
+	}
+
+	@tool("by_mutable", "Takes a mutable integer")
+	string f(int n) @safe
+	{
+		return "mutable";
+	}
+}
+
+unittest  // each overloaded @tool calls the overload it was registered from
+{
+	auto s = McpServer.stateless("t", "1");
+	registerHandlers(s, new OverloadedToolApi);
+	auto c = callToolArgs(s, "by_const", `{"n":1}`);
+	assert(c["content"][0]["text"].get!string == "const", c.toString);
+	auto m = callToolArgs(s, "by_mutable", `{"n":1}`);
+	assert(m["content"][0]["text"].get!string == "mutable", m.toString);
+}
+
+version (unittest) private interface OverloadedToolBase
+{
+	@tool("iface_const", "Takes a const integer")
+	string f(const int n) @safe;
+
+	@tool("iface_mutable", "Takes a mutable integer")
+	string f(int n) @safe;
+}
+
+version (unittest) private final class OverloadedToolImpl : OverloadedToolBase
+{
+	string f(const int n) @safe
+	{
+		return "impl const";
+	}
+
+	string f(int n) @safe
+	{
+		return "impl mutable";
+	}
+}
+
+unittest  // an overloaded handler inherited from an interface dispatches to its exact override
+{
+	auto s = McpServer.stateless("t", "1");
+	registerHandlers(s, new OverloadedToolImpl);
+	auto c = callToolArgs(s, "iface_const", `{"n":1}`);
+	assert(c["content"][0]["text"].get!string == "impl const", c.toString);
+	auto m = callToolArgs(s, "iface_mutable", `{"n":1}`);
+	assert(m["content"][0]["text"].get!string == "impl mutable", m.toString);
 }
 
 version (unittest) private final class RequiredIntApi
