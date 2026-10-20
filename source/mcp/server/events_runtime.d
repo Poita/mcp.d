@@ -396,6 +396,13 @@ struct EventsOptions
 	Duration webhookRetryBase = 30.seconds; /// exponential-backoff base between attempts (5 attempts span 7.5 min)
 	DeliveryQueue deliveryQueue; /// webhook outbox (default in-memory); shared/durable for multi-node
 	Duration workerInterval = 5.seconds; /// cadence of the periodic worker `enableEvents` starts (0 = the author runs it)
+	/// How often the worker reconciles this node's delivery bookkeeping with the
+	/// shared store and queue (`reconcileDeliveries`). Each reconcile reads the
+	/// store once per subscription this node tracks and the queue once per job,
+	/// so it runs on this slower cadence rather than every worker pass; it only
+	/// catches up on jobs other nodes settled and subscriptions they removed.
+	/// Zero reconciles on every pass.
+	Duration reconcileInterval = 30.seconds;
 	/// How long a worker claims a leased delivery job. Raised at construction to at
 	/// least twice the longest stretch between lease renewals (three
 	/// `webhookHttpTimeout`s: a receiver-document GET, a verification challenge and
@@ -681,6 +688,7 @@ final class EventsRuntime
 	private EmitBuffer buffer_;
 	private WebhookSubscriptionStore webhookStore_;
 	private DeliveryQueue deliveryQueue_;
+	private Nullable!long lastReconcileMs_; // when the worker last reconciled
 	private EventsOptions opts_;
 	private void delegate() @safe onListChanged_;
 	private PushStream[] pushStreams_;
@@ -2956,7 +2964,13 @@ final class EventsRuntime
 		guarded("poll-lease sweep", &sweepPollLeases);
 		guarded("webhook sweep", &sweepWebhookSubscriptions);
 		guarded("missed-position flush", &flushCoalescedMisses);
-		guarded("delivery reconciliation", &reconcileDeliveries);
+		const now = opts_.nowMs();
+		if (lastReconcileMs_.isNull
+				|| now - lastReconcileMs_.get >= opts_.reconcileInterval.total!"msecs")
+		{
+			lastReconcileMs_ = now;
+			guarded("delivery reconciliation", &reconcileDeliveries);
+		}
 		guarded("poll-driven webhook pass", &pollWebhookSubscriptions);
 		guarded("terminated-envelope posting", &pumpTerminatePosts);
 		guarded("delivery drain", &drainDeliveries);
@@ -3740,7 +3754,7 @@ final class EventsRuntime
 	/// is settled here, in order, which advances the watermark past positions
 	/// only this node can order and frees the job's slot under the pending
 	/// bound. Jobs this node is delivering or still enqueueing are skipped. The
-	/// periodic worker runs this every pass.
+	/// periodic worker runs this every `EventsOptions.reconcileInterval`.
 	void reconcileDeliveries() @safe
 	{
 		bool[string] known;
@@ -7738,11 +7752,13 @@ unittest  // a check-backed type is served over webhook by replaying from the cu
 version (unittest)
 {
 	// A delivery queue forwarding to an in-memory one whose next `failEnqueues`
-	// enqueues throw, as a shared queue's I/O failure would.
+	// enqueues throw, as a shared queue's I/O failure would. It counts
+	// `contains` calls.
 	private final class FailingQueue : DeliveryQueue
 	{
 		InMemoryDeliveryQueue inner;
 		int failEnqueues;
+		int containsCalls;
 
 		this() @safe
 		{
@@ -7781,6 +7797,7 @@ version (unittest)
 
 		bool contains(string jobId) @safe
 		{
+			containsCalls++;
 			return inner.contains(jobId);
 		}
 
@@ -7857,6 +7874,36 @@ unittest  // a backfill whose enqueue throws leaves the replay to the next fetch
 	assert(collectException(rt.subscribeWebhook(p, "user-1")) !is null);
 	rt.pollWebhookSubscriptions();
 	assert(ft.eventPosts().length == 1); // m1 delivered by the poll-driven pass
+}
+
+unittest  // the worker reconciles delivery bookkeeping on its own slower cadence
+{
+	import core.time : seconds;
+
+	long now = 1_000_000;
+	auto q = new FailingQueue();
+	EventsOptions o;
+	o.nowMs = () @safe => now;
+	o.nowIso = () @safe => "t";
+	o.allowPrivateCallbackHosts = true;
+	o.webhookTransport = new FakeWebhookTransport();
+	o.deliveryQueue = q;
+	o.deliveryExecutor = (void delegate() @safe job) @safe { job(); };
+	o.reconcileInterval = 30.seconds;
+	auto rt = new EventsRuntime(null, o);
+	EventRegistration reg = {descriptor: EventType("n"), emitOnly: true};
+	rt.register(reg);
+	auto r = rt.subscribeWebhook(webhookSub("n", "https://proxy/hooks"), "user-1");
+	rt.trackJob(r.id, "j1", nullable("c1"));
+	rt.tick();
+	assert(q.containsCalls == 1);
+	rt.trackJob(r.id, "j2", nullable("c2"));
+	now += 5_000;
+	rt.tick();
+	assert(q.containsCalls == 1); // within the reconcile interval
+	now += 30_000;
+	rt.tick();
+	assert(q.containsCalls == 2);
 }
 
 unittest  // a check that throws during a webhook backfill is logged
@@ -10113,6 +10160,7 @@ version (unittest)
 			o.deliveryQueue = t.queue;
 			o.webhookMaxPendingPerSubscription = maxPending;
 			o.webhookRetryBase = Duration.zero;
+			o.reconcileInterval = Duration.zero; // every worker pass reconciles
 			o.deliveryExecutor = delivers ? (void delegate() @safe job) @safe {
 				job();
 			} : (void delegate() @safe job) @safe {};
