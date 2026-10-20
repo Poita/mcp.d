@@ -1272,8 +1272,22 @@ struct CallToolResult
 	/// The `content` text mirror (which the reflection layer populates alongside
 	/// `structuredContent`) is valid in all versions and is preserved. Mirrors
 	/// `Tool.forVersion`.
+	///
+	/// An MRTR `InputRequiredResult` or a task handle has no legacy
+	/// `CallToolResult` form; projecting either below 2026-07-28 throws
+	/// `McpException(internalError)` rather than emit an empty result that
+	/// reads as a successful call.
 	CallToolResult forVersion(ProtocolVersion v) const @safe
 	{
+		import mcp.protocol.errors : internalError;
+
+		if (v < ProtocolVersion.v2026_07_28)
+		{
+			if (isTask())
+				throw internalError("a task result cannot be sent on a legacy session");
+			if (isInputRequired())
+				throw internalError("an input-required result cannot be sent on a legacy session");
+		}
 		CallToolResult projected;
 		// Project each content block so kinds newer than the peer's version
 		// (audio/resource_link/...) and post-2024-11-05 content `_meta` /
@@ -1282,16 +1296,9 @@ struct CallToolResult
 			projected.content ~= c.forVersion(v);
 		projected.isError = isError;
 		projected.meta = meta;
-		// `inputRequests`/`requestState` form the modern-only MRTR
-		// `InputRequiredResult` shape; a legacy `CallToolResult` schema has no
-		// such fields, so drop them when projecting below 2026-07-28.
-		if (v >= ProtocolVersion.v2026_07_28)
-		{
-			projected.inputRequests = inputRequests.dup;
-			projected.requestState = requestState;
-			// The SEP-2663 task handle is likewise a modern-only result shape.
-			projected.task = task;
-		}
+		projected.inputRequests = inputRequests.dup;
+		projected.requestState = requestState;
+		projected.task = task;
 		// `structuredContent` is a 2025-06-18+ field: absent from 2025-03-26 and
 		// 2024-11-05, so omit it for those versions.
 		if (v >= ProtocolVersion.v2025_06_18)
@@ -2284,7 +2291,7 @@ unittest  // dupSelf deep-copies the Json fields of a content block (no aliasing
 	assert(use.meta()["k"].get!string == "v");
 
 	auto tr = Content.makeToolResult("call_1").withStructuredContent(Json([
-			"x": Json(1)
+		"x": Json(1)
 	]));
 	auto trCopy = tr.dupSelf();
 	trCopy.structuredContent()["x"] = 2;
@@ -2878,16 +2885,31 @@ unittest  // CallToolResult.forVersion drops structuredContent on 2024-11-05 (in
 	assert(j["content"].length == 1);
 }
 
-unittest  // CallToolResult.forVersion drops modern-only MRTR fields below 2026-07-28
+unittest  // CallToolResult.forVersion rejects an input-required result below 2026-07-28
 {
+	import std.exception : collectException;
+
 	CallToolResult r;
 	r.content = [Content.makeText("ok")];
 	r.inputRequests = [InputRequest("req1", "elicitation", Json.emptyObject)];
-	r.requestState = "blob";
-	auto projected = r.forVersion(ProtocolVersion.v2025_11_25);
-	assert(projected.inputRequests.length == 0,
-			"inputRequests is a modern-only MRTR field and must not project below the modern");
-	assert(projected.requestState.length == 0);
+	auto ex = collectException!McpException(r.forVersion(ProtocolVersion.v2025_11_25));
+	assert(ex !is null && ex.code == ErrorCode.internalError);
+
+	CallToolResult stateOnly;
+	stateOnly.requestState = "blob";
+	ex = collectException!McpException(stateOnly.forVersion(ProtocolVersion.v2025_11_25));
+	assert(ex !is null && ex.code == ErrorCode.internalError);
+}
+
+unittest  // CallToolResult.forVersion rejects a task handle below 2026-07-28
+{
+	import std.exception : collectException;
+
+	CallToolResult r;
+	r.task.taskId = "t1";
+	auto ex = collectException!McpException(r.forVersion(ProtocolVersion.v2025_11_25));
+	assert(ex !is null && ex.code == ErrorCode.internalError);
+	assert(r.forVersion(ProtocolVersion.v2026_07_28).isTask);
 }
 
 unittest  // CallToolResult.forVersion keeps MRTR fields on 2026-07-28
@@ -5477,24 +5499,23 @@ struct GetPromptResult
 	/// Return a copy with each message's content projected for the negotiated
 	/// protocol version (see `PromptMessage.forVersion` / `Content.forVersion`),
 	/// so newer content kinds and post-2024-11-05 content `_meta` /
-	/// `Annotations.lastModified` do not leak to an older peer. The MRTR
-	/// `inputRequests`/`requestState` survive only on the modern protocol.
-	/// Mirrors `CallToolResult.forVersion`.
+	/// `Annotations.lastModified` do not leak to an older peer. An MRTR
+	/// `InputRequiredResult` has no legacy form, so projecting one below
+	/// 2026-07-28 throws `McpException(internalError)`. Mirrors
+	/// `CallToolResult.forVersion`.
 	GetPromptResult forVersion(ProtocolVersion v) const @safe
 	{
+		import mcp.protocol.errors : internalError;
+
+		if (v < ProtocolVersion.v2026_07_28 && isInputRequired())
+			throw internalError("an input-required result cannot be sent on a legacy session");
 		GetPromptResult r;
 		r.description = description;
 		r.meta = meta;
 		foreach (m; messages)
 			r.messages ~= m.forVersion(v);
-		// `inputRequests`/`requestState` form the modern-only MRTR
-		// `InputRequiredResult` shape; a legacy `GetPromptResult` schema has no
-		// such fields, so drop them when projecting below 2026-07-28.
-		if (v >= ProtocolVersion.v2026_07_28)
-		{
-			r.inputRequests = inputRequests.dup;
-			r.requestState = requestState;
-		}
+		r.inputRequests = inputRequests.dup;
+		r.requestState = requestState;
 		return r;
 	}
 }
@@ -5510,13 +5531,15 @@ unittest  // GetPromptResult.forVersion keeps MRTR fields on the modern protocol
 	assert(modern.requestState == "s1");
 }
 
-unittest  // GetPromptResult.forVersion drops MRTR fields below the modern protocol
+unittest  // GetPromptResult.forVersion rejects an input-required result below the modern protocol
 {
+	import std.exception : collectException;
+
 	GetPromptResult r;
 	r.inputRequests = [InputRequest("q1", "elicitation", Json.emptyObject)];
 	r.requestState = "s1";
-	auto legacy = r.forVersion(ProtocolVersion.v2025_11_25);
-	assert(!legacy.isInputRequired);
+	auto ex = collectException!McpException(r.forVersion(ProtocolVersion.v2025_11_25));
+	assert(ex !is null && ex.code == ErrorCode.internalError);
 }
 
 unittest  // Content.forVersion downgrades audio to a text placeholder pre-2025-03-26
