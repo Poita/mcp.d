@@ -131,20 +131,20 @@ struct TaskRecord
 
 	/// Reconstruct a record from `toJson` output, building fresh associative
 	/// arrays so the result shares no mutable state with any other copy. Throws
-	/// `internalError` (-32603) when the stored `meta` is not a valid `Task`: a
-	/// corrupt record is a server fault, not a bad client request.
+	/// `internalError` (-32603) when `j` is not an object or its `meta` is
+	/// missing or not a valid `Task`: a corrupt record is a server fault, not a
+	/// bad client request.
 	static TaskRecord fromJson(Json j) @safe
 	{
 		import mcp.protocol.errors : McpException, internalError;
 
+		if (j.type != Json.Type.object || "meta" !in j)
+			throw internalError("corrupt stored task record: no 'meta'");
 		TaskRecord r;
-		if ("meta" in j)
-		{
-			try
-				r.meta = Task.fromJson(j["meta"]);
-			catch (McpException e)
-				throw internalError("corrupt stored task record: " ~ e.msg);
-		}
+		try
+			r.meta = Task.fromJson(j["meta"]);
+		catch (McpException e)
+			throw internalError("corrupt stored task record: " ~ e.msg);
 		if ("result" in j && j["result"].type != Json.Type.undefined)
 			r.result = nullable(cloneJson(j["result"]));
 		if ("error" in j && j["error"].type != Json.Type.undefined)
@@ -357,7 +357,10 @@ string defaultTaskIdGenerator() @safe
 
 unittest  // TaskRecord.fromJson shares no Json with its source
 {
+	TaskRecord src;
+	src.meta.taskId = "t";
 	auto j = Json([
+		"meta": src.meta.toJson(),
 		"result": Json(["structuredContent": Json(["ok": Json(true)])]),
 		"error": Json(["code": Json(-32603), "message": Json("m")])
 	]);
@@ -376,6 +379,18 @@ unittest  // TaskRecord.fromJson reports a corrupt stored record as an internal 
 	auto e = collectException!McpException(
 			TaskRecord.fromJson(Json(["meta": Json(["status": Json(42)])])));
 	assert(e !is null && e.code == ErrorCode.internalError);
+}
+
+unittest  // TaskRecord.fromJson reports a record with no meta as an internal error
+{
+	import std.exception : collectException;
+	import mcp.protocol.errors : McpException, ErrorCode;
+
+	foreach (j; [Json.emptyObject, Json(["meta": Json("x")]), Json(5)])
+	{
+		auto e = collectException!McpException(TaskRecord.fromJson(j));
+		assert(e !is null && e.code == ErrorCode.internalError);
+	}
 }
 
 unittest  // TaskRecord round-trips all execution state through JSON
