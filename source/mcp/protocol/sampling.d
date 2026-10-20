@@ -162,8 +162,9 @@ struct ModelHint
 }
 
 /// The server's preferences for model selection during sampling. All fields are
-/// optional. The priority values, when set, are clamped at the wire boundary to
-/// the spec's 0..1 range by the consuming client.
+/// optional. Each priority, when set, must lie in the spec's 0..1 range:
+/// `toJson` refuses to serialize one outside it, and `fromJson` rejects one
+/// with -32602.
 struct ModelPreferences
 {
 	ModelHint[] hints; /// ordered model name hints, most preferred first
@@ -171,8 +172,15 @@ struct ModelPreferences
 	Nullable!double speedPriority; /// 0..1: importance of minimizing latency
 	Nullable!double intelligencePriority; /// 0..1: importance of capability
 
+	/// Throws a plain `Exception` (a local builder mistake, not a peer error)
+	/// when a priority is outside 0..1 or NaN.
 	Json toJson() const @safe
 	{
+		import std.exception : enforce;
+
+		foreach (pr; [costPriority, speedPriority, intelligencePriority]) // Both comparisons are false for NaN, so it is rejected too.
+			enforce(pr.isNull || (pr.get >= 0 && pr.get <= 1),
+					"ModelPreferences priorities must be numbers from 0 to 1");
 		Json j = Json.emptyObject;
 		if (hints.length)
 		{
@@ -967,6 +975,31 @@ unittest  // ModelPreferences.fromJson accepts the priority bounds 0 and 1
 	j["speedPriority"] = Json(1.0);
 	auto p = ModelPreferences.fromJson(j);
 	assert(p.costPriority.get == 0 && p.speedPriority.get == 1);
+}
+
+unittest  // ModelPreferences.toJson rejects a priority outside 0..1 as a local error
+{
+	import std.exception : collectException;
+
+	foreach (bad; [-0.1, 1.5, double.nan])
+	{
+		ModelPreferences p;
+		p.intelligencePriority = bad;
+		auto e = collectException(p.toJson());
+		assert(e !is null);
+		assert(cast(McpException) e is null);
+	}
+}
+
+unittest  // CreateMessageRequest.toJson rejects out-of-range model preferences
+{
+	import std.exception : collectException;
+
+	CreateMessageRequest req;
+	req.messages = [SamplingMessage("user", Content.makeText("hi"))];
+	req.maxTokens = 16;
+	req.modelPreferences.costPriority = 2.0;
+	assert(collectException(req.toJson()) !is null);
 }
 
 unittest  // CreateMessageRequest.toJson rejects a negative maxTokens as a local error
