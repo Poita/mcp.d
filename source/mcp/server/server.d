@@ -1055,12 +1055,13 @@ final class McpServer : ServerCore
 	void registerResourceTemplate(ResourceTemplate descriptor,
 			TemplateReader reader, Nullable!CacheHint cache = Nullable!CacheHint.init) @safe
 	{
-		// A template with adjacent variables would silently never match; reject
-		// it at registration rather than shadowing it.
+		// A malformed template would silently never match; reject it at
+		// registration rather than serving nothing.
 		const tmpl = descriptor.uriTemplate;
-		if (hasAdjacentUriVariables(tmpl))
-			throw new Exception("resource template '" ~ descriptor.name
-					~ "' has adjacent variables that can never match: " ~ tmpl);
+		if (const why = uriTemplateError(tmpl))
+			throw new Exception(
+					"resource template '" ~ descriptor.name
+					~ "' can never match (" ~ why ~ "): " ~ tmpl);
 		foreach (ref t; templates)
 			if (t.descriptor.uriTemplate == tmpl)
 				throw alreadyRegistered("a resource template '" ~ tmpl ~ "'",
@@ -4392,6 +4393,92 @@ package(mcp) bool hasAdjacentUriVariables(string tmpl) @safe pure nothrow @nogc
 	return false;
 }
 
+/// Why the URI template `tmpl` can never match a concrete URI, or `null` when it
+/// is well formed. Each `{...}` must be closed and hold an optional supported
+/// operator followed by comma-separated RFC 6570 varspecs (a name of
+/// `ALPHA / DIGIT / "_" / "." / pct-encoded` characters, then either a prefix
+/// `:n` with 1 <= n < 10000 or an explode `*`); a literal may not contain `}`;
+/// and no two expressions may sit adjacent without a boundary
+/// (`hasAdjacentUriVariables`).
+package(mcp) string uriTemplateError(string tmpl) @safe pure nothrow
+{
+	import std.ascii : isAlphaNum, isDigit, isHexDigit;
+
+	size_t i;
+	while (i < tmpl.length)
+	{
+		if (tmpl[i] == '}')
+			return "unmatched '}'";
+		if (tmpl[i] != '{')
+		{
+			++i;
+			continue;
+		}
+		size_t close = i + 1;
+		while (close < tmpl.length && tmpl[close] != '}' && tmpl[close] != '{')
+			++close;
+		if (close == tmpl.length || tmpl[close] == '{')
+			return "unclosed '{'";
+		string expr = tmpl[i + 1 .. close];
+		i = close + 1;
+		if (expr.length && isUriTemplateOperator(expr[0]))
+			expr = expr[1 .. $];
+		if (expr.length == 0)
+			return "empty expression";
+		size_t start;
+		foreach (j; 0 .. expr.length + 1)
+		{
+			if (j < expr.length && expr[j] != ',')
+				continue;
+			const spec = expr[start .. j];
+			start = j + 1;
+			size_t nameEnd;
+			while (nameEnd < spec.length)
+			{
+				const c = spec[nameEnd];
+				if (c == '%')
+				{
+					if (nameEnd + 2 >= spec.length || !isHexDigit(spec[nameEnd + 1])
+							|| !isHexDigit(spec[nameEnd + 2]))
+						return "invalid percent-encoding in variable name";
+					nameEnd += 3;
+				}
+				else if (isAlphaNum(c) || c == '_' || c == '.')
+					++nameEnd;
+				else
+					break;
+			}
+			if (nameEnd == 0)
+				return "empty variable name";
+			if (spec[0] == '.' || spec[nameEnd - 1] == '.')
+				return "variable name may not begin or end with '.'";
+			const modifier = spec[nameEnd .. $];
+			if (modifier.length == 0 || modifier == "*")
+				continue;
+			if (modifier[0] != ':')
+				return "invalid character in variable name";
+			const digits = modifier[1 .. $];
+			if (digits.length == 0 || digits.length > 4 || digits[0] == '0')
+				return "prefix length must be between 1 and 9999";
+			foreach (d; digits)
+				if (!isDigit(d))
+					return "prefix length must be between 1 and 9999";
+		}
+	}
+	if (hasAdjacentUriVariables(tmpl))
+		return "adjacent variables";
+	return null;
+}
+
+/// Whether `c` is an RFC 6570 operator the template matcher supports.
+private bool isUriTemplateOperator(char c) @safe pure nothrow @nogc
+{
+	foreach (op; "+#./;?&")
+		if (op == c)
+			return true;
+	return false;
+}
+
 /// Bind one template expression (`expr`, the text between the braces) against
 /// the URI substring `s` it spans; see `matchUriTemplate` for the rules. With
 /// `keepRaw`, a value is checked as usual but captured still percent-encoded.
@@ -7175,6 +7262,71 @@ unittest  // registerResourceTemplate rejects adjacent variables that can never 
 	assertThrown!Exception(s.registerResourceTemplate(t, (string uri, string[string] params) @safe {
 			return ResourceContents.makeText(uri, "text/plain", "x");
 		}));
+}
+
+unittest  // registerResourceTemplate rejects an unclosed expression
+{
+	import std.exception : assertThrown;
+
+	auto s = McpServer.stateless("t", "1");
+	ResourceTemplate t = {uriTemplate: "test://{id", name: "unclosed"};
+	assertThrown!Exception(s.registerResourceTemplate(t, (string uri, string[string] params) @safe {
+			return ResourceContents.makeText(uri, "text/plain", "x");
+		}));
+}
+
+unittest  // registerResourceTemplate rejects an empty expression
+{
+	import std.exception : assertThrown;
+
+	auto s = McpServer.stateless("t", "1");
+	ResourceTemplate t = {uriTemplate: "test://{}", name: "empty"};
+	assertThrown!Exception(s.registerResourceTemplate(t, (string uri, string[string] params) @safe {
+			return ResourceContents.makeText(uri, "text/plain", "x");
+		}));
+}
+
+unittest  // registerResourceTemplate rejects a zero prefix length
+{
+	import std.exception : assertThrown;
+
+	auto s = McpServer.stateless("t", "1");
+	ResourceTemplate t = {uriTemplate: "test://{id:0}", name: "zero"};
+	assertThrown!Exception(s.registerResourceTemplate(t, (string uri, string[string] params) @safe {
+			return ResourceContents.makeText(uri, "text/plain", "x");
+		}));
+}
+
+unittest  // registerResourceTemplate rejects a variable name with invalid characters
+{
+	import std.exception : assertThrown;
+
+	auto s = McpServer.stateless("t", "1");
+	ResourceTemplate t = {uriTemplate: "test://{a b}", name: "spaced"};
+	assertThrown!Exception(s.registerResourceTemplate(t, (string uri, string[string] params) @safe {
+			return ResourceContents.makeText(uri, "text/plain", "x");
+		}));
+}
+
+unittest  // registerResourceTemplate rejects a stray closing brace
+{
+	import std.exception : assertThrown;
+
+	auto s = McpServer.stateless("t", "1");
+	ResourceTemplate t = {uriTemplate: "test://a}b/{id}", name: "stray"};
+	assertThrown!Exception(s.registerResourceTemplate(t, (string uri, string[string] params) @safe {
+			return ResourceContents.makeText(uri, "text/plain", "x");
+		}));
+}
+
+unittest  // uriTemplateError accepts every supported expression form
+{
+	foreach (tmpl; [
+		"res://{id}", "res://{+path}", "res://x{#frag}", "res://x{/a,b}",
+		"res://x{.ext}", "res://x{;p}", "res://x{?q,r}", "res://x{&s}",
+		"res://{id:3}", "res://x{/path*}", "res://{a.b_c%20}", "res://{id}{?q}"
+	])
+		assert(uriTemplateError(tmpl) is null, tmpl);
 }
 
 unittest  // logging/setLevel is refused on a stateless server (no session-scoped level)
