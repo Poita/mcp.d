@@ -368,6 +368,9 @@ package(mcp) string unsupportedTypeReason(T, SchemaUse use, Ancestors...)()
 		static if (FieldNameTuple!T.length && !hasBoundField!T)
 			return T.stringof ~ ": it has no public, non-@ignore'd field, so it has no "
 				~ "JSON form; use a struct with public fields";
+		static if (duplicateWireName!T !is null)
+			return T.stringof ~ ": more than one field is serialized as '"
+				~ duplicateWireName!T ~ "'; rename one, or give it a distinct @name";
 		static foreach (field; FieldNameTuple!T)
 		{
 			static if (isBoundField!(T, field))
@@ -411,6 +414,24 @@ package(mcp) string unsupportedTypeReason(T, SchemaUse use, Ancestors...)()
 		return null; // custom-serialized, such as SysTime or Date
 	else
 		return T.stringof ~ ": the type has no JSON representation";
+}
+
+/// The first wire name two bound fields of struct `T` share (`limit` and
+/// `limit_`, or a clashing `@name`), or `null` when every one is distinct.
+private string duplicateWireName(T)()
+{
+	string[] seen;
+	static foreach (field; FieldNameTuple!T)
+	{
+		static if (isBoundField!(T, field))
+		{
+			foreach (other; seen)
+				if (other == wireFieldName!(T, field))
+					return other;
+			seen ~= wireFieldName!(T, field);
+		}
+	}
+	return null;
 }
 
 /// Whether struct `T` has at least one field that takes part in
@@ -1437,6 +1458,36 @@ unittest  // a struct with no public fields is reported as unsupported
 	static assert(unsupportedTypeReason!(Opaque, SchemaUse.input)().length);
 	static assert(unsupportedTypeReason!(Opaque, SchemaUse.output)().length);
 	static assert(unsupportedTypeReason!(Opaque[], SchemaUse.input)().length);
+}
+
+unittest  // struct fields sharing a wire name are reported as unsupported
+{
+	import std.algorithm.searching : canFind;
+	import vibe.data.serialization : ignore, name;
+
+	static struct Underscore
+	{
+		int limit;
+		int limit_;
+	}
+
+	static struct Renamed
+	{
+		int a;
+		@name("a") int b;
+	}
+
+	static struct IgnoredClash
+	{
+		int limit;
+		@ignore int limit_;
+	}
+
+	enum reason = unsupportedTypeReason!(Underscore, SchemaUse.input)();
+	static assert(reason.canFind("'limit'"), reason);
+	static assert(unsupportedTypeReason!(Renamed, SchemaUse.output)().length);
+	static assert(unsupportedTypeReason!(Renamed[], SchemaUse.input)().length);
+	static assert(unsupportedTypeReason!(IgnoredClash, SchemaUse.input)() is null);
 }
 
 unittest  // a Duration is reported as unsupported with a hint to use a number

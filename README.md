@@ -757,7 +757,9 @@ is predictable when porting a hand-built server):
 
 A parameter, field, or return type with no JSON form — a class, pointer,
 delegate, `char`, `std.typecons.Tuple`, an associative array keyed by a
-non-string, a struct whose fields are all private or `@ignore`d, a
+non-string, a struct whose fields are all private or `@ignore`d, a struct with
+two fields serialized under one name (`limit` and `limit_`, or a clashing
+`@name`), a
 `core.time.Duration` (take a `long` count of milliseconds or seconds instead),
 or a `real` parameter (use `double`) — is rejected at compile time
 with a message naming the handler and parameter, as is a `@schemaDefault` whose
