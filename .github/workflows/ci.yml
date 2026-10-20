@@ -20,10 +20,11 @@ jobs:
           compiler: ldc-latest
 
       # dfmt has no `--check` flag, so the idiom is format-in-place then fail
-      # if the working tree changed. The dfmt config lives in dfmt.json.
+      # if the working tree changed. The dfmt config lives in dfmt.json. dfmt is
+      # pinned (as in the justfile) so a new release cannot reformat the tree.
       - name: Check formatting (dfmt)
         run: |
-          dub run dfmt -- --inplace source/ conformance/ examples/ bench/ deploy/ci-smoke/
+          dub run dfmt@0.15.2 -- --inplace source/ conformance/ examples/ bench/ deploy/ci-smoke/
           git diff --exit-code
 
   dscanner-lint:
@@ -38,7 +39,7 @@ jobs:
         with:
           compiler: ldc-latest
 
-      # Runs `dub run dscanner -- --styleCheck source/` via the wrapper, using
+      # Runs `dub run dscanner@0.16.0-beta.4 -- --styleCheck source/` via the wrapper, using
       # the checks configured in dscanner.ini. The wrapper fails on any finding;
       # see scripts/dscanner-lint.sh for the documented false-positive filter.
       - name: D-Scanner static analysis

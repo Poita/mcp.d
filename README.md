@@ -276,7 +276,7 @@ dub test               # run all unit tests
 Formatting and linting (the same gates CI runs; `just fmt` / `just lint` wrap them):
 
 ```bash
-dub run dfmt -- --inplace source/ conformance/ examples/ bench/ deploy/ci-smoke/
+dub run dfmt@0.15.2 -- --inplace source/ conformance/ examples/ bench/ deploy/ci-smoke/
 ./scripts/dscanner-lint.sh     # D-Scanner with the project config and documented filters
 ```
 

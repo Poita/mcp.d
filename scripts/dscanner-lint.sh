@@ -3,7 +3,7 @@
 # Run D-Scanner static analysis over the SDK sources and fail on any finding.
 #
 # This is the script the CI "dscanner lint" gate invokes. It runs:
-#     dub run dscanner -- --styleCheck source/
+#     dub run dscanner@<DSCANNER_VERSION> -- --styleCheck source/
 # using the project's dscanner.ini (which documents every disabled check), then
 # fails if D-Scanner reports any warning or error.
 #
@@ -49,16 +49,34 @@ if command -v ldc2 >/dev/null 2>&1; then
   compiler=(--compiler=ldc2)
 fi
 
+# D-Scanner is pinned: the filters below match its exact diagnostic text, and
+# its parser decides which constructs it can read. Bump deliberately and
+# re-check the filters.
+DSCANNER_VERSION=0.16.0-beta.4
+dscanner="dscanner@${DSCANNER_VERSION}"
+
 # D-Scanner exits non-zero both when it reports findings and when it cannot be
 # built, so build it first: a toolchain failure must fail the gate rather than
 # leave an empty, "clean" result.
-if ! dub build --quiet ${compiler[@]+"${compiler[@]}"} dscanner >/dev/null; then
+if ! dub build --quiet ${compiler[@]+"${compiler[@]}"} "${dscanner}" >/dev/null; then
   echo "D-Scanner could not be built; no lint was run." >&2
   exit 2
 fi
 
-# Collect only the diagnostic lines (D-Scanner prints them to stdout).
-raw="$(dub run --quiet ${compiler[@]+"${compiler[@]}"} dscanner -- --styleCheck source/ 2>/dev/null || true)"
+# Diagnostics go to stdout; stderr is kept apart to tell a crash from findings.
+errfile="$(mktemp)"
+trap 'rm -f "${errfile}"' EXIT
+raw="$(dub run --quiet ${compiler[@]+"${compiler[@]}"} "${dscanner}" -- --styleCheck source/ 2>"${errfile}")"
+status=$?
+
+# A non-zero exit with no diagnostics, or an uncaught D exception or error on
+# stderr, means D-Scanner crashed rather than finished the analysis.
+if grep -qE '^[A-Za-z_][A-Za-z0-9_.]*(Exception|Error)@' "${errfile}" \
+    || { [[ ${status} -ne 0 ]] && ! printf '%s\n' "${raw}" | grep -qE '\[(warn|error)\]'; }; then
+  echo "D-Scanner failed (exit ${status}); the analysis did not complete:" >&2
+  cat "${errfile}" >&2
+  exit 2
+fi
 
 # Keep only [warn]/[error] diagnostics, then drop the documented false positives.
 findings="$(printf '%s\n' "${raw}" \

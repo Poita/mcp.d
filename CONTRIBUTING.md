@@ -52,7 +52,7 @@ dub test                                 # run all unit tests (every module must
 MCP_TEST_MODULES=mcp.server,mcp.protocol dub test   # macOS: only modules with these name prefixes
 
 just fmt                                 # format every D tree in place (matches CI)
-dub run dscanner -- --styleCheck source/ # static analysis / style lint
+dub run dscanner@0.16.0-beta.4 -- --styleCheck source/ # static analysis / style lint
 ./scripts/dscanner-lint.sh               # the exact lint gate CI runs (with documented filters)
 ```
 
@@ -64,7 +64,7 @@ wraps these (and the conformance suites) as one-word recipes — each sets the
 just            # list all recipes
 just build      # dub build
 just test       # dub test
-just fmt        # dub run dfmt -- --inplace source/ conformance/ examples/ bench/ deploy/ci-smoke/
+just fmt        # dub run dfmt@0.15.2 -- --inplace source/ conformance/ examples/ bench/ deploy/ci-smoke/
 just lint       # ./scripts/dscanner-lint.sh + ./scripts/check-readme-versions.sh
 just examples   # ./scripts/run-examples.sh (build + e2e-run every example; ~15 min)
 just example tools   # ./scripts/run-examples.sh tools (one example; a minute or two)
@@ -79,7 +79,7 @@ just conformance-server-lane 2026-07-28   # one revision (likewise -client-lane)
 CI (`.github/workflows/ci.yml`) runs these jobs on every push and PR, and your
 change must pass all of them:
 
-1. **dfmt format check** — `dub run dfmt -- --inplace source/ conformance/ examples/ bench/ deploy/ci-smoke/`
+1. **dfmt format check** — `dub run dfmt@0.15.2 -- --inplace source/ conformance/ examples/ bench/ deploy/ci-smoke/`
    followed by `git diff --exit-code` (dfmt has no `--check` flag, so the idiom
    is format-in-place then fail if the tree changed). Run `just fmt` before you
    commit.
