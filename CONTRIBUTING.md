@@ -97,7 +97,8 @@ change must pass all of them:
    (non-blocking upload).
 6. **examples** — `./scripts/run-examples.sh` builds every example and runs each
    client as a self-verifying end-to-end test on Ubuntu; **examples-windows**
-   runs the stdio examples end to end on `windows-latest`. The full run takes
+   runs five of them (`tools`, `resources`, `elicitation`, `sampling`,
+   `prompts`) end to end over stdio on `windows-latest`. The full run takes
    roughly 15 minutes locally, since every example compiles its own server and
    client against the SDK; while iterating, run just the examples you touched
    with `just example <name>` (or `./scripts/run-examples.sh <name>...`).
