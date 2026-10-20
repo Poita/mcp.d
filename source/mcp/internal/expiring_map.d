@@ -166,6 +166,8 @@ package(mcp) struct BoundedExpiringMap(V)
 	}
 
 	/// Record that `key` has been used, so cap eviction prefers other entries.
+	/// The use counts as activity: the entry is stamped just-active, which also
+	/// keeps the used list in stamp order as it joins that list's tail.
 	void markUsed(string key) @safe
 	{
 		auto p = key in nodes;
@@ -173,6 +175,7 @@ package(mcp) struct BoundedExpiringMap(V)
 			return;
 		unusedOrder.unlink(*p);
 		(*p).used = true;
+		(*p).stamp = now();
 		usedOrder.append(*p);
 	}
 
@@ -374,6 +377,27 @@ unittest  // BoundedExpiringMap sweeps entries older than the TTL on the next pu
 	assert(!found);
 	m.take("fresh", found);
 	assert(found);
+}
+
+unittest  // BoundedExpiringMap's sweep still finds an expired entry after markUsed reorders it
+{
+	import core.time : MonoTime, minutes;
+
+	auto clk = MonoTime.currTime;
+	auto m = BoundedExpiringMap!int(10.minutes, 0, () @safe => clk);
+	string[] evicted;
+	m.onEvict = (string key, int value) @safe { evicted ~= key; };
+	m.put("a", 1);
+	clk += 5.minutes;
+	m.put("b", 2);
+	m.markUsed("b");
+	clk += 4.minutes;
+	m.markUsed("a");
+	// Marking "a" used is activity, so it outlives "b".
+	clk += 7.minutes;
+	m.put("c", 3);
+	assert(evicted == ["b"], "the sweep must evict exactly the entries past their TTL");
+	assert(m.contains("a"));
 }
 
 unittest  // BoundedExpiringMap caps live entries, evicting the oldest by timestamp
