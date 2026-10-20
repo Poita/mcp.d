@@ -466,7 +466,8 @@ final class StdioClientTransport : ClientTransport
 	}
 
 	/// The body of the stderr task: split `stream` into lines (LF or CRLF, at
-	/// most `maxStderrLineBytes` each) until it ends or the task is interrupted.
+	/// most `maxStderrLineBytes` each, cut between code points) until it ends or
+	/// the task is interrupted. Each line reaches `onLine` as valid UTF-8.
 	version (Posix) private static void readStderr(PipeInputStream* stream,
 			void delegate(string) @safe nothrow onLine) @safe nothrow
 	{
@@ -478,8 +479,19 @@ final class StdioClientTransport : ClientTransport
 			if (line.length && line[$ - 1] == '\r')
 				line = line[0 .. $ - 1];
 			if (onLine !is null)
-				onLine(line.idup);
+				onLine(sanitizeUtf8(line));
 			line = null;
+		}
+
+		// Deliver a piece of an over-long line, holding back a code point it
+		// would otherwise split so the next piece starts with it whole.
+		void emitPiece() @safe nothrow
+		{
+			const cut = utf8CompletePrefix(line);
+			auto rest = line[cut .. $].dup;
+			line = line[0 .. cut];
+			emit();
+			line = rest;
 		}
 
 		ubyte[4096] buf;
@@ -496,7 +508,7 @@ final class StdioClientTransport : ClientTransport
 					{
 						line ~= cast(char) b;
 						if (line.length >= maxStderrLineBytes)
-							emit();
+							emitPiece();
 					}
 				}
 			}
@@ -870,12 +882,74 @@ struct SpawnSettings
 
 	/// With `StderrMode.capture`, called on the event loop with each line the
 	/// server writes to stderr, without its line terminator. A line longer than
-	/// `maxStderrLineBytes` is delivered in pieces of at most that size.
+	/// `maxStderrLineBytes` is delivered in pieces of at most that size, cut
+	/// between code points. Each line is valid UTF-8: a byte that is not is
+	/// replaced with U+FFFD.
 	void delegate(string line) @safe nothrow onStderrLine;
 }
 
 /// The longest stderr line `StderrMode.capture` delivers in one piece.
 enum size_t maxStderrLineBytes = 64 * 1024;
+
+/// The length of the longest prefix of `s` that ends on a code point boundary:
+/// `s` without a trailing, still incomplete UTF-8 sequence. Bytes that cannot
+/// begin a sequence are left in, so a prefix of invalid bytes is never empty.
+private size_t utf8CompletePrefix(const(char)[] s) @safe pure nothrow @nogc
+{
+	foreach (back; 1 .. 5)
+	{
+		if (back > s.length)
+			break;
+		const b = cast(ubyte) s[$ - back];
+		if ((b & 0xC0) == 0x80)
+			continue; // a continuation byte: keep looking for the lead
+		const need = b >= 0xF0 && b < 0xF8 ? 4 : b >= 0xE0 ? 3 : b >= 0xC0 ? 2 : 1;
+		return need > back && s.length > back ? s.length - back : s.length;
+	}
+	return s.length;
+}
+
+/// `s` as a string of valid UTF-8, each invalid byte replaced by U+FFFD.
+private string sanitizeUtf8(const(char)[] s) @safe pure nothrow
+{
+	import std.utf : decode;
+
+	string res;
+	size_t i;
+	while (i < s.length)
+	{
+		const start = i;
+		try
+		{
+			decode(s, i);
+			res ~= s[start .. i];
+		}
+		catch (Exception)
+		{
+			res ~= "\uFFFD";
+			i = start + 1;
+		}
+	}
+	return res;
+}
+
+unittest  // utf8CompletePrefix holds back only a trailing incomplete sequence
+{
+	assert(utf8CompletePrefix("abc") == 3);
+	assert(utf8CompletePrefix("a\xC3") == 1);
+	assert(utf8CompletePrefix("a\xC3\xA9") == 3);
+	assert(utf8CompletePrefix("a\xE2\x82") == 1);
+	assert(utf8CompletePrefix("a\xF0\x9F\x98") == 1);
+	assert(utf8CompletePrefix("\xC3") == 1);
+	assert(utf8CompletePrefix("a\x80\x80\x80\x80") == 5);
+}
+
+unittest  // sanitizeUtf8 replaces each invalid byte and keeps valid text
+{
+	assert(sanitizeUtf8("h\xC3\xA9llo") == "h\xC3\xA9llo");
+	assert(sanitizeUtf8("x\xFFy") == "x\uFFFDy");
+	assert(sanitizeUtf8("\xC3") == "\uFFFD");
+}
 
 /// Throw a descriptive `McpException` when `args` cannot start a process in
 /// `workingDir`: an empty command line, a missing working directory, or an
@@ -1887,6 +1961,39 @@ version (Posix) unittest  // StderrMode.capture hands each line the server write
 		transport.closeProcess(200.msecs, 200.msecs);
 	});
 	assert(lines == ["first", "second", "last"]);
+}
+
+version (Posix) unittest  // StderrMode.capture delivers valid UTF-8, splitting long lines between code points
+{
+	import core.time : msecs, seconds;
+	import std.algorithm.searching : all;
+	import std.datetime.stopwatch : StopWatch, AutoStart;
+	import std.utf : validate;
+	import vibe.core.core : sleep;
+
+	string[] lines;
+	SpawnSettings s;
+	s.stderr = StderrMode.capture;
+	s.onStderrLine = (string line) @safe nothrow{ lines ~= line; };
+	inLoop(() @safe {
+		// A line of 65535 ASCII bytes and a two-byte "é" straddling the piece
+		// limit, then a line with a byte that is never valid UTF-8.
+		auto transport = spawnStdioTransport([
+			"sh", "-c",
+			`{ head -c 65535 /dev/zero | tr '\0' a; printf '\303\251\n'; printf 'x\377y\n'; } >&2;` ~ ` read line; printf '{"jsonrpc":"2.0","id":1,"result":{}}\n'`
+		], defaultMaxLineBytes, s);
+		transport.deliver(parseJsonString(`{"jsonrpc":"2.0","id":1,"method":"ping"}`), 1);
+		auto sw = StopWatch(AutoStart.yes);
+		while (lines.length < 3 && sw.peek < 5.seconds)
+			sleep(10.msecs);
+		transport.closeProcess(200.msecs, 200.msecs);
+	});
+	assert(lines.length == 3);
+	foreach (line; lines)
+		validate(line);
+	assert(lines[0].length == 65535 && lines[0].all!(c => c == 'a'));
+	assert(lines[1] == "é");
+	assert(lines[2] == "x�y");
 }
 
 version (Posix) unittest  // spawning a missing executable fails with an McpException naming it and leaks no descriptor
