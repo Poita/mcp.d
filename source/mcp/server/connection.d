@@ -120,7 +120,7 @@ unittest  // subscriptions are per-connection
 {
 	auto a = new ConnectionState;
 	auto b = new ConnectionState;
-	a.subscriptions["res://x"] = true;
+	a.subscriptions["res://x"] = 1;
 	assert(("res://x" in a.subscriptions) !is null);
 	assert(("res://x" in b.subscriptions) is null);
 }

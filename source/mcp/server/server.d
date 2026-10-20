@@ -2263,8 +2263,7 @@ final class McpServer : ServerCore
 			// 2025-era standalone GET stream, never present in stateless/modern) falls
 			// back to `plainEligible` for legacy delivery:
 			// list-changed broadcasts unconditionally, while `resources/updated` honours
-			// the 2025-era subscribe-then-deliver gate (`plainGetEligibleFor`). On the
-			// modern single-connection path the global opt-in still gates that fallback.
+			// the 2025-era subscribe-then-deliver gate (`plainGetEligibleFor`).
 			const plainEligible = plainGetEligible(method, uri);
 			// Every change notification fans out once per session and once per
 			// listen stream (one stream per session, honouring Multiple
@@ -12706,8 +12705,8 @@ unittest  // notifyResourceUpdated reaches every session subscribed to the uri
 	auto connA = new ConnectionState;
 	auto connB = new ConnectionState;
 	auto connC = new ConnectionState;
-	connA.subscriptions["file:///x"] = true;
-	connB.subscriptions["file:///x"] = true;
+	connA.subscriptions["file:///x"] = 1;
+	connB.subscriptions["file:///x"] = 1;
 	string a, b, c;
 	ch.addListener((string fr) @safe { a = fr; }, Json.init, ListenFilter.init,
 			"", s.sessionPushEligibility(connA), "sess-A");
