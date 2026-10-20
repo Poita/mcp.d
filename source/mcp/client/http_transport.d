@@ -853,10 +853,20 @@ final class HttpClientTransport : ClientTransport
 	void sendOneway(Json message) @safe
 	{
 		const status = post(message);
+		const initialized = message.type == Json.Type.object && "method" in message
+			&& message["method"] == Json("notifications/initialized");
+		// The handshake is incomplete until the server takes `initialized`, so a
+		// rejection fails `initialize` instead of leaving an unusable session.
+		if (initialized && status != 0 && (status < 200 || status >= 300))
+		{
+			if (status == 404 || status == 410)
+				throw new SessionExpiredException(status, "MCP session expired: the server answered notifications/initialized with HTTP " ~ idStr(
+						status));
+			throw new HttpStatusException(status,
+					"the server rejected notifications/initialized with HTTP " ~ idStr(status));
+		}
 		// A new session is ready once the server has its `initialized`.
-		if (reopenServerStream && status >= 200 && status < 300 && sessionId.length
-				&& message.type == Json.Type.object && "method" in message
-				&& message["method"] == Json("notifications/initialized"))
+		if (reopenServerStream && initialized && status >= 200 && status < 300 && sessionId.length)
 		{
 			reopenServerStream = false;
 			startServerStream();
@@ -907,8 +917,9 @@ final class HttpClientTransport : ClientTransport
 
 		import mcp.protocol.ssrf : secureRequestHTTP, SsrfPolicy;
 
-		const target = legacyMode ? legacyEndpoint : url;
+		string target = legacyMode ? legacyEndpoint : url;
 		int status;
+		string location;
 		// Only a legacy request takes an in-flight permit. A notification or a reply
 		// to a server->client request bypasses the cap: the request POST awaiting
 		// that reply already holds a permit, so with every permit held by such
@@ -932,18 +943,30 @@ final class HttpClientTransport : ClientTransport
 				captureSession(res, message);
 				status = res.statusCode;
 				challenge = res.headers.get("WWW-Authenticate", "");
+				location = res.headers.get("Location", "");
 				res.dropBody();
 			}, FetchOptions(sendTimeout, tlsTrust));
 		}
 
 		// As in `deliver`: a rejected bearer is reported once, and the POST
-		// retried once with the refreshed token.
+		// retried once with the refreshed token; a same-origin 307/308 is followed
+		// with the same method and body a bounded number of times.
+		enum maxRedirects = 5;
 		const sentSession = sessionId;
-		const sentBearer = currentBearer();
-		attempt(sentBearer);
-		if (bearerProvider.onRejected !is null && sentBearer.length
-				&& isRejectedBearer(status, challenge) && refreshBearer(sentBearer))
-			attempt(currentBearer());
+		foreach (redirects; 0 .. maxRedirects + 1)
+		{
+			const sentBearer = currentBearer();
+			attempt(sentBearer);
+			if (bearerProvider.onRejected !is null && sentBearer.length
+					&& isRejectedBearer(status, challenge) && refreshBearer(sentBearer))
+				attempt(currentBearer());
+			if ((status != 307 && status != 308) || location.length == 0 || redirects == maxRedirects)
+				break;
+			const next = resolveEndpointUri(target, location);
+			if (next.length == 0 || next == target)
+				break;
+			target = next;
+		}
 		// A oneway send carries no awaited reply, so a rejection would otherwise be
 		// invisible: 404/410 under a session means the session is gone (drop its id
 		// and mark it so the next non-initialize request surfaces a clear error);
@@ -5334,6 +5357,48 @@ unittest  // a request the server accepted is not re-sent when its session vanis
 	assert(msg.canFind("unknown"), msg);
 }
 
+unittest  // initialize fails when the server rejects notifications/initialized
+{
+	import std.algorithm.searching : canFind;
+	import mcp.client.client : McpClient;
+
+	foreach (rejectStatus; [400, 404, 500])
+	{
+		auto router = new URLRouter;
+		router.post("/mcp", (HTTPServerRequest req, HTTPServerResponse res) @safe {
+			auto j = requestJson(req);
+			const method = ("method" in j) ? j["method"].get!string : "";
+			if (method == "initialize")
+			{
+				res.headers["Mcp-Session-Id"] = "s1";
+				res.writeBody(initializeReply(j, "2025-11-25").toString(), "application/json");
+				return;
+			}
+			res.statusCode = method == "notifications/initialized" ? rejectStatus : 202;
+			res.writeBody("", "text/plain");
+		});
+
+		string msg;
+		bool expired;
+		const failure = runAgainstFakeServer(router, (string url) @safe {
+			auto client = McpClient.http(url);
+			scope (exit)
+				client.close();
+			try
+				client.initialize("2025-11-25");
+			catch (HttpStatusException e)
+			{
+				msg = e.msg;
+				expired = cast(SessionExpiredException) e !is null;
+			}
+		});
+		assert(failure.length == 0, "scenario failed: " ~ failure);
+		assert(msg.canFind("notifications/initialized"),
+				"initialize must fail when notifications/initialized is rejected: " ~ msg);
+		assert(expired == (rejectStatus == 404), msg);
+	}
+}
+
 unittest  // a failed legacy fallback closes the GET stream it opened
 {
 	import core.time : msecs, MonoTime;
@@ -8006,13 +8071,14 @@ version (unittest)
 	}
 }
 
-unittest  // a request POST follows a same-origin 307 or 308 redirect
+unittest  // request and notification POSTs follow a same-origin 307 or 308 redirect
 {
 	int served;
 	assert(redirectedListTools(307, "/mcp", served) is null);
-	assert(served == 2, "initialize and tools/list must both reach the redirect target");
+	assert(served == 3,
+			"initialize, its initialized notification and tools/list must all reach the redirect target");
 	assert(redirectedListTools(308, "/mcp", served) is null);
-	assert(served == 2);
+	assert(served == 3);
 }
 
 unittest  // a request POST does not follow a cross-origin redirect
