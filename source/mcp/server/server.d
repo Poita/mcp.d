@@ -4254,7 +4254,9 @@ final class McpServer : ServerCore
 /// control character such as NUL, does not match.
 /// Comma-separated variable lists are supported. A prefix modifier (`:n`) caps
 /// its variable's decoded value at `n` code points. An explode modifier (`*`) on
-/// the last variable of a `/` or `.` expression takes the remaining segments.
+/// the last variable of a `/` or `.` expression takes the remaining segments,
+/// and on a `;`, `?` or `&` variable collects each repetition of its
+/// `name=value` pair into one comma-separated value.
 private bool matchUriTemplate(string tmpl, string uri, out string[string] params) @safe
 {
 	auto m = UriTemplateMatcher(tmpl, uri);
@@ -4408,6 +4410,8 @@ private bool bindUriExpression(string expr, string s, bool keepRaw, ref string[s
 	string[] names;
 	// Each variable's RFC 6570 prefix length (`{var:n}`), or 0 for none.
 	size_t[] maxLengths;
+	// Whether each variable carries the explode modifier (`{?var*}`).
+	bool[] exploded;
 	bool explodeLast;
 	foreach (spec; expr.split(','))
 	{
@@ -4427,6 +4431,7 @@ private bool bindUriExpression(string expr, string s, bool keepRaw, ref string[s
 		}
 		maxLengths ~= maxLength;
 		explodeLast = spec.length && spec[$ - 1] == '*';
+		exploded ~= explodeLast;
 		if (explodeLast)
 			spec = spec[0 .. $ - 1];
 		if (spec.length == 0)
@@ -4499,6 +4504,10 @@ private bool bindUriExpression(string expr, string s, bool keepRaw, ref string[s
 			return true;
 		if (s[0] != op)
 			return false;
+		// An exploded list repeats `name=value` once per element (RFC 6570
+		// §3.2.1); its elements are joined with `,`, the separator a list
+		// variable is split on.
+		auto seen = new bool[names.length];
 		foreach (pair; s[1 .. $].split(op == ';' ? ';' : '&'))
 		{
 			const eq = pair.indexOf('=');
@@ -4514,7 +4523,12 @@ private bool bindUriExpression(string expr, string s, bool keepRaw, ref string[s
 				return false;
 			if (!withinPrefix(idx, v))
 				return false;
-			params[name] = keepRaw ? raw : v;
+			const value = keepRaw ? raw : v;
+			if (seen[idx] && exploded[idx])
+				params[name] ~= "," ~ value;
+			else
+				params[name] = value;
+			seen[idx] = true;
 		}
 		return true;
 	}

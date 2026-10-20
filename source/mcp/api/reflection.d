@@ -1646,7 +1646,9 @@ private string[] uriTemplateVars(string tmpl) @safe pure
 
 /// The separator between the elements of URI template variable `name`'s value
 /// in `tmpl`: an exploded `{/var*}` or `{.var*}` repeats its operator between
-/// elements, and every other list value is comma-separated (RFC 6570 §3.2.1).
+/// elements, and every other list value is comma-separated (RFC 6570 §3.2.1);
+/// the matcher joins the repeated pairs of an exploded `{?var*}`, `{;var*}`, or
+/// `{&var*}` with `,` too.
 private char uriTemplateListSeparator(string tmpl, string name) @safe pure
 {
 	import std.algorithm.iteration : splitter;
@@ -3964,6 +3966,22 @@ version (unittest) private final class ListTemplateApi
 		return names.join("|");
 	}
 
+	@resourceTemplate("exploded://{id}{?tags*}", "Exploded", "text/plain")
+	string exploded(string id, string[] tags) @safe
+	{
+		import std.array : join;
+
+		return id ~ ":" ~ tags.join("|");
+	}
+
+	@resourceTemplate("params://{id}{;keys*}", "Params", "text/plain")
+	string params(string id, int[] keys) @safe
+	{
+		import std.conv : to;
+
+		return id ~ keys.to!string;
+	}
+
 	@resourceTemplate("pair://{xy}", "Pair", "text/plain")
 	string pair(int[2] xy) @safe
 	{
@@ -4010,6 +4028,18 @@ unittest  // a percent-encoded separator inside a resource-template list element
 	rr = readUri(s, "files://root/a/b%2Fc");
 	assert("error" !in rr, rr.toString);
 	assert(rr["result"]["contents"][0]["text"].get!string == "a|b/c");
+}
+
+unittest  // an exploded query or parameter list variable collects every repeated name=value pair
+{
+	auto s = McpServer.stateless("t", "1");
+	registerHandlers(s, new ListTemplateApi);
+	auto rr = readUri(s, "exploded://x?tags=a&tags=b%2Cc&tags=d");
+	assert("error" !in rr, rr.toString);
+	assert(rr["result"]["contents"][0]["text"].get!string == "x:a|b,c|d");
+	rr = readUri(s, "params://y;keys=1;keys=2");
+	assert("error" !in rr, rr.toString);
+	assert(rr["result"]["contents"][0]["text"].get!string == "y[1, 2]");
 }
 
 unittest  // a resource-template array element that does not parse is an InvalidParams error
