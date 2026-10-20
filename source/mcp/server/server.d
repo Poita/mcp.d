@@ -158,6 +158,9 @@ private Exception notRegistered(string what) @safe
 	return new Exception("no " ~ what ~ " is registered");
 }
 
+/// The most task ids one `subscriptions/listen` request may name.
+private enum maxListenTaskIds = 1024;
+
 /// The most `resources/subscribe` URIs one connection may hold, bounding the
 /// per-session state a client can make the server keep.
 private enum maxResourceSubscriptions = 1024;
@@ -3339,9 +3342,11 @@ final class McpServer : ServerCore
 	/// `notifications/resources/updated` for. Those URIs are kept on the stream's
 	/// filter (so `notifyResourceUpdated` honours them) and the
 	/// `resourceSubscriptions` opt-in is flagged when the array is non-empty.
-	/// With the Tasks extension enabled, `taskIds` (SEP-2663) opts the stream into
-	/// `notifications/tasks` for those task ids; it requires the client to declare
-	/// the extension. A flat top-level filter is also accepted when no
+	/// `taskIds` (SEP-2663) opts the stream into `notifications/tasks` for those
+	/// task ids. Like any other type the server does not support for this
+	/// request, it is dropped from the filter and the acknowledged subset unless
+	/// the server has the Tasks extension enabled and the request's client
+	/// capabilities declare it. A flat top-level filter is also accepted when no
 	/// `notifications` object is present.
 	private Json doSubscribeListen(Json params, ConnectionState conn) @safe
 	{
@@ -3400,9 +3405,8 @@ final class McpServer : ServerCore
 			}
 
 			if (auto ids = "taskIds" in filter)
-				if (tasksEnabled_ && ids.type == Json.Type.array && ids.length)
+				if (supportsListenTaskIds(params) && ids.type == Json.Type.array && ids.length)
 				{
-					requireTasksDeclared(params);
 					bool[string] seen;
 					foreach (i; 0 .. ids.length)
 						if ((*ids)[i].type == Json.Type.string)
@@ -3410,7 +3414,7 @@ final class McpServer : ServerCore
 							const id = (*ids)[i].get!string;
 							if (id in seen)
 								continue;
-							if (seen.length >= maxResourceSubscriptions)
+							if (seen.length >= maxListenTaskIds)
 								throw invalidParams("Too many taskIds in one listen request");
 							seen[id] = true;
 							perStream.taskIds ~= id;
@@ -3427,6 +3431,15 @@ final class McpServer : ServerCore
 		// route and the HTTP transport derive the acknowledgement from
 		// `acknowledgedSubsetFor` of the recorded filter), so return an empty object.
 		return Json.emptyObject;
+	}
+
+	/// Whether a `subscriptions/listen` request may opt into `taskIds`: the Tasks
+	/// extension is enabled here and declared in the request's client
+	/// capabilities.
+	private bool supportsListenTaskIds(Json params) const @safe
+	{
+		return tasksEnabled_ && declaresTasksExtension(RequestMeta.fromParams(params)
+				.clientCapabilities);
 	}
 
 	/// Whether the server actually supports (advertises) a given
@@ -12655,6 +12668,34 @@ unittest  // notifications/tasks for an ownerless task reaches the stdio listen 
 	assert(frames.canFind!(fr => fr.canFind("notifications/tasks") && fr.canFind("done")));
 	assert(!frames.canFind!(fr => fr.canFind("unrequested")),
 			"a task the listen stream did not name must not reach it");
+}
+
+unittest  // a listen naming taskIds without the Tasks extension omits them from the ack
+{
+	import vibe.data.json : parseJsonString;
+
+	auto s = McpServer.stateless("t", "1");
+	auto rt = s.enableTasks();
+	s.enableToolsListChanged();
+	auto t = rt.createFor("", Json.undefined);
+	string[] frames;
+	Json meta = Json.emptyObject;
+	meta[MetaKey.protocolVersion] = "2026-07-28";
+	meta[MetaKey.clientCapabilities] = Json.emptyObject;
+	Json params = Json.emptyObject;
+	params["notifications"] = Json([
+		"toolsListChanged": Json(true),
+		"taskIds": Json([Json(t.taskId)])
+	]);
+	params["_meta"] = meta;
+	assert(s.tryServeStdioListen(Message(makeRequest(Json(1),
+			"subscriptions/listen", params)), (string f) @safe { frames ~= f; }));
+	assert(frames.length == 1);
+	auto ack = parseJsonString(frames[0]);
+	assert("error" !in ack);
+	assert(ack["method"].get!string == "notifications/subscriptions/acknowledged");
+	assert("taskIds" !in ack["params"]["notifications"]);
+	assert(ack["params"]["notifications"]["toolsListChanged"].get!bool);
 }
 
 unittest  // a listen stream receives only the notification types its filter requested
