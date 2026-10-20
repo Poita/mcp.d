@@ -41,6 +41,12 @@ final class ConnectionState
 	/// stateless): a handler that needs a client capability then errors.
 	ClientCapabilities clientCaps;
 
+	/// Whether `clientCaps` holds what an `initialize` on this connection
+	/// declared. False on a connection that never saw `initialize`, such as
+	/// the fresh per-request state a stateless HTTP server dispatches a
+	/// 2025-era request on, where the client's capabilities are unknown.
+	bool clientCapsDeclared;
+
 	/// The minimum log level the client asked for via `logging/setLevel`
 	/// (stateful) or the per-request `_meta` log level (modern).
 	string logLevel = "info";

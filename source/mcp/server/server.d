@@ -539,10 +539,13 @@ final class McpServer : ServerCore
 	/// `data.requiredCapabilities` is a `ClientCapabilities` object listing
 	/// exactly the unmet capabilities — when the request's declared capabilities
 	/// do not cover `caps` (2026-07-28 basic/lifecycle: "A server MUST NOT rely on
-	/// capabilities the client has not declared"). On the stateful 2025-era
-	/// protocols the gate uses the session capabilities negotiated at
-	/// `initialize`. Passing a default-constructed `ClientCapabilities` clears the
-	/// requirement. Returns `false` if no tool with `name` is registered.
+	/// capabilities the client has not declared"). On the 2025-era protocols
+	/// the gate uses the capabilities the client declared at `initialize`. A
+	/// stateless HTTP server dispatches each 2025-era request on a connection
+	/// that never saw `initialize`, so it cannot know them and does not gate
+	/// those requests; the handler sees empty `ctx.clientCapabilities()`. Passing a
+	/// default-constructed `ClientCapabilities` clears the requirement. Returns
+	/// `false` if no tool with `name` is registered.
 	bool setToolRequiredClientCapabilities(string name, ClientCapabilities caps) @safe
 	{
 		auto entry = name in tools;
@@ -559,8 +562,11 @@ final class McpServer : ServerCore
 	/// front with a `-32021` `MissingRequiredClientCapabilityError` — whose
 	/// `data.requiredCapabilities` is a `ClientCapabilities` object listing
 	/// exactly the unmet capabilities — when the request's declared capabilities
-	/// do not cover `caps`. On the stateful 2025-era protocols the gate uses the
-	/// session capabilities negotiated at `initialize`. Passing a
+	/// do not cover `caps`. On the 2025-era protocols
+	/// the gate uses the capabilities the client declared at `initialize`. A
+	/// stateless HTTP server dispatches each 2025-era request on a connection
+	/// that never saw `initialize`, so it cannot know them and does not gate
+	/// those requests; the handler sees empty `ctx.clientCapabilities()`. Passing a
 	/// default-constructed `ClientCapabilities` clears the requirement. Returns
 	/// `false` if no prompt with `name` is registered.
 	bool setPromptRequiredClientCapabilities(string name, ClientCapabilities caps) @safe
@@ -581,8 +587,11 @@ final class McpServer : ServerCore
 	/// `MissingRequiredClientCapabilityError` — whose
 	/// `data.requiredCapabilities` is a `ClientCapabilities` object listing
 	/// exactly the unmet capabilities — when the request's declared capabilities
-	/// do not cover `caps`. On the stateful 2025-era protocols the gate uses the
-	/// session capabilities negotiated at `initialize`. Passing a
+	/// do not cover `caps`. On the 2025-era protocols
+	/// the gate uses the capabilities the client declared at `initialize`. A
+	/// stateless HTTP server dispatches each 2025-era request on a connection
+	/// that never saw `initialize`, so it cannot know them and does not gate
+	/// those requests; the handler sees empty `ctx.clientCapabilities()`. Passing a
 	/// default-constructed `ClientCapabilities` clears the requirement.
 	///
 	/// For a direct resource, `uri` is the exact resource URI. Returns `false`
@@ -605,8 +614,11 @@ final class McpServer : ServerCore
 	/// `MissingRequiredClientCapabilityError` — whose
 	/// `data.requiredCapabilities` is a `ClientCapabilities` object listing
 	/// exactly the unmet capabilities — when the request's declared capabilities
-	/// do not cover `caps`. On the stateful 2025-era protocols the gate uses the
-	/// session capabilities negotiated at `initialize`. Passing a
+	/// do not cover `caps`. On the 2025-era protocols
+	/// the gate uses the capabilities the client declared at `initialize`. A
+	/// stateless HTTP server dispatches each 2025-era request on a connection
+	/// that never saw `initialize`, so it cannot know them and does not gate
+	/// those requests; the handler sees empty `ctx.clientCapabilities()`. Passing a
 	/// default-constructed `ClientCapabilities` clears the requirement.
 	///
 	/// `uriTemplate` is the URI template string (e.g. `"res://{id}"`). Returns
@@ -3460,12 +3472,7 @@ final class McpServer : ServerCore
 
 		if (auto direct = uri in resources)
 		{
-			// Capability gating: mirrors doCallTool — uses per-request
-			// _meta.clientCapabilities on the modern protocol, or the session caps
-			// negotiated at initialize on stateful 2025-era protocols.
-			const ClientCapabilities declared = ctx.clientCapabilities();
-			if (auto missing = direct.requiredClientCapabilities.missingFrom(declared))
-				throw missingRequiredClientCapability(missing.get);
+			requireClientCapabilities(direct.requiredClientCapabilities, ctx, ver, conn);
 			ReadResourceResult result;
 			result.contents = projectContents(direct.reader(ctx), ver);
 			return maybeCache(result, direct.cache, ver);
@@ -3476,10 +3483,7 @@ final class McpServer : ServerCore
 			string[string] captured;
 			if (matchUriTemplate(t.descriptor.uriTemplate, uri, captured))
 			{
-				// Capability gating: same logic as for direct resources.
-				const ClientCapabilities declared = ctx.clientCapabilities();
-				if (auto missing = t.requiredClientCapabilities.missingFrom(declared))
-					throw missingRequiredClientCapability(missing.get);
+				requireClientCapabilities(t.requiredClientCapabilities, ctx, ver, conn);
 				ReadResourceResult result;
 				result.contents = projectContents(t.reader(uri, captured, ctx), ver);
 				return maybeCache(result, t.cache, ver);
@@ -3759,12 +3763,8 @@ final class McpServer : ServerCore
 		if (entry is null)
 			throw invalidParams("Unknown prompt: " ~ name);
 
-		// Capability gating: mirrors doCallTool — uses per-request
-		// _meta.clientCapabilities on the modern protocol, or the session caps
-		// negotiated at initialize on stateful 2025-era protocols.
+		requireClientCapabilities(entry.requiredClientCapabilities, ctx, ver, conn);
 		const ClientCapabilities declared = ctx.clientCapabilities();
-		if (auto missing = entry.requiredClientCapabilities.missingFrom(declared))
-			throw missingRequiredClientCapability(missing.get);
 
 		Json args = requestArguments(params, "prompts/get");
 		// GetPromptRequest types `arguments` as a map of string to string; a null
@@ -3966,6 +3966,7 @@ final class McpServer : ServerCore
 		// 2026-07-28 defines no `initialize`, so the handshake cannot claim it.
 		conn.negotiated = negotiate(p.protocolVersion);
 		conn.clientCaps = p.capabilities;
+		conn.clientCapsDeclared = true;
 		// Record that this stateful session has processed its `initialize`, so the
 		// re-init guard above rejects a second one even if it arrives before the
 		// client's `notifications/initialized`.
@@ -4002,6 +4003,23 @@ final class McpServer : ServerCore
 				(string name) => name, (string name) => tools[name].descriptor, params, ver);
 	}
 
+	/// Reject a request with a `-32021` `MissingRequiredClientCapabilityError`
+	/// listing, in `data.requiredCapabilities`, each capability in `required`
+	/// the client did not declare (2026-07-28 basic/lifecycle: a server MUST NOT
+	/// rely on a capability the client has not declared). The declared set is
+	/// the modern request's `_meta.clientCapabilities`, or what `initialize`
+	/// declared on a 2025-era connection. A 2025-era request on a connection
+	/// that never saw `initialize` — every request to a stateless HTTP server —
+	/// has unknowable capabilities, so it is not gated.
+	private static void requireClientCapabilities(const ClientCapabilities required,
+			RequestContext ctx, ProtocolVersion ver, ConnectionState conn) @safe
+	{
+		if (!ver.isModern && !conn.clientCapsDeclared)
+			return;
+		if (auto missing = required.missingFrom(ctx.clientCapabilities()))
+			throw missingRequiredClientCapability(missing.get);
+	}
+
 	/// The `arguments` object of a `tools/call` / `prompts/get` request: an empty
 	/// object when absent. Any other non-object value makes the request
 	/// malformed (-32602).
@@ -4025,17 +4043,8 @@ final class McpServer : ServerCore
 		if (entry is null)
 			throw invalidParams("Unknown tool: " ~ name);
 
-		// Capability gating (2026-07-28 basic/lifecycle): a server MUST NOT rely on a
-		// capability the client did not declare. When this tool declares required
-		// client capabilities, reject the call with a `-32021`
-		// `MissingRequiredClientCapabilityError` listing the unmet ones in
-		// `data.requiredCapabilities`. The set the client actually declared is
-		// taken from this request's `_meta.clientCapabilities` on the stateless
-		// modern protocol, or from the session capabilities negotiated at
-		// `initialize` on the stateful 2025-era protocols.
+		requireClientCapabilities(entry.requiredClientCapabilities, ctx, ver, conn);
 		const ClientCapabilities declared = ctx.clientCapabilities();
-		if (auto missing = entry.requiredClientCapabilities.missingFrom(declared))
-			throw missingRequiredClientCapability(missing.get);
 
 		Json args = requestArguments(params, "tools/call");
 
@@ -9947,6 +9956,32 @@ unittest  // stateful (2025-era) tools/call gates on negotiated session capabili
 	]);
 	auto resp = s.handle(req(2, "tools/call", p)).get;
 	assert(resp["error"]["code"].get!long == -32021);
+}
+
+unittest  // a 2025-era request with no initialize on its connection skips the client-cap gate
+{
+	// A stateless HTTP server dispatches each 2025-era request on a fresh
+	// connection that never saw `initialize`, so the client's capabilities are
+	// unknown rather than empty.
+	auto s = McpServer.stateless("t", "1");
+	Tool t = {name: "needs-sampling"};
+	s.registerTool(t, (Json) @safe => CallToolResult());
+	Prompt pr = {name: "greet"};
+	s.registerPrompt(pr, (Json) @safe => GetPromptResult.init);
+	s.registerResource(Resource("res://x", "x"), () @safe => ResourceContents.init);
+	ClientCapabilities reqCap;
+	reqCap.sampling = true;
+	assert(s.setToolRequiredClientCapabilities("needs-sampling", reqCap));
+	assert(s.setPromptRequiredClientCapabilities("greet", reqCap));
+	assert(s.setResourceRequiredClientCapabilities("res://x", reqCap));
+	auto call = s.handle(req(1, "tools/call", Json([
+				"name": Json("needs-sampling")
+	]))).get;
+	assert("error" !in call);
+	auto prompt = s.handle(req(2, "prompts/get", Json(["name": Json("greet")]))).get;
+	assert("error" !in prompt);
+	auto read = s.handle(req(3, "resources/read", Json(["uri": Json("res://x")]))).get;
+	assert("error" !in read);
 }
 
 unittest  // modern prompts/get rejects with -32021 when a required client cap is undeclared
