@@ -2717,9 +2717,6 @@ final class HttpClientTransport : ClientTransport
 		import std.string : strip;
 		import vibe.core.task : Task;
 
-		const ep = parseHttpEndpoint(url);
-		// Resolve + pin the user-configured endpoint host to a numeric address.
-		const pinnedHost = pinnedEndpointHost(ep);
 		bool established;
 
 		legacyStreamAlive = true;
@@ -2743,6 +2740,11 @@ final class HttpClientTransport : ClientTransport
 		() {
 			try
 			{
+				// Resolve + pin the user-configured endpoint host to a numeric
+				// address inside the attempt, so a failed lookup ends this stream
+				// with a recorded failure and a reconnect resolves afresh.
+				const ep = parseHttpEndpoint(url);
+				const pinnedHost = pinnedEndpointHost(ep);
 				// A 401 rejecting the bearer is reported to the provider's
 				// `onRejected`, and the stream is opened once more with the
 				// refreshed token, as `runServerStream` does.
@@ -7942,6 +7944,30 @@ unittest  // startLegacyFallback surfaces a refused legacy GET connection prompt
 	assert(failure.length == 0, failure);
 	assert(msg.length);
 	assert(!msg.canFind("did not send an `endpoint` event"), msg);
+	assert(took < 5.seconds);
+}
+
+unittest  // startLegacyFallback surfaces an unresolvable legacy host promptly
+{
+	import core.time : MonoTime, seconds;
+	import std.algorithm : canFind;
+
+	auto router = new URLRouter;
+	string msg;
+	auto took = 0.seconds;
+	const failure = runAgainstFakeServer(router, (string url) @safe {
+		// The `.invalid` TLD never resolves (RFC 6761).
+		auto t = new HttpClientTransport("http://mcp-sdk-test.invalid/mcp");
+		const start = MonoTime.currTime;
+		try
+			t.startLegacyFallback();
+		catch (McpException e)
+			msg = e.msg;
+		took = MonoTime.currTime - start;
+		t.close();
+	});
+	assert(failure.length == 0, failure);
+	assert(msg.canFind("could not be resolved"), msg);
 	assert(took < 5.seconds);
 }
 
