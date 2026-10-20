@@ -1444,6 +1444,8 @@ private void registerEventMethod(string memberName, alias overload, alias parent
 	static if (is(ReturnType!overload == EventBatch!EP, EP))
 	{
 		alias A = Parameters!overload[0];
+		enum problem = eventSignatureProblem!(memberName, overload, EP)();
+		static assert(problem is null, problem);
 
 		auto ev = server.ensureEvents("@event '" ~ attr.name ~ "'").define!(A,
 				EP)(attr.name, attr.description, attr.title);
@@ -1456,6 +1458,41 @@ private void registerEventMethod(string memberName, alias overload, alias parent
 	else
 		static assert(false, "@event method '" ~ memberName
 				~ "' must return EventBatch!P (its payload type P derives the payloadSchema)");
+}
+
+/// Why the `@event` method `overload` (member `memberName`, taking
+/// `(A args, FetchContext ctx)` and returning `EventBatch!EP`) cannot back an
+/// event type, or `null` when it can: `A` must be a struct whose fields bind from
+/// JSON (they are the subscription arguments), `EP` must be writable as JSON, and
+/// the parameters carry no UDAs or storage classes, which would have no effect.
+/// Checked up front so the diagnostic names the handler rather than surfacing
+/// from deep inside schema generation or binding.
+private string eventSignatureProblem(string memberName, alias overload, EP)()
+{
+	import mcp.api.binding : unsupportedTypeReason;
+	import mcp.protocol.jsonhelpers : isFieldwiseStruct;
+
+	alias A = Unqual!(Parameters!overload[0]);
+	alias storage = ParameterStorageClassTuple!overload;
+	enum prefix = "@event method '" ~ memberName ~ "': ";
+	static if (!isFieldwiseStruct!A)
+		return prefix ~ "its subscription-argument type " ~ A.stringof
+			~ " must be a struct whose fields are the subscription arguments";
+	else static if (unsupportedTypeReason!(A, SchemaUse.input)() !is null)
+		return prefix ~ "its subscription-argument type " ~ A.stringof
+			~ " cannot be bound from JSON (" ~ unsupportedTypeReason!(A, SchemaUse.input)() ~ ")";
+	else static if (unsupportedTypeReason!(EP, SchemaUse.output)() !is null)
+		return prefix ~ "its payload type " ~ EP.stringof ~ " cannot be written as JSON ("
+			~ unsupportedTypeReason!(EP, SchemaUse.output)() ~ ")";
+	else static if (ParamAttributes!(overload, 0).length || ParamAttributes!(overload, 1).length)
+		return prefix ~ "a UDA on its parameters has no effect; annotate the fields of "
+			~ A.stringof ~ " instead";
+	else static if ((storage[0] | storage[1]) & (
+			ParameterStorageClass.out_ | ParameterStorageClass.ref_ | ParameterStorageClass.lazy_))
+		return prefix ~ "its parameters must not be out, ref, or lazy; the arguments are "
+			~ "bound from JSON and passed by value";
+	else
+		return null;
 }
 
 /// Wrap the value prompt method `memberName` returns into a `PromptResponse`. A
@@ -4828,6 +4865,103 @@ version (unittest)
 			], "c1");
 		}
 	}
+}
+
+version (unittest)
+{
+	private struct UnbindableEventArgs
+	{
+		int* target;
+	}
+
+	private struct UnwritablePayload
+	{
+		void delegate() callback;
+	}
+
+	private class UnbindableArgsEventApi
+	{
+		@event("bad.args", "Unbindable arguments")
+		EventBatch!Email fetch(UnbindableEventArgs args, FetchContext ctx) @safe
+		{
+			return EventBatch!Email.empty("c0");
+		}
+	}
+
+	private class ScalarArgsEventApi
+	{
+		@event("scalar.args", "Arguments that are not a struct")
+		EventBatch!Email fetch(int args, FetchContext ctx) @safe
+		{
+			return EventBatch!Email.empty("c0");
+		}
+	}
+
+	private class UnwritablePayloadEventApi
+	{
+		@event("bad.payload", "Unwritable payload")
+		EventBatch!UnwritablePayload fetch(EmailArgs args, FetchContext ctx) @safe
+		{
+			return EventBatch!UnwritablePayload.empty("c0");
+		}
+	}
+
+	private class ParamUdaEventApi
+	{
+		@event("param.uda", "A UDA on the arguments parameter")
+		EventBatch!Email fetch(@fieldDescription("filters") EmailArgs args, FetchContext ctx)@safe
+		{
+			return EventBatch!Email.empty("c0");
+		}
+	}
+}
+
+unittest  // @event rejects an unbindable argument type with a diagnostic naming the handler
+{
+	import std.algorithm : canFind;
+
+	enum problem = eventSignatureProblem!("fetch", UnbindableArgsEventApi.fetch, Email)();
+	static assert(problem.canFind("@event method 'fetch'")
+			&& problem.canFind("UnbindableEventArgs"), problem);
+	auto s = McpServer.stateless("t", "1");
+	static assert(!__traits(compiles, registerHandlers(s, new UnbindableArgsEventApi)));
+}
+
+unittest  // @event rejects subscription arguments that are not a struct
+{
+	import std.algorithm : canFind;
+
+	enum problem = eventSignatureProblem!("fetch", ScalarArgsEventApi.fetch, Email)();
+	static assert(problem.canFind("@event method 'fetch'") && problem.canFind("struct"), problem);
+	auto s = McpServer.stateless("t", "1");
+	static assert(!__traits(compiles, registerHandlers(s, new ScalarArgsEventApi)));
+}
+
+unittest  // @event rejects a payload type that cannot be written as JSON
+{
+	import std.algorithm : canFind;
+
+	enum problem = eventSignatureProblem!("fetch",
+				UnwritablePayloadEventApi.fetch, UnwritablePayload)();
+	static assert(problem.canFind("@event method 'fetch'")
+			&& problem.canFind("UnwritablePayload"), problem);
+	auto s = McpServer.stateless("t", "1");
+	static assert(!__traits(compiles, registerHandlers(s, new UnwritablePayloadEventApi)));
+}
+
+unittest  // @event rejects a UDA on its parameters, which would have no effect
+{
+	import std.algorithm : canFind;
+
+	enum problem = eventSignatureProblem!("fetch", ParamUdaEventApi.fetch, Email)();
+	static assert(problem.canFind("@event method 'fetch'") && problem.canFind("no effect"), problem);
+	auto s = McpServer.stateless("t", "1");
+	static assert(!__traits(compiles, registerHandlers(s, new ParamUdaEventApi)));
+}
+
+unittest  // a well-formed @event signature has no problem
+{
+	static assert(eventSignatureProblem!("checkEmail", EventUdaApi.checkEmail, Email)() is null);
 }
 
 unittest  // @event derives input + payload schemas from its typed signature
