@@ -752,6 +752,8 @@ final class HttpClientTransport : ClientTransport
 	{
 		import vibe.core.task : InterruptException, Task;
 
+		if (closeRequested)
+			throw new TransportClosedException("HTTP transport closed");
 		if (isInitialize(message))
 		{
 			// An initialize always opens a new session; the server assigns its id
@@ -7968,6 +7970,31 @@ unittest  // startLegacyFallback surfaces a refused legacy GET connection prompt
 	assert(msg.length);
 	assert(!msg.canFind("did not send an `endpoint` event"), msg);
 	assert(took < 5.seconds);
+}
+
+unittest  // a request after close() fails with TransportClosedException without being sent
+{
+	int posts;
+	auto router = answeringRouter((Json req, HTTPServerResponse res) @safe {
+		posts++;
+		res.writeJsonBody(Json([
+			"jsonrpc": Json("2.0"),
+			"id": req["id"],
+			"result": Json.emptyObject
+		]));
+	});
+	bool closedError;
+	const failure = runAgainstFakeServer(router, (string url) @safe {
+		auto t = new HttpClientTransport(url);
+		t.close();
+		try
+			t.deliver(makeRequest(Json(1), "ping", Json.emptyObject), 1);
+		catch (TransportClosedException)
+			closedError = true;
+	});
+	assert(failure.length == 0, failure);
+	assert(closedError, "a closed transport must say so");
+	assert(posts == 0, "a closed transport must not send the request");
 }
 
 unittest  // startLegacyFallback waits listenTimeout_ for the endpoint event
