@@ -802,6 +802,9 @@ final class McpServer : ServerCore
 	/// protections at once: integrity (the client cannot tamper with the opaque
 	/// state), expiry (`ttl`), and user-binding (the echoed state must belong to
 	/// the currently authenticated subject, defending against replay/hijack).
+	/// The default `sec.bindTo` also binds the state to the call it was issued
+	/// for — method, tool/prompt name and arguments — so it cannot be redeemed
+	/// by a retry with different arguments (see `RequestStateBinding`).
 	///
 	/// Verification is fail-closed: a tampered, expired, wrong-subject, or
 	/// otherwise invalid blob is treated as if the client echoed NO state and no
@@ -9036,7 +9039,7 @@ unittest  // registerTaskExecutor refuses a name that already has an executor
 
 	auto s = McpServer.stateless("t", "1");
 	s.registerTaskExecutor("job", (TaskContext tc) @safe => Json([
-			"first": Json(true)
+		"first": Json(true)
 	]));
 	assertThrown(s.registerTaskExecutor("job", (TaskContext tc) @safe => Json.emptyObject));
 	Tool clash = {name: "job"};

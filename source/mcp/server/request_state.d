@@ -15,7 +15,8 @@
 ///   payload = {"s":<stateJson>,"exp":<unixSeconds>,"b":<bindTagHex>}
 ///   - signed (HMAC-SHA256): "v1."  ~ b64url(payload) ~ "." ~ b64url(mac)
 ///   - encrypted (AES-256-GCM): "v1e." ~ b64url(nonce ~ ciphertext ~ tag)
-/// The bind tag is HMAC-SHA256(key, subject [~ "\0" ~ tool]) hex; in the
+/// The bind tag is HMAC-SHA256(key, subject [~ "\0" ~ tool [~ "\0" ~ args]])
+/// hex, where `args` is the request's canonical `arguments` JSON; in the
 /// encrypted mode it is also fed as GCM AAD. Verification is fail-closed: a bad
 /// MAC, a GCM auth failure, an expired blob, a wrong-subject bind, or an
 /// unparseable envelope all yield `Nullable!string.init` (the dispatch path
@@ -76,8 +77,16 @@ enum RequestStateBinding
 	authSubject,
 	/// Bind to the authenticated subject AND the request method plus tool/prompt
 	/// name, so a blob issued by one tool cannot be replayed into another tool,
-	/// nor into a prompt that shares its name.
+	/// nor into a prompt that shares its name. The `arguments` are NOT bound:
+	/// until the blob expires, the client can redeem it on a retry carrying
+	/// different arguments, so a handler must copy into its state every
+	/// argument the state's meaning depends on and trust those copies.
 	authSubjectAndTool,
+	/// `authSubjectAndTool` plus the request's `arguments`, compared in a
+	/// canonical form (object keys sorted, integral numbers written as
+	/// integers), so a retry must repeat the original call exactly. An absent
+	/// `arguments` binds as the empty object.
+	authSubjectToolAndArguments,
 }
 
 /// Configuration handed to `McpServer.secureRequestState`. The `key` is the
@@ -99,9 +108,10 @@ struct RequestStateSecurity
 	/// verification and re-elicits. Defaults to 5 minutes.
 	Duration ttl = 5.minutes;
 
-	/// Identity binding. Defaults to `authSubjectAndTool`, so a blob one tool
-	/// issued cannot be redeemed by another tool or prompt.
-	RequestStateBinding bindTo = RequestStateBinding.authSubjectAndTool;
+	/// Identity binding. Defaults to `authSubjectToolAndArguments`, so a blob
+	/// one call issued can be redeemed only by a retry of that same call (same
+	/// subject, method, tool/prompt name and arguments).
+	RequestStateBinding bindTo = RequestStateBinding.authSubjectToolAndArguments;
 }
 
 /// The codec the dispatch path installs when an operator enables
@@ -137,13 +147,14 @@ package(mcp) final class RequestStateCodec
 	}
 
 	/// Wrap `stateJson` (the handler's plaintext requestState) into a wire blob
-	/// bound to `subject`/`toolName` (per the configured binding) and stamped with
-	/// an expiry `ttl` from now. The result is what the client sees and echoes
-	/// back; `decode` is its inverse.
-	string encode(string stateJson, string subject, string toolName) @safe
+	/// bound to `subject`/`toolName`/`arguments` (per the configured binding)
+	/// and stamped with an expiry `ttl` from now. `arguments` is the canonical
+	/// arguments JSON (`requestStateArguments`). The result is what the client
+	/// sees and echoes back; `decode` is its inverse.
+	string encode(string stateJson, string subject, string toolName, string arguments = "") @safe
 	{
 		const exp = currentUnixTime() + cast(long) ttl.total!"seconds";
-		const bindTagHex = bindTag(subject, toolName);
+		const bindTagHex = bindTag(subject, toolName, arguments);
 
 		Json env = Json.emptyObject;
 		env["s"] = stateJson;
@@ -166,27 +177,29 @@ package(mcp) final class RequestStateCodec
 		}
 	}
 
-	/// Verify an echoed `wire` blob against the current `subject`/`toolName` and
-	/// return the inner plaintext state, or `Nullable!string.init` on any failure
-	/// (bad MAC, GCM auth failure, expired, wrong-subject bind, or unparseable).
-	/// Fail-closed: the caller re-elicits on null.
-	Nullable!string decode(string wire, string subject, string toolName) @safe
+	/// Verify an echoed `wire` blob against the current
+	/// `subject`/`toolName`/`arguments` and return the inner plaintext state, or
+	/// `Nullable!string.init` on any failure (bad MAC, GCM auth failure,
+	/// expired, wrong-identity bind, or unparseable). Fail-closed: the caller
+	/// re-elicits on null.
+	Nullable!string decode(string wire, string subject, string toolName, string arguments = "") @safe
 	{
 		try
 		{
+			const expectedBind = bindTag(subject, toolName, arguments);
 			final switch (mode)
 			{
 			case RequestStateMode.signed:
-				return decodeSigned(wire, subject, toolName);
+				return decodeSigned(wire, expectedBind);
 			case RequestStateMode.encrypted:
-				return decodeEncrypted(wire, subject, toolName);
+				return decodeEncrypted(wire, expectedBind);
 			}
 		}
 		catch (Exception)
 			return Nullable!string.init;
 	}
 
-	private Nullable!string decodeSigned(string wire, string subject, string toolName) @safe
+	private Nullable!string decodeSigned(string wire, string expectedBind) @safe
 	{
 		import std.array : split;
 
@@ -201,10 +214,10 @@ package(mcp) final class RequestStateCodec
 		const expectedMac = hmacSha256(payloadMacKey(), payloadBytes);
 		if (!constantTimeEquals(presentedMac, expectedMac))
 			return Nullable!string.init;
-		return openEnvelope(payloadBytes, subject, toolName);
+		return openEnvelope(payloadBytes, expectedBind);
 	}
 
-	private Nullable!string decodeEncrypted(string wire, string subject, string toolName) @safe
+	private Nullable!string decodeEncrypted(string wire, string expectedBind) @safe
 	{
 		if (wire.length < 4 || wire[0 .. 4] != "v1e.")
 			return Nullable!string.init;
@@ -214,17 +227,16 @@ package(mcp) final class RequestStateCodec
 			return Nullable!string.init;
 		const nonce = blob[0 .. 12];
 		const ctAndTag = blob[12 .. $];
-		const aad = cast(const(ubyte)[]) bindTag(subject, toolName).representation;
+		const aad = cast(const(ubyte)[]) expectedBind.representation;
 		auto opened = aesGcmOpen(aesKey(), nonce, ctAndTag, aad);
 		if (opened.isNull)
 			return Nullable!string.init;
-		return openEnvelope(opened.get, subject, toolName);
+		return openEnvelope(opened.get, expectedBind);
 	}
 
 	/// Parse the decrypted/verified payload, check expiry, and confirm the bind
-	/// tag matches the current identity. Returns the inner state or null.
-	private Nullable!string openEnvelope(const(ubyte)[] payloadBytes, string subject,
-			string toolName) @safe
+	/// tag matches `expectedBind`. Returns the inner state or null.
+	private Nullable!string openEnvelope(const(ubyte)[] payloadBytes, string expectedBind) @safe
 	{
 		const payload = (() @trusted => (cast(const(char)[]) payloadBytes).idup)();
 		const env = parseJsonString(payload);
@@ -237,7 +249,6 @@ package(mcp) final class RequestStateCodec
 		if (env["exp"].get!long < currentUnixTime())
 			return Nullable!string.init;
 		const presentedBind = env["b"].get!string;
-		const expectedBind = bindTag(subject, toolName);
 		if (!constantTimeEquals(cast(const(ubyte)[]) presentedBind.representation,
 				cast(const(ubyte)[]) expectedBind.representation))
 			return Nullable!string.init;
@@ -247,13 +258,15 @@ package(mcp) final class RequestStateCodec
 	/// The bind tag (hex HMAC) for an identity. Empty subject (stdio / in-process
 	/// / no auth) or `bindTo == none` yields the tag over an empty subject, so
 	/// binding is a no-op without an authenticated identity (documented).
-	private string bindTag(string subject, string toolName) @safe
+	private string bindTag(string subject, string toolName, string arguments) @safe
 	{
 		if (bindTo == RequestStateBinding.none)
 			subject = "";
 		string material = subject;
 		if (bindTo == RequestStateBinding.authSubjectAndTool)
 			material = subject ~ "\0" ~ toolName;
+		else if (bindTo == RequestStateBinding.authSubjectToolAndArguments)
+			material = subject ~ "\0" ~ toolName ~ "\0" ~ arguments;
 		const mac = hmacSha256(bindKey(), cast(const(ubyte)[]) material.representation);
 		return toHex(mac);
 	}
@@ -303,10 +316,79 @@ package string requestStateTarget(string method, Json params) @safe
 	return method ~ "\0" ~ name;
 }
 
+/// The request's `arguments` in canonical JSON, the form the
+/// `authSubjectToolAndArguments` binding compares: object keys sorted, integral
+/// numbers written as integers, and an absent `arguments` as `{}`, so a client
+/// that re-serialises the same arguments on its retry still matches.
+package string requestStateArguments(Json params) @safe
+{
+	if (params.type != Json.Type.object || "arguments" !in params)
+		return "{}";
+	return canonicalJson(params["arguments"]);
+}
+
+/// `j` serialised with object keys sorted and every number that holds an
+/// integral value written as an integer, so equal JSON values serialise alike.
+private string canonicalJson(Json j) @safe
+{
+	import std.algorithm : sort;
+	import std.array : appender;
+	import std.conv : to;
+	import std.format : format;
+	import std.math : isFinite;
+
+	final switch (j.type)
+	{
+	case Json.Type.undefined:
+	case Json.Type.null_:
+		return "null";
+	case Json.Type.bool_:
+		return j.get!bool ? "true" : "false";
+	case Json.Type.int_:
+		return j.get!long
+			.to!string;
+	case Json.Type.bigInt:
+	case Json.Type.string:
+		return j.toString();
+	case Json.Type.float_:
+		const d = j.get!double;
+		if (isFinite(d) && d > -0x1p63 && d < 0x1p63 && d == cast(double)(cast(long) d))
+			return (cast(long) d).to!string;
+		return format("%.17g", d);
+	case Json.Type.array:
+		auto a = appender!string("[");
+		foreach (i; 0 .. j.length)
+		{
+			if (i)
+				a ~= ",";
+			a ~= canonicalJson(j[i]);
+		}
+		a ~= "]";
+		return a[];
+	case Json.Type.object:
+		string[] keys;
+		foreach (k, _; j.byKeyValue)
+			keys ~= k;
+		sort(keys);
+		auto o = appender!string("{");
+		foreach (i, k; keys)
+		{
+			if (i)
+				o ~= ",";
+			o ~= Json(k).toString();
+			o ~= ":";
+			o ~= canonicalJson(j[k]);
+		}
+		o ~= "}";
+		return o[];
+	}
+}
+
 /// Verify an incoming (echoed) MRTR `requestState`. With no codec configured
 /// (`codec is null`) the raw value passes through unchanged (plaintext). With
 /// the codec enabled, a non-empty blob is decoded and verified against the
-/// request's authenticated subject and tool name; on success the inner state
+/// request's authenticated subject, tool name and arguments (per the
+/// configured binding); on success the inner state
 /// is returned, and on ANY failure (tamper / GCM auth fail / expiry /
 /// wrong-subject / unparseable) it fails closed to null, with a warning
 /// logged. An absent blob is also null (without a warning): every
@@ -323,7 +405,8 @@ package Nullable!string verifyIncomingRequestState(RequestStateCodec codec,
 		return nullable(raw);
 	if (raw.length == 0)
 		return Nullable!string.init;
-	auto decoded = codec.decode(raw, requestStateSubject(ctx), requestStateTarget(method, params));
+	auto decoded = codec.decode(raw, requestStateSubject(ctx),
+			requestStateTarget(method, params), requestStateArguments(params));
 	if (decoded.isNull)
 		logWarn("secureRequestState: rejected an echoed requestState on %s "
 				~ "(tamper, expiry, wrong-subject, or malformed); re-eliciting.", method);
@@ -358,7 +441,7 @@ package Json secureOutgoingRequestState(RequestStateCodec codec, Json result,
 	if (plain.length == 0 && "inputRequests" !in result)
 		return result;
 	result["requestState"] = codec.encode(plain, requestStateSubject(ctx),
-			requestStateTarget(method, params));
+			requestStateTarget(method, params), requestStateArguments(params));
 	return result;
 }
 
@@ -772,10 +855,52 @@ version (unittest)
 	}
 }
 
-unittest  // the default binding ties a requestState to both the subject and the tool
+unittest  // the default binding ties a requestState to the subject, the tool and its arguments
 {
 	RequestStateSecurity sec;
-	assert(sec.bindTo == RequestStateBinding.authSubjectAndTool);
+	assert(sec.bindTo == RequestStateBinding.authSubjectToolAndArguments);
+}
+
+unittest  // authSubjectToolAndArguments rejects a blob replayed with other arguments
+{
+	auto codec = signedCodec(RequestStateBinding.authSubjectToolAndArguments);
+	const wire = codec.encode(`{"step":1}`, "alice", "tool", `{"amount":1}`);
+	assert(codec.decode(wire, "alice", "tool", `{"amount":1000}`).isNull);
+	assert(codec.decode(wire, "alice", "other", `{"amount":1}`).isNull);
+	assert(!codec.decode(wire, "alice", "tool", `{"amount":1}`).isNull);
+}
+
+unittest  // authSubjectAndTool leaves the arguments unbound
+{
+	auto codec = signedCodec(RequestStateBinding.authSubjectAndTool);
+	const wire = codec.encode(`{"step":1}`, "alice", "tool", `{"amount":1}`);
+	assert(!codec.decode(wire, "alice", "tool", `{"amount":1000}`).isNull);
+}
+
+unittest  // the seams bind the canonical arguments: key order and absence of arguments do not matter
+{
+	import vibe.data.json : parseJsonString;
+
+	auto codec = signedCodec(RequestStateBinding.authSubjectToolAndArguments);
+	auto ctx = new AnonymousCtx();
+	Json issued = parseJsonString(
+			`{"name":"pay","arguments":{"to":"bob","amount":1,"memo":{"b":2,"a":[1,"x"]}}}`);
+	Json result = Json(["requestState": Json(`{"step":1}`)]);
+	const wire = secureOutgoingRequestState(codec, result, "tools/call", issued, ctx)["requestState"]
+		.get!string;
+
+	Json reordered = parseJsonString(
+			`{"arguments":{"memo":{"a":[1,"x"],"b":2},"amount":1,"to":"bob"},"name":"pay"}`);
+	assert(verifyIncomingRequestState(codec, wire, "tools/call", reordered, ctx).get == `{"step":1}`);
+	Json changed = parseJsonString(
+			`{"name":"pay","arguments":{"to":"eve","amount":1,"memo":{"b":2,"a":[1,"x"]}}}`);
+	assert(verifyIncomingRequestState(codec, wire, "tools/call", changed, ctx).isNull);
+
+	Json fresh = Json(["requestState": Json(`{"step":1}`)]);
+	const bare = secureOutgoingRequestState(codec, fresh, "tools/call",
+			Json(["name": Json("pay")]), ctx)["requestState"].get!string;
+	Json empty = parseJsonString(`{"name":"pay","arguments":{}}`);
+	assert(verifyIncomingRequestState(codec, bare, "tools/call", empty, ctx).get == `{"step":1}`);
 }
 
 unittest  // with the codec enabled, a retry carrying no requestState is unverified
